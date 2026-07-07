@@ -105,6 +105,14 @@ _COMPUTE_EXPERIMENT_FINDING_TYPES = frozenset(
 REGION_MIN_SHARED = 2
 REGION_MIN_JACCARD = 0.5
 STRONG_REGION_JACCARD = 0.7
+# Minimum shared-file count required for the jaccard-only corroborator to fire.
+# Identical 1-2-file sets are not strong enough evidence alone (module-scoped
+# directions concentrate distinct work onto the same 2 hot files, so jaccard=1.0
+# is trivially achieved by any two findings in the same module — confirmed live
+# incident: two distinct findings sharing acceptance_criteria.py +
+# routers/admin_acceptance_criteria.py were both dropped against "fix pr #12662",
+# which shared only those two files without any title or claim agreement).
+STRONG_REGION_MIN_SHARED = 3
 CORROBORATE_WORDS_SAME = 3
 # Retained for reference / legacy direction-aware title-overlap callers
 # (e.g. ``is_duplicate``). The region-identity matcher no longer uses a
@@ -1141,10 +1149,15 @@ def _find_overlap_match(
         )
         # Strong corroborators (shared claim, near-identical file set) assert
         # semantic identity directly and apply regardless of direction.
-        strong_corroborated = (
-            bool(finding_claims & candidate.claims)
-            or file_jaccard >= STRONG_REGION_JACCARD
+        # File-jaccard alone is only trusted when the shared set is large enough
+        # (>= STRONG_REGION_MIN_SHARED): identical 1-2-file sets are typical for
+        # any two findings in a module-scoped direction, so jaccard=1.0 there is
+        # not meaningful signal without title or claim corroboration.
+        strong_files = (
+            file_jaccard >= STRONG_REGION_JACCARD
+            and len(shared) >= STRONG_REGION_MIN_SHARED
         )
+        strong_corroborated = bool(finding_claims & candidate.claims) or strong_files
         if cross_direction:
             # Independent strategic tracks routinely touch the same hot file
             # (e.g. orchestrator.py) while pursuing genuinely distinct work, so
@@ -1197,6 +1210,7 @@ def _coerce_overlap_candidate(raw: object) -> Optional[_OverlapCandidate]:
             title=str(raw[1]),
             task_type=_normalize_task_type(raw[2]) if len(raw) >= 3 else None,
             related_files=_norm_related_files(raw[3]) if len(raw) >= 4 else frozenset(),
+            claims=_norm_claim_set(raw[4]) if len(raw) >= 5 else frozenset(),
         )
     return None
 

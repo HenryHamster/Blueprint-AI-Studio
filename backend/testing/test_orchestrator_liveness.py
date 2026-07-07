@@ -17,6 +17,7 @@ from datetime import timedelta
 import pytest
 
 import app.orchestrator as _orch
+import app.orchestrator_liveness as _liv
 import app.shared_state as _ss
 from app.time_utils import _utcnow
 
@@ -47,6 +48,72 @@ def _make_leader_db_healthy():
     _ss.is_leader = True
     _ss.external_health["db"] = True
     _ss.external_health["failed_deps"] = []
+
+
+class TestLivenessModuleExtraction:
+    """The liveness heartbeat + watchdog LOGIC was extracted to
+    ``app.orchestrator_liveness`` while the mutable gauges
+    (``_orchestrator_last_*``) stay owned by ``app.orchestrator``. These pin the
+    extraction contract: the public API is single-sourced in the new module and
+    re-exported from ``app.orchestrator``, and the extracted predicate reads (and
+    the heartbeat setter writes) the gauges that remain on ``app.orchestrator`` —
+    so a slow-but-progressing worker verdict crosses the module boundary intact.
+    """
+
+    def test_public_api_is_single_sourced_in_liveness_module(self):
+        # Re-exported names on app.orchestrator must be the SAME objects defined
+        # in app.orchestrator_liveness — one implementation, two import paths.
+        for name in (
+            "evaluate_orchestrator_liveness",
+            "hard_watchdog_should_abort",
+            "_mark_orchestrator_progress",
+            "_bounded_leader_step",
+            "start_orchestrator_hard_watchdog",
+            "stop_orchestrator_hard_watchdog",
+            "OrchestratorLiveness",
+            "ORCHESTRATOR_HANG_SECONDS",
+            "ORCHESTRATOR_HARD_WATCHDOG_SECONDS",
+        ):
+            assert getattr(_orch, name) is getattr(_liv, name), name
+
+    def test_extracted_predicate_reads_orchestrator_owned_gauges(
+        self, restore_orch_state
+    ):
+        # Gauges are owned by app.orchestrator; the extracted predicate reaches
+        # them via a lazy import. A stale completed cycle but a fresh heartbeat
+        # written on app.orchestrator must read as healthy (not stalled) through
+        # the NEW module's function.
+        now = _utcnow()
+        _orch._orchestrator_last_cycle = now - timedelta(seconds=600)
+        _orch._orchestrator_cycle_started = now - timedelta(seconds=400)
+        _orch._orchestrator_last_progress = now - timedelta(seconds=2)
+
+        liveness = _liv.evaluate_orchestrator_liveness(now)
+        assert liveness.healthy is True
+        assert liveness.stalled is False
+        assert liveness.alive is True
+
+    def test_extracted_predicate_flags_wedge_on_orchestrator_owned_gauges(
+        self, restore_orch_state
+    ):
+        now = _utcnow()
+        stale = now - timedelta(seconds=_liv.ORCHESTRATOR_HANG_SECONDS + 30)
+        _orch._orchestrator_last_progress = stale
+        _orch._orchestrator_last_cycle = stale
+        _orch._orchestrator_cycle_started = stale
+
+        assert _liv.evaluate_orchestrator_liveness(now).stalled is True
+
+    def test_mark_progress_setter_writes_orchestrator_owned_gauge(
+        self, restore_orch_state
+    ):
+        # The extracted heartbeat setter must write the gauge that lives on
+        # app.orchestrator (not a private copy), so /health and the worker agree.
+        _orch._orchestrator_last_progress = None
+        _liv._mark_orchestrator_progress()
+        assert _orch._orchestrator_last_progress is not None
+        age = (_utcnow() - _orch._orchestrator_last_progress).total_seconds()
+        assert age < 5
 
 
 class TestResolveCiFixBranch:

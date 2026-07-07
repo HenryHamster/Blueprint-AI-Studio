@@ -40,6 +40,23 @@ def _default_no_migration_pr(mocker):
     )
 
 
+@pytest.fixture(autouse=True)
+def _default_size_cap_ok(mocker):
+    """Default size-cap preflight to 'ok' so existing merge tests are unaffected.
+
+    ``_attempt_merge_with_retry_and_escalation`` now runs
+    ``preflight_rollup_size_caps`` for direct task PRs. Existing merge tests
+    don't mock the GitHub calls the preflight makes, so without this default
+    the unmocked ``get_file_text_at_ref`` would make every merge test fail.
+    Tests exercising the size-cap gate re-patch
+    ``app.rollup_size_preflight.preflight_rollup_size_caps`` to override this.
+    """
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("ok", None)),
+    )
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _patch_dedicated_sessions_to_test_engine(mocker, db_session):
     """Dedicated AsyncSessionLocal scopes in ci_completion must use the shared
@@ -1942,6 +1959,110 @@ async def test_integration_landing_triggers_build_config_refresh(db_session, moc
 
 
 @pytest.mark.asyncio
+async def test_criterion_evidence_persisted_via_attempt_merge_proven_verdict_covers_criterion(
+    db_session, mocker
+):
+    """Direct CI merge with criterion_ids records proven task_merge evidence.
+
+    The direct merge path (_attempt_merge_with_retry_and_escalation) now records
+    CriterionEvidence for each criterion the task carries when the merge succeeds.
+    The evidence must be recorded with proven=True so the criterion coverage
+    transitions from 'uncovered' to 'covered' (not just 'partial').
+
+    This pins the direct merge path to the same proven-evidence standard that
+    the rollup path enforces, ensuring v22 criteria do not depend on one
+    merge topology.
+    """
+    from app.acceptance_criteria import (
+        compute_criterion_coverage,
+        create_criterion,
+        get_evidence_for_criterion,
+    )
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    # Create project with release version and criterion
+    project = Project(name="Criterion merge test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create an acceptance criterion
+    criterion = await create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Direct merge must record proven evidence",
+        created_by="strategist",
+    )
+
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    # Create the original task (what carries the criterion)
+    orig_task = Task(
+        project_id=project.id,
+        title="Original task with criterion",
+        payloads=[{"type": "research", "prompt": "test"}],
+        context={CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True}},
+        criterion_ids=[criterion.criterion_key],  # Task carries the criterion
+        vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    # Create the CI parking task that will merge and record evidence
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Trigger the merge
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+
+    # Refresh the original task to read the committed state from the dedicated _orig_session
+    await db_session.refresh(orig_task)
+
+    # Verify evidence was recorded with proven=True
+    evidence = await get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) > 0, "Evidence should be recorded after merge"
+
+    # Find the task_merge evidence entry
+    task_merge_evidence = [e for e in evidence if e.source_kind == "task_merge"]
+    assert len(task_merge_evidence) > 0, "task_merge evidence should be recorded"
+    assert task_merge_evidence[0].detail.get("proven") is True, (
+        "task_merge evidence must have proven=True to satisfy criterion coverage"
+    )
+
+    # Verify coverage transitions to 'covered' due to the proven evidence
+    coverage = compute_criterion_coverage(evidence)
+    assert coverage == "covered", (
+        f"Coverage should be 'covered' with proven task_merge evidence, got '{coverage}'"
+    )
+
+
+@pytest.mark.asyncio
 async def test_orig_task_with_promotion_target_merge_withholds_pr_merged(
     db_session, mocker
 ):
@@ -3589,6 +3710,59 @@ async def test_merge_held_on_migration_fetch_failure(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_migration_guard_hold_reason_includes_http_exception_detail(
+    db_session, mocker
+):
+    """HTTPException.detail is included in the hold-reason status message.
+
+    When github.get_pr_files raises an HTTPException (e.g. a 502 from
+    upstream), the hold reason surfaced in task.latest_status_message must
+    contain the detail string — not a bare 'HTTPException: ' with nothing
+    after the colon.
+    """
+    from fastapi import HTTPException
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(
+            side_effect=HTTPException(
+                status_code=502, detail="GitHub 502: upstream error"
+            )
+        ),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+
+    project = Project(name="guard http exc", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False, "HTTPException from guard must hold the merge"
+    merge_mock.assert_not_called()
+    status_msg = task.latest_status_message or ""
+    assert "upstream error" in status_msg, (
+        f"HTTPException detail must appear in status message, got: {status_msg!r}"
+    )
+    assert "HTTPException: " not in status_msg or "HTTPException(502)" in status_msg, (
+        "Must not render as bare 'HTTPException: ' with empty detail"
+    )
+
+
+@pytest.mark.asyncio
 async def test_clean_migration_pr_merges(db_session, mocker):
     """A migration PR that extends the chain cleanly merges normally."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
@@ -4863,12 +5037,14 @@ async def test_criterion_evidence_persisted_via_attempt_merge(db_session, mocker
         created_by="strategist",
     )
 
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
     # Create the original (implementation) task with criterion_ids set
     orig_task = Task(
         project_id=project.id,
         title="Implement feature",
         payloads=[{"type": "create", "prompt": "build the feature", "base_branch": "main"}],
-        context={"direction_id": "d-ce-test"},
+        context={"direction_id": "d-ce-test", CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True}},
         status=TaskStatus.EVALUATING,
         vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
         criterion_ids=[criterion.criterion_key],
@@ -4906,4 +5082,573 @@ async def test_criterion_evidence_persisted_via_attempt_merge(db_session, mocker
     task_merge_ev = [e for e in evidence if e.source_kind == "task_merge"]
     assert len(task_merge_ev) == 1, "exactly one task_merge evidence row expected"
     assert task_merge_ev[0].source_id == str(orig_task.id)
-    assert task_merge_ev[0].detail == {"pr": 99}
+    # Evidence must include proven=True so the criterion coverage transitions to 'covered'.
+    # The detail dict may also contain direction_key and other metadata fields.
+    assert task_merge_ev[0].detail.get("proven") is True, (
+        "task_merge evidence must have proven=True to satisfy criterion coverage"
+    )
+    # Verify coverage is 'covered' due to the proven evidence
+    coverage = ac.compute_criterion_coverage(evidence)
+    assert coverage == "covered", (
+        f"Coverage should be 'covered' with proven task_merge evidence, got '{coverage}'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_merge_unproven_verdict_records_no_proven_evidence(
+    db_session, mocker
+):
+    """Direct CI merge WITHOUT a proven code-acceptance verdict records NO evidence.
+
+    When orig_task.context lacks a proven verdict (or the verdict is absent),
+    record_task_merge_evidence must not write any CriterionEvidence rows.
+    This is the acceptance-gate regression guard: bare merge badges must NOT
+    fabricate 'covered' status for criteria that have not been genuinely proven.
+    """
+    from app import acceptance_criteria as ac
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True, "sha": "abc123noproven"},
+    )
+    mocker.patch(
+        "app.rollup_pr_verification.verify_rollup_merge_landed",
+        new=AsyncMock(return_value="indeterminate"),
+    )
+
+    project = Project(name="Unproven verdict merge test", user_id="test-user-upv")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Must be covered only by proven merge",
+        created_by="strategist",
+    )
+
+    # orig_task has NO code-acceptance verdict — simulates an unproven merge
+    orig_task = Task(
+        project_id=project.id,
+        title="Unproven feature task",
+        payloads=[{"type": "create", "prompt": "build it", "base_branch": "main"}],
+        context={"direction_id": "d-upv-test"},  # no CODE_ACCEPTANCE_VERDICT_KEY
+        status=TaskStatus.EVALUATING,
+        vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
+        criterion_ids=[criterion.criterion_key],
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    ci_task = _make_task(
+        db_session,
+        project,
+        pr_number=77,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+            "base_branch": "main",
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(ci_task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        ci_task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True, "merge should have succeeded"
+
+    # Verify that NO evidence rows were written — unproven verdict must be gated out
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    task_merge_ev = [e for e in evidence if e.source_kind == "task_merge"]
+    assert len(task_merge_ev) == 0, (
+        "No task_merge evidence should be recorded when the code-acceptance verdict "
+        f"is absent or unproven; got {task_merge_ev}"
+    )
+
+    # Coverage must remain uncovered — no fabricated proven evidence
+    coverage = ac.compute_criterion_coverage(evidence)
+    assert coverage == "uncovered", (
+        f"Coverage must stay 'uncovered' when verdict is absent, got '{coverage}'"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Size-cap preflight integration — direct (non-rollup) task PR gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_size_cap_hold_sets_requires_approval_and_returns_false(db_session, mocker):
+    """Size-cap preflight 'hold' → requires_approval=True, merge deferred."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("hold", "chronic offender: models.py (3 bumps)")),
+    )
+
+    project = Project(name="Size hold test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    assert task.requires_approval is True
+    assert "size-cap" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_size_cap_bumped_rearms_ci_and_returns_false(db_session, mocker):
+    """Size-cap preflight 'bumped' → CI re-armed (ci_waiting=True, ci_passed=False)."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("bumped", "models.py: 500 -> 800")),
+    )
+
+    project = Project(name="Size bump test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    loop = (task.context or {}).get("review_loop", {})
+    assert loop.get("ci_waiting") is True
+    assert loop.get("ci_passed") is False
+    assert "size-cap" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_size_cap_hold_gates_off_does_not_set_requires_approval(db_session, mocker):
+    """Size-cap 'hold' with gates OFF must hold the merge but NOT set requires_approval.
+
+    With gates off the approval-gate timeout in services.py would FAIL the task
+    if requires_approval were set — the hold must still surface but the flag stays clear.
+    """
+    from app import shared_state
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("hold", "chronic offender: models.py")),
+    )
+    original_gates = shared_state.runtime_config.get("require_approval_gates", True)
+    shared_state.runtime_config["require_approval_gates"] = False
+    try:
+        project = Project(name="Size hold gates-off test", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = _make_task(db_session, project)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        result = await _attempt_merge_with_retry_and_escalation(
+            task, "fake-token", "owner", "repo", db_session, source="poll"
+        )
+
+        assert result is False, "hold verdict must still defer the merge"
+        assert not task.requires_approval, (
+            "C5 invariant: with gates off, requires_approval must NOT be set"
+        )
+        assert "size-cap" in (task.latest_status_message or "").lower()
+    finally:
+        shared_state.runtime_config["require_approval_gates"] = original_gates
+
+
+@pytest.mark.asyncio
+async def test_size_cap_defer_returns_false_without_state_mutation(db_session, mocker):
+    """Size-cap preflight 'defer' (transient error) → returns False, no task state change."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("defer", "github rate limit")),
+    )
+
+    project = Project(name="Size defer test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+    original_status = task.status
+    original_requires_approval = task.requires_approval
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    assert task.requires_approval == original_requires_approval, (
+        "'defer' must not set requires_approval"
+    )
+    assert task.status == original_status, "'defer' must not change task status"
+
+
+@pytest.mark.asyncio
+async def test_size_cap_skipped_for_rollup_parent_task(db_session, mocker):
+    """Size-cap preflight is skipped when rollup_pr_number is set (rollup parent task)."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    preflight_mock = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("hold", "should not be called")),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+
+    project = Project(name="Rollup skip test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    task.context = {**(task.context or {}), "rollup_pr_number": 999}
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True, "Rollup parent merge must not be blocked by size-cap preflight"
+    preflight_mock.assert_not_awaited()
+    merge_mock.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# effective_pr_number / arm_ci_wait — PR-identity split-brain accessors
+# ---------------------------------------------------------------------------
+from app.ci_completion import arm_ci_wait, effective_pr_number  # noqa: E402
+
+
+class _CtxHolder:
+    """Minimal Task-like stand-in exposing a ``.context`` attribute."""
+
+    def __init__(self, context):
+        self.context = context
+
+
+def test_effective_pr_number_prefers_review_loop_pr_number():
+    holder = _CtxHolder({"review_loop": {"pr_number": 111}, "rollup_pr_number": 222})
+    assert effective_pr_number(holder) == 111
+
+
+def test_effective_pr_number_falls_back_to_rollup_pr_number():
+    # The split-brain shape: ci_waiting armed with no review_loop.pr_number, the
+    # PR identity living only at context.rollup_pr_number.
+    holder = _CtxHolder({"review_loop": {"ci_waiting": True}, "rollup_pr_number": 222})
+    assert effective_pr_number(holder) == 222
+
+
+def test_effective_pr_number_none_when_absent():
+    assert effective_pr_number(_CtxHolder({"review_loop": {}})) is None
+    assert effective_pr_number(_CtxHolder(None)) is None
+
+
+def test_effective_pr_number_accepts_bare_context_dict():
+    assert effective_pr_number({"review_loop": {"pr_number": 5}}) == 5
+    assert effective_pr_number({"rollup_pr_number": 9}) == 9
+    assert effective_pr_number({}) is None
+
+
+def test_arm_ci_wait_costamps_identity_and_clock():
+    review_loop = {"iteration": 3}
+    now = "2026-07-05T00:00:00"
+    out = arm_ci_wait(review_loop, pr_number=42, now_iso=now)
+    assert out is review_loop  # mutates in place
+    assert review_loop["ci_waiting"] is True
+    assert review_loop["pr_number"] == 42
+    assert review_loop["ci_wait_started"] == now
+    assert review_loop["ci_wait_pause_baseline"] == 0.0
+    assert review_loop["iteration"] == 3  # unrelated fields preserved
+    # Optional identity fields are omitted when not supplied.
+    assert "head_sha" not in review_loop
+    assert "base_branch" not in review_loop
+
+
+def test_arm_ci_wait_sets_optional_head_and_base():
+    review_loop = {}
+    arm_ci_wait(
+        review_loop,
+        pr_number=1,
+        head_sha="abc123",
+        base_branch="automain",
+        now_iso="t",
+        pause_baseline=12.5,
+    )
+    assert review_loop["head_sha"] == "abc123"
+    assert review_loop["base_branch"] == "automain"
+    assert review_loop["ci_wait_pause_baseline"] == 12.5
+
+
+def test_arm_ci_wait_asserts_pr_number_present():
+    with pytest.raises(AssertionError):
+        arm_ci_wait({}, pr_number=0, now_iso="t")
+    with pytest.raises(AssertionError):
+        arm_ci_wait({}, pr_number=None, now_iso="t")
+
+
+# ---------------------------------------------------------------------------
+# Auto-resolve audit findings on merge
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_auto_resolves_finding_keys_on_orig_task(db_session, mocker):
+    """When the original (fix) task carries resolving_finding_keys and a PR
+    merges, apply_finding_resolution must write resolved ledger rows for the
+    open ReleaseVersion.  Exercises the primary path inside _orig_session."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import AuditFindingResolution, ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Auto-resolve finding merge test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open release version for the project (required for auto-resolve).
+    version = ReleaseVersion(
+        project_id=project.id, version_number=1, status="open"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    finding_key_a = "abcd1234abcd1234"
+    finding_key_b = "ef567890ef567890"
+
+    # Original fix task carries the finding keys to resolve on merge.
+    orig_task = Task(
+        project_id=project.id,
+        title="Fix task for audit findings",
+        payloads=[{"type": "fix", "prompt": "fix the finding"}],
+        context={"resolving_finding_keys": [finding_key_a, finding_key_b]},
+        vm_instance_id=f"agent-vm-orig-resolve-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    # CI parking task that will trigger the merge.
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+
+    # The auto-resolve writes run in the _orig_session (dedicated session).
+    # Read the committed rows back through the test session.
+    rows = (
+        (
+            await db_session.execute(
+                _select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    resolved_keys = {r.finding_key for r in rows}
+    assert finding_key_a in resolved_keys, (
+        "finding_key_a must be marked resolved after merge"
+    )
+    assert finding_key_b in resolved_keys, (
+        "finding_key_b must be marked resolved after merge"
+    )
+    for row in rows:
+        assert row.state == "resolved"
+        assert row.project_id == project.id
+        assert row.release_version_id == version.id
+
+
+@pytest.mark.asyncio
+async def test_merge_auto_resolve_skips_when_no_open_version(db_session, mocker):
+    """When the orig task has resolving_finding_keys but no open ReleaseVersion
+    exists for the project, the auto-resolve silently skips without error."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import AuditFindingResolution
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Auto-resolve no version", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No open ReleaseVersion — auto-resolve must skip gracefully.
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Fix task — no open version",
+        payloads=[{"type": "fix", "prompt": "fix something"}],
+        context={"resolving_finding_keys": ["deadbeefdeadbeef"]},
+        vm_instance_id=f"agent-vm-orig-nov-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    # Merge must still succeed — no open version must not block the merge.
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+
+    # No AuditFindingResolution rows should have been written.
+    rows = (
+        (
+            await db_session.execute(
+                _select(AuditFindingResolution).where(
+                    AuditFindingResolution.project_id == project.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 0, (
+        "No finding-resolution rows must be written when no open version exists"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
+    """When the orig task has no resolving_finding_keys, no AuditFindingResolution
+    rows are written — existing behavior is unchanged for ordinary fix tasks."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import AuditFindingResolution, ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="No keys — no rows", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(
+        project_id=project.id, version_number=1, status="open"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Ordinary fix task (no finding keys)",
+        payloads=[{"type": "fix", "prompt": "fix something"}],
+        context={},  # No resolving_finding_keys
+        vm_instance_id=f"agent-vm-orig-nokeys-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    rows = (
+        (
+            await db_session.execute(
+                _select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 0, "No AuditFindingResolution rows expected for task without keys"

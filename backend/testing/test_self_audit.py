@@ -865,6 +865,137 @@ class TestSelfAuditCompletion:
         assert record is not None
         assert len(record) <= _PROPAGATION_RECORD_MAX_ENTRIES
 
+    @pytest.mark.asyncio
+    async def test_skipped_propagation_note_deduped_on_same_mode(
+        self, db_session, mock_broadcast
+    ):
+        """Identical skip notes for the same operator-pinned mode are deduplicated."""
+        project = await _seed_project_with_member(db_session)
+        project.directions = [
+            {
+                "id": "d1",
+                "status": "active",
+                "system_id": "sys-auth",
+                "recommended_mode": "ship",
+                "notes": [],
+                # No recommended_mode_meta → operator-pinned
+            }
+        ]
+        db_session.add(project)
+        await db_session.commit()
+
+        # First audit: skip note created
+        task1 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task1)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task1,
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "system_id": "sys-auth",
+                            "score": 40,
+                            "recommended_mode": "fundamentals",
+                        }
+                    ]
+                }
+            ),
+            db_session,
+        )
+
+        await db_session.refresh(project)
+        d = project.directions[0]
+        notes = d.get("notes") or []
+        skip_notes_1 = [n for n in notes if n.get("source") == "self_audit_skip"]
+        assert len(skip_notes_1) == 1
+
+        # Second audit with same findings: skip note should NOT be duplicated
+        task2 = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task2)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task2,
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "system_id": "sys-auth",
+                            "score": 40,
+                            "recommended_mode": "fundamentals",
+                        }
+                    ]
+                }
+            ),
+            db_session,
+        )
+
+        await db_session.refresh(project)
+        d = project.directions[0]
+        notes = d.get("notes") or []
+        skip_notes_2 = [n for n in notes if n.get("source") == "self_audit_skip"]
+        assert len(skip_notes_2) == 1, (
+            f"Skip note should be deduplicated; expected 1, got {len(skip_notes_2)}: {notes}"
+        )
+        assert skip_notes_2[0].get("proposed_mode") == "fundamentals"
+
+    @pytest.mark.asyncio
+    async def test_direction_notes_capped_at_history_max(
+        self, db_session, mock_broadcast
+    ):
+        """Direction notes are capped at STRATEGIC_NOTES_HISTORY_MAX when skip notes are added."""
+        from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX
+
+        project = await _seed_project_with_member(db_session)
+        # Pre-populate direction with notes at the cap
+        initial_notes = [
+            {"text": f"Note {i}", "source": "test"} for i in range(STRATEGIC_NOTES_HISTORY_MAX)
+        ]
+        project.directions = [
+            {
+                "id": "d1",
+                "status": "active",
+                "system_id": "sys-auth",
+                "recommended_mode": "ship",
+                "notes": initial_notes,
+                # No recommended_mode_meta → operator-pinned
+            }
+        ]
+        db_session.add(project)
+        await db_session.commit()
+
+        # Trigger an audit that tries to propagate but is skipped due to operator pin
+        # This should add a skip note and cap the list
+        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        db_session.add(task)
+        await db_session.commit()
+        await _handle_self_audit_completion(
+            task,
+            json.dumps(
+                {
+                    "findings": [
+                        {
+                            "system_id": "sys-auth",
+                            "score": 50,
+                            "recommended_mode": "fundamentals",
+                        }
+                    ]
+                }
+            ),
+            db_session,
+        )
+
+        await db_session.refresh(project)
+        d = project.directions[0]
+        notes = d.get("notes") or []
+        assert len(notes) <= STRATEGIC_NOTES_HISTORY_MAX, (
+            f"Notes list should be capped to {STRATEGIC_NOTES_HISTORY_MAX}, "
+            f"got {len(notes)}"
+        )
+        # Verify that a skip note was added
+        skip_notes = [n for n in notes if n.get("source") == "self_audit_skip"]
+        assert len(skip_notes) == 1, f"Expected 1 skip note, got {len(skip_notes)}"
+
 
 # ── Admin endpoint ──────────────────────────────────────────────────────────
 

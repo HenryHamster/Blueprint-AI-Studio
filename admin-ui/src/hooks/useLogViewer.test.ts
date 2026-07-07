@@ -34,6 +34,7 @@ class MockWebSocket {
 }
 
 let fetchSpy: ReturnType<typeof vi.fn>;
+let failingTaskTypesFetchCount = 0;
 
 function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?: boolean } = {}) {
   return renderHook(() => {
@@ -41,6 +42,8 @@ function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?:
     const fetchDirectionsRef = useRef<() => void>(vi.fn());
     const refreshStrategicReadModelRef = useRef<() => void>(vi.fn());
     const refreshMessagesRef = useRef<() => void>(vi.fn());
+    const fetchAlertsRef = useRef<() => void>(vi.fn());
+    const refreshFleetRunnersRef = useRef<() => void>(vi.fn());
     const setDeployState = vi.fn();
     const lv = useLogViewer({
       fetchTasksRef,
@@ -48,10 +51,12 @@ function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?:
       fetchDirectionsRef,
       refreshStrategicReadModelRef,
       refreshMessagesRef,
+      fetchAlertsRef,
+      refreshFleetRunnersRef,
       selectedProjectId: options.selectedProjectId,
       realtimeWsEnabled: options.realtimeWsEnabled,
     });
-    return { lv, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef };
+    return { lv, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef, fetchAlertsRef, refreshFleetRunnersRef };
   });
 }
 
@@ -59,7 +64,59 @@ describe('useLogViewer strategist events', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     MockWebSocket.instances = [];
-    fetchSpy = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ ticket: 't' }) });
+    failingTaskTypesFetchCount = 0;
+    fetchSpy = vi.fn((url: RequestInfo | URL) => {
+      const path = String(url);
+      if (path.includes('/ws-ticket')) {
+        return Promise.resolve({ ok: true, json: async () => ({ ticket: 't' }) });
+      }
+      if (path.includes('/failing-task-types')) {
+        failingTaskTypesFetchCount += 1;
+        const payload = failingTaskTypesFetchCount === 1
+          ? {
+              gated_types: [],
+              global_failure_threshold: 0.6,
+              anomaly_tightened: true,
+              window_minutes: 15,
+              generated_at: '2026-07-05T12:00:00Z',
+            }
+          : failingTaskTypesFetchCount === 2
+            ? {
+                gated_types: [
+                  { task_type: 'create', failure_rate: 0.8, sample_size: 10, threshold: 0.6 },
+                ],
+                global_failure_threshold: 0.6,
+                anomaly_tightened: true,
+                window_minutes: 15,
+                generated_at: '2026-07-05T12:00:00Z',
+              }
+            : failingTaskTypesFetchCount === 3
+              ? {
+                  gated_types: [
+                    { task_type: 'create', failure_rate: 0.8, sample_size: 10, threshold: 0.6 },
+                    { task_type: 'fix', failure_rate: 0.9, sample_size: 5, threshold: 0.6 },
+                  ],
+                  global_failure_threshold: 0.6,
+                  anomaly_tightened: true,
+                  window_minutes: 15,
+                  generated_at: '2026-07-05T12:00:00Z',
+                }
+              : {
+                  gated_types: [
+                    { task_type: 'fix', failure_rate: 0.9, sample_size: 5, threshold: 0.6 },
+                  ],
+                  global_failure_threshold: 0.6,
+                  anomaly_tightened: true,
+                  window_minutes: 15,
+                  generated_at: '2026-07-05T12:00:00Z',
+                };
+        return Promise.resolve({
+          ok: true,
+          json: async () => payload,
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
     vi.stubGlobal('fetch', fetchSpy);
     vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
   });
@@ -104,6 +161,35 @@ describe('useLogViewer strategist events', () => {
     act(() => { vi.advanceTimersByTime(500); });
 
     expect(refreshMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes pipeline refetch envelopes to the task refresh path', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+    const fetchTasks = result.current.fetchTasksRef.current as ReturnType<typeof vi.fn>;
+    fetchTasks.mockClear();
+
+    act(() => {
+      ws.emit({
+        event: 'pipeline_refetched',
+        data: {
+          schema_version: 1,
+          project_id: 'proj-live',
+          resource: 'pipeline',
+          action: 'updated',
+          refetch: { surfaces: ['pipeline'] },
+        },
+      });
+    });
+    act(() => { vi.advanceTimersByTime(500); });
+
+    expect(fetchTasks).toHaveBeenCalledTimes(1);
   });
 
   it('waits for realtime auth readiness before connecting the selected project websocket', async () => {
@@ -888,6 +974,70 @@ describe('useLogViewer strategist events', () => {
     expect(result.current.lv.strategistActive).toBe(false);
   });
 
+  it('debounces a fetchAlerts call on alert_created event', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const fetchAlerts = result.current.fetchAlertsRef.current as ReturnType<typeof vi.fn>;
+    fetchAlerts.mockClear();
+
+    act(() => { ws.emit({ event: 'alert_created', data: { alert_id: 'a-1' } }); });
+    expect(fetchAlerts).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchAlerts).toHaveBeenCalledTimes(1);
+  });
+
+  it('debounces a fetchAlerts call on alert_dismissed event', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const fetchAlerts = result.current.fetchAlertsRef.current as ReturnType<typeof vi.fn>;
+    fetchAlerts.mockClear();
+
+    act(() => { ws.emit({ event: 'alert_dismissed', data: { alert_id: 'a-1' } }); });
+    expect(fetchAlerts).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchAlerts).toHaveBeenCalledTimes(1);
+  });
+
+  it('debounces a fetchAlerts call on workbench_refetch with runtime surface', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const fetchAlerts = result.current.fetchAlertsRef.current as ReturnType<typeof vi.fn>;
+    const refreshFleetRunners = result.current.refreshFleetRunnersRef.current as ReturnType<typeof vi.fn>;
+    fetchAlerts.mockClear();
+    refreshFleetRunners.mockClear();
+
+    act(() => {
+      ws.emit({
+        event: 'workbench_refetch',
+        data: {
+          schema_version: 1,
+          project_id: 'proj1',
+          resource: 'runner',
+          action: 'updated',
+          refetch: { surfaces: ['runtime'] },
+        },
+      });
+    });
+    expect(fetchAlerts).not.toHaveBeenCalled();
+    expect(refreshFleetRunners).toHaveBeenCalledTimes(1);
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchAlerts).toHaveBeenCalledTimes(1);
+  });
+
+  it('debounces multiple alert events into a single fetchAlerts call', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const fetchAlerts = result.current.fetchAlertsRef.current as ReturnType<typeof vi.fn>;
+    fetchAlerts.mockClear();
+
+    act(() => {
+      ws.emit({ event: 'alert_created', data: { alert_id: 'a-1' } });
+      ws.emit({ event: 'alert_dismissed', data: { alert_id: 'a-2' } });
+    });
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchAlerts).toHaveBeenCalledTimes(1);
+  });
+
   it('test_tracks_strategic_cycle_progress_and_completion_outcome', async () => {
     const { result } = setup();
     const ws = await connect(result);
@@ -976,5 +1126,90 @@ describe('useLogViewer strategist events', () => {
     const fetchDirections = result.current.fetchDirectionsRef.current as ReturnType<typeof vi.fn>;
     act(() => { vi.advanceTimersByTime(500); });
     expect(fetchDirections).toHaveBeenCalledTimes(1);
+  });
+
+  it('adds a gated type on type_throttle and removes it on type_unthrottle', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(0);
+
+    act(() => {
+      ws.emit({ event: 'type_throttle', data: { type: 'create', failure_rate: 0.8, sample_size: 10, detail: 'gated' } });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(1);
+    expect(result.current.lv.gatedTaskTypes[0].task_type).toBe('create');
+    expect(result.current.lv.gatedTaskTypes[0].failure_rate).toBe(0.8);
+    expect(result.current.lv.gatedTaskTypes[0].sample_size).toBe(10);
+    expect(result.current.lv.gatedTaskTypes[0].threshold).toBe(0.6);
+
+    act(() => {
+      ws.emit({ event: 'type_throttle', data: { type: 'fix', failure_rate: 0.9, sample_size: 5, detail: 'gated' } });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(2);
+    // Sorted alphabetically
+    expect(result.current.lv.gatedTaskTypes[0].task_type).toBe('create');
+    expect(result.current.lv.gatedTaskTypes[1].task_type).toBe('fix');
+
+    act(() => {
+      ws.emit({ event: 'type_unthrottle', data: { type: 'create', failure_rate: 0.5, sample_size: 10, detail: 'recovered' } });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(1);
+    expect(result.current.lv.gatedTaskTypes[0].task_type).toBe('fix');
+  });
+
+  it('clears gated types on project change', async () => {
+    const { result, rerender } = renderHook(
+      ({ pid }: { pid: string | null }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        return { lv };
+      },
+      { initialProps: { pid: 'projA' as string | null } },
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+
+    act(() => {
+      ws.emit({ event: 'type_throttle', data: { type: 'create', failure_rate: 0.8, sample_size: 10, detail: 'gated' } });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(1);
+
+    act(() => { rerender({ pid: 'projB' }); });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(0);
   });
 });

@@ -206,6 +206,7 @@ async def flush_pending_branch_alerts(session) -> int:
     pending = _pending_durable_branch_alerts
     _pending_durable_branch_alerts = []
 
+    from sqlalchemy import tuple_
     from sqlmodel import select
 
     from app.broadcast import broadcast_to_project
@@ -213,21 +214,38 @@ async def flush_pending_branch_alerts(session) -> int:
 
     created = 0
     failed: list[dict] = []
+
+    # Pre-filter valid items and batch-fetch all existing undismissed alerts in
+    # one query instead of one SELECT per item.
+    valid_items = [
+        item
+        for item in pending
+        if item.get("project_id") is not None and item.get("title")
+    ]
+    if valid_items:
+        pairs = list({
+            (item["project_id"], item["title"]) for item in valid_items
+        })
+        _existing_result = await session.execute(
+            select(Alert).where(
+                tuple_(Alert.project_id, Alert.title).in_(pairs),
+                Alert.task_id.is_(None),
+                Alert.dismissed_at.is_(None),
+            )
+        )
+        existing_keys: set[tuple] = {
+            (a.project_id, a.title) for a in _existing_result.scalars().all()
+        }
+    else:
+        existing_keys = set()
+
     for item in pending:
         project_id = item.get("project_id")
         title = item.get("title")
         if project_id is None or not title:
             continue
         try:
-            existing = await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project_id,
-                    Alert.title == title,
-                    Alert.task_id.is_(None),
-                    Alert.dismissed_at.is_(None),
-                )
-            )
-            if existing.scalars().first() is not None:
+            if (project_id, title) in existing_keys:
                 continue
             try:
                 severity = AlertSeverity(item.get("severity") or "ERROR")
@@ -241,6 +259,7 @@ async def flush_pending_branch_alerts(session) -> int:
             )
             session.add(alert)
             created += 1
+            existing_keys.add((project_id, title))
             await broadcast_to_project(
                 str(project_id),
                 "alert_created",

@@ -192,6 +192,13 @@ _HISTORY_AGG_DEFAULTS = {
     "total_tasks_cancelled": 0,
     "first_cycle_at": None,
     "total_autonomous_prs_merged": 0,
+    # Verification-aware lifetime autonomous merge count: the honest basis for
+    # the retirement-eligibility milestone in compute_direction_autonomy_state.
+    # Only autonomous merges that also landed in a verified acceptance bucket
+    # count, so this stays <= total_autonomous_prs_merged and survives cycle
+    # eviction. Two-step legacy fallback on fold (see _fold_evicted_into_aggregate)
+    # keeps pre-field entries whole rather than dropping them to zero.
+    "total_verified_autonomous_prs_merged": 0,
     "total_assisted_prs_merged": 0,
     "total_operator_actions": 0,
     "total_generalized_successes": 0,
@@ -470,8 +477,33 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
     directions older than 10 cycles silently lost all scope/decomposition data.
     """
     agg = prev_agg or {}
+    # Detect legacy aggregates that have accumulated autonomous credit in
+    # total_autonomous_prs_merged but predate total_verified_autonomous_prs_merged.
+    # Must check BEFORE setdefault materializes the key at 0.
+    _seed_verified_autonomous = (
+        "total_verified_autonomous_prs_merged" not in agg
+        and agg.get("total_autonomous_prs_merged", 0) > 0
+    )
     for k, v in _HISTORY_AGG_DEFAULTS.items():
         agg.setdefault(k, v)
+    # Seed from total_autonomous_prs_merged so pre-deploy folded credit is not
+    # silently dropped the first time this key is materialized. Subsequent folds
+    # find the key present and skip this branch.
+    if _seed_verified_autonomous:
+        agg["total_verified_autonomous_prs_merged"] = agg["total_autonomous_prs_merged"]
+        # Backfill legacy eviction snapshots with the autonomous fallback so that
+        # post-eviction delta calculations (_apply_direction_outcomes) compute the
+        # correct _snap_val baseline. Without this, a late-merge event on a legacy
+        # snapshot (_snap_val=0) adds the full recomputed total on top of the
+        # already-seeded aggregate, counting pre-eviction merges twice.
+        for _snap in (agg.get("_evicted_cycle_snapshots") or {}).values():
+            if "verified_autonomous_prs_merged" not in _snap:
+                _snap["verified_autonomous_prs_merged"] = int(
+                    _snap.get(
+                        "autonomous_prs_merged", _snap.get("prs_merged", 0)
+                    )
+                    or 0
+                )
     normalized_generalized = _normalize_aggregate_generalized_state(agg)
     agg["total_generalized_successes"] = normalized_generalized[
         "total_generalized_successes"
@@ -530,6 +562,14 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         # treat all merges as autonomous so CPM is conservative for old data.
         agg["total_autonomous_prs_merged"] += ev.get(
             "autonomous_prs_merged", ev.get("prs_merged", 0)
+        )
+        # Verification-aware autonomous fold. Two-step legacy fallback consistent
+        # with verified_autonomous_merged_count: pre-field entries degrade to the
+        # raw autonomous count, and pre-attribution entries to prs_merged, so no
+        # historical direction silently loses accumulated autonomy credit.
+        agg["total_verified_autonomous_prs_merged"] += ev.get(
+            "verified_autonomous_prs_merged",
+            ev.get("autonomous_prs_merged", ev.get("prs_merged", 0)),
         )
         agg["total_assisted_prs_merged"] += ev.get("assisted_prs_merged", 0)
         agg["total_operator_actions"] += ev.get("operator_action_count", 0)
@@ -592,6 +632,73 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
     ]
     agg["outcome_kind_breakdown"] = normalized_generalized["outcome_kind_breakdown"]
     return agg
+
+
+def build_evicted_cycle_snapshot(entry: dict[str, Any]) -> dict[str, Any]:
+    """Compact per-cycle baseline stored under ``_evicted_cycle_snapshots``.
+
+    Records the EXACT per-cycle contributions that :func:`_fold_evicted_into_aggregate`
+    credited for one research_history entry, so a post-eviction late recompute
+    (``_apply_direction_outcomes`` in ``direction_outcomes``) can compute correct
+    incremental deltas for the aggregate keys once the live entry is gone.
+
+    Every value here mirrors the same quantity the fold adds for this cycle:
+
+      * the 11 primitive merge counters (with the fold's legacy fallbacks), and
+      * the acceptance-verified + generalized baselines that the fold folds but
+        that older snapshots omitted — namely the acceptance-verified merged base
+        (``verified_merged_count`` credited only when the cycle is acceptance-aware,
+        matching the fold's ``"acceptance_merged_write_total" in ev`` gate), the
+        verified WRITE slice, generalized successes / terminal outcomes, and the
+        per-kind outcome breakdown.
+
+    This is the SINGLE constructor used by both snapshot-writing sites
+    (``research_direction_state`` and ``research_completion``) so the two can
+    never drift, and it is also used to refresh the snapshot after a delta is
+    applied so repeated recomputes are no-ops.
+    """
+    acceptance_aware = "acceptance_merged_write_total" in entry
+    return {
+        "prs_merged": int(entry.get("prs_merged") or 0),
+        "verified_prs_merged": int(
+            entry.get("verified_prs_merged", entry.get("prs_merged", 0)) or 0
+        ),
+        "autonomous_prs_merged": int(
+            entry.get("autonomous_prs_merged", entry.get("prs_merged", 0)) or 0
+        ),
+        "verified_autonomous_prs_merged": int(
+            entry.get(
+                "verified_autonomous_prs_merged",
+                entry.get("autonomous_prs_merged", entry.get("prs_merged", 0)),
+            )
+            or 0
+        ),
+        "assisted_prs_merged": int(entry.get("assisted_prs_merged") or 0),
+        "reachable_prs_merged": int(entry.get("reachable_prs_merged") or 0),
+        "stranded_prs_merged": int(entry.get("stranded_prs_merged") or 0),
+        "acceptance_proven_merged": int(entry.get("acceptance_proven_merged") or 0),
+        "acceptance_consumed_merged": int(entry.get("acceptance_consumed_merged") or 0),
+        "acceptance_declared_merged": int(entry.get("acceptance_declared_merged") or 0),
+        "acceptance_merged_write_total": int(
+            entry.get("acceptance_merged_write_total") or 0
+        ),
+        # Acceptance-verified + generalized baselines. Gated identically to the
+        # fold so a cycle that is not acceptance-aware records 0 (and so the fold
+        # and the delta cannot diverge on the acceptance-aware boundary).
+        "acceptance_verified_merged": (
+            verified_merged_count(entry) if acceptance_aware else 0
+        ),
+        "acceptance_verified_write_merged": (
+            int(entry.get("acceptance_verified_write_merged") or 0)
+            if acceptance_aware
+            else 0
+        ),
+        "generalized_successes": _entry_generalized_successes(entry),
+        "generalized_terminal_outcomes": _entry_generalized_terminal_outcomes(entry),
+        "outcome_kind_breakdown": _copy_outcome_kind_breakdown(
+            entry.get("outcome_kind_breakdown") or _fallback_outcome_kind_breakdown(entry)
+        ),
+    }
 
 
 def _compute_momentum_factor(d: dict) -> float:

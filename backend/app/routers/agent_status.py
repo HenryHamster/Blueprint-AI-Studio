@@ -106,6 +106,33 @@ router = APIRouter()
 
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 _AGENT_STATUS_TERMINAL_STATUSES = TASK_AGENT_STATUS_IDEMPOTENT_STATUSES
+
+
+def _is_deadlock_error(exc: BaseException) -> bool:
+    """True when exc is a Postgres deadlock (40P01, DeadlockDetected).
+
+    WI-6 defense-in-depth. The primary fix acquires the Project row lock
+    before the Task row lock in ``_process_post_commit`` (canonical
+    Project-before-Task ordering), removing the known cross-table deadlock
+    vector on concurrent agent-status callbacks. Should any residual deadlock
+    still occur, Postgres has already rolled the victim transaction back
+    cleanly (no partial commit), so it is safe to route into the existing
+    post-commit retry-pending path — persist the write-ahead marker and return
+    a clean 200 so ``_sweep_post_commit_pending`` re-runs the deferred side
+    effects — rather than surfacing a 5xx that Cloud Run flags as a
+    ContainerError and quarantines the instance. Detection mirrors
+    ``migration_retry.is_transient_lock_error`` (SQLAlchemy wraps the asyncpg
+    exception, so the stable surface is the sqlstate / message text) but is
+    scoped to deadlock ONLY — lock_timeout / LockNotAvailable keep their
+    existing 500 path.
+    """
+    orig = getattr(exc, "orig", None)
+    if getattr(orig, "sqlstate", None) == "40P01":
+        return True
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return "deadlockdetected" in msg or "deadlock detected" in msg or "40p01" in msg
+
+
 _PARK_AND_RETARGET_DEFAULT_BUDGET_SECONDS = 600
 _PARK_AND_RETARGET_MAX_BUDGET_SECONDS = 1800
 
@@ -1060,6 +1087,22 @@ async def update_agent_status(
                         "status": "post_commit_retry_pending",
                         "task_id": _task_id_str,
                     }
+                # WI-6 defense-in-depth: a residual deadlock (40P01) on the
+                # retry path is the same shape — Postgres rolled the victim
+                # back cleanly and post_commit_pending is still set, so the
+                # sweep owns the retry. Return a clean 200 rather than 500ing.
+                if _is_deadlock_error(e):
+                    logger.warning(
+                        "[PIPELINE] Post-commit retry for %s hit a Postgres deadlock "
+                        "(40P01); leaving post_commit_pending set for the sweep",
+                        _task_id_str,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+                    return {
+                        "status": "post_commit_retry_pending",
+                        "task_id": _task_id_str,
+                    }
                 logger.error(
                     f"[PIPELINE] Post-commit retry also failed for {task.id}: {e}",
                     exc_info=True,
@@ -1376,13 +1419,18 @@ async def update_agent_status(
                 persist_task_pr_linkage(
                     task, pr_number=parse_pr_number_from_url(payload.pr_url)
                 )
+                # Snapshot task.id before the flush: the dedup-race rollback
+                # below expires `task`, so reading task.id in the log would fire
+                # a sync lazy-load -> MissingGreenlet, 500-ing the status POST
+                # instead of returning the accepted-dedup-race response.
+                _dedup_race_task_id = task.id
                 try:
                     await session.flush()  # surface IntegrityError now, not at commit
                 except IntegrityError as ie:
                     # Concurrent peer beat us to it — partial UNIQUE caught the race.
                     await session.rollback()
                     logger.info(
-                        f"[STATUS] Task {task.id} PR artifact race lost (peer inserted first); "
+                        f"[STATUS] Task {_dedup_race_task_id} PR artifact race lost (peer inserted first); "
                         f"continuing with peer's row: {ie}"
                     )
                     return {"status": "accepted_dedup_race"}
@@ -1541,6 +1589,11 @@ async def update_agent_status(
                 # No-op if the account wasn't probing anything for this model.
                 acct_id_clear = get_task_llm_account_id(task)
                 model_clear = _extract_task_model(task)
+                # Snapshot vm_provisioned_at now: the regression-recovery except
+                # below may session.rollback() (expiring `task`), and the
+                # completion-event duration read further down would then fire a
+                # sync lazy-load -> MissingGreenlet on task.vm_provisioned_at.
+                _vm_provisioned_at = task.vm_provisioned_at
                 if acct_id_clear and model_clear:
                     try:
                         await clear_rate_limit_state_on_success(
@@ -1603,10 +1656,10 @@ async def update_agent_status(
                         # at ~1979 as an opaque PendingRollbackError.
                         with contextlib.suppress(Exception):
                             await session.rollback()
-                if acct_id_clear and task.vm_provisioned_at:
+                if acct_id_clear and _vm_provisioned_at:
                     try:
                         duration_secs = (
-                            _utcnow() - task.vm_provisioned_at
+                            _utcnow() - _vm_provisioned_at
                         ).total_seconds()
                         await record_completion_event(acct_id_clear, duration_secs)
                     except Exception as e:
@@ -1929,6 +1982,12 @@ async def update_agent_status(
                                         # breaker alert path).
                                         with contextlib.suppress(Exception):
                                             await session.rollback()
+                                            # rollback expired `task`; re-materialise it so
+                                            # the shared terminal path below
+                                            # (get_task_llm_account_id(task), task.context)
+                                            # runs on a live instance rather than
+                                            # firing a sync lazy-load -> MissingGreenlet.
+                                            await session.refresh(task)
                         else:
                             # Transient infrastructure outage: retry with exponential backoff.
                             # Budget is 5 retries (up from 3) to survive longer outages.
@@ -2205,6 +2264,11 @@ async def update_agent_status(
                                 )
                                 with contextlib.suppress(Exception):
                                     await session.rollback()
+                                    # rollback expired `task`; re-materialise it so
+                                    # the blacklist/requeue reads + mutations below
+                                    # (task.context, task.vm_instance_id, commit) run
+                                    # on a live instance instead of MissingGreenlet.
+                                    await session.refresh(task)
 
                     # Blacklist the disabled account so this task's next attempt
                     # picks a different account.
@@ -3197,12 +3261,15 @@ async def update_agent_status(
                                                 continue
                                         elif _task_type not in _PLAYBOOK_DEFAULT_TYPES:
                                             continue
+                                        # Only credit entries that were actually shown to this task
+                                        if _pk not in _shown_keys:
+                                            continue
                                         _entry = dict(_pv)
                                         _entry["confirmed_count"] = (
                                             _entry.get("confirmed_count", 0) + 1
                                         )
                                         _entry["last_confirmed_at"] = _now_iso
-                                        # Update rolling recent_outcomes only for entries shown to this task
+                                        # Update rolling recent_outcomes for entries shown to this task
                                         if _pk in _shown_keys:
                                             _recent = list(
                                                 _entry.get("recent_outcomes", [])
@@ -3238,25 +3305,40 @@ async def update_agent_status(
                         )
                 # Capture positive pattern for sampling-eligible first-attempt successes
                 if _ctx["_first_attempt_succeeded"] and _proj:
+                    # SAVEPOINT isolation (DB-contention fix): capture_success_pattern
+                    # takes a FOR UPDATE lock on the Project row and issues a COUNT
+                    # query (success_patterns.py), either of which can hit the 30s
+                    # lock_timeout and raise LockNotAvailableError. Previously this
+                    # ran directly in the request's OUTER transaction and its except
+                    # rolled that WHOLE transaction back — discarding the pending
+                    # terminal-status write, so the COMPLETED/FAILED transition the
+                    # agent reported was never persisted (prod chain: capture
+                    # lock-timeout -> InFailedSQLTransactionError on the early commit
+                    # -> completed PR/commit silently lost). Capture is best-effort
+                    # telemetry, so: flush the already-staged terminal status +
+                    # metrics into the OUTER transaction first, then run capture
+                    # inside a nested SAVEPOINT. A capture failure now rolls back
+                    # ONLY the savepoint (via begin_nested's __aexit__), leaving the
+                    # outer transaction — and the terminal status — intact for the
+                    # early commit below. Mirrors the SAVEPOINT discipline in
+                    # release_reconciliation._record_post_promotion_outcome.
                     try:
                         from app.playbook_learning import capture_success_pattern
 
-                        await capture_success_pattern(task, session)
+                        await session.flush()
+                        async with session.begin_nested():
+                            await capture_success_pattern(task, session)
                     except Exception as _sce:
                         logger.warning(
                             f"[PLAYBOOK] Failed to capture success pattern for task {_task_id_str}: {_sce}"
                         )
-                        # WHY: capture_success_pattern issues a COUNT query
-                        # (session.execute) and session.get(Project, ...) — both
-                        # may raise on serialization / lock-timeout / connection
-                        # loss, leaving the session pending-rollback and
-                        # crashing the early commit at line ~1979. This was one
-                        # of the leak categories explicitly named in the
-                        # comment block at lines ~1951-1962 ("playbook
-                        # capture/learning").
-                        with contextlib.suppress(Exception):
-                            await session.rollback()
-                        _attrs_may_be_expired = True
+                        # The nested SAVEPOINT already rolled back the failed
+                        # capture; the outer transaction (holding the terminal
+                        # status) stays valid, so we deliberately do NOT issue a
+                        # full session.rollback() here — that full rollback is
+                        # exactly what used to drop the completion. A savepoint
+                        # rollback does not expire the outer identity map, so
+                        # _attrs_may_be_expired is left unchanged.
             except Exception as _e:
                 logger.warning(
                     f"[METRICS] Failed to record first-attempt metrics for task {_task_id_str}: {_e}"
@@ -3484,6 +3566,10 @@ async def update_agent_status(
                     # was named in the leak categories at lines ~1951-1962.
                     with contextlib.suppress(Exception):
                         await session.rollback()
+                        # rollback expired `task`; re-materialise it so
+                        # _propagate_pipeline_failure_to_original(task) below can
+                        # read task.first_payload without MissingGreenlet.
+                        await session.refresh(task)
 
             # CLOSED → OPEN after 5 consecutive infra failures (wall of provisioning/rate-limit)
             elif (
@@ -3530,6 +3616,10 @@ async def update_agent_status(
                     # surface the upstream poisoning as PendingRollbackError.
                     with contextlib.suppress(Exception):
                         await session.rollback()
+                        # rollback expired `task`; re-materialise it so
+                        # _propagate_pipeline_failure_to_original(task) below can
+                        # read task.first_payload without MissingGreenlet.
+                        await session.refresh(task)
             # Persist breaker state on any transition
             if (
                 breaker["state"] != "CLOSED"
@@ -3772,6 +3862,12 @@ async def update_agent_status(
             is_disconnect = bool(
                 getattr(e, "connection_invalidated", False)
             ) or isinstance(e, InterfaceError)
+            # WI-6 defense-in-depth: a residual cross-table deadlock (40P01)
+            # after the Project-before-Task ordering fix. Postgres rolled the
+            # victim transaction back cleanly, so it is safe to route into the
+            # same retry-pending path — the sweep re-runs the deferred side
+            # effects — instead of a 500 → Cloud Run ContainerError → quarantine.
+            is_deadlock = _is_deadlock_error(e)
             if is_timeout:
                 reason = "post_commit_timeout"
             elif is_locked:
@@ -3780,6 +3876,8 @@ async def update_agent_status(
                 reason = "post_commit_final_commit_failed"
             elif is_disconnect:
                 reason = "post_commit_disconnect"
+            elif is_deadlock:
+                reason = "post_commit_deadlock"
             else:
                 reason = "post_commit_error"
             logger.error(  # noqa: TRY400 — conditional exc_info: suppress for expected timeout/lock, show for real errors
@@ -3817,7 +3915,9 @@ async def update_agent_status(
             # 5xx → Cloud Run ContainerError for what is benign contention with a
             # peer post-commit driver, exactly the case the row-lock guard above
             # converts to a 429. So treat it like the final-commit case.
-            if (is_final_commit or is_locked or is_disconnect) and _persist_err is None:
+            if (
+                is_final_commit or is_locked or is_disconnect or is_deadlock
+            ) and _persist_err is None:
                 if is_disconnect:
                     logger.warning(
                         "[PIPELINE] Post-commit hit a disconnection-class DB error "
@@ -3825,6 +3925,15 @@ async def update_agent_status(
                         "already committed, retry marker persisted; returning 200 so "
                         "the sweep owns the deferred side effects instead of 500ing the "
                         "agent.",
+                        _task_id_str,
+                    )
+                elif is_deadlock:
+                    logger.warning(
+                        "[PIPELINE] Post-commit hit a Postgres deadlock (40P01) for "
+                        "task %s — victim transaction rolled back cleanly, retry "
+                        "marker persisted; returning 200 so the sweep re-runs the "
+                        "deferred side effects instead of 500ing the agent. If this "
+                        "recurs, an un-audited Task-before-Project lock path remains.",
                         _task_id_str,
                     )
                 return {

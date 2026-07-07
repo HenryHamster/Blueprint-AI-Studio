@@ -30,8 +30,9 @@ from app.database import get_session
 from app.direction_outcomes import proven_merged_count, reachable_merged_count, verified_merged_count
 from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
 from app.message_convergence import get_message_link, resolve_message_ref
-from app.models import Project, QualificationVerdict, ReleaseVersion, Task
+from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task
 from app.project_message_projection import agent_fetch_message_dict
+from app.qualification_state_resolver import apply_verdict_substitution
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.source_ref_validation import (
@@ -78,6 +79,8 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         "merge_grade_status",
         "merge_grade_coverage",
         "merge_grade_biggest_gap",
+        "debt_enforce_confidence_preview",
+        "debt_enforce_weight_preview",
     )
     out = {key: qual.get(key) for key in keys if qual.get(key) is not None}
 
@@ -154,18 +157,14 @@ def _compose_serving_block(
     }
 
 
-_FINALIZED_TERMINAL_STATUSES = frozenset(
-    {"promoted", "not_promoted", "dry_run", "promotion_failed"}
-)
-
-
 def _compact_version_lifecycle(
     version: ReleaseVersion,
     project: Project,
     *,
     latest_verdict: "QualificationVerdict | None" = None,
+    resolved_qualification: "tuple[dict[str, Any] | None, dict[str, Any] | None] | None" = None,
 ) -> dict[str, Any]:
-    from app import release_version as _release_version
+    from app.qualification_state_resolver import resolve_effective_qualification_state
     from app.release_artifacts import version_serving_summary
 
     aggregate_serving, artifacts = version_serving_summary(version, project)
@@ -175,24 +174,24 @@ def _compact_version_lifecycle(
         else {}
     )
 
-    # Detect pending/verdict disagreement: last_qualification is in a transient
-    # promotion_pending state but the verdict row already has a finalized outcome.
-    verdict_disagreement: dict[str, Any] | None = None
-    effective_qual = qual
-    if (
-        latest_verdict is not None
-        and qual.get("status") == "pending"
-        and isinstance(qual.get("promotion_pending"), dict)
-        and latest_verdict.terminal_status in _FINALIZED_TERMINAL_STATUSES
-    ):
-        verdict_disagreement = {
-            "last_qualification_status": "pending",
-            "verdict_terminal_status": latest_verdict.terminal_status,
-        }
-        # Use the finalized verdict status so summarize_qualification_state sees
-        # the resolved outcome instead of the transient promotion_in_flight state.
-        effective_qual = {**qual, "status": latest_verdict.terminal_status}
-        effective_qual.pop("promotion_pending", None)
+    # Derive the effective qualification_state through the shared resolver so the
+    # finalized-verdict substitution (transient promotion_pending superseded by a
+    # finalized verdict row) is applied identically across every read surface.
+    # For the OPEN version the caller pre-resolves the state through the async
+    # ``resolve_open_version_qualification_state`` seam (which ALSO applies the
+    # version-scoped audit-crash reconciliation the sync path here cannot reach
+    # without a DB query) and threads it in via ``resolved_qualification`` so the
+    # open version agrees with the strategic payload / admin / system-state
+    # surfaces. Closed rows keep the cheap sync path (verdict substitution only).
+    if resolved_qualification is not None:
+        qualification_state, verdict_disagreement = resolved_qualification
+    else:
+        qualification_state, verdict_disagreement = resolve_effective_qualification_state(
+            version,
+            project,
+            latest_verdict=latest_verdict,
+            serving=(aggregate_serving, artifacts),
+        )
 
     out = {
         "id": str(version.id),
@@ -209,14 +208,7 @@ def _compact_version_lifecycle(
         "qualification_attempts": version.qualification_attempts,
         "active_candidate_sha": qual.get("candidate_sha"),
         "last_qualification": _compact_last_qualification(qual),
-        "qualification_state": _release_version.summarize_qualification_state(
-            effective_qual,
-            version.serving_status,
-            version.deploy_failure_reason,
-            aggregate_serving_status=aggregate_serving["serving_status"],
-            aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-            artifact_evidence=artifacts,
-        ),
+        "qualification_state": qualification_state,
         "serving_status": version.serving_status,
         "served_sha": version.served_sha,
         "served_at": _iso(version.served_at),
@@ -256,6 +248,80 @@ async def _resolve_agent_project(
     return project
 
 
+@router.get("/projects/{project_id}/directions")
+@limiter.limit("60/minute")
+async def agent_fetch_directions_list(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return compact direction listing (id, status, text, priority) for all
+    directions in the project. Used as a recovery path when directions_summary
+    was dropped entirely under budget pressure so no ids were shipped — the
+    agent can call this with no id to discover direction ids, then pull full
+    detail with ``./fetch direction <id>``."""
+    project = await _resolve_agent_project(project_id, token, session)
+    _COMPACT_KEYS = ("id", "status", "text", "priority")
+    directions = [
+        {k: d[k] for k in _COMPACT_KEYS if k in d}
+        for d in (project.directions or [])
+        if isinstance(d, dict)
+    ]
+    return {"status": "success", "data": directions}
+
+
+@router.get("/projects/{project_id}/messages/open")
+@limiter.limit("60/minute")
+async def agent_fetch_open_messages_list(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return compact open-message listing (id, ref, type, from_type, content
+    excerpt, status). Used as a recovery path when open_messages was dropped
+    entirely under budget pressure so no message refs were shipped — the agent
+    can call this with no id to see what messages exist, then pull a full
+    message with ``./fetch message <ref>``.
+
+    Path is the ``/messages/open`` sub-collection, NOT bare ``/messages`` — the
+    latter is owned by the resident agent's cursor-poll list in
+    ``agent_strategic_messages.py`` (``{messages, server_time}``). Keeping this on
+    a distinct literal path avoids the route collision where this listing (being
+    included first in ``app.main``) silently shadowed that poll. Registered before
+    the ``/messages/{ref}`` resolver below so the literal ``open`` segment wins."""
+    await _resolve_agent_project(project_id, token, session)
+    rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == "open",
+                )
+                .order_by(ProjectMessage.created_at.asc())
+                .limit(50)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    _CONTENT_CAP = 200
+    items = [
+        {
+            "id": str(m.id),
+            "ref": m.id.hex[:8],
+            "type": getattr(m.message_type, "value", str(m.message_type)),
+            "from_type": m.from_type,
+            "content": (m.content or "")[:_CONTENT_CAP],
+            "status": m.status,
+        }
+        for m in rows
+    ]
+    return {"status": "success", "data": items}
+
+
 @router.get("/projects/{project_id}/directions/{direction_id}")
 @limiter.limit("60/minute")
 async def agent_fetch_direction(
@@ -274,6 +340,24 @@ async def agent_fetch_direction(
         None,
     )
     if direction is None:
+        retired = next(
+            (
+                r
+                for r in ((project.vision or {}).get("_recently_retired_directions") or [])
+                if r.get("id") == direction_id
+            ),
+            None,
+        )
+        if retired is not None:
+            raise HTTPException(
+                status_code=410,
+                detail={
+                    "status": "pruned",
+                    "retired_at": retired.get("retired_at"),
+                    "reason": retired.get("reason"),
+                    "gap_id": retired.get("gap_id"),
+                },
+            )
         raise HTTPException(status_code=404, detail="Direction not found")
     out = dict(direction)
     # Compute merge_credit summary from the full history before capping.
@@ -445,13 +529,16 @@ async def agent_fetch_qualification(
     exists or no qualification has run yet.
 
     Payload includes: candidate_sha, finalized_at, status, confidence,
-    sub_scores, findings, excluded_findings, challenger_refuted_findings.
+    sub_scores, findings, excluded_findings, challenger_refuted_findings, and
+    serving_sha (the git SHA of the deployed code producing this response).
     """
+    from app.deployed_sha import get_serving_sha  # noqa: PLC0415
     from app.release_qualifier import (  # noqa: PLC0415
         get_latest_qualification_audit_findings,
     )
 
     await _resolve_agent_project(project_id, token, session)
+    serving_sha = get_serving_sha()
 
     open_row = (
         (
@@ -469,7 +556,18 @@ async def agent_fetch_qualification(
         .first()
     )
     if open_row is None:
-        return {"source": "no_open_version"}
+        return {
+            "source": "no_open_version",
+            "serving_sha": serving_sha,
+            "qualification_trigger_state": {
+                "trigger_state": "blocked",
+                "open_version_id": None,
+                "reason": "no_open_version",
+                "summary": "no open release version — nothing to qualify",
+                "coverage_total": 0,
+                "coverage_covered": 0,
+            },
+        }
 
     # Re-qualification readiness signal + per-finding resolution view (ADDITIVE).
     # The fix-first triage workflow needs to know, from the same read it already
@@ -481,6 +579,11 @@ async def agent_fetch_qualification(
     requalification_extra: dict = {
         "requalification_ready": None,
         "finding_resolution": [],
+        "audit_findings_truncated": None,
+        "requalification_readiness_reason": None,
+        "gating_total": None,
+        "gating_resolved": None,
+        "promotion_ci_green_gate": None,
     }
     try:
         from app.release_readiness import (  # noqa: PLC0415
@@ -493,11 +596,41 @@ async def agent_fetch_qualification(
             # Per-finding resolution view: each gating carried finding's key,
             # severity, summary, and resolution state (resolved|stale|unresolved).
             "finding_resolution": readiness["findings"],
+            # Truncation and progress context so the strategist can understand
+            # why re-qualification is blocked (e.g. truncated + unresolved).
+            "audit_findings_truncated": readiness["audit_findings_truncated"],
+            "requalification_readiness_reason": readiness["reason"],
+            "gating_total": readiness["gating_total"],
+            "gating_resolved": readiness["gating_resolved"],
+            # Populated by the CI-green-gate block below; keep the key present so
+            # the response shape is stable whether or not that compute succeeds.
+            "promotion_ci_green_gate": None,
         }
     except Exception:
         logger.exception(
             "[AGENT_FETCH] requalification readiness compute failed for project %s; "
             "serving qualification without the readiness signal",
+            project_id,
+        )
+
+    # Full-suite CI green gate (ADDITIVE, READ-ONLY). Surfaces whether the
+    # integration-branch HEAD has a green ci.yml full-matrix run — the same gate
+    # the promotion_failed re-driver consults before re-entering qualification.
+    # dispatch=False so this read NEVER triggers a workflow run. Best-effort: a
+    # GitHub failure degrades to ``promotion_ci_green_gate: None`` without breaking
+    # the read or changing any existing key.
+    try:
+        from app.release_readiness import (  # noqa: PLC0415
+            compute_promotion_ci_green_gate,
+        )
+
+        requalification_extra["promotion_ci_green_gate"] = (
+            await compute_promotion_ci_green_gate(session, project_id, dispatch=False)
+        )
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] promotion CI green gate compute failed for project %s; "
+            "serving qualification without the gate signal",
             project_id,
         )
 
@@ -516,6 +649,28 @@ async def agent_fetch_qualification(
         logger.exception(
             "[AGENT_FETCH] goal_coverage_drift compute failed for project %s; "
             "serving qualification without the drift signal",
+            project_id,
+        )
+
+    # Initial-qualification trigger-state signal (ADDITIVE). Answers 'why hasn't
+    # the FIRST qualification fired' — armed, or blocked because coverage is N/M,
+    # wrong phase, or already attempted. Computed via the shared classifier so the
+    # sweep and this read-surface cannot drift apart. Best-effort: a compute
+    # failure degrades to ``qualification_trigger_state: None`` without breaking
+    # the read or changing any existing key.
+    qualification_trigger_state: dict | None = None
+    try:
+        from app.release_readiness import (  # noqa: PLC0415
+            compute_qualification_trigger_state,
+        )
+
+        qualification_trigger_state = await compute_qualification_trigger_state(
+            session, project_id
+        )
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] qualification_trigger_state compute failed for project "
+            "%s; serving qualification without the trigger-state signal",
             project_id,
         )
 
@@ -550,26 +705,23 @@ async def agent_fetch_qualification(
         # agent sees the resolved disposition instead of the stale pending.
         lq = open_row.last_qualification or {}
         lq_status = lq.get("status")
-        lq_has_promotion_pending = isinstance(lq.get("promotion_pending"), dict)
-        verdict_is_finalized = verdict.terminal_status in _FINALIZED_TERMINAL_STATUSES
 
-        source_disagreement: dict[str, Any] | None = None
-        if lq_status == "pending" and lq_has_promotion_pending and verdict_is_finalized:
+        # Detect (and record) the transient pending vs finalized-verdict
+        # disagreement through the shared resolver primitive so the agent fetch
+        # verb and the version-phase surface classify this window identically.
+        _, source_disagreement = apply_verdict_substitution(lq, verdict)
+        if source_disagreement is not None:
             resolved_status = verdict.terminal_status
             resolved_finalized_at = (
                 verdict.finalized_at.isoformat() if verdict.finalized_at else None
             )
-            source_disagreement = {
-                "last_qualification_status": lq_status,
-                "verdict_terminal_status": verdict.terminal_status,
-            }
         else:
             resolved_status = lq_status or verdict.terminal_status
             resolved_finalized_at = lq.get("finalized_at") or (
                 verdict.finalized_at.isoformat() if verdict.finalized_at else None
             )
 
-        return {
+        out = {
             "candidate_sha": lq.get("candidate_sha") or verdict.candidate_sha,
             "finalized_at": resolved_finalized_at,
             "status": resolved_status,
@@ -580,14 +732,52 @@ async def agent_fetch_qualification(
             "challenger_refuted_findings": verdict.challenger_refuted_audit_findings
             or [],
             "goal_alignment": verdict.goal_alignment,
+            "error": lq.get("error") or None,
+            "detail": lq.get("detail") or None,
+            "blocker": lq.get("blocker") or None,
+            "qualify_request_blocked": lq.get("qualify_request_blocked") or None,
+            "qualify_request_blocked_at": lq.get("qualify_request_blocked_at") or None,
             "source": "qualification_verdict",
             "source_disagreement": source_disagreement,
             "goal_coverage_drift": goal_coverage_drift,
+            "qualification_trigger_state": qualification_trigger_state,
+            "serving_sha": serving_sha,
             **requalification_extra,
         }
 
+        # Surface promotion-failure context: would_promote, promotion_pr_url,
+        # promotion_conflict, promotion_error_detail, promotion_failure_count, and
+        # promotion_pending sub-record. Mirrors _compact_last_qualification logic.
+        if lq.get("would_promote") is not None:
+            out["would_promote"] = lq["would_promote"]
+        if lq.get("promotion_pr_url") is not None:
+            out["promotion_pr_url"] = lq["promotion_pr_url"]
+        if lq.get("promotion_conflict") is not None:
+            out["promotion_conflict"] = lq["promotion_conflict"]
+        if lq.get("promotion_error_detail") is not None:
+            out["promotion_error_detail"] = lq["promotion_error_detail"]
+        if lq.get("promotion_failure_count") is not None:
+            out["promotion_failure_count"] = lq["promotion_failure_count"]
+
+        promotion_pending = lq.get("promotion_pending")
+        if isinstance(promotion_pending, dict):
+            out["promotion_pending"] = {
+                key: promotion_pending.get(key)
+                for key in (
+                    "pr_number",
+                    "pr_url",
+                    "auto_merge_enabled",
+                    "managed_check_wait",
+                    "migration_carrying",
+                    "ci_state",
+                )
+                if promotion_pending.get(key) is not None
+            }
+
+        return out
+
     qual = open_row.last_qualification or {}
-    return {
+    out = {
         "candidate_sha": qual.get("candidate_sha"),
         "finalized_at": qual.get("finalized_at"),
         "status": qual.get("status"),
@@ -598,10 +788,48 @@ async def agent_fetch_qualification(
         "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings")
         or [],
         "goal_alignment": qual.get("goal_alignment"),
+        "error": qual.get("error") or None,
+        "detail": qual.get("detail") or None,
+        "blocker": qual.get("blocker") or None,
+        "qualify_request_blocked": qual.get("qualify_request_blocked") or None,
+        "qualify_request_blocked_at": qual.get("qualify_request_blocked_at") or None,
         "source": "last_qualification",
         "goal_coverage_drift": goal_coverage_drift,
+        "qualification_trigger_state": qualification_trigger_state,
+        "serving_sha": serving_sha,
         **requalification_extra,
     }
+
+    # Surface promotion-failure context: would_promote, promotion_pr_url,
+    # promotion_conflict, promotion_error_detail, promotion_failure_count, and
+    # promotion_pending sub-record. Mirrors _compact_last_qualification logic.
+    if qual.get("would_promote") is not None:
+        out["would_promote"] = qual["would_promote"]
+    if qual.get("promotion_pr_url") is not None:
+        out["promotion_pr_url"] = qual["promotion_pr_url"]
+    if qual.get("promotion_conflict") is not None:
+        out["promotion_conflict"] = qual["promotion_conflict"]
+    if qual.get("promotion_error_detail") is not None:
+        out["promotion_error_detail"] = qual["promotion_error_detail"]
+    if qual.get("promotion_failure_count") is not None:
+        out["promotion_failure_count"] = qual["promotion_failure_count"]
+
+    promotion_pending = qual.get("promotion_pending")
+    if isinstance(promotion_pending, dict):
+        out["promotion_pending"] = {
+            key: promotion_pending.get(key)
+            for key in (
+                "pr_number",
+                "pr_url",
+                "auto_merge_enabled",
+                "managed_check_wait",
+                "migration_carrying",
+                "ci_state",
+            )
+            if promotion_pending.get(key) is not None
+        }
+
+    return out
 
 
 @router.get("/projects/{project_id}/version_phase")
@@ -693,26 +921,28 @@ async def agent_fetch_version_phase(
                 project_id,
             )
 
-    open_version_verdict: QualificationVerdict | None = None
+    # Resolve the OPEN version's qualification_state through the shared async
+    # seam so it applies ALL THREE reconciliation enrichments (serving aggregate,
+    # version-scoped audit child, and the newest finalized verdict) in the same
+    # fixed order as the strategic payload, admin lifecycle endpoint, and
+    # system-state snapshot. Previously this surface passed only the finalized
+    # verdict (no audit-crash reconciliation), so it told a ``qualifying`` story
+    # in the audit-crashed window while the operator panel already read
+    # ``audit_crashed``. The helper resolves the canonical newest verdict itself.
+    _open_resolved_qual: tuple[dict | None, dict | None] | None = None
     if open_row is not None:
-        open_version_verdict = (
-            (
-                await session.execute(
-                    select(QualificationVerdict)
-                    .where(
-                        QualificationVerdict.release_version_id == open_row.id,
-                        QualificationVerdict.audit_findings.is_not(None),
-                    )
-                    .order_by(QualificationVerdict.created_at.desc())
-                    .limit(1)
-                )
-            )
-            .scalars()
-            .first()
+        from app.qualification_state_resolver import (  # noqa: PLC0415
+            resolve_open_version_qualification_state,
+        )
+
+        _open_resolved_qual = await resolve_open_version_qualification_state(
+            session, open_row, project
         )
 
     _current_version_data = (
-        _compact_version_lifecycle(open_row, project, latest_verdict=open_version_verdict)
+        _compact_version_lifecycle(
+            open_row, project, resolved_qualification=_open_resolved_qual
+        )
         if open_row is not None
         else None
     )
@@ -728,8 +958,7 @@ async def agent_fetch_version_phase(
     if open_row is not None:
         try:
             from app.strategic_spawning import (  # noqa: PLC0415
-                _build_freshness_shas_block,
-                _freshness_generated_at,
+                _build_payload_staleness_block,
                 _resolve_candidate_currency,
                 get_project_integration_branch,
             )
@@ -739,19 +968,18 @@ async def agent_fetch_version_phase(
             _raw_currency = await _resolve_candidate_currency(
                 session, project, _last_qual, _integration_branch
             )
-            if _raw_currency is not None:
-                candidate_currency = {
-                    **_raw_currency,
-                    **_build_freshness_shas_block(_raw_currency),
-                }
+            # Typed currency block: resolved (fresh/stale) merges the raw
+            # current/candidate_sha/head_sha keys with the freshness block for
+            # backward compat; api_unreachable and unknown carry their verdict and
+            # reason WITHOUT a stale flag so the agent distinguishes a transient
+            # GitHub outage from genuine indeterminacy.
+            _staleness = _build_payload_staleness_block(_raw_currency)
+            if isinstance(_raw_currency, dict) and isinstance(
+                _raw_currency.get("current"), bool
+            ):
+                candidate_currency = {**_raw_currency, **_staleness}
             else:
-                # Indeterminate: freshness could not be resolved (GitHub unreachable,
-                # no candidate SHA on record, etc.). Mark explicitly so agent knows
-                # the state is unknown, not current or stale.
-                candidate_currency = {
-                    "verdict": "unknown",
-                    "generated_at": _freshness_generated_at(),
-                }
+                candidate_currency = _staleness
         except Exception:
             logger.exception(
                 "[AGENT_FETCH] candidate_currency resolve failed for project %s",
@@ -953,6 +1181,206 @@ async def agent_fetch_compute_sweep(
     if not docs:
         raise HTTPException(status_code=404, detail="Sweep not found")
     return {"status": "success", "data": docs}
+
+
+# ---------------------------------------------------------------------------
+# Payload-section fetch inventory + generic section recovery endpoint
+# ---------------------------------------------------------------------------
+
+# Maps every _STRATEGIC_REVIEW_SCHEMA key to its recovery path:
+#   - a fetch verb string ("problem-model", "direction", ...) — dedicated endpoint
+#   - "sections" — served by agent_fetch_payload_section below
+#   - None — no recovery (ephemeral, in-memory, or always-critical)
+# This dict must stay in sync with _STRATEGIC_REVIEW_SCHEMA; the inventory
+# test enforces that every schema key has an explicit entry here.
+SECTION_FETCH_INVENTORY: dict[str, str | None] = {
+    # Critical identity/routing — always ships, never dropped
+    "type": None, "research_mode": None, "project_name": None, "base_branch": None,
+    "is_self_repo": None, "enable_self_improvement": None, "model": None, "effort": None,
+    "vision": None, "direction_counts": None, "max_active_directions": None,
+    "open_message_count": None,
+    # High — dedicated fetch verbs
+    "open_messages": "message",
+    "directions_summary": "direction",
+    "problem_model": "problem-model",
+    "version_phase": "version-phase",
+    # Medium/high — dedicated fetch verbs
+    "design_doc": "section",
+    "knowledge_index": "knowledge",
+    "compute_experiment_sweeps": "compute-sweeps",
+    "capability_trial_verdicts": "capability-trials",
+    "efficiency_snapshot": "efficiency-snapshot",
+    "ci_compliance": "ci-compliance",
+    "open_completion_debt": "completion-debt",
+    # Low — generic section endpoint (project-data-based, no complex async)
+    "self_reflection_log": "sections",
+    "anomaly_summary": "sections",
+    "playbook_summary": "sections",
+    "retired_directions_summary": "sections",
+    "rejected_proposals": "sections",
+    "past_retirement_critiques": "sections",
+    "previous_decision_outcomes": "sections",
+    "outcome_evaluation": "sections",
+    # High/medium exempt — ephemeral, bounded at build time, or tiny scalars
+    "prompt_suffix": None, "running_update": None,
+    "running_update_acknowledged_at": None, "user_last_active_at": None,
+    "first_autonomous_improvement_at": None,
+    "operator_context_refs": None, "cycle_start_reconciliation": None,
+    "model_health": None, "prune_candidates": None, "playbook_keys_index": None,
+    "staged_directions": None, "retirement_deferrals": None,
+    "payload_staleness": None, "deployment_state": None,
+    "operator_overrides": None, "missing_capability_demand": None,
+    "available_capabilities": None, "local_runner_status": None,
+    # Tiny resident/autonomous session cadence scalars — runtime config, no fetch path
+    "strategic_session_idle_tick_seconds": None,
+    "strategic_session_min_tick_seconds": None,
+    "strategic_session_max_ops_per_turn": None,
+    "strategic_session_message_poll_seconds": None,
+    "strategic_session_turn_timeout_seconds": None,
+    "strategic_session_autonomous_turn_timeout_seconds": None,
+    # Medium — no recovery (require complex async or ephemeral session data)
+    "conversation_thread": None,
+    "recent_interventions": None,   # requires GitHub API fan-out
+    "drift_signals": None,          # requires async DB compute
+    "memo_citations": None,         # requires cycle-scoped Task query
+    # Low — no recovery (in-memory runtime state or tiny unactionable scalars)
+    "held_directions": None,        # in-memory shared state, not persisted
+    "running_update_superseded": None,
+    "prediction_calibration_factor": None,
+    "prediction_calibration_note": None,
+    "system_maturity": None,
+    "resident_exam_leads": None,    # exempt (never dropped); session-scoped, no fetch path
+    # Low — dedicated fetch verb; tiny persisted trend across recent cycles
+    "integrity_conflict_trend": "integrity-conflict-trend",
+}
+
+_SECTIONS_NEEDING_CYCLE_HISTORY: frozenset[str] = frozenset({
+    "past_retirement_critiques",
+    "previous_decision_outcomes",
+    "outcome_evaluation",
+})
+
+
+@router.get("/projects/{project_id}/sections/{section_name}")
+@limiter.limit("60/minute")
+async def agent_fetch_payload_section(
+    request: Request,
+    project_id: uuid.UUID,
+    section_name: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a freshly-built payload section by name for sections that have no
+    dedicated fetch verb. Only sections registered as 'sections' in
+    SECTION_FETCH_INVENTORY are served here; others get 404. Used as the
+    recovery path when a low-priority section was dropped under budget pressure.
+    Cross-project access returns 404 (not 403)."""
+    if SECTION_FETCH_INVENTORY.get(section_name) != "sections":
+        raise HTTPException(status_code=404, detail="Section not available via this endpoint")
+    project = await _resolve_agent_project(project_id, token, session)
+
+    from datetime import timedelta  # noqa: PLC0415
+    from app.strategic_spawning import (  # noqa: PLC0415
+        _build_anomaly_summary,
+        _build_playbook_summary,
+        _build_past_retirement_critiques,
+        _build_previous_decision_outcomes,
+    )
+    from app.strategic_analysis import (  # noqa: PLC0415
+        _build_retired_directions_summary,
+        _build_outcome_evaluation,
+    )
+    from app import strategic_cycle as _sc  # noqa: PLC0415
+    from app.time_utils import _utcnow  # noqa: PLC0415
+
+    if section_name == "self_reflection_log":
+        data: Any = project.self_reflection_log or []
+    elif section_name == "anomaly_summary":
+        data = _build_anomaly_summary(project)
+    elif section_name == "playbook_summary":
+        data = _build_playbook_summary(project)
+    elif section_name == "retired_directions_summary":
+        data = _build_retired_directions_summary(project)
+    elif section_name == "rejected_proposals":
+        cutoff = (_utcnow() - timedelta(days=30)).isoformat()
+        rows = [
+            {
+                "text": (d.get("text") or "")[:300],
+                "rejected_at": d.get("rejected_at"),
+                "rationale": (d.get("rationale") or "")[:300] if d.get("rationale") else None,
+            }
+            for d in (project.directions or [])
+            if d.get("status") == "rejected" and (d.get("rejected_at") or "") >= cutoff
+        ]
+        rows.sort(key=lambda r: r.get("rejected_at") or "", reverse=True)
+        data = rows[:10]
+    else:
+        # past_retirement_critiques, previous_decision_outcomes, outcome_evaluation
+        cycle_history = await _sc.recent_for_agent_context(session, project.id)
+        if section_name == "past_retirement_critiques":
+            data = _build_past_retirement_critiques(cycle_history)
+        elif section_name == "previous_decision_outcomes":
+            data = _build_previous_decision_outcomes(project, cycle_history)
+        else:
+            data = _build_outcome_evaluation(project, cycle_history)
+
+    return {"status": "success", "data": data}
+
+
+@router.get("/projects/{project_id}/integrity-conflict-trend")
+@limiter.limit("60/minute")
+async def agent_fetch_integrity_conflict_trend(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the persisted integrity-conflict trend for the project.
+
+    Queries the last 10 completed strategic cycles for their stamped
+    integrity-conflict counts (orphaned_gaps, ungrounded_directions,
+    stale_active_moves, staffed_but_deferred) and returns the trend summary:
+    stamped_cycles, consecutive_clean_cycles, and last_counts.  Used by the
+    strategist to verify the '2 consecutive clean cycles' retirement condition
+    for the direction-gap referential-integrity direction."""
+    project = await _resolve_agent_project(project_id, token, session)
+    from app import strategic_cycle as _sc  # noqa: PLC0415
+
+    _ = project  # resolve auth; project_id is passed directly to the query
+    trend = await _sc.recent_integrity_conflict_trend(session, project_id, limit=10)
+    return {"status": "success", "data": trend}
+
+
+@router.get("/projects/{project_id}/completion-debt")
+@limiter.limit("60/minute")
+async def agent_fetch_completion_debt(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return open completion-debt entries for the project.
+
+    Recovery path when ``open_completion_debt`` was dropped from the strategic
+    payload under budget pressure. Returns the bounded list of open debt entries
+    (kind, description, created_at, age_days) from the completion-debt ledger.
+
+    Returns ``{"status": "success", "data": [], "source": "not_available"}`` when
+    the completion-debt module has not yet been deployed (ledger table absent).
+    Cross-project access returns 404.
+    """
+    await _resolve_agent_project(project_id, token, session)
+    try:
+        from importlib import import_module
+
+        _completion_debt = import_module("app.completion_debt")
+        entries = await _completion_debt.get_open_completion_debt(session, project_id)
+        return {"status": "success", "data": entries}
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] completion_debt unavailable for project %s", project_id
+        )
+        return {"status": "success", "data": [], "source": "not_available"}
 
 
 @router.get("/projects/{project_id}/gaps/{gap_id}")

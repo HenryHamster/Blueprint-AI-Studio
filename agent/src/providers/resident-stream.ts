@@ -23,6 +23,8 @@
  * treats a nested `result` as sub-progress, never as the turn's completion.
  */
 
+import { STRATEGIC_OPS_REGISTRY } from '../handlers/strategic-ops-registry.js';
+
 export type ResidentEventKind = 'text' | 'tool' | 'tool_result' | 'result' | 'error' | 'system' | 'other';
 
 /**
@@ -161,6 +163,8 @@ export interface ResidentStreamEvent {
   nested?: boolean;
   /** token usage parsed from a top-level 'result' event (when the CLI reported it) */
   usage?: ResidentTokenUsage;
+  /** turn count parsed from a top-level 'result' event (when the CLI reported it) */
+  numTurns?: number;
   /** LIVE activity-strip kind for a 'tool' / 'tool_result' event (ephemeral) */
   activityKind?: ResidentActivityKind;
   /** LIVE activity-strip one-liner text for a 'tool' / 'tool_result' event */
@@ -182,6 +186,16 @@ export function extractResultUsage(obj: Record<string, unknown>): ResidentTokenU
   const outputTokens = Number(u.output_tokens ?? 0) || 0;
   if (inputTokens <= 0 && outputTokens <= 0) return undefined;
   return { inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens };
+}
+
+/**
+ * Extract the per-turn model-turn count from a `result` object, or undefined
+ * when absent/invalid.
+ */
+export function extractResultTurns(obj: Record<string, unknown>): number | undefined {
+  const numTurns = Number(obj.num_turns ?? 0);
+  if (!Number.isFinite(numTurns) || numTurns <= 0) return undefined;
+  return Math.floor(numTurns);
 }
 
 /**
@@ -219,13 +233,11 @@ export function extractDeltaText(obj: Record<string, unknown>): string | undefin
   return undefined;
 }
 
-const STRATEGIC_MUTATING_VERBS = new Set([
-  'set-problem-model', 'set-running-update', 'reflect', 'pending-confirm', 'set-vision',
-  'create-direction', 'update-direction', 'retire-direction', 'stage-direction',
-  'approve-direction', 'reject-direction', 'create-message', 'resolve-message',
-  'spawn-task', 'spawn-fix', 'set-retirement-critiques', 'set-evidence-progress',
-  'set-acceptance-criteria', 'cite-memos', 'set-strategic-challenge',
-]);
+const STRATEGIC_MUTATING_VERBS = new Set(
+  STRATEGIC_OPS_REGISTRY
+    .filter(e => e.cli && e.alias !== null)
+    .map(e => e.alias as string),
+);
 
 /**
  * True when a Bash command invokes a MUTATING `./strategic <verb>` op. Reads
@@ -314,6 +326,7 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
     events.push({
       kind: 'result', text: result, isTurnResult: !nested, nested, sessionId,
       usage: extractResultUsage(obj),
+      numTurns: extractResultTurns(obj),
     });
     return events;
   }

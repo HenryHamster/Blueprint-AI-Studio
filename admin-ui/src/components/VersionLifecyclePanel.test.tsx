@@ -13,9 +13,6 @@ vi.mock('../firebase', () => ({
 }));
 vi.mock('../api');
 
-// Mock window.confirm for cut version tests
-const mockConfirm = vi.spyOn(window, 'confirm');
-
 function makeCurrentVersion(overrides: Partial<api.CurrentVersion> = {}): api.CurrentVersion {
   return {
     version_number: 1,
@@ -90,7 +87,6 @@ describe('VersionLifecyclePanel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRefresh.mockClear();
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
   });
 
@@ -350,9 +346,10 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Enable/ }));
 
-      await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith('Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.');
-      });
+      // ConfirmDialog appears with the fleet-wide warning
+      expect(screen.getByText('Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
       await waitFor(() => {
         expect(patchAdminSettingsMock).toHaveBeenCalledWith({ promotion_enabled: true });
       });
@@ -375,6 +372,7 @@ describe('VersionLifecyclePanel', () => {
       );
 
       fireEvent.click(screen.getByRole('button', { name: /Enable/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(screen.getByText('Request failed')).toBeInTheDocument();
@@ -408,6 +406,9 @@ describe('VersionLifecyclePanel', () => {
 
       expect(screen.getByText(/fleet default/)).toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: /^Arm$/ }));
+
+      // ConfirmDialog appears for project-level arming
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(setProjectPromotionEnabledMock).toHaveBeenCalledWith('proj-1', true);
@@ -467,7 +468,6 @@ describe('VersionLifecyclePanel', () => {
       });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -481,16 +481,15 @@ describe('VersionLifecyclePanel', () => {
       const cutButton = screen.getByRole('button', { name: /Cut\/Abandon/ });
       fireEvent.click(cutButton);
 
-      // Should show the input and buttons
+      // Should show the inline input and Cut button
       const reasonInput = screen.getByPlaceholderText('Optional reason for cut...');
       expect(reasonInput).toBeInTheDocument();
 
-      const cutButtonInForm = screen.getByRole('button', { name: /^Cut$/ });
-      fireEvent.click(cutButtonInForm);
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
-      await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith('Abandon v1 and open a fresh version?');
-      });
+      // ConfirmDialog appears with the abandon message
+      expect(screen.getByText('Abandon v1 and open a fresh version?')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(cutVersionMock).toHaveBeenCalledWith('proj-1', undefined, expect.any(String));
@@ -506,7 +505,6 @@ describe('VersionLifecyclePanel', () => {
       });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -523,15 +521,15 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.change(reasonInput, { target: { value: 'stalled in build' } });
 
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(cutVersionMock).toHaveBeenCalledWith('proj-1', 'stalled in build', expect.any(String));
       });
     });
 
-    it('cancels cut version action when confirm is rejected', async () => {
+    it('cancels cut version action when cancel is clicked in the dialog', async () => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(false);
 
       render(
         <VersionLifecyclePanel
@@ -545,9 +543,9 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
-      await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith('Abandon v1 and open a fresh version?');
-      });
+      // ConfirmDialog appears; click the dialog's Cancel button
+      expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-cancel'));
 
       expect(vi.mocked(api.cutVersion)).not.toHaveBeenCalled();
     });
@@ -559,7 +557,6 @@ describe('VersionLifecyclePanel', () => {
       });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -572,6 +569,7 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(screen.getByText('Cut v5 → opened v6')).toBeInTheDocument();
@@ -588,7 +586,6 @@ describe('VersionLifecyclePanel', () => {
         });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -601,13 +598,13 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
       await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(1));
 
-      // Retry after the failure (the cut UI stays open on error). The waitFor
-      // above resolves as soon as the mock is INVOKED — the rejection may not
-      // have settled yet, so the button can still wear its in-flight
-      // "Cutting v…" label; findByRole waits for it to revert to "Cut".
+      // Retry after the failure (the cut UI stays open on error, dialog is closed).
+      // findByRole waits for the "Cut" button to re-appear after loading clears.
       fireEvent.click(await screen.findByRole('button', { name: /^Cut$/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
       await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(2));
 
       // Both calls carried the SAME generated key (a lost-response retry must
@@ -844,13 +841,11 @@ describe('VersionLifecyclePanel', () => {
       expect(consequences).not.toHaveTextContent('No tasks are currently in flight.');
     });
 
-    it('folds consequences into the confirm message', async () => {
-      const cutVersionMock = vi.fn().mockResolvedValue({
+    it('folds consequences into the confirm dialog message', async () => {
+      vi.mocked(api.cutVersion).mockResolvedValue({
         abandoned_version: { version_number: 6, status: 'abandoned' },
         new_version: { version_number: 7, phase: 'build', goal: null, opened_at: '2026-01-02T00:00:00Z' },
       });
-      vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -869,11 +864,12 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
+      // ConfirmDialog shows the consequences folded into the message
       await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith(
-          'Abandon v6 and open a fresh version?\n\nThis will: 1 staged direction will start now; 2 in-flight tasks will keep running against the new version.'
-        );
+        expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
       });
+      expect(screen.getByText(/1 staged direction will start now/)).toBeInTheDocument();
+      expect(screen.getByText(/2 in-flight tasks will keep running against the new version/)).toBeInTheDocument();
     });
 
     it('surfaces promotion-in-flight context before confirming a cut', async () => {
@@ -914,11 +910,12 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
+      // ConfirmDialog shows the promotion-in-flight context in the message
       await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith(
-          expect.stringContaining('promotion PR #7357 is open and auto-merging (in flight ~2h 5m (auto-timeout cap 4h))')
-        );
+        expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
       });
+      expect(screen.getByText(/promotion PR #7357 is open and auto-merging \(in flight ~2h 5m \(auto-timeout cap 4h\)\)/)).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
       await waitFor(() => {
         expect(screen.getByText(/wait for it to land or cancel it before cutting/)).toBeInTheDocument();
       });
@@ -2882,6 +2879,9 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByTestId('clear-deploy-failed'));
 
+      // ConfirmDialog appears — click confirm to proceed with the verify path
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
       await waitFor(() => {
         expect(clearMock).toHaveBeenCalledWith('proj-1');
       });
@@ -2891,7 +2891,7 @@ describe('VersionLifecyclePanel', () => {
       expect(mockRefresh).toHaveBeenCalled();
     });
 
-    it('prompts for an attestation reason and force-clears when verify is refused', async () => {
+    it('prompts for an attestation reason via dialog and force-clears when verify is refused', async () => {
       const clearMock = vi
         .fn()
         .mockRejectedValueOnce(new Error('deploy could not be independently verified live — re-submit with force=true and a reason'))
@@ -2906,7 +2906,6 @@ describe('VersionLifecyclePanel', () => {
           attestation_reason: 'verified live by hand',
         });
       vi.mocked(api.clearDeployFailed).mockImplementation(clearMock);
-      const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('verified live by hand');
 
       render(
         <VersionLifecyclePanel
@@ -2920,16 +2919,24 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByTestId('clear-deploy-failed'));
 
+      // First dialog: plain confirm to attempt verify path
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      // First API call fails with force=true required → attestation dialog appears
       await waitFor(() => {
-        expect(promptSpy).toHaveBeenCalled();
+        expect(screen.getByTestId('confirm-dialog-attestation-input')).toBeInTheDocument();
       });
+      fireEvent.change(screen.getByTestId('confirm-dialog-attestation-input'), {
+        target: { value: 'verified live by hand' },
+      });
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
       await waitFor(() => {
         expect(clearMock).toHaveBeenLastCalledWith('proj-1', true, 'verified live by hand');
       });
       await waitFor(() => {
         expect(screen.getByText(/operator-attested/)).toBeInTheDocument();
       });
-      promptSpy.mockRestore();
     });
   });
 
@@ -3482,6 +3489,8 @@ describe('VersionLifecyclePanel', () => {
         started_at: null,
         finalized_at: '2026-01-01T00:00:00Z',
         created_at: '2026-01-01T00:00:00Z',
+        debt_enforce_confidence_preview: 0.81,
+        debt_enforce_weight_preview: 0.15,
       };
     }
 
@@ -3541,6 +3550,35 @@ describe('VersionLifecyclePanel', () => {
 
       await screen.findByTestId('verdict-history');
       expect(screen.queryByTestId('confidence-sparkline')).not.toBeInTheDocument();
+    });
+
+    it('renders debt-enforce previews in the current summary and verdict history rows', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [makeVerdict(0.91)],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                debt_enforce_confidence_preview: 0.73,
+                debt_enforce_weight_preview: 0.15,
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await screen.findByTestId('verdict-history');
+      const previews = screen.getAllByTestId('debt-enforce-preview');
+      expect(previews).toHaveLength(2);
+      expect(previews[0]).toHaveTextContent('enforce 73% @w0.15');
+      expect(previews[1]).toHaveTextContent('enforce 81% @w0.15');
     });
   });
 
@@ -3639,6 +3677,46 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByTestId('criterion-row-k1')).toBeInTheDocument();
       expect(screen.getByTestId('criterion-row-k2')).toBeInTheDocument();
       expect(screen.getByTestId('criterion-row-k3')).toBeInTheDocument();
+    });
+
+    it('renders inactive criterion audit rows from current_version criterion_coverage when active total is zero', async () => {
+      const coverage: api.VersionCriterionCoverage = {
+        total: 0,
+        covered: 0,
+        partial: 0,
+        uncovered: 0,
+        retracted: 1,
+        superseded: 0,
+        inactive: 1,
+        criteria: [
+          {
+            criterion_key: 'inactive-k1',
+            text: 'Retracted criterion remains visible',
+            coverage: 'uncovered',
+            status: 'retracted',
+            evidence_count: 0,
+          },
+        ],
+      };
+      const TASKS: api.ChangelogEntry[] = [
+        { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+      ];
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: coverage,
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      expect(await screen.findByTestId('criterion-row-inactive-k1')).toHaveTextContent('Retracted criterion remains visible');
+      expect(screen.getByTestId('criterion-status-inactive-k1')).toHaveTextContent('retracted');
+      expect(screen.queryByText('No acceptance criteria defined for this version.')).not.toBeInTheDocument();
     });
 
     it('does not render criterion coverage panel when criterion_coverage is null', async () => {
@@ -3775,6 +3853,440 @@ describe('VersionLifecyclePanel', () => {
       // The compact sub-score should show "s:—" not "s:0" when smoke is disabled.
       expect(history.textContent).toContain('s:—');
       expect(history.textContent).not.toContain('s:0');
+    });
+  });
+
+  describe('verdict-fetch error handling', () => {
+    it('shows verdicts-error when fetchQualificationVerdicts rejects', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockRejectedValue(new Error('Network error'));
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const errorEl = await screen.findByTestId('verdicts-error');
+      expect(errorEl).toHaveTextContent('Failed to load verdict history.');
+      expect(screen.queryByTestId('verdict-history')).not.toBeInTheDocument();
+    });
+
+    it('re-fetches verdicts when data prop changes (refresh cycle)', async () => {
+      const { rerender } = render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(vi.mocked(api.fetchQualificationVerdicts)).toHaveBeenCalledTimes(1);
+
+      const secondData = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({ phase: 'stabilize' }),
+      });
+
+      rerender(
+        <VersionLifecyclePanel
+          data={secondData}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await waitFor(() => {
+        expect(vi.mocked(api.fetchQualificationVerdicts)).toHaveBeenCalledTimes(2);
+      });
+    });
+  });
+
+  describe('attest criterion', () => {
+    const TASKS: api.ChangelogEntry[] = [
+      { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+    ];
+
+    function makeStuckCoverage(stuckReason: 'no_mapping' | 'direction_retired'): api.VersionCriterionCoverage {
+      return {
+        total: 1,
+        covered: 0,
+        partial: 0,
+        uncovered: 1,
+        stuck_count: 1,
+        criteria: [
+          {
+            criterion_key: 'k-stuck',
+            text: 'Stuck criterion text',
+            coverage: 'uncovered',
+            evidence_count: 0,
+            stuck_reason: stuckReason,
+          },
+        ],
+      };
+    }
+
+    it('shows attestation reason dialog and calls attestAcceptanceCriterion on confirm', async () => {
+      vi.mocked(api.attestAcceptanceCriterion).mockResolvedValue({ status: 'ok', criterion_key: 'k-stuck', coverage: 'covered' });
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: makeStuckCoverage('no_mapping'),
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const attestBtn = await screen.findByTestId('attest-btn-k-stuck');
+      fireEvent.click(attestBtn);
+
+      expect(await screen.findByText('Attest criterion')).toBeInTheDocument();
+      const input = screen.getByPlaceholderText(/verified live by hand|direction retired|attestation/i) ||
+        screen.getByRole('textbox');
+      fireEvent.change(input, { target: { value: 'Direction retired; criterion superseded' } });
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      await waitFor(() => {
+        expect(api.attestAcceptanceCriterion).toHaveBeenCalledWith('proj-1', 'k-stuck', 'Direction retired; criterion superseded');
+      });
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('does not call API when attestation dialog is cancelled', async () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: makeStuckCoverage('direction_retired'),
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const attestBtn = await screen.findByTestId('attest-btn-k-stuck');
+      fireEvent.click(attestBtn);
+
+      expect(await screen.findByText('Attest criterion')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-cancel'));
+
+      await waitFor(() => {
+        expect(screen.queryByText('Attest criterion')).not.toBeInTheDocument();
+      });
+      expect(api.attestAcceptanceCriterion).not.toHaveBeenCalled();
+    });
+
+    it('shows error message when attest API fails', async () => {
+      vi.mocked(api.attestAcceptanceCriterion).mockRejectedValue(new Error('Attestation failed'));
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: makeStuckCoverage('no_mapping'),
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const attestBtn = await screen.findByTestId('attest-btn-k-stuck');
+      fireEvent.click(attestBtn);
+
+      const input = await screen.findByRole('textbox');
+      fireEvent.change(input, { target: { value: 'some reason' } });
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Attestation failed')).toBeInTheDocument();
+      });
+    });
+
+    it('Attest and Link direction buttons only appear on stuck active criteria', async () => {
+      const coverage: api.VersionCriterionCoverage = {
+        total: 2,
+        covered: 1,
+        partial: 0,
+        uncovered: 1,
+        stuck_count: 1,
+        criteria: [
+          {
+            criterion_key: 'k-stuck',
+            text: 'Stuck criterion',
+            coverage: 'uncovered',
+            evidence_count: 0,
+            stuck_reason: 'no_mapping',
+          },
+          {
+            criterion_key: 'k-ok',
+            text: 'Covered criterion',
+            coverage: 'covered',
+            evidence_count: 1,
+          },
+        ],
+      };
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 2,
+          criterion_coverage: coverage,
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      await screen.findByTestId('criterion-coverage-panel');
+      expect(screen.getByTestId('attest-btn-k-stuck')).toBeInTheDocument();
+      expect(screen.getByTestId('link-direction-btn-k-stuck')).toBeInTheDocument();
+      expect(screen.queryByTestId('attest-btn-k-ok')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('link-direction-btn-k-ok')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('link direction', () => {
+    const TASKS: api.ChangelogEntry[] = [
+      { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+    ];
+    const stuckCoverage: api.VersionCriterionCoverage = {
+      total: 1,
+      covered: 0,
+      partial: 0,
+      uncovered: 1,
+      stuck_count: 1,
+      criteria: [
+        {
+          criterion_key: 'k-stuck',
+          text: 'Needs direction link',
+          coverage: 'uncovered',
+          evidence_count: 0,
+          stuck_reason: 'direction_retired',
+        },
+      ],
+    };
+
+    it('shows direction-key input dialog and calls linkCriteriaToDirection on confirm', async () => {
+      vi.mocked(api.linkCriteriaToDirection).mockResolvedValue({ status: 'ok', direction_key: 'd-abc123', criterion_keys: ['k-stuck'] });
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: stuckCoverage,
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const linkBtn = await screen.findByTestId('link-direction-btn-k-stuck');
+      fireEvent.click(linkBtn);
+
+      expect(await screen.findByText('Link criterion to direction')).toBeInTheDocument();
+      const input = screen.getByRole('textbox');
+      fireEvent.change(input, { target: { value: 'd-abc123' } });
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      await waitFor(() => {
+        expect(api.linkCriteriaToDirection).toHaveBeenCalledWith('proj-1', 'd-abc123', ['k-stuck']);
+      });
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('does not call API when link direction dialog is cancelled', async () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: stuckCoverage,
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const linkBtn = await screen.findByTestId('link-direction-btn-k-stuck');
+      fireEvent.click(linkBtn);
+
+      expect(await screen.findByText('Link criterion to direction')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-cancel'));
+
+      await waitFor(() => {
+        expect(screen.queryByText('Link criterion to direction')).not.toBeInTheDocument();
+      });
+      expect(api.linkCriteriaToDirection).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('completion-debt lane in qualification sub-scores', () => {
+    function makeQualWithDebt(debtOverrides: Partial<api.CompletionDebtQualSnapshot> = {}, debtPressure = 0.8): api.VersionQualification {
+      return makeQualification({
+        sub_scores: {
+          audit: 0.9,
+          test_erosion: 0.85,
+          smoketest: 0.95,
+          debt_pressure: debtPressure,
+        },
+        completion_debt: {
+          total_open: 2,
+          items: [
+            { id: 'd-1', kind: 'default_off_merge', title: 'Feature flag X', description: 'desc', created_at: '2026-01-01T00:00:00Z', age_days: 10 },
+            { id: 'd-2', kind: 'observe_mode', title: 'Observe knob Y', description: 'desc', created_at: '2026-01-02T00:00:00Z', age_days: 5 },
+          ],
+          ...debtOverrides,
+        },
+      });
+    }
+
+    it('renders debt lane and items when debt_pressure and completion_debt are present', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: makeQualWithDebt() }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByText(/debt: 2 open/)).toBeInTheDocument();
+      expect(screen.getByTestId('debt-items-list')).toBeInTheDocument();
+      expect(screen.getByText('Feature flag X')).toBeInTheDocument();
+      expect(screen.getByText('Observe knob Y')).toBeInTheDocument();
+    });
+
+    it('omits debt lane when debt_pressure is absent (legacy row)', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: makeQualification({
+            sub_scores: { audit: 0.9, test_erosion: 0.85, smoketest: 0.95 },
+          }) }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.queryByText(/debt:/)).not.toBeInTheDocument();
+      expect(screen.queryByTestId('debt-items-list')).not.toBeInTheDocument();
+    });
+
+    it('omits debt lane when last_qualification is null', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: null }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.queryByText(/debt:/)).not.toBeInTheDocument();
+    });
+
+    it('renders clean zero-debt state when total_open is 0', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: makeQualification({
+            sub_scores: { audit: 0.9, test_erosion: 0.85, smoketest: 0.95, debt_pressure: 1.0 },
+            completion_debt: { total_open: 0, items: [] },
+          }) }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByText('debt: none')).toBeInTheDocument();
+      expect(screen.queryByTestId('debt-items-list')).not.toBeInTheDocument();
+    });
+
+    it('shows truncation note when total_open exceeds items length', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: makeQualWithDebt({ total_open: 5 }) }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByText(/showing 2 oldest/)).toBeInTheDocument();
+    });
+
+    it('renders debt segment in verdict history row when debt_pressure present', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [{
+          id: 'v-1',
+          release_version_id: 'r-1',
+          candidate_sha: 'abc1234',
+          confidence: 0.85,
+          sub_scores: { audit: 0.9, test_erosion: 0.85, smoketest: 0.95, debt_pressure: 0.8 },
+          completion_debt: { total_open: 3, items: [] },
+          blocker: null,
+          audit_missing_reason: null,
+          would_promote: false,
+          promotion_enabled: false,
+          terminal_status: 'not_promoted',
+          threshold: 0.9,
+          started_at: null,
+          finalized_at: '2026-01-01T00:00:00Z',
+          created_at: '2026-01-01T00:00:00Z',
+        }],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ phase: 'stabilize' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('verdict-history')).toBeInTheDocument();
+      });
+      expect(screen.getByText(/d:3open/)).toBeInTheDocument();
+    });
+
+    it('omits debt segment in verdict history when debt_pressure absent', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [{
+          id: 'v-1',
+          release_version_id: 'r-1',
+          candidate_sha: 'abc1234',
+          confidence: 0.85,
+          sub_scores: { audit: 0.9, test_erosion: 0.85, smoketest: 0.95 },
+          blocker: null,
+          audit_missing_reason: null,
+          would_promote: false,
+          promotion_enabled: false,
+          terminal_status: 'not_promoted',
+          threshold: 0.9,
+          started_at: null,
+          finalized_at: '2026-01-01T00:00:00Z',
+          created_at: '2026-01-01T00:00:00Z',
+        }],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ phase: 'stabilize' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('verdict-history')).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/d:\d+open/)).not.toBeInTheDocument();
     });
   });
 });

@@ -592,7 +592,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | approve_direction | reject_direction | create_message | resolve_message | spawn_task | set_problem_model | set_running_update | reflect | pending_confirm | set_retirement_critiques | set_evidence_progress | cite_memos",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | dispose_completion_debt | set_problem_model | set_running_update | reflect | pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution",
   "data": { }
 }
 ```
@@ -610,6 +610,11 @@ truncated). Notable behaviors:
   tasks tied to it.
 - `set_problem_model` lifts out transient `version_phase_decision` /
   `qualify_request` siblings before validating the durable problem model.
+- `record_finding_resolution` writes a per-finding re-qualification resolution
+  ledger row for the current open release version. Required `data` fields:
+  `finding_key` (string, ≤ 64 chars), `state` (`resolved` | `stale`). Optional:
+  `severity`, `note`, `resolving_ref`, `verified_against_sha`. Returns `409`
+  when no open version exists.
 
 ---
 

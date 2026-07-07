@@ -61,6 +61,57 @@ def _set_review_loop_terminal_outcome(
     flag_modified(task, "context")
 
 
+async def _create_handmerge_attention_message(
+    task: Task,
+    pr_number: int,
+    iterations: int,
+    cap_label: str,
+    session: AsyncSession,
+) -> None:
+    """Create a durable operator-attention ProjectMessage for a preserved hand-merge PR.
+
+    Idempotent: a message keyed to the task is only inserted if one does not
+    already exist (safe on retry).  The message is committed independently so
+    it persists even if the caller's surrounding try/except swallows errors.
+    The sweep ``sweep_closed_handmerge_prs`` resolves this message automatically
+    when it detects the PR has been merged or closed.
+    """
+    from app.models import MessageType, ProjectMessage
+    from sqlmodel import select as _sqlm_select
+
+    ikey = f"handmerge:{task.id}"
+    existing = (
+        await session.execute(
+            _sqlm_select(ProjectMessage).where(
+                ProjectMessage.project_id == task.project_id,
+                ProjectMessage.idempotency_key == ikey,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+    session.add(
+        ProjectMessage(
+            project_id=task.project_id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            from_task_id=task.id,
+            content=(
+                f"PR #{pr_number} preserved for hand-merge — review-fix cap reached "
+                f"({iterations} iterations, {cap_label}); PR left open with mergeable "
+                f"work awaiting manual merge"
+            ),
+            context={
+                "event_type": "handmerge_pr_preserved",
+                "pr_number": pr_number,
+                "task_id": str(task.id),
+            },
+            idempotency_key=ikey,
+        )
+    )
+    await session.commit()
+
+
 # Escalation kinds that flag the chain original ``requires_approval`` while the
 # review-fix loop KEEPS RUNNING (stuck cycle / standoff / repeat-fingerprint
 # halt). These holds exist to point an operator at a loop that looks like it is
@@ -552,6 +603,7 @@ async def _handle_cap_exhaustion(
             ctx["failure_detail"] = "cap_exhausted_after_approve"
             ctx["review_cap_iterations"] = iterations
             ctx["pr_preserved_for_handmerge"] = True
+            ctx["handmerge_pr_number"] = pr_number
             # NB: deliberately NOT setting pr_rejected — this was an approved PR.
             orig.context = ctx
             flag_modified(orig, "context")
@@ -620,6 +672,15 @@ async def _handle_cap_exhaustion(
                 logger.warning(
                     f"[PIPELINE] Cap-exhaustion(after-approve/preserve): alert "
                     f"failed for PR #{pr_number}: {e}"
+                )
+            try:
+                await _create_handmerge_attention_message(
+                    orig, pr_number, iterations, cap_label, session
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[PIPELINE] Cap-exhaustion(after-approve/preserve): attention "
+                    f"message failed for PR #{pr_number}: {e}"
                 )
             return
 
@@ -753,6 +814,7 @@ async def _handle_cap_exhaustion(
         ctx["failure_detail"] = "review_cap_preserved_for_handmerge"
         ctx["review_cap_iterations"] = iterations
         ctx["pr_preserved_for_handmerge"] = True
+        ctx["handmerge_pr_number"] = pr_number
         # NB: deliberately NOT setting pr_rejected / CODE_ERROR — the work is
         # salvageable, not a code failure, and the PR is NOT closed.
         orig.context = ctx
@@ -809,6 +871,15 @@ async def _handle_cap_exhaustion(
             logger.warning(
                 f"[PIPELINE] Cap-exhaustion(preserve): alert failed for PR "
                 f"#{pr_number}: {e}"
+            )
+        try:
+            await _create_handmerge_attention_message(
+                orig, pr_number, iterations, cap_label, session
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(preserve): attention message failed "
+                f"for PR #{pr_number}: {e}"
             )
         return
 

@@ -689,6 +689,178 @@ class TestResidualFingerprintDbWrite:
         assert row.hit_count == 2
 
     @pytest.mark.asyncio
+    async def test_residual_case_upsert_persists_sample_lists(
+        self, session_factory, monkeypatch
+    ):
+        """INSERT persists sample_messages, sample_statuses, and task_ids."""
+        from datetime import datetime, timezone
+        import app.database as db_mod
+        from app.failure_residual import _upsert_residual_case_async
+        from app.models import ResidualRemediationCase
+        from sqlmodel import select
+
+        project_id = uuid.uuid4()
+        now_dt = datetime.now(tz=timezone.utc)
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        await _upsert_residual_case_async(
+            project_id,
+            "fp-lists",
+            now_dt,
+            "main error",
+            sample_messages=["msg-a", "msg-b"],
+            sample_statuses=["status-a"],
+            task_ids=["tid-1", "tid-2"],
+        )
+
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == "fp-lists",
+                    )
+                )
+            ).scalars().first()
+        assert row is not None
+        assert row.sample_messages == ["msg-a", "msg-b"]
+        assert row.sample_statuses == ["status-a"]
+        assert row.task_ids == ["tid-1", "tid-2"]
+
+    @pytest.mark.asyncio
+    async def test_second_hit_merges_sample_lists(self, session_factory, monkeypatch):
+        """Second upsert merges distinct items into the existing lists."""
+        from datetime import datetime, timezone
+        import app.database as db_mod
+        from app.failure_residual import _upsert_residual_case_async
+        from app.models import ResidualRemediationCase
+        from sqlmodel import select
+
+        project_id = uuid.uuid4()
+        now_dt = datetime.now(tz=timezone.utc)
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        await _upsert_residual_case_async(
+            project_id,
+            "fp-merge",
+            now_dt,
+            "err1",
+            sample_messages=["msg-1"],
+            sample_statuses=["status-1"],
+            task_ids=["tid-1"],
+        )
+        await _upsert_residual_case_async(
+            project_id,
+            "fp-merge",
+            now_dt,
+            "err2",
+            sample_messages=["msg-2"],
+            sample_statuses=["status-2"],
+            task_ids=["tid-2"],
+        )
+
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == "fp-merge",
+                    )
+                )
+            ).scalars().first()
+        assert row.hit_count == 2
+        assert "msg-1" in row.sample_messages
+        assert "msg-2" in row.sample_messages
+        assert "status-1" in row.sample_statuses
+        assert "status-2" in row.sample_statuses
+        assert "tid-1" in row.task_ids
+        assert "tid-2" in row.task_ids
+
+    @pytest.mark.asyncio
+    async def test_sample_lists_capped_at_5(self, session_factory, monkeypatch):
+        """Lists never exceed 5 entries even after many upserts."""
+        from datetime import datetime, timezone
+        import app.database as db_mod
+        from app.failure_residual import _upsert_residual_case_async
+        from app.models import ResidualRemediationCase
+        from sqlmodel import select
+
+        project_id = uuid.uuid4()
+        now_dt = datetime.now(tz=timezone.utc)
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        for i in range(8):
+            await _upsert_residual_case_async(
+                project_id,
+                "fp-cap",
+                now_dt,
+                f"err-{i}",
+                sample_messages=[f"msg-{i}"],
+                sample_statuses=[f"status-{i}"],
+                task_ids=[f"tid-{i}"],
+            )
+
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == "fp-cap",
+                    )
+                )
+            ).scalars().first()
+        assert row.hit_count == 8
+        assert len(row.sample_messages) <= 5
+        assert len(row.sample_statuses) <= 5
+        assert len(row.task_ids) <= 5
+
+    @pytest.mark.asyncio
+    async def test_duplicate_sample_not_appended(self, session_factory, monkeypatch):
+        """Duplicate entries are not appended to the sample lists."""
+        from datetime import datetime, timezone
+        import app.database as db_mod
+        from app.failure_residual import _upsert_residual_case_async
+        from app.models import ResidualRemediationCase
+        from sqlmodel import select
+
+        project_id = uuid.uuid4()
+        now_dt = datetime.now(tz=timezone.utc)
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        await _upsert_residual_case_async(
+            project_id,
+            "fp-dedup",
+            now_dt,
+            "same error",
+            sample_messages=["same-msg"],
+            sample_statuses=["same-status"],
+            task_ids=["same-tid"],
+        )
+        await _upsert_residual_case_async(
+            project_id,
+            "fp-dedup",
+            now_dt,
+            "same error",
+            sample_messages=["same-msg"],
+            sample_statuses=["same-status"],
+            task_ids=["same-tid"],
+        )
+
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == "fp-dedup",
+                    )
+                )
+            ).scalars().first()
+        assert row.hit_count == 2
+        assert row.sample_messages.count("same-msg") == 1
+        assert row.sample_statuses.count("same-status") == 1
+        assert row.task_ids.count("same-tid") == 1
+
+    @pytest.mark.asyncio
     async def test_repeated_hits_are_not_undercounted(
         self, session_factory, monkeypatch
     ):

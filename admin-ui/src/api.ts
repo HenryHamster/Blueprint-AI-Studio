@@ -285,6 +285,11 @@ export interface ComputeExperimentLaunchRequest {
   };
   model?: string;
   effort?: string;
+  // Provenance: the operator's original idea text, the LLM draft rationale, and
+  // whether this contract came from a drafted refinement (vs. hand-typed).
+  idea?: string;
+  draft_notes?: string;
+  drafted_from_refinement?: boolean;
 }
 
 /** Response from the dedicated compute_experiment launch endpoint — the created
@@ -434,15 +439,19 @@ export interface ComputeExperimentDraftRequest {
   idea: string;
   github_repo?: string;
   base_branch?: string;
+  /** Optional prior draft for multi-turn refinement — the backend threads it into the LLM conversation. */
+  prior_draft?: ComputeExperimentDraftResponse;
 }
 
 /**
  * Response from the draft endpoint. `draft_available` is false when the model
  * could not produce a usable contract; callers should fall back to manual entry.
  * All contract fields are optional — only populated when `draft_available` is true.
+ * `notes` explains why a draft is unavailable or provides context on success.
  */
 export interface ComputeExperimentDraftResponse {
   draft_available: boolean;
+  notes?: string;
   title?: string;
   prompt?: string;
   hypothesis?: string;
@@ -1392,6 +1401,21 @@ export async function fetchEvictedFindings(
   return res.json();
 }
 
+export async function submitChurnRetirementDecision(
+  projectId: string,
+  directionId: string,
+  decision: 'KEEP' | 'RETIRE',
+  rationale?: string,
+): Promise<void> {
+  const body: Record<string, unknown> = { decision };
+  if (rationale) body.rationale = rationale;
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/directions/${encodeURIComponent(directionId)}/churn-retirement-decision`,
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+  if (!res.ok) throw new Error(`Failed to submit churn-retirement decision: ${res.status}`);
+}
+
 export interface SrCategoryTrend {
   current_hit_rate?: number | null;
   previous_hit_rate?: number | null;
@@ -2037,6 +2061,21 @@ export interface VersionQualificationSubScores {
   test_erosion: number;
   smoketest: number;
   ci_resolution?: CiResolution | null;
+  debt_pressure?: number | null;
+}
+
+export interface CompletionDebtQualItem {
+  id: string;
+  kind: string;
+  title: string;
+  description: string;
+  created_at: string | null;
+  age_days: number | null;
+}
+
+export interface CompletionDebtQualSnapshot {
+  items: CompletionDebtQualItem[];
+  total_open: number;
 }
 
 export type QualificationStatus =
@@ -2142,6 +2181,9 @@ export interface VersionQualification {
   promotion_error_detail?: string | null;
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
+  completion_debt?: CompletionDebtQualSnapshot | null;
+  debt_enforce_confidence_preview?: number | null;
+  debt_enforce_weight_preview?: number | null;
 }
 
 /** Single resolved serving block — the canonical answer to "is this version live?"
@@ -2208,7 +2250,9 @@ export type QualificationStateValue =
   | 'promoted_unconfirmed'
   | 'promotion_deploy_failed'
   | 'promotion_confirmation_timed_out'
-  | 'deferred_unsynced';
+  | 'deferred_unsynced'
+  | 'error'
+  | 'infra_failure';
 
 export interface QualificationState {
   state: QualificationStateValue;
@@ -2262,14 +2306,21 @@ export interface CriterionCoverageEntry {
   criterion_key: string;
   text: string;
   coverage: 'covered' | 'partial' | 'uncovered';
+  status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
+  stuck_reason?: 'no_mapping' | 'direction_retired' | null;
 }
 
 export interface VersionCriterionCoverage {
+  // Active criteria only; inactive criteria may still appear in criteria for audit.
   total: number;
   covered: number;
   partial: number;
   uncovered: number;
+  retracted?: number;
+  superseded?: number;
+  inactive?: number;
+  stuck_count?: number;
   criteria: CriterionCoverageEntry[];
 }
 
@@ -2761,6 +2812,56 @@ export async function deleteAcceptanceCriterion(
   }
 }
 
+export async function reinstateAcceptanceCriterion(
+  projectId: string,
+  criterionKey: string,
+): Promise<{ status: string; criterion_key: string }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/${encodeURIComponent(criterionKey)}/reinstate`,
+    { method: 'POST' },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to reinstate criterion: ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+export async function attestAcceptanceCriterion(
+  projectId: string,
+  criterionKey: string,
+  reason: string,
+): Promise<{ status: string; criterion_key: string; coverage: string }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/${encodeURIComponent(criterionKey)}/attest`,
+    { method: 'POST', body: JSON.stringify({ reason }) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to attest criterion: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : `Failed to attest criterion: ${res.status}`);
+  }
+  return data;
+}
+
+export async function linkCriteriaToDirection(
+  projectId: string,
+  directionKey: string,
+  criterionKeys: string[],
+): Promise<{ status: string; direction_key: string; criterion_keys: string[] }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/link-direction`,
+    { method: 'POST', body: JSON.stringify({ direction_key: directionKey, criterion_keys: criterionKeys }) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to link criteria to direction: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : `Failed to link criteria to direction: ${res.status}`);
+  }
+  return data;
+}
+
 export type QualifyTriggerStatus =
   | 'wrong_phase'
   | 'already_pending'
@@ -2829,6 +2930,9 @@ export interface QualificationVerdictRecord {
   promotion_error_detail?: string | null;
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
+  completion_debt?: CompletionDebtQualSnapshot | null;
+  debt_enforce_confidence_preview?: number | null;
+  debt_enforce_weight_preview?: number | null;
 }
 
 export interface QualificationVerdictsInfraContext {
@@ -3307,6 +3411,41 @@ export interface ComputeJob {
     met: boolean | null;
     cost_usd: number | null;
   }> | null;
+  // Runner identity fields — present when the job was dispatched to a registered
+  // local runner. Absent on legacy rows or cloud-dispatched jobs. Older backends
+  // may omit these fields entirely; consumers must treat absence as null.
+  runner_target_id?: string | null;
+  runner_claimed_at?: string | null;
+  awaiting_local_runner_since?: string | null;
+  runner?: {
+    id: string;
+    hostname: string | null;
+    status: string | null;
+  } | null;
+  // Original launch configuration from the task payload, projected for cloning.
+  // Absent on legacy rows where the task payload predates this field.
+  launch_params?: {
+    command?: string | null;
+    arms?: Array<{ name: string; command: string }> | null;
+    declared_metric?: string | null;
+    metric?: string | null;
+    cwd?: string | null;
+    env_keys?: string[] | null;
+    accelerator?: string | null;
+    machine_type?: string | null;
+    container_image?: string | null;
+    provisioning_model?: string | null;
+    spend_cap_usd?: number | null;
+    deadline_seconds?: number | null;
+    require_live_release?: boolean | null;
+    require_durable_artifact?: boolean | null;
+    // Provenance persisted at launch time; absent on legacy or manually-configured launches.
+    provenance?: {
+      idea?: string | null;
+      draft_notes?: string | null;
+      drafted_from_refinement?: boolean | null;
+    } | null;
+  } | null;
 }
 
 export interface ComputeJobsSummary {
@@ -3351,6 +3490,43 @@ export async function fetchHeldComputeExperiments(
   if (!res.ok) throw new Error(`Failed to fetch held compute experiments: ${res.status}`);
   const data = await res.json();
   return Array.isArray(data) ? data : (data.tasks ?? []);
+}
+
+/**
+ * A compute_experiment task held QUEUED because project policy requires local
+ * execution and no eligible runner is live. These tasks have NO ComputeJob row,
+ * so this is the only surface that exposes them. Shape mirrors the backend
+ * `_awaiting_local_runner_entry` contract in admin_compute_jobs.py.
+ */
+export interface AwaitingLocalRunnerHold {
+  id: string;
+  title: string | null;
+  awaiting_local_runner_since: string;
+  created_at: string | null;
+  requires_approval: boolean;
+  spend_cap_usd: number | null;
+  command: string | null;
+  machine_type: string | null;
+  accelerator: string | null;
+  container_image: string | null;
+  provisioning_model: string | null;
+  deadline_seconds: number | null;
+}
+
+export async function fetchAwaitingLocalRunnerHolds(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<AwaitingLocalRunnerHold[]> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs/awaiting-local-runner`,
+    undefined,
+    2,
+    20000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch awaiting-local-runner holds: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data) ? data : [];
 }
 
 export async function fetchComputeJobs(
@@ -4151,6 +4327,38 @@ export async function patchStructuralHealthSettings(patch: { structural_health_a
   }
 }
 
+export interface MetricsIntegrityObservabilityResponse {
+  ticks: number;
+  checks_run: number;
+  flags_total: number;
+  errors_total: number;
+  enrolled_total: number;
+  last_tick_at: string | null;
+  last_tick: Record<string, unknown> | null;
+  recent_ticks: Record<string, unknown>[];
+  recent_flags: Record<string, unknown>[];
+}
+
+export async function fetchMetricsIntegrityObservability(
+  signal?: AbortSignal,
+): Promise<MetricsIntegrityObservabilityResponse> {
+  const res = await apiFetch('/api/admin/evergreen/metrics-integrity-observability', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch metrics integrity observability: ${res.status}`);
+  return res.json();
+}
+
+export async function patchMetricsIntegritySettings(patch: { metrics_integrity_sweep_mode?: string }): Promise<void> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update metrics integrity settings: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update metrics integrity settings: ${res.status}`);
+  }
+}
+
 export async function declareCapabilityVerdict(
   projectId: string,
   capName: string,
@@ -4282,6 +4490,23 @@ export async function registerFleetRunner(
   return res.json();
 }
 
+/** Rotate a runner token. Returns the one-time replacement token. */
+export async function rotateFleetRunnerToken(
+  projectId: string,
+  runnerId: string,
+): Promise<FleetRunnerRegistrationResult> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/rotate-token`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to rotate runner token: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to rotate runner token: ${res.status}`);
+  }
+  return res.json();
+}
+
 /** List active (non-deleted) runners for a project. */
 export async function listFleetRunners(projectId: string): Promise<FleetRunner[]> {
   const res = await apiFetch(
@@ -4327,6 +4552,70 @@ export async function triggerTaskRollup(
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.detail || `Failed to trigger rollup: ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface CompletionDebtEntry {
+  id: string;
+  project_id: string;
+  kind: string;
+  title: string;
+  detail: string | null;
+  status: 'open' | 'dismissed' | 'resolved';
+  dismiss_reason: string | null;
+  created_at: string;
+  dismissed_at: string | null;
+  resolved_at: string | null;
+}
+
+/** List completion-debt entries for a project. */
+export async function fetchCompletionDebts(
+  projectId: string,
+  filters?: { status?: string; kind?: string },
+): Promise<{ entries: CompletionDebtEntry[]; count: number; total_count: number }> {
+  const params = new URLSearchParams();
+  if (filters?.status) params.set('status', filters.status);
+  if (filters?.kind) params.set('kind', filters.kind);
+  const qs = params.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/completion-debts${qs ? `?${qs}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to fetch completion debts: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Dismiss a completion-debt entry with a reason. */
+export async function dismissCompletionDebt(
+  projectId: string,
+  debtId: string,
+  reason: string,
+): Promise<{ status: string; entry: CompletionDebtEntry }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/completion-debts/${encodeURIComponent(debtId)}/dismiss`,
+    { method: 'POST', body: JSON.stringify({ reason }), headers: { 'Content-Type': 'application/json' } },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to dismiss completion debt: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Resolve a completion-debt entry (mark work complete). */
+export async function resolveCompletionDebt(
+  projectId: string,
+  debtId: string,
+): Promise<{ status: string; entry: CompletionDebtEntry }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/completion-debts/${encodeURIComponent(debtId)}/resolve`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to resolve completion debt: ${res.status}`);
   }
   return res.json();
 }

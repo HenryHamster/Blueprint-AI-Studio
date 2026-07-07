@@ -81,25 +81,24 @@ async def cost_summary(
     by_type: Dict[str, Any] = {}
     total_cost = 0.0
 
-    # Fetch raw rows and aggregate in Python so the query is dialect-agnostic
-    # (func.greatest and func.extract('epoch', interval) are PostgreSQL-only).
-    raw_rows = (
-        await session.execute(
-            select(
-                Task.provider,
-                Task.vm_spot,
-                Task.vm_machine_type,
-                Task.vm_provisioned_at,
-                Task.vm_stopped_at,
-            ).where(
-                Task.created_at >= cutoff,
-                Task.vm_provisioned_at.is_not(None),
-                Task.vm_stopped_at.is_not(None),
-            )
+    # Stream rows to avoid loading the full date range into memory at once.
+    # (func.greatest and func.extract('epoch', interval) are PostgreSQL-only so
+    # aggregation stays in Python; yield_per caps the per-fetch batch size.)
+    stream = await session.stream(
+        select(
+            Task.provider,
+            Task.vm_spot,
+            Task.vm_machine_type,
+            Task.vm_provisioned_at,
+            Task.vm_stopped_at,
+        ).where(
+            Task.created_at >= cutoff,
+            Task.vm_provisioned_at.is_not(None),
+            Task.vm_stopped_at.is_not(None),
         )
-    ).all()
+    )
 
-    for row in raw_rows:
+    async for row in stream:
         provider = row.provider
         vm_spot = row.vm_spot
         machine_type = row.vm_machine_type
@@ -190,7 +189,6 @@ async def get_auto_remediation_config(
                         Task.status,
                         Task.title,
                         Task.auto_remediation,
-                        Task.context,
                         Task.created_at,
                         raiseload=True,
                     )
@@ -222,15 +220,31 @@ async def get_auto_remediation_config(
         else None
     )
 
+    # Only the 5 most-recent preview rows expose ci_failure_branch, so fetch the
+    # (large) context JSONB just for those ids in a narrow second query rather
+    # than materializing context for all 500 rows scanned above. The counts and
+    # success rate computed above need no JSONB and are derived without it.
+    preview_tasks = auto_tasks[:5]
+    branch_by_id: Dict[Any, str] = {}
+    if preview_tasks:
+        preview_ids = [t.id for t in preview_tasks]
+        ctx_rows = (
+            await session.execute(
+                select(Task.id, Task.context).where(Task.id.in_(preview_ids))
+            )
+        ).all()
+        for row in ctx_rows:
+            branch_by_id[row[0]] = (row[1] or {}).get("ci_failure_branch", "")
+
     recent_tasks_data = [
         {
             "id": str(t.id),
             "title": t.title or "",
             "status": t.status,
-            "branch": (t.context or {}).get("ci_failure_branch", ""),
+            "branch": branch_by_id.get(t.id, ""),
             "created_at": t.created_at.isoformat() if t.created_at else None,
         }
-        for t in auto_tasks[:5]
+        for t in preview_tasks
     ]
 
     return {

@@ -22,6 +22,7 @@ from app.database import AsyncSessionLocal
 from app.lifecycle import (
     _BACKGROUND_CRASH_EPISODE_THRESHOLD,
     _BACKGROUND_CRASH_EPISODE_WINDOW_SECONDS,
+    _emit_crash_alert,
     _emit_crash_episode_alert,
     _evaluate_reaper_stall,
     _record_crash_and_count,
@@ -159,6 +160,107 @@ class TestCrashEpisodeAlertEmission:
             .all()
         )
         assert len(alerts) == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-crash WARNING-Alert emission — exercises _emit_crash_alert (batched query)
+# ---------------------------------------------------------------------------
+
+
+class TestCrashAlertEmission:
+    @pytest.mark.asyncio
+    async def test_emits_alert_per_project(self, db_session):
+        """On a crash one WARNING Alert is created per project."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        created = await _emit_crash_alert(
+            AsyncSessionLocal, "orchestrator", "something went wrong"
+        )
+        assert created == 1
+
+        alerts = (
+            (
+                await db_session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.title == "Background service crashed: orchestrator",
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1
+        assert alerts[0].severity == AlertSeverity.ERROR
+        assert "something went wrong" in alerts[0].message
+
+    @pytest.mark.asyncio
+    async def test_deduped_when_open_alert_exists(self, db_session):
+        """A second crash does not create a duplicate alert while one is open."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        first = await _emit_crash_alert(
+            AsyncSessionLocal, "orchestrator", "crash 1"
+        )
+        second = await _emit_crash_alert(
+            AsyncSessionLocal, "orchestrator", "crash 2"
+        )
+        assert first == 1
+        assert second == 0
+
+        alerts = (
+            (
+                await db_session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project.id,
+                        Alert.title == "Background service crashed: orchestrator",
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_projects_returns_zero(self, db_session):
+        """When there are no projects, _emit_crash_alert returns 0 without error."""
+        created = await _emit_crash_alert(
+            AsyncSessionLocal, "reaper", "crash"
+        )
+        assert created == 0
+
+    @pytest.mark.asyncio
+    async def test_cause_truncated_to_300_chars(self, db_session):
+        """A cause string longer than 300 chars is truncated in the alert message."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        long_cause = "x" * 500
+        await _emit_crash_alert(AsyncSessionLocal, "reaper", long_cause)
+
+        alerts = (
+            (
+                await db_session.execute(
+                    select(Alert).where(Alert.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1
+        assert "x" * 300 in alerts[0].message
+        assert "x" * 301 not in alerts[0].message
 
 
 # ---------------------------------------------------------------------------

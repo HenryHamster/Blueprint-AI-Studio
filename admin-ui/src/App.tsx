@@ -1,4 +1,4 @@
-import { useMemo, useRef, useEffect, useState, useCallback } from 'react';
+import { useMemo, useRef, useEffect, useState, useCallback, lazy, Suspense } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Activity, AlertCircle, CheckSquare, LayoutList, PanelRightOpen } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
@@ -11,7 +11,7 @@ import { ResearchBrowser } from './components/ResearchBrowser';
 import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL } from './api';
-import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBackendLastSeen, resolveLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
+import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
 import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
@@ -43,8 +43,10 @@ import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
-import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type ProjectSection, type RuntimeSection, type RuntimeSettingsSection } from './components/OperatorWorkspaces';
-import { PipelineWorkspace } from './components/PipelineWorkspace';
+import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './components/OperatorWorkspaces';
+const ProjectWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.ProjectWorkspace })));
+const RuntimeWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.RuntimeWorkspace })));
+const PipelineWorkspace = lazy(() => import('./components/PipelineWorkspace').then(m => ({ default: m.PipelineWorkspace })));
 import { WorkbenchFrame, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
@@ -52,6 +54,7 @@ import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
 import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
+import { useVersionLifecycle, hasVersionLifecycleData } from './hooks/useVersionLifecycle';
 import { checkInStrategicSession, startStrategicSession, stopStrategicSession, updateStrategicWorkbenchState, type StrategicResidentRunnerOption, type StrategicResidentSessionSnapshot, type StrategicStateAttentionItem, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
@@ -64,7 +67,7 @@ type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 type PipelineDirectionOption = { id: string; text: string };
 const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];
 const PROJECT_SECTION_ORDER: readonly ProjectSection[] = ['running-update', 'directions', 'problem-model', 'design-doc', 'manage'];
-const RUNTIME_SECTION_ORDER: readonly RuntimeSection[] = ['health', 'devices', 'compute', 'accounts', 'settings', 'analytics'];
+const RUNTIME_SECTION_ORDER: readonly RuntimeSection[] = ['health', 'devices', 'compute', 'accounts', 'settings', 'analytics', 'version-lifecycle'];
 const ACTIVE_TASK_STATUS_FILTER = STATUS_OPTIONS.map(option => option.value);
 
 function cycleSection<T extends string>(sections: readonly T[], current: T, direction: -1 | 1): T {
@@ -82,9 +85,10 @@ function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
   const refreshMessagesRef = useRef<() => void>(() => {});
+  const refreshFleetRunnersRef = useRef<() => void>(() => {});
   const [messageRealtimeRefreshSignal, setMessageRealtimeRefreshSignal] = useState(0);
   refreshMessagesRef.current = () => setMessageRealtimeRefreshSignal(value => value + 1);
-  const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef });
+  const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef });
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);
   const pipelineContextRequestRef = useRef(0);
@@ -241,21 +245,18 @@ export default function App() {
     if (!selectedProjectId) return;
     const pid = selectedProjectId; // narrowed to string
     try {
-      const params = new URLSearchParams({ project_id: pid, status: 'open', limit: '100' });
-      const [res, backendTs] = await Promise.all([
-        apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`),
-        fetchBackendLastSeen(pid),
-      ]);
+      // Use the lightweight counts endpoint — returns only integers, no message previews.
+      const localTs = loadLastSeen(s.user?.email, pid);
+      const params = new URLSearchParams({ project_id: pid });
+      if (localTs !== null) params.set('last_seen_ms', String(localTs));
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/counts?${params}`);
       if (!res.ok || signal.aborted) return;
       const data = await res.json();
-      const msgs: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }> = data.messages ?? [];
       if (!signal.aborted) {
-        const noisePrefs = closedPanelNoisePrefsRef.current;
-        const tempMutes = closedPanelTempMutesRef.current;
-        setOpenMessageCount(countHighSignalMessages(msgs, noisePrefs, tempMutes));
-        const localTs = loadLastSeen(s.user?.email, pid);
-        const lastSeenTs = resolveLastSeen(localTs, backendTs);
-        setNewSinceLastVisit(countNewSinceLastVisit(msgs, lastSeenTs, noisePrefs, tempMutes));
+        setOpenMessageCount(
+          (data.blocker ?? 0) + (data.question ?? 0) + (data.bug_report ?? 0) + (data.feedback ?? 0) + (data.high_signal_note ?? 0),
+        );
+        setNewSinceLastVisit(data.unread ?? 0);
       }
     } catch { /* ignore */ }
   }, {
@@ -308,7 +309,7 @@ export default function App() {
     const pid = selectedProjectId;
     let cancelled = false;
     apiFetch(
-      `${API_BASE_URL}/api/admin/tasks?task_type=research&archived=false&limit=500&project_id=${encodeURIComponent(pid)}`,
+      `${API_BASE_URL}/api/admin/tasks?archived=false&limit=500&project_id=${encodeURIComponent(pid)}`,
     )
       .then(async res => {
         if (!res.ok || cancelled) return;
@@ -650,13 +651,15 @@ export default function App() {
     return [...base, ...extra];
   }, [s.columnPrefs]);
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const columnMap = useMemo(() => new Map<string, typeof COLUMNS[number]>(COLUMNS.map(c => [c.id, c])), []);
   const visibleColumns = useMemo(() => {
     return effectiveColumnPrefs
       .filter(pref => pref.visible)
-      .map(pref => COLUMNS.find(c => c.id === pref.id))
+      .map(pref => columnMap.get(pref.id))
       .filter((c): c is typeof COLUMNS[number] => !!c)
       .filter(col => col.includes.some(status => ACTIVE_TASK_STATUS_FILTER.includes(status)));
-  }, [effectiveColumnPrefs]);
+  }, [effectiveColumnPrefs, columnMap]);
 
   const stuckTaskIds = useMemo(() => new Set((s.diagnostics?.stuck_tasks ?? []).filter((st: { task_id: string; stuck_for_seconds: number }) => st.stuck_for_seconds >= s.stuckMinSeconds).map((st: { task_id: string }) => st.task_id)), [s.diagnostics, s.stuckMinSeconds]);
   const dateRangeCutoffs: Record<string, number> = { '1h': 3600000, '6h': 21600000, '24h': 86400000, '7d': 604800000 };
@@ -717,11 +720,22 @@ export default function App() {
   }, [addTaskLookupToast, handleOpenTaskDetails, taskLookupTasks]);
 
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
-  const visibleActiveTasks = useMemo(() => filteredTasks.filter(t => ACTIVE_PIPELINE_STATUSES.has(t.status)), [filteredTasks]);
-  const visibleQueuedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'QUEUED'), [filteredTasks]);
-  const visibleBlockedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'BLOCKED'), [filteredTasks]);
-  const visibleFailedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'FAILED'), [filteredTasks]);
-  const visibleTerminalTasks = useMemo(() => filteredTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [filteredTasks]);
+  const { visibleActiveTasks, visibleQueuedTasks, visibleBlockedTasks, visibleFailedTasks, visibleTerminalTasks } = useMemo(() => {
+    const active: typeof filteredTasks = [];
+    const queued: typeof filteredTasks = [];
+    const blocked: typeof filteredTasks = [];
+    const failed: typeof filteredTasks = [];
+    const terminal: typeof filteredTasks = [];
+    for (const t of filteredTasks) {
+      if (ACTIVE_PIPELINE_STATUSES.has(t.status)) active.push(t);
+      if (t.status === 'QUEUED') queued.push(t);
+      if (t.status === 'BLOCKED') blocked.push(t);
+      if (t.status === 'FAILED') failed.push(t);
+      if (TERMINAL_STATUSES.has(t.status)) terminal.push(t);
+    }
+    return { visibleActiveTasks: active, visibleQueuedTasks: queued, visibleBlockedTasks: blocked, visibleFailedTasks: failed, visibleTerminalTasks: terminal };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredTasks]);
   const backendPipelineAttentionItems = useMemo(() => {
     const byTaskId = new Map<string, StrategicStateAttentionItem>();
     (strategicReadModel.data?.attention?.items ?? []).forEach(item => {
@@ -771,6 +785,8 @@ export default function App() {
   const [projectManageSection, setProjectManageSection] = useState<ProjectManageSection>('overview');
   const [runtimeSection, setRuntimeSection] = useState<RuntimeSection>('health');
   const [runtimeConfigSection, setRuntimeConfigSection] = useState<RuntimeSettingsSection>('orchestrator');
+  const { versionLifecycle, versionLifecycleError, versionLifecycleLastSuccessAt, versionLifecycleRefreshing, refreshVersionLifecycle } = useVersionLifecycle(s.selectedProjectId);
+  const hasVersionLifecycle = hasVersionLifecycleData(versionLifecycle);
   const { setActiveTab: setPrimaryTab, setShowArchive: setArchiveVisible, setViewMode: setTaskViewMode } = s;
   const applyPipelineSection = useCallback((section: PipelineSection) => {
     setPipelineSection(section);
@@ -788,11 +804,14 @@ export default function App() {
       return true;
     }
     if (activeTab === 'runtime') {
-      setRuntimeSection(cycleSection(RUNTIME_SECTION_ORDER, runtimeSection, direction));
+      const visibleRuntimeSections = RUNTIME_SECTION_ORDER.filter(
+        s => s !== 'version-lifecycle' || hasVersionLifecycle,
+      );
+      setRuntimeSection(cycleSection(visibleRuntimeSections, runtimeSection, direction));
       return true;
     }
     return false;
-  }, [activeTab, applyPipelineSection, pipelineSection, projectSection, runtimeSection]);
+  }, [activeTab, applyPipelineSection, hasVersionLifecycle, pipelineSection, projectSection, runtimeSection]);
   useEffect(() => {
     if (!selectedProjectId || !strategicWorkbenchState?.active_surface) return;
     if (strategicWorkbenchOperatorSurfaceTouchedRef.current) return;
@@ -911,6 +930,18 @@ export default function App() {
     anyAutonomousEnabled: s.projects.some(p => p.autonomous_enabled),
     onPauseAllAutonomous: s.handlePauseAllAutonomous,
     onRestartOrchestrator: s.handleRestartOrchestrator,
+    directionChurnWindowCycles: s.directionChurnWindowCycles,
+    onUpdateDirectionChurnWindowCycles: s.updateDirectionChurnWindowCycles,
+    directionChurnNonMergeThreshold: s.directionChurnNonMergeThreshold,
+    onUpdateDirectionChurnNonMergeThreshold: s.updateDirectionChurnNonMergeThreshold,
+    directionChurnMinMergeRate: s.directionChurnMinMergeRate,
+    onUpdateDirectionChurnMinMergeRate: s.updateDirectionChurnMinMergeRate,
+    directionLifetimeNonMergeThreshold: s.directionLifetimeNonMergeThreshold,
+    onUpdateDirectionLifetimeNonMergeThreshold: s.updateDirectionLifetimeNonMergeThreshold,
+    directionLifetimeMinMergeRate: s.directionLifetimeMinMergeRate,
+    onUpdateDirectionLifetimeMinMergeRate: s.updateDirectionLifetimeMinMergeRate,
+    directionReviewRecommendationThreshold: s.directionReviewRecommendationThreshold,
+    onUpdateDirectionReviewRecommendationThreshold: s.updateDirectionReviewRecommendationThreshold,
     githubAccount: s.githubAccount,
     onConnectGitHub: s.connectGitHub,
     maxPlanAccounts: s.maxPlanAccounts,
@@ -995,6 +1026,7 @@ export default function App() {
     onUpdateIntegrationBranch: s.handleUpdateIntegrationBranch,
     promotionTargetData: s.promotionTargetData,
     onUpdatePromotionTarget: s.handleUpdatePromotionTarget,
+    selectedProjectOnboardingProof: selectedProject?.onboarding_proof ?? null,
   };
 
   // activeTab drives the four operator modes: Strategic, Pipeline, Project, Runtime.
@@ -1122,6 +1154,7 @@ export default function App() {
   const workbenchCommands = useWorkbenchCommands({
     selectedProjectId: s.selectedProjectId,
     selectedProjectRepoLabel,
+    hasVersionLifecycle,
     directionsCount: directions.length,
     filteredTaskCount: filteredTasks.length,
     visibleActiveCount: visibleActiveTasks.length,
@@ -1400,6 +1433,7 @@ export default function App() {
         health={s.orchestratorHealth}
         detailedHealth={s.detailedHealth}
         pipelineThrottle={s.pipelineThrottle}
+        gatedTaskTypes={s.gatedTaskTypes}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
       />
       <CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} />
@@ -1579,6 +1613,7 @@ export default function App() {
         </WorkbenchSurface>
       ) : activeTab === 'project' ? (
         <ErrorBoundary level="panel">
+          <Suspense fallback={null}>
           <ProjectWorkspace
             projectSection={projectSection}
             onProjectSectionChange={setProjectSection}
@@ -1600,9 +1635,11 @@ export default function App() {
             onViewKnowledge={(dirId) => { setKnowledgeBrowserDirectionId(dirId); s.setShowKnowledgeBrowser(true); }}
             onNavigateToTask={handleViewTaskById}
           />
+          </Suspense>
         </ErrorBoundary>
       ) : activeTab === 'runtime' ? (
         <ErrorBoundary level="panel">
+          <Suspense fallback={null}>
           <RuntimeWorkspace
             runtimeSection={runtimeSection}
             onRuntimeSectionChange={setRuntimeSection}
@@ -1631,17 +1668,31 @@ export default function App() {
               s.setComputeExperiment(defaultComputeExperimentForm());
               s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
             }}
+            onCloneExperiment={(form) => {
+              s.setComputeExperiment(form);
+              s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
+            }}
             onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             onConfigureTargets={handleConfigureTargets}
             onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task - investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })}
             onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })}
+            gatedTaskTypes={s.gatedTaskTypes}
             onApproveExperiment={s.handleApprove}
             onDismissExperiment={s.handleDismiss}
             onNavigateToKnowledge={(docId) => { setKnowledgeBrowserInitialDocId(docId); s.setShowKnowledgeBrowser(true); }}
             onRestartOrchestrator={s.handleRestartOrchestrator}
+            fleetRunnersRefreshSignal={s.fleetRunnersRefreshSignal}
+            addToast={s.addToast}
+            versionLifecycle={versionLifecycle}
+            versionLifecycleError={versionLifecycleError}
+            versionLifecycleLastSuccessAt={versionLifecycleLastSuccessAt}
+            versionLifecycleRefreshing={versionLifecycleRefreshing}
+            refreshVersionLifecycle={refreshVersionLifecycle}
           />
+          </Suspense>
         </ErrorBoundary>
       ) : (
+        <Suspense fallback={null}>
         <PipelineWorkspace
           surface={{
             pipelineSection,
@@ -1679,6 +1730,7 @@ export default function App() {
           }}
           flow={{
             tasks: filteredTasks,
+            loading: s.initialLoading,
             hasActiveFilters,
             onViewLogs: handleOpenTaskDetails,
             onNavigateToParent: (parentTaskId) => {
@@ -1771,6 +1823,7 @@ export default function App() {
             onUntrackAll: s.untrackAll,
           }}
         />
+        </Suspense>
       )}
       </WorkbenchFrame>
 
@@ -1845,6 +1898,11 @@ export default function App() {
           preflightResult={s.preflightResult}
           preflightLoading={s.preflightLoading}
           preflightError={s.preflightError}
+          ideaText={s.ideaText}
+          setIdeaText={s.setIdeaText}
+          draftNotes={s.draftNotes}
+          setDraftNotes={s.setDraftNotes}
+          onDraftApplied={s.onDraftApplied}
           repoOptions={s.repoOptions}
           repoLoading={s.repoLoading}
           repoError={s.repoError}
@@ -2013,6 +2071,8 @@ export default function App() {
           onViewTask={handleViewTask}
           projects={s.projects}
           selectedProjectId={s.selectedProjectId}
+          fleetRunnersRefreshSignal={s.fleetRunnersRefreshSignal}
+          live={s.wsConnected}
         />
       )}
 

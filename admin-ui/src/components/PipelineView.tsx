@@ -613,7 +613,7 @@ function RootGroup({
   );
 }
 
-export function PipelineView({ tasks, onViewLogs, hasActiveFilters, onNavigateToParent, onClearWaveDeps, onArchiveGroup, onUnarchiveTask }: PipelineViewProps) {
+export function PipelineView({ tasks, loading, onViewLogs, hasActiveFilters, onNavigateToParent, onClearWaveDeps, onArchiveGroup, onUnarchiveTask }: PipelineViewProps) {
   const forest = useMemo(() => buildForest(tasks), [tasks]);
   const allTaskIds = useMemo(() => new Set(tasks.map(t => t.id)), [tasks]);
   const taskMap = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
@@ -749,9 +749,11 @@ export function PipelineView({ tasks, onViewLogs, hasActiveFilters, onNavigateTo
         )}
         {visibleForest.length === 0 && (
           <div className="text-center text-neutral-600 text-xs py-16 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
-            {hasActiveFilters
-              ? 'No tasks match the active filters — try clearing filters to see all tasks'
-              : 'No tasks yet'}
+            {loading
+              ? 'Loading tasks...'
+              : hasActiveFilters
+                ? 'No tasks match the active filters — try clearing filters to see all tasks'
+                : 'No tasks yet'}
           </div>
         )}
         {visibleForest.map(root => (

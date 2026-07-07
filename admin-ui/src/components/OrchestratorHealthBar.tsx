@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import type { Task } from './TaskCard';
 import type { OrchestratorHealth, ProviderApisHealth } from '../types/settings';
+import type { FailingTaskTypeEntry } from '../types/diagnostics';
 import { timeAgo, parseTimestamp, formatDurationSec } from '../utils/time';
 import { apiFetch } from '../api';
 
@@ -41,6 +42,7 @@ interface OrchestratorHealthBarProps {
   lastFetchTime: number;
   tasks: Task[];
   pipelineThrottle?: PipelineThrottle | null;
+  gatedTaskTypes?: FailingTaskTypeEntry[];
   costSectionAvailable?: boolean;
 }
 
@@ -78,7 +80,7 @@ const COST_RED_THRESHOLD = 0.9;
 // progressing cycle is healthy on every surface, and degraded begins at 120s.
 const SLOW_CYCLE_THRESHOLD_SEC = 120;
 
-export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle, costSectionAvailable = false }: OrchestratorHealthBarProps) {
+export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle, gatedTaskTypes, costSectionAvailable = false }: OrchestratorHealthBarProps) {
   const [now, setNow] = useState(() => Date.now());
   const [circuitExpanded, setCircuitExpanded] = useState(false);
   const [refreshingQuota, setRefreshingQuota] = useState(false);
@@ -524,6 +526,27 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
               <span className="min-w-0 truncate">Throttled: {pipelineThrottle.detail}</span>
               {pipelineThrottle.recovery_seconds != null && ` (~${pipelineThrottle.recovery_seconds}s)`}
             </span>
+          </>
+        )}
+
+        {gatedTaskTypes && gatedTaskTypes.length > 0 && (
+          <>
+            <div className="w-px h-3 bg-neutral-800 shrink-0" />
+            <div
+              className="inline-flex max-w-full min-w-0 flex-wrap items-center gap-1 rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-xs"
+              title={`Per-type dispatch gates active: ${gatedTaskTypes.map(t => `${t.task_type} (${(t.failure_rate * 100).toFixed(0)}% failure rate, n=${t.sample_size})`).join('; ')}`}
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
+              <span className="text-amber-300 shrink-0">Gated:</span>
+              {gatedTaskTypes.map(t => (
+                <span
+                  key={t.task_type}
+                  className="font-mono text-amber-200 bg-amber-900/30 rounded px-1"
+                >
+                  {t.task_type}
+                </span>
+              ))}
+            </div>
           </>
         )}
 

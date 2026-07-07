@@ -3471,7 +3471,7 @@ describe('mid-run ./fetch provisioning for review/fix', () => {
     );
     const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('MID-RUN FETCH (./fetch)');
-    expect(prompt).toContain('./fetch direction <id>');
+    expect(prompt).toContain('./fetch direction [id]');
     expect(prompt).toContain('./fetch section <key>');
     expect(prompt).toContain('./fetch playbook <key>');
     expect(prompt).not.toContain('./fetch problem-model');

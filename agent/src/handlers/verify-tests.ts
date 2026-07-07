@@ -490,6 +490,10 @@ async function computePrDiff(
   const baseRef = `origin/${baseBranch}`;
   const addedLinesByFile: Record<string, string[]> = {};
   try {
+    // Early health check: verify git and base ref are available before computing full diff.
+    // Fails fast if the repo is not properly initialized (e.g., shallow clone without origin).
+    await execFileAsync('git', ['rev-parse', baseRef], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
+
     const namesOut = await execFileAsync('git', ['diff', '--name-only', `${baseRef}...HEAD`], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });
     const changedFiles = namesOut.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
     const diffOut = await execFileAsync('git', ['diff', '--unified=0', `${baseRef}...HEAD`], { cwd: WORKSPACE, timeoutMs: GENERIC_PROBE_TIMEOUT });

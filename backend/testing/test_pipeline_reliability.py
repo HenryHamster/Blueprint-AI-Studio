@@ -26,6 +26,7 @@ import app.orchestrator as _orch_module
 import app.shared_state as _shared_state
 from app.services import _check_evaluating_timeouts
 from app.models import Project, Task, TaskStatus
+from fastapi import HTTPException as _HTTPException
 
 # ── SQLite JSONB compatibility ────────────────────────────────────────────────
 
@@ -109,6 +110,7 @@ async def orch_db(mocker):
     )
 
     mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+    mocker.patch("app.dep_lifecycle.AsyncSessionLocal", _Session)
 
     # Patch app.main functions imported lazily by orchestrator_worker()
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
@@ -585,16 +587,16 @@ async def test_ci_polling_deleted_pr_fails_task(orch_db, mocker):
     await session.refresh(ci_task)
     task_id = ci_task.id
 
-    # Simulate a deleted PR (GitHub returns 404)
-    class _NotFoundError(Exception):
-        status_code = 404
-
+    # Simulate a deleted PR (GitHub returns 404). Use HTTPException to match
+    # what get_pull_request actually raises so the except HTTPException handler
+    # fires (not the outer generic handler where record_task_result is unbound).
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         return_value=("fake-token", "owner", "repo"),
     )
     mocker.patch(
-        "app.github.get_pull_request", side_effect=_NotFoundError("PR not found")
+        "app.github.get_pull_request",
+        side_effect=_HTTPException(status_code=404, detail="PR not found"),
     )
 
     await _run_one_cycle(mocker)
@@ -645,6 +647,8 @@ async def test_ci_polling_deleted_pr_creates_alert(orch_db, mocker):
     await session.commit()
     await session.refresh(ci_task)
 
+    # Use a custom exception with status_code=404 (not HTTPException) so the
+    # generic except-Exception handler fires, which emits an alert containing "404".
     class _NotFoundError(Exception):
         status_code = 404
 

@@ -30,8 +30,10 @@ vi.mock('../prompt.js', () => ({
 }));
 vi.mock('./strategic-helpers.js', () => ({ writeStrategicHelpers: vi.fn() }));
 vi.mock('../providers/runners.js', () => ({
-  startResidentClaudeSession: vi.fn(),
   provisionAmbientHelpers: vi.fn(),
+}));
+vi.mock('../providers/resident-session.js', () => ({
+  startResidentClaudeSession: vi.fn(),
 }));
 vi.mock('./strategic-sections.js', () => ({
   buildDirSummaryText: vi.fn(() => ''),

@@ -2,7 +2,6 @@ import { useState, useCallback, useRef, useMemo } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { fetchTask } from '../api';
 import { timeAgo } from '../utils/time';
-import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
 import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
 import { PRMonitorSection, type OpenPR } from './PRMonitorSection';
@@ -62,8 +61,8 @@ import type { Project } from '../types/project';
 import { type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
 import { useDashboardDigest, type SparkPoint } from '../hooks/useDashboardDigest';
 import { useOpenPRs } from '../hooks/useOpenPRs';
-import { useVersionLifecycle } from '../hooks/useVersionLifecycle';
 import { useProjectMetrics } from '../hooks/useProjectMetrics';
+import type { FailingTaskTypeEntry } from '../types/diagnostics';
 
 // Dashboard reads DirectionPortfolioSection's `DirectionProgress` shape off
 // `direction_progress`, so it instantiates the generic canonical type with it.
@@ -102,6 +101,7 @@ export interface DashboardHomeProps {
   onConfigureTargets?: () => void;
   onSpawnOrphanFix?: (pr: OpenPR) => void;
   onPanelReviewPr?: (pr: OpenPR) => void;
+  gatedTaskTypes?: FailingTaskTypeEntry[];
   userRole?: 'admin' | 'user' | null;
 }
 
@@ -115,7 +115,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, userRole }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, gatedTaskTypes }: DashboardHomeProps) {
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [windowHours, setWindowHours] = useState(24);
   const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
@@ -144,7 +144,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
 
   const { digest, digestStale, loading, lastFetchError, sparkData, refetchDigest } = useDashboardDigest(selectedProjectId, windowHours, activeCount, queuedCount);
   const { openPRs, openPRsStale, openPRsDegraded, openPRsIntegrationBranch, openPRsPromotionTarget, openPRsRefreshing, fetchOpenPRs } = useOpenPRs(selectedProjectId);
-  const { versionLifecycle, versionLifecycleError, versionLifecycleLastSuccessAt, versionLifecycleRefreshing, refreshVersionLifecycle } = useVersionLifecycle(selectedProjectId);
   const {
     measurementData,
     scopeBaselines,
@@ -288,7 +287,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
       </div>
 
       {/* Anomaly Throttle Banner */}
-      <AnomalyThrottleBanner digest={digest} onRestored={refetchDigest} />
+      <AnomalyThrottleBanner digest={digest} onRestored={refetchDigest} gatedTaskTypes={gatedTaskTypes} />
 
       {/* System Health — actionable issues with remediation hints */}
       <SystemHealthCard
@@ -304,21 +303,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
 
       {/* Viewport Debt — only relevant for the self-repo; backend always scans Blueprint's own admin-ui */}
       {selectedProjectId && selectedProject?.is_self_repo && <ViewportDebtPanel projectId={selectedProjectId} />}
-
-      {/* Version Lifecycle */}
-      {selectedProjectId && (
-        <VersionLifecyclePanel
-          data={versionLifecycle}
-          loading={loading}
-          projectId={selectedProjectId}
-          onRefresh={refreshVersionLifecycle}
-          userRole={userRole}
-          refreshError={versionLifecycleError}
-          lastSuccessfulRefreshAt={versionLifecycleLastSuccessAt}
-          refreshing={versionLifecycleRefreshing}
-          agentServingShas={agentServingShas}
-        />
-      )}
 
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />

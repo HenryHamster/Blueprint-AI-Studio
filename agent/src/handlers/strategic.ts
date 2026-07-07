@@ -18,6 +18,7 @@ import {
   runStrategicChallenge,
   buildStrategicChallengeExecutorSection,
   blockedChallengeRecord,
+  renderStrategicFetchVerbHelpLines,
 } from './strategic-helpers.js';
 import { parseBackendTimestamp } from '../utils/time.js';
 import { reconcileDesignDocIndex } from '../utils/design-doc-presence.js';
@@ -63,7 +64,9 @@ import {
   buildDirHealthSummary,
   buildSweepComparisonSection,
   buildCiComplianceSection,
+  buildCompletionDebtSection,
   buildPayloadStalenessSection,
+  buildResidentExamLeadsSection,
 } from './strategic-sections.js';
 
 /**
@@ -293,6 +296,11 @@ export async function handleStrategic(
     const openMessages = Array.isArray(payload.open_messages)
       ? payload.open_messages as Array<Record<string, unknown>>
       : [];
+    // Trim-proof inbox depth: shipped at critical tier so it survives even when
+    // open_messages itself is dropped under byte budget pressure.
+    const openMessageCount = typeof payload.open_message_count === 'number'
+      ? payload.open_message_count
+      : openMessages.length;
 
     const visionJson = vision && Object.keys(vision).length > 0
       ? JSON.stringify(vision, null, 2)
@@ -310,12 +318,18 @@ export async function handleStrategic(
       ? payload.held_directions as Array<Record<string, unknown>>
       : [];
 
+    const residentExamLeads = Array.isArray(payload.resident_exam_leads)
+      ? payload.resident_exam_leads as Array<Record<string, unknown>>
+      : [];
+
     const systemMaturitySection = buildSystemMaturitySection(systemMaturity);
     const driftSection = buildDriftSection(driftSignals);
     const heldDirectionsSection = buildHeldDirectionsSection(heldDirections);
+    const residentExamLeadsSection = buildResidentExamLeadsSection(residentExamLeads);
 
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
     const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
+    const completionDebtSection = buildCompletionDebtSection(payload.open_completion_debt);
 
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
     const outcomeSection = buildOutcomeSection(outcomeEval);
@@ -510,6 +524,49 @@ export async function handleStrategic(
     // wholesale; both forms land in payload._packer_meta. Render them so the
     // agent knows what's available-but-not-shipped and can call ./fetch.
     const packerMeta = payload._packer_meta as Record<string, unknown> | undefined;
+    // Sections whose recovery path is the generic section-fetch endpoint carry a
+    // `fetch_verb` of "sections" in the packer meta. Render the command with the
+    // section name so the strategist gets an actionable `./fetch sections <name>`.
+    const SECTION_FETCH_VERB = 'sections';
+    const sectionFetchHint = (sectionName: string): string =>
+      `./fetch sections ${sectionName}`;
+    // Build the "; run ... " recovery clause for a packer-meta record. When the
+    // fetch verb is the generic section verb, emit the exact `./fetch sections <name>`
+    // CLI command — 'sections' is a real FetchVerb granted to strategic agents.
+    const recoveryClause = (fetchVerb: string, key: string, tail: string): string => {
+      if (!fetchVerb) return '';
+      if (fetchVerb === SECTION_FETCH_VERB) {
+        return `; run \`./fetch sections ${key}\` ${tail}`;
+      }
+      return `; run \`./fetch ${fetchVerb}\` ${tail}`;
+    };
+    // Maps each strategic payload key to the ./fetch command that recovers it.
+    const PAYLOAD_KEY_FETCH_VERB: Record<string, string> = {
+      'problem_model':              './fetch problem-model',
+      'directions_summary':         './fetch direction',
+      'staged_directions':          './fetch direction',
+      'open_messages':              './fetch message',
+      'knowledge_index':            './fetch knowledge',
+      'version_phase':              './fetch version-phase',
+      'design_doc':                 './fetch section <key>',
+      'capability_trial_verdicts':  './fetch capability-trials',
+      'compute_experiment_sweeps':  './fetch compute-sweeps',
+      'efficiency_snapshot':        './fetch efficiency-snapshot',
+      'ci_compliance':              './fetch ci-compliance',
+      'open_completion_debt':       './fetch completion-debt',
+      // sections-type keys: served by /api/agent/projects/{id}/sections/{name}.
+      // retirement_deferrals is intentionally omitted: it has no recovery path
+      // (SECTION_FETCH_INVENTORY maps it to None), so advertising any fetch
+      // would mislead.
+      'self_reflection_log':        sectionFetchHint('self_reflection_log'),
+      'anomaly_summary':            sectionFetchHint('anomaly_summary'),
+      'playbook_summary':           sectionFetchHint('playbook_summary'),
+      'retired_directions_summary': sectionFetchHint('retired_directions_summary'),
+      'rejected_proposals':         sectionFetchHint('rejected_proposals'),
+      'past_retirement_critiques':  sectionFetchHint('past_retirement_critiques'),
+      'previous_decision_outcomes': sectionFetchHint('previous_decision_outcomes'),
+      'outcome_evaluation':         sectionFetchHint('outcome_evaluation'),
+    };
     const renderPackerMeta = (meta: Record<string, unknown> | undefined): string => {
       if (!meta) return '';
       const trimmed = Array.isArray(meta.trimmed) ? meta.trimmed as Array<Record<string, unknown>> : [];
@@ -521,13 +578,19 @@ export async function handleStrategic(
         for (const t of trimmed) {
           const k = strVal(t.key, '?');
           const kind = strVal(t.kind, 'summarized');
+          const bytesOrig = typeof t.bytes_original === 'number'
+            ? ` (${t.bytes_original}→${typeof t.bytes_trimmed === 'number' ? t.bytes_trimmed : '?'} bytes)` : '';
+          const fetchVerb = strVal(t.fetch_verb);
+          const recovery = recoveryClause(fetchVerb, k, 'for full detail');
           if (kind === 'list_trimmed') {
             const shown = (t.shown as number | undefined) ?? '?';
             const total = (t.total as number | undefined) ?? '?';
-            lines.push(`  - ${k}: showing ${shown} of ${total} entries`);
+            lines.push(`  - ${k}: showing ${shown} of ${total} entries${bytesOrig}${recovery}`);
           } else {
-            lines.push(`  - ${k}: shipped in summarized form`);
+            lines.push(`  - ${k}: shipped in ${kind} form${bytesOrig}${recovery}`);
           }
+          const fetchHint = PAYLOAD_KEY_FETCH_VERB[k];
+          if (fetchHint) lines.push(`    → ${fetchHint}`);
         }
       }
       if (dropped.length > 0) {
@@ -535,20 +598,14 @@ export async function handleStrategic(
         for (const d of dropped) {
           const k = strVal(d.key, '?');
           const reason = strVal(d.reason, 'budget exhausted');
-          lines.push(`  - ${k}: ${reason}`);
+          const bytes = typeof d.bytes === 'number' ? ` (${d.bytes} bytes)` : '';
+          const fetchVerb = strVal(d.fetch_verb);
+          const recovery = recoveryClause(fetchVerb, k, 'to recover');
+          lines.push(`  - ${k}${bytes}: ${reason}${recovery}`);
+          const fetchHint = PAYLOAD_KEY_FETCH_VERB[k];
+          if (fetchHint) lines.push(`    → ${fetchHint}`);
         }
       }
-      lines.push(
-        '',
-        'To pull full detail when you need it:',
-        '  - `./fetch problem-model` — full durable problem_model for this project (use when the section was trimmed or dropped)',
-        '  - `./fetch direction <id>` — full direction record (research_history capped at 20 cycles)',
-        '  - `./fetch playbook <key>` — single playbook entry (e.g. `./fetch playbook frontend-build`)',
-        '  - `./fetch gap <id>` — single gap with full history/past_moves/evidence',
-        '  - `./fetch message <ref>` — inspect a message by short ref (8+ hex chars) or UUID, including one aged out of the live thread; then `./messages resolve <ref>` accepts the same ref',
-        '  - `./fetch section <key>` — single design_doc section, full prose/specs, presence-grounded (e.g. `./fetch section systems/auth`); the design_doc ships as a compact index so pull a section before relying on its detail',
-        '  - `./fetch version-phase` — compact current version phase/lifecycle context if version_phase/current_version was trimmed or dropped',
-      );
       return lines.join('\n');
     };
     const packerMetaSection = renderPackerMeta(packerMeta);
@@ -683,6 +740,7 @@ prompts, schemas, tools, or orchestration.` : '';
       systemMaturitySection,
       driftSection,
       heldDirectionsSection,
+      residentExamLeadsSection,
       recentWorkSection,
       feedbackSection,
       questionSection,
@@ -692,6 +750,7 @@ prompts, schemas, tools, or orchestration.` : '';
       memoCitationsSection: buildMemoCitationsSection(payload.memo_citations),
       efficiencySnapshotSection,
       ciComplianceSection,
+      completionDebtSection,
       // Shared capability vocabulary + uniform provides_capability / prerequisite
       // declaration guidance, so the strategist draws cross-lane capability refs
       // from the same registry namespace every other task type uses.
@@ -876,7 +935,7 @@ Only escalate when you literally cannot proceed without the user:
 - Ambiguous user intent where the wrong call wastes cycles
 - External blockers outside the system's control
 
-Use \`./strategic pending-confirm\` for those — it's the structured channel for blocking asks. Use \`./messages send\` for general conversation or observations. NEVER \`./messages send\` to ask "should I do X?" for coding decisions — those you make.
+Use \`./strategic pending-confirm\` for those — it's the structured channel for blocking asks. Use \`./messages send\` for general conversation or observations, and \`./messages send --stdin\` for quote-heavy or multiline replies. NEVER \`./messages send\` to ask "should I do X?" for coding decisions — those you make.
 
 If a direction is dead, retire it. If there's an obvious gap, open it. If a user asked for something, create a direction with a source citation on the gap.
 
@@ -917,6 +976,10 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # direction, stage it by id below. For a NEW next-version idea, do NOT
 # create-then-stage — pass "staged": true on create-direction (one atomic op).
 ./strategic stage-direction '{"direction_id": "d-xxx", "rationale": "why this belongs to the next version"}'
+./strategic approve-direction '{"direction_id": "d-xxx", "rationale": "..."}'
+./strategic reject-direction '{"direction_id": "d-xxx", "rationale": "..."}'
+# Reactivate a staged or user-paused direction back to active.
+./strategic activate-direction '{"direction_id": "d-xxx", "rationale": "why reactivating now"}'
 
 # REQUIRED: Submit the retired-direction critique from Section 3.5.
 # Pass a JSON array of critique objects (or the no-eligible sentinel).
@@ -987,17 +1050,33 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # the others.  "declared_metric" (required with arms) is the exact metric key each
 # arm writes to $BLUEPRINT_RESULT_FILE.
 ./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<arm A outperforms arm B on the declared metric>", "arms": [{"name": "a", "command": "<command for arm a>"}, {"name": "b", "command": "<command for arm b>"}], "declared_metric": "<metric_key>", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "direction_id": "d-xxx"}'
+# Optional fields on any spawn-task call:
+#   criterion_ids — list of criterion keys (from acceptance criteria) to link this
+#     task's merge evidence to coverage. When direction_id is also set, these are
+#     MERGED with the direction's criterion_keys (both filtered to active keys).
+#     Use this for direction-free proving spawns that should count toward coverage.
+#   acceptance_evidence — declare HOW the spawned task proves its claim; the named_test
+#     kind is the strongest signal: when the declared test runs green, the merge is
+#     credited as proven and contributes to acceptance_declaration_coverage.
+#     Without this field, a proven merge still records evidence but is not pinned to
+#     a specific test, so the coverage credit is weaker.
+# Direction-free proving spawn that contributes to criterion coverage:
+./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "criterion_ids": ["c-key-1", "c-key-2"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar"}}'
+# Direction spawn with explicit extra criterion coverage (merged with direction's own keys):
+./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "direction_id": "d-xxx", "criterion_ids": ["c-key-extra"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py"}}'
+
+# One-time fix: spawn a PR-producing task with NO direction (create/refactor/qa).
+# Fires once and lands a PR; no direction lifecycle.
+./strategic spawn-fix '{"type": "create|refactor|qa", "title": "...", "prompt": "Full implementation prompt..."}'
+
+# Dispose an open completion-debt ledger entry.
+# disposition: "resolved" (requires evidence) or "dismissed" (requires reason).
+./strategic dispose-completion-debt '{"debt_id": "...", "disposition": "resolved|dismissed", "reason": "evidence or reason"}'
 
 # Pull full detail for items the strategic packer trimmed (see "Context not
 # shipped this cycle" section in your prompt). Use only when you actually
 # need the detail — extra context hurts reasoning quality.
-./fetch problem-model              # full durable problem_model for this project
-./fetch direction <direction_id>   # full direction record
-./fetch playbook <key>             # single playbook entry (e.g., frontend-build)
-./fetch gap <gap_id>               # single problem_model gap
-./fetch message <ref>              # inspect a message by short ref (8+ hex chars) or UUID,
-                                   # even one that has aged out of the live thread
-./fetch version-phase              # compact current version phase/lifecycle context
+${renderStrategicFetchVerbHelpLines().join('\n')}
 
 # Operational Knowledge (playbook)
 # You always receive a complete index of playbook keys (playbook_keys_index) —
@@ -1013,12 +1092,15 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # NOT need to recover the full UUID out-of-band.
 ./messages resolve <ref> 'How it was addressed'
 ./messages send 'Observation or note to the user'
+./messages send --stdin <<'EOF'
+Observation or note to the user
+EOF
 \`\`\`
 
 # Existing directions (for update/retire operations)
 ${dirSummaryText}
 
-${questionSection}${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\nA message tagged \`⚠ STALE\` is a BUG_REPORT/BLOCKER citing code that no longer exists on HEAD — treat it as discounted/unproven: do NOT spawn a fix or investigation to chase it. Resolve/close it as already-fixed, or re-verify the defect still reproduces on HEAD before acting.\n${openMessagesText}\n` : ''}
+${questionSection}${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\nA message tagged \`⚠ STALE\` is a BUG_REPORT/BLOCKER citing code that no longer exists on HEAD — treat it as discounted/unproven: do NOT spawn a fix or investigation to chase it. Resolve/close it as already-fixed, or re-verify the defect still reproduces on HEAD before acting.\n${openMessagesText}\n` : openMessageCount > 0 ? `# Open Messages (inbox not shipped — ${openMessageCount} message${openMessageCount === 1 ? '' : 's'} available)\nThe open-message inbox was dropped under byte-budget pressure this cycle. Run \`./fetch message\` to retrieve the ${openMessageCount} unresolved message${openMessageCount === 1 ? '' : 's'} before responding to or resolving any operator requests.\n` : ''}
 # Strategic analysis to execute
 
 ${analysisText.slice(0, 50_000)}
@@ -1060,6 +1142,8 @@ ${proposedCriteriaBlock}
    *Optional companion:* If the Thinker's Section 3.6 recorded \`evidence_progress\` verdicts for long-running active directions, persist them with \`./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing|stalled|met","rationale":"..."}]'\`. Skip entirely when Section 3.6 is empty — this is an optional precision refinement, never a required call. **Challenge gate:** submit an \`advancing\` or \`met\` status ONLY for a (direction_id, status) pair the independent challenge APPROVED (see the "Independent strategic challenge" section above). For any direction the challenge did not approve at that exact status — or if the challenge was blocked/invalid — submit \`stalled\` (advisory, always allowed) or omit it.
 
 4.5. **Acceptance criteria (conditional).** If the proposed criteria block above is non-empty, call \`./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"\`. If the file is absent or empty, SKIP — do not fabricate a criteria list.
+
+   The payload may contain both a \`criteria\` additions array and an optional \`retract\` array. A \`retract\` item retracts or supersedes an existing **active** criterion that has become permanently uncoverable: \`{"criterion_key":"c-xxx","reason":"...","superseded_by_key":"c-yyy"}\` (\`superseded_by_key\` is optional; omit when retraction stands alone). Retractions are processed before additions. **Never fabricate retractions** — only retract when the Thinker's analysis shows the criterion is demonstrably uncoverable given the current direction portfolio.
 
 5. **Version phase / qualify siblings (conditional — do this BEFORE step 1's \`set-problem-model\` call).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key, so the file becomes:
    \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`
@@ -1117,12 +1201,18 @@ ${proposedCriteriaBlock}
         /"op"\s*:\s*"set_retirement_critiques"/.test(allOutput)
         || /\.\/strategic\s+set-retirement-critiques\b/.test(allOutput)
         || /Retirement critiques recorded/i.test(allOutput);
+      const acceptanceCriteriaSetInOutput =
+        /"op"\s*:\s*"set_acceptance_criteria"/.test(allOutput)
+        || /\.\/strategic\s+set-acceptance-criteria\b/.test(allOutput)
+        || /Acceptance criteria recorded/i.test(allOutput);
+      const proposedCriteriaRequired = proposedCriteriaBlock.length > 0;
 
-      if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateSetInOutput || !retirementCritiquesSetInOutput)) {
+      if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateSetInOutput || !retirementCritiquesSetInOutput || (proposedCriteriaRequired && !acceptanceCriteriaSetInOutput))) {
         const missing: string[] = [];
         if (!problemModelSetInOutput) missing.push('./strategic set-problem-model');
         if (!runningUpdateSetInOutput) missing.push('./strategic set-running-update');
         if (!retirementCritiquesSetInOutput) missing.push('./strategic set-retirement-critiques');
+        if (proposedCriteriaRequired && !acceptanceCriteriaSetInOutput) missing.push('./strategic set-acceptance-criteria');
         sendLog(ws, `\n[WARNING] Strategic executor completed but required calls missing: ${missing.join(', ')}. Retrying...\n`);
         const retryInstructions = [
           'Your previous attempt did not call one or more REQUIRED commands.',
@@ -1133,6 +1223,7 @@ ${proposedCriteriaBlock}
           !problemModelSetInOutput ? `- ./strategic set-problem-model "$(cat /tmp/problem_model_${taskId}.json)"  (if file missing: ${problemModelRecovery === 'fetch' ? 'run `./fetch problem-model` and edit the full model — NEVER construct a cold-start bootstrap, it wipes durable state' : 'construct from analysis grounded in the managed project — NEVER self-describe'})` : '',
           !runningUpdateSetInOutput ? `- ./strategic set-running-update /tmp/running_update_${taskId}.md  (if file missing: write a single clean markdown doc to that path first — describe the managed project's current state, NEVER self-describe)` : '',
           !retirementCritiquesSetInOutput ? `- ./strategic set-retirement-critiques '[{"direction_id":"d-xxx","what_it_addressed":"...","pattern_that_produced_it":"...","lesson":"..."}]'  OR  ./strategic set-retirement-critiques '{"no_eligible_retirements": true}'  (one of these two payloads, depending on whether there are retired directions to critique)` : '',
+          proposedCriteriaRequired && !acceptanceCriteriaSetInOutput ? `- ./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"` : '',
           '',
           'Nothing else.',
         ].filter(Boolean).join('\n');

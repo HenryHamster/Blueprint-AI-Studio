@@ -66,9 +66,37 @@ def test_record_playbook_tombstone_adds_deleted_key_once():
     deleted_keys = doc["playbook_deleted_keys"]
     assert deleted_keys == ["playbook/tip"]
     archive = doc["playbook_archive"]
+    # Idempotent: repeated tombstone for same key produces exactly one archive row
+    assert len(archive) == 1
+    assert archive[0]["_archived_key"] == "playbook/tip"
+    assert archive[0]["_retirement_reason"] == "operator_deleted"
+
+
+def test_record_playbook_tombstone_idempotent_keeps_ordinary_archive_entries():
+    """Ordinary archive entries for the same key are preserved; only operator_deleted is deduped."""
+    from app.playbook_storage import _append_archived_playbook_entry, record_playbook_tombstone
+
+    now_iso = _utcnow().isoformat()
+    doc: dict = {}
+
+    # Add an ordinary (non-operator_deleted) archive entry for the same key first
+    _append_archived_playbook_entry(
+        doc, "playbook/tip", {"_retirement_reason": "capacity"}, archived_at=now_iso
+    )
+
+    # Two tombstone calls — should produce exactly one operator_deleted row
+    record_playbook_tombstone(doc, "playbook/tip", archived_at=now_iso)
+    record_playbook_tombstone(doc, "playbook/tip", archived_at=now_iso)
+
+    deleted_keys = doc["playbook_deleted_keys"]
+    assert deleted_keys == ["playbook/tip"]
+
+    archive = doc["playbook_archive"]
+    # Ordinary entry preserved + exactly one operator_deleted row
     assert len(archive) == 2
-    assert all(entry["_archived_key"] == "playbook/tip" for entry in archive)
-    assert all(entry["_retirement_reason"] == "operator_deleted" for entry in archive)
+    reasons = [e["_retirement_reason"] for e in archive]
+    assert "capacity" in reasons
+    assert reasons.count("operator_deleted") == 1
 
 
 def test_playbook_learning_reexports_storage_helpers():

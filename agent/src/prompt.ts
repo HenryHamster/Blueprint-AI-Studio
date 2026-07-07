@@ -84,6 +84,15 @@ const READ_ONLY_BLOCK_MARKER = 'This is a read-only analysis task. Do NOT commit
 const READ_ONLY_BLOCK_HOOK = `#!/bin/sh\necho "ERROR: ${READ_ONLY_BLOCK_MARKER}" >&2\nexit 1\n`;
 const READ_ONLY_BLOCKED_HOOKS = ['pre-commit', 'pre-push'] as const;
 
+function installReadOnlyBlockHooks(hooksDir: string): void {
+  try {
+    fs.mkdirSync(hooksDir, { recursive: true });
+    for (const hook of READ_ONLY_BLOCKED_HOOKS) {
+      fs.writeFileSync(`${hooksDir}/${hook}`, READ_ONLY_BLOCK_HOOK, { mode: 0o755 });
+    }
+  } catch { /* hooks dir may not exist before clone completes */ }
+}
+
 export function configureAgentPermissions(taskType: string): string[] {
   const hooksDir = `${WORKSPACE}/.git/hooks`;
   if (isReadOnlyTaskType(taskType)) {
@@ -92,13 +101,8 @@ export function configureAgentPermissions(taskType: string): string[] {
       execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/readonly/readonly.git'], { cwd: WORKSPACE });
     } catch { /* git dir may not exist yet */ }
 
-    // Block git commit/push via hooks (backup enforcement)
-    try {
-      fs.mkdirSync(hooksDir, { recursive: true });
-      for (const hook of READ_ONLY_BLOCKED_HOOKS) {
-        fs.writeFileSync(`${hooksDir}/${hook}`, READ_ONLY_BLOCK_HOOK, { mode: 0o755 });
-      }
-    } catch { /* hooks dir may not exist before clone completes */ }
+    // Block git commit/push via hooks (backup enforcement).
+    installReadOnlyBlockHooks(hooksDir);
 
     return ['Write', 'Edit', 'NotebookEdit'];
   }
@@ -124,6 +128,21 @@ export function configureAgentPermissions(taskType: string): string[] {
     } catch { /* nothing to clear / hooks dir absent */ }
   }
   return [];
+}
+
+/**
+ * Configure the resident seat's explicit read-only posture.
+ *
+ * The resident uses a live credential helper to keep `git fetch origin`
+ * working, so we only install the inner-agent write blockers and commit/push
+ * hooks here. The remote URL itself stays untouched.
+ */
+export function configureResidentAgentPermissions(taskType: string): string[] {
+  if (!isReadOnlyTaskType(taskType)) {
+    throw new Error(`resident permissions require a read-only task type, got "${taskType}"`);
+  }
+  installReadOnlyBlockHooks(`${WORKSPACE}/.git/hooks`);
+  return ['Write', 'Edit', 'NotebookEdit'];
 }
 
 export function strVal(v: unknown, fallback = ''): string {
@@ -296,7 +315,7 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
   return hints;
 }
 
-export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. Use ./symbols <name> to find where a function or class is defined (returns file path, line, and kind). If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
+export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. Use ./symbols <name> to find where a function or class is defined (returns file path, line, and kind). If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER) or ./messages send --stdin for quote-safe multiline text.';
 
 // Shared parenthetical for every read-only handler that instructs the agent to
 // write a /tmp output file. The Write/Edit tools are stripped for read-only
@@ -467,6 +486,7 @@ fails too. Decision rule:
 
 2. **Out-of-scope and my task can ship without it?** → **Report and
    skip.** Don't side-quest. Use \`./messages send "<content>" NOTE\`
+   or \`./messages send --stdin NOTE\` for quote-heavy prose
    (types: \`NOTE\` | \`BUG_REPORT\` | \`BLOCKER\`). Include: file paths,
    rough count, effort estimate, whether anything blocks you.
 
@@ -600,6 +620,68 @@ export function shellEscapeDoubleQuoted(value: string): string {
   return value.replace(/[\\"`$]/g, '\\$&');
 }
 
+// Returns the shared bash _post_with_retry function embedded by all write-capable
+// helper scripts (messages send/resolve, playbook set, design-doc set/delete, note).
+// Provides bounded retry on 429/5xx: 4 max attempts, 5s/15s/30s backoff, Retry-After
+// honored, token re-read each attempt. Requires _load_agent_token (from agentTokenShellFn()).
+// Usage in bash: echo "$JSON" | _post_with_retry <url> <op-label>
+export function retryPostShellFn(): string {
+  return `
+_post_with_retry() {
+  local url="$1" op_label="$2"
+  local payload attempt=0 max=4 delay http_code body response dump saw_auth=0
+  payload=$(cat)
+  while [ $attempt -lt $max ]; do
+    _load_agent_token || return 1
+    dump=$(mktemp)
+    response=$(printf '%s' "$payload" | curl -sS --max-time 30 --connect-timeout 10 \\
+      -X POST "$url" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" \\
+      --data-binary @- \\
+      -D "$dump" \\
+      -w '\\n%{http_code}')
+    http_code=$(printf '%s' "$response" | tail -n1)
+    body=$(printf '%s' "$response" | head -n -1)
+    delay=$(grep -i '^retry-after:' "$dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
+    rm -f "$dump"
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+      printf '%s' "$body"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    if [ $attempt -ge $max ]; then break; fi
+    # curl emits http_code "000" on a transport-level failure (connect timeout,
+    # DNS failure, TLS handshake, dropped connection) — no HTTP response at all.
+    # Treat it as a transient failure and retry alongside 429/5xx so a network
+    # blip (or a token-budget hiccup) is not booked as a permanent failure.
+    if [ "$http_code" = "000" ] || [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
+      if [ -z "$delay" ]; then
+        if [ $attempt -eq 1 ]; then delay=5
+        elif [ $attempt -eq 2 ]; then delay=15
+        else delay=30; fi
+      fi
+      echo "[RETRY $attempt/$((max - 1))] $op_label failed (HTTP $http_code), retrying in \${delay}s..." >&2
+      sleep "$delay"
+    elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+      saw_auth=1
+      echo "[AUTH] $op_label rejected (HTTP $http_code) — re-reading rotated agent token and retrying" >&2
+      sleep 1
+    else
+      if [ -n "$body" ]; then printf '%s\\n' "$body" >&2; fi
+      echo "[ERROR] $op_label failed (HTTP $http_code, non-retryable)" >&2
+      return 1
+    fi
+  done
+  if [ "$saw_auth" -eq 1 ] && { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; }; then
+    echo "[ERROR] $op_label failed: agent token expired — restart the session." >&2
+  else
+    if [ -n "$body" ]; then printf '%s\\n' "$body" >&2; fi
+    echo "[ERROR] $op_label failed after $max attempts (HTTP $http_code)" >&2
+  fi
+  return 1
+}`;
+}
+
 export function writePlaybookHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
@@ -610,7 +692,7 @@ API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
-
+${retryPostShellFn()}
 if [ "$OP" = "get" ]; then
   printf '{"task_id":"%s","op":"get"}' "$TASK" | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
@@ -625,8 +707,7 @@ elif [ "$OP" = "set" ]; then
     '{task_id: $tid, op: "set", key: $k, value: $v}
        + (if $br == "" then {} else {branch: $br} end)
        + (if $sha == "" then {} else {head_sha: $sha} end)' | \\
-    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+    _post_with_retry "$API/api/agent/playbook" "playbook set"
 elif [ "$OP" = "list" ]; then
   printf '{"task_id":"%s","op":"list"}' "$TASK" | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
@@ -635,7 +716,9 @@ else
   echo "Error: unsupported playbook operation: $OP" >&2
   exit 1
 fi
+rc=$?
 echo ""
+exit $rc
 `;
   fs.writeFileSync(`${workspace}/playbook`, helperScript, { mode: 0o755 });
   excludeAgentHelpers();
@@ -646,72 +729,43 @@ export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKS
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
 # Usage:
-#   ./messages send '<content>'                    # send a NOTE message
+#   ./messages send '<content>'                    # send a NOTE message (inline form)
+#   ./messages send --stdin [type]                 # quote-safe form; read content from stdin (pipe or heredoc), defaults to NOTE
 #   ./messages send '<content>' QUESTION           # send with specific type (NOTE|QUESTION|FEEDBACK|BUG_REPORT|BLOCKER)
 #   ./messages resolve <ref> '<resolution>'        # resolve an open message; <ref> may be a
 #                                                  #   short ref (first 8+ hex chars of the
 #                                                  #   message UUID, as shown in the admin UI)
 #                                                  #   or a full UUID — the backend resolves it,
 #                                                  #   so no need to recover the full UUID.
+# Note: send reads content from stdin so apostrophes, quotes, and newlines are safe.
 
 OP="\${1:?Usage: messages send|resolve ...}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
-CURL_OPTS="-sS --max-time 30 --connect-timeout 10"
-
-# Capture the JSON body from stdin ONCE so a 401 (rotated resident-session token)
-# can be retried after re-reading the live token — stdin is consumed on the first
-# curl and cannot be re-read.
-_post_strategic() {
-  local payload response http_code body attempt=0
-  payload=$(cat)
-  while [ $attempt -lt 2 ]; do
-    _load_agent_token || return 1
-    if ! response=$(printf '%s' "$payload" | curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" \\
-      --data-binary @- \\
-      -w '\\n%{http_code}'); then
-      return 1
-    fi
-    http_code=$(printf '%s' "$response" | tail -n1)
-    body=$(printf '%s' "$response" | head -n -1)
-    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-      printf '%s' "$body"
-      return 0
-    fi
-    # On 401/403 re-read the rotated token and retry ONCE before failing.
-    if { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; } && [ $attempt -eq 0 ]; then
-      echo "[AUTH] messages $OP rejected (HTTP $http_code) — re-reading rotated agent token and retrying once" >&2
-      attempt=$((attempt + 1))
-      continue
-    fi
-    if [ -n "$body" ]; then
-      printf '%s\\n' "$body" >&2
-    fi
-    if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
-      echo "[ERROR] messages $OP failed: agent token expired — restart the resident session (agent JWT TTL is 1h)." >&2
-    else
-      echo "[ERROR] messages $OP failed (HTTP $http_code)" >&2
-    fi
-    return 1
-  done
-  return 1
-}
-
+${retryPostShellFn()}
 if [ "$OP" = "send" ]; then
-  CONTENT="\${2:?send requires '<content>'}"
-  MSG_TYPE="\${3:-NOTE}"
-  jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" \\
-    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c}}' | \\
-    _post_strategic
+  if [ "\${2:-}" = "--stdin" ]; then
+    MSG_TYPE="\${3:-NOTE}"
+    CONTENT="$(cat)"
+  else
+    CONTENT="\${2:?send requires '<content>'}"
+    MSG_TYPE="\${3:-NOTE}"
+  fi
+  [ -n "$CONTENT" ] || { echo "Error: send requires message content" >&2; exit 1; }
+  IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
+  PAYLOAD=$(jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" --arg k "$IDEM_KEY" \\
+    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c, idempotency_key: $k}}') || {
+    echo "[ERROR] send: failed to serialize message payload" >&2; exit 1
+  }
+  printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/strategic" "messages $OP"
 elif [ "$OP" = "resolve" ]; then
   MSG_ID="\${2:?resolve requires <message-id>}"
   RESOLUTION="\${3:-Addressed}"
   jq -n --arg tid "$TASK" --arg mid "$MSG_ID" --arg r "$RESOLUTION" \\
     '{task_id: $tid, op: "resolve_message", data: {message_id: $mid, resolution: $r}}' | \\
-    _post_strategic
+    _post_with_retry "$API/api/agent/strategic" "messages $OP"
 else
   echo "Unknown op: $OP. Use send or resolve." >&2; exit 1
 fi
@@ -827,66 +881,24 @@ export function writeDesignDocHelper(
 #   ./design-doc list                     — list all section keys`;
   const usageLine = readOnly ? 'get|list' : 'get|set|delete|list';
 
-  // Durable POST for write operations (set/delete). Retries up to 3 times on
-  // 429 (lock contention / rate limit) and 5xx (transient), honoring the
-  // Retry-After header when present and falling back to linear backoff.
-  // Non-retryable responses (other 4xx) surface immediately.
-  const retryFn = readOnly ? '' : `
-_post_retry() {
-  local body="$1"
-  local attempt=0 max=3 delay http_code response dump
-  while [ $attempt -lt $max ]; do
-    # Re-read the live token each attempt so a rotated resident-session token is
-    # picked up on the 401 retry below.
-    _load_agent_token || return 1
-    dump=$(mktemp)
-    response=$(printf '%s' "$body" | \\
-      curl -sS --max-time 30 --connect-timeout 10 \\
-        -X POST "$API/api/agent/design-doc" \\
-        -H "Content-Type: application/json" \\
-        -H "X-Agent-Token: $TOKEN" \\
-        --data-binary @- \\
-        -D "$dump" \\
-        -w '\\n%{http_code}')
-    http_code=$(printf '%s' "$response" | tail -n1)
-    delay=$(grep -i '^retry-after:' "$dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
-    rm -f "$dump"
-    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-      printf '%s' "$response" | head -n -1
-      return 0
-    fi
-    attempt=$((attempt + 1))
-    if [ $attempt -ge $max ]; then break; fi
-    if [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
-      [ -z "$delay" ] && delay=$((attempt * 2))
-      echo "[RETRY $attempt/$((max - 1))] design-doc $OP failed (HTTP $http_code), retrying in \${delay}s..." >&2
-      sleep "$delay"
-    elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
-      # Rotated resident-session token — the next loop iteration re-reads the
-      # live token via _load_agent_token before retrying.
-      echo "[AUTH] design-doc $OP rejected (HTTP $http_code) — re-reading rotated agent token and retrying" >&2
-      sleep 1
-    else
-      printf '%s' "$response" | head -n -1 >&2
-      echo "[ERROR] design-doc $OP failed (HTTP $http_code, non-retryable)" >&2
-      return 1
-    fi
-  done
-  echo "[ERROR] design-doc $OP failed after $max attempts" >&2
-  return 1
-}
-`;
+  // Durable POST for write operations (set/delete). Routes through the shared
+  // _post_with_retry wrapper (4 attempts, 5s/15s/30s backoff, Retry-After honored)
+  // so 429 (lock contention) and 5xx (transient) are never silently dropped.
+  // Non-retryable 4xx responses surface immediately.
+  const retryFn = readOnly ? '' : retryPostShellFn();
   const writeBranches = readOnly ? `elif [ "$OP" = "set" ] || [ "$OP" = "delete" ]; then
   echo "Error: ./design-doc is read-only in this workspace ($OP not permitted)." >&2; exit 1` : `elif [ "$OP" = "set" ]; then
   if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
-  _post_retry "$(printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "$TASK" "$KEY" "$VALUE")"
+  printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "$TASK" "$KEY" "$VALUE" | \\
+    _post_with_retry "$API/api/agent/design-doc" "design-doc set"
 elif [ "$OP" = "delete" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  _post_retry "$(printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY")"`;
+  printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY" | \\
+    _post_with_retry "$API/api/agent/design-doc" "design-doc delete"`;
   const unknownUsage = readOnly ? 'Use get or list.' : 'Use get, set, delete, or list.';
   const helperScript = `#!/bin/bash
 # Design doc wiki tool — updates pages incrementally via API

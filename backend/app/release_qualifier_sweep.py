@@ -54,6 +54,18 @@ from app.release_stall_alerts import (
     _check_version_stabilize_stall,
 )
 from app.time_utils import _utcnow
+from app.release_qualifier_redrive import (
+    _MAX_ERROR_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
+    _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
+    _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,  # noqa: F401 — re-exported for release_qualifier
+    _TRANSIENT_ERROR_CODES,  # noqa: F401 — re-exported for tests
+    _redrive_deferred_unsynced_qualification,
+    _redrive_dry_run_candidate,
+    _redrive_error_qualification,
+    _redrive_infra_failure_qualification,
+    _redrive_not_promoted_qualification,
+    _redrive_promotion_failed_qualification,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -302,218 +314,289 @@ async def _force_finalize_sweep_crash_loop(
     )
 
 
-async def _redrive_deferred_unsynced_qualification(
+async def _reconcile_if_criterion_coverage_now_complete(
     version_id,
     *,
     session_factory=None,
 ) -> bool:
-    """Re-enter the qualifier for a version stranded in ``deferred_unsynced``.
+    """Re-qualify a not_promoted/criterion_coverage_incomplete version once coverage clears.
 
-    The qualify-on-synced gate (``release_qualifier._check_lts_sync_gate``)
-    DEFERS a candidate the promotion target is not yet absorbed into — a
-    ``main -> integration`` back-merge is still pending — and records
-    ``last_qualification.status == "deferred_unsynced"``.  The deferral is meant
-    to be retryable, but ``run_qualification`` only ever re-enters via a fresh
-    strategic ``qualify_request`` or the admin ``POST /qualify`` endpoint; there
-    is no scheduled re-driver.  So once the strategist stops re-emitting (its own
-    status reads a standing ``deferred_unsynced`` as "qualification in
-    progress"), the version strands there indefinitely — even after the
-    back-merge has made it synced — and the gate's OWN bounded fall-through never
-    fires, because that fall-through is evaluated only ON RE-ENTRY.
+    ``criterion_coverage_incomplete`` (release_scoring) means active version
+    acceptance criteria were uncovered when the candidate was scored — a state
+    that a criterion retraction / supersession (or fresh coverage evidence) can
+    clear WITHOUT the candidate SHA changing.  ``run_qualification`` caches the
+    ``not_promoted`` verdict by candidate SHA, so neither the strategist nor the
+    admin endpoint re-enters once coverage clears; the version strands
+    not_promoted with no operator in the loop — the exact deadlock the
+    acceptance-contract safety valve exists to break.
 
-    This is that missing scheduled re-driver.  For an open, stabilize-phase
-    version whose ``last_qualification.status == "deferred_unsynced"`` it
-    re-invokes ``run_qualification`` in a dedicated session.
-    ``run_qualification`` re-snapshots the integration-branch HEAD and either
-    PROCEEDS — now synced, or the bounded fall-through window has elapsed —
-    spawning the real audit, or RE-DEFERS (still behind) while preserving
-    ``first_deferred_at`` so the fall-through clock keeps accumulating across
-    sweeps.  ``run_qualification`` is fully self-defending (it re-checks phase /
-    in-flight / promotion / cached-verdict under its own ``FOR UPDATE`` row
-    lock), so a version that changed state since the scan is a safe no-op, and a
-    still-unsynced candidate spawns nothing (the gate returns before the spawn).
+    This is the scheduled trigger, mirroring
+    :func:`_reconcile_if_ci_unresolved_now_green`.  For an open, stabilize-phase
+    version whose ``last_qualification`` is ``not_promoted`` with blocker
+    ``criterion_coverage_incomplete``, when automain still points at the exact
+    candidate SHA AND the live coverage summary shows the coverage gate would no
+    longer fire (every active criterion covered, or zero active criteria remain),
+    it re-invokes ``run_qualification`` on the same candidate.
+    ``run_qualification``'s own ``criterion_coverage_recovered_same_sha``
+    exception then permits the fresh re-audit instead of serving the cached
+    verdict; every other gate still applies to that re-audit.
 
-    Returns True only when the re-entry actually STARTED a qualification
-    (``status == "spawned"``) — i.e. the deferral cleared — so the sweep can
-    count and log it.  A continued deferral or any guard no-op returns False.
-
-    **Rollback on non-spawned result**: when ``run_qualification`` returns any
-    status other than ``"spawned"`` (e.g. ``sha_error``, ``no_credentials``,
-    still-deferred), the session is rolled back rather than committed.  This
-    preserves the pre-existing ``last_qualification`` (including
-    ``first_deferred_at``) so the version stays in ``deferred_unsynced`` and
-    remains eligible for the next sweep.  Without the rollback an error result
-    would overwrite ``last_qualification`` with a non-deferred status, silently
-    removing the version from the re-drive loop.
+    Returns True iff a new qualification was spawned.
     """
-    # ``run_qualification`` lives in release_qualifier (the core coordinator);
-    # import it lazily to avoid the load-time import cycle (release_qualifier
-    # imports this module at top for its re-exports).
-    from app import release_qualifier
-
-    factory = session_factory or AsyncSessionLocal
-    async with factory() as redrive_session:
-        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
-        if version is None:
-            return False
-        qual = version.last_qualification
-        if (
-            not isinstance(qual, dict)
-            or qual.get("status") != "deferred_unsynced"
-            or version.phase != "stabilize"
-        ):
-            return False
-        result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
-        )
-        if result and result.get("status") == "spawned":
-            await redrive_session.commit()
-            return True
-        # run_qualification returned a non-spawned status (sha_error, no_credentials,
-        # still deferred, etc.) — rollback so last_qualification is not overwritten
-        # with an error state that would drop this version from the re-drive loop
-        # (only deferred_unsynced versions are picked up by the next sweep).
-        await redrive_session.rollback()
-        return False
-
-
-async def _redrive_not_promoted_qualification(
-    version_id,
-    *,
-    session_factory=None,
-) -> bool:
-    """Re-enter the qualifier for a ``not_promoted`` version whose blockers cleared.
-
-    When a stabilize-phase version receives a conclusive ``not_promoted`` verdict,
-    ``run_qualification`` caches that verdict by candidate SHA and will not re-run
-    as long as the candidate SHA is unchanged.  But once the gating audit findings
-    are ledger-resolved AND ``automain`` has advanced past the ``not_promoted``
-    candidate's SHA, the stale verdict is no longer valid — a fresh qualification
-    against the new HEAD is warranted.  Neither the strategic ``qualify_request``
-    path nor the admin endpoint drive this re-entry automatically: the strategist
-    reads the standing ``not_promoted`` status as "qualification settled" and stops
-    emitting, so the version strands indefinitely even after all blockers clear.
-
-    This is that missing scheduled re-driver.  For each sweep it checks an open,
-    stabilize-phase version whose ``last_qualification.status == "not_promoted"``
-    and:
-
-      1. Calls ``compute_requalification_readiness`` to verify ALL gating
-         high/medium audit findings are ledger-resolved (``resolved`` or ``stale``).
-         If not, returns False immediately — the blockers have NOT cleared.
-         Versions with zero gating findings (e.g. blocked by ``ci_not_green``)
-         pass this check: the hard blockers may be resolved by a code fix, and
-         HEAD advancement is the signal that warrants a fresh qualification.
-      2. Re-invokes ``run_qualification``, which under its own ``FOR UPDATE`` lock
-         re-resolves the candidate SHA.  If ``automain`` has NOT advanced (same
-         SHA), ``run_qualification`` normally returns ``cached_verdict``.  The
-         bounded exception is a stale keyless finding: it has no code anchor, so
-         the sweep marks the old verdict non-conclusive once and lets a fresh
-         qualification re-confirm or refute it on the current HEAD.  If
-         ``automain`` HAS advanced, the cached-verdict guard is a miss (new SHA)
-         and a fresh qualification spawns.
-
-    Returns True only when the re-entry actually STARTED a new qualification
-    (``status == "spawned"``).  Any guard no-op or readiness miss returns False.
-
-    ``run_qualification`` is fully self-defending (phase check, in-flight check,
-    cached-verdict check, all under a ``FOR UPDATE`` lock), so a version that
-    changed state between the scan and the re-drive is a safe no-op.
-    """
-    # Both ``run_qualification`` and ``compute_requalification_readiness`` live
-    # in modules that import this one (directly or transitively), so import
-    # them lazily to avoid load-time import cycles.
     from app import github, release_qualifier
-    from app.release_readiness import (
-        _KEYLESS_FINDING_SENTINEL,
-        compute_requalification_readiness,
+    from app.acceptance_criteria import (
+        backfill_direction_merge_evidence,
+        get_version_coverage_summary,
     )
+    from app.models import Direction
 
     factory = session_factory or AsyncSessionLocal
-    async with factory() as redrive_session:
-        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
-        if version is None:
-            return False
-        qual = version.last_qualification
-        if (
-            not isinstance(qual, dict)
-            or qual.get("status") != "not_promoted"
-            or version.phase != "stabilize"
-        ):
-            return False
-        # Readiness guard: all gating audit findings must be ledger-resolved.
-        # compute_requalification_readiness returns requalification_ready=True in two
-        # cases: (1) zero carried high/medium audit findings (e.g. version blocked by
-        # non-audit blocker like ci_not_green that has since cleared), or (2) all
-        # gating findings ledger-resolved.  In both cases the version is eligible for
-        # re-qualification against the current automain HEAD.
-        readiness = await compute_requalification_readiness(
-            redrive_session, version.project_id
-        )
-        if not readiness.get("requalification_ready"):
-            return False
-        keyless_stale = any(
-            f.get("key") == _KEYLESS_FINDING_SENTINEL and f.get("state") == "stale"
-            for f in readiness.get("findings", [])
-            if isinstance(f, dict)
-        )
-        if keyless_stale and qual.get("keyless_requalification_consumed_at"):
-            project = await redrive_session.get(Project, version.project_id)
-            current_head_sha = None
-            if project is not None:
-                resolved = await release_qualifier._resolve_github_with_session(
-                    redrive_session, project
-                )
-                if resolved is not None:
-                    token, owner, repo = resolved
-                    integration_branch, _promotion_target = (
-                        release_qualifier._lts_branch_names(project)
+    async with factory() as session:
+        try:
+            version = await session.get(release_version.ReleaseVersion, version_id)
+            if version is None:
+                return False
+            if version.status != "open" or version.phase != "stabilize":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "not_promoted":
+                return False
+            if qual.get("blocker") != "criterion_coverage_incomplete":
+                return False
+            candidate_sha = qual.get("candidate_sha")
+            if not candidate_sha:
+                return False
+
+            # Live coverage gate: mirror release_scoring — the gate fires when
+            # ``total > 0 and covered < total``, so it is CLEAR when no active
+            # criteria remain or every active one is covered.
+            coverage = await get_version_coverage_summary(session, version.id)
+            total = int(coverage.get("total") or 0)
+            covered = int(coverage.get("covered") or 0)
+
+            if total > 0 and covered < total:
+                # Before giving up, attempt to backfill merge evidence for any
+                # uncovered criteria that have an active direction mapping.  Tasks
+                # that merged before the criterion-direction mapping was created
+                # were never given a chance to record evidence; replaying them here
+                # lets the gate re-evaluate on fresher data without requiring a
+                # human to call the manual reconcile-backfill endpoint.
+                uncovered_with_mapping = [
+                    c["criterion_key"]
+                    for c in coverage.get("criteria", [])
+                    if c.get("coverage") == "uncovered"
+                    and c.get("status") == "active"
+                    and c.get("stuck_reason") is None
+                ]
+                if uncovered_with_mapping:
+                    result = await session.execute(
+                        select(Direction).where(
+                            Direction.project_id == version.project_id,
+                            Direction.status.notin_(
+                                ["expired", "retired", "superseded", "completed"]
+                            ),
+                        )
                     )
-                    try:
-                        current_head_sha = await github.get_branch_sha(
-                            token, owner, repo, integration_branch
+                    active_directions = list(result.scalars().all())
+                    keys_to_backfill: set[str] = set()
+                    for direction in active_directions:
+                        dkeys = set(direction.criterion_keys or [])
+                        if dkeys & set(uncovered_with_mapping):
+                            keys_to_backfill.add(direction.direction_key)
+                    for dk in keys_to_backfill:
+                        await backfill_direction_merge_evidence(
+                            session, version.project_id, dk
                         )
-                    except Exception:
-                        logger.warning(
-                            "[RELEASE_QUALIFIER] sweep: failed to resolve %s HEAD "
-                            "for version %s while checking consumed keyless marker",
-                            integration_branch,
-                            version_id,
+                    if keys_to_backfill:
+                        coverage = await get_version_coverage_summary(
+                            session, version.id
                         )
-            if current_head_sha is None or current_head_sha == qual.get(
-                "candidate_sha"
-            ):
-                logger.info(
-                    "[RELEASE_QUALIFIER] sweep: version v%d keyless stale blocker "
-                    "already consumed for this candidate — skipping re-drive",
+                        total = int(coverage.get("total") or 0)
+                        covered = int(coverage.get("covered") or 0)
+                        logger.info(
+                            "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                            "backfilled evidence for %d direction(s) on v%d "
+                            "(total=%d covered=%d after backfill)",
+                            len(keys_to_backfill),
+                            version.version_number,
+                            total,
+                            covered,
+                        )
+
+            if not (total == 0 or covered >= total):
+                return False
+
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                    "no GitHub credentials for v%d — skipping",
                     version.version_number,
                 )
                 return False
-        if keyless_stale:
-            version.last_qualification = {
-                **qual,
-                "status": "requalification_requested",
-                "previous_status": "not_promoted",
-                "keyless_requalification_consumed_at": _utcnow().isoformat(),
-            }
-            flag_modified(version, "last_qualification")
-            redrive_session.add(version)
-        # The real backstop against redundant re-runs is run_qualification's cached-
-        # verdict guard: under its FOR UPDATE lock, it re-resolves the candidate SHA.
-        # Stale keyless findings are the bounded same-SHA exception because they
-        # have no code anchor; rewriting the old status to non-conclusive lets
-        # exactly one fresh pending qualification replace it.
-        result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
-        )
-        if result and result.get("status") == "spawned":
-            await redrive_session.commit()
-            return True
-        # run_qualification returned a non-spawned status (error, cached_verdict,
-        # already_pending, etc.) — rollback so last_qualification is not corrupted
-        # and the identity map is expired for subsequent session reads.
-        await redrive_session.rollback()
-        return False
+            token, owner, repo = resolved
+            integration_branch, _promotion_target = (
+                release_qualifier._lts_branch_names(project)
+            )
+            try:
+                automain_sha = await github.get_branch_sha(
+                    token, owner, repo, integration_branch
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                    "could not resolve %s HEAD SHA for v%d (%s) — skipping",
+                    integration_branch,
+                    version.version_number,
+                    exc,
+                )
+                return False
+            # Only the SAME-SHA wedge is ours: a different HEAD is a fresh
+            # candidate the stale-not-promoted re-drive already owns.
+            if automain_sha != candidate_sha:
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                "coverage cleared for candidate %s of v%d on unchanged automain "
+                "(total=%d covered=%d) — spawning fresh qualification",
+                candidate_sha[:8],
+                version.version_number,
+                total,
+                covered,
+            )
+            result = await release_qualifier.run_qualification(
+                session, version.project_id, version
+            )
+            if result and result.get("status") == "spawned":
+                await session.commit()
+                return True
+            await session.rollback()
+            return False
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                "unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                    "rollback failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
+async def _fire_initial_qualification_if_coverage_complete(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Fire the FIRST qualification for a stabilize-phase version once coverage is complete.
+
+    This is the initial-trigger complement to
+    :func:`_reconcile_if_criterion_coverage_now_complete` (which handles the
+    RE-drive path for versions that already have a ``not_promoted`` attempt).
+    Here we fire the FIRST qualification for a version that has never been
+    qualified at all (``last_qualification is None`` AND
+    ``qualification_attempts == 0``) once criterion coverage is complete.
+
+    Uses :func:`~app.release_readiness.compute_qualification_trigger_state` as
+    the single classifier so the read-surface and sweep behavior cannot drift.
+    Resolves the automain HEAD SHA and invokes ``run_qualification`` on the
+    same pattern as :func:`_reconcile_if_criterion_coverage_now_complete`.
+
+    Returns True iff a new qualification was spawned.
+    """
+    from app import github, release_qualifier
+    from app.release_readiness import compute_qualification_trigger_state
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version = await session.get(release_version.ReleaseVersion, version_id)
+            if version is None:
+                return False
+
+            trigger = await compute_qualification_trigger_state(
+                session, version.project_id
+            )
+            if trigger.get("trigger_state") != "armed":
+                return False
+            # Guard: only act on the version we were asked about (the trigger
+            # resolves the open version for the project; confirm it matches).
+            if str(version.id) != trigger.get("open_version_id"):
+                return False
+
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                    "no GitHub credentials for v%d — skipping",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+            integration_branch, _promotion_target = (
+                release_qualifier._lts_branch_names(project)
+            )
+            try:
+                automain_sha = await github.get_branch_sha(
+                    token, owner, repo, integration_branch
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                    "could not resolve %s HEAD SHA for v%d (%s) — skipping",
+                    integration_branch,
+                    version.version_number,
+                    exc,
+                )
+                return False
+            if not automain_sha:
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                "coverage complete for v%d on %s (total=%d covered=%d) "
+                "— spawning initial qualification",
+                version.version_number,
+                automain_sha[:8],
+                trigger.get("coverage_total", 0),
+                trigger.get("coverage_covered", 0),
+            )
+            result = await release_qualifier.run_qualification(
+                session, version.project_id, version
+            )
+            if result and result.get("status") == "spawned":
+                await session.commit()
+                return True
+            await session.rollback()
+            return False
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                "unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                    "rollback failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
 
 
 async def _auto_stale_not_promoted_findings(
@@ -631,6 +714,34 @@ async def _auto_stale_not_promoted_findings(
         if not gating_findings:
             return 0
 
+        # When HEAD has advanced and at least one gating finding is file-anchored,
+        # fetch the files changed between candidate_sha and head_sha.  We only
+        # auto-stale file-anchored findings whose file actually changed — staleing a
+        # finding whose file is untouched would force a needless re-audit cycle on
+        # every automain merge, burning audit tokens even when none of the flagged
+        # code was touched.  Findings without a file field have no code anchor so
+        # they are staled unconditionally when HEAD advances.
+        changed_files: "set[str] | None" = None
+        if head_advanced and any(
+            str(f.get("file") or "").strip() for f in gating_findings
+        ):
+            raw_files = await github.get_files_changed_between_refs(
+                token, owner, repo, candidate_sha, head_sha
+            )
+            if raw_files is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] auto_stale: cannot determine changed "
+                    "files between %s and %s for version %s — skipping "
+                    "file-anchored stales this cycle",
+                    candidate_sha[:12],
+                    head_sha[:12],
+                    version_id,
+                )
+                # Leave changed_files as None to signal: skip file-anchored
+                # findings this cycle; next sweep will retry.
+            else:
+                changed_files = set(raw_files)
+
         # Load existing ledger keys for this version (idempotency — skip any
         # finding that already has a row so operator 'resolved' entries are
         # never overwritten).
@@ -665,6 +776,16 @@ async def _auto_stale_not_promoted_findings(
             # the finding was a false positive.
             if not head_advanced and key != _KEYLESS_FINDING_SENTINEL:
                 continue
+            # File-anchored findings: only stale when the finding's specific file
+            # changed between candidate_sha and head_sha.  If we could not
+            # determine the changed-file set (API error), skip this cycle so the
+            # next sweep can retry rather than staling still-live findings.
+            finding_file = str(f.get("file") or "").strip()
+            if head_advanced and finding_file:
+                if changed_files is None:
+                    continue  # API error; retry next sweep
+                if finding_file not in changed_files:
+                    continue  # File unchanged; finding may still be live
             note = (
                 "auto-staled: automain advanced past not_promoted candidate SHA"
                 if head_advanced
@@ -725,146 +846,233 @@ async def _auto_stale_not_promoted_findings(
         return written
 
 
-_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS = 3
-"""Circuit-breaker cap on autonomous re-qualify attempts after a promotion_failed.
-
-When a version's ``last_qualification.promotion_failure_count`` reaches this cap
-the automatic re-driver stops and raises an operator-visible Alert instead of
-looping forever.  Each _record_promotion_failure call increments the counter,
-so this caps the TOTAL number of autonomous promotion attempts (fix→qualify→
-promote→CI-red) before human review is required.
-"""
-
-
-async def _redrive_promotion_failed_qualification(
+async def _promote_dry_run_pass_if_enabled(
     version_id,
     *,
     session_factory=None,
 ) -> bool:
-    """Re-enter the qualifier for a ``promotion_failed`` version after automain advances.
+    """Promote a dry-run-pass candidate once promotion is enabled for the project.
 
-    When a promotion PR's CI goes red the version is recorded as
-    ``promotion_failed`` and returned to the stabilize phase.  Neither the
-    strategist nor the admin endpoint drives a re-entry automatically: the
-    strategist reads the standing ``promotion_failed`` status as "awaiting fix"
-    and the next ``qualify_request`` only fires once a strategic cycle emits one.
+    When ``_finalize_qualification`` records ``status='dry_run'`` with
+    ``would_promote=True``, promotion was disabled at finalize time.  If the
+    operator subsequently enables promotion (fleet-wide or per-project), nothing
+    automatically acts on the standing dry-run pass — the version strands open in
+    the stabilize phase indefinitely.
 
-    This is the missing scheduled re-driver.  For each sweep it:
+    This re-driver fires for open, stabilize-phase versions whose
+    ``last_qualification.status == 'dry_run'`` and ``would_promote=True`` when
+    ``resolve_project_promotion_enabled`` now returns True.  It verifies the
+    stored candidate SHA still equals the current integration-branch HEAD —
+    stale candidates (automain has advanced) are skipped and will re-qualify via
+    normal paths.  When the candidate is current it enters the normal promotion
+    machinery via ``_force_promote_in_dedicated_session``, which preserves all
+    promotion-in-flight idempotency guards.
 
-      1. Checks ``compute_requalification_readiness``.  That function already
-         defers while a ``promotion_ci_remediation``-tagged fix task is in
-         flight (``release_readiness._has_active_promotion_ci_remediation``),
-         so the re-driver naturally waits for any harvested fix to land on the
-         integration branch before triggering a fresh promotion.
-
-      2. Circuit-breaker: when ``promotion_failure_count`` in
-         ``last_qualification`` exceeds ``_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS``
-         the loop stops and an operator Alert is raised — preventing a
-         persistently-red candidate from cycling forever.
-
-      3. Calls ``run_qualification``.  Its cached-verdict guard re-resolves the
-         candidate SHA under a FOR UPDATE lock.  If automain has NOT advanced
-         the same-SHA cached verdict fires and this returns False (no-op).  If
-         automain HAS advanced, a fresh qualification spawns.
-
-    Returns True only when the re-entry actually STARTED a new qualification
-    (``status == "spawned"``).  Any guard no-op, circuit-breaker, or readiness
-    miss returns False.
+    Returns True when a promotion was initiated, False otherwise.
     """
-    from app import release_qualifier
-    from app.release_readiness import compute_requalification_readiness
+    from app import github, release_qualifier
+    from app.runtime_config_state import resolve_project_promotion_enabled
 
     factory = session_factory or AsyncSessionLocal
-    async with factory() as redrive_session:
-        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
+    async with factory() as session:
+        version = await session.get(release_version.ReleaseVersion, version_id)
         if version is None:
             return False
         qual = version.last_qualification
         if (
             not isinstance(qual, dict)
-            or qual.get("status") != "promotion_failed"
+            or qual.get("status") != "dry_run"
+            or not qual.get("would_promote")
             or version.phase != "stabilize"
+            or version.status != "open"
         ):
             return False
 
-        # Circuit breaker: stop re-qualifying if the failure count is at the cap.
-        failure_count = int(qual.get("promotion_failure_count") or 0)
-        if failure_count >= _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS:
-            # Raise an operator Alert (once) so the cap is visible.  Guard
-            # against duplicate alerts with a flag on last_qualification.
-            if not qual.get("promotion_loop_escalated"):
-                alert = Alert(
-                    project_id=version.project_id,
-                    severity=AlertSeverity.ERROR,
-                    title=(
-                        f"Release v{version.version_number} promotion loop halted"
-                    ),
-                    message=(
-                        f"Release v{version.version_number} has failed promotion "
-                        f"{failure_count} time(s) — autonomous re-qualification "
-                        f"halted. Human review required before next promote attempt."
-                    ),
-                    extra={
-                        "version_id": str(version.id),
-                        "version_number": version.version_number,
-                        "promotion_failure_count": failure_count,
-                        "last_error": qual.get("error"),
-                    },
+        # Only act when promotion is now enabled for this project.
+        if not resolve_project_promotion_enabled(version.project_id):
+            return False
+
+        candidate_sha = qual.get("candidate_sha")
+        if not candidate_sha:
+            return False
+
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            return False
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            logger.warning(
+                "[RELEASE_QUALIFIER] dry_run promote: no GitHub credentials "
+                "for v%d — skipping",
+                version.version_number,
+            )
+            return False
+        token, owner, repo = resolved
+        integration_branch, _promotion_target = release_qualifier._lts_branch_names(
+            project
+        )
+        try:
+            head_sha = await github.get_branch_sha(token, owner, repo, integration_branch)
+        except Exception:
+            logger.warning(
+                "[RELEASE_QUALIFIER] dry_run promote: failed to resolve %s HEAD "
+                "for v%d — skipping",
+                integration_branch,
+                version.version_number,
+            )
+            return False
+
+        if head_sha != candidate_sha:
+            logger.info(
+                "[RELEASE_QUALIFIER] dry_run promote: v%d candidate %s is stale "
+                "(automain HEAD is %s) — skipping, will re-qualify on new HEAD",
+                version.version_number,
+                candidate_sha[:8],
+                head_sha[:8] if head_sha else "unknown",
+            )
+            return False
+
+        candidate_diff_hash = qual.get("candidate_diff_hash")
+        version_number = version.version_number
+
+    result = await release_qualifier._force_promote_in_dedicated_session(
+        version_id,
+        candidate_sha,
+        candidate_diff_hash,
+        "sweep_dry_run_promote",
+        session_factory=session_factory,
+    )
+    promoted = result.get("status") not in release_qualifier._FORCE_PROMOTE_NOOP_STATUSES
+    if promoted:
+        logger.info(
+            "[RELEASE_QUALIFIER] dry_run promote: initiated promotion for v%d "
+            "candidate %s (result=%s)",
+            version_number,
+            candidate_sha[:8],
+            result.get("status"),
+        )
+    return promoted
+
+
+async def _check_full_suite_drift_sentinel(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Dispatch and evaluate the standing full-suite CI sentinel on automain.
+
+    When ``build_config.full_suite_drift_sentinel_enabled`` is True, resolves
+    the integration-branch HEAD and dispatches a ci.yml full-matrix run if none
+    exists for that SHA.  A concluded-red run raises a deduplicated Alert
+    (keyed on project+SHA so repeated sweeps do not double-alert) and spawns
+    harvest remediation via the same path used by the promotion-failed re-driver.
+
+    Only fires for open, stabilize-phase versions; ignores all others.
+    Best-effort: any exception is swallowed and logged.  Returns True when a
+    dispatch or alert/harvest occurred.
+    """
+    from app import release_qualifier
+    from app.release_readiness import compute_promotion_ci_green_gate
+    from app.release_reconciliation import _harvest_promotion_ci_failures
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version = await session.get(release_version.ReleaseVersion, version_id)
+            if version is None or version.phase != "stabilize" or version.status != "open":
+                return False
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+            if not (project.build_config or {}).get("full_suite_drift_sentinel_enabled"):
+                return False
+
+            gate = await compute_promotion_ci_green_gate(
+                session, version.project_id, dispatch=True
+            )
+            gate_state = gate.get("gate_state")
+            head_sha = gate.get("head_sha") or ""
+
+            if gate_state == "dispatched":
+                logger.info(
+                    "[DRIFT_SENTINEL] dispatched full-suite CI run for project %s "
+                    "HEAD %s",
+                    version.project_id,
+                    head_sha[:8] if head_sha else "?",
                 )
-                redrive_session.add(alert)
-                version.last_qualification = {
-                    **qual,
-                    "promotion_loop_escalated": True,
-                }
-                flag_modified(version, "last_qualification")
-                redrive_session.add(version)
-                await redrive_session.commit()
+                return True
+
+            if gate_state != "red":
+                return False
+
+            # Red: raise a deduplicated alert + spawn harvest remediation.
+            dedupe_key = f"drift_sentinel:red:{version.project_id}:{head_sha}"
+            existing = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == version.project_id,
+                            Alert.dedupe_key == dedupe_key,
+                            Alert.dismissed_at.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if existing is None:
+                run_url = gate.get("html_url") or str(gate.get("run_id") or "")
+                session.add(
+                    Alert(
+                        project_id=version.project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=(
+                            f"Full-suite CI red on integration branch "
+                            f"({head_sha[:8] if head_sha else '?'})"
+                        ),
+                        message=(
+                            f"Standing drift sentinel: ci.yml concluded failure for "
+                            f"integration HEAD {head_sha[:12] if head_sha else '?'}."
+                            + (f" Run: {run_url}." if run_url else "")
+                            + " Harvest remediation spawning."
+                        ),
+                        dedupe_key=dedupe_key,
+                    )
+                )
+                await session.commit()
                 logger.warning(
-                    "[RELEASE_QUALIFIER] sweep: v%d promotion_failure_count=%d "
-                    "reached cap=%d — raised operator Alert and halted auto-requalify",
-                    version.version_number,
-                    failure_count,
-                    _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+                    "[DRIFT_SENTINEL] full-suite CI red for project %s HEAD %s — "
+                    "alert raised, harvest spawning",
+                    version.project_id,
+                    head_sha[:8] if head_sha else "?",
+                )
+
+            # Harvest is best-effort and self-gating (per-hour/concurrent caps).
+            integration_branch, _ = release_qualifier._lts_branch_names(project)
+            auto_rem = (project.design_doc or {}).get("_auto_remediation") or {}
+            await _harvest_promotion_ci_failures(
+                project_id=version.project_id,
+                version_id=version.id,
+                version_number=version.version_number,
+                owner=project.github_owner or "",
+                repo=project.github_repo or "",
+                ci_source_sha=head_sha,
+                integration_branch=integration_branch,
+                auto_remediation_config=auto_rem,
+                selfheal_enabled=True,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "[DRIFT_SENTINEL] sentinel check failed for version %s", version_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[DRIFT_SENTINEL] rollback failed for version %s", version_id
                 )
             return False
-
-        # Readiness guard: defers while a promotion-CI remediation fix is in flight.
-        readiness = await compute_requalification_readiness(
-            redrive_session, version.project_id
-        )
-        if not readiness.get("requalification_ready"):
-            return False
-
-        # Thread session_factory so run_qualification's passing-audit reuse
-        # (promotion_failed + unchanged audited surface → re-promote WITHOUT
-        # re-auditing) runs its DEDICATED promote session on the same factory.
-        # In production this is None → AsyncSessionLocal (a genuine second
-        # connection); tests inject a shared factory.
-        #
-        # allow_synchronous_reuse_promote=True: this sweep re-driver is the ONLY
-        # safe caller for the synchronous reuse-promote — it runs OUTSIDE any
-        # lock-holding request (redrive_session has no uncommitted version-row
-        # write on this path), so promote()'s nested staged-direction activation
-        # cannot hang on a caller-held Direction lock (review finding 1).  Every
-        # other caller (strategic / admin) defers to this path.
-        result = await release_qualifier.run_qualification(
-            redrive_session,
-            version.project_id,
-            version,
-            session_factory=session_factory,
-            allow_synchronous_reuse_promote=True,
-        )
-        # "spawned" = a fresh audit ran; "reused_audit" = the passing-audit
-        # reuse-promote fired (it committed on its OWN dedicated session).  Both
-        # are forward progress; every other result is a no-op → roll back the
-        # read-only redrive_session.
-        if result and (
-            result.get("status") == "spawned" or result.get("reused_audit")
-        ):
-            await redrive_session.commit()
-            return True
-        await redrive_session.rollback()
-        return False
 
 
 async def sweep_stuck_qualifications(
@@ -1044,6 +1252,67 @@ async def sweep_stuck_qualifications(
                 version_id,
             )
 
+    # Re-drive qualifications stranded at ``status=error`` due to a transient
+    # GitHub failure (sha_error, no_credentials).  A single outage parks the
+    # version indefinitely because the strategist reads a standing error as
+    # settled.  This loop re-enters run_qualification for each open,
+    # stabilize-phase version with a transient error code, subject to a bounded
+    # attempt cap (_MAX_ERROR_REDRIVE_ATTEMPTS) so a permanently broken path
+    # does not retry forever.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_error_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: error re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove error version %s "
+                "(transient error cleared — qualification spawned)",
+                version_id,
+            )
+
+    # Re-drive qualifications stranded in ``infra_failure`` — the only
+    # non-conclusive outcome with no scheduled re-entry.  A transient
+    # infrastructure failure (qualifier child timeout, GitHub API unavailable,
+    # migration-identity gate unreachable) records ``status=infra_failure`` and
+    # parks the version indefinitely because the strategist treats it as
+    # "re-qualify needed" but only acts on a fresh strategic cycle; no
+    # automatic retry fires.  This loop re-enters run_qualification for each
+    # open, stabilize-phase ``infra_failure`` version, subject to a per-episode
+    # cap (_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS) so a persistently broken
+    # infra path does not retry forever.  Runs AFTER the error re-driver loop
+    # (``status=error`` re-drives above) because both are transient-outcome
+    # re-drivers operating on the same version_ids snapshot.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_infra_failure_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: infra_failure re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove infra_failure version %s "
+                "(transient infra cleared — qualification spawned)",
+                version_id,
+            )
+
     # Auto-stale not_promoted gating findings when automain has advanced.
     # ``_redrive_not_promoted_qualification`` requires every gating finding to
     # have a ledger row in state ``resolved`` or ``stale``, but no automated
@@ -1096,6 +1365,35 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove ci_unresolved version %s "
                 "(CI green on unchanged automain — qualification spawned)",
+                version_id,
+            )
+
+    # Re-drive quiescent ``not_promoted`` versions whose only blocker was the
+    # ``criterion_coverage_incomplete`` gate, once a criterion retraction /
+    # supersession (or fresh evidence) has cleared coverage on the UNCHANGED
+    # automain SHA.  The acceptance-contract safety valve: an uncoverable
+    # criterion that is retracted must let the version re-audit and clear the
+    # gate without a SHA change or operator action, rather than stranding
+    # not_promoted.  Mirrors the ci_unresolved reconciler above; runs before the
+    # generic stale-not-promoted loop.
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_criterion_coverage_now_complete(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: criterion_coverage-now-complete "
+                "reconcile failed for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove criterion_coverage version %s "
+                "(coverage cleared on unchanged automain — qualification spawned)",
                 version_id,
             )
 
@@ -1191,6 +1489,70 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove promotion_failed version %s "
                 "(re-qualification spawned after automain advanced)",
+                version_id,
+            )
+
+    # Dry-run-pass candidates, once the operator enables promotion.  A candidate
+    # that passes qualification while ``promotion_enabled=False`` records a
+    # conclusive ``dry_run`` verdict (``would_promote=True``); nothing acts on it
+    # when promotion is later enabled (stall alerts treat ``dry_run`` as healthy,
+    # and the same-SHA ``qualify_request`` no-ops via the cached-verdict guard).
+    # Two triggers cover this state and MUST NOT both fire for the same version
+    # (audit 8989794e): the cheap, deterministic direct-promote path
+    # (``_promote_dry_run_pass_if_enabled``) handles a candidate that is STILL the
+    # integration-branch HEAD — it already passed every gate, so it only needs
+    # promoting — while the expensive, non-deterministic full re-qualification
+    # (``_redrive_dry_run_candidate``) is reserved for the genuine re-qualification
+    # case where automain has advanced past the candidate SHA.  The cheap path
+    # runs FIRST and records which versions it promoted; the expensive re-driver
+    # then SKIPS those, so a still-current candidate is never needlessly (and
+    # non-deterministically) re-audited after it was already promoted.  Both run
+    # AFTER the ``promotion_failed`` re-driver so a version that exited ``dry_run``
+    # via another path is handled there first.
+    dry_run_promoted_ids: set = set()
+    for version_id in version_ids:
+        try:
+            promoted = await _promote_dry_run_pass_if_enabled(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: dry_run promote failed for version %s",
+                version_id,
+            )
+            continue
+        if promoted:
+            dry_run_promoted_ids.add(version_id)
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep promoted dry-run-pass version %s "
+                "(promotion now enabled — candidate current)",
+                version_id,
+            )
+    for version_id in version_ids:
+        # Skip any candidate the cheap direct-promote path already handled this
+        # cycle — re-qualifying a still-current candidate is wasteful and risks a
+        # non-deterministic audit flipping a previously-passing candidate to fail.
+        if version_id in dry_run_promoted_ids:
+            continue
+        try:
+            redriven = await _redrive_dry_run_candidate(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: dry_run re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove dry_run version %s "
+                "(promotion enabled — re-qualification spawned)",
                 version_id,
             )
 
@@ -1453,6 +1815,53 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep recovered deploy-failed version %s "
                 "(promoted SHA confirmed serving after a prior latch)",
+                version_id,
+            )
+
+    # Fire the INITIAL qualification for stabilize-phase versions that have
+    # never been qualified once their criterion coverage is complete.  Every
+    # other loop in this sweep is a RE-driver; this is the only trigger that
+    # fires the first qualification automatically — filling the gap where the
+    # strategist never emitted qualify_request.  Runs AFTER all RE-driver loops
+    # so a version that transitioned state during this sweep cycle is handled
+    # by the appropriate re-driver first.
+    for version_id in version_ids:
+        try:
+            fired = await _fire_initial_qualification_if_coverage_complete(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: initial qualification fire failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if fired:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep fired initial qualification for "
+                "version %s (coverage complete — first qualification spawned)",
+                version_id,
+            )
+
+    # Standing full-suite drift sentinel: on a build_config opt-in, dispatch
+    # ci.yml on the integration branch for each stabilize-phase open version,
+    # alert+harvest when a run concludes red.  This catches full-suite CI drift
+    # before it accumulates invisibly across hundreds of targeted-CI merges and
+    # surfaces at a promotion-gate failure.  Each version runs in its own
+    # dedicated session via the function itself.
+    for version_id in version_ids:
+        try:
+            await _check_full_suite_drift_sentinel(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: full-suite drift sentinel failed "
+                "for version %s",
                 version_id,
             )
 

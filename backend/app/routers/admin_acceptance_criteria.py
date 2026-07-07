@@ -79,7 +79,7 @@ async def create_acceptance_criterion(
     if not text:
         raise HTTPException(status_code=422, detail="text must not be empty")
 
-    existing_count = await ac.count_criteria_for_version(session, open_version.id)
+    existing_count = await ac.count_active_criteria_for_version(session, open_version.id)
     if existing_count >= ac.MAX_CRITERIA_PER_VERSION:
         raise HTTPException(
             status_code=409,
@@ -141,6 +141,67 @@ async def delete_acceptance_criterion(
     return {"status": "deleted", "criterion_key": criterion_key}
 
 
+@router.post("/projects/{project_id}/acceptance-criteria/{criterion_key}/reinstate")
+async def reinstate_acceptance_criterion(
+    project_id: uuid.UUID,
+    criterion_key: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Reinstate a retracted or superseded criterion back to active status.
+
+    This operator-only endpoint reverses a loop-driven retraction the operator
+    disagrees with. Idempotent: calling on an already-active criterion returns 200.
+    Enforces the per-version active-criteria cap before reinstating.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    existing = await ac.get_criteria_by_keys(
+        session,
+        project_id,
+        [criterion_key],
+        release_version_id=open_version.id,
+    )
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Criterion key not found in open version: {criterion_key}",
+        )
+
+    row = existing[0]
+    if row.status != "active":
+        active_count = await ac.count_active_criteria_for_version(session, open_version.id)
+        if active_count >= ac.MAX_CRITERIA_PER_VERSION:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Version already has {ac.MAX_CRITERIA_PER_VERSION} active criteria (cap reached); cannot reinstate",
+            )
+
+    reinstated = await ac.reinstate_criterion(
+        session,
+        project_id=project_id,
+        release_version_id=open_version.id,
+        criterion_key=criterion_key,
+    )
+    if reinstated is None:
+        raise HTTPException(status_code=404, detail="Criterion not found")
+
+    logger.info(
+        "[AC] Operator reinstated criterion %s for project %s version %s",
+        criterion_key,
+        project_id,
+        open_version.id,
+    )
+    return {"status": "ok", "criterion_key": criterion_key}
+
+
 class LinkDirectionRequest(BaseModel):
     direction_key: str = Field(..., max_length=128)
     criterion_keys: List[str] = Field(..., max_length=50)
@@ -171,22 +232,33 @@ async def link_criteria_to_direction(
     # De-duplicate while preserving order.
     deduped_keys = list(dict.fromkeys(body.criterion_keys))
 
-    # Validate that all supplied keys exist in the current open version.
-    # criterion_key is unique only within release_version_id, so we must scope
-    # the lookup to open_version.id to reject stale keys from closed versions.
+    # Validate all supplied keys against the version's active/inactive sets in
+    # one query (guard mirrors check_gap_id_write in problem_model.py).
     if deduped_keys:
-        existing = await ac.get_criteria_by_keys(
-            session,
-            project_id,
-            deduped_keys,
-            release_version_id=open_version.id,
+        from app.direction_referential_guard import (
+            check_criterion_key_write,
+            load_version_criterion_key_sets,
         )
-        existing_keys = {r.criterion_key for r in existing}
-        unknown = [k for k in deduped_keys if k not in existing_keys]
-        if unknown:
+
+        active_keys, inactive_keys = await load_version_criterion_key_sets(
+            session, project_id, open_version.id
+        )
+        failures: dict[str, list[str]] = {}
+        for k in deduped_keys:
+            cls, _ = check_criterion_key_write(k, active_keys, inactive_keys)
+            if cls is not None:
+                failures.setdefault(cls, []).append(k)
+        if failures:
+            # Prioritize dangling over inactive in the error report.
+            classification = "dangling" if "dangling" in failures else "inactive"
             raise HTTPException(
                 status_code=400,
-                detail=f"Unknown criterion keys for this version: {unknown}",
+                detail={
+                    "error": "criterion_key_invalid",
+                    "classification": classification,
+                    "keys": failures[classification],
+                    "active_criterion_keys": sorted(active_keys),
+                },
             )
 
     row = (
@@ -209,6 +281,26 @@ async def link_criteria_to_direction(
         body.direction_key,
         project_id,
     )
+
+    # Best-effort backfill: replay merge evidence for tasks that merged before
+    # this mapping was created so they are not stranded without evidence.
+    try:
+        backfilled = await ac.backfill_direction_merge_evidence(
+            session, project_id, body.direction_key
+        )
+        if backfilled:
+            logger.info(
+                "[AC] link-direction backfill: direction=%s recorded=%d",
+                body.direction_key,
+                backfilled,
+            )
+    except Exception:
+        logger.warning(
+            "[AC] link-direction backfill failed for direction %s (non-fatal)",
+            body.direction_key,
+            exc_info=True,
+        )
+
     return {
         "status": "ok",
         "direction_key": body.direction_key,
@@ -259,6 +351,11 @@ async def attest_criterion(
         )
 
     row = existing[0]
+    if row.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Criterion '{criterion_key}' is {row.status} and cannot be attested",
+        )
     evidence = CriterionEvidence(
         criterion_id=row.id,
         project_id=project_id,
@@ -283,3 +380,71 @@ async def attest_criterion(
         body.reason,
     )
     return {"status": "ok", "criterion_key": criterion_key, "coverage": "covered"}
+
+
+class ReconcileBackfillRequest(BaseModel):
+    direction_key: str | None = Field(
+        None,
+        description="Specific direction to backfill. Omit to backfill all directions.",
+    )
+
+
+@router.post("/projects/{project_id}/acceptance-criteria/reconcile-backfill")
+async def reconcile_backfill(
+    project_id: uuid.UUID,
+    body: ReconcileBackfillRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Run the merge-evidence backfill on demand for stranded criterion mappings.
+
+    Backfills evidence for already-merged tasks in the given direction (or all
+    directions in the project when ``direction_key`` is omitted).  Idempotent
+    — duplicate evidence rows are silently skipped.  Returns a per-direction
+    summary of newly recorded rows.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    if body.direction_key is not None:
+        # Backfill a single direction.
+        rows = await ac.backfill_direction_merge_evidence(
+            session, project_id, body.direction_key
+        )
+        return {
+            "status": "ok",
+            "results": [{"direction_key": body.direction_key, "evidence_recorded": rows}],
+            "total_evidence_recorded": rows,
+        }
+
+    # Backfill all directions in the project.
+    from sqlmodel import select as _select
+    from app.models import Direction as _Direction
+
+    dir_result = await session.execute(
+        _select(_Direction.direction_key).where(
+            _Direction.project_id == project_id,
+        )
+    )
+    direction_keys = list(dir_result.scalars().all())
+
+    results = []
+    total = 0
+    for dk in direction_keys:
+        recorded = await ac.backfill_direction_merge_evidence(session, project_id, dk)
+        total += recorded
+        if recorded:
+            results.append({"direction_key": dk, "evidence_recorded": recorded})
+
+    logger.info(
+        "[AC] reconcile-backfill: project=%s directions=%d total_recorded=%d",
+        project_id,
+        len(direction_keys),
+        total,
+    )
+    return {
+        "status": "ok",
+        "results": results,
+        "total_evidence_recorded": total,
+    }

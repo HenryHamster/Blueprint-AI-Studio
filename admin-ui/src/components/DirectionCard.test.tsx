@@ -758,3 +758,73 @@ describe('DirectionCard staged retarget control', () => {
     expect(screen.getByRole('button', { name: 'Retarget' })).toBeDisabled();
   });
 });
+
+describe('DirectionCard churn-retirement recommendation', () => {
+  function churnRetireProps(overrides: Partial<Direction> = {}) {
+    const d = makeDirection({
+      status: 'paused',
+      churn_retirement_recommended: true,
+      churn_retirement_recommended_reason: 'Direction has exceeded max pause cycles with no merges.',
+      churn_retirement_recommended_at: '2026-04-24T10:00:00Z',
+      ...overrides,
+    });
+    return {
+      ...makeProps(d, 'paused'),
+      decideChurnRetirement: vi.fn(),
+    };
+  }
+
+  it('renders retirement recommendation banner with reason and timestamp', () => {
+    const props = churnRetireProps();
+    render(<DirectionCard {...props} />);
+    expect(screen.getByText('Retirement recommended')).toBeInTheDocument();
+    expect(screen.getByText('Direction has exceeded max pause cycles with no merges.')).toBeInTheDocument();
+  });
+
+  it('renders Keep and Retire buttons when churn_retirement_recommended is true', () => {
+    const props = churnRetireProps();
+    render(<DirectionCard {...props} />);
+    expect(screen.getByRole('button', { name: /Keep/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Retire/i })).toBeInTheDocument();
+  });
+
+  it('calls decideChurnRetirement with KEEP when Keep is clicked', () => {
+    const props = churnRetireProps();
+    render(<DirectionCard {...props} />);
+    fireEvent.click(screen.getByRole('button', { name: /Keep/i }));
+    expect(props.decideChurnRetirement).toHaveBeenCalledWith('d-1', 'KEEP');
+  });
+
+  it('shows inline retire confirm popover when Retire is clicked', () => {
+    const props = churnRetireProps();
+    render(<DirectionCard {...props} />);
+    // Click the first Retire button to open the confirm popover
+    const retireButtons = screen.getAllByRole('button', { name: /Retire/i });
+    fireEvent.click(retireButtons[0]);
+    expect(screen.getByText('Retire this direction?')).toBeInTheDocument();
+  });
+
+  it('calls decideChurnRetirement with RETIRE when confirm Retire is clicked', () => {
+    const props = churnRetireProps();
+    render(<DirectionCard {...props} />);
+    // Open popover
+    const retireButtons = screen.getAllByRole('button', { name: /Retire/i });
+    fireEvent.click(retireButtons[0]);
+    // Confirm
+    const confirmButtons = screen.getAllByRole('button', { name: /Retire/i });
+    fireEvent.click(confirmButtons[confirmButtons.length - 1]);
+    expect(props.decideChurnRetirement).toHaveBeenCalledWith('d-1', 'RETIRE');
+  });
+
+  it('does not render banner when churn_retirement_recommended is false', () => {
+    const props = churnRetireProps({ churn_retirement_recommended: false });
+    render(<DirectionCard {...props} />);
+    expect(screen.queryByText('Retirement recommended')).not.toBeInTheDocument();
+  });
+
+  it('does not render banner when churn_retirement_recommended is undefined', () => {
+    const d = makeDirection({ status: 'paused' });
+    render(<DirectionCard {...makeProps(d, 'paused')} />);
+    expect(screen.queryByText('Retirement recommended')).not.toBeInTheDocument();
+  });
+});

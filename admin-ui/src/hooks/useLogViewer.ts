@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Task, TaskStatus, TrackLogEntry } from '../types/task';
 import type { DeployState } from '../types/settings';
 import type { StrategicChallengeSummary } from '../types/digest';
+import type { FailingTaskTypeEntry, FailingTaskTypes } from '../types/diagnostics';
 import {
   workbenchMessageMatchesProject,
   workbenchRefetchSurfacesFromMessage,
@@ -14,6 +15,8 @@ interface UseLogViewerDeps {
   fetchDirectionsRef?: React.MutableRefObject<() => void>;
   refreshStrategicReadModelRef?: React.MutableRefObject<() => void>;
   refreshMessagesRef?: React.MutableRefObject<() => void>;
+  fetchAlertsRef?: React.MutableRefObject<() => void>;
+  refreshFleetRunnersRef?: React.MutableRefObject<() => void>;
   selectedProjectId?: string | null;
   realtimeWsEnabled?: boolean;
 }
@@ -117,6 +120,8 @@ export function useLogViewer({
   fetchDirectionsRef,
   refreshStrategicReadModelRef,
   refreshMessagesRef,
+  fetchAlertsRef,
+  refreshFleetRunnersRef,
   selectedProjectId,
   realtimeWsEnabled = true,
 }: UseLogViewerDeps) {
@@ -127,6 +132,7 @@ export function useLogViewer({
   const [wsDisconnectReason, setWsDisconnectReason] = useState<string | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
   const [pipelineThrottle, setPipelineThrottle] = useState<{ reason: string; detail: string; recovery_seconds: number | null } | null>(null);
+  const [gatedTypesMap, setGatedTypesMap] = useState<Map<string, FailingTaskTypeEntry>>(new Map());
   // Lightweight "strategist is working" indicator, toggled by strategic_cycle_started/completed events.
   const [strategistActive, setStrategistActive] = useState(false);
   // Phase-level progress from the current running cycle (null when idle).
@@ -135,6 +141,7 @@ export function useLogViewer({
   const [lastCycleCompletion, setLastCycleCompletion] = useState<StrategicCycleCompletion | null>(null);
   // Live resident-session transcript buffer, appended from strategic_session events.
   const [strategicSessionTranscript, setStrategicSessionTranscript] = useState<StrategicSessionDelta[]>([]);
+  const gatedTypesRefreshSeqRef = useRef(0);
   const pipelineThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsConnectingProjectRef = useRef<string | null>(null);
@@ -145,6 +152,7 @@ export function useLogViewer({
   const fetchDirectionsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshStrategicReadModelDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshMessagesDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchAlertsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsPingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastPongRef = useRef<number>(0);
   const wsPongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -167,6 +175,29 @@ export function useLogViewer({
   useEffect(() => { logTaskRef.current = logTask; }, [logTask]);
   useEffect(() => { selectedProjectIdRef.current = selectedProjectId; }, [selectedProjectId]);
 
+  const refreshGatedTaskTypes = useCallback(async () => {
+    const seq = ++gatedTypesRefreshSeqRef.current;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/failing-task-types`, {
+        headers: await authHeaders(),
+      });
+      if (!res.ok) return;
+      const data = await res.json() as FailingTaskTypes;
+      if (gatedTypesRefreshSeqRef.current !== seq) return;
+      const threshold = typeof data.global_failure_threshold === 'number'
+        ? data.global_failure_threshold
+        : 0.7;
+      const gatedTypes = Array.isArray(data.gated_types) ? data.gated_types : [];
+      const next = new Map<string, FailingTaskTypeEntry>();
+      for (const entry of gatedTypes) {
+        next.set(entry.task_type, { ...entry, threshold });
+      }
+      setGatedTypesMap(next);
+    } catch {
+      // Preserve the current banner state if the snapshot probe fails.
+    }
+  }, []);
+
   // Clear wsDisconnected banner when task reaches a terminal state
   useEffect(() => {
     if (logTask && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(logTask.status)) {
@@ -186,6 +217,10 @@ export function useLogViewer({
     // The transcript is a per-project live buffer; a fresh project starts empty
     // and the resident session re-streams its own strategic_session deltas.
     setStrategicSessionTranscript([]);
+    // Per-type gate state is global, but clear on project switch so stale gates
+    // from a previous project don't bleed onto the newly-selected project's view.
+    gatedTypesRefreshSeqRef.current += 1;
+    setGatedTypesMap(new Map());
   }, [selectedProjectId]);
 
   // Clean up WebSocket and timers on unmount
@@ -215,6 +250,9 @@ export function useLogViewer({
       }
       if (refreshMessagesDebounceRef.current) {
         clearTimeout(refreshMessagesDebounceRef.current);
+      }
+      if (fetchAlertsDebounceRef.current) {
+        clearTimeout(fetchAlertsDebounceRef.current);
       }
     };
   }, []);
@@ -332,6 +370,17 @@ export function useLogViewer({
     }, 500);
   }, [refreshMessagesRef]);
 
+  const refreshAlerts = useCallback(() => {
+    if (!fetchAlertsRef?.current) return;
+    if (fetchAlertsDebounceRef.current) {
+      clearTimeout(fetchAlertsDebounceRef.current);
+    }
+    fetchAlertsDebounceRef.current = setTimeout(() => {
+      fetchAlertsDebounceRef.current = null;
+      fetchAlertsRef.current();
+    }, 500);
+  }, [fetchAlertsRef]);
+
   // Shared WS message handler — dispatches to log drawer AND tracked tasks
   const handleWsMessage = useCallback((event: MessageEvent) => {
     try {
@@ -403,7 +452,17 @@ export function useLogViewer({
         const clearMs = (msg.data.recovery_seconds ?? 60) * 1000;
         pipelineThrottleTimerRef.current = setTimeout(() => setPipelineThrottle(null), clearMs);
       }
-      if (projectEventApplies && (msg.event === 'task_updated' || msg.event === 'artifact_created')) {
+      if (projectEventApplies && msg.event === 'type_throttle' && typeof msg.data?.type === 'string') {
+        void refreshGatedTaskTypes();
+      }
+      if (projectEventApplies && msg.event === 'type_unthrottle' && typeof msg.data?.type === 'string') {
+        void refreshGatedTaskTypes();
+      }
+      if (projectEventApplies && (
+        msg.event === 'task_updated'
+        || msg.event === 'artifact_created'
+        || refetchSurfaces.has('pipeline')
+      )) {
         if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
         fetchTasksDebounceRef.current = setTimeout(() => { fetchTasksRef.current(); }, 500);
       }
@@ -419,6 +478,14 @@ export function useLogViewer({
         || refetchSurfaces.has('messages')
       )) {
         refreshMessages();
+      }
+      if (projectEventApplies && (
+        msg.event === 'alert_created'
+        || msg.event === 'alert_dismissed'
+        || refetchSurfaces.has('runtime')
+      )) {
+        refreshAlerts();
+        refreshFleetRunnersRef?.current?.();
       }
 
       // Strategist activity events — drive a live refresh of the directions view.
@@ -484,7 +551,7 @@ export function useLogViewer({
     } catch {
       // ignore parse errors
     }
-  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages]);
+  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, refreshGatedTaskTypes, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshAlerts, refreshFleetRunnersRef]);
 
   const connectWs = useCallback(async (projectId: string) => {
     if (hasActiveWsForProject(projectId)) return;
@@ -572,6 +639,7 @@ export function useLogViewer({
         // Refresh task list to catch up on any missed state changes during disconnect
         setLogLines(prev => [...prev, '[Refreshing task list after reconnect]']);
         fetchTasksRef.current();
+        void refreshGatedTaskTypes();
       };
 
       ws.onmessage = handleWsMessage;
@@ -626,7 +694,7 @@ export function useLogViewer({
       setLogsConnecting(false);
       setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
     }
-  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject]);
+  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject, refreshGatedTaskTypes]);
 
   // Keep connectWsRef in sync so the online listener can call the latest version
   useEffect(() => { connectWsRef.current = connectWs; }, [connectWs]);
@@ -761,11 +829,14 @@ export function useLogViewer({
     }
   }, [hasForegroundLogTask, restoreSelectedProjectStream]);
 
+  const gatedTaskTypes = [...gatedTypesMap.values()].sort((a, b) => a.task_type.localeCompare(b.task_type));
+
   return {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,
     handleViewLogs, closeLogViewer,
     wsRef, wsConnected,
     pipelineThrottle,
+    gatedTaskTypes,
     strategistActive,
     cycleProgress,
     lastCycleCompletion,

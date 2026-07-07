@@ -37,6 +37,7 @@ from app.strategic_completion import (
     _extract_rationale_from_notes,
     _compute_churn_metrics,
     _compute_lifetime_burn_metrics,
+    _direction_non_merge_pause,
     _direction_still_productive,
     _recent_merges_mostly_unproven,
     _already_built_signature,
@@ -69,10 +70,11 @@ from app.strategic_spawning import (
     _build_previous_decision_outcomes,
     _build_past_retirement_critiques,
     _spawn_strategic_review,
+    STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY,
 )
 from app.strategic_analysis import _build_outcome_evaluation
 from app.direction_lifecycle import _reset_outcome_detection_state
-from app.models import Direction, Project, ProjectMember, ReleaseVersion, StrategicCycle, Task, VersionAcceptanceCriterion
+from app.models import CriterionEvidence, Direction, Project, ProjectMember, ReleaseVersion, StrategicCycle, Task, TaskStatus, VersionAcceptanceCriterion
 from app.auth import create_agent_token
 from httpx import AsyncClient
 from sqlmodel import select
@@ -339,10 +341,13 @@ class TestCheckDirectionHealth:
     # --- Rule 2: Zero-merge ---
 
     def test_zero_merge_5_cycles_all_finished_returns_message(self):
-        # All cycles: 0 PRs merged, last cycle fully finished
+        # All cycles: 0 PRs merged, last cycle fully finished. tasks_failed=1 means
+        # all 5 cycles would also match Rule 4 ("Recent stall:") — but the non-merge
+        # proxy is evaluated FIRST so this direction is classified as "Unproductive:"
+        # (reversible/non-terminal) not "Recent stall:" (terminal code_failure ladder).
         d = _direction(
             research_history=_history(
-                5, prs_merged=0, tasks_created=2, tasks_completed=1, tasks_failed=1
+                5, prs_merged=0, tasks_created=2, tasks_completed=2, tasks_failed=1
             ),
         )
         result = _check_direction_health(d)
@@ -559,6 +564,16 @@ class TestCheckDirectionHealth:
         assert result is not None
         assert "Churn guardrail" in result
 
+    def test_rule5_config_zero_merge_rate_honored(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_churn_min_merge_rate": 0.0},
+            clear=False,
+        )
+        d = _direction(research_history=_history(5, tasks_created=25, tasks_completed=20, tasks_failed=0, prs_merged=1))
+        assert _compute_churn_metrics(d)["merge_rate"] < 0.10
+        assert _check_direction_health(d) is None
+
     def test_rule5_config_window_honored(self, mocker):
         # window=3 focuses on last 3 bad cycles, ignoring earlier good ones that
         # would raise the merge rate high enough to suppress the rule
@@ -592,6 +607,77 @@ class TestCheckDirectionHealth:
         # non_merge_finished=20, merged=0, window_cycles=5
         assert "0 merged" in result
         assert "5 cycles" in result
+
+    # --- Rule 5 defense-in-depth: raw merge-volume backstop ---
+
+    def test_compute_churn_metrics_exposes_real_merges(self):
+        # real_merges is the windowed sum of merged_prs_any_base (raw merge volume).
+        hist = _history(3, prs_merged=0)
+        for e in hist:
+            e["merged_prs_any_base"] = 2
+        m = _compute_churn_metrics(_direction(research_history=hist))
+        assert m["real_merges"] == 6
+        # Legacy entries lacking the field contribute 0 — no crash, no false credit.
+        legacy = _compute_churn_metrics(
+            _direction(research_history=_history(3, prs_merged=0))
+        )
+        assert legacy["real_merges"] == 0
+
+    def test_rule5_churn_suppressed_when_real_merges_present(self):
+        # Same shape as the default-threshold churn case (non_merge_finished=15,
+        # credit-gate merge_rate=0%), but the cycles ALSO carry raw staging/
+        # integration merges whose landed credit has not yet propagated into
+        # verified_prs_merged. The defense-in-depth guard must suppress the pause.
+        hist = _history(
+            5, tasks_created=5, tasks_completed=3, tasks_failed=0, prs_merged=0
+        )
+        for e in hist:
+            e["merged_prs_any_base"] = 3
+        d = _direction(research_history=hist)
+        m = _compute_churn_metrics(d)
+        # credit-gate metrics still look exactly like churn...
+        assert m["non_merge_finished"] >= 15
+        assert m["merge_rate"] < 0.10
+        assert m["real_merges"] == 15
+        # ...but real merges are in flight, so the guardrail must NOT pause.
+        assert _check_direction_health(d) is None
+
+    def test_rule5_churn_still_fires_when_no_real_merges(self):
+        # Explicit merged_prs_any_base=0 on every cycle: nothing merged anywhere.
+        # This is GENUINE churn and the guardrail must still pause.
+        hist = _history(
+            5, tasks_created=5, tasks_completed=3, tasks_failed=0, prs_merged=0
+        )
+        for e in hist:
+            e["merged_prs_any_base"] = 0
+        d = _direction(research_history=hist)
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
+
+    def test_non_merge_pause_suppressed_when_real_merges_present(self):
+        # Isolates the NON-MERGE-RATE proxy (the zero-merge tail): 5 finished cycles,
+        # 0 credited merges, and NO code failures (tasks_failed=0) so the separate,
+        # deliberately-ungated code-failure "Recent stall" guard cannot fire. The
+        # bare fixture pauses "Unproductive:"; injecting real staging/integration
+        # merges (merged_prs_any_base>0) whose landed credit has not yet propagated
+        # must suppress it. The raw-merge guard is scoped to the merge-rate proxy
+        # ONLY — it never masks a genuine crash signal.
+        cycle = dict(
+            tasks_created=2,
+            tasks_completed=2,
+            tasks_failed=0,
+            tasks_failed_infra=0,
+            prs_merged=0,
+        )
+        churning = _direction(research_history=[dict(cycle) for _ in range(5)])
+        result = _check_direction_health(churning)
+        assert result is not None and "Unproductive" in result  # fires w/o raw merges
+
+        landing = _direction(
+            research_history=[{**cycle, "merged_prs_any_base": 2} for _ in range(5)]
+        )
+        assert _check_direction_health(landing) is None  # suppressed by raw volume
 
     # --- Rule 6: Lifetime cumulative burn backstop ---
 
@@ -675,6 +761,34 @@ class TestCheckDirectionHealth:
         assert result is not None
         assert "Lifetime burn backstop" in result
 
+    def test_rule6_config_zero_merge_rate_honored(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_lifetime_min_merge_rate": 0.0},
+            clear=False,
+        )
+        d = _direction(
+            research_history=[
+                {
+                    "tasks_created": 5,
+                    "tasks_completed": 4,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 1,
+                }
+                for _ in range(5)
+            ],
+            history_aggregate={
+                "total_tasks_completed": 145,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        assert _compute_lifetime_burn_metrics(d)["lifetime_merge_rate"] < 0.10
+        assert _check_direction_health(d) is None
+
     def test_rule6_message_includes_machine_readable_counts(self):
         # lifetime_non_merge_finished=160, lifetime_merged=0, rate=0%
         d = _direction(
@@ -712,6 +826,81 @@ class TestCheckDirectionHealth:
         assert reason is not None
         assert "Lifetime burn backstop" in reason
         assert _is_code_failure_pause_reason(reason) is False
+
+    # --- Consolidation: single non-merge-rate proxy governs the pause ---
+
+    def test_consolidated_pause_uses_single_non_merge_proxy(self):
+        """The merge-rate pause decision flows through ONE proxy driven by the
+        proof-weighted merge verdict — not the former separate zero-merge / churn /
+        lifetime rules.
+
+        Two directions with the SAME finished-work shape and real (verified) merge
+        outcomes differ only in the merge-test *verdict*: one ships merely-delivered
+        UNDECLARED merges (proof-weighted rate below the floor), the other ships
+        machine-PROVEN merges (adequate rate). The single proxy pauses the first and
+        spares the second, and ``_check_direction_health`` returns exactly what
+        ``_direction_non_merge_pause`` returns — proving the consolidation.
+        """
+        # Real verified merge each cycle, but UNDECLARED ("merely delivered"):
+        # proof weight 0.4 → windowed proof-weighted merge rate ≈ 8% (< 10% floor).
+        unproven = _direction(
+            research_history=[
+                {
+                    "tasks_created": 6,
+                    "tasks_completed": 5,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,
+                    "acceptance_merged_write_total": 1,
+                    "acceptance_declared_merged": 0,
+                    "acceptance_proven_merged": 0,
+                }
+                for _ in range(5)
+            ]
+        )
+        # The proxy signal itself: high unmerged volume AND a sub-floor merge rate.
+        metrics = _compute_churn_metrics(unproven)
+        assert metrics is not None
+        assert metrics["non_merge_finished"] >= 15
+        assert metrics["merge_rate"] < 0.10
+
+        proxy_reason = _direction_non_merge_pause(unproven)
+        assert proxy_reason is not None
+        assert proxy_reason.startswith("Churn guardrail:")
+        # The single proxy — not saturation or a code-failure guard — is the cause.
+        assert not proxy_reason.startswith(
+            ("Saturated:", "High code failure rate:", "Recent stall:")
+        )
+        assert _is_code_failure_pause_reason(proxy_reason) is False
+        # _check_direction_health delegates the merge-rate decision to the one proxy.
+        assert _check_direction_health(unproven) == proxy_reason
+
+        # Same finished-work shape, but PROVEN merges (full credit) → the SAME proxy
+        # reads an adequate merge rate and does NOT pause, even with high unmerged
+        # volume. It is the proof-weighted rate, not raw non-merge volume, that decides.
+        proven = _direction(
+            research_history=[
+                {
+                    "tasks_created": 8,
+                    "tasks_completed": 7,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 2,
+                    "verified_prs_merged": 2,
+                    "acceptance_merged_write_total": 2,
+                    "acceptance_declared_merged": 2,
+                    "acceptance_proven_merged": 2,
+                }
+                for _ in range(5)
+            ]
+        )
+        proven_metrics = _compute_churn_metrics(proven)
+        assert proven_metrics is not None
+        assert proven_metrics["non_merge_finished"] >= 15
+        assert proven_metrics["merge_rate"] >= 0.10
+        assert _direction_non_merge_pause(proven) is None
+        assert _check_direction_health(proven) is None
 
 
 # ── _compute_churn_metrics ────────────────────────────────────────────────────
@@ -1172,6 +1361,7 @@ class TestRecordRetiredDirectionMemory:
             "id": "d-abc",
             "text": "model gc garbage collection optimize performance",
             "gap_id": "g-model-gc",
+            "research_history": [{"prs_merged": 1}],
         }
         record_retired_direction_memory(vision, d, reason="strategic_retire")
         entries = vision["_recently_retired_directions"]
@@ -1183,6 +1373,10 @@ class TestRecordRetiredDirectionMemory:
         assert "model" in entry["text_tokens"]
         assert "gc" in entry["text_tokens"]
         assert "retired_at" in entry
+        assert entry["retired_outcome"] == {
+            "classification": "landed",
+            "metrics": {"cycles": 1, "prs_merged": 1},
+        }
 
     def test_records_entry_without_gap_id(self):
         vision: dict = {}
@@ -1191,6 +1385,17 @@ class TestRecordRetiredDirectionMemory:
         entry = vision["_recently_retired_directions"][0]
         assert "gap_id" not in entry
         assert entry["reason"] == "auto_completed"
+        assert entry["retired_outcome"]["classification"] == "success_evidence_met"
+
+    def test_records_abandoned_outcome_when_no_success_or_merge_signal(self):
+        vision: dict = {}
+        d = {"id": "d-stop", "text": "cache layer optimization database"}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        entry = vision["_recently_retired_directions"][0]
+        assert entry["retired_outcome"] == {
+            "classification": "abandoned",
+            "metrics": {"cycles": 0, "prs_merged": 0},
+        }
 
     def test_fifo_eviction_at_cap(self):
         from app.strategic_completion import _RETIRED_MEMORY_CAP
@@ -1218,6 +1423,52 @@ class TestRecordRetiredDirectionMemory:
         assert "fix" not in tokens
         assert "add" not in tokens
         assert "database" in tokens
+
+    def test_no_outcome_key_when_omitted(self):
+        # Backward compatibility: existing callers that omit outcome keep the
+        # previous entry shape (no 'outcome' key at all).
+        vision: dict = {}
+        d = {"id": "d-1", "text": "cache layer optimization database"}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        entry = vision["_recently_retired_directions"][0]
+        assert "outcome" not in entry
+        assert "retired_outcome" in entry
+
+    def test_records_bounded_outcome_when_provided(self):
+        from app.strategic_completion import _RETIRED_OUTCOME_CHAR_CAP
+
+        vision: dict = {}
+        d = {"id": "d-1", "text": "cache layer optimization database"}
+        long_outcome = "x" * (_RETIRED_OUTCOME_CHAR_CAP + 50)
+        record_retired_direction_memory(
+            vision, d, reason="strategic_retire", outcome=long_outcome
+        )
+        entry = vision["_recently_retired_directions"][0]
+        assert entry["outcome"] == "x" * _RETIRED_OUTCOME_CHAR_CAP
+        assert len(entry["outcome"]) == _RETIRED_OUTCOME_CHAR_CAP
+
+    def test_empty_or_whitespace_outcome_not_stored(self):
+        vision: dict = {}
+        d = {"id": "d-1", "text": "cache layer optimization database"}
+        record_retired_direction_memory(
+            vision, d, reason="strategic_superseded", outcome="   "
+        )
+        entry = vision["_recently_retired_directions"][0]
+        assert "outcome" not in entry
+        assert "retired_outcome" in entry
+
+    def test_superseded_outcome_carries_successor_pointer(self):
+        vision: dict = {}
+        d = {"id": "d-1", "text": "cache layer optimization database"}
+        record_retired_direction_memory(
+            vision,
+            d,
+            reason="strategic_superseded",
+            outcome="superseded by d-successor",
+        )
+        entry = vision["_recently_retired_directions"][0]
+        assert entry["reason"] == "strategic_superseded"
+        assert entry["outcome"] == "superseded by d-successor"
 
 
 class TestCheckGapRespawnBlock:
@@ -1304,6 +1555,26 @@ class TestCheckGapRespawnBlock:
         )
         # cooldown_days=0 means cutoff = now, so even a 0-day-old entry is outside window
         assert reason is None
+
+
+def test_retired_grounding_classifier_handles_legacy_memory_entry():
+    from app.direction_referential_guard import build_retired_direction_grounding
+
+    grounding = build_retired_direction_grounding(
+        {
+            "id": "d-legacy",
+            "reason": "strategic_retire",
+            "cycles": 4,
+            "prs_merged": 0,
+        }
+    )
+
+    assert grounding == {
+        "direction_id": "d-legacy",
+        "classification": "abandoned",
+        "metrics": {"prs_merged": 0, "cycles": 4},
+        "reason": "strategic_retire",
+    }
 
 
 def test_strategic_refresh_rejects_same_gap_duplicate_direction():
@@ -1718,6 +1989,105 @@ class TestThinkerArtifactsMissingOutcome:
         await strat_fail_db.refresh(cycle)
 
         assert cycle.outcome == sc.OUTCOME_FAILED_PHASE2
+
+
+# ── vision-lock discipline on failure paths ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unparseable_output_increments_failures_preserves_vision_keys(
+    db_session, mocker
+):
+    """Unparseable-output path increments _strategic_failures via
+    with_vision_locked so that sibling vision keys are NOT clobbered and the
+    increment is not lost to a concurrent stale-read race."""
+    from unittest.mock import AsyncMock
+
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "keep-me", "_strategic_failures": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "p", "vision": {"revision": 0}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Pass unparseable logs so the function takes the failure branch
+    await _handle_strategic_completion(task, "{{not valid json", db_session)
+
+    await db_session.refresh(project)
+    vision = project.vision or {}
+    # Counter must have been incremented (was 1, now 2)
+    assert vision.get("_strategic_failures") == 2, (
+        f"Expected _strategic_failures=2, got {vision.get('_strategic_failures')!r}"
+    )
+    # Sibling key must NOT have been clobbered
+    assert vision.get("purpose") == "keep-me", (
+        f"vision lock must preserve sibling vision keys; got purpose={vision.get('purpose')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_vision_produced_increments_failures_under_held_lock(
+    db_session, mocker
+):
+    """No-vision path must increment _strategic_failures on the already-locked
+    project object without re-acquiring with_vision_locked (which would deadlock).
+    Other vision keys must be preserved."""
+    import json
+    from unittest.mock import AsyncMock
+
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "keep-me", "revision": 1, "_strategic_failures": 0},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "p", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Logs parse successfully but contain no "vision" key — triggers the no-vision path
+    logs = json.dumps({"problem_model": {}})
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    vision = project.vision or {}
+    assert vision.get("_strategic_failures") == 1, (
+        f"Expected _strategic_failures=1, got {vision.get('_strategic_failures')!r}"
+    )
+    # Sibling key must be preserved
+    assert vision.get("purpose") == "keep-me", (
+        f"no-vision path must preserve sibling vision keys; got purpose={vision.get('purpose')!r}"
+    )
 
 
 # ── _check_direction_starvation ──────────────────────────────────────────────
@@ -3944,7 +4314,16 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
         name="DR1",
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
-        directions=[],
+        directions=[
+            {
+                "id": "d-grounded",
+                "text": "Improve login flow",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            }
+        ],
     )
     db_session.add(project)
     await db_session.commit()
@@ -3972,7 +4351,7 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
                     "success_evidence": "All auth tests pass",
                     "retirement_condition": "OAuth2 flow live for 3 cycles",
                     "dedup_reasoning": {
-                        "closest_directions": ["Improve login flow", "Add SSO support"],
+                        "closest_directions": ["d-grounded", "Add SSO support"],
                         "distinction": "Targets the auth backend protocol, not the UI flow",
                     },
                 }
@@ -3987,8 +4366,280 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
     ctx = dirs[0].get("context") or {}
     dr = ctx.get("dedup_reasoning")
     assert dr is not None, "dedup_reasoning should be stored in context"
-    assert dr["closest_directions"] == ["Improve login flow", "Add SSO support"]
+    assert dr["closest_directions"] == ["d-grounded", "Add SSO support"]
     assert dr["distinction"] == "Targets the auth backend protocol, not the UI flow"
+    verdict = ctx.get("grounding_verdict")
+    assert verdict is not None
+    assert verdict["status"] == "validated"
+    assert verdict["live_direction_ids"] == ["d-grounded"]
+
+
+@pytest.mark.asyncio
+async def test_create_direction_attaches_landed_retired_outcome(db_session, mocker):
+    """Fallback create ops matching landed retired work carry prior outcome context."""
+    import json
+    from unittest.mock import AsyncMock
+    from app import strategic_cycle
+    from app.models import KnowledgeDocument, SourceKind
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.strategic_completion._runtime_config",
+        {"direction_gap_respawn_block_mode": "observe"},
+    )
+
+    retired_memory = [
+        {
+            "id": "d-landed",
+            "text_tokens": ["gpu", "runner", "lane", "verification"],
+            "retired_at": _utcnow().isoformat(),
+            "reason": "success_evidence_met",
+            "outcome": {
+                "classification": "landed",
+                "metrics": {"prs_merged": 2, "cycles": 3},
+            },
+        }
+    ]
+    project = Project(
+        name="RetiredOutcomeCreate",
+        user_id="u-retired-outcome",
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": retired_memory,
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    source_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "prompt": "retirement memo"}],
+        context={},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    memo = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        source_kind=SourceKind.DIRECTION_RETIREMENT.value,
+        title="Direction retired: GPU runner lane",
+        summary="GPU runner lane shipped and verified on automain.",
+        body="Retirement memo body",
+        topic="direction-retirement",
+        direction_id="d-landed",
+        tags=["direction-retirement"],
+    )
+    db_session.add(memo)
+    await db_session.commit()
+    await db_session.refresh(memo)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {
+                "purpose": "test",
+                "revision": 2,
+                "_recently_retired_directions": retired_memory,
+            },
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Rebuild GPU runner lane verification coverage",
+                    "priority": "medium",
+                    "success_evidence": "Fresh verification is present",
+                    "retirement_condition": "Verification remains green",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = [
+        d for d in (project.directions or []) if "GPU runner lane" in d.get("text", "")
+    ]
+    assert len(created) == 1
+    grounding = (created[0].get("context") or {}).get("retired_direction_grounding")
+    assert grounding == {
+        "direction_id": "d-landed",
+        "classification": "landed",
+        "metrics": {"prs_merged": 2, "cycles": 3},
+        "reason": "success_evidence_met",
+        "retirement_memo": {
+            "knowledge_doc_id": str(memo.id),
+            "summary": "GPU runner lane shipped and verified on automain.",
+        },
+    }
+    notes = [n.get("text", "") for n in created[0].get("notes", [])]
+    assert any("prior_outcome=landed" in n and "landed work" in n for n in notes)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    created_id = created[0]["id"]
+    assert meta["created_retired_grounding"][created_id]["classification"] == "landed"
+
+
+@pytest.mark.asyncio
+async def test_create_direction_attaches_abandoned_retired_outcome(db_session, mocker):
+    """Fallback create ops matching non-landed retired work are marked abandoned."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.strategic_completion._runtime_config",
+        {"direction_gap_respawn_block_mode": "observe"},
+    )
+
+    retired_memory = [
+        {
+            "id": "d-abandoned",
+            "text_tokens": ["cache", "warming", "scheduler", "latency"],
+            "retired_at": _utcnow().isoformat(),
+            "reason": "strategic_retire",
+            "outcome": {
+                "classification": "abandoned",
+                "metrics": {"prs_merged": 0, "cycles": 5},
+            },
+        }
+    ]
+    project = Project(
+        name="AbandonedRetiredOutcomeCreate",
+        user_id="u-abandoned-outcome",
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": retired_memory,
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {
+                "purpose": "test",
+                "revision": 2,
+                "_recently_retired_directions": retired_memory,
+            },
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Retry cache warming scheduler latency improvements",
+                    "priority": "medium",
+                    "success_evidence": "Latency improves",
+                    "retirement_condition": "Scheduler stabilizes",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = [
+        d for d in (project.directions or []) if "cache warming" in d.get("text", "")
+    ]
+    assert len(created) == 1
+    grounding = (created[0].get("context") or {}).get("retired_direction_grounding")
+    assert grounding["classification"] == "abandoned"
+    assert grounding["metrics"] == {"prs_merged": 0, "cycles": 5}
+    notes = [n.get("text", "") for n in created[0].get("notes", [])]
+    assert any("prior_outcome=abandoned" in n for n in notes)
+    assert not any("landed work" in n for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_create_direction_without_retired_match_has_no_grounding(
+    db_session, mocker
+):
+    """Clean fallback creates remain unchanged when retired memory does not match."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="NoRetiredOutcomeCreate",
+        user_id="u-no-retired-outcome",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Open a new retrieval evaluation lane",
+                    "priority": "medium",
+                    "success_evidence": "Evaluation lane reports results",
+                    "retirement_condition": "Retriever quality is measured",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = [
+        d for d in (project.directions or []) if "retrieval evaluation" in d.get("text", "")
+    ]
+    assert len(created) == 1
+    assert "retired_direction_grounding" not in (created[0].get("context") or {})
+    assert all(
+        "Grounding: matches retired direction" not in n.get("text", "")
+        for n in created[0].get("notes", [])
+    )
 
 
 @pytest.mark.asyncio
@@ -5308,7 +5959,9 @@ async def test_set_retirement_critiques_rejects_all_malformed(client, db_session
 # ── set_evidence_progress HTTP API path ────────────────────────────────────────
 
 
-async def _make_strategic_task(db_session, *, name, vm, directions=None):
+async def _make_strategic_task(
+    db_session, *, name, vm, directions=None, problem_model=None
+):
     """Build a committed project + cycle + strategic_review task; return the task."""
     from app.models import TaskStatus
     from app import strategic_cycle
@@ -5317,6 +5970,7 @@ async def _make_strategic_task(db_session, *, name, vm, directions=None):
         name=name,
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
+        problem_model=problem_model,
         directions=directions or [],
     )
     db_session.add(project)
@@ -6053,6 +6707,72 @@ async def test_approve_direction_rejected_portfolio_operation_blocks(
 
 
 @pytest.mark.asyncio
+async def test_approve_direction_staffs_linked_gap(client, db_session):
+    """Approve direction must activate the direction and staff its linked gap."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(
+        db_session,
+        name="PO-APPROVE-GAP",
+        vm="vm-po-approve-gap",
+        directions=[
+            {
+                "id": "d-approve",
+                "status": "proposed",
+                "text": "Approve me",
+                "gap_id": "g-1",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+        problem_model={
+            "revision": 1,
+            "gaps": [
+                {
+                    "id": "g-1",
+                    "name": "Gap 1",
+                    "status": "active",
+                    "active_moves": [],
+                    "past_moves": [],
+                    "deferral": {
+                        "rationale": "waiting on staffing",
+                        "created_at": "2026-01-01T00:00:00",
+                    },
+                }
+            ],
+        },
+    )
+
+    token = create_agent_token(
+        str(task.id), "vm-po-approve-gap", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "approve_direction",
+            "data": {"direction_id": "d-approve", "rationale": "good idea"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "approve_direction"
+
+    project = await db_session.get(Project, task.project_id)
+    await db_session.refresh(project)
+    approved = next(d for d in project.directions if d.get("id") == "d-approve")
+    assert approved["status"] == "active"
+    assert approved["activated_at"]
+
+    gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-1")
+    assert gap["active_moves"] == ["d-approve"]
+    assert gap["past_moves"] == []
+    assert gap["deferral"] is None
+
+
+@pytest.mark.asyncio
 async def test_reject_direction_rejected_portfolio_operation_blocks(client, db_session):
     task = await _make_strategic_task(
         db_session,
@@ -6522,6 +7242,10 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
                     "direction_id": "d-legacy",
                     "successor_id": "d-successor",
                     "rationale": "replaced",
+                    "dedup_reasoning": {
+                        "closest_directions": ["d-legacy"],
+                        "distinction": "This is a status reviver, not a new direction",
+                    },
                     "changes": {"status": "superseded"},
                 },
             ],
@@ -6537,6 +7261,215 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
     assert sb is not None, "superseded_by must be derived from successor_id"
     assert sb.get("direction_id") == "d-successor"
     assert "set_at" in sb
+    verdict = (target.get("context") or {}).get("grounding_verdict")
+    assert verdict and verdict["status"] == "validated"
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_to_superseded_records_retired_memory(
+    db_session, mocker
+):
+    """Fallback op=update flipping status->superseded records retired-direction memory.
+
+    The strategist-driven terminal-status write must queue a
+    _recently_retired_directions entry (reason=strategic_superseded, outcome
+    carrying the successor pointer) so a same-gap re-spawn is blocked next cycle.
+    """
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="SUP-MEM-FB",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-sup",
+                "text": "model gc garbage collection optimize performance",
+                "status": "active",
+                "priority": "medium",
+                "gap_id": "g-model-gc",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-sup",
+                    "rationale": "replaced by newer approach",
+                    "changes": {
+                        "status": "superseded",
+                        "superseded_by": {
+                            "direction_id": "d-new",
+                            "set_at": "2026-01-01T00:00:00",
+                        },
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    entry = next((m for m in mem if m.get("id") == "d-sup"), None)
+    assert entry is not None, (
+        f"update->superseded must record retired memory; got {mem}"
+    )
+    assert entry["reason"] == "strategic_superseded"
+    assert entry.get("gap_id") == "g-model-gc"
+    assert entry.get("outcome") == "superseded by d-new"
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_to_expired_records_retired_memory(db_session, mocker):
+    """Fallback op=update flipping status->expired records retired memory (reason+rationale)."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="EXP-MEM-FB",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-exp",
+                "text": "cache layer optimization database query performance",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-exp",
+                    "rationale": "no longer relevant after refactor",
+                    "changes": {"status": "expired"},
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    entry = next((m for m in mem if m.get("id") == "d-exp"), None)
+    assert entry is not None, f"update->expired must record retired memory; got {mem}"
+    assert entry["reason"] == "strategic_expired"
+    assert entry.get("outcome") == "no longer relevant after refactor"
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_non_terminal_records_no_retired_memory(
+    db_session, mocker
+):
+    """Fallback op=update that does NOT flip to a terminal status records no memory."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="NONTERM-MEM-FB",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-live",
+                "text": "keep improving the live direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-live",
+                    "rationale": "bump priority",
+                    "changes": {"priority": "high"},
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    assert not any(m.get("id") == "d-live" for m in mem), (
+        f"non-terminal update must NOT record retired memory; got {mem}"
+    )
 
 
 @pytest.mark.asyncio
@@ -6615,6 +7548,162 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
         "direction_id": "d-http-new",
         "set_at": "2026-01-01T00:00:00",
     }
+
+
+@pytest.mark.asyncio
+async def test_strategic_http_update_direction_auto_paused_reactivation_stamps_grace(
+    client, db_session, mocker
+):
+    """HTTP update_direction reactivating an auto-paused direction clears residue,
+    stamps the auto_recovered_at grace marker, and preserves the churn counter."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="REACT-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-http-auto-paused",
+                "text": "auto-paused churn direction",
+                "status": "paused",
+                "auto_paused": True,
+                "paused_reason": "Churn guardrail: low merge rate",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "churn_family_pause_count": 1,
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-react-http",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-react-http", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-auto-paused",
+                "rationale": "resume auto-paused direction",
+                "changes": {"status": "active"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    target = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-auto-paused"
+    )
+    assert target.get("status") == "active"
+    assert target.get("auto_recovered_at") is not None
+    assert "auto_paused" not in target
+    assert "paused_reason" not in target
+    assert target.get("churn_family_pause_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_strategic_http_update_direction_user_paused_reactivation_blocked(
+    client, db_session, mocker
+):
+    """HTTP update_direction must not resume a USER-paused direction: the response
+    is blocked, the status stays paused, and no grace marker is stamped."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="REACT-HTTP-USER",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-http-user-paused",
+                "text": "user-paused direction",
+                "status": "paused",
+                # No auto_paused flag → user/operator paused it.
+                "paused_reason": "operator paused",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-react-http-user",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-react-http-user", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-user-paused",
+                "rationale": "try to resume user-paused direction",
+                "changes": {"status": "active"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("status") == "blocked"
+
+    await db_session.refresh(project)
+    target = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-user-paused"
+    )
+    assert target.get("status") == "paused"
+    assert "auto_recovered_at" not in target
+    assert target.get("paused_reason") == "operator paused"
 
 
 @pytest.mark.asyncio
@@ -7672,14 +8761,13 @@ async def test_strategic_completion_appends_routine_digest_to_running_update(
 @pytest.mark.asyncio
 async def test_version_phase_decision_flows_end_to_end(client, db_session, mocker):
     """End-to-end: a version_phase_decision embedded in a set_problem_model call
-    rides task.context through to strategic completion and flips the open
-    ReleaseVersion's phase.
+    is applied synchronously within the API handler and flips the open
+    ReleaseVersion's phase immediately — not deferred to task completion.
 
-    This is the seam Phase 2b connects: the agent embeds version_phase_decision
-    as a top-level sibling of the problem_model; the /api/agent/strategic
-    endpoint must lift it out (ProblemModel is extra="forbid"), stash it on
-    task.context, and the completion handler must apply it to the open version.
-    The test exercises the REAL HTTP transport, not a mocked context write.
+    The agent embeds version_phase_decision as a top-level sibling of the
+    problem_model; the /api/agent/strategic endpoint lifts it out (ProblemModel
+    is extra="forbid"), applies it synchronously, and pops the context key so
+    _handle_strategic_completion is a no-op. Exercises the REAL HTTP transport.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -7755,23 +8843,22 @@ async def test_version_phase_decision_flows_end_to_end(client, db_session, mocke
         "Ship the thing"
     )
 
-    # It rides task.context to the completion handler.
-    await db_session.refresh(task)
-    stored = (task.context or {}).get("_strategic_version_phase_decision")
-    assert stored == {
-        "phase": "stabilize",
-        "reasoning": "Enough features landed; time to harden.",
-    }
-
-    # Completion handler's API path applies the decision to the open version.
-    await _handle_strategic_completion(task, "", db_session)
-
+    # Synchronous apply: phase flip happened during set_problem_model itself.
     await db_session.refresh(version)
     assert version.phase == "stabilize", (
-        f"Expected open ReleaseVersion to flip to stabilize, got {version.phase!r}"
+        f"Expected open ReleaseVersion to flip to stabilize during set_problem_model, got {version.phase!r}"
     )
     assert version.phase_changed_at is not None
     assert version.phase_reasoning == "Enough features landed; time to harden."
+
+    # Context key is consumed and popped — not stored for the completion handler.
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_version_phase_decision") is None
+
+    # Completion handler is a no-op for version_phase (key already applied).
+    await _handle_strategic_completion(task, "", db_session)
+    await db_session.refresh(version)
+    assert version.phase == "stabilize"  # unchanged — no second flip
 
     # Sanity: still exactly one open version, still v1.
     open_ver = await rv.current_open_version(db_session, project.id)
@@ -8035,18 +9122,20 @@ async def test_handle_strategic_completion_preserves_collections_on_bootstrap(
 
 @pytest.mark.asyncio
 async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
-    """End-to-end: a qualify_request embedded in a set_problem_model call rides
-    task.context through to strategic completion and triggers the release
-    qualifier when the open ReleaseVersion is in the stabilize phase.
+    """End-to-end: a qualify_request embedded in a set_problem_model call is
+    applied synchronously within the API handler so resident sessions (where the
+    task stays open for the entire conversation) get immediate effect.
 
-    This is the seam Phase 3 batch 3b connects: the strategic agent embeds
-    qualify_request as a top-level sibling of the problem_model; the
-    /api/agent/strategic endpoint must lift it out (ProblemModel is
-    extra="forbid"), stash it on task.context, and the completion handler must
-    call release_qualifier.run_qualification on the open version. The test
-    exercises the REAL HTTP transport, not a mocked context write — the absence
-    of exactly this kind of end-to-end test let the version_phase_decision seam
-    silently break earlier.
+    The strategic agent embeds qualify_request as a top-level sibling of the
+    problem_model; the /api/agent/strategic endpoint lifts it out (ProblemModel
+    is extra="forbid"), applies it synchronously by calling _apply_qualify_request
+    directly, and pops the context key so _handle_strategic_completion is a
+    no-op — no double-application for non-resident tasks that also complete
+    normally.
+
+    Regression for fr-resident-qualify-request-application-timing: a qualify_request
+    submitted mid-session can no longer sit queued for the entire remaining duration
+    of the resident conversation.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -8132,25 +9221,119 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
         "Ship the thing"
     )
 
-    # It rides task.context to the completion handler.
-    await db_session.refresh(task)
-    stored = (task.context or {}).get("_strategic_qualify_request")
-    assert stored == {
-        "reason": "Hardening is sufficient; the version is release-ready.",
-    }
-
-    # The qualifier has not run yet — only set_problem_model has been called.
-    run_qualification.assert_not_called()
-
-    # Completion handler's API path triggers qualification on the open version.
-    await _handle_strategic_completion(task, "", db_session)
-
+    # Synchronous apply: run_qualification fired during set_problem_model itself —
+    # not deferred to task completion. This is the resident-session fix.
     run_qualification.assert_awaited_once()
     call_args = run_qualification.await_args.args
-    # run_qualification(session, project_id, version)
-    assert call_args[0] is db_session
+    # run_qualification(session, project_id, version) — the handler's own session
+    # is used (not db_session), so check project_id and version identity only.
     assert call_args[1] == project.id
     assert call_args[2].id == version.id
+
+    # The context key is consumed and popped — no stale key left over.
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_qualify_request") is None
+
+    # Completion handler does NOT trigger a second qualification (idempotency).
+    await _handle_strategic_completion(task, "", db_session)
+    run_qualification.assert_awaited_once()  # still exactly once
+
+
+@pytest.mark.asyncio
+async def test_qualify_request_side_effect_failure_does_not_break_durable_write(
+    client, db_session, mocker
+):
+    """STRUCTURAL regression (ci_compliance connection-death wedge).
+
+    The qualify_request side-effect does minutes of external GitHub I/O
+    (CI-compliance scan + run_qualification). It used to run INSIDE the
+    completion / set_problem_model transaction, under the Project ``FOR UPDATE``
+    lock — so the idle DB connection died mid-scan (asyncpg
+    ``connection is closed`` on ``UPDATE project SET ci_compliance``), poisoned
+    the session, and the commit raised ``PendingRollbackError``. The handler
+    classified that as transient and requeued the WHOLE agent job, re-running a
+    5–24 min review up to ``max_retries`` times before failing — even though the
+    agent's design-doc write had already landed.
+
+    The fix runs the qualify side-effect AFTER the durable commit, on an isolated
+    fresh session, fail-open. This test simulates the side-effect blowing up the
+    exact way the connection death did and asserts the durable problem_model
+    write still commits and the agent gets a 200 — never a 500 / requeue.
+    """
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import release_version as rv
+    from app import strategic_cycle
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    # Stand in for the connection-death poison: the qualify side-effect raises a
+    # disconnect-class error. Patched at the module global so the post-commit
+    # wrapper's ``await _apply_qualify_request(...)`` hits it.
+    boom = mocker.patch(
+        "app.strategic_completion._apply_qualify_request",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError(
+            "(sqlalchemy.dialects.postgresql.asyncpg.InterfaceError) connection is "
+            "closed [SQL: UPDATE project SET ci_compliance=$1 WHERE project.id = $2]"
+        ),
+    )
+
+    project = Project(
+        name="QR-ISOLATE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="hardening")
+    db_session.add(version)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-qr-iso",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-qr-iso", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship it", "current_focus": "qualify"},
+                "capabilities": [],
+                "gaps": [],
+                "qualify_request": {"reason": "release-ready"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+
+    # The durable problem_model write survived even though the qualify side-effect
+    # raised a connection-death error — no 500, no requeue.
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["qualify_request_received"] is True
+    await db_session.refresh(project)
+    assert (project.problem_model or {}).get("intent", {}).get("purpose") == "Ship it"
+    # The side-effect ran POST-commit (on the isolated fresh session) and its
+    # failure was swallowed rather than propagated to the durable write.
+    boom.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -8160,8 +9343,9 @@ async def test_qualify_request_skipped_when_version_not_in_stabilize(
     """A qualify_request is dropped (qualifier not run) when the open version is
     still in the build phase — qualification only runs from stabilize.
 
-    The transport still works (the field is stripped + stashed), but the
-    completion handler's phase gate blocks run_qualification.
+    The field is stripped from problem_model and the synchronous apply path
+    no-ops (phase gate). The context key is popped regardless so the completion
+    handler is also a no-op.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -8224,14 +9408,15 @@ async def test_qualify_request_skipped_when_version_not_in_stabilize(
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 200, resp.text
-    # The transport works — the field is received and stashed.
+    # The field is received (reported in the response).
     assert resp.json()["qualify_request_received"] is True
+    # Phase gate blocks the qualifier — run_qualification not called.
+    run_qualification.assert_not_awaited()
+    # Context key is consumed and popped, not left in task.context.
     await db_session.refresh(task)
-    assert (task.context or {}).get("_strategic_qualify_request") == {
-        "reason": "premature ask"
-    }
+    assert (task.context or {}).get("_strategic_qualify_request") is None
 
-    # But the completion handler's stabilize gate blocks the qualifier.
+    # Completion handler is also a no-op (key already popped).
     await _handle_strategic_completion(task, "", db_session)
     run_qualification.assert_not_awaited()
 
@@ -8291,6 +9476,84 @@ async def test_set_problem_model_with_qualify_request_does_not_400(client, db_se
     # problem_model write succeeded: revision bumped off the empty baseline.
     assert body["revision"] == 1
     assert body["qualify_request_received"] is True
+
+
+@pytest.mark.asyncio
+async def test_qualify_request_failure_recorded_on_release_version(
+    db_session, mocker
+):
+    """When run_qualification raises unexpectedly, _apply_qualify_request must
+    record a durable qualify_request_error on ReleaseVersion.last_qualification
+    rather than silently swallowing the failure into a log line only.
+
+    Regression: before this fix the outer except swallowed all exceptions with
+    no queryable trace — qualification_attempts stayed 0, last_qualification
+    stayed None, and diagnosis required log-diving.
+    """
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _apply_qualify_request
+    from app import release_version as rv
+
+    project = Project(
+        name="QR-ERR-DURABLE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.last_qualification is None
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-qr-err",
+        payloads=[
+            {"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Force run_qualification to raise — simulates any unexpected failure
+    # (DB error, network blip, unhandled edge case inside the qualifier).
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("injected failure for durable-error test"),
+    )
+
+    await _apply_qualify_request(
+        {"reason": "ready"},
+        task,
+        project,
+        db_session,
+        path="test",
+    )
+
+    # The failure must be recorded on the ReleaseVersion row, not just logged.
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq is not None, (
+        "last_qualification must be set after run_qualification raises — "
+        "a silent log line is not queryable by the agent or operator"
+    )
+    assert "qualify_request_error" in lq, (
+        f"last_qualification must contain qualify_request_error; got: {lq}"
+    )
+    assert "qualify_request_error_at" in lq
+    # The error text must identify the failure so it is diagnosable without logs.
+    assert "injected failure" in lq["qualify_request_error"]
 
 
 # ── new_acceptance_criteria transport / fallback ─────────────────────────────
@@ -8355,7 +9618,7 @@ async def test_handle_strategic_completion_applies_new_acceptance_criteria_from_
 async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
     client, db_session
 ):
-    """The API seam must strip, stow, and later apply new_acceptance_criteria."""
+    """The API seam must strip and apply new_acceptance_criteria synchronously."""
     from app import acceptance_criteria as ac
     from app import release_version as rv
     from app.auth import create_agent_token
@@ -8423,15 +9686,19 @@ async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
     await db_session.refresh(project)
     assert "new_acceptance_criteria" not in (project.problem_model or {})
 
-    await db_session.refresh(task)
-    stored = (task.context or {}).get(NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY)
-    assert stored == criteria_texts
-
-    await _handle_strategic_completion(task, "", db_session)
-
+    # Synchronous apply: criteria created during set_problem_model, not deferred.
     fetched = await ac.get_criteria_for_version(db_session, version.id)
     assert [c.text for c in fetched] == criteria_texts
     assert all(c.created_by == "strategist" for c in fetched)
+
+    # Context key is consumed and popped — completion handler is a no-op.
+    await db_session.refresh(task)
+    assert (task.context or {}).get(NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY) is None
+
+    # Completion handler does not create duplicate criteria.
+    await _handle_strategic_completion(task, "", db_session)
+    fetched2 = await ac.get_criteria_for_version(db_session, version.id)
+    assert len(fetched2) == len(criteria_texts)  # no duplicates
 
 
 # ── _compute_lifetime_burn_metrics ───────────────────────────────────────────
@@ -10286,6 +11553,38 @@ class TestChallengeRejectsPortfolioOp:
             rec, "create_direction", text="Stand up a local-GPU runner lane"
         ) == (False, "")
 
+    def test_rejected_activate_direction_blocks(self):
+        rec = self._rec(
+            [{"op": "activate_direction", "direction_id": "d-5", "verdict": "rejected"}]
+        )
+        blocked, why = challenge_rejects_portfolio_op(
+            rec, "activate_direction", direction_id="d-5"
+        )
+        assert blocked is True
+        assert isinstance(why, str)
+
+    def test_approved_activate_direction_does_not_block(self):
+        rec = self._rec(
+            [{"op": "activate_direction", "direction_id": "d-5", "verdict": "approved"}]
+        )
+        assert challenge_rejects_portfolio_op(
+            rec, "activate_direction", direction_id="d-5"
+        ) == (False, "")
+
+    def test_absent_verdict_for_activate_direction_blocks(self):
+        # No matching portfolio_operations entry → hard-block op fails closed.
+        rec = self._rec([])
+        blocked, why = challenge_rejects_portfolio_op(
+            rec, "activate_direction", direction_id="d-5"
+        )
+        assert blocked is True
+
+    def test_activate_alias_canonicalizes(self):
+        from app.strategic_completion import _canonical_portfolio_op
+
+        assert _canonical_portfolio_op("activate") == "activate_direction"
+        assert _canonical_portfolio_op("activate_direction") == "activate_direction"
+
 
 class TestStrategicChallengeSummary:
     def test_non_dict_returns_none(self):
@@ -11944,6 +13243,155 @@ async def test_fallback_direction_ops_accept_http_style_create_direction(
 
 
 @pytest.mark.asyncio
+async def test_fallback_update_direction_auto_paused_reactivation_stamps_grace(
+    db_session, mocker
+):
+    """Fallback update_direction reactivating an AUTO-paused direction clears
+    residue and stamps the auto_recovered_at grace marker while preserving the
+    churn counter."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackAutoPausedReactivate",
+        user_id="u-fallback-auto-paused",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-auto-paused",
+                "text": "Auto-paused churn direction",
+                "status": "paused",
+                "auto_paused": True,
+                "paused_reason": "Churn guardrail: low merge rate",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "churn_family_pause_count": 1,
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "update_direction",
+                    "direction_id": "d-auto-paused",
+                    "changes": {"status": "active"},
+                    "rationale": "resume the auto-paused direction",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-auto-paused")
+    assert d["status"] == "active"
+    assert d.get("auto_recovered_at") is not None
+    assert "auto_paused" not in d
+    assert "paused_reason" not in d
+    assert "paused_at" not in d
+    # Counter must survive the reactivation.
+    assert d.get("churn_family_pause_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_direction_user_paused_reactivation_blocked(
+    db_session, mocker
+):
+    """Fallback update_direction must NOT resume a USER-paused direction: status
+    stays paused, no grace is stamped, and the block is logged."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackUserPausedBlocked",
+        user_id="u-fallback-user-paused",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-user-paused",
+                "text": "User-paused direction",
+                "status": "paused",
+                # No auto_paused flag → operator/user paused it.
+                "paused_reason": "operator paused",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "update_direction",
+                    "direction_id": "d-user-paused",
+                    "changes": {"status": "active"},
+                    "rationale": "try to resume the user-paused direction",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-user-paused")
+    assert d["status"] == "paused", "user-paused direction must not be resumed"
+    assert "auto_recovered_at" not in d
+    # Residue is untouched because the reactivation was blocked.
+    assert d.get("paused_reason") == "operator paused"
+
+
+@pytest.mark.asyncio
 async def test_retirement_memo_dedup_guard(db_session, mocker):
     """No second retirement memo is spawned when one already exists within 90 days."""
     from unittest.mock import AsyncMock
@@ -12943,6 +14391,51 @@ class TestDesignDocCompletionStrategistEvent:
         await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
 
         emit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_manual_design_doc_cycle_skips_autonomous_budget_guard(
+        self, strat_fail_db, mocker
+    ):
+        from unittest.mock import AsyncMock
+        from app.task_completion import _handle_design_doc_completion
+        from app.strategic_spawning import _spawn_design_doc_update
+
+        project = Project(
+            name="P",
+            user_id="u1",
+            vision={"purpose": "test"},
+            design_doc={"overview": {"body": "x"}, "_meta": {"revision": 1}},
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+
+        assert await _spawn_design_doc_update(project, strat_fail_db) is True
+        task = (
+            (
+                await strat_fail_db.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()[0]
+        )
+        assert (task.context or {}).get(STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY) is True
+        task.status = TaskStatus.COMPLETED
+        strat_fail_db.add(task)
+        await strat_fail_db.commit()
+
+        spawn = AsyncMock(return_value=True)
+        mocker.patch("app.strategic_spawning._spawn_strategic_review", new=spawn)
+        mocker.patch(
+            "app.strategic_events.emit_strategic_cycle_completed",
+            new=AsyncMock(),
+        )
+
+        await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
+
+        assert spawn.await_count == 1
+        assert spawn.await_args.kwargs["apply_spawn_budget_guard"] is False
 
     @pytest.mark.asyncio
     async def test_deferred_path_survives_task_and_project_expiry(
@@ -15551,6 +17044,60 @@ def test_compute_model_gc_telemetry_basic_fields():
     assert result["model_size_status"] in ("healthy", "growing", "large", "oversized")
     assert result["directions_dropped_count"] == 0
     assert result["problem_model_truncated"] is False
+    # No drops → high_tier_dropped is an empty list (present, not None).
+    assert result["high_tier_dropped"] == []
+
+
+def test_compute_model_gc_telemetry_reports_high_tier_dropped():
+    """high_tier_dropped lists only high/critical-tier dropped keys; medium/low
+    drops are excluded (they are expected degradation, not a degraded payload)."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 119000,
+                    "trimmed": [],
+                    "dropped": [
+                        {
+                            "key": "open_messages",
+                            "reason": "exceeds remaining budget (no summarize_fn)",
+                            "priority": "high",
+                        },
+                        {
+                            "key": "playbook_summary",
+                            "reason": "exceeds remaining budget (no summarize_fn)",
+                            "priority": "low",
+                        },
+                        {
+                            "key": "identity",
+                            "reason": "value not JSON-serializable",
+                            "priority": "critical",
+                        },
+                    ],
+                },
+            }
+        ],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    # Only the high and critical keys appear; the low-tier drop is excluded.
+    assert set(result["high_tier_dropped"]) == {"open_messages", "identity"}
+    assert "playbook_summary" not in result["high_tier_dropped"]
 
 
 def test_compute_model_gc_telemetry_detects_directions_dropped():
@@ -15729,6 +17276,164 @@ def test_compute_model_gc_telemetry_gap_memory_absent():
 
     assert result["gap_memory_trimmed_count"] == 0
     assert result["gap_memory_hidden_entries"] == 0
+
+
+def test_cycle_telemetry_records_core_section_survival():
+    """open_messages_dropped and version_phase_dropped reflect core-section drops.
+
+    When open_messages appears in packer dropped list, open_messages_dropped is True.
+    When version_phase appears in packer dropped list, version_phase_dropped is True.
+    When neither core section was dropped, both flags are False.
+    """
+    base_project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+
+    # Both core sections dropped
+    task_both_dropped = Task(
+        project_id=base_project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 119000,
+                    "trimmed": [],
+                    "dropped": [
+                        {"key": "open_messages", "reason": "exceeds remaining budget"},
+                        {"key": "version_phase", "reason": "exceeds remaining budget"},
+                    ],
+                },
+            }
+        ],
+        context={},
+    )
+    result_both = _compute_model_gc_telemetry(base_project, task_both_dropped)
+    assert result_both["open_messages_dropped"] is True
+    assert result_both["version_phase_dropped"] is True
+
+    # Only open_messages dropped
+    task_open_only = Task(
+        project_id=base_project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 110000,
+                    "trimmed": [],
+                    "dropped": [
+                        {"key": "open_messages", "reason": "exceeds remaining budget"},
+                    ],
+                },
+            }
+        ],
+        context={},
+    )
+    result_open_only = _compute_model_gc_telemetry(base_project, task_open_only)
+    assert result_open_only["open_messages_dropped"] is True
+    assert result_open_only["version_phase_dropped"] is False
+
+    # Neither core section dropped — survival case
+    task_survived = Task(
+        project_id=base_project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 80000,
+                    "trimmed": [],
+                    "dropped": [
+                        {"key": "knowledge_index", "reason": "exceeds remaining budget"},
+                    ],
+                },
+            }
+        ],
+        context={},
+    )
+    result_survived = _compute_model_gc_telemetry(base_project, task_survived)
+    assert result_survived["open_messages_dropped"] is False
+    assert result_survived["version_phase_dropped"] is False
+
+
+def test_compute_model_gc_telemetry_budget_utilization():
+    """_packer_meta with shipped entries produces budget_utilization_pct and
+    non-empty top_budget_consumers reflecting the largest shipped sections."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={"intent": {"purpose": "t", "current_focus": ""}, "capabilities": [], "gaps": [], "friction": []},
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 100_000,
+                    "budget_used": 80_000,
+                    "trimmed": [],
+                    "dropped": [],
+                    "shipped": [
+                        {"key": "problem_model", "bytes": 50_000, "priority": "high"},
+                        {"key": "directions_summary", "bytes": 20_000, "priority": "high"},
+                        {"key": "vision", "bytes": 10_000, "priority": "critical"},
+                    ],
+                    "gap_memory_trimmed": [],
+                },
+            }
+        ],
+        context={},
+    )
+    result = _compute_model_gc_telemetry(project, task)
+    assert result["budget_utilization_pct"] == 80.0
+    consumers = result["top_budget_consumers"]
+    assert len(consumers) > 0
+    # Largest section is problem_model at 50 KB.
+    assert consumers[0]["key"] == "problem_model"
+    assert consumers[0]["bytes"] == 50_000
+    # Descending order.
+    for i in range(len(consumers) - 1):
+        assert consumers[i]["bytes"] >= consumers[i + 1]["bytes"]
+
+
+def test_compute_model_gc_telemetry_shipped_absent_backward_compat():
+    """Old _packer_meta without 'shipped' key still returns budget_utilization_pct
+    (derived from budget_used/budget_total) and an empty top_budget_consumers."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={"intent": {"purpose": "t", "current_focus": ""}, "capabilities": [], "gaps": [], "friction": []},
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120_000,
+                    "budget_used": 60_000,
+                    "trimmed": [],
+                    "dropped": [],
+                    # no "shipped" key — old payload format
+                },
+            }
+        ],
+        context={},
+    )
+    result = _compute_model_gc_telemetry(project, task)
+    # Still derives utilization from existing budget fields.
+    assert result["budget_utilization_pct"] == 50.0
+    # No shipped entries → no section_bytes from that path.
+    assert result["top_budget_consumers"] == []
 
 
 # ── QUESTION answer threading tests ──────────────────────────────────────────
@@ -16190,12 +17895,12 @@ async def test_handle_strategic_completion_rejects_contentless_new_version_goal(
 async def test_set_problem_model_lifts_new_version_goal_api_path(
     client, db_session, mocker
 ):
-    """Full API-path regression: new_version_goal lifts past ProblemModel extra=forbid,
-    stows in task.context, and the completion handler applies it to a null-goal version.
+    """Full API-path regression: new_version_goal lifts past ProblemModel extra=forbid
+    and is applied synchronously within the API handler to the open version.
 
     Exercises the seam end-to-end using the real HTTP transport (not a mocked
-    context write) so that a future regression in any of the three layers
-    (endpoint strip, context stow, completion apply) will fail this test.
+    context write). The context key is popped after synchronous apply so the
+    completion handler is a no-op (idempotency guard for non-resident tasks).
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -16277,25 +17982,24 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
         "Ship the thing"
     )
 
-    # It must ride task.context to the completion handler.
-    await db_session.refresh(task)
-    stored = (task.context or {}).get(NEW_VERSION_GOAL_CONTEXT_KEY)
-    assert stored == goal_text, (
-        f"Expected new_version_goal stowed in task.context[{NEW_VERSION_GOAL_CONTEXT_KEY!r}]; "
-        f"got {stored!r}"
-    )
-
-    # Completion handler's API path must apply the goal to the null-goal version.
-    await _handle_strategic_completion(task, "", db_session)
-
+    # Synchronous apply: goal is set during set_problem_model, not deferred.
     await db_session.refresh(version)
     assert version.goal == goal_text, (
-        f"Expected open version goal to be set to {goal_text!r}; got {version.goal!r}"
+        f"Expected open version goal to be set during set_problem_model; got {version.goal!r}"
     )
     assert version.goal_editor_info is not None
     assert version.goal_editor_info.startswith("[strategist:"), (
         f"goal_editor_info must use source='strategist'; got {version.goal_editor_info!r}"
     )
+
+    # Context key is consumed and popped — not stowed for the completion handler.
+    await db_session.refresh(task)
+    assert (task.context or {}).get(NEW_VERSION_GOAL_CONTEXT_KEY) is None
+
+    # Completion handler is a no-op (key already applied).
+    await _handle_strategic_completion(task, "", db_session)
+    await db_session.refresh(version)
+    assert version.goal == goal_text  # unchanged
 
     # A second call with a different goal from the strategist IS allowed —
     # the strategist can correct its own previously-authored goal.
@@ -16315,8 +18019,7 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
         headers={"x-agent-token": token},
     )
     assert resp2.status_code == 200, resp2.text
-    await db_session.refresh(task)
-    await _handle_strategic_completion(task, "", db_session)
+    # Second synchronous apply sets corrected goal immediately.
     await db_session.refresh(version)
     assert version.goal == corrected_goal, (
         f"Strategist must be able to correct its own goal; got {version.goal!r}"
@@ -16707,3 +18410,618 @@ async def test_set_acceptance_criteria_dedup_does_not_consume_headroom(
     # DB count unchanged
     count_after = await ac.count_criteria_for_version(db_session, version.id)
     assert count_after == ac.MAX_CRITERIA_PER_VERSION
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_rejects_inactive_or_dangling_direction_mapping_key(
+    client: AsyncClient, db_session
+):
+    """set_acceptance_criteria scrubs inactive and dangling criterion keys
+    from Direction.criterion_keys when merging new mappings via classify_criterion_key.
+
+    A direction may carry stale criterion_keys from prior operations.  When
+    set_acceptance_criteria maps a new criterion to that direction, the guard
+    classifies each existing key — inactive (retracted) and dangling (never
+    existed) keys are filtered out, leaving only active or newly-created keys.
+    """
+    from app import acceptance_criteria as ac
+
+    project = Project(name="AC-Guard-Scrub-Test", user_id="test-user-ac-guard")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create a criterion and retract it so it becomes inactive.
+    inactive_criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion that will be retracted"
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=inactive_criterion.criterion_key,
+        reason="superseded in test",
+        retracted_by="test",
+    )
+
+    # Direction pre-loaded with one inactive key and one dangling key (never existed).
+    dangling_key = "c-dangling-does-not-exist"
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-guard-scrub-test1",
+        data={"id": "d-guard-scrub-test1", "text": "Test direction", "status": "active"},
+        status="active",
+        criterion_keys=[inactive_criterion.criterion_key, dangling_key],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+    await db_session.refresh(direction)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-ac-guard",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-ac-guard", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    # Map a new active criterion to the direction.
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": "New active criterion to map",
+                        "direction_keys": ["d-guard-scrub-test1"],
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert len(body["criteria"]) == 1
+    new_criterion_key = body["criteria"][0]["criterion_key"]
+    assert body["criteria"][0]["direction_keys"] == ["d-guard-scrub-test1"]
+
+    # The direction must contain only the new active key.
+    # classify_criterion_key must have scrubbed both the inactive and dangling keys.
+    await db_session.refresh(direction)
+    assert new_criterion_key in direction.criterion_keys, (
+        "New criterion key must be present in direction.criterion_keys"
+    )
+    assert inactive_criterion.criterion_key not in direction.criterion_keys, (
+        "Inactive (retracted) criterion key must be scrubbed from direction.criterion_keys"
+    )
+    assert dangling_key not in direction.criterion_keys, (
+        "Dangling criterion key must be scrubbed from direction.criterion_keys"
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_backfills_evidence_for_prelanded_task(
+    client: AsyncClient, db_session
+):
+    """set_acceptance_criteria backfill hook records evidence for a task that already
+    merged before the criterion-direction mapping was created.
+
+    This exercises the 'late-mapping' scenario: a task shipped, then the strategist
+    maps a new criterion to that direction.  The backfill hook in the strategic op
+    should replay evidence for the pre-existing proven task.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    # --- Setup ---
+    project = Project(name="AC-Backfill-Strategic", user_id="test-user-ac-bf")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-ac-bf-test1",
+        data={"id": "d-ac-bf-test1", "text": "Backfill test direction", "status": "active"},
+        status="active",
+    )
+    db_session.add(direction)
+    await db_session.commit()
+    await db_session.refresh(direction)
+
+    # Pre-existing task that already merged in the current version window.
+    pre_landed_task = Task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+        context={
+            "direction_id": direction.direction_key,
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True},
+        },
+    )
+    db_session.add(pre_landed_task)
+    await db_session.commit()
+    await db_session.refresh(pre_landed_task)
+
+    # Strategic task that will author the criterion.
+    strategic_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-ac-bf",
+    )
+    db_session.add(strategic_task)
+    await db_session.commit()
+    await db_session.refresh(strategic_task)
+
+    token = create_agent_token(
+        str(strategic_task.id), "agent-vm-ac-bf", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    # Call set_acceptance_criteria — maps a new criterion to the direction that
+    # already has a proven merged task.
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(strategic_task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": "Pre-landed criterion coverage check",
+                        "direction_keys": [direction.direction_key],
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    criterion_key = body["criteria"][0]["criterion_key"]
+
+    # The backfill hook should have created evidence for the pre-landed task.
+    criteria_rows = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.criterion_key == criterion_key
+            )
+        )
+    ).scalars().all()
+    assert len(criteria_rows) == 1, "Criterion row must exist"
+    criterion_id = criteria_rows[0].id
+
+    ev_rows = (
+        await db_session.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion_id
+            )
+        )
+    ).scalars().all()
+    source_kinds = {e.source_kind for e in ev_rows}
+    assert "task_merge" in source_kinds, (
+        "Backfill hook must have recorded task_merge evidence for the pre-landed task"
+    )
+    assert "reachability" in source_kinds, (
+        "Backfill hook must have recorded reachability evidence for the pre-landed task"
+    )
+    # All evidence rows reference the pre-landed task.
+    for ev in ev_rows:
+        assert ev.source_id == str(pre_landed_task.id)
+
+
+@pytest.mark.asyncio
+async def test_spawn_retirement_memos_failure_does_not_abort_commit(db_session, mocker):
+    """When _spawn_retirement_memos raises, the surrounding commit still runs and exception is logged."""
+    from unittest.mock import AsyncMock, patch
+    from app.strategic_completion import _handle_strategic_completion, _RETIRED_NOTE_PREFIX
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    direction_id = "d-memo-fail-01"
+    direction = {
+        "id": direction_id,
+        "text": "Memo-fail test direction",
+        "status": "expired",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "notes": [
+            {
+                "text": f"{_RETIRED_NOTE_PREFIX}test rationale",
+                "added_at": "2026-01-01T00:00:00",
+            }
+        ],
+    }
+    project = Project(
+        name="MemoFail",
+        user_id="u-memo-fail",
+        vision={"purpose": "test", "revision": 1},
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={
+            "_strategic_api_called": True,
+            "_strategic_retired_ids": [direction_id],
+            "_strategic_retired": 1,
+        },
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    async def _blow_up(*args, **kwargs):
+        raise RuntimeError("simulated memo spawn failure")
+
+    with patch("app.strategic_completion._spawn_retirement_memos", new=_blow_up):
+        with patch("app.strategic_completion.logger") as mock_logger:
+            # Must not raise — commit must proceed
+            await _handle_strategic_completion(sr_task, "", db_session)
+
+    error_calls = [str(c) for c in mock_logger.error.call_args_list]
+    assert any("_spawn_retirement_memos" in c or "retirement memo" in c.lower() for c in error_calls), (
+        f"Expected error log for memo spawn failure; got: {error_calls}"
+    )
+
+    # The project must still be committable (no session in error state) and reachable.
+    await db_session.refresh(project)
+    assert project.id is not None, "Project must still be readable after memo-spawn failure"
+
+
+@pytest.mark.asyncio
+async def test_unparseable_strategic_failure_counter_is_atomic(db_session, mocker):
+    """Two sequential unparseable-output failures both increment _strategic_failures.
+
+    Regression test for the unlocked RMW race: before the fix, two concurrent
+    (or sequential) failures could both read the same baseline and write back the
+    same +1, silently losing an increment. with_vision_locked serializes the
+    counter bump so both increments are recorded.
+    """
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First failure: empty logs -> unparseable -> increments _strategic_failures to 1
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}],
+        context={},
+    )
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+
+    await _handle_strategic_completion(task1, "", db_session)
+
+    # Second failure: another task, empty logs -> unparseable -> increments to 2
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}],
+        context={},
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    await _handle_strategic_completion(task2, "", db_session)
+
+    await db_session.refresh(project)
+    vision = project.vision or {}
+    assert vision.get("_strategic_failures") == 2, (
+        f"Two sequential unparseable failures must each increment _strategic_failures; "
+        f"expected 2, got {vision.get('_strategic_failures')!r}"
+    )
+    assert vision.get("_strategic_failures_at") is not None, (
+        "_strategic_failures_at must be stamped after unparseable failure"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_activate_direction_applied(db_session, mocker):
+    """Fallback must transition a paused direction to active via activate_direction op."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="FallbackActivate",
+        user_id="u-fallback-activate",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-paused",
+                "text": "Paused direction",
+                "status": "paused",
+                "auto_paused": True,
+                "paused_reason": "churn",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "activate_direction",
+                    "direction_id": "d-paused",
+                    "rationale": "ready to proceed",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    activated = next(
+        (d for d in (project.directions or []) if d.get("id") == "d-paused"), None
+    )
+    assert activated is not None, "d-paused must still be present after activate_direction"
+    assert activated["status"] == "active", (
+        f"activate_direction must set status=active; got {activated.get('status')!r}"
+    )
+    assert not activated.get("auto_paused"), (
+        "activate_direction must clear auto_paused flag"
+    )
+    await db_session.refresh(task)
+    updated_ids = (task.context or {}).get("_strategic_updated_ids", [])
+    assert "d-paused" in updated_ids, (
+        f"task context must record d-paused in _strategic_updated_ids; got {updated_ids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_reject_direction_no_mid_loop_write(db_session, mocker):
+    """reject_direction must use the single end-of-loop with_directions_locked call,
+    not a separate mid-loop write — one call total, direction properly tombstoned."""
+    import app.task_locking as _task_locking_mod
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="FallbackRejectSingleWrite",
+        user_id="u-reject-single-write",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-reject",
+                "text": "Reject me",
+                "status": "proposed",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "reject_direction",
+                    "direction_id": "d-reject",
+                    "rationale": "not worthwhile",
+                }
+            ],
+        }
+    )
+
+    wdl_call_count = 0
+    real_wdl = _task_locking_mod.with_directions_locked
+
+    async def counting_wdl(session, project_id, mutate_fn, **kwargs):
+        nonlocal wdl_call_count
+        wdl_call_count += 1
+        return await real_wdl(session, project_id, mutate_fn, **kwargs)
+
+    mocker.patch.object(_task_locking_mod, "with_directions_locked", new=counting_wdl)
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    assert wdl_call_count == 1, (
+        "reject_direction must not make a mid-loop with_directions_locked call; "
+        f"expected 1 total call, got {wdl_call_count}"
+    )
+    await db_session.refresh(project)
+    tombstone = next(
+        (d for d in (project.directions or []) if d.get("id") == "d-reject"), None
+    )
+    assert tombstone is not None, "tombstone must remain in directions after reject"
+    assert tombstone["status"] == "rejected", (
+        f"rejected direction must have status=rejected; got {tombstone.get('status')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_directions_write_preserves_concurrent_add(db_session, mocker):
+    """Delta-based write must not overwrite a direction added concurrently during the
+    fallback; the concurrent direction must survive the locked write."""
+    import app.task_locking as _task_locking_mod
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    concurrent_dir = {
+        "id": "d-concurrent",
+        "text": "Added concurrently",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-02T00:00:00",
+        "research_history": [],
+        "notes": [],
+    }
+
+    project = Project(
+        name="FallbackDeltaPreserve",
+        user_id="u-delta-preserve",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-retire",
+                "text": "To be retired",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "retire_direction",
+                    "direction_id": "d-retire",
+                    "rationale": "done",
+                }
+            ],
+        }
+    )
+
+    real_wdl = _task_locking_mod.with_directions_locked
+
+    async def wdl_inject_concurrent(session, project_id, mutate_fn, **kwargs):
+        # Simulate a concurrent writer inserting d-concurrent into the DB
+        # before the delta callback fires.  The delta callback must preserve it.
+        def injecting_fn(fresh: list) -> list:
+            return mutate_fn(fresh + [concurrent_dir])
+
+        return await real_wdl(session, project_id, injecting_fn, **kwargs)
+
+    mocker.patch.object(_task_locking_mod, "with_directions_locked", new=wdl_inject_concurrent)
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    dir_ids = {d.get("id") for d in (project.directions or [])}
+    assert "d-concurrent" in dir_ids, (
+        "Delta write must preserve a concurrently-added direction; "
+        f"got direction ids: {sorted(dir_ids)}"
+    )
+    retired = next(
+        (d for d in (project.directions or []) if d.get("id") == "d-retire"), None
+    )
+    assert retired is not None and retired["status"] == "retired", (
+        f"d-retire must be retired after fallback retire_direction; got {retired}"
+    )

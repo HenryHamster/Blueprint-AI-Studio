@@ -260,6 +260,17 @@ async def get_activity(
 
     inprogress_result = await session.execute(
         select(Task)
+        .options(
+            load_only(
+                Task.id,
+                Task.payloads,
+                Task.title,
+                Task.started_at,
+                Task.created_at,
+                Task.latest_status_message,
+                raiseload=True,
+            )
+        )
         .where(*inprogress_filters)
         .order_by(Task.created_at.desc())
         .limit(limit * 3)

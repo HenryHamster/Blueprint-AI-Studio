@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
+import React from 'react';
 import userEvent from '@testing-library/user-event';
 import { NewTaskModal } from './NewTaskModal';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { defaultComputeExperimentForm } from '../hooks/useTaskModal';
+import { usePersistedState } from '../hooks/usePersistedState';
 
 const mockDraftComputeExperiment = vi.fn();
 
@@ -59,6 +61,11 @@ const baseProps = {
   preflightResult: null,
   preflightLoading: false,
   preflightError: null,
+  ideaText: '',
+  setIdeaText: vi.fn(),
+  draftNotes: null,
+  setDraftNotes: vi.fn(),
+  onDraftApplied: vi.fn(),
   onRepoChange: vi.fn(),
   onSubmit: vi.fn(),
   onClose: vi.fn(),
@@ -66,6 +73,24 @@ const baseProps = {
 
 function makeComputeExperiment(overrides?: Partial<ComputeExperimentForm>): ComputeExperimentForm {
   return { ...defaultComputeExperimentForm(), ...overrides };
+}
+
+// Stateful wrapper that manages ideaText/draftNotes so the textarea behaves
+// as a controlled input in tests (mirrors what useTaskModal does in production).
+// Uses usePersistedState to match hook behavior, enabling the persist-across-
+// remounts test to work correctly.
+function DraftStateWrapper(props: Omit<React.ComponentProps<typeof NewTaskModal>, 'ideaText' | 'setIdeaText' | 'draftNotes' | 'setDraftNotes'>) {
+  const [ideaText, setIdeaText] = usePersistedState('compute-experiment-idea', '');
+  const [draftNotes, setDraftNotes] = usePersistedState<string | null>('compute-experiment-draft-notes', null);
+  return (
+    <NewTaskModal
+      {...props}
+      ideaText={ideaText}
+      setIdeaText={setIdeaText}
+      draftNotes={draftNotes}
+      setDraftNotes={setDraftNotes}
+    />
+  );
 }
 
 describe('NewTaskModal — Draft contract', () => {
@@ -123,7 +148,7 @@ describe('NewTaskModal — Draft contract', () => {
     const setNewTaskPrompt = vi.fn();
 
     render(
-      <NewTaskModal
+      <DraftStateWrapper
         {...baseProps}
         setNewTaskTitle={setNewTaskTitle}
         setNewTaskPrompt={setNewTaskPrompt}
@@ -162,7 +187,7 @@ describe('NewTaskModal — Draft contract', () => {
     const setComputeExperimentSpy = vi.fn();
 
     render(
-      <NewTaskModal
+      <DraftStateWrapper
         {...baseProps}
         computeExperiment={prefilled}
         setComputeExperiment={setComputeExperimentSpy}
@@ -179,6 +204,90 @@ describe('NewTaskModal — Draft contract', () => {
     expect(setComputeExperimentSpy).not.toHaveBeenCalled();
   });
 
+  it('shows server-provided notes as the inline error when draft_available=false', async () => {
+    const user = userEvent.setup();
+    mockDraftComputeExperiment.mockResolvedValue({
+      draft_available: false,
+      notes: 'Idea is too vague to draft a contract — add a metric.',
+    });
+    const setComputeExperimentSpy = vi.fn();
+
+    render(
+      <DraftStateWrapper
+        {...baseProps}
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={setComputeExperimentSpy}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'something');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Idea is too vague to draft a contract — add a metric.')).toBeInTheDocument();
+    });
+    // server notes replace the generic fallback message
+    expect(screen.queryByText(/draft not available — fill the form manually/i)).not.toBeInTheDocument();
+    expect(setComputeExperimentSpy).not.toHaveBeenCalled();
+  });
+
+  it('renders notes from a successful draft as context without an error', async () => {
+    const user = userEvent.setup();
+    mockDraftComputeExperiment.mockResolvedValue({
+      draft_available: true,
+      command: 'python train.py',
+      notes: 'Assumed single-GPU since the idea did not mention scale.',
+    });
+
+    render(
+      <DraftStateWrapper
+        {...baseProps}
+        computeExperiment={computeExperiment}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'tune lr');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+
+    const notes = await screen.findByText('Assumed single-GPU since the idea did not mention scale.');
+    // rendered as neutral context, not the red draftError paragraph
+    expect(notes).toHaveClass('text-neutral-400');
+    expect(notes).not.toHaveClass('text-red-400');
+    expect(computeExperiment.command).toBe('python train.py');
+  });
+
+  it('clears stale notes when a later successful draft omits notes', async () => {
+    const user = userEvent.setup();
+    mockDraftComputeExperiment
+      .mockResolvedValueOnce({
+        draft_available: true,
+        command: 'python train.py --v1',
+        notes: 'First-draft caveat.',
+      })
+      .mockResolvedValueOnce({
+        draft_available: true,
+        command: 'python train.py --v2',
+      });
+
+    render(
+      <DraftStateWrapper
+        {...baseProps}
+        computeExperiment={computeExperiment}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'tune lr');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+    await screen.findByText('First-draft caveat.');
+
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+    await waitFor(() => {
+      expect(screen.queryByText('First-draft caveat.')).not.toBeInTheDocument();
+    });
+  });
+
   it('surfaces network error inline without clearing existing form state', async () => {
     const user = userEvent.setup();
     mockDraftComputeExperiment.mockRejectedValue(new Error('Network error'));
@@ -186,7 +295,7 @@ describe('NewTaskModal — Draft contract', () => {
     const setComputeExperimentSpy = vi.fn();
 
     render(
-      <NewTaskModal
+      <DraftStateWrapper
         {...baseProps}
         computeExperiment={prefilled}
         setComputeExperiment={setComputeExperimentSpy}
@@ -216,7 +325,7 @@ describe('NewTaskModal — Draft contract', () => {
     });
 
     render(
-      <NewTaskModal
+      <DraftStateWrapper
         {...baseProps}
         computeExperiment={computeExperiment}
         setComputeExperiment={setComputeExperiment}
@@ -231,5 +340,187 @@ describe('NewTaskModal — Draft contract', () => {
     expect(computeExperiment.arms).toHaveLength(2);
     expect(computeExperiment.arms[0].name).toBe('arm-A');
     expect(computeExperiment.declaredMetric).toBe('accuracy');
+  });
+
+  it('persists research idea and draft notes across component remounts', async () => {
+    const user = userEvent.setup();
+
+    // Clear localStorage before test to ensure clean state
+    localStorage.removeItem('blueprint-admin:compute-experiment-idea');
+    localStorage.removeItem('blueprint-admin:compute-experiment-draft-notes');
+    localStorage.removeItem('blueprint-admin:compute-experiment-last-draft');
+
+    const draftResponse = {
+      draft_available: true,
+      command: 'python train.py --lr 0.01',
+      spend_cap_usd: 5,
+      deadline_seconds: 1800,
+      notes: 'Assumed single-GPU configuration',
+    };
+    mockDraftComputeExperiment.mockResolvedValue(draftResponse);
+
+    // First render: type the idea and draft
+    const { unmount } = render(
+      <DraftStateWrapper
+        {...baseProps}
+        computeExperiment={computeExperiment}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    const ideaInput = screen.getByPlaceholderText(/describe your experiment/i);
+    await user.type(ideaInput, 'Tune learning rate on ImageNet');
+
+    // Click draft to populate the form and set draft notes
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+    await waitFor(() => {
+      expect(screen.getByText('Assumed single-GPU configuration')).toBeInTheDocument();
+    });
+
+    // Verify that localStorage has the persisted values
+    const storedIdea = localStorage.getItem('blueprint-admin:compute-experiment-idea');
+    expect(storedIdea).toBe(JSON.stringify('Tune learning rate on ImageNet'));
+
+    // Unmount the component
+    unmount();
+
+    // Second render: component should restore the persisted idea and notes
+    mockDraftComputeExperiment.mockResolvedValue(draftResponse);
+    render(
+      <DraftStateWrapper
+        {...baseProps}
+        computeExperiment={computeExperiment}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    // Verify the idea is restored from localStorage
+    expect(screen.getByPlaceholderText(/describe your experiment/i)).toHaveValue('Tune learning rate on ImageNet');
+    // Verify the draft notes are restored
+    expect(screen.getByText('Assumed single-GPU configuration')).toBeInTheDocument();
+  });
+
+  it('shows which fields were updated when a draft changes multiple values', async () => {
+    const user = userEvent.setup();
+    const prefilled = makeComputeExperiment({
+      command: 'python old_command.py',
+      spendCapUsd: '10',
+      deadlineSeconds: '3600',
+      hypothesis: 'Old hypothesis',
+    });
+
+    mockDraftComputeExperiment.mockResolvedValue({
+      draft_available: true,
+      command: 'python new_command.py --lr 0.01',
+      spend_cap_usd: 5,
+      deadline_seconds: 1800,
+      hypothesis: 'New hypothesis for improved results',
+      notes: 'Adjusted resource requirements based on analysis.',
+    });
+
+    render(
+      <DraftStateWrapper
+        {...baseProps}
+        computeExperiment={prefilled}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'Refine training');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+
+    // Verify that the changes are displayed
+    await waitFor(() => {
+      expect(screen.getByText(/Updated: Command, Spend cap, Deadline, Hypothesis/)).toBeInTheDocument();
+    });
+
+    // Verify the values were actually updated
+    expect(computeExperiment.command).toBe('python new_command.py --lr 0.01');
+    expect(computeExperiment.spendCapUsd).toBe('5');
+    expect(computeExperiment.deadlineSeconds).toBe('1800');
+    expect(computeExperiment.hypothesis).toBe('New hypothesis for improved results');
+  });
+
+  it('does not show changes when draft values match current form state', async () => {
+    const user = userEvent.setup();
+    const prefilled = makeComputeExperiment({
+      command: 'python train.py --lr 0.01',
+      spendCapUsd: '5',
+      deadlineSeconds: '1800',
+      hypothesis: 'Test hypothesis',
+    });
+
+    mockDraftComputeExperiment.mockResolvedValue({
+      draft_available: true,
+      command: 'python train.py --lr 0.01',
+      spend_cap_usd: 5,
+      deadline_seconds: 1800,
+      hypothesis: 'Test hypothesis',
+      notes: 'Form already matches the optimal contract.',
+    });
+
+    render(
+      <DraftStateWrapper
+        {...baseProps}
+        computeExperiment={prefilled}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'Verify form');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Form already matches the optimal contract/)).toBeInTheDocument();
+    });
+
+    // Verify that no "Updated:" message appears
+    expect(screen.queryByText(/^Updated:/)).not.toBeInTheDocument();
+  });
+
+  it('calls onDraftApplied when a successful draft is applied', async () => {
+    const user = userEvent.setup();
+    const onDraftApplied = vi.fn();
+    mockDraftComputeExperiment.mockResolvedValue({
+      draft_available: true,
+      command: 'python train.py',
+      spend_cap_usd: 5,
+      deadline_seconds: 1800,
+    });
+
+    render(
+      <DraftStateWrapper
+        {...baseProps}
+        onDraftApplied={onDraftApplied}
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={vi.fn()}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'My idea');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+
+    await waitFor(() => expect(onDraftApplied).toHaveBeenCalledTimes(1));
+  });
+
+  it('does not call onDraftApplied when draft_available is false', async () => {
+    const user = userEvent.setup();
+    const onDraftApplied = vi.fn();
+    mockDraftComputeExperiment.mockResolvedValue({ draft_available: false });
+
+    render(
+      <DraftStateWrapper
+        {...baseProps}
+        onDraftApplied={onDraftApplied}
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={vi.fn()}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'something');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+
+    await waitFor(() => expect(screen.getByText(/draft not available/i)).toBeInTheDocument());
+    expect(onDraftApplied).not.toHaveBeenCalled();
   });
 });

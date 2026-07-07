@@ -108,4 +108,26 @@ describe('ConfirmDialog — viewport regression', () => {
       });
     });
   });
+
+  test('renders attestation input variant without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ConfirmDialog
+            title="Attest deploy is live"
+            message="The deploy could not be independently verified live. To force-clear, enter an attestation reason (required)."
+            confirmLabel="Force clear"
+            attestationInput={{ label: 'Attestation reason', placeholder: 'e.g. verified live by hand' }}
+            onConfirm={() => {}}
+            onCancel={() => {}}
+          />,
+        );
+      });
+    });
+  });
 });

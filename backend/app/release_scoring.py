@@ -34,6 +34,47 @@ _DEFAULT_POLICY: dict[str, Any] = {
     "threshold": 0.90,
 }
 
+# total_open count at which _score_completion_debt_pressure reaches 0.0.
+# A linear decay: 0 items → 1.0; _DEBT_PRESSURE_CEIL items → 0.0.
+_DEBT_PRESSURE_CEIL = 20
+
+# Hard cap on the completion_debt blend factor.  completion_debt is a SEPARATE
+# blend weight, NOT part of the audit + test_erosion + smoketest core-weight sum
+# (see ``compute_composite``): the existing sub-scores are scaled by
+# ``(1 - w_debt)`` and the debt term is added, so the total stays in [0, 1].
+# Bounded at 0.5 so the debt signal can never dominate the quality sub-scores.
+MAX_COMPLETION_DEBT_WEIGHT = 0.5
+
+# Default completion_debt blend weight applied when the operator graduates
+# ``completion_debt_weight_mode`` to "enforce" but left the weight unset/zero —
+# so graduation actually changes the composite instead of being a no-op.
+DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT = 0.15
+
+
+def coerce_completion_debt_weight(weights_raw: Any) -> float:
+    """Read the OPTIONAL ``completion_debt`` blend weight from a weights mapping.
+
+    Returns ``0.0`` when the key is absent or unparseable — this is what keeps a
+    legacy three-key ``{audit, test_erosion, smoketest}`` policy fully backward
+    compatible (an effective completion_debt weight of 0.0 = the shipped observe
+    behaviour).  A present numeric value is clamped to
+    ``[0.0, MAX_COMPLETION_DEBT_WEIGHT]``.  Pure — no I/O, no runtime_config.
+    """
+    if not isinstance(weights_raw, dict):
+        return 0.0
+    raw = weights_raw.get("completion_debt")
+    if raw is None or isinstance(raw, bool):
+        return 0.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if v < 0.0:
+        return 0.0
+    if v > MAX_COMPLETION_DEBT_WEIGHT:
+        return MAX_COMPLETION_DEBT_WEIGHT
+    return v
+
 
 def _clamp01(value: float) -> float:
     """Clamp a numeric sub-score into [0.0, 1.0]."""
@@ -314,6 +355,30 @@ def compute_goal_coverage_drift(
     }
 
 
+def _score_completion_debt_pressure(
+    debt_snapshot: dict[str, Any] | None,
+) -> float:
+    """Convert an open-debt snapshot to a [0, 1] pressure score.
+
+    Returns 1.0 when there is no open debt (optimal state).  Decays linearly
+    toward 0.0 as the actionable open count grows, reaching 0.0 at
+    ``_DEBT_PRESSURE_CEIL`` open items.  A scoring-only
+    ``project_actionable_open`` count is preferred when present; older callers
+    that only provide ``total_open`` keep the legacy behavior.  A missing or
+    empty snapshot is treated as zero debt (1.0).
+    """
+    if not debt_snapshot:
+        return 1.0
+    open_count = int(
+        debt_snapshot.get("project_actionable_open")
+        if "project_actionable_open" in debt_snapshot
+        else debt_snapshot.get("total_open") or 0
+    )
+    if open_count <= 0:
+        return 1.0
+    return max(0.0, 1.0 - open_count / _DEBT_PRESSURE_CEIL)
+
+
 def compute_composite(
     ci_green: bool,
     audit_score: float,
@@ -328,6 +393,7 @@ def compute_composite(
     migration_apply_blocked: bool = False,
     criterion_coverage: dict[str, Any] | None = None,
     merge_grade_misses: bool = False,
+    debt_pressure_score: float | None = None,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -494,6 +560,10 @@ def compute_composite(
         "test_erosion": _clamp01(test_erosion) if test_erosion is not None else 0.0,
         "smoketest": _clamp01(smoketest_score) if smoketest_score is not None else 0.0,
     }
+    # Debt-pressure sub-score: always recorded when provided (observe mode);
+    # only blended into confidence when completion_debt_weight > 0 in policy.
+    if debt_pressure_score is not None:
+        sub_scores["debt_pressure"] = _clamp01(debt_pressure_score)
 
     if blocker is not None:
         return {
@@ -503,13 +573,25 @@ def compute_composite(
             "blocker": blocker,
         }
 
+    # Debt-pressure weight (defaults to 0.0 = observe mode: recorded but not
+    # blended).  When > 0 the existing sub-scores are scaled by (1 - w_debt)
+    # and the debt-pressure term is added so the total remains in [0, 1].
+    w_debt = float((policy.get("weights") or {}).get("completion_debt", 0.0))
+    w_debt = max(0.0, min(w_debt, 0.5))  # cap at 50% to bound disruption
+
     # When the smoketest dimension is dropped its weight is 0.0, so the term
     # contributes nothing regardless of the (unused) smoketest sub-score.
-    confidence = (
+    existing_confidence = (
         w_audit * sub_scores["audit"]
         + w_test * sub_scores["test_erosion"]
         + w_smoke * sub_scores["smoketest"]
     )
+    if w_debt > 0.0 and debt_pressure_score is not None:
+        # Enforce mode: scale existing confidence down by (1 - w_debt) and
+        # blend in the debt-pressure term so total weight stays at 1.0.
+        confidence = (1.0 - w_debt) * existing_confidence + w_debt * sub_scores["debt_pressure"]
+    else:
+        confidence = existing_confidence
     confidence = round(_clamp01(confidence), 4)
     return {
         "confidence": confidence,
@@ -2168,3 +2250,39 @@ def compute_challenged_vs_unchallenged_telemetry(
         "unchallenged": _cohort_stats(unchallenged, include_disagreement=False),
         "total_verdicts": len(verdicts),
     }
+
+
+def compute_enforce_confidence_preview(
+    existing_confidence: float,
+    debt_pressure_score: float,
+    *,
+    configured_weight: float | None = None,
+) -> dict[str, Any]:
+    """Compute the hypothetical confidence if ``completion_debt_weight_mode`` were "enforce".
+
+    Pure / side-effect-free.  Called in observe mode to record what enforce would
+    have done, so qualifications accumulate decision-ready evidence for graduating
+    the knob without affecting the live composite.
+
+    The effective weight mirrors ``_apply_completion_debt_weight_mode``'s enforce
+    branch exactly:
+      * ``configured_weight > 0`` → use it (clamped to [0, MAX_COMPLETION_DEBT_WEIGHT]).
+      * ``configured_weight <= 0`` or ``None`` → fall back to
+        ``DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT`` so a graduation with no explicit
+        weight still changes the composite.
+
+    Returns ``{"enforce_confidence": float, "effective_weight": float}``.
+    """
+    if configured_weight is not None and configured_weight > 0.0:
+        effective = max(0.0, min(float(configured_weight), MAX_COMPLETION_DEBT_WEIGHT))
+    else:
+        effective = DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+
+    enforce_confidence = round(
+        _clamp01(
+            (1.0 - effective) * _clamp01(existing_confidence)
+            + effective * _clamp01(debt_pressure_score)
+        ),
+        4,
+    )
+    return {"enforce_confidence": enforce_confidence, "effective_weight": effective}

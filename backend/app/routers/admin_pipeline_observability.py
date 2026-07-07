@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import delete
+from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -35,6 +38,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    UiLoadTimingSample,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
 )
@@ -683,6 +687,10 @@ async def _load_outer_loop_original_tasks(
                 Task.status,
                 Task.context,
                 Task.created_at,
+                # The convergence reducer walks these via _derive_completed_at,
+                # which reads the durable terminal timestamp; a deferred read
+                # under raiseload=True raises, so load it eagerly.
+                Task.completed_at,
                 # Hydrated originals are appended to the task list the
                 # convergence reducer walks, and an in-window original can be
                 # CANCELLED (outside the COMPLETED/FAILED window query), so the
@@ -733,6 +741,10 @@ _OUTER_LOOP_TASK_COLUMNS = (
     Task.status,
     Task.context,
     Task.created_at,
+    # compute_outer_loop_convergence -> _derive_completed_at reads the durable
+    # terminal timestamp; a deferred read under raiseload=True raises, so it
+    # must be eagerly loaded here.
+    Task.completed_at,
     Task.latest_status_message,
 )
 
@@ -744,6 +756,7 @@ async def _fetch_outer_loop_tasks(
     project_id: uuid.UUID | None,
     limit: int,
     order_desc: bool = False,
+    lookback_cutoff: "datetime | None" = None,
 ) -> List[Task]:
     """Fetch the outer-loop window's terminal tasks with their payload type.
 
@@ -755,15 +768,23 @@ async def _fetch_outer_loop_tasks(
     just ``payloads[0]['type']`` and stash it for ``first_payload``; SQLite
     (tests/local) lacks usable JSON-path projection semantics and falls back to
     loading the column, mirroring ``admin_digest._compute_digest``.
+
+    ``lookback_cutoff`` controls the ``created_at >=`` DB filter. When wider than
+    ``cutoff`` (e.g. ``cutoff - hours`` to match the digest's 2x lookback), tasks
+    created before the window but completing within it become visible to
+    ``_compute_non_code_outcomes``, which windows on completion time not
+    creation time. Defaults to ``cutoff`` (unchanged behaviour for callers that
+    don't need the wider scan).
     """
     from app.sr_review_quality_metrics import (  # noqa: PLC0415
         _stash_projected_task_fields,
     )
 
+    db_cutoff = lookback_cutoff if lookback_cutoff is not None else cutoff
     use_projection = resolve_dialect_name(session) == "postgresql"
     where_clauses = [
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-        Task.created_at >= cutoff,
+        Task.created_at >= db_cutoff,
     ]
     if project_id is not None:
         where_clauses.append(Task.project_id == project_id)
@@ -866,6 +887,10 @@ async def get_outer_loop_convergence(
     from app.digest_metrics import compute_outer_loop_convergence  # noqa: PLC0415
 
     cutoff = _utcnow() - timedelta(hours=hours)
+    # Widen the DB scan by 1x hours so tasks created before the window but
+    # completing within it are visible to _compute_non_code_outcomes (which
+    # windows on completion time). Mirrors the 2x-lookback the digest uses.
+    lookback_cutoff = cutoff - timedelta(hours=hours)
 
     tasks = await _fetch_outer_loop_tasks(
         session,
@@ -873,6 +898,7 @@ async def get_outer_loop_convergence(
         project_id=project_id,
         limit=_OUTER_LOOP_TASK_CAP,
         order_desc=True,
+        lookback_cutoff=lookback_cutoff,
     )
     if len(tasks) >= _OUTER_LOOP_TASK_CAP:
         logger.warning(
@@ -1807,3 +1833,80 @@ async def get_spawn_gate_census(
 
     census = compute_spawn_gate_census(tasks, window_start=cutoff)
     return {"window_hours": hours, **census}
+
+
+# ---------------------------------------------------------------------------
+# Admin-UI initial-load timing: persisted per surface
+# ---------------------------------------------------------------------------
+
+_UI_TIMING_LOCK = threading.Lock()
+_UI_TIMING_SAMPLES: Dict[str, deque] = {}
+_UI_TIMING_MAX_PER_SURFACE = 200
+
+
+@router.post("/ui-load-timing")
+async def record_ui_load_timing(
+    payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Record one admin-UI initial-load timing sample for a surface.
+
+    Persisted to the database so samples survive process restarts and can
+    be used for before/after deploy comparisons.  The in-memory ring buffer
+    is retained for cross-test compatibility.
+    """
+    surface = str(payload.get("surface") or "unknown")[:64]
+    sample_type = str(payload.get("sample_type") or "first_commit")[:32]
+    ms_raw = payload.get("page_ready_ms")
+    if not isinstance(ms_raw, (int, float)) or ms_raw < 0 or ms_raw > 600_000:
+        raise HTTPException(status_code=400, detail="page_ready_ms must be a non-negative number ≤600000")
+    ms = int(ms_raw)
+    now = _utcnow()
+    sample_row = UiLoadTimingSample(surface=surface, page_ready_ms=ms, sample_type=sample_type, recorded_at=now)
+    session.add(sample_row)
+    # Trim oldest rows beyond cap (keep newest _UI_TIMING_MAX_PER_SURFACE)
+    cutoff_sq = (
+        sa_select(UiLoadTimingSample.recorded_at)
+        .where(UiLoadTimingSample.surface == surface)
+        .order_by(UiLoadTimingSample.recorded_at.desc())
+        .offset(_UI_TIMING_MAX_PER_SURFACE - 1)
+        .limit(1)
+        .scalar_subquery()
+    )
+    await session.execute(
+        delete(UiLoadTimingSample).where(
+            UiLoadTimingSample.surface == surface,
+            UiLoadTimingSample.recorded_at < cutoff_sq,
+        )
+    )
+    await session.commit()
+    with _UI_TIMING_LOCK:
+        q = _UI_TIMING_SAMPLES.setdefault(surface, deque(maxlen=_UI_TIMING_MAX_PER_SURFACE))
+        q.append({"ts": now.isoformat(), "page_ready_ms": ms})
+    return {"ok": True}
+
+
+@router.get("/ui-load-timing")
+async def get_ui_load_timing(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Return recent admin-UI initial-load timing samples grouped by surface.
+
+    Each surface entry is a list of {ts, page_ready_ms, sample_type} objects
+    ordered oldest-first (up to 200 per surface).  Persisted across restarts.
+    """
+    rows = (
+        await session.execute(
+            select(UiLoadTimingSample)
+            .order_by(UiLoadTimingSample.recorded_at.asc())
+            .limit(5000)
+        )
+    ).scalars().all()
+    surfaces: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        surfaces.setdefault(row.surface, []).append(
+            {"ts": row.recorded_at.isoformat(), "page_ready_ms": row.page_ready_ms, "sample_type": row.sample_type}
+        )
+    return {"surfaces": surfaces}

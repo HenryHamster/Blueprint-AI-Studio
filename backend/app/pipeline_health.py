@@ -243,6 +243,7 @@ async def compute_pipeline_health_summary(
                 Task.project_id,
                 Task.status,
                 Task.created_at,
+                Task.completed_at,
                 Task.context,
                 Task.latest_status_message,
                 Task.payloads,

@@ -31,26 +31,37 @@ The reaper carve-out for these tasks lives in ``reaper_orphan_classify.py``
 session seam both depend on.
 """
 
+import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, or_, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal, get_session
-from app.models import Project, ProjectMessage, Task, TaskStatus, _utcnow
+from app.failure_classification import ADMIN_CANCEL
+from app.models import (
+    Direction,
+    Project,
+    ProjectMessage,
+    StrategicCycle,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.shared_state import limiter, runtime_config
 from app.task_locking import (
     project_lock,
     task_lock,
+    with_task_context_locked,
     with_vision_locked,
 )
 from app.workbench_state import (
@@ -85,6 +96,12 @@ RESIDENT_SESSION_REASON_KEY = "_resident_strategic_session_reason"
 # by the auto-start hook because they are runtime outcomes, not static config.
 RESIDENT_SESSION_REASON_NO_RUNNER = "no_runner"
 RESIDENT_SESSION_REASON_START_FAILED_PREFIX = "start_failed"
+# Transient block: a batch strategic cycle is already in flight (IN_PROGRESS /
+# EVALUATING) — no adoptable task exists and the spawn guard refuses to create a
+# duplicate. The blocking cycle completes on its own; the strategic_completion
+# handler re-tries the Workday auto-start once it finishes, so the operator
+# session starts without manual re-entry into Workday mode.
+RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT = "cycle_in_flight"
 # Multi-device block reason: the runner the session is pinned to (an explicit
 # operator override at start, OR the auto-picked device mid-session) is offline /
 # no longer available. Derived by the read model from the live runner set + the
@@ -118,6 +135,29 @@ _RESIDENT_START_CLAIM_STALE_SECONDS = 300  # 5 min
 # interaction for the unattended cap (operator messages are stored as ``user``;
 # ``operator`` is included defensively).
 _OPERATOR_MESSAGE_FROM_TYPES = ("user", "operator")
+
+# created_by value stamped on tasks the strategist spawns (mirrors
+# ``agent_tasks._STRATEGIC_AGENT_CREATED_BY`` / admin_agent_ops). Used to scope
+# the heartbeat's work-state signal to the strategist's OWN in-flight work.
+_STRATEGIC_AGENT_CREATED_BY = "STRATEGIC_AGENT"
+
+# Direction statuses that are "live" (not retired/terminal) for the surface
+# catalog — mirrors the directions_summary inclusion logic in strategic_spawning.
+_ACTIVE_DIRECTION_STATUSES = ("active", "paused", "proposed")
+
+# Maximum bytes stored for the agent's serialized exam-ledger (note field).
+_EXAM_LEDGER_MAX_BYTES = 20_000
+
+# Rolling window (seconds) over which a STRATEGIC_AGENT task that reached a
+# terminal status counts toward ``work_state_summary.terminal_since`` — i.e.
+# "how many of my spawned tasks just landed." Advisory only.
+_WORK_STATE_TERMINAL_WINDOW_SECONDS = 3600
+
+# Depth limit for the recursive CTE that walks STRATEGIC_AGENT task descendants
+# in ``_compute_resident_work_state``. Matches the identical guard in
+# ``agent_tasks._ANCESTOR_WALK_MAX_DEPTH`` — parent_task_id is admin-mutable
+# so an explicit cap prevents cycle-induced infinite recursion.
+_WORK_STATE_ANCESTOR_WALK_MAX_DEPTH = 20
 
 # The resident task must be one of these (non-terminal) statuses to host / keep
 # hosting a session. Mirrors ``strategic_state_read_model._LIVE_STRATEGIC_TASK_STATUSES``.
@@ -233,6 +273,36 @@ async def set_resident_session_blocked_reason(
         )
 
 
+async def _set_cycle_in_flight_reason(
+    session: AsyncSession,
+    project: Project,
+    operator_user_id: str,
+) -> None:
+    """Record the ``cycle_in_flight`` reason, including the operator_user_id.
+
+    Stores the operator_user_id alongside the reason so the completion-retry
+    handler can re-run the Workday auto-start with the right user identity once
+    the blocking cycle finishes. Best-effort: failure is logged and swallowed.
+    """
+    try:
+        def _apply(vision: dict[str, Any]) -> None:
+            vision[RESIDENT_SESSION_REASON_KEY] = {
+                "reason": RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+                "recorded_at": _utcnow().isoformat(),
+                "operator_user_id": str(operator_user_id)[:200],
+            }
+
+        await with_vision_locked(session, project.id, _apply, skip_locked=False)
+        await session.commit()
+        await session.refresh(project)
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] failed to record cycle_in_flight reason for project %s",
+            project.id,
+            exc_info=True,
+        )
+
+
 async def _record_blocked_reason_isolated(
     project_id: uuid.UUID,
     reason: str | None,
@@ -326,22 +396,169 @@ def _start_claim_is_stale(blob: dict[str, Any] | None, now: datetime) -> bool:
     return (now - started).total_seconds() > _RESIDENT_START_CLAIM_STALE_SECONDS
 
 
+def _session_scope_conditions(resident_session_id: str | None) -> list:
+    """WHERE fragments scoping operator messages to a resident session.
+
+    When ``resident_session_id`` is provided, only messages stamped for THAT
+    session — plus legacy/cadence NULL-session rows (never hidden: backward
+    compat so pre-migration backlog is not silently dropped) — are matched. A
+    message stamped for a DIFFERENT session is excluded, so session A's messages
+    do not re-arm session B's unattended cap or pollute B's pacing signal. When
+    ``resident_session_id`` is None (older callers / cadence path) the scope is
+    empty and the query behaves project-wide exactly as before.
+    """
+    if resident_session_id is None:
+        return []
+    return [
+        or_(
+            ProjectMessage.resident_session_id == resident_session_id,
+            ProjectMessage.resident_session_id.is_(None),
+        )
+    ]
+
+
 async def _latest_operator_interaction_at(
-    session: AsyncSession, project_id: uuid.UUID
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    resident_session_id: str | None = None,
 ) -> datetime | None:
     """Return the newest operator-authored message time for the project (or None).
 
     Operator messages are the durable "operator interaction" signal the
-    unattended cap resets on. Naive-UTC ``created_at`` is returned directly.
+    unattended cap resets on. Naive-UTC ``created_at`` is returned directly. When
+    ``resident_session_id`` is given, only messages addressed to THIS session (or
+    unstamped legacy/cadence rows) reset the clock — see
+    ``_session_scope_conditions``.
     """
     return (
         await session.execute(
             select(func.max(ProjectMessage.created_at)).where(
                 ProjectMessage.project_id == project_id,
                 ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
+                *_session_scope_conditions(resident_session_id),
             )
         )
     ).scalar_one_or_none()
+
+
+async def _compute_resident_work_state(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    resident_session_id: str | None = None,
+) -> tuple[str | None, dict[str, int]]:
+    """READ-ONLY snapshot of strategist-relevant world state for the heartbeat.
+
+    Returns ``(work_state_rev, work_state_summary)``:
+
+    * ``work_state_rev`` — a monotonic marker: the newest ISO-8601 timestamp
+      across the change sources the strategist cares about — STRATEGIC_AGENT-
+      created tasks' and their descendant tasks' latest status transitions
+      (``Task.updated_at`` advances on every transition via ``onupdate``),
+      operator-authored ``ProjectMessage`` arrivals, and ``StrategicCycle``
+      mutation stamps. The agent compares this against the rev it recorded at
+      its last autonomous turn to decide whether the world moved. ``None`` when
+      the project has no such activity yet, in which case an older agent
+      degrades to floor-tick pacing.
+    * ``work_state_summary`` — advisory ``{in_flight, terminal_since,
+      new_operator_messages}`` counts feeding the agent's tick context.
+
+    This is DELIBERATELY cheap (a handful of indexed ``max()``/``count()``
+    aggregates) and STRICTLY read-only: it never reads or mutates the lease,
+    the continuation freshness marker, or the session blob, so surfacing it on
+    the heartbeat cannot extend the dead-man's switch (contract pinned by
+    ``test_heartbeat_liveness_only_does_not_extend_lease``).
+    """
+    # A single recursive CTE finds the entire strategist subtree (roots +
+    # transitive descendants) bounded at _WORK_STATE_ANCESTOR_WALK_MAX_DEPTH
+    # levels, then aggregates max(updated_at), in-flight count, and
+    # terminal-since count in the same query — no Python-side BFS, no
+    # unbounded loop, no cycle risk.
+    terminal_cutoff = _utcnow() - timedelta(
+        seconds=_WORK_STATE_TERMINAL_WINDOW_SECONDS
+    )
+    tree_row = (
+        await session.execute(
+            text("""
+                WITH RECURSIVE task_tree AS (
+                    SELECT id, updated_at, archived, status, 0 AS depth
+                    FROM task
+                    WHERE project_id = :project_id
+                      AND created_by = :created_by
+                    UNION ALL
+                    SELECT t.id, t.updated_at, t.archived, t.status,
+                           tt.depth + 1
+                    FROM task t
+                    INNER JOIN task_tree tt ON t.parent_task_id = tt.id
+                    WHERE t.project_id = :project_id
+                      AND tt.depth < :max_depth
+                )
+                SELECT
+                    max(updated_at) AS max_updated,
+                    count(*) FILTER (
+                        WHERE NOT archived
+                          AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                    ) AS in_flight,
+                    count(*) FILTER (
+                        WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                          AND updated_at >= :terminal_cutoff
+                    ) AS terminal_since
+                FROM task_tree
+            """),
+            {
+                "project_id": project_id,
+                "created_by": _STRATEGIC_AGENT_CREATED_BY,
+                "max_depth": _WORK_STATE_ANCESTOR_WALK_MAX_DEPTH,
+                "terminal_cutoff": terminal_cutoff,
+            },
+        )
+    ).fetchone()
+
+    task_max = tree_row[0] if tree_row else None
+    in_flight: int = int(tree_row[1] or 0) if tree_row else 0
+    terminal_since: int = int(tree_row[2] or 0) if tree_row else 0
+
+    msg_max = (
+        await session.execute(
+            select(func.max(ProjectMessage.created_at)).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
+                *_session_scope_conditions(resident_session_id),
+            )
+        )
+    ).scalar_one_or_none()
+    cycle_max = (
+        await session.execute(
+            select(func.max(StrategicCycle.updated_at)).where(
+                StrategicCycle.project_id == project_id,
+            )
+        )
+    ).scalar_one_or_none()
+    # task_max comes from raw SQL (asyncpg returns TIMESTAMPTZ as tz-aware);
+    # msg_max/cycle_max go through NaiveUTCDateTime and are tz-naive. Normalise.
+    if task_max is not None and task_max.tzinfo is not None:
+        task_max = task_max.astimezone(timezone.utc).replace(tzinfo=None)
+    stamps = [dt for dt in (task_max, msg_max, cycle_max) if dt is not None]
+    work_state_rev = max(stamps).isoformat() if stamps else None
+
+    new_operator_messages = (
+        await session.execute(
+            select(func.count())
+            .select_from(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
+                ProjectMessage.status == "open",
+                *_session_scope_conditions(resident_session_id),
+            )
+        )
+    ).scalar() or 0
+    return work_state_rev, {
+        "in_flight": int(in_flight),
+        "terminal_since": int(terminal_since),
+        "new_operator_messages": int(new_operator_messages),
+    }
 
 
 async def _release_start_claim(
@@ -443,7 +660,13 @@ async def _find_adoptable_strategic_review_task(
 
 
 async def _spawn_resident_strategic_task(
-    session: AsyncSession, project: Project, runner_id: str | None, *, session_id: str
+    session: AsyncSession,
+    project: Project,
+    runner_id: str | None,
+    *,
+    session_id: str,
+    exam_ledger: str | None = None,
+    message_cursor: str | None = None,
 ) -> Task | None:
     """Spawn a fresh ``strategic_review`` task via the canonical spawn path.
 
@@ -488,7 +711,9 @@ async def _spawn_resident_strategic_task(
         # ``max_concurrent_vms=0``). When no runner is eligible (``runner_id`` None)
         # this stays None and the task is born QUEUED (degraded cloud fallback).
         runner_pin_id=str(runner_id) if runner_id else None,
-        extra_context=_resident_born_context(session_id, runner_id),
+        extra_context=_resident_born_context(
+            session_id, runner_id, exam_ledger=exam_ledger, message_cursor=message_cursor
+        ),
         # Spawn MINIMALLY: skip the ~2-minute synchronous strategic-context build
         # (design-doc grounding + capability backing-path verification GitHub
         # content/tree fetches, branch-SHA lookups, recent-intervention ancestry,
@@ -657,7 +882,11 @@ async def build_resident_runner_options(
 
 
 def _resident_born_context(
-    session_id: str, runner_id: str | None
+    session_id: str,
+    runner_id: str | None,
+    *,
+    exam_ledger: str | None = None,
+    message_cursor: str | None = None,
 ) -> dict[str, Any]:
     """Build the resident-session context flags a SPAWNED task is BORN with.
 
@@ -684,11 +913,28 @@ def _resident_born_context(
         # operator's runner instead of falling back to a fresh cloud VM.
         context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] = True
         context[STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY] = "resident_session"
+    # Carry the persisted exam ledger forward across a session restart: the agent
+    # restores it from ``task.context["_exam_ledger"]`` on startup, so a NEW
+    # session born on a fresh task continues the examination rotation instead of
+    # resetting to never-examined-first. Absent (first-ever start) leaves the
+    # context byte-identical to before.
+    if exam_ledger:
+        context["_exam_ledger"] = exam_ledger
+    # Carry the message cursor forward so the agent's poll window doesn't regress
+    # to the 2-minute fallback on restart (which re-delivers already-answered
+    # messages). Absent on first-ever start — no cursor has been established yet.
+    if message_cursor:
+        context["message_cursor"] = message_cursor
     return context
 
 
 def _stamp_resident_context(
-    task: Task, *, session_id: str, runner_id: str | None
+    task: Task,
+    *,
+    session_id: str,
+    runner_id: str | None,
+    exam_ledger: str | None = None,
+    message_cursor: str | None = None,
 ) -> None:
     """Stamp the shared resident-session flags + AUTHORITATIVE runner pin onto *task*.
 
@@ -724,6 +970,14 @@ def _stamp_resident_context(
     context = dict(task.context or {})
     context["_resident_session"] = True
     context["strategic_session_id"] = session_id
+    # Carry the persisted exam ledger forward (adopt-path twin of the born-context
+    # seed) so an adopted cadence task continues the examination rotation across a
+    # restart. Absent leaves the merged context unchanged.
+    if exam_ledger:
+        context["_exam_ledger"] = exam_ledger
+    # Carry the message cursor forward so the poll window survives a restart.
+    if message_cursor:
+        context["message_cursor"] = message_cursor
     if runner_id:
         context["preferred_runner_target_id"] = str(runner_id)
         # Hard local-runner intent so dispatch pins the warm session to the
@@ -868,6 +1122,28 @@ async def start_resident_session(
     # common "operator re-opens a running session" case.
     existing = read_resident_session(project.vision)
     stale_session_id: str | None = None
+    # Carry the persisted exam ledger forward across a session restart. A real
+    # restart ENDS the prior resident task and starts a NEW session on a fresh
+    # (spawned/adopted) task, so the ledger the heartbeat mirrored onto the OLD
+    # task's context would otherwise be lost and the examination rotation would
+    # reset to never-examined-first. Capture it from the prior session blob (the
+    # heartbeat also mirrors the ledger into the blob) and seed it into the new
+    # task's context + blob below so the agent restores it on startup. Bounded to
+    # the same byte cap the heartbeat enforces; a malformed/oversized value is
+    # dropped (best-effort — a lost ledger only costs one rotation reset).
+    carried_exam_ledger: str | None = None
+    carried_message_cursor: str | None = None
+    if isinstance(existing, dict):
+        _raw_ledger = existing.get("_exam_ledger")
+        if isinstance(_raw_ledger, str) and 0 < len(
+            _raw_ledger.encode()
+        ) <= _EXAM_LEDGER_MAX_BYTES:
+            carried_exam_ledger = _raw_ledger
+        # Carry the message cursor forward so a restarted session resumes from the
+        # high-water mark instead of falling back to the 2-minute window.
+        _raw_cursor = existing.get("_message_cursor")
+        if isinstance(_raw_cursor, str) and _raw_cursor:
+            carried_message_cursor = _raw_cursor
     if resident_session_is_active(existing):
         task_id = existing.get("task_id")
         live = None
@@ -977,6 +1253,15 @@ async def start_resident_session(
             # session, which is itself an interaction.
             "last_operator_interaction_at": now_iso,
         }
+        # Preserve the carried-forward exam ledger on the new session blob too, so
+        # a subsequent restart BEFORE the new session's first heartbeat still has a
+        # ledger to carry forward (the heartbeat mirror re-writes it thereafter).
+        if carried_exam_ledger:
+            vision[RESIDENT_SESSION_KEY]["_exam_ledger"] = carried_exam_ledger
+        # Preserve the message cursor on the new session blob so a restart BEFORE
+        # the first heartbeat still restores the high-water mark correctly.
+        if carried_message_cursor:
+            vision[RESIDENT_SESSION_KEY]["_message_cursor"] = carried_message_cursor
         decision["mode"] = "adopt" if adopt_task is not None else "spawn"
 
     await with_vision_locked(session, project.id, _claim, skip_locked=False)
@@ -1046,6 +1331,8 @@ async def start_resident_session(
                             task,
                             session_id=session_id,
                             runner_id=effective_runner_id,
+                            exam_ledger=carried_exam_ledger,
+                            message_cursor=carried_message_cursor,
                         )
                         session.add(task)
                         workbench_state = (
@@ -1091,7 +1378,12 @@ async def start_resident_session(
             # with-the-flag closes that race. No re-stamp here — we only finalize
             # the session blob (record task_id) + arm the lease below.
             task = await _spawn_resident_strategic_task(
-                session, project, effective_runner_id, session_id=session_id
+                session,
+                project,
+                effective_runner_id,
+                session_id=session_id,
+                exam_ledger=carried_exam_ledger,
+                message_cursor=carried_message_cursor,
             )
             if task is None:
                 raise HTTPException(
@@ -1127,6 +1419,15 @@ async def start_resident_session(
             )
             await session.commit()
     except Exception:
+        # Snapshot the project id into a plain local BEFORE the rollback below.
+        # ``session.rollback()`` expires EVERY ORM attribute on ``project`` (this
+        # happens even under ``expire_on_commit=False``), so a later ``project.id``
+        # read would trigger a sync lazy-load in async context and raise
+        # ``MissingGreenlet`` — masking the real failure and leaking a half-
+        # compensated start. Every post-rollback use below reads this snapshot,
+        # never the (now-expired) ORM attribute. (``session_id`` and
+        # ``spawned_task_id`` are already plain locals captured before the rollback.)
+        project_id = project.id
         # Log the ORIGINAL failure (with traceback) FIRST, before any
         # compensation — so the true cause is visible next time even if the
         # caller session is poisoned and its own rollback trips over the dead
@@ -1137,7 +1438,7 @@ async def start_resident_session(
         logger.exception(
             "[RESIDENT_SESSION] start failed for project %s (session %s); "
             "compensating on a fresh session",
-            project.id,
+            project_id,
             session_id,
         )
         # Best-effort caller-session rollback so its connection is returned
@@ -1150,11 +1451,11 @@ async def start_resident_session(
             logger.warning(
                 "[RESIDENT_SESSION] caller-session rollback failed during start "
                 "compensation for project %s (continuing on a fresh session)",
-                project.id,
+                project_id,
                 exc_info=True,
             )
         await _release_start_claim(
-            project.id, session_id, spawned_task_id, session_factory=session_factory
+            project_id, session_id, spawned_task_id, session_factory=session_factory
         )
         raise
 
@@ -1166,6 +1467,111 @@ async def start_resident_session(
         project.id,
     )
     return resident_session_snapshot(project.vision) or {}
+
+
+async def _run_resident_completion_on_stop(
+    task_id: uuid.UUID,
+    *,
+    session_factory=None,
+) -> None:
+    """Run strategic completion processing for an operator-stopped resident task.
+
+    When an operator stops a resident session, the backing task is cancelled
+    server-side before the agent can post its terminal status, so the normal
+    post-commit completion pipeline never fires.  This helper bridges that gap:
+    it opens a fresh, dedicated session (the same isolation idiom as
+    ``_release_start_claim``), re-fetches the task, and calls
+    ``_handle_strategic_completion`` so cycle-closure events, pending playbook
+    entries, and retirement memos all run exactly once.
+
+    Only invoked when the task context holds stashed strategic work (a
+    qualify_request, version_phase_decision, new_version_goal, or
+    new_acceptance_criteria written by set_problem_model / set_vision, or
+    any api_was_used marker set during the session).  Skipping the handler for
+    tasks with no activity avoids false _strategic_failures increments: the
+    handler's fallback path (no API, no parseable logs) would otherwise record
+    a spurious failure and raise an alert.
+
+    When there IS work to process the project row is locked via
+    ``lock_project_for_strategic_transition`` before calling the handler,
+    satisfying the C3 locking invariant the api_was_used branch requires.
+
+    Best-effort: any exception is logged and swallowed — completion processing
+    must never mask or roll back the stop itself.
+    """
+    factory = session_factory or AsyncSessionLocal
+    try:
+        async with factory() as fresh_session:
+            task = await fresh_session.get(Task, task_id)
+            if task is None:
+                logger.warning(
+                    "[RESIDENT_SESSION] _run_resident_completion_on_stop: task %s not found",
+                    task_id,
+                )
+                return
+            from app.strategic_completion import (
+                QUALIFY_REQUEST_CONTEXT_KEY,
+                VERSION_PHASE_DECISION_CONTEXT_KEY,
+                NEW_VERSION_GOAL_CONTEXT_KEY,
+                NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+                _handle_strategic_completion,
+            )
+
+            ctx = task.context or {}
+            # Keys stashed by set_problem_model / set_vision API endpoints
+            _STASH_KEYS = (
+                QUALIFY_REQUEST_CONTEXT_KEY,
+                VERSION_PHASE_DECISION_CONTEXT_KEY,
+                NEW_VERSION_GOAL_CONTEXT_KEY,
+                NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+            )
+            # Counters / flags set by strategic API calls during the session
+            _API_MARKERS = (
+                "_strategic_vision_set",
+                "_strategic_dirs_created",
+                "_strategic_dirs_retired",
+                "_strategic_dirs_staged",
+                "_strategic_dirs_updated",
+                "_strategic_proposals_approved",
+                "_strategic_proposals_rejected",
+                "_strategic_tasks_spawned",
+                "_strategic_api_called",
+            )
+            has_strategic_work = any(ctx.get(k) for k in _STASH_KEYS) or any(
+                ctx.get(k) for k in _API_MARKERS
+            )
+            if not has_strategic_work:
+                logger.info(
+                    "[RESIDENT_SESSION] _run_resident_completion_on_stop: task %s has no stashed "
+                    "strategic work — skipping completion processing (operator stop with no API activity)",
+                    task_id,
+                )
+                return
+
+            # Acquire the project row lock before entering the handler.  The
+            # api_was_used branch inside _handle_strategic_completion assumes the
+            # caller pre-acquired the lock (C3 pair-locker); calling without it
+            # would run mark_phase2_completed and the _apply_* chain unlocked.
+            from app.task_locking import lock_project_for_strategic_transition
+
+            locked_project = await lock_project_for_strategic_transition(
+                fresh_session, task.project_id
+            )
+            if locked_project is None:
+                logger.warning(
+                    "[RESIDENT_SESSION] _run_resident_completion_on_stop: could not acquire project "
+                    "lock for task %s — skipping completion processing",
+                    task_id,
+                )
+                return
+
+            await _handle_strategic_completion(task, "", fresh_session, project=locked_project)
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] _run_resident_completion_on_stop: completion processing failed for task %s",
+            task_id,
+            exc_info=True,
+        )
 
 
 async def stop_resident_session(
@@ -1213,6 +1619,7 @@ async def stop_resident_session(
 
     # Drive the resident task terminal (instant reclaim). Only touch a live task.
     task_id = (blob or {}).get("task_id")
+    cancelled_task_id: uuid.UUID | None = None
     if task_id:
         try:
             task = await session.get(Task, uuid.UUID(str(task_id)))
@@ -1221,7 +1628,12 @@ async def stop_resident_session(
         if task is not None and task.status in _LIVE_TASK_STATUSES:
             task.status = TaskStatus.CANCELLED
             task.latest_status_message = "Resident strategic session stopped by operator"
+            ctx = dict(task.context or {})
+            ctx["failure_category"] = ADMIN_CANCEL
+            task.context = ctx
+            flag_modified(task, "context")
             session.add(task)
+            cancelled_task_id = task.id
 
     def _release_and_end(vision: dict[str, Any]) -> None:
         # Release the continuation lease (the resident session is over) and mark
@@ -1249,6 +1661,38 @@ async def stop_resident_session(
         project.id,
         task_id,
     )
+
+    # Best-effort: resolve open messages from the ending session so they don't
+    # re-appear as fresh inbox items in later strategic payloads.
+    _session_id = (blob or {}).get("session_id")
+    if _session_id:
+        try:
+            from app.session_message_handoff import handoff_session_messages
+
+            _handed_off = await handoff_session_messages(session, project.id, _session_id)
+            if _handed_off:
+                await session.commit()
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "[RESIDENT_SESSION] message handoff raised for session %s — stop still committed",
+                _session_id,
+                exc_info=True,
+            )
+
+    if cancelled_task_id is not None:
+        try:
+            await _run_resident_completion_on_stop(cancelled_task_id)
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] stop-time completion processing raised for task %s — stop still committed",
+                cancelled_task_id,
+                exc_info=True,
+            )
+
     return resident_session_snapshot(project.vision) or {}
 
 
@@ -1318,6 +1762,14 @@ async def sync_resident_session_for_interaction_mode(
 
     factory = session_factory or AsyncSessionLocal
 
+    # Snapshot the project id into a plain local BEFORE the rollback below. The
+    # rollback intentionally expires the caller's cached ORM ``project`` (so the
+    # endpoint's trailing read reloads the freshly-committed state), but that also
+    # means any ``project.id`` read AFTER it would trigger a sync lazy-load in
+    # async context → ``MissingGreenlet``. Every post-rollback use in this function
+    # reads this plain snapshot, never the (now-expired) ORM attribute.
+    project_id = project.id
+
     # Release the caller session's transaction / expire its cached ``project`` so
     # (a) the shared single-connection test pool is free for the dedicated session
     # below, and (b) the endpoint's trailing read reloads the freshly-committed
@@ -1330,14 +1782,14 @@ async def sync_resident_session_for_interaction_mode(
         logger.warning(
             "[RESIDENT_SESSION] caller-session rollback before sync failed for "
             "project %s (continuing on a dedicated session)",
-            project.id,
+            project_id,
             exc_info=True,
         )
 
     try:
         if entered:
             return await _auto_start_on_workday_entry(
-                project.id,
+                project_id,
                 operator_user_id=operator_user_id,
                 session_factory=factory,
             )
@@ -1346,7 +1798,7 @@ async def sync_resident_session_for_interaction_mode(
         # clear any recorded reason, on a dedicated session.
         try:
             async with factory() as fresh:
-                fresh_project = await fresh.get(Project, project.id)
+                fresh_project = await fresh.get(Project, project_id)
                 if fresh_project is not None:
                     await stop_resident_session(
                         fresh, fresh_project, operator_user_id=operator_user_id
@@ -1354,11 +1806,11 @@ async def sync_resident_session_for_interaction_mode(
         except Exception:
             logger.warning(
                 "[RESIDENT_SESSION] auto-stop on Workday exit failed for project %s",
-                project.id,
+                project_id,
                 exc_info=True,
             )
         await _record_blocked_reason_isolated(
-            project.id, None, session_factory=factory
+            project_id, None, session_factory=factory
         )
         return None
     except Exception:
@@ -1367,7 +1819,7 @@ async def sync_resident_session_for_interaction_mode(
         logger.warning(
             "[RESIDENT_SESSION] sync for interaction_mode change failed for "
             "project %s",
-            project.id,
+            project_id,
             exc_info=True,
         )
         return None
@@ -1400,6 +1852,22 @@ async def _auto_start_on_workday_entry(
                     fresh, project, RESIDENT_SESSION_REASON_NO_RUNNER
                 )
                 return None
+            # Pre-check: if no adoptable strategic_review exists AND a batch
+            # strategic cycle is in flight, the spawn path would be refused with
+            # a generic 409. Detect this early and record a named reason so the
+            # read model can surface a non-alarming "waiting on active cycle"
+            # state, and the completion handler can retry once the cycle finishes.
+            _adopt_hint = await _find_adoptable_strategic_review_task(
+                fresh, project.id
+            )
+            if _adopt_hint is None:
+                from app.task_lifecycle import _has_active_strategic_task
+
+                if await _has_active_strategic_task(project.id, fresh):
+                    await _set_cycle_in_flight_reason(
+                        fresh, project, operator_user_id
+                    )
+                    return None
             snapshot = await start_resident_session(
                 fresh,
                 project,
@@ -1437,6 +1905,8 @@ async def renew_resident_session_lease(
     task_id: str,
     progress: bool = False,
     note: str | None = None,
+    message_cursor: str | None = None,
+    handled_message_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
@@ -1494,6 +1964,48 @@ async def renew_resident_session_lease(
     now = _utcnow()
     now_iso = now.isoformat()
 
+    # READ-ONLY work-state signal for the agent's state-gated pacing. Computed
+    # once, up front, from cheap aggregate queries; additive to every return
+    # branch below. It NEVER touches lease/freshness/session state, so it cannot
+    # extend the dead-man's switch (pinned by
+    # test_heartbeat_liveness_only_does_not_extend_lease). Older agents ignore
+    # the extra fields.
+    work_state_rev, work_state_summary = await _compute_resident_work_state(
+        session, project.id, resident_session_id=session_id
+    )
+
+    # Parse the agent's serialized exam-ledger from the heartbeat note (JSON,
+    # guarded). When valid, the string is written into the session blob as
+    # ``_exam_ledger`` so a restart can restore the ledger instead of beginning
+    # from scratch. Best-effort: malformed or absent JSON is silently ignored.
+    exam_ledger_str: str | None = None
+    if isinstance(note, str) and note.strip():
+        try:
+            parsed_note = json.loads(note)
+            if isinstance(parsed_note, dict):
+                # Only store when the full JSON fits; truncating mid-value
+                # yields invalid JSON that causes JSON.parse to throw on restart.
+                if len(note.encode()) <= _EXAM_LEDGER_MAX_BYTES:
+                    exam_ledger_str = note
+        except Exception:
+            pass
+
+    # Cheap indexed read of live direction keys for the agent's surface-catalog
+    # refresh. Returns only non-retired directions so newly created or newly
+    # retired directions immediately enter/leave the rotation on the next tick.
+    active_direction_ids: list[str] = list(
+        (
+            await session.execute(
+                select(Direction.direction_key).where(
+                    Direction.project_id == project.id,
+                    Direction.status.in_(list(_ACTIVE_DIRECTION_STATUSES)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     # Stop-requested / ended (pre-lock snapshot): do NOT renew — let the lease
     # lapse so the cadence can reclaim, and signal the agent to wind down.
     if stop_requested or status == STATUS_ENDED:
@@ -1505,6 +2017,10 @@ async def renew_resident_session_lease(
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": status,
+            "work_state_rev": work_state_rev,
+            "work_state_summary": work_state_summary,
+            "exam_ledger": None,
+            "active_direction_ids": active_direction_ids,
         }
 
     # Unattended cap: compare now against the last operator interaction, taking
@@ -1516,7 +2032,9 @@ async def renew_resident_session_lease(
     last_op_dt = _parse_iso_naive(
         blob.get("last_operator_interaction_at")
     ) or _parse_iso_naive(blob.get("started_at"))
-    latest_msg_dt = await _latest_operator_interaction_at(session, project.id)
+    latest_msg_dt = await _latest_operator_interaction_at(
+        session, project.id, resident_session_id=session_id
+    )
     op_reengaged = latest_msg_dt is not None and (
         last_op_dt is None or latest_msg_dt > last_op_dt
     )
@@ -1647,9 +2165,91 @@ async def renew_resident_session_lease(
             updated["last_progress_at"] = now_iso
         if op_reengaged and latest_msg_dt is not None:
             updated["last_operator_interaction_at"] = latest_msg_dt.isoformat()
+        # Persist the agent's serialized exam-ledger so it survives a restart.
+        # ``_exam_ledger`` is NOT exposed by ``resident_session_snapshot``; it is
+        # an opaque blob the agent reads back via ``task.context`` on startup.
+        if exam_ledger_str is not None:
+            updated["_exam_ledger"] = exam_ledger_str
+        # Persist the advancing message cursor so a restart resumes from the
+        # high-water mark rather than re-delivering already-answered messages.
+        if message_cursor:
+            updated["_message_cursor"] = message_cursor
         vision[RESIDENT_SESSION_KEY] = updated
 
     await with_vision_locked(session, project.id, _renew, skip_locked=False)
+    # Mirror the exam ledger and message cursor into task.context so a runner
+    # restart can read them back on startup (the agent reads task.context at pull
+    # time; project.vision is not visible to the agent).
+    _need_ctx_update = exam_ledger_str is not None or bool(message_cursor)
+    if _need_ctx_update:
+        try:
+            _ledger_task_id = uuid.UUID(task_id)
+        except (ValueError, TypeError):
+            _ledger_task_id = None
+        if _ledger_task_id is not None:
+
+            def _mirror_ledger(ctx: dict) -> None:
+                # Only these two keys are the resident-heartbeat's durable
+                # restart state; every OTHER key in ``ctx`` (e.g. the
+                # strategic-API ``_strategic_api_called`` / ``_strategic_vision_set``
+                # flags) belongs to another writer and is preserved untouched.
+                if exam_ledger_str is not None:
+                    ctx["_exam_ledger"] = exam_ledger_str
+                if message_cursor:
+                    ctx["message_cursor"] = message_cursor
+
+            # Re-read Task.context FRESH under FOR UPDATE (populate_existing)
+            # before the read-modify-write so a concurrent strategic-API
+            # whole-column write cannot be clobbered (lost update), and vice
+            # versa. We already hold the project row lock here (``with_vision_locked``
+            # above holds it until this session commits), so acquiring the task
+            # lock now is the canonical Project→Task order and cannot deadlock.
+            # skip_locked=False so this durable restart-state mirror waits for
+            # (rather than silently drops) the row; the wait is bounded and, since
+            # we hold the project lock, the row is effectively uncontended by the
+            # strategic-API paths (they cannot hold the task lock without first
+            # holding the project lock we own).
+            await with_task_context_locked(
+                session,
+                _ledger_task_id,
+                _mirror_ledger,
+                skip_locked=False,
+                timeout=10.0,
+            )
+    # Mark inbound operator messages as handled so a restart does not re-answer
+    # them and so they stop counting as open backlog. Scoped to the project and
+    # session to avoid touching rows that belong to another session's conversation.
+    if handled_message_ids:
+        # Wrap in a SAVEPOINT so a DB error here only rolls back the
+        # handled-ids UPDATE, leaving the outer transaction (the vision lease
+        # renewal + task-context mirror) intact and committed below.
+        try:
+            safe_ids: list[uuid.UUID] = []
+            for uid in handled_message_ids:
+                if not isinstance(uid, str) or not uid:
+                    continue
+                try:
+                    safe_ids.append(uuid.UUID(uid))
+                except ValueError:
+                    pass
+            if safe_ids:
+                async with session.begin_nested():
+                    await session.execute(
+                        sa_update(ProjectMessage)
+                        .where(
+                            ProjectMessage.project_id == project.id,
+                            ProjectMessage.id.in_(safe_ids),
+                            ProjectMessage.resident_session_id == session_id,
+                            ProjectMessage.status == "open",
+                        )
+                        .values(status="handled")
+                    )
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] handled_message_ids update failed for session %s — ignored",
+                session_id,
+                exc_info=True,
+            )
     await session.commit()
     await session.refresh(project)
 
@@ -1665,6 +2265,10 @@ async def renew_resident_session_lease(
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": refreshed.get("status") or STATUS_ENDED,
+            "work_state_rev": work_state_rev,
+            "work_state_summary": work_state_summary,
+            "exam_ledger": None,
+            "active_direction_ids": active_direction_ids,
         }
     if holder["capped"] or holder["lapsed"]:
         # Finding 1: the unattended cap was exceeded, or the lease genuinely
@@ -1672,11 +2276,32 @@ async def renew_resident_session_lease(
         # stamped ended + lease released) so the resident task can go terminal
         # and the legacy cadence reclaims strategic authority. Signal the agent
         # to wind down.
+        # Best-effort: resolve session messages so they don't re-enter the inbox.
+        try:
+            from app.session_message_handoff import handoff_session_messages
+
+            _handed_off = await handoff_session_messages(session, project.id, session_id)
+            if _handed_off:
+                await session.commit()
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "[RESIDENT_SESSION] message handoff raised for session %s (cap/lapse) — ignored",
+                session_id,
+                exc_info=True,
+            )
         return {
             "authority_held": False,
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": refreshed.get("status") or STATUS_ENDED,
+            "work_state_rev": work_state_rev,
+            "work_state_summary": work_state_summary,
+            "exam_ledger": None,
+            "active_direction_ids": active_direction_ids,
         }
     return {
         "authority_held": bool(cont.get("fresh"))
@@ -1685,6 +2310,10 @@ async def renew_resident_session_lease(
         "leased_until": cont.get("expires_at"),
         "stop_requested": refreshed_stop,
         "status": refreshed.get("status") or STATUS_ACTIVE,
+        "work_state_rev": work_state_rev,
+        "work_state_summary": work_state_summary,
+        "exam_ledger": exam_ledger_str,
+        "active_direction_ids": active_direction_ids,
     }
 
 
@@ -1698,6 +2327,8 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     task_id: str
     progress: bool | None = None
     note: str | None = None
+    message_cursor: str | None = None
+    handled_message_ids: list[str] | None = None
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -1726,4 +2357,6 @@ async def resident_session_heartbeat(
         task_id=payload.task_id,
         progress=bool(payload.progress),
         note=payload.note,
+        message_cursor=payload.message_cursor,
+        handled_message_ids=payload.handled_message_ids,
     )

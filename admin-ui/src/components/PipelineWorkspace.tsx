@@ -43,6 +43,7 @@ type PipelineArchiveProps = Omit<ArchiveProps, 'setShowArchive'>;
 
 interface PipelineFlowProps {
   tasks: Task[];
+  loading?: boolean;
   hasActiveFilters: boolean;
   onViewLogs: (task: Task) => void;
   onNavigateToParent: (parentTaskId: string) => void;
@@ -640,6 +641,7 @@ export function PipelineWorkspace({
               <main data-testid="pipeline-flow-main" className="flex min-h-0 min-w-0 flex-col overflow-hidden px-3 py-2.5 md:px-4 lg:col-start-1 lg:row-start-1 lg:py-3">
                 <PipelineView
                   tasks={flow.tasks}
+                  loading={flow.loading}
                   hasActiveFilters={flow.hasActiveFilters}
                   onViewLogs={flow.onViewLogs}
                   onNavigateToParent={flow.onNavigateToParent}

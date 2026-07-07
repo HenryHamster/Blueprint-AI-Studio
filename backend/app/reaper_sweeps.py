@@ -411,6 +411,27 @@ async def sweep_stalled_strategic_cycles(
     _step7_now = _utcnow()
     actually_stalled: list = []
     pending_broadcasts: list[tuple[str, dict]] = []
+
+    # Batch-fetch all linked tasks in a single IN query to avoid N+1
+    # round-trips (one session.get per stalled cycle).
+    _pre_linked_ids: list = []
+    for _c in stalled:
+        if _c.outcome in (
+            strategic_cycle.OUTCOME_IN_PROGRESS,
+            strategic_cycle.OUTCOME_PHASE1_RUNNING,
+            strategic_cycle.OUTCOME_PHASE1_DONE,
+        ):
+            _tid = _c.phase1_task_id
+        else:
+            _tid = _c.phase2_task_id
+        if _tid is not None:
+            _pre_linked_ids.append(_tid)
+    _linked_tasks: dict = {}
+    if _pre_linked_ids:
+        _rows = await session.execute(select(Task).where(Task.id.in_(_pre_linked_ids)))
+        for _t in _rows.scalars():
+            _linked_tasks[_t.id] = _t
+
     for c in stalled:
         if c.outcome in (
             strategic_cycle.OUTCOME_IN_PROGRESS,
@@ -424,7 +445,7 @@ async def sweep_stalled_strategic_cycles(
             linked_task_id = c.phase2_task_id
 
         if linked_task_id is not None:
-            linked_task = await session.get(Task, linked_task_id)
+            linked_task = _linked_tasks.get(linked_task_id)
             if task_is_strategic_local_runner_hold(linked_task):
                 logger.info(
                     f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "
@@ -533,6 +554,21 @@ async def sweep_regression_scan(session) -> int:
 
     _last_regression_scan = now_scan
     return await _run_regression_scan_and_notify(session)
+
+
+async def sweep_metrics_integrity(session, now=None) -> dict | None:
+    """Standing metrics-integrity sweep seam — recompute selected self-reported
+    counters from ground truth and FLAG drift without mutating the source.
+
+    Thin delegator to :func:`app.metrics_integrity_sweep.run_metrics_integrity_sweep`
+    so the sweep lives beside the other reaper housekeeping sweeps. Mode- and
+    cadence-gated inside the callee; returns the tick summary dict, or ``None``
+    when gated out (mode off / cadence not due). The reaper wraps this call in
+    its own try/except+rollback, so a raised error can never crash the cycle.
+    """
+    from app.metrics_integrity_sweep import run_metrics_integrity_sweep
+
+    return await run_metrics_integrity_sweep(session, now)
 
 
 async def sweep_stuck_qualifications(session, *, session_factory) -> int:
@@ -799,9 +835,17 @@ async def sweep_stale_staged_directions(session) -> int:
         return 0
 
     # Group staged rows by project so each project reads its open version once.
+    # Snapshot the fields we read (the ``data`` blob + ``direction_key``) into
+    # plain values NOW. A per-project failure below calls session.rollback()
+    # (rollback expires every Direction row regardless of expire_on_commit), and
+    # a later row.data / row.direction_key read on an expired row would fire a
+    # sync lazy-load inside the AsyncSession -> MissingGreenlet, spuriously
+    # skipping every subsequent project's staged rows. Plain locals never expire.
     by_project: dict = {}
     for r in rows:
-        by_project.setdefault(r.project_id, []).append(r)
+        by_project.setdefault(r.project_id, []).append(
+            (dict(r.data or {}), r.direction_key)
+        )
 
     now = _utcnow()
     total_alerts = 0
@@ -809,8 +853,7 @@ async def sweep_stale_staged_directions(session) -> int:
         try:
             open_version = await current_open_version(session, pid)
             open_n = open_version.version_number if open_version else None
-            for row in staged_rows:
-                d = row.data or {}
+            for d, row_direction_key in staged_rows:
                 target = d.get("staged_for_version")
                 try:
                     target_n = int(target)
@@ -844,7 +887,7 @@ async def sweep_stale_staged_directions(session) -> int:
                 created = await _maybe_create_stale_staged_direction_alert(
                     session,
                     pid,
-                    direction_id=str(d.get("id") or row.direction_key),
+                    direction_id=str(d.get("id") or row_direction_key),
                     direction_text=d.get("text"),
                     waited_days=waited_days,
                     staged_for_version=target_n,
@@ -1217,6 +1260,166 @@ from app.reaper_bug_message_sweeps import (  # noqa: E402
     sweep_wake_delivery_stall_alerts,
 )
 
+async def sweep_closed_handmerge_prs(session) -> int:
+    """Resolve the operator-attention record for preserved hand-merge PRs that have since been merged or closed.
+
+    Finds FAILED tasks with ``pr_preserved_for_handmerge=True``, fetches each
+    PR's current state from GitHub, and — when the PR is no longer open —
+    clears the flag (removing the ``hand_merge_required`` attention item) and
+    resolves the associated ProjectMessage created at preservation time.
+
+    Capped at ``_HANDMERGE_SWEEP_BATCH`` tasks per reaper cycle to bound
+    GitHub API call volume (each task needs one round-trip).
+    """
+    import contextlib as _contextlib
+
+    from app.models import ArtifactType, ProjectMessage, Task, TaskStatus
+    from app.models import Artifact as _Artifact
+    from sqlalchemy.orm.attributes import flag_modified
+    from sqlmodel import select as _select
+
+    _HANDMERGE_SWEEP_BATCH = 10
+
+    # Order by updated_at ASC so that tasks whose context was most recently
+    # stamped (open-PR checks bump updated_at) rotate to the back, ensuring
+    # every preserved task is eventually checked regardless of batch size.
+    preserved_tasks = list(
+        (
+            await session.execute(
+                _select(Task)
+                .where(
+                    Task.archived.is_(False),
+                    Task.status == TaskStatus.FAILED,
+                    Task.context["pr_preserved_for_handmerge"].as_boolean().is_(True),
+                )
+                .order_by(Task.updated_at.asc())
+                .limit(_HANDMERGE_SWEEP_BATCH)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not preserved_tasks:
+        return 0
+
+    try:
+        from app.github import get_pull_request as _get_pull_request
+        from app.routers.agent import get_github_token_for_task as _get_token
+    except ImportError:
+        return 0
+
+    # Snapshot the fields we need as plain Python values NOW.
+    # session.commit() and session.rollback() both expire every ORM instance
+    # (expire_on_commit=True by default), so a lazy-load in a later iteration
+    # fires a sync DB read inside the async session → MissingGreenlet, silently
+    # aborting the rest of the batch.  Plain locals never expire.
+    task_snapshots = [
+        (task, task.id, task.project_id, dict(task.context or {}))
+        for task in preserved_tasks
+    ]
+
+    resolved = 0
+    for task, t_id, t_project_id, ctx in task_snapshots:
+        pr_number = ctx.get("handmerge_pr_number")
+        if not isinstance(pr_number, int):
+            # Fall back to the PULL_REQUEST artifact for tasks preserved before
+            # handmerge_pr_number was stored in context.
+            artifact = (
+                await session.execute(
+                    _select(_Artifact).where(
+                        _Artifact.task_id == t_id,
+                        _Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    )
+                )
+            ).scalar_one_or_none()
+            if artifact and artifact.pr_url:
+                try:
+                    pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+                except (ValueError, IndexError):
+                    pr_number = None
+        if not pr_number:
+            continue
+
+        try:
+            gh_token, owner, repo = await _get_token(t_id, session)
+            pr = await _get_pull_request(
+                gh_token, owner, repo, pr_number, project_id=str(t_project_id)
+            )
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] handmerge-sweep: failed to check PR #%s for task %s: %s",
+                pr_number,
+                t_id,
+                _e,
+            )
+            continue
+
+        if (pr.get("state") or "").lower() == "open":
+            # Stamp last-checked time and commit so updated_at advances,
+            # rotating this task to the back of the ordered batch next cycle.
+            ctx["handmerge_last_checked_at"] = _utcnow().isoformat()
+            task.context = ctx
+            flag_modified(task, "context")
+            session.add(task)
+            try:
+                await session.commit()
+            except Exception as _e:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] handmerge-sweep: failed to stamp last-checked for task %s: %s",
+                    t_id,
+                    _e,
+                )
+                with _contextlib.suppress(Exception):
+                    await session.rollback()
+            continue
+
+        # PR is no longer open — clear the flag so the attention item disappears.
+        resolution = "merged" if pr.get("merged_at") else "closed"
+        ctx.pop("pr_preserved_for_handmerge", None)
+        ctx["handmerge_pr_resolved"] = True
+        ctx["handmerge_pr_resolution"] = resolution
+        task.context = ctx
+        flag_modified(task, "context")
+        session.add(task)
+
+        # Resolve the associated operator-attention ProjectMessage if open.
+        ikey = f"handmerge:{t_id}"
+        msg = (
+            await session.execute(
+                _select(ProjectMessage).where(
+                    ProjectMessage.project_id == t_project_id,
+                    ProjectMessage.idempotency_key == ikey,
+                    ProjectMessage.status == "open",
+                )
+            )
+        ).scalar_one_or_none()
+        if msg is not None:
+            msg.status = "resolved"
+            msg.resolution = f"PR #{pr_number} {resolution}"
+            msg.resolved_at = _utcnow()
+            session.add(msg)
+
+        try:
+            await session.commit()
+            resolved += 1
+            logger.info(
+                "[REAPER] handmerge-sweep: cleared PR #%s (%s) for task %s",
+                pr_number,
+                resolution,
+                t_id,
+            )
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] handmerge-sweep: commit failed for task %s: %s",
+                t_id,
+                _e,
+            )
+            with _contextlib.suppress(Exception):
+                await session.rollback()
+
+    return resolved
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -1257,4 +1460,5 @@ __all__ = [
     "sweep_resolve_open_owned_bug_messages",
     "sweep_resolve_stale_open_bug_messages",
     "sweep_wake_delivery_stall_alerts",
+    "sweep_closed_handmerge_prs",
 ]

@@ -143,6 +143,8 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
   const [featureConfigLoading, setFeatureConfigLoading] = useState(false);
   const [autoRemSaving, setAutoRemSaving] = useState(false);
   const [issueImplSaving, setIssueImplSaving] = useState(false);
+  const [autoRemToggleError, setAutoRemToggleError] = useState('');
+  const [issueImplToggleError, setIssueImplToggleError] = useState('');
 
   // Repo picker state
   const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
@@ -285,7 +287,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
       setStep('success');
       onSuccess(projectId);
 
-      // Load feature configs for the setup guide
+      // Load feature configs for the setup guide — optional, never undoes the success step
       setFeatureConfigLoading(true);
       try {
         const [arRes, iiRes] = await Promise.all([
@@ -300,6 +302,8 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
           const iiData = await iiRes.json();
           if (iiData?.config) setIssueImplementationConfig(iiData.config as IssueImplementationConfig);
         }
+      } catch {
+        // feature-config is best-effort; project is already created
       } finally {
         setFeatureConfigLoading(false);
       }
@@ -311,20 +315,22 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
   const handleToggleAutoRemediation = async () => {
     if (!createdProjectId || !autoRemediationConfig) return;
+    const prev = autoRemediationConfig;
     const next = !autoRemediationConfig.enabled;
     setAutoRemediationConfig({ ...autoRemediationConfig, enabled: next });
+    setAutoRemToggleError('');
     setAutoRemSaving(true);
     try {
       const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(createdProjectId)}/auto-remediation`, {
         method: 'PATCH',
         body: JSON.stringify({ ...autoRemediationConfig, enabled: next }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.config) setAutoRemediationConfig(data.config as AutoRemediationConfig);
-      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data?.config) setAutoRemediationConfig(data.config as AutoRemediationConfig);
     } catch {
-      setAutoRemediationConfig({ ...autoRemediationConfig, enabled: !next });
+      setAutoRemediationConfig(prev);
+      setAutoRemToggleError('Failed to update — change was not saved.');
     } finally {
       setAutoRemSaving(false);
     }
@@ -332,20 +338,22 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
   const handleToggleIssueImplementation = async () => {
     if (!createdProjectId || !issueImplementationConfig) return;
+    const prev = issueImplementationConfig;
     const next = !issueImplementationConfig.enabled;
     setIssueImplementationConfig({ ...issueImplementationConfig, enabled: next });
+    setIssueImplToggleError('');
     setIssueImplSaving(true);
     try {
       const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(createdProjectId)}/issue-implementation`, {
         method: 'PATCH',
         body: JSON.stringify({ enabled: next }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.config) setIssueImplementationConfig(data.config as IssueImplementationConfig);
-      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data?.config) setIssueImplementationConfig(data.config as IssueImplementationConfig);
     } catch {
-      setIssueImplementationConfig({ ...issueImplementationConfig, enabled: !next });
+      setIssueImplementationConfig(prev);
+      setIssueImplToggleError('Failed to update — change was not saved.');
     } finally {
       setIssueImplSaving(false);
     }
@@ -1033,6 +1041,11 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 <div className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
                   Automation Features
                 </div>
+                {(autoRemToggleError || issueImplToggleError) && (
+                  <p className="text-ui-sm text-red-400 mb-2" data-testid="toggle-error">
+                    {autoRemToggleError || issueImplToggleError}
+                  </p>
+                )}
                 {featureConfigLoading ? (
                   <div className="flex items-center gap-2 py-3 text-neutral-500 text-xs">
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -1053,6 +1066,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                           </div>
                         </div>
                         <button
+                          aria-label="Toggle Auto-Remediation"
                           onClick={handleToggleAutoRemediation}
                           disabled={autoRemSaving || !autoRemediationConfig}
                           className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-3 disabled:opacity-50 ${
@@ -1083,6 +1097,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                           </div>
                         </div>
                         <button
+                          aria-label="Toggle Issue-to-Implementation"
                           onClick={handleToggleIssueImplementation}
                           disabled={issueImplSaving || !issueImplementationConfig}
                           className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ml-3 disabled:opacity-50 ${

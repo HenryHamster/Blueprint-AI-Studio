@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { auth } from '../firebase';
+import { auth, getIdToken } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
 import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
 import { parseTimestamp, timeAgo } from '../utils/time';
@@ -23,7 +23,7 @@ import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer } from './MessagesComposer';
-import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
+import { armingToastCopy, parseArmingOutcome, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
@@ -32,7 +32,7 @@ import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import {
   createStrategicSessionMessage,
-  fetchStrategicSession,
+  fetchStrategicConversation,
   type StrategicContextPackageDescriptor,
   type StrategicMessageTarget,
   type StrategicStateResponse,
@@ -656,16 +656,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }, 100);
   }, []);
 
-  // Refs for scrolling to sections from summary card
-  const blockersRefEl = useRef<HTMLDivElement>(null);
-  const questionsRefEl = useRef<HTMLDivElement>(null);
-  const routineRefEl = useRef<HTMLDivElement>(null);
-
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
   const notifyOnHighSignalMessageRef = useRef(notifyOnHighSignalMessage);
   notifyOnHighSignalMessageRef.current = notifyOnHighSignalMessage;
+  // Stable ref for the direction convert-form so the memoized convert handler
+  // does not churn on the form hook's per-render object identity.
+  const convertFormRef = useRef(convertForm);
+  convertFormRef.current = convertForm;
 
   // Track seen messages to detect new arrivals and avoid initial-load toast spam
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
@@ -848,11 +847,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       : { items: [], latestLifecycle: null } as StrategicLiveActivity),
     [conversationMode, strategicSessionTranscript, conversationMessages],
   );
-  // The chat is "working on a reply" while a turn is pending (optimistic send not
-  // yet answered) OR the resident agent has streamed a `responding`/activity
-  // frame. The strip clears the instant the turn is done (below).
+  // The activity strip is visible while any resident turn is in flight: operator
+  // turns (responding) or autonomous turns (working), but not after done.
+  // `workingSince` covers the optimistic-send period before the first lifecycle
+  // frame lands. `responding` drives the operator-waiting indicator; `working`
+  // drives the autonomous-advancing indicator — both show the strip.
   const strategicTurnWorking = conversationMode && (
-    workingSince != null || liveActivity.latestLifecycle === 'responding'
+    workingSince != null
+    || liveActivity.latestLifecycle === 'responding'
+    || liveActivity.latestLifecycle === 'working'
   ) && liveActivity.latestLifecycle !== 'done';
   // Render the operator's optimistic bubble until the durable copy lands — dedup
   // against any already-present user message with the same content so there is
@@ -879,6 +882,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     } satisfies ProjectMessage;
     return [...conversationMessages, optimisticMessage];
   }, [conversationMode, optimisticSend, conversationMessages, selectedProjectId]);
+  const starterPrompts = conversationMode && !loading && conversationMessages.length === 0 ? WORKDAY_STARTER_PROMPTS : null;
 
   // Clear the working state once a FRESH strategist reply lands (compare reply
   // COUNT to the baseline captured at send time — robust to client/server clock
@@ -964,6 +968,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         status: visibleTarget.status,
       });
       textareaRef.current?.focus();
+    } else if (targetMessage?.action === 'reply') {
+      addToastRef.current('Reply not primed: target must be an open Agent or Strategic message.', 'info');
     }
     onTargetMessageHandled?.();
   }, [
@@ -1016,7 +1022,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setShowTempMuteMenu(false);
   }
 
-  function getTop3NoisyEventTypes(): Array<[string, number]> {
+  const getTop3NoisyEventTypes = useCallback((): Array<[string, number]> => {
     if (routineOpen.length === 0) return [];
     const now = Date.now();
     const oneHourAgo = now - 3600000;
@@ -1028,7 +1034,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       }
     }
     return Object.entries(eventTypeCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
-  }
+  }, [routineOpen]);
 
   const activeView = useMemo(
     () => savedViews.find(v => v.id === activeViewId) ?? null,
@@ -1193,7 +1199,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     try {
       if (conversationMode) {
         const includeMessageId = getStrategicSessionIncludeMessageId(selectedProjectId, targetMessageId);
-        const session = await fetchStrategicSession(selectedProjectId, includeMessageId);
+        const result = await fetchStrategicConversation(selectedProjectId, includeMessageId);
         const currentIncludeMessageId = getStrategicSessionIncludeMessageId(
           selectedProjectIdRef.current,
           targetMessageIdRef.current,
@@ -1206,7 +1212,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           return;
         }
         lastStrategicSessionTargetFetchRef.current = includeMessageId;
-        const sessionMessages = session.conversation?.items ?? [];
+        const sessionMessages = result.conversation?.items ?? [];
         sessionMessages.forEach(m => seenMessageIdsRef.current.add(m.id));
         hasInitiallyLoadedRef.current = true;
         setMessages(prev => {
@@ -1324,18 +1330,39 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
 
+  // Record data-ready timing when initial load completes (once per surface entry)
+  const initialLoadDoneRef = useRef(false);
+  useEffect(() => {
+    if (loading || initialLoadDoneRef.current) return;
+    initialLoadDoneRef.current = true;
+    const ms = Math.round(performance.now());
+    const surface = (window.location.hash.replace(/^#\/?/, '').split('/')[0] || 'chat').slice(0, 64);
+    getIdToken().then(token => {
+      if (!token) return;
+      fetch('/api/admin/ui-load-timing', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ surface, page_ready_ms: ms, sample_type: 'data_ready' }),
+      }).catch(() => {});
+    }).catch(() => {});
+  }, [loading]);
+
   useEffect(() => {
     if (!realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;
     lastRealtimeRefreshSignalRef.current = realtimeRefreshSignal;
     void fetchMessages();
   }, [fetchMessages, realtimeRefreshSignal]);
 
-  // Auto-scroll to bottom only on initial load or when user sends a new message
-  // (new message = count increased AND user is near the bottom)
+  // Auto-scroll to bottom on initial load, when the operator sends their own
+  // message (optimistic send), or when a new message arrives while near bottom.
+  // Uses renderedConversationMessages (includes the optimistic bubble) so the
+  // operator's own just-sent message fires the scroll before the server round-trip.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const currentCount = conversationMode ? conversationMessages.length : highSignalOpen.length + routineOpen.length + visibleResolved.length;
+    const currentCount = conversationMode
+      ? renderedConversationMessages.length
+      : highSignalOpen.length + routineOpen.length + visibleResolved.length;
     if (conversationMode && targetMessageId) {
       prevMessageCountRef.current = currentCount;
       return;
@@ -1345,15 +1372,18 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // First load — jump to bottom instantly
       requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }));
     } else if (currentCount > prevMessageCountRef.current) {
-      // New message arrived — only scroll if user is already near bottom
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+      // Operator's own just-sent message (optimistic bubble) — always scroll.
+      // For incoming messages use a generous threshold (200 px) to absorb mobile
+      // viewport shifts from the on-screen keyboard opening/closing.
+      const alwaysScroll = conversationMode && optimisticSend != null;
+      const nearBottom = alwaysScroll || el.scrollHeight - el.scrollTop - el.clientHeight < 200;
       if (nearBottom) {
         requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }));
       }
     }
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
-  }, [conversationMode, conversationMessages.length, highSignalOpen, routineOpen, targetMessageId, visibleResolved]);
+  }, [conversationMode, renderedConversationMessages.length, highSignalOpen, routineOpen, targetMessageId, visibleResolved, optimisticSend]);
 
   // Keep the chat pinned to the live streaming preview as it grows — but only
   // when the operator is already near the bottom, so a deliberate scroll-up to
@@ -1604,7 +1634,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }
 
-  async function handleResolve(msgId: string, resolution: string) {
+  const handleResolve = useCallback(async (msgId: string, resolution: string) => {
     setResolvingId(null);
     setResolveInput('');
     try {
@@ -1616,22 +1646,22 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await fetchMessages();
     } catch {
-      addToast('Failed to resolve message', 'error');
+      addToastRef.current('Failed to resolve message', 'error');
     }
-  }
+  }, [fetchMessages]);
 
-  async function handleDelete(msgId: string) {
+  const handleDelete = useCallback(async (msgId: string) => {
     setDeletingIds(prev => new Set(prev).add(msgId));
     try {
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msgId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await fetchMessages();
     } catch {
-      addToast('Failed to delete message', 'error');
+      addToastRef.current('Failed to delete message', 'error');
     } finally {
       setDeletingIds(prev => { const next = new Set(prev); next.delete(msgId); return next; });
     }
-  }
+  }, [fetchMessages]);
 
   async function handleCreateDirection(msg: ProjectMessage, silent = false): Promise<boolean> {
     if (!selectedProjectId) return false;
@@ -1675,10 +1705,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }
 
-  function handleOpenConvertModal(msg: ProjectMessage) {
-    convertForm.seedFromMessage(msg.content);
+  const handleOpenConvertModal = useCallback((msg: ProjectMessage) => {
+    convertFormRef.current.seedFromMessage(msg.content);
     setPendingConvertMsg(msg);
-  }
+  }, []);
 
   async function handleSubmitConvertForm() {
     if (!selectedProjectId || !pendingConvertMsg || !convertForm.newText.trim()) return;
@@ -1729,7 +1759,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }
 
-  async function handleCreateInvestigation(msg: ProjectMessage): Promise<boolean> {
+  const handleCreateInvestigation = useCallback(async (msg: ProjectMessage): Promise<boolean> => {
     if (!selectedProjectId || !githubRepo) return false;
     setInvestigatingIds(prev => new Set(prev).add(msg.id));
     try {
@@ -1753,15 +1783,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         throw new Error(errData?.detail || errData?.error?.message || `HTTP ${res.status}`);
       }
       setInvestigatingId(null);
-      addToast('Investigation task created', 'success');
+      addToastRef.current('Investigation task created', 'success');
       return true;
     } catch (err) {
-      addToast(`Failed to create investigation: ${err instanceof Error ? err.message : 'Unknown error'}`, 'error');
+      addToastRef.current(`Failed to create investigation: ${err instanceof Error ? err.message : 'Unknown error'}`, 'error');
       return false;
     } finally {
       setInvestigatingIds(prev => { const next = new Set(prev); next.delete(msg.id); return next; });
     }
-  }
+  }, [selectedProjectId, githubRepo, defaultBranch]);
 
   const KEEP_RESOLVED = 20;
 
@@ -1788,13 +1818,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     await fetchMessages();
   }
 
-  function toggleSelect(msgId: string) {
+  const toggleSelect = useCallback((msgId: string) => {
     setSelectedIds(prev => {
       const next = new Set(prev);
       if (next.has(msgId)) next.delete(msgId); else next.add(msgId);
       return next;
     });
-  }
+  }, []);
 
   async function handleBatchCreateDirections() {
     const msgs = openFeedbackMessages.filter(m => selectedIds.has(m.id));
@@ -1826,7 +1856,22 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }
 
-  const bubbleProps = {
+  // Stable per-bubble handlers so `bubbleProps` keeps a stable identity across
+  // renders (see React.memo on MessageBubble). Setters/refs are stable, so most
+  // carry an empty dependency array; the rest depend only on their (already
+  // memoized) target handler.
+  const onCreateInvestigation = useCallback((msg: ProjectMessage) => { void handleCreateInvestigation(msg); }, [handleCreateInvestigation]);
+  const onDelete = useCallback((msgId: string) => { void handleDelete(msgId); }, [handleDelete]);
+  const onStartResolve = useCallback((msgId: string) => { setResolvingId(msgId); setResolveInput(''); }, []);
+  const onCancelResolve = useCallback(() => setResolvingId(null), []);
+  const onStartInvestigate = useCallback((msgId: string) => setInvestigatingId(msgId), []);
+  const onCancelInvestigate = useCallback(() => setInvestigatingId(null), []);
+  const onReply = useCallback((replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => {
+    setReplyTo(replyTo);
+    textareaRef.current?.focus();
+  }, []);
+
+  const bubbleProps = useMemo(() => ({
     actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
     resolvingId,
     resolveInput,
@@ -1838,21 +1883,41 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     selectedIds,
     onOpenTask,
     onToggleSelect: toggleSelect,
-    onCreateDirection: (msg: ProjectMessage) => { handleOpenConvertModal(msg); },
-    onCreateInvestigation: (msg: ProjectMessage) => { void handleCreateInvestigation(msg); },
+    onCreateDirection: handleOpenConvertModal,
+    onCreateInvestigation,
     onResolve: handleResolve,
-    onDelete: (msgId: string) => { void handleDelete(msgId); },
-    onStartResolve: (msgId: string) => { setResolvingId(msgId); setResolveInput(''); },
-    onCancelResolve: () => setResolvingId(null),
+    onDelete,
+    onStartResolve,
+    onCancelResolve,
     onSetResolveInput: setResolveInput,
-    onStartInvestigate: (msgId: string) => setInvestigatingId(msgId),
-    onCancelInvestigate: () => setInvestigatingId(null),
-    onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => {
-      setReplyTo(replyTo);
-      textareaRef.current?.focus();
-    },
+    onStartInvestigate,
+    onCancelInvestigate,
+    onReply,
     onOpenStrategicContext: conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined,
-  };
+  }), [
+    conversationMode,
+    resolvingId,
+    resolveInput,
+    deletingIds,
+    creatingDirectionIds,
+    investigatingId,
+    investigatingIds,
+    selectMode,
+    selectedIds,
+    onOpenTask,
+    toggleSelect,
+    handleOpenConvertModal,
+    onCreateInvestigation,
+    handleResolve,
+    onDelete,
+    onStartResolve,
+    onCancelResolve,
+    onStartInvestigate,
+    onCancelInvestigate,
+    onReply,
+    onOpenStrategicContextWorkspace,
+    onOpenStrategicContextCommands,
+  ]);
 
   return (
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
@@ -2069,16 +2134,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} text={streamingTurn.text} /> : null}
         activityStrip={strategicTurnWorking ? <StrategicActivityStrip items={liveActivity.items} /> : null}
         scrollRef={scrollRef}
-        blockersRefEl={blockersRefEl}
-        questionsRefEl={questionsRefEl}
-        routineRefEl={routineRefEl}
         dividerDismissedRef={dividerDismissedRef}
         messages={conversationMode ? renderedConversationMessages : messages}
         loading={loading}
         dividerTime={dividerTime}
         totalNewCount={totalNewCount}
         newMessageCounts={newMessageCounts}
-        highSignalOpen={highSignalOpen}
         routineOpen={routineOpen}
         linkedMessages={linkedMessages}
         pinnedBlockers={pinnedBlockers}
@@ -2182,6 +2243,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
+        starterPrompts={starterPrompts ?? undefined}
+        capabilityHint={starterPrompts ? WORKDAY_CAPABILITY_HINT : undefined}
+        onPickStarterPrompt={(value) => { setNewContent(value); saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); focusComposerTextarea(); }}
         chrome={conversationMode ? 'minimal' : 'full'}
         strategicContext={strategicComposerContext}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}

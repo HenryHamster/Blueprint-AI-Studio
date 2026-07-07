@@ -26,6 +26,14 @@ vi.mock('../api', () => ({
   patchAdminSettings: vi.fn(),
   setProjectPromotionEnabled: vi.fn(),
   clearDeployFailed: vi.fn(),
+  // VersionLifecyclePanel statically imports the acceptance-criteria actions;
+  // browser-mode ESM requires the mock factory to expose every named export the
+  // subtree imports or the linker fails at import time with "does not provide an
+  // export named '…'". These three were added with the acceptance-criteria
+  // attestation UI and must be mocked here.
+  attestAcceptanceCriterion: vi.fn(async () => ({ status: 'attested', criterion_key: 'k', coverage: 'covered' })),
+  linkCriteriaToDirection: vi.fn(async () => ({ status: 'ok', direction_key: 'd', criterion_keys: [] })),
+  reinstateAcceptanceCriterion: vi.fn(async () => ({ status: 'reinstated', criterion_key: 'k' })),
 }));
 
 const QUALIFYING_DATA: VersionLifecycleResponse = {
@@ -421,6 +429,78 @@ const SERVING_DISAGREE_DATA: VersionLifecycleResponse = {
   staged_directions: [],
 };
 
+// Regression coverage relocated from DashboardHome.viewport.test.tsx: the
+// version-lifecycle panel moved out of DashboardHome into its own nav tab
+// (#12985), so these audit/infra reason-chip assertions now live with the panel
+// that actually renders them.
+const AUDIT_MISSING_REASON_DATA: VersionLifecycleResponse = {
+  current_version: {
+    version_number: 42,
+    phase: 'stabilize',
+    phase_changed_at: '2026-05-20T12:00:00Z',
+    phase_reasoning: null,
+    goal: null,
+    opened_at: '2026-05-15T00:00:00Z',
+    qualification_attempts: 2,
+    merged_task_count: 15,
+    in_flight_task_count: 0,
+    active_candidate_sha: null,
+    qualification_state: null,
+    last_qualification: {
+      status: 'dry_run',
+      confidence: 0.78,
+      threshold: 0.8,
+      sub_scores: null,
+      ci_resolution: null,
+      blocker: 'audit below threshold',
+      finalized_at: '2026-05-20T11:00:00Z',
+      error: null,
+      consecutive_infra_errors: 0,
+      audit_missing_reason: 'parseable_but_unscoreable',
+      audit_reconciliation: null,
+    },
+    latest_audit: null,
+    audit_evidence_state: 'none',
+  },
+  recent_versions: [],
+  promotion_enabled: false,
+  staged_directions: [],
+};
+
+const INFRA_STREAK_DATA: VersionLifecycleResponse = {
+  current_version: {
+    version_number: 42,
+    phase: 'stabilize',
+    phase_changed_at: '2026-05-20T12:00:00Z',
+    phase_reasoning: null,
+    goal: null,
+    opened_at: '2026-05-15T00:00:00Z',
+    qualification_attempts: 2,
+    merged_task_count: 15,
+    in_flight_task_count: 0,
+    active_candidate_sha: null,
+    qualification_state: null,
+    last_qualification: {
+      status: 'infra_failure',
+      confidence: 0.78,
+      threshold: 0.8,
+      sub_scores: null,
+      ci_resolution: null,
+      blocker: null,
+      finalized_at: '2026-05-20T11:00:00Z',
+      error: 'release_audit heartbeat stale',
+      consecutive_infra_errors: 3,
+      audit_missing_reason: null,
+      audit_reconciliation: null,
+    },
+    latest_audit: null,
+    audit_evidence_state: 'none',
+  },
+  recent_versions: [],
+  promotion_enabled: false,
+  staged_directions: [],
+};
+
 describe('VersionLifecyclePanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -522,6 +602,23 @@ describe('VersionLifecyclePanel — viewport regression', () => {
     const badges = container.querySelectorAll('[data-testid="serving-disagree-badge"]');
     if (badges.length === 0) {
       throw new Error('Expected at least one serving-disagree-badge when aggregate and scalar serving statuses differ');
+    }
+  });
+
+  test('parseable-but-unscoreable audit reason renders a readable chip', async () => {
+    await makeRender(AUDIT_MISSING_REASON_DATA)();
+    if (!host?.textContent?.includes('audit findings present but missing severity tags')) {
+      throw new Error('Expected the parseable_but_unscoreable audit-missing-reason chip to render its readable label');
+    }
+  });
+
+  test('infra streak and error render as distinct chips', async () => {
+    await makeRender(INFRA_STREAK_DATA)();
+    if (!host?.textContent?.includes('3 consecutive infra failures')) {
+      throw new Error('Expected the consecutive-infra-failures streak chip to render');
+    }
+    if (!host?.textContent?.includes('release_audit heartbeat stale')) {
+      throw new Error('Expected the infra-failure error text to render distinctly from the streak chip');
     }
   });
 

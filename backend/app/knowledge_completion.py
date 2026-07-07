@@ -50,6 +50,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
+from app.direct_llm_client import DIRECT_LLM_MODEL, get_anthropic_api_key
+from app.inline_llm import call_inline_llm_json, resolve_inline_llm_settings
 from app.json_extract import _extract_json_object
 from app.schemas import sanitize_rpc_diagnostic
 from app.knowledge_query import (
@@ -1123,19 +1125,12 @@ async def _handle_knowledge_document_completion(
 # artifact-grounded document. Cited LLM analysis is an explicit optional upgrade.
 # ---------------------------------------------------------------------------
 
-# LLM analysis call shape — mirrors review_learning.categorize_review_issues_llm:
-# a locally-instantiated AsyncAnthropic client, an explicit model + timeout, a
-# small JSON-parse retry, gated behind ANTHROPIC_API_KEY and an opt-out flag.
-_COMPUTE_LLM_ANALYSIS_MODEL = "claude-haiku-4-5-20251001"
-_COMPUTE_LLM_ANALYSIS_TIMEOUT = 30.0
-_COMPUTE_LLM_ANALYSIS_MAX_TOKENS = 2000
 # Opt-out switch in the same spirit as DISABLE_LLM_REVIEW_CATEGORIZATION.
 _DISABLE_LLM_COMPUTE_ANALYSIS_ENV = "DISABLE_LLM_COMPUTE_ANALYSIS"
 # Bound any free text (log excerpt) folded into the prompt so a runaway command
 # log can never blow up the analysis prompt.
 _COMPUTE_LOG_TEXT_CAP = 4000
 _COMPUTE_MAX_CITATIONS = 20
-_COMPUTE_QA_MAX_TOKENS = 800
 
 
 def _enrich_per_arm_cost(
@@ -1841,27 +1836,6 @@ def _build_compute_analysis_prompt(
     )
 
 
-def _parse_compute_analysis_json(raw: str) -> dict[str, Any] | None:
-    """Best-effort parse of the LLM's JSON analysis (tolerates fenced output)."""
-    text = (raw or "").strip()
-    if text.startswith("```"):
-        # Strip a leading ```json / ``` fence and trailing fence.
-        text = re.sub(r"^```[a-zA-Z0-9]*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text).strip()
-    try:
-        obj = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end <= start:
-            return None
-        try:
-            obj = json.loads(text[start : end + 1])
-        except (json.JSONDecodeError, ValueError):
-            return None
-    return obj if isinstance(obj, dict) else None
-
-
 async def _call_compute_analysis_llm(
     api_key: str, prompt: str
 ) -> dict[str, Any] | None:
@@ -1871,37 +1845,14 @@ async def _call_compute_analysis_llm(
     error or any API failure. The explicit analysis caller reports that as
     unavailable; it never persists deterministic output as if it were analysis.
     """
-    for attempt in range(2):
-        try:
-            import anthropic as _anthropic
-
-            client = _anthropic.AsyncAnthropic(api_key=api_key)
-            resp = await client.messages.create(
-                model=_COMPUTE_LLM_ANALYSIS_MODEL,
-                max_tokens=_COMPUTE_LLM_ANALYSIS_MAX_TOKENS,
-                timeout=_COMPUTE_LLM_ANALYSIS_TIMEOUT,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = resp.content[0].text.strip()
-            data = _parse_compute_analysis_json(raw)
-            if not isinstance(data, dict) or not all(
-                k in data for k in ("title", "summary", "body")
-            ):
-                raise ValueError("analysis missing required keys")
-            return data
-        except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
-            if attempt == 0:
-                logger.info("[COMPUTE] analysis parse error %s, retrying once", exc)
-                continue
-            logger.info("[COMPUTE] analysis parse error on retry; analysis unavailable")
-            return None
-        except Exception as exc:  # noqa: BLE001 — any API error ⇒ unavailable
-            logger.info(
-                "[COMPUTE] analysis LLM call failed (%s); analysis unavailable",
-                exc,
-            )
-            return None
-    return None
+    data = await call_inline_llm_json(
+        "compute_analysis",
+        prompt,
+        required_keys=("title", "summary", "body"),
+    )
+    if data is None:
+        return None
+    return data
 
 
 async def _analyze_compute_experiment_with_llm(
@@ -1926,7 +1877,7 @@ async def _analyze_compute_experiment_with_llm(
     if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
         logger.info("[COMPUTE] LLM analysis disabled via env for task %s", task.id)
         return None, "analysis-disabled"
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = get_anthropic_api_key()
     if not api_key:
         logger.info(
             "[COMPUTE] LLM analysis skipped for task %s: ANTHROPIC_API_KEY not set "
@@ -1934,6 +1885,12 @@ async def _analyze_compute_experiment_with_llm(
             task.id,
         )
         return None, "precondition-not-met"
+    if resolve_inline_llm_settings("compute_analysis").disabled:
+        logger.info(
+            "[COMPUTE] LLM analysis disabled via runtime config for task %s",
+            task.id,
+        )
+        return None, "analysis-disabled"
 
     evidence = await _gather_compute_evidence(
         task,
@@ -1966,7 +1923,7 @@ def _ground_and_assemble_compute_analysis(
     evidence: dict[str, Any],
     fallback: dict[str, Any],
     *,
-    analysis_model: str = _COMPUTE_LLM_ANALYSIS_MODEL,
+    analysis_model: str = DIRECT_LLM_MODEL,
     execution: str = "backend",
 ) -> tuple[dict[str, Any] | None, str]:
     """Ground a produced analysis document and assemble the upgrade payload.
@@ -2699,8 +2656,12 @@ async def answer_compute_experiment_question(
     grounding_miss, and fallback_reason. Declines honestly when evidence is insufficient
     or the LLM is unavailable. Never persists any data — purely ephemeral Q&A.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1" or not api_key:
+    api_key = get_anthropic_api_key()
+    if (
+        os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1"
+        or not api_key
+        or resolve_inline_llm_settings("compute_qa").disabled
+    ):
         return _qa_unavailable("llm-disabled")
     evidence = await _gather_compute_evidence(
         task,
@@ -2730,59 +2691,40 @@ async def answer_compute_experiment_question(
         history=bounded_history,
     )
     allowed_set = set(evidence.get("citations", []))
-    for attempt in range(2):
-        try:
-            import anthropic as _anthropic
-
-            client = _anthropic.AsyncAnthropic(api_key=api_key)
-            resp = await client.messages.create(
-                model=_COMPUTE_LLM_ANALYSIS_MODEL,
-                max_tokens=_COMPUTE_QA_MAX_TOKENS,
-                timeout=_COMPUTE_LLM_ANALYSIS_TIMEOUT,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = resp.content[0].text.strip()
-            data = _parse_compute_analysis_json(raw)
-            if not isinstance(data, dict) or "answer" not in data:
-                raise ValueError("QA response missing 'answer'")
-            raw_cits = data.get("citations") or []
-            grounded_cits = [
-                c.strip()
-                for c in raw_cits
-                if isinstance(c, str) and c.strip() in allowed_set
-            ][:_COMPUTE_MAX_CITATIONS]
-            unresolved_cits = [
-                c.strip()
-                for c in raw_cits
-                if isinstance(c, str) and c.strip() not in allowed_set
-            ]
-            real_evidence_set = set(evidence.get("real_evidence", []))
-            durable_cits = [
-                c for c in grounded_cits if c in real_evidence_set
-            ]
-            grounding_stamp = {
-                "checked": True,
-                "file_citations": len(raw_cits),
-                "grounded": len(durable_cits),
-                "unresolved": unresolved_cits,
-            }
-            miss_reason = None if durable_cits else "no-grounded-citations"
-            return {
-                "answer": str(data["answer"])[:4000],
-                "citations": durable_cits,
-                "grounding": grounding_stamp,
-                "grounding_miss": miss_reason is not None,
-                "fallback_reason": miss_reason,
-            }
-        except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
-            if attempt == 0:
-                logger.info("[COMPUTE] QA parse error %s, retrying", exc)
-                continue
-            break
-        except Exception as exc:  # noqa: BLE001
-            logger.info("[COMPUTE] QA LLM call failed (%s)", exc)
-            break
-    return _qa_unavailable("llm-error")
+    data = await call_inline_llm_json(
+        "compute_qa",
+        prompt,
+        required_keys=("answer",),
+    )
+    if data is None:
+        return _qa_unavailable("llm-error")
+    raw_cits = data.get("citations") or []
+    grounded_cits = [
+        c.strip()
+        for c in raw_cits
+        if isinstance(c, str) and c.strip() in allowed_set
+    ][:_COMPUTE_MAX_CITATIONS]
+    unresolved_cits = [
+        c.strip()
+        for c in raw_cits
+        if isinstance(c, str) and c.strip() not in allowed_set
+    ]
+    real_evidence_set = set(evidence.get("real_evidence", []))
+    durable_cits = [c for c in grounded_cits if c in real_evidence_set]
+    grounding_stamp = {
+        "checked": True,
+        "file_citations": len(raw_cits),
+        "grounded": len(durable_cits),
+        "unresolved": unresolved_cits,
+    }
+    miss_reason = None if durable_cits else "no-grounded-citations"
+    return {
+        "answer": str(data["answer"])[:4000],
+        "citations": durable_cits,
+        "grounding": grounding_stamp,
+        "grounding_miss": miss_reason is not None,
+        "fallback_reason": miss_reason,
+    }
 
 
 async def _handle_web_research_completion(
@@ -2830,14 +2772,24 @@ def _build_research_audit_document(
     base_tags = [str(t) for t in raw_tags[:28]] if isinstance(raw_tags, list) else []
     tags = list(dict.fromkeys([*base_tags, "research_audit"]))[:30]
 
-    title_parts = [f"Research audit: {str(topic)[:200]}"]
-    title = title_parts[0][:500]
+    _FALLBACK_TOPIC = "Research audit"
+    topic_str = str(topic)[:200]
+    if topic_str == _FALLBACK_TOPIC:
+        title = _FALLBACK_TOPIC
+    else:
+        title = f"Research audit: {topic_str}"[:500]
 
     summary_parts: list[str] = []
     if findings:
-        summary_parts.append(f"{len(findings)} finding(s) recorded.")
+        n = len(findings)
+        leading_titles = [
+            str(f.get("title") or f"Finding {i + 1}").strip()[:80]
+            for i, f in enumerate(findings[:3])
+        ]
+        title_text = "; ".join(leading_titles)
+        summary_parts.append(f"{n} finding(s): {title_text}.")
     if insights:
-        summary_parts.append(f"{len(insights)} insight(s) recorded.")
+        summary_parts.append(f"{len(insights)} insight(s).")
     summary = " ".join(summary_parts) or "Research audit report."
 
     body_lines = [f"# Research audit: {topic}", ""]

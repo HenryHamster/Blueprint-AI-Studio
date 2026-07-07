@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Archive, ArrowDownUp, ChevronLeft, ChevronRight, GripVertical } from 'lucide-react';
+import { ConfirmDialog } from './ConfirmDialog';
 import {
   SortableContext,
   useSortable,
@@ -227,6 +228,7 @@ export function ColumnArchiveButton({
 }) {
   const [confirming, setConfirming] = useState(false);
   const [countdown, setCountdown] = useState(4);
+  const [showConfirmDialog, setShowConfirmDialog] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -243,7 +245,10 @@ export function ColumnArchiveButton({
       if (intervalRef.current) clearInterval(intervalRef.current);
       setConfirming(false);
       setCountdown(4);
-      if (taskIds.length > 10 && !window.confirm(`Archive all ${taskIds.length} ${columnLabel} tasks? This cannot be undone.`)) return;
+      if (taskIds.length > 10) {
+        setShowConfirmDialog(true);
+        return;
+      }
       onArchiveColumn(taskIds, columnLabel);
     } else {
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
@@ -268,14 +273,25 @@ export function ColumnArchiveButton({
     : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50';
 
   return (
-    <button
-      data-viewport-allow-small-target
-      onClick={handleClick}
-      title={confirming ? `Archive ${taskIds.length} tasks? (${countdown}s)` : `Archive all ${columnLabel} tasks`}
-      className={`p-1 rounded transition-colors ${stateClass}${extraClassName ? ` ${extraClassName}` : ''}`}
-    >
-      <Archive className="w-3.5 h-3.5" />
-    </button>
+    <>
+      <button
+        data-viewport-allow-small-target
+        onClick={handleClick}
+        title={confirming ? `Archive ${taskIds.length} tasks? (${countdown}s)` : `Archive all ${columnLabel} tasks`}
+        className={`p-1 rounded transition-colors ${stateClass}${extraClassName ? ` ${extraClassName}` : ''}`}
+      >
+        <Archive className="w-3.5 h-3.5" />
+      </button>
+      {showConfirmDialog && (
+        <ConfirmDialog
+          title="Archive tasks"
+          message={`Archive all ${taskIds.length} ${columnLabel} tasks? This cannot be undone.`}
+          confirmLabel="Archive all"
+          onConfirm={() => { setShowConfirmDialog(false); onArchiveColumn(taskIds, columnLabel); }}
+          onCancel={() => setShowConfirmDialog(false)}
+        />
+      )}
+    </>
   );
 }
 

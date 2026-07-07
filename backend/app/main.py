@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, Callable
 from fastapi import (
     FastAPI,
     Depends,
@@ -28,6 +28,8 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 from slowapi.errors import RateLimitExceeded
 from app.csrf import CSRFMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,6 +61,7 @@ from app.routers.agent_github import router as agent_github_router
 from app.routers.agent_ci_compliance import router as agent_ci_compliance_router
 from app.routers.agent_strategic_fetch import router as agent_strategic_fetch_router
 from app.routers.agent_strategic_messages import router as agent_strategic_messages_router
+from app.routers.agent_tasks import router as agent_tasks_router
 from app.strategic_resident_session import router as strategic_resident_session_router
 from app.routers.agent_warm_continuity import router as agent_warm_continuity_router
 from app.efficiency_snapshot import agent_router as efficiency_snapshot_agent_router
@@ -88,6 +91,7 @@ from app.routers.admin_onboard import router as admin_onboard_router
 from app.routers.admin_agent_ops import router as admin_agent_ops_router
 from app.routers.admin_agent_ops import _bump_size_limit  # noqa: F401  re-exported for test patches (test_agent_annotate.py)
 from app.routers.admin_acceptance_criteria import router as admin_acceptance_criteria_router
+from app.routers.admin_direction_events import router as admin_direction_events_router
 from app.routers.admin_state import router as admin_state_router
 from app.routers.admin_operator_attention import router as admin_operator_attention_router
 from app.shared_state import limiter
@@ -102,7 +106,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0367"
+EXPECTED_SCHEMA_REVISION = "0410"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -774,6 +778,46 @@ from app.alert_dispatch import (  # noqa: F401  re-exported for back-compat (cal
 )
 
 
+class RequestDurationMiddleware(BaseHTTPMiddleware):
+    """Middleware to measure admin API request duration and add Server-Timing headers.
+
+    Tracks backend processing time for each request, adds Server-Timing header,
+    and logs requests exceeding the slow-request threshold.
+    """
+
+    SLOW_REQUEST_THRESHOLD_MS = 500  # Log requests slower than 500ms
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        # Only measure admin/debug API endpoints
+        path = request.url.path
+        is_admin_endpoint = path.startswith("/api/admin/") or path.startswith(
+            "/api/debug/"
+        )
+        if not is_admin_endpoint:
+            return await call_next(request)
+
+        start_time = time.monotonic()
+        response = await call_next(request)
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+
+        # Add Server-Timing header with backend duration
+        response.headers["Server-Timing"] = f"backend;dur={elapsed_ms:.1f}"
+
+        # Log slow requests with route template and duration
+        if elapsed_ms > self.SLOW_REQUEST_THRESHOLD_MS:
+            logger.warning(
+                "[ADMIN_PERF] slow request",
+                extra={
+                    "route": path,
+                    "method": request.method,
+                    "duration_ms": round(elapsed_ms, 1),
+                    "status": response.status_code,
+                },
+            )
+
+        return response
+
+
 app = FastAPI(
     title="Blueprint Orchestrator",
     description="Secure Orchestration & State Management",
@@ -797,6 +841,7 @@ app.include_router(agent_github_router)
 app.include_router(agent_ci_compliance_router)
 app.include_router(agent_strategic_fetch_router)
 app.include_router(agent_strategic_messages_router)
+app.include_router(agent_tasks_router)
 app.include_router(strategic_resident_session_router)
 app.include_router(agent_warm_continuity_router)
 app.include_router(github_router)
@@ -820,6 +865,7 @@ app.include_router(agent_status_router)
 app.include_router(agent_credentials_router)
 app.include_router(agent_compute_jobs_router)
 app.include_router(admin_compute_jobs_router)
+app.include_router(admin_direction_events_router)
 app.include_router(admin_onboard_router)
 app.include_router(admin_agent_ops_router)
 
@@ -1170,6 +1216,12 @@ async def health_detailed(
     # the caches are earning their keep.  See github.py:get_check_runs_cached,
     # security.py:scan_pr_for_injection, rollup_management.py:_verify_pr_merged.
     _cache_hits = dict(_shared_state.github_cache_hits)
+    # Top 10 consumers by call count this window.
+    _top_consumers = sorted(
+        _shared_state.github_consumer_counts.items(),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )[:10]
     components["github_quota"] = {
         **gq,
         "status": _q_status,
@@ -1177,6 +1229,11 @@ async def health_detailed(
         "total_calls_this_window": sum(_shared_state.github_call_counts.values()),
         "cache_hits_this_window": _cache_hits,
         "calls_avoided_this_window": sum(_cache_hits.values()),
+        "consumer_counts": [{"consumer": c, "count": n} for c, n in _top_consumers],
+        "consumer_snapshot": dict(_shared_state.github_consumer_counts_snapshot),
+        "off_backend_burn_estimate": _shared_state.github_off_backend_estimate.get(
+            "cumulative_this_window", 0
+        ),
     }
 
     # --- Pipeline Health (rolling reaper signals) ---
@@ -1867,6 +1924,8 @@ app.add_middleware(
         "X-CSRF-Token",
     ],
 )
+
+app.add_middleware(RequestDurationMiddleware)
 
 
 @app.get("/")

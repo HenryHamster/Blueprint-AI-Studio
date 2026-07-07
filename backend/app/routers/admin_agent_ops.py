@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func as _func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -26,14 +27,22 @@ from app.capability_trial_verdict import (
     carry_adoption_verdicts_for_consolidation,
     record_trial_verdict,
 )
+from app.direction_referential_guard import build_retired_direction_grounding
 from app.database import get_session
+from app.knowledge_query import fetch_retirement_memo
 from app.strategic_events import (
     STRATEGIC_KIND_DIRECTIONS,
     STRATEGIC_KIND_PROBLEM_MODEL,
     STRATEGIC_KIND_RUNNING_UPDATE,
     emit_strategic_updated,
 )
-from app.direction_lifecycle import _reset_outcome_detection_state
+from app.direction_lifecycle import (
+    _reset_outcome_detection_state,
+    apply_churn_retirement_keep,
+    apply_churn_retirement_retire,
+    direction_has_churn_retirement_recommendation,
+    reactivate_paused_direction,
+)
 from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
@@ -54,6 +63,7 @@ from app.source_ref_validation import (
     ground_design_doc_value,
     resolve_branch_verification_context as _resolve_branch_verification_context,
 )
+from app.direction_grounding import validate_create_direction_grounding
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     limiter,
@@ -66,8 +76,10 @@ from app.strategic_completion import (
     _normalize_recommended_mode,
     _reset_scaffolding_state_on_outcome_change,
     _spawn_retirement_memos,
+    record_retired_direction_memory,
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
     challenge_approves_retirement,
+    find_gap_respawn_match,
     spawn_budget_status,
     spawn_title_is_redundant,
     strategic_retirement_challenge_gate_mode,
@@ -90,7 +102,9 @@ from app.auth import require_admin
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
     lock_project_or_429 as _lock_project_or_429,
+    task_lock,
     with_directions_locked as _with_directions_locked,
+    with_vision_locked as _with_vision_locked,
 )
 from app.time_utils import _utcnow
 
@@ -98,12 +112,56 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
+# Keys in project.design_doc that are owned by the playbook system or reserved
+# for internal orchestration. These are excluded from design-doc list responses
+# and rejected by set/delete operations (use /api/agent/playbook instead).
+_RESERVED_DESIGN_DOC_KEYS = frozenset(
+    {
+        "playbook_archive",
+        "proposed_changes",
+        "lane_baselines",
+        "module_feedback",
+        "sr_catch_rate_trends",
+        "efficiency_baseline",
+        "retired_diagnoses_archive",
+    }
+)
+
 # Mixed surface marker: this module deliberately hosts both /api/admin and
 # /api/agent routes. The route-table invariant in backend/testing/test_invariants.py
 # uses this marker to include the sibling /api/agent endpoints in the same
 # auth scan as the admin routes.
 ADMIN_AGENT_OPS_MODULE = __name__
 STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES = 50_000
+
+# Canonical set of strategic ops the agent script advertises and dispatches.
+# Derived from the same inventory as the agent-side STRATEGIC_OP_INVENTORY
+# (agent/src/handlers/strategic-op-inventory.ts). The parity test in
+# backend/testing/test_admin_routers.py asserts every name here has a real
+# elif handler in this module, so adding an op to the inventory and forgetting
+# the backend handler produces a CI failure rather than a silent no-op.
+STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
+    "set_problem_model",
+    "set_running_update",
+    "reflect",
+    "pending_confirm",
+    "set_vision",
+    "create_direction",
+    "update_direction",
+    "retire_direction",
+    "stage_direction",
+    "approve_direction",
+    "reject_direction",
+    "create_message",
+    "resolve_message",
+    "spawn_task",
+    "spawn_fix",
+    "dispose_completion_debt",
+    "set_retirement_critiques",
+    "set_evidence_progress",
+    "set_acceptance_criteria",
+    "record_finding_resolution",
+})
 
 
 def _cap_str(
@@ -175,7 +233,15 @@ async def update_design_doc(
     if payload.op == "list":
         project = await session.get(Project, task.project_id)
         doc = project.design_doc or {} if project else {}
-        return {"keys": [k for k in doc if not k.startswith("_")]}
+        return {
+            "keys": [
+                k
+                for k in doc
+                if not k.startswith("_")
+                and not k.startswith("playbook/")
+                and k not in _RESERVED_DESIGN_DOC_KEYS
+            ]
+        }
 
     if payload.op == "get":
         project = await session.get(Project, task.project_id)
@@ -207,6 +273,11 @@ async def update_design_doc(
     if not key or len(key) > 100 or key.startswith("_"):
         raise HTTPException(
             status_code=400, detail="Invalid key (max 100 chars, no _ prefix)"
+        )
+    if key.startswith("playbook/") or key in _RESERVED_DESIGN_DOC_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Key '{key}' is reserved. Use the /api/agent/playbook endpoint for playbook/* keys.",
         )
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
@@ -652,11 +723,53 @@ async def agent_annotate(
     return response
 
 
+async def _maybe_link_task_to_debt(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    debt_id: Any,
+    task_id: uuid.UUID,
+) -> str | None:
+    """Best-effort link a freshly-spawned task to an open completion-debt row.
+
+    Returns the debt id (str) on success, ``None`` when no debt_id was supplied
+    or linkage failed. Linkage is a convenience forward-pointer and must NEVER
+    fail the spawn that already committed, so all errors (unknown/closed debt,
+    ledger write failure) are swallowed after rolling back the linkage attempt.
+    """
+    if not debt_id:
+        return None
+    from app.completion_debt import link_task_to_debt as _link_task_to_debt
+
+    try:
+        await _link_task_to_debt(
+            session,
+            debt_id,
+            project_id=project_id,
+            task_id=task_id,
+            note="spawned by strategist",
+        )
+        await session.commit()
+        return str(debt_id)
+    except Exception:  # noqa: BLE001 — best-effort; spawn already committed
+        await session.rollback()
+        logger.warning(
+            "[STRATEGIC API] link_task_to_debt failed (debt_id=%s task=%s) — non-fatal",
+            debt_id,
+            task_id,
+            exc_info=True,
+        )
+        return None
+
+
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge", "set_acceptance_criteria"
+    # The accepted op vocabulary is the canonical registry mirrored in
+    # app/strategic_ops_manifest.json (single source of truth for the ./strategic
+    # CLI, the resident prompt, and this dispatch chain). test_strategic_ops_registry.py
+    # asserts the dispatch below accepts EXACTLY the manifest's op names.
+    op: str
     data: Any = {}
 
 
@@ -672,14 +785,15 @@ async def strategic_operation(
     if str(payload.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
     # Message ops (create/resolve) are available to all agent types.
-    # Direction/vision ops are restricted to strategic_review only.
+    # Direction/vision ops are restricted to strategic task types.
     MESSAGE_OPS = ("create_message", "resolve_message")
-    if payload.op not in MESSAGE_OPS and token.get("task_type") not in (
-        "strategic_review",
+    if (
+        payload.op not in MESSAGE_OPS
+        and token.get("task_type") not in STRATEGIC_TASK_TYPES
     ):
         raise HTTPException(
             status_code=403,
-            detail="Only strategic_review agents can modify directions/vision",
+            detail="Only strategic agents can modify directions/vision",
         )
 
     task = await session.get(Task, payload.task_id)
@@ -688,6 +802,32 @@ async def strategic_operation(
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
     project = await _lock_project_or_429(session, task.project_id)
+
+    # Re-acquire the task row FRESH under FOR UPDATE now that we hold the project
+    # lock (canonical Project→Task order — see task_locking.lock_project_then_task).
+    # ``task`` was loaded above WITHOUT a lock and BEFORE the project lock, so its
+    # in-memory ``context`` can be stale relative to a concurrent whole-column
+    # writer — specifically the resident-session heartbeat mirror in
+    # ``strategic_resident_session.renew_resident_session_lease``, which stamps
+    # durable restart keys (``_exam_ledger`` / ``message_cursor``). Every
+    # ``task.context = {**ctx, ...}`` read-modify-write in this endpoint would
+    # otherwise overwrite the whole column from that stale read and drop the
+    # heartbeat's keys (lost update), and vice versa. Re-reading FOR UPDATE with
+    # populate_existing refreshes the SHARED Task object with the current
+    # committed context and holds the row until this request commits, so all
+    # downstream context RMWs are serialized and race-free. Since we already hold
+    # the project lock, no Project→Task writer can be holding this task lock; a
+    # None here means a non-project task-locker (dispatch/reaper) holds it —
+    # surface a retryable 429 (matching the project 429 contract) rather than
+    # block on the 30s lock_timeout and risk a Cloud Run container-fault.
+    async with task_lock(session, task.id, skip_locked=True) as _locked_task:
+        if _locked_task is None:
+            raise HTTPException(
+                status_code=429,
+                detail="Task row locked by concurrent write, retry",
+                headers={"Retry-After": "2"},
+            )
+        task = _locked_task
 
     data = payload.data
     warnings: List[str] = []
@@ -898,6 +1038,52 @@ async def strategic_operation(
                 matched.get("status"),
                 project.id,
             )
+        retired_memory = list((project.vision or {}).get("_recently_retired_directions") or [])
+        retired_grounding: dict[str, Any] | None = None
+        _ret_match_raw = find_gap_respawn_match(
+            text,
+            str(data.get("gap_id") or "") or None,
+            retired_memory,
+            cooldown_days=90,
+        )
+        if _ret_match_raw is not None:
+            retired_match, retired_match_kind = _ret_match_raw
+            retirement_memo = None
+            retired_direction_id = str(retired_match.get("id") or "")
+            if retired_direction_id:
+                try:
+                    retirement_memo = await fetch_retirement_memo(
+                        session,
+                        project.id,
+                        retired_direction_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "[STRATEGIC] API path: failed to fetch retirement memo for recently-retired "
+                        "direction %s on project %s",
+                        retired_direction_id,
+                        project.id,
+                        exc_info=True,
+                    )
+            retired_grounding = build_retired_direction_grounding(
+                retired_match,
+                retirement_memo,
+            )
+            logger.info(
+                "[STRATEGIC] API path: direction '%s' matches recently-retired '%s' "
+                "(prior_outcome=%s, match=%s, memo=%s) — creating anyway (advisory; agent-owned set); "
+                "project=%s",
+                text[:60],
+                (retired_match.get("text") or retired_direction_id)[:60],
+                retired_grounding.get("classification"),
+                retired_match_kind,
+                (
+                    retired_grounding.get("retirement_memo", {}).get("knowledge_doc_id")
+                    if isinstance(retired_grounding.get("retirement_memo"), dict)
+                    else "none"
+                ),
+                project.id,
+            )
         success_evidence = str(data.get("success_evidence", "")).strip()
         retirement_condition = str(data.get("retirement_condition", "")).strip()
         if not success_evidence or not retirement_condition:
@@ -1028,6 +1214,11 @@ async def strategic_operation(
                 dr["distinction"] = distinction[:_DIR_FIELD_MAX]
             if dr:
                 new_dir["context"]["dedup_reasoning"] = dr
+                new_dir["context"]["grounding_verdict"] = validate_create_direction_grounding(
+                    dr,
+                    directions,
+                    (project.vision or {}).get("_recently_retired_directions") or [],
+                )
         if data.get("system_id"):
             new_dir["system_id"] = _cap_str(
                 data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings
@@ -1036,7 +1227,15 @@ async def strategic_operation(
         # direction back to the problem-model gap it works on. Optional and
         # string-cast; additive on the JSONB direction dict (no migration).
         if data.get("gap_id"):
-            new_dir["gap_id"] = str(data["gap_id"])
+            _gid = str(data["gap_id"])
+            from app.problem_model import check_gap_id_write
+            _gap_err, _open_ids = check_gap_id_write(_gid, project.problem_model)
+            if _gap_err:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "gap_link_invalid", "reason": _gap_err, "open_gap_ids": _open_ids},
+                )
+            new_dir["gap_id"] = _gid
         if data.get("paths"):
             new_dir["paths"] = data["paths"]
         if data.get("category") and data["category"] in ("product", "structural"):
@@ -1070,16 +1269,38 @@ async def strategic_operation(
         # gap: add it to active_moves and clear any now-false deferral. Mirrors
         # the retire-side reconciliation but in the staffing direction.
         if new_dir.get("gap_id") and not staged_create:
-            from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
 
-            _reconciled_pm = reconcile_gap_staffing_raw(
-                project.problem_model, new_dir["id"], new_dir["gap_id"], None
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                new_dir["id"],
+                new_dir["gap_id"],
+                None,
+                new_status=new_dir.get("status"),
+                now_iso=_utcnow().isoformat(),
             )
-            if _reconciled_pm is not None:
-                project.problem_model = _reconciled_pm
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
                 flag_modified(project, "problem_model")
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] create_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
+        _captured_new_dir = new_dir
+        await _with_directions_locked(
+            session,
+            project.id,
+            lambda fresh: (
+                [*fresh, _captured_new_dir]
+                if not any(d.get("id") == _captured_new_dir["id"] for d in fresh)
+                else fresh
+            ),
+        )
         ctx = task.context or {}
         created_ids = list(ctx.get("_strategic_created_ids", []))
         created_ids.append(new_dir["id"])
@@ -1114,7 +1335,10 @@ async def strategic_operation(
             "status": "ok",
             "op": "create_direction",
             "direction_id": new_dir["id"],
+            "grounding_verdict": new_dir.get("context", {}).get("grounding_verdict"),
         }
+        if retired_grounding:
+            resp_body["retired_grounding"] = retired_grounding
         if staged_create:
             resp_body["staged_for_version"] = staged_for_version
         return _resp(resp_body)
@@ -1122,10 +1346,12 @@ async def strategic_operation(
     elif payload.op == "update_direction":
         dir_id = data.get("direction_id")
         changes = data.get("changes", {})
+        raw_dedup_reasoning = data.get("dedup_reasoning")
         if not dir_id or not changes:
             raise HTTPException(
                 status_code=400, detail="direction_id and changes required"
             )
+        now_iso = _utcnow().isoformat()
         rationale = _cap_str(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
@@ -1141,12 +1367,19 @@ async def strategic_operation(
         # any change is applied so a gap_id change can prune the old gap. Holds
         # ``(new_gap_id, prior_gap_id)`` once a gap_id change is observed.
         _gap_reground: tuple[str | None, str | None] | None = None
+        _pre_status: str | None = None
+        retired_memory = list((project.vision or {}).get("_recently_retired_directions") or [])
+        # Set to the terminal status ("expired"/"superseded") when this update
+        # flips the direction INTO a terminal state from a non-terminal one, so
+        # retired-direction memory is recorded exactly once after the loop.
+        _terminal_flip: str | None = None
         for d in directions:
             if d.get("id") == dir_id:
                 _pre_text = d.get("text")
                 _pre_se = (d.get("context") or {}).get("success_evidence")
                 _pre_rc = (d.get("context") or {}).get("retirement_condition")
                 _pre_gap_id = d.get("gap_id")
+                _pre_status = d.get("status")
                 if "text" in changes:
                     d["text"] = _cap_str(
                         changes["text"],
@@ -1177,23 +1410,30 @@ async def strategic_operation(
                     "expired",
                     "superseded",
                 ):
-                    if (
-                        changes["status"] == "active"
-                        and d.get("status") == "paused"
-                        and not d.get("auto_paused")
-                    ):
-                        ctx = task.context or {}
-                        task.context = {**ctx, "_strategic_api_called": True}
-                        flag_modified(task, "context")
-                        session.add(task)
-                        await session.commit()
-                        return _resp(
-                            {
-                                "status": "blocked",
-                                "reason": "Cannot reactivate user-paused direction",
-                            }
-                        )
-                    d["status"] = changes["status"]
+                    if changes["status"] == "active":
+                        # Route reactivation through the shared seam: clears pause
+                        # residue and stamps the auto_recovered_at grace marker when
+                        # resuming from paused, so frozen research_history cannot
+                        # immediately re-pause/zombie-retire the direction. The
+                        # autonomous strategist may NOT resume a user-paused
+                        # direction (allow_user_paused=False) → returns False and we
+                        # emit the existing blocked response.
+                        if not reactivate_paused_direction(
+                            d, allow_user_paused=False
+                        ):
+                            ctx = task.context or {}
+                            task.context = {**ctx, "_strategic_api_called": True}
+                            flag_modified(task, "context")
+                            session.add(task)
+                            await session.commit()
+                            return _resp(
+                                {
+                                    "status": "blocked",
+                                    "reason": "Cannot reactivate user-paused direction",
+                                }
+                            )
+                    else:
+                        d["status"] = changes["status"]
                     if changes["status"] == "superseded":
                         d["completed_at"] = _utcnow().isoformat()
                         superseded_by = changes.get("superseded_by")
@@ -1211,6 +1451,11 @@ async def strategic_operation(
                                 }
                         if superseded_by:
                             d["superseded_by"] = superseded_by
+                    if changes["status"] in (
+                        "expired",
+                        "superseded",
+                    ) and _pre_status not in ("expired", "superseded"):
+                        _terminal_flip = changes["status"]
                 if "recommended_mode" in changes:
                     mode = _normalize_recommended_mode(changes["recommended_mode"])
                     if mode is not None:
@@ -1220,7 +1465,15 @@ async def strategic_operation(
                 if "gap_id" in changes:
                     gid = changes["gap_id"]
                     if gid:
-                        d["gap_id"] = str(gid)
+                        _gid = str(gid)
+                        from app.problem_model import check_gap_id_write
+                        _gap_err, _open_ids = check_gap_id_write(_gid, project.problem_model)
+                        if _gap_err:
+                            raise HTTPException(
+                                status_code=400,
+                                detail={"error": "gap_link_invalid", "reason": _gap_err, "open_gap_ids": _open_ids},
+                            )
+                        d["gap_id"] = _gid
                     else:
                         d.pop("gap_id", None)
                     _gap_reground = (d.get("gap_id"), _pre_gap_id)
@@ -1291,6 +1544,21 @@ async def strategic_operation(
                     d["notes"] = _cap_list(
                         notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
                     )
+                if isinstance(raw_dedup_reasoning, dict):
+                    dr: dict = {}
+                    closest = raw_dedup_reasoning.get("closest_directions")
+                    if isinstance(closest, list):
+                        dr["closest_directions"] = closest[:3]
+                    distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
+                    if distinction:
+                        dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+                    if dr:
+                        ctx = dict(d.get("context") or {})
+                        ctx["dedup_reasoning"] = dr
+                        ctx["grounding_verdict"] = validate_create_direction_grounding(
+                            dr, directions, retired_memory
+                        )
+                        d["context"] = ctx
                 if (
                     d.get("text") != _pre_text
                     or (d.get("context") or {}).get("success_evidence") != _pre_se
@@ -1301,22 +1569,77 @@ async def strategic_operation(
                 break
         if not updated:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
-        # Re-ground reconciliation, in the same locked transaction: when the
-        # direction's gap_id changed, stage the new gap (active_moves + clear
-        # deferral) and prune the old one. Mirrors create_direction and the
-        # retire-side reconciliation.
-        if _gap_reground is not None:
-            from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
+        _updated_dir = next((x for x in directions if x.get("id") == dir_id), None)
+        _new_status = _updated_dir.get("status") if _updated_dir else None
+        if _updated_dir is not None and (
+            _gap_reground is not None or _new_status != _pre_status
+        ):
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
 
-            _new_gap_id, _prior_gap_id = _gap_reground
-            _reconciled_pm = reconcile_gap_staffing_raw(
-                project.problem_model, str(dir_id), _new_gap_id, _prior_gap_id
+            _new_gap_id = _updated_dir.get("gap_id")
+            _prior_gap_id = (
+                _gap_reground[1]
+                if _gap_reground is not None
+                else _updated_dir.get("gap_id")
             )
-            if _reconciled_pm is not None:
-                project.problem_model = _reconciled_pm
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                str(dir_id),
+                _new_gap_id,
+                _prior_gap_id,
+                new_status=_new_status,
+                prior_status=_pre_status,
+                now_iso=now_iso,
+            )
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
                 flag_modified(project, "problem_model")
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] update_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
+        # Record retired-direction memory when this update flipped the direction
+        # into a terminal state, in the SAME committed transaction (mirrors the
+        # retire_direction op). Only fires on a real non-terminal->terminal
+        # transition, so repeated updates or already-terminal directions record
+        # nothing.
+        if _terminal_flip and _updated_dir is not None:
+            if _terminal_flip == "superseded":
+                _term_reason = "strategic_superseded"
+                _sb = _updated_dir.get("superseded_by")
+                _succ = (
+                    _sb.get("direction_id") if isinstance(_sb, dict) else None
+                )
+                _term_outcome = f"superseded by {_succ}" if _succ else None
+            else:
+                _term_reason = "strategic_expired"
+                _term_outcome = rationale or None
+            _term_snapshot = dict(_updated_dir)
+
+            def _record_terminal_memory(vision: dict) -> None:
+                record_retired_direction_memory(
+                    vision,
+                    _term_snapshot,
+                    reason=_term_reason,
+                    outcome=_term_outcome,
+                )
+
+            await _with_vision_locked(session, project.id, _record_terminal_memory)
+        _captured_updated_dir = dict(_updated_dir) if _updated_dir is not None else None
+        _captured_update_id = str(dir_id)
+        def _apply_update(fresh: list) -> list:
+            if _captured_updated_dir is None:
+                return fresh
+            return [
+                _captured_updated_dir if d.get("id") == _captured_update_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_update)
         ctx = task.context or {}
         updated_ids = list(ctx.get("_strategic_updated_ids", []))
         updated_ids.append(str(dir_id))
@@ -1335,7 +1658,16 @@ async def strategic_operation(
             changed_count=1,
         )
         logger.info(f"[STRATEGIC API] Updated direction {dir_id}")
-        return _resp({"status": "ok", "op": "update_direction", "direction_id": dir_id})
+        return _resp(
+            {
+                "status": "ok",
+                "op": "update_direction",
+                "direction_id": dir_id,
+                "grounding_verdict": (_updated_dir.get("context") or {}).get(
+                    "grounding_verdict"
+                ),
+            }
+        )
 
     elif payload.op == "retire_direction":
         dir_id = data.get("direction_id")
@@ -1418,8 +1750,14 @@ async def strategic_operation(
             matched_direction["notes"] = _cap_list(
                 notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
             )
-            _d = directions
-            await _with_directions_locked(session, project.id, lambda _: _d)
+            _captured_deferred_dir = dict(matched_direction)
+            _captured_deferred_id = str(dir_id)
+            def _apply_deferred(fresh: list) -> list:
+                return [
+                    _captured_deferred_dir if d.get("id") == _captured_deferred_id else d
+                    for d in fresh
+                ]
+            await _with_directions_locked(session, project.id, _apply_deferred)
             verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
             verdicts.append(gate_audit)
             deferrals = list(ctx.get("_strategic_retirement_deferrals", []))
@@ -1443,6 +1781,32 @@ async def strategic_operation(
             flag_modified(task, "context")
             session.add(task)
             await session.commit()
+            # Completion-debt ledger: a deferred retirement is a residual
+            # obligation (the retire is owed once the gate clears). Best-effort,
+            # deduped per (project, direction) so repeated deferrals keep a
+            # single open row and never break the strategic operation.
+            try:
+                from app.completion_debt import (
+                    arecord_completion_debt,
+                    KIND_RETIREMENT_RESIDUAL,
+                )
+
+                await arecord_completion_debt(
+                    session,
+                    dedupe_key=f"retirement_residual:{project.id}:{dir_id}:deferred",
+                    kind=KIND_RETIREMENT_RESIDUAL,
+                    title=f"Retirement deferred for direction {dir_id}: {gate_reason}",
+                    project_id=project.id,
+                    source="admin_agent_ops",
+                    detail={"direction_id": str(dir_id), "kind": "deferred"},
+                )
+                await session.commit()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[STRATEGIC API] completion-debt record failed for deferred "
+                    "retirement of direction %s (non-fatal)",
+                    dir_id,
+                )
             await _emit_updated(
                 STRATEGIC_KIND_DIRECTIONS,
                 changed_direction_ids=[dir_id],
@@ -1481,8 +1845,14 @@ async def strategic_operation(
         matched_direction["notes"] = _cap_list(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        _captured_retired_dir = dict(matched_direction)
+        _captured_retire_id = str(dir_id)
+        def _apply_retire(fresh: list) -> list:
+            return [
+                _captured_retired_dir if d.get("id") == _captured_retire_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_retire)
         # Reconcile the problem-model gap this direction was staffing in the SAME
         # committed transaction: prune the retired id from gap.active_moves (->
         # past_moves) and, if it was the gap's last active move, record a
@@ -1495,6 +1865,36 @@ async def strategic_operation(
             reconcile_gaps_for_retired_directions(pm, [dir_id], now_iso)
 
         await with_problem_model_locked(session, project.id, _reconcile_pm)
+        # Record retired-direction memory in the SAME committed transaction so a
+        # strategist-retired direction blocks a same-gap / text-overlap re-spawn
+        # next cycle (mirrors the fallback retire path's deferred vision write).
+        # Only reached on a real commit — the challenge-gate deferral branch
+        # returns above without ever getting here.
+        _retire_snapshot = dict(matched_direction)
+        _retire_outcome = rationale or None
+
+        def _record_retire_memory(vision: dict) -> None:
+            record_retired_direction_memory(
+                vision,
+                _retire_snapshot,
+                reason="strategic_retire",
+                outcome=_retire_outcome,
+            )
+
+        await _with_vision_locked(session, project.id, _record_retire_memory)
+        # Criterion-link guard: clear criterion_keys from the Direction ORM row so
+        # downstream spawn paths don't propagate stale criterion links from a now-dead
+        # direction.  Best-effort (non-blocking) — a missing ORM row is harmless.
+        from app.directions_repo import get_direction_row as _get_retire_dir_row
+        _retire_dir_row = await _get_retire_dir_row(session, project.id, str(dir_id))
+        if _retire_dir_row is not None and _retire_dir_row.criterion_keys:
+            _cleared_keys = list(_retire_dir_row.criterion_keys)
+            _retire_dir_row.criterion_keys = []
+            session.add(_retire_dir_row)
+            warnings.append(
+                f"Retired direction {dir_id} had {len(_cleared_keys)} criterion "
+                f"link(s) cleared: {_cleared_keys}"
+            )
         verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
         verdicts.append(gate_audit)
         retired_ids = list(ctx.get("_strategic_retired_ids", []))
@@ -1519,6 +1919,22 @@ async def strategic_operation(
             changed_count=1,
         )
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
+        # Resolve the gate-DEFERRED retirement residual now that the retire has
+        # committed. Best-effort/non-fatal and idempotent w.r.t. the same
+        # resolution done inside ``_spawn_retirement_memos`` below (the second
+        # call is a no-op on an already-resolved row). Only touches the
+        # ``:deferred`` key — the memo handoff debt is a separate obligation.
+        try:
+            from app.completion_debt import aresolve_deferred_retirement_debt
+
+            await aresolve_deferred_retirement_debt(session, project.id, dir_id)
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "[STRATEGIC API] deferred-retirement debt resolve failed for "
+                "direction %s (non-fatal)",
+                dir_id,
+            )
         await _spawn_retirement_memos(
             session, project, task, [dir_id], {dir_id: rationale}
         )
@@ -1538,6 +1954,138 @@ async def strategic_operation(
                 f"{MIN_HEALTHY_ACTIVE_DIRECTIONS} active)."
             )
         return _resp({"status": "ok", "op": "retire_direction", "direction_id": dir_id})
+
+    elif payload.op == "decide_churn_retirement":
+        # Autonomous keep/retire decision for a direction the churn/zombie retire
+        # ladder held PAUSED pending review (churn_retirement_recommended). Mirrors
+        # the operator decision seam (directions.decide_churn_retirement) so the
+        # flagged direction can be decided by the strategist as well as an operator.
+        dir_id = data.get("direction_id")
+        if not dir_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        decision = data.get("decision")
+        if not isinstance(decision, str) or decision.upper() not in ("KEEP", "RETIRE"):
+            raise HTTPException(
+                status_code=400, detail="decision must be 'KEEP' or 'RETIRE'"
+            )
+        decision = decision.upper()
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
+        now_iso = _utcnow().isoformat()
+        directions = list(project.directions or [])
+        matched_direction = next(
+            (d for d in directions if d.get("id") == dir_id), None
+        )
+        if matched_direction is None:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+
+        if not direction_has_churn_retirement_recommendation(matched_direction):
+            # Idempotent no-op — nothing pending to decide.
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return _resp(
+                {
+                    "status": "noop",
+                    "op": "decide_churn_retirement",
+                    "direction_id": dir_id,
+                    "reason": "No pending churn-retirement recommendation",
+                }
+            )
+
+        _did_retire = False
+        if decision == "KEEP":
+            # The autonomous strategist may NOT resume a user-paused direction;
+            # a churn-recommended direction is auto_paused so this never blocks,
+            # but keep the guard for parity with the other reactivation paths.
+            if not apply_churn_retirement_keep(
+                matched_direction, allow_user_paused=False
+            ):
+                ctx = task.context or {}
+                task.context = {**ctx, "_strategic_api_called": True}
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                return _resp(
+                    {
+                        "status": "blocked",
+                        "reason": "Cannot reactivate user-paused direction",
+                    }
+                )
+            result_status = "kept"
+        else:
+            reason = (
+                "Retired by explicit strategic keep/retire decision: "
+                "churn/zombie retirement recommendation confirmed."
+            )
+            if rationale:
+                reason = f"{reason} {rationale}"
+            apply_churn_retirement_retire(
+                matched_direction, reason=reason, now_iso=now_iso
+            )
+            result_status = "retired"
+            _did_retire = True
+
+        _captured_dir = dict(matched_direction)
+        _captured_id = str(dir_id)
+
+        def _apply_decision(fresh: list) -> list:
+            return [
+                _captured_dir if d.get("id") == _captured_id else d for d in fresh
+            ]
+
+        await _with_directions_locked(session, project.id, _apply_decision)
+
+        if _did_retire:
+            # Reconcile the freed gap + record retired-direction memory in the same
+            # committed transaction, mirroring the retire_direction op.
+            from app.problem_model import reconcile_gaps_for_retired_directions
+            from app.task_locking import with_problem_model_locked
+
+            def _reconcile_pm(pm: dict) -> None:
+                reconcile_gaps_for_retired_directions(pm, [dir_id], now_iso)
+
+            await with_problem_model_locked(session, project.id, _reconcile_pm)
+
+            _retire_snapshot = dict(matched_direction)
+            _retire_outcome = rationale or None
+
+            def _record_memory(vision: dict) -> None:
+                record_retired_direction_memory(
+                    vision,
+                    _retire_snapshot,
+                    reason="churn_retirement_decision",
+                    outcome=_retire_outcome,
+                )
+
+            await _with_vision_locked(session, project.id, _record_memory)
+
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
+        logger.info(
+            "[STRATEGIC API] Churn-retirement decision %s for direction %s",
+            decision,
+            dir_id,
+        )
+        return _resp(
+            {
+                "status": result_status,
+                "op": "decide_churn_retirement",
+                "direction_id": dir_id,
+                "decision": decision,
+            }
+        )
 
     elif payload.op == "stage_direction":
         # Stage an EXISTING direction for the NEXT version: flip status to
@@ -1587,6 +2135,8 @@ async def strategic_operation(
                 status_code=409,
             )
         staged_for_version = open_version.version_number
+        _pre_status = target.get("status")
+        _gap_id = target.get("gap_id")
         target["status"] = "staged"
         target["staged_for_version"] = staged_for_version
         target["staged_at"] = _utcnow().isoformat()
@@ -1603,8 +2153,38 @@ async def strategic_operation(
         target["notes"] = _cap_list(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        _captured_staged_dir = dict(target)
+        _captured_stage_id = str(dir_id)
+        def _apply_stage(fresh: list) -> list:
+            return [
+                _captured_staged_dir if d.get("id") == _captured_stage_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_stage)
+        if _gap_id:
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                str(dir_id),
+                _gap_id,
+                _gap_id,
+                new_status="staged",
+                prior_status=_pre_status,
+                now_iso=_utcnow().isoformat(),
+            )
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
+                flag_modified(project, "problem_model")
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] stage_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
         ctx = task.context or {}
         staged_ids = list(ctx.get("_strategic_staged_ids", []))
         staged_ids.append(dir_id)
@@ -1693,8 +2273,39 @@ async def strategic_operation(
         target["notes"] = _cap_list(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        if target.get("gap_id"):
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+
+            now_iso = _utcnow().isoformat()
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                dir_id,
+                target["gap_id"],
+                None,
+                new_status="active",
+                prior_status="proposed",
+                now_iso=now_iso,
+            )
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
+                flag_modified(project, "problem_model")
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] approve_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
+        _captured_approved_dir = dict(target)
+        _captured_approve_id = str(dir_id)
+        def _apply_approve(fresh: list) -> list:
+            return [
+                _captured_approved_dir if d.get("id") == _captured_approve_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_approve)
         ctx = task.context or {}
         task.context = {
             **ctx,
@@ -1789,8 +2400,18 @@ async def strategic_operation(
                     vm_ids_to_delete.append(t.vm_instance_id)
             cancelled_count += len(cancelled_tasks)
             await session.flush()
-        _d = remaining
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        _captured_reject_id = str(dir_id)
+        _captured_tombstone = tombstone if rejected_text else None
+        def _apply_reject(fresh: list) -> list:
+            _fresh_remaining = [d for d in fresh if d.get("id") != _captured_reject_id]
+            if _captured_tombstone is None:
+                return _fresh_remaining
+            _rejected_bucket = [d for d in _fresh_remaining if d.get("status") == "rejected"]
+            _non_rejected_bucket = [d for d in _fresh_remaining if d.get("status") != "rejected"]
+            _rejected_bucket.append(_captured_tombstone)
+            _rejected_bucket = _rejected_bucket[-20:]
+            return _non_rejected_bucket + _rejected_bucket
+        await _with_directions_locked(session, project.id, _apply_reject)
         ctx = task.context or {}
         task.context = {
             **ctx,
@@ -1825,6 +2446,145 @@ async def strategic_operation(
                 "direction_id": dir_id,
                 "cancelled_tasks": cancelled_count,
             }
+        )
+
+    elif payload.op == "activate_direction":
+        # Reactivate a staged or paused direction back to active.
+        # This is the sanctioned reactivation path — allows resuming user-paused
+        # directions because the strategist is explicitly requesting it (unlike the
+        # autonomous lifecycle which blocks user-paused via allow_user_paused=False).
+        dir_id = data.get("direction_id")
+        if not dir_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
+        directions = list(project.directions or [])
+        target = next((d for d in directions if d.get("id") == dir_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        cur_status = target.get("status")
+        _TERMINAL_STATUSES = frozenset(
+            {"retired", "expired", "superseded", "completed", "rejected"}
+        )
+        if cur_status == "active":
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp({"status": "skipped", "reason": "Direction is already active"}),
+                status_code=409,
+            )
+        if cur_status in _TERMINAL_STATUSES:
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": f"Direction is in terminal state '{cur_status}'",
+                    }
+                ),
+                status_code=409,
+            )
+        _blk = await _challenge_gate("activate_direction", direction_id=str(dir_id))
+        if _blk is not None:
+            return _blk
+        active_count = sum(1 for d in directions if d.get("status") == "active")
+        max_active = _runtime_config.get("max_active_directions", 5)
+        if active_count >= max_active:
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": f"Direction cap reached: {active_count}/{max_active} active",
+                    }
+                ),
+                status_code=409,
+            )
+        _pre_status = cur_status
+        _gap_id = target.get("gap_id")
+        reactivate_paused_direction(target, allow_user_paused=True)
+        # reactivate_paused_direction clears staged_for_version/staged_activated_at
+        # but not staged_at — pop it so staged→active leaves no staging residue.
+        target.pop("staged_at", None)
+        if rationale:
+            notes = target.get("notes", [])
+            notes.append(
+                {
+                    "text": f"Reactivated by strategic op: {rationale}",
+                    "added_at": _utcnow().isoformat(),
+                }
+            )
+            target["notes"] = _cap_list(
+                notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+            )
+        if _gap_id:
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                str(dir_id),
+                _gap_id,
+                _gap_id,
+                new_status="active",
+                prior_status=_pre_status,
+                now_iso=_utcnow().isoformat(),
+            )
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
+                flag_modified(project, "problem_model")
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] activate_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
+        _captured_activated_dir = dict(target)
+        _captured_activate_id = str(dir_id)
+        def _apply_activate(fresh: list) -> list:
+            return [
+                _captured_activated_dir if d.get("id") == _captured_activate_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_activate)
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
+            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))
+            + [dir_id],
+            "_strategic_api_called": True,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
+        logger.info(
+            "[STRATEGIC API] Reactivated direction %s from '%s' for project %s",
+            dir_id,
+            _pre_status,
+            project.id,
+        )
+        return _resp(
+            {"status": "ok", "op": "activate_direction", "direction_id": dir_id}
         )
 
     elif payload.op == "create_message":
@@ -1866,6 +2626,43 @@ async def strategic_operation(
             warning = await _compute_message_citation_warning(session, project, content)
             if warning:
                 msg_ctx = {**msg_ctx, "_provenance_warnings": warning}
+        # Idempotency guard: a network error can cause the caller to retry after
+        # the server already committed. Accept an optional idempotency_key from
+        # the agent and short-circuit if a matching row already exists.
+        raw_idem = str(data.get("idempotency_key") or "").strip()
+        idem_key: str | None = raw_idem[:255] if raw_idem else None
+        if idem_key:
+            existing = (
+                await session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.idempotency_key == idem_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return _resp(
+                    {
+                        "status": "ok",
+                        "op": "create_message",
+                        "message_id": str(existing.id),
+                    }
+                )
+        # Stamp the resident reply with the live session id (NULL when none is
+        # active) so it is addressed to the same conversation as the operator
+        # messages it answers — matching the session-identity scoping used by the
+        # poll / unattended-cap / pacing queries.
+        from app.strategic_resident_session import (
+            read_resident_session,
+            resident_session_is_active,
+        )
+
+        _resident_blob = read_resident_session(project.vision)
+        _resident_session_id = (
+            _resident_blob.get("session_id")
+            if isinstance(_resident_blob, dict) and resident_session_is_active(_resident_blob)
+            else None
+        )
         new_msg = ProjectMessage(
             project_id=project.id,
             message_type=msg_type,
@@ -1873,12 +2670,41 @@ async def strategic_operation(
             from_task_id=task.id,
             content=content,
             context=msg_ctx,
+            idempotency_key=idem_key,
+            resident_session_id=_resident_session_id,
         )
         session.add(new_msg)
-        await session.commit()
+        # Snapshot project.id before commit: the IntegrityError rollback below
+        # expires `project` (rollback expires regardless of expire_on_commit), so
+        # evaluating ProjectMessage.project_id == project.id in the coalesce
+        # re-query would fire a sync lazy-load -> MissingGreenlet, 500-ing the
+        # idempotency-coalesce path instead of returning the existing message.
+        _project_id = project.id
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            if idem_key:
+                existing = (
+                    await session.execute(
+                        select(ProjectMessage).where(
+                            ProjectMessage.project_id == _project_id,
+                            ProjectMessage.idempotency_key == idem_key,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return _resp(
+                        {
+                            "status": "ok",
+                            "op": "create_message",
+                            "message_id": str(existing.id),
+                        }
+                    )
+            raise
         # Broadcast so the UI can update immediately instead of waiting for poll
         await broadcast_to_project(
-            str(project.id),
+            str(_project_id),
             "message_created",
             message_event_payload(new_msg),
         )
@@ -1943,6 +2769,10 @@ async def strategic_operation(
         await session.commit()
         message_id_str = str(msg.id)
         message_update_event = message_updated_event_payload(msg)
+        # Snapshot project.id too: the reply-post except below rolls back the
+        # session (expiring `project`), and the unconditional broadcast that
+        # follows reads project.id — a sync lazy-load there would MissingGreenlet.
+        _project_id_str = str(project.id)
         reply_msg: ProjectMessage | None = None
         if msg.message_type in (MessageType.QUESTION, MessageType.FEEDBACK):
             try:
@@ -1975,13 +2805,13 @@ async def strategic_operation(
                     exc_info=True,
                 )
         await broadcast_to_project(
-            str(project.id),
+            _project_id_str,
             "message_updated",
             message_update_event,
         )
         if reply_msg is not None:
             await broadcast_to_project(
-                str(project.id),
+                _project_id_str,
                 "message_created",
                 message_event_payload(reply_msg),
             )
@@ -2025,6 +2855,25 @@ async def strategic_operation(
                 status_code=400, detail=f"Unknown direction_id: {direction_id}"
             )
 
+        # Optional explicit criterion_ids — validated against active keys at
+        # task-creation time (same as direction-row inheritance below). Allows
+        # direction-free proving spawns to link their merge evidence to coverage
+        # criteria without requiring a direction assignment.
+        raw_explicit_criterion_ids = data.get("criterion_ids")
+        explicit_criterion_ids: list[str] = []
+        if raw_explicit_criterion_ids is not None:
+            if not isinstance(raw_explicit_criterion_ids, list):
+                raise HTTPException(
+                    status_code=400, detail="criterion_ids must be a list of strings"
+                )
+            for _cid in raw_explicit_criterion_ids:
+                if not isinstance(_cid, str) or not _cid.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="criterion_ids entries must be non-empty strings",
+                    )
+            explicit_criterion_ids = [str(k).strip() for k in raw_explicit_criterion_ids[:50]]
+
         # Build payload — use the same validator the research/plan spawners use
         # so the new task is indistinguishable from normal autonomous spawns
         # except for the context flags.
@@ -2036,6 +2885,25 @@ async def strategic_operation(
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id
+
+        # Forward an acceptance_evidence declaration from the strategist into the
+        # task payload so direction-free proving spawns can declare a named_test
+        # and have their merge credited as proven acceptance evidence.
+        raw_acceptance_evidence = data.get("acceptance_evidence")
+        if raw_acceptance_evidence is not None:
+            if isinstance(raw_acceptance_evidence, dict):
+                from app.payload_schemas import AcceptanceEvidence as _AcceptanceEvidence
+                try:
+                    _AcceptanceEvidence.model_validate(raw_acceptance_evidence)
+                    spawn_payload["acceptance_evidence"] = raw_acceptance_evidence
+                except Exception:  # noqa: BLE001
+                    warnings.append(
+                        "acceptance_evidence declaration is malformed and was ignored"
+                    )
+            else:
+                warnings.append(
+                    "acceptance_evidence must be a dict; ignored"
+                )
 
         # compute_experiment requires a validated launch contract with spend-gate.
         spawn_requires_approval: bool | None = None
@@ -2168,7 +3036,16 @@ async def strategic_operation(
         # the project-wide spawns in the rolling window, then ask the pure policy
         # helper whether one more fits. When exhausted, stamp an observable flag
         # on the review, log, and refuse with 429 — never a silent swallow.
-        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        #
+        # Resident sessions use one long-lived task_id for their entire lifetime
+        # (hours), so the per-review cap would fire after legitimate operator work.
+        # Skip it for resident sessions; the rolling window cap still applies.
+        _is_resident = bool((task.context or {}).get("_resident_session"))
+        per_review_cap = (
+            0
+            if _is_resident
+            else _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        )
         window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
         window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
 
@@ -2247,15 +3124,34 @@ async def strategic_operation(
         if direction_id:
             new_task_ctx["direction_id"] = direction_id
 
-        # Resolve criterion_keys from the direction row so they propagate to the
-        # spawned task's criterion_ids field.
+        # Resolve criterion_keys from two sources: the direction row (when
+        # direction_id is set) and any explicit criterion_ids the strategist
+        # passed. Both are merged and filtered to active keys on the open
+        # version so stale/retracted criteria never propagate to new tasks.
         _task_criterion_ids: list[str] = []
+        _keys_to_filter: list[str] = list(explicit_criterion_ids)
         if direction_id:
             from app.directions_repo import get_direction_row as _get_direction_row
 
             _dir_row = await _get_direction_row(session, project.id, direction_id)
             if _dir_row is not None and _dir_row.criterion_keys:
-                _task_criterion_ids = list(_dir_row.criterion_keys)
+                # Merge: explicit keys first, then direction-derived; deduplicate.
+                _keys_to_filter = list(
+                    dict.fromkeys(_keys_to_filter + list(_dir_row.criterion_keys))
+                )
+        if _keys_to_filter:
+            from app.acceptance_criteria import (
+                filter_active_criterion_keys as _filter_active_crit,
+            )
+            from app.release_version import current_open_version as _current_open_version
+
+            _open_version = await _current_open_version(session, project.id)
+            _task_criterion_ids = await _filter_active_crit(
+                session,
+                project.id,
+                _keys_to_filter,
+                release_version_id=_open_version.id if _open_version is not None else None,
+            )
 
         new_task = Task(
             project_id=project.id,
@@ -2289,6 +3185,9 @@ async def strategic_operation(
             f"[STRATEGIC API] Spawned {spawn_type} task {new_task.id} "
             f"(priority=100) from strategic review {task.id} for project {project.id}"
         )
+        linked_debt_id = await _maybe_link_task_to_debt(
+            session, project.id, data.get("debt_id"), new_task.id
+        )
         return _resp(
             {
                 "status": "ok",
@@ -2296,6 +3195,7 @@ async def strategic_operation(
                 "task_id": str(new_task.id),
                 "type": spawn_type,
                 "priority": 100,
+                **({"linked_debt_id": linked_debt_id} if linked_debt_id else {}),
             }
         )
 
@@ -2424,7 +3324,16 @@ async def strategic_operation(
         # fix spawns in the rolling window, then ask the same pure policy helper
         # whether one more fits. When exhausted, stamp an observable flag, log,
         # and refuse with 429 — never a silent swallow.
-        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        #
+        # Resident sessions use one long-lived task_id for their entire lifetime
+        # (hours), so the per-review cap would fire after legitimate operator work.
+        # Skip it for resident sessions; the rolling window cap still applies.
+        _is_resident = bool((task.context or {}).get("_resident_session"))
+        per_review_cap = (
+            0
+            if _is_resident
+            else _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        )
         window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
         window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
 
@@ -2531,6 +3440,9 @@ async def strategic_operation(
             f"(priority=100, no direction) from strategic review {task.id} "
             f"for project {project.id}"
         )
+        linked_debt_id = await _maybe_link_task_to_debt(
+            session, project.id, data.get("debt_id"), new_task.id
+        )
         return _resp(
             {
                 "status": "ok",
@@ -2539,6 +3451,7 @@ async def strategic_operation(
                 "type": spawn_type,
                 "priority": 100,
                 "deduplicated": False,
+                **({"linked_debt_id": linked_debt_id} if linked_debt_id else {}),
             }
         )
 
@@ -2550,12 +3463,21 @@ async def strategic_operation(
         from pydantic import ValidationError as _PmValidationError
 
         from app import strategic_cycle as _strategic_cycle
-        from app.problem_model import apply_agent_update, operator_owned_subset
+        from app.problem_model import (
+            active_direction_gap_ids as _active_direction_gap_ids,
+            apply_agent_update,
+            normalize_active_moves_writeback as _normalize_active_moves_writeback,
+            operator_owned_subset,
+        )
         from app.strategic_completion import (
             NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
             NEW_VERSION_GOAL_CONTEXT_KEY,
             QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
+            _apply_new_acceptance_criteria,
+            _apply_new_version_goal,
+            _apply_qualify_request_post_commit,
+            _apply_version_phase_decision,
             extract_new_version_goal,
             extract_qualify_request,
             extract_version_phase_decision,
@@ -2619,12 +3541,14 @@ async def strategic_operation(
                     snap = _strategic_cycle.baseline_problem_model(pm_cycle_row)
                     if snap:
                         baseline_pm = snap
+        _protected_gap_ids = _active_direction_gap_ids(project.directions)
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
                 proposed_raw=pm_data,
                 now_iso=_utcnow().isoformat(),
                 baseline_raw=baseline_pm,
+                protected_gap_ids=_protected_gap_ids,
             )
         except _PmValidationError as ve:
             raise HTTPException(
@@ -2632,6 +3556,26 @@ async def strategic_operation(
             ) from None
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
+        # Surface blocked gap deletions (active direction still references the gap).
+        _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
+        for _bid in _blocked_dels:
+            warnings.append(
+                f"gap deletion blocked: {_bid} is still referenced by an active direction"
+            )
+        # Normalize stale active_moves via the shared helper so both write paths
+        # (op-endpoint + log-parse fallback) stay converged.
+        _active_dir_ids = {
+            str(d.get("id"))
+            for d in (project.directions or [])
+            if d.get("status") == "active"
+        }
+        new_pm_raw, _norm = _normalize_active_moves_writeback(
+            new_pm_raw, _active_dir_ids, _utcnow().isoformat()
+        )
+        if _norm:
+            for _c in _norm:
+                warnings.append(f"active_moves normalized: {_c}")
+            project.problem_model = new_pm_raw
         # Carry proof records and adoption verdicts onto survivor keys when a
         # capability consolidation occurred in this write.
         _consolidated = pm_diff.get("capabilities_consolidated")
@@ -2666,6 +3610,11 @@ async def strategic_operation(
             "_strategic_api_called": True,
             "_strategic_problem_model_set": True,
         }
+        # Stash keys transiently so _handle_strategic_completion can still read
+        # them if something prevents the synchronous apply below from running.
+        # They are popped after the synchronous apply so the completion-time
+        # handler is a no-op (prevents double-application for non-resident tasks
+        # that complete normally after this call).
         if version_phase_decision is not None:
             new_ctx[VERSION_PHASE_DECISION_CONTEXT_KEY] = version_phase_decision
         if qualify_request is not None:
@@ -2677,10 +3626,53 @@ async def strategic_operation(
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
+        # Apply synchronously within this handler so resident sessions (where the
+        # task stays open for the entire conversation) get immediate effect rather
+        # than waiting for task completion. These apply helpers only call
+        # session.add(); the single commit below persists everything atomically.
+        # qualify_request is the exception: it does minutes of GitHub I/O
+        # (CI-compliance scan + run_qualification) and MUST NOT run under the
+        # Project FOR UPDATE lock held by this endpoint — doing so idled the
+        # connection until Cloud SQL closed it, poisoning the commit. It is
+        # applied post-commit on a fresh session below (see
+        # _apply_qualify_request_post_commit).
+        await _apply_version_phase_decision(
+            version_phase_decision, task, project, session, path="api_inline"
+        )
+        _qr_task_id = task.id
+        _qr_project_id = project.id
+        await _apply_new_version_goal(
+            new_version_goal, task, project, session, path="api_inline"
+        )
+        await _apply_new_acceptance_criteria(
+            new_acceptance_criteria, task, project, session, path="api_inline"
+        )
+        # Pop the context keys now that they have been applied so
+        # _handle_strategic_completion's completion-time apply path is a no-op
+        # for each key that was handled here (idempotency guard).
+        for _applied_key in (
+            VERSION_PHASE_DECISION_CONTEXT_KEY,
+            QUALIFY_REQUEST_CONTEXT_KEY,
+            NEW_VERSION_GOAL_CONTEXT_KEY,
+            NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+        ):
+            new_ctx.pop(_applied_key, None)
+        task.context = new_ctx
+        flag_modified(task, "context")
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_PROBLEM_MODEL,
             problem_model_changed=True,
+        )
+        # qualify_request runs AFTER the commit that released the Project lock, on
+        # its own fresh session, so its slow GitHub I/O never idles this request's
+        # locked connection (which would poison the commit and 500 the agent). The
+        # agent still awaits it here, preserving synchronous semantics.
+        await _apply_qualify_request_post_commit(
+            qualify_request,
+            task_id=_qr_task_id,
+            project_id=_qr_project_id,
+            path="api_inline",
         )
         logger.info(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
@@ -2688,28 +3680,26 @@ async def strategic_operation(
         )
         if version_phase_decision is not None:
             logger.info(
-                "[STRATEGIC API] version_phase_decision (phase=%s) routed to "
-                "task.context for task %s — applied at strategic completion",
+                "[STRATEGIC API] version_phase_decision (phase=%s) applied "
+                "synchronously for task %s",
                 version_phase_decision["phase"],
                 task.id,
             )
         if qualify_request is not None:
             logger.info(
-                "[STRATEGIC API] qualify_request routed to task.context for "
-                "task %s — release qualifier runs at strategic completion if "
-                "the open version is in stabilize",
+                "[STRATEGIC API] qualify_request applied synchronously for "
+                "task %s — release qualifier ran if open version is in stabilize",
                 task.id,
             )
         if new_version_goal is not None:
             logger.info(
-                "[STRATEGIC API] new_version_goal routed to task.context for "
-                "task %s — applied to open version at strategic completion",
+                "[STRATEGIC API] new_version_goal applied synchronously for task %s",
                 task.id,
             )
         if new_acceptance_criteria is not None:
             logger.info(
-                "[STRATEGIC API] new_acceptance_criteria (%d items) routed to task.context "
-                "for task %s — criteria created at strategic completion",
+                "[STRATEGIC API] new_acceptance_criteria (%d items) applied "
+                "synchronously for task %s",
                 len(new_acceptance_criteria),
                 task.id,
             )
@@ -2857,6 +3847,7 @@ async def strategic_operation(
         from pydantic import ValidationError as _PcValidationError
 
         from app.problem_model import (
+            PENDING_USER_CONFIRMATION_MAX,
             PendingConfirmation,
             parse_problem_model,
         )
@@ -2878,6 +3869,25 @@ async def strategic_operation(
                 status_code=400, detail=f"Invalid pending_confirmation: {ve}"
             ) from None
         current_model = parse_problem_model(project.problem_model)
+        # Idempotent: same caller-supplied id on a retry is a no-op.
+        if any(
+            p.id == pending.id
+            for p in current_model.pending_user_confirmation
+        ):
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return _resp({"status": "ok", "op": "pending_confirm", "id": pending.id})
+        if len(current_model.pending_user_confirmation) >= PENDING_USER_CONFIRMATION_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"pending_user_confirmation is at the cap "
+                    f"({PENDING_USER_CONFIRMATION_MAX}); resolve existing items before adding more"
+                ),
+            )
         current_model.pending_user_confirmation.append(pending)
         project.problem_model = current_model.model_dump()
         flag_modified(project, "problem_model")
@@ -3220,26 +4230,75 @@ async def strategic_operation(
         # above by the task_type guard).  Deduplicates by text within the
         # (project_id, release_version_id) scope so repeated calls are safe.
         from app.acceptance_criteria import (
-            count_criteria_for_version as _count_criteria,
+            count_active_criteria_for_version as _count_active_criteria,
+            get_criterion_by_key as _get_criterion_by_key,
             get_criterion_by_text as _get_criterion_by_text,
             generate_criterion_key as _gen_criterion_key,
+            is_operator_authored_criterion as _is_operator_authored_criterion,
             MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
+            OperatorAuthoredRetractionError as _OperatorAuthoredRetractionError,
+            retract_criterion as _retract_criterion,
+        )
+        from app.notification_dispatch import (
+            post_criterion_retracted_message as _post_criterion_retracted_message,
+            post_criterion_superseded_message as _post_criterion_superseded_message,
         )
         from app.directions_repo import get_direction_row as _get_direction_row
         from app.models import VersionAcceptanceCriterion as _VAC
         from app.release_version import current_open_version as _cur_open_ver
 
-        if not isinstance(data, dict) or not isinstance(data.get("criteria"), list):
+        if not isinstance(data, dict):
             raise HTTPException(
                 status_code=400,
-                detail="set_acceptance_criteria: data must be {\"criteria\": [...]}",
+                detail="set_acceptance_criteria: data must be an object",
             )
-        criteria_input = data["criteria"]
+        criteria_input = data.get("criteria", [])
+        if not isinstance(criteria_input, list):
+            raise HTTPException(
+                status_code=400,
+                detail="set_acceptance_criteria: 'criteria' must be a list when provided",
+            )
         for item in criteria_input:
-            if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not item["text"].strip():
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("text"), str)
+                or not item["text"].strip()
+            ):
                 raise HTTPException(
                     status_code=400,
                     detail="set_acceptance_criteria: each criterion must have a non-empty 'text' string",
+                )
+        retract_input = data.get("retract", [])
+        if not isinstance(retract_input, list):
+            raise HTTPException(
+                status_code=400,
+                detail="set_acceptance_criteria: 'retract' must be a list when provided",
+            )
+        for item in retract_input:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("criterion_key"), str)
+                or not item["criterion_key"].strip()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_acceptance_criteria: each retract item must have a non-empty 'criterion_key' string",
+                )
+            if (
+                not isinstance(item.get("reason"), str)
+                or not item["reason"].strip()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_acceptance_criteria: each retract item must have a non-empty 'reason' string",
+                )
+            superseded_by_key = item.get("superseded_by_key")
+            if superseded_by_key is not None and not isinstance(
+                superseded_by_key, str
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_acceptance_criteria: 'superseded_by_key' must be a string when provided",
                 )
 
         open_version = await _cur_open_ver(session, project.id)
@@ -3254,7 +4313,152 @@ async def strategic_operation(
                 status_code=409,
             )
 
-        existing_count = await _count_criteria(session, open_version.id)
+        # LOOP-AUTHORSHIP GUARD. Validate ALL retract targets up front so a
+        # strategist/loop-driven retraction can only touch criteria the loop
+        # authored. Operator/human-authored criteria (created_by=operator/user/
+        # human) require operator action; refuse the WHOLE request before any
+        # retraction commits so a partial batch cannot leave some retracted.
+        # Also snapshot each target's pre-retraction status so the notification
+        # step only fires when a previously-active criterion actually changes.
+        pre_status_by_key: dict[str, str | None] = {}
+        for item in retract_input:
+            criterion_key = item["criterion_key"].strip()
+            existing = await _get_criterion_by_key(
+                session, open_version.id, criterion_key
+            )
+            pre_status_by_key[criterion_key] = (
+                existing.status if existing is not None else None
+            )
+            if existing is not None and _is_operator_authored_criterion(
+                existing.created_by
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"set_acceptance_criteria: criterion '{criterion_key}' was "
+                        f"authored by an operator and cannot be retracted by the "
+                        f"autonomous loop; operator action is required to retract it"
+                    ),
+                )
+
+        # Validate supersession targets before executing any retractions.
+        for item in retract_input:
+            criterion_key = item["criterion_key"].strip()
+            superseded_by_key_raw = item.get("superseded_by_key")
+            superseded_by_key = (
+                superseded_by_key_raw.strip()
+                if isinstance(superseded_by_key_raw, str) and superseded_by_key_raw.strip()
+                else None
+            )
+            if superseded_by_key is None:
+                continue
+            if superseded_by_key == criterion_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"set_acceptance_criteria: criterion '{criterion_key}' cannot supersede itself",
+                )
+            target = await _get_criterion_by_key(session, open_version.id, superseded_by_key)
+            if target is None or target.status != "active":
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"set_acceptance_criteria: superseded_by_key '{superseded_by_key}' "
+                        f"does not refer to an active criterion on the open release version"
+                    ),
+                )
+
+        # Process retractions FIRST so freed headroom is available to additions
+        # in the same call — this is the core safety-valve path.
+        retracted: list[dict] = []
+        retracted_active_count = 0
+        for item in retract_input:
+            criterion_key = item["criterion_key"].strip()
+            reason = item["reason"].strip()
+            superseded_by_key_raw = item.get("superseded_by_key")
+            superseded_by_key = (
+                superseded_by_key_raw.strip()
+                if isinstance(superseded_by_key_raw, str)
+                and superseded_by_key_raw.strip()
+                else None
+            )
+            try:
+                row = await _retract_criterion(
+                    session,
+                    project_id=project.id,
+                    release_version_id=open_version.id,
+                    criterion_key=criterion_key,
+                    reason=reason,
+                    retracted_by="strategist",
+                    superseded_by_key=superseded_by_key,
+                    enforce_loop_authored=True,
+                )
+            except _OperatorAuthoredRetractionError as exc:
+                # Belt-and-suspenders: the up-front guard already rejected
+                # operator-authored targets, so reaching here means state
+                # changed under us. Refuse cleanly rather than partially commit.
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            took_effect = (
+                row is not None
+                and row.status != "active"
+                and pre_status_by_key.get(criterion_key) == "active"
+            )
+            if took_effect:
+                # Row was active and is now retracted/superseded — headroom freed.
+                retracted_active_count += 1
+                # OPERATOR-ATTENTION SIGNAL. Best-effort: a failure to post the
+                # notification must NEVER abort or roll back the retraction. The
+                # message rides the caller's transaction (post_event_message only
+                # session.add()s; the commit below flushes it).
+                try:
+                    if superseded_by_key:
+                        await _post_criterion_superseded_message(
+                            session,
+                            project.id,
+                            criterion_key=criterion_key,
+                            text=row.text,
+                            reason=reason,
+                            release_version_id=open_version.id,
+                            superseded_by_key=superseded_by_key,
+                            retracted_by="strategist",
+                            task_id=task.id,
+                        )
+                    else:
+                        await _post_criterion_retracted_message(
+                            session,
+                            project.id,
+                            criterion_key=criterion_key,
+                            text=row.text,
+                            reason=reason,
+                            release_version_id=open_version.id,
+                            retracted_by="strategist",
+                            task_id=task.id,
+                        )
+                except Exception as exc:  # noqa: BLE001 — signal is best-effort
+                    logger.warning(
+                        "[STRATEGIC API] Failed to post criterion "
+                        "retraction/supersession notification for %s: %s",
+                        criterion_key,
+                        exc,
+                    )
+            retracted.append(
+                {
+                    "criterion_key": criterion_key,
+                    "status": row.status if row is not None else None,
+                    "found": row is not None,
+                }
+            )
+
+        # Active-only count minus what we just retracted in this call
+        existing_active_count = await _count_active_criteria(session, open_version.id)
+        # Snapshot active criterion keys from DB to use for stale-key scrubbing
+        # when merging criterion_key into dir_row.criterion_keys.  Keys created
+        # in this call are tracked separately so multi-item loops don't lose
+        # each other's newly written keys before they flush to DB.
+        from app.direction_referential_guard import (
+            load_version_criterion_key_sets as _load_crit_key_sets,
+        )
+        _db_active_crit_keys, _ = await _load_crit_key_sets(session, project.id, open_version.id)
+        _call_crit_keys: set[str] = set()
         new_added_count = 0
         skipped_over_cap = 0
         processed: list[dict] = []
@@ -3269,7 +4473,7 @@ async def strategic_operation(
                 criterion_key = existing.criterion_key
                 is_new = False
             else:
-                if existing_count + new_added_count >= _MAX_CRITERIA:
+                if existing_active_count + new_added_count >= _MAX_CRITERIA:
                     skipped_over_cap += 1
                     continue
                 criterion_key = _gen_criterion_key()
@@ -3284,13 +4488,30 @@ async def strategic_operation(
                 new_added_count += 1
                 is_new = True
 
+            # Track keys added in this call so later iterations can preserve
+            # them even before they flush to DB.
+            _call_crit_keys.add(criterion_key)
+
             mapped_keys: list[str] = []
             for dk in direction_keys_input:
                 dir_row = await _get_direction_row(session, project.id, dk)
                 if dir_row is None:
                     warnings.append(f"Unknown direction_key: {dk}")
                     continue
-                merged = list(set(dir_row.criterion_keys or []) | {criterion_key})
+                # Scrub stale (inactive/old-version) keys from the existing set,
+                # keeping only keys that are active in this version or were
+                # added during this call (not yet flushed to DB).
+                _valid_keys = _db_active_crit_keys | _call_crit_keys
+                _prior_keys = set(dir_row.criterion_keys or [])
+                merged = list(
+                    (_valid_keys & _prior_keys) | {criterion_key}
+                )
+                _scrubbed = _prior_keys - _valid_keys - {criterion_key}
+                if _scrubbed:
+                    warnings.append(
+                        f"Direction '{dk}': {len(_scrubbed)} stale criterion key(s) "
+                        f"removed: {sorted(_scrubbed)}"
+                    )
                 dir_row.criterion_keys = merged
                 session.add(dir_row)
                 mapped_keys.append(dk)
@@ -3309,23 +4530,166 @@ async def strategic_operation(
             **ctx,
             "_strategic_api_called": True,
             "_strategic_criteria_authored": len(processed),
+            "_strategic_criteria_retracted": sum(
+                1 for item in retracted if item["found"]
+            ),
         }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
         logger.info(
-            "[STRATEGIC API] set_acceptance_criteria for task %s: %d criteria, %d skipped (cap), %d warnings",
+            "[STRATEGIC API] set_acceptance_criteria for task %s: %d criteria, "
+            "%d retracted, %d skipped (cap), %d warnings",
             task.id,
             len(processed),
+            sum(1 for item in retracted if item["found"]),
             skipped_over_cap,
             len(warnings),
         )
+
+        # Best-effort backfill: for each direction that received new criterion
+        # mappings, replay merge evidence for tasks that already landed.
+        _mapped_directions: set[str] = set()
+        for item in processed:
+            for dk in item.get("direction_keys", []):
+                _mapped_directions.add(dk)
+        if _mapped_directions:
+            from app.acceptance_criteria import backfill_direction_merge_evidence as _backfill
+            for _dk in _mapped_directions:
+                try:
+                    await _backfill(session, project.id, _dk)
+                except Exception:
+                    logger.warning(
+                        "[STRATEGIC API] set_acceptance_criteria backfill failed "
+                        "for direction %s (non-fatal)",
+                        _dk,
+                        exc_info=True,
+                    )
+
         return _resp(
             {
                 "status": "ok",
                 "op": "set_acceptance_criteria",
                 "criteria": processed,
+                "retracted": retracted,
                 "skipped_over_cap": skipped_over_cap,
+            }
+        )
+
+    elif payload.op == "dispose_completion_debt":
+        # Strategist disposition of an open completion-debt row: resolve it (with
+        # required evidence) or dismiss it (with a reason). Scoped to this
+        # project so a strategist can never touch another project's ledger.
+        from app.completion_debt import (
+            debt_to_dict as _debt_to_dict,
+            dismiss_debt as _dismiss_debt,
+            resolve_debt as _resolve_debt,
+        )
+
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400, detail="dispose_completion_debt data must be an object"
+            )
+        debt_id = data.get("debt_id")
+        if not debt_id:
+            raise HTTPException(status_code=400, detail="debt_id is required")
+        disposition = str(data.get("disposition", "")).strip().lower()
+        if disposition not in ("resolved", "dismissed"):
+            raise HTTPException(
+                status_code=400,
+                detail="disposition must be one of ['resolved', 'dismissed']",
+            )
+        reason = str(data.get("reason") or data.get("evidence") or "").strip()
+        # Resolving a debt REQUIRES evidence — a bare "resolved" with no proof is
+        # exactly the green-CI churn the ledger exists to prevent. Dismissal also
+        # requires a reason (enforced by dismiss_debt).
+        if disposition == "resolved" and not reason:
+            raise HTTPException(
+                status_code=400,
+                detail="resolving completion debt requires evidence (reason)",
+            )
+        try:
+            if disposition == "resolved":
+                entry = await _resolve_debt(
+                    session, debt_id, project_id=project.id, reason=reason
+                )
+            else:
+                entry = await _dismiss_debt(
+                    session, debt_id, project_id=project.id, reason=reason
+                )
+        except ValueError as exc:
+            if "not_found" in str(exc):
+                raise HTTPException(
+                    status_code=404, detail="Completion debt entry not found"
+                ) from exc
+            if "invalid_reason" in str(exc):
+                raise HTTPException(
+                    status_code=400, detail="reason must be a non-empty string"
+                ) from exc
+            raise HTTPException(status_code=409, detail="Entry is not open") from exc
+
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        return _resp(
+            {
+                "status": "ok",
+                "op": "dispose_completion_debt",
+                "disposition": disposition,
+                "entry": _debt_to_dict(entry),
+            }
+        )
+
+    elif payload.op == "record_finding_resolution":
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400, detail="record_finding_resolution data must be an object"
+            )
+        finding_key = str(data.get("finding_key") or "").strip()
+        state = str(data.get("state") or "").strip()
+        # Coerce optional fields to str before they reach the model columns —
+        # the dedicated endpoint gets this typing from AuditFindingResolutionOp,
+        # but this arm receives untyped JSON (e.g. severity: 5).
+        severity = str(data.get("severity") or "").strip() or None
+        note = str(data.get("note") or "").strip() or None
+        resolving_ref = str(data.get("resolving_ref") or "").strip() or None
+        verified_against_sha = str(data.get("verified_against_sha") or "").strip() or None
+        task_type = token.get("task_type")
+        resolution_version_id = await _apply_finding_resolution_write(
+            session,
+            task,
+            project.id,
+            finding_key,
+            state,
+            task_type,
+            severity=severity,
+            note=note,
+            resolving_ref=resolving_ref,
+            verified_against_sha=verified_against_sha,
+        )
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] record_finding_resolution: task %s marked finding '%s' as '%s' "
+            "for project %s version %s",
+            task.id,
+            finding_key,
+            state,
+            project.id,
+            resolution_version_id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "record_finding_resolution",
+                "finding_key": finding_key,
+                "state": state,
+                "release_version_id": str(resolution_version_id),
             }
         )
 
@@ -3355,6 +4719,82 @@ _VALID_RESOLUTION_STATES: frozenset[str] = frozenset({"resolved", "stale"})
 _AUDIT_BOUND_VERSION_TASK_TYPES: frozenset[str] = frozenset(
     {"release_audit", "release_audit_challenge"}
 )
+
+
+async def _apply_finding_resolution_write(
+    session: AsyncSession,
+    task: Task,
+    project_id: uuid.UUID,
+    finding_key: str,
+    state: str,
+    task_type: str | None,
+    severity: str | None = None,
+    note: str | None = None,
+    resolving_ref: str | None = None,
+    verified_against_sha: str | None = None,
+) -> uuid.UUID:
+    """Validate, version-bind, and apply an audit finding resolution.
+
+    Shared by both the dedicated ``/api/agent/audit-finding-resolution``
+    endpoint and the ``record_finding_resolution`` strategic op dispatch
+    branch. Raises HTTPException on validation or version-binding failure.
+    Returns the resolution_version_id on success; the caller must commit.
+    """
+    if state not in _VALID_RESOLUTION_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid state '{state}'; must be one of {sorted(_VALID_RESOLUTION_STATES)}",
+        )
+    if not finding_key or len(finding_key) > 64:
+        raise HTTPException(
+            status_code=400,
+            detail="finding_key is required and must be at most 64 characters",
+        )
+    from app.release_version import current_open_version  # noqa: PLC0415
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+    resolution_version_id = open_version.id
+    # release_audit and release_audit_challenge tasks carry a stable
+    # release_version_id in their context (stamped at spawn time). Use that
+    # binding to attribute the resolution to the correct version, and reject
+    # the write if the task's bound version is no longer the open one — an
+    # older candidate must not mark findings resolved on a later open version.
+    if task_type in _AUDIT_BOUND_VERSION_TASK_TYPES:
+        bound_str = (task.context or {}).get("release_version_id")
+        if bound_str:
+            try:
+                bound_id = uuid.UUID(bound_str)
+            except (ValueError, AttributeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid release_version_id in task context",
+                )
+            if bound_id != open_version.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Task is bound to release version {bound_id} "
+                        f"but the current open version is {open_version.id}; "
+                        "resolution rejected to prevent cross-version attribution"
+                    ),
+                )
+            resolution_version_id = bound_id
+    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415
+
+    await apply_finding_resolution(
+        session,
+        project_id,
+        resolution_version_id,
+        finding_key,
+        state,
+        severity=severity,
+        note=note,
+        resolving_ref=resolving_ref,
+        verified_against_sha=verified_against_sha,
+    )
+    return resolution_version_id
 
 
 class AuditFindingResolutionOp(BaseModel):
@@ -3388,69 +4828,20 @@ async def agent_audit_finding_resolution(
             ),
         )
 
-    if payload.state not in _VALID_RESOLUTION_STATES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid state '{payload.state}'; must be one of {sorted(_VALID_RESOLUTION_STATES)}",
-        )
-
-    if not payload.finding_key or len(payload.finding_key) > 64:
-        raise HTTPException(
-            status_code=400,
-            detail="finding_key is required and must be at most 64 characters",
-        )
-
     task = await session.get(Task, payload.task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     project = await _lock_project_or_429(session, task.project_id)
-
-    from app.release_version import current_open_version  # noqa: PLC0415
-
-    open_version = await current_open_version(session, project.id)
-    if open_version is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No open release version",
-        )
-
-    # release_audit and release_audit_challenge tasks carry a stable
-    # release_version_id in their context (stamped at spawn time).  Use that
-    # binding to attribute the resolution to the correct version, and reject
-    # the write if the task's bound version is no longer the open one — an
-    # older candidate must not mark findings resolved on a later open version.
     task_type = token.get("task_type")
-    resolution_version_id = open_version.id
-    if task_type in _AUDIT_BOUND_VERSION_TASK_TYPES:
-        bound_str = (task.context or {}).get("release_version_id")
-        if bound_str:
-            try:
-                bound_id = uuid.UUID(bound_str)
-            except (ValueError, AttributeError):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid release_version_id in task context",
-                )
-            if bound_id != open_version.id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Task is bound to release version {bound_id} "
-                        f"but the current open version is {open_version.id}; "
-                        "resolution rejected to prevent cross-version attribution"
-                    ),
-                )
-            resolution_version_id = bound_id
 
-    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415
-
-    await apply_finding_resolution(
+    resolution_version_id = await _apply_finding_resolution_write(
         session,
+        task,
         project.id,
-        resolution_version_id,
         payload.finding_key,
         payload.state,
+        task_type,
         severity=payload.severity,
         note=payload.note,
         resolving_ref=payload.resolving_ref,
@@ -3626,3 +5017,109 @@ async def admin_declare_capability_verdict(
         "cap_name": cap_name,
         "verdict": body.verdict,
     }
+
+
+# ── Completion-debt endpoints ──────────────────────────────────────────────────
+
+
+@router.get("/api/admin/projects/{project_id}/completion-debts")
+@limiter.limit("60/minute")
+async def admin_list_completion_debts(
+    request: Request,
+    project_id: uuid.UUID,
+    status: str | None = None,
+    kind: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """List completion-debt entries for a project with optional filters."""
+    from app.completion_debt import count_completion_debts, debt_to_dict, list_completion_debts
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    valid_statuses = {"open", "dismissed", "resolved"}
+    if status is not None and status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"status must be one of {sorted(valid_statuses)}")
+
+    entries = await list_completion_debts(
+        session,
+        project_id=project_id,
+        status=status,
+        kind=kind,
+        limit=min(limit, 200),
+        offset=offset,
+    )
+    total_count = await count_completion_debts(
+        session,
+        project_id=project_id,
+        status=status,
+        kind=kind,
+    )
+    return {"entries": [debt_to_dict(e) for e in entries], "count": len(entries), "total_count": total_count}
+
+
+class _DismissDebtRequest(BaseModel):
+    reason: str
+
+
+@router.post("/api/admin/projects/{project_id}/completion-debts/{debt_id}/dismiss")
+@limiter.limit("30/minute")
+async def admin_dismiss_completion_debt(
+    request: Request,
+    project_id: uuid.UUID,
+    debt_id: uuid.UUID,
+    body: _DismissDebtRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Dismiss a completion-debt entry with a reason."""
+    from app.completion_debt import debt_to_dict, dismiss_debt
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    reason = body.reason.strip() if isinstance(body.reason, str) else ""
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason must be a non-empty string")
+
+    try:
+        entry = await dismiss_debt(session, debt_id, project_id=project_id, reason=reason)
+    except ValueError as exc:
+        if "not_found" in str(exc):
+            raise HTTPException(status_code=404, detail="Completion debt entry not found") from exc
+        raise HTTPException(status_code=409, detail="Entry is not open") from exc
+
+    await session.commit()
+    return {"status": "ok", "entry": debt_to_dict(entry)}
+
+
+@router.post("/api/admin/projects/{project_id}/completion-debts/{debt_id}/resolve")
+@limiter.limit("30/minute")
+async def admin_resolve_completion_debt(
+    request: Request,
+    project_id: uuid.UUID,
+    debt_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Mark a completion-debt entry as resolved."""
+    from app.completion_debt import debt_to_dict, resolve_debt
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        entry = await resolve_debt(session, debt_id, project_id=project_id)
+    except ValueError as exc:
+        if "not_found" in str(exc):
+            raise HTTPException(status_code=404, detail="Completion debt entry not found") from exc
+        raise HTTPException(status_code=409, detail="Entry is not open") from exc
+
+    await session.commit()
+    return {"status": "ok", "entry": debt_to_dict(entry)}

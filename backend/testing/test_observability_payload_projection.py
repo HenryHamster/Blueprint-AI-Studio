@@ -133,6 +133,110 @@ async def test_outer_loop_convergence_walks_non_code_outcomes_without_lazy_load(
 
 
 @pytest.mark.asyncio
+async def test_outer_loop_convergence_counts_straddling_task_via_widened_scan(
+    client: AsyncClient, db_session
+):
+    """A task created BEFORE the hours window but completing INSIDE it must be
+    counted in non_code_outcomes. Guards the widened DB scan in
+    get_outer_loop_convergence (lookback_cutoff = cutoff - hours): with the old
+    ``created_at >= cutoff`` filter the straddling row never left the DB, so
+    the completion-time walk in _compute_non_code_outcomes could not see it —
+    a silent under-count no pure-function test can catch."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Created 30h ago (outside hours=24, inside the widened 48h scan),
+    # completed 1h ago (inside the window). Memo type so the honest success
+    # signal also proves plan_output hydration covers straddling rows.
+    straddling = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=30),
+        completed_at=now - timedelta(hours=1),
+        payloads=[{"type": "memo"}],
+        plan_output={"memo": {"summary": "s", "reasoning": "r"}},
+    )
+    db_session.add(straddling)
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/outer-loop-convergence?hours=24&project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    nco = resp.json()["non_code_outcomes"]
+    assert nco["total"] == 1
+    assert nco["successes"] == 1
+    assert nco["by_kind"]["memo_artifact"]["success"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_outer_loop_tasks_lookback_cutoff_widens_created_at_scan(
+    db_session,
+):
+    """DB-layer contract of the ``lookback_cutoff`` parameter itself: passing a
+    cutoff wider than ``cutoff`` admits rows created between the two, without
+    admitting rows older than the widened bound; omitting it preserves the
+    original ``created_at >= cutoff`` behavior for existing callers."""
+    from conftest import TestingSessionLocal
+
+    from app.routers.admin_pipeline_observability import _fetch_outer_loop_tasks
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    in_window = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=1),
+        payloads=[{"type": "memo"}],
+    )
+    straddling = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=30),
+        completed_at=now - timedelta(hours=1),
+        payloads=[{"type": "memo"}],
+    )
+    ancient = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=60),
+        payloads=[{"type": "memo"}],
+    )
+    db_session.add_all([in_window, straddling, ancient])
+    await db_session.commit()
+
+    cutoff = now - timedelta(hours=24)
+    async with TestingSessionLocal() as fresh_session:
+        default_ids = {
+            t.id
+            for t in await _fetch_outer_loop_tasks(
+                fresh_session, cutoff=cutoff, project_id=project.id, limit=100
+            )
+        }
+    async with TestingSessionLocal() as fresh_session:
+        widened_ids = {
+            t.id
+            for t in await _fetch_outer_loop_tasks(
+                fresh_session,
+                cutoff=cutoff,
+                project_id=project.id,
+                limit=100,
+                lookback_cutoff=cutoff - timedelta(hours=24),
+            )
+        }
+
+    assert default_ids == {in_window.id}
+    assert widened_ids == {in_window.id, straddling.id}
+
+
+@pytest.mark.asyncio
 async def test_lane_diag_walks_hydrated_original_without_lazy_load(
     client: AsyncClient, db_session
 ):

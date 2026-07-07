@@ -518,10 +518,10 @@ async def test_conversion_rate_excludes_degraded_unverified_merges():
 
 @pytest.mark.asyncio
 async def test_conversion_rate_excludes_pr_ineligible_task_types():
-    """conversion_rate denominator drops research/audit/memo tasks (which never open a PR).
+    """conversion_rate denominator drops research/memo tasks (which never open a PR).
 
     research_history records 6 tasks_created but type_breakdown shows 4 of them are
-    PR-ineligible (research/audit), leaving 2 PR-eligible. With 1 PR merged the
+    PR-ineligible (research/memo), leaving 2 PR-eligible. With 1 PR merged the
     direction conversion_rate AND the headline pipeline_conversion_rate must be
     1/2 = 0.5, not 1/6 = 0.167.
     """
@@ -542,7 +542,7 @@ async def test_conversion_rate_excludes_pr_ineligible_task_types():
                         "tasks_created": 6,
                         "type_breakdown": {
                             "research": {"created": 3},
-                            "audit": {"created": 1},
+                            "memo": {"created": 1},
                             "create": {"created": 2},
                         },
                     }

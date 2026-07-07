@@ -2,6 +2,8 @@ import {
   TOKEN_REFRESH_FRACTION, TOKEN_REFRESH_FLOOR_MS, TOKEN_REFRESH_CEILING_MS,
   BOOTSTRAP_TOKEN_THRESHOLD_MS, BOOTSTRAP_CONFIRMATION_DELAY_MS, API_TIMEOUT,
 } from '../constants.js';
+import { writeGithubTokenFile } from '../token-file.js';
+import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 
 // Dependencies injected by index.ts at startup to avoid a circular import.
 interface TokenModuleConfig {
@@ -135,4 +137,86 @@ export function scheduleProactiveTokenRefresh(token: string): void {
 
 export function stopProactiveTokenRefresh(): void {
   if (tokenRefreshTimer) { clearTimeout(tokenRefreshTimer); tokenRefreshTimer = null; }
+}
+
+/** How often to proactively refresh the GitHub installation token (45 min). */
+const GITHUB_TOKEN_REFRESH_MS = 45 * 60 * 1000;
+
+export let githubTokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Schedule a proactive GitHub installation token refresh every 45 min, mirroring
+ * scheduleProactiveTokenRefresh for the agent JWT. On each fire:
+ *   1. Calls GET /api/agent/github/token?task_id=<taskId> (hits backend cache —
+ *      zero GitHub API calls when the 50-min backend cache is warm).
+ *   2. Writes the fresh token to GITHUB_TOKEN_FILE via writeGithubTokenFile.
+ *   3. If NOT read-only: refreshes the on-disk git token file and (re)configures
+ *      the credential helper that serves it, keeping the persisted origin URL
+ *      clean (https://github.com/owner/repo.git) so the installation token is
+ *      never written into .git/config nor exposed in the git process argv.
+ *      Reuses git-credential.ts — the same mechanism the strategic resident
+ *      installs at role start — rather than embedding the token in the URL.
+ *   4. Reschedules itself.
+ */
+export function scheduleGithubTokenRefresh(
+  taskId: string,
+  workspace: string,
+  owner: string,
+  repo: string,
+  isReadOnly: boolean,
+): void {
+  stopGithubTokenRefresh();
+
+  const { getOrchestratorUrl, getHeaders, log } = cfg();
+
+  githubTokenRefreshTimer = setTimeout(() => {
+    void (async () => {
+      log('GitHub token refresh: refreshing installation token before expiry');
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => { controller.abort(); }, API_TIMEOUT);
+        const res = await fetch(
+          `${getOrchestratorUrl()}/api/agent/github/token?task_id=${encodeURIComponent(taskId)}`,
+          { headers: { ...getHeaders() }, signal: controller.signal },
+        );
+        clearTimeout(timeout);
+        if (res.ok) {
+          const data = await res.json() as { data?: { token?: string } };
+          const newToken = (data.data)?.token;
+          if (newToken) {
+            writeGithubTokenFile(newToken);
+            if (!isReadOnly) {
+              // Keep the installation token OUT of the persisted remote URL /
+              // .git/config and out of the git process argv. Rather than
+              // `git remote set-url origin https://x-access-token:<token>@…`
+              // (which lands the secret in .git/config for the task lifetime and
+              // briefly in the git argv), refresh the on-disk token file and
+              // (re)configure the credential helper that reads it, leaving the
+              // origin URL clean. Git then fetches fresh credentials from the
+              // helper on every network call. Reuses the same mechanism the
+              // strategic resident installs (git-credential.ts) instead of
+              // inventing a divergent one. Best-effort: a failure here just
+              // leaves the previously-configured auth in place.
+              try {
+                writeGitTokenFile(newToken);
+                setupGitCredentialHelper(owner, repo, workspace);
+              } catch { /* best effort */ }
+            }
+            log('GitHub token refresh: succeeded');
+          } else {
+            log('GitHub token refresh: backend returned no token — continuing with current token');
+          }
+        } else {
+          log(`GitHub token refresh: backend returned ${res.status} — continuing with current token`);
+        }
+      } catch (e) {
+        log(`GitHub token refresh failed: ${String(e)}`);
+      }
+      scheduleGithubTokenRefresh(taskId, workspace, owner, repo, isReadOnly);
+    })();
+  }, GITHUB_TOKEN_REFRESH_MS);
+}
+
+export function stopGithubTokenRefresh(): void {
+  if (githubTokenRefreshTimer) { clearTimeout(githubTokenRefreshTimer); githubTokenRefreshTimer = null; }
 }

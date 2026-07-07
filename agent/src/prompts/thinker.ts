@@ -101,6 +101,7 @@ function buildStrategicFingerprintPrompt(
     systemMaturitySection: p.systemMaturitySection ? '<system-maturity>' : '',
     driftSection: p.driftSection ? '<drift>' : '',
     heldDirectionsSection: p.heldDirectionsSection ? '<held-directions>' : '',
+    residentExamLeadsSection: p.residentExamLeadsSection ? '<resident-exam-leads>' : '',
     recentWorkSection: '<recent-work>',
     feedbackSection: '<feedback>',
     questionSection: '<question>',
@@ -110,6 +111,7 @@ function buildStrategicFingerprintPrompt(
     memoCitationsSection: p.memoCitationsSection ? '<memo-citations>' : '',
     efficiencySnapshotSection: p.efficiencySnapshotSection ? '<efficiency-snapshot>' : '',
     ciComplianceSection: p.ciComplianceSection ? '<ci-compliance>' : '',
+    completionDebtSection: p.completionDebtSection ? '<completion-debt>' : '',
     availableCapabilitiesSection: p.availableCapabilitiesSection ? '<available-capabilities>' : '',
     sweepComparisonSection: p.sweepComparisonSection ? '<sweep-comparison>' : '',
     localRunnerSection: p.localRunnerSection ? '<local-runner>' : '',
@@ -203,6 +205,11 @@ export interface ThinkerPromptParams {
    * constructions/tests that omit it still compile; '' renders nothing.
    */
   heldDirectionsSection?: string;
+  /**
+   * Open FOUND leads from the resident session's exam ledger. Optional so
+   * existing constructions/tests that omit it still compile; '' renders nothing.
+   */
+  residentExamLeadsSection?: string;
   recentWorkSection: string;
   feedbackSection: string;
   questionSection: string;
@@ -218,6 +225,13 @@ export interface ThinkerPromptParams {
    * still compile; '' renders nothing (also omitted when overall status is 'pass').
    */
   ciComplianceSection?: string;
+  /**
+   * Open completion-debt obligations from the ledger: unfinished work from
+   * merged default-OFF features, observe-mode knobs, or retired directions.
+   * Built from the strategic payload's `open_completion_debt` field. Optional
+   * so existing constructions/tests that omit it still compile; '' renders nothing.
+   */
+  completionDebtSection?: string;
   /**
    * Shared capability vocabulary section (canonical registry names + statuses)
    * plus the uniform provides_capability / prerequisite declaration guidance.
@@ -314,7 +328,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.residentExamLeadsSection ? `\n${p.residentExamLeadsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
 ${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
@@ -419,8 +433,10 @@ Name the hypothesis, the command (or arms), the metric being measured, and what 
 - **direction-free \`spawn-task\`** (type \`research\`, NO \`direction_id\`) — BOUNDED work that's done once built but that you can't yet enumerate, so it needs a research pass to decompose into the implementation tasks. It fans out into the children and, carrying no direction, runs once and is never re-researched. Use it for a finite feature/fix that needs investigation but leaves nothing to steer afterward — do NOT manufacture a direction for it.
 - **\`spawn-fix\`** (the Executor's \`./strategic spawn-fix\` command, types \`create\`/\`refactor\`/\`qa\`) — a one-time fix you can already describe without research. One task, no direction, fires once and lands a PR.
 - **\`spawn-task\` with a \`direction_id\`** (research/plan/\`web_research\`/\`design\`/\`compute_experiment\`) — read-only INVESTIGATION or empirical measurement that feeds a STANDING direction, as described under Knowledge commissions and Experiment commissions above.
+- **\`dispose-completion-debt\`** — dispose of an open completion-debt ledger entry: \`"resolved"\` (requires evidence that the obligation was actually met) or \`"dismissed"\` (requires a reason the obligation is no longer relevant). Use this only when the open-completion-debt section lists entries and you have a clear verdict; never fabricate evidence.
+- **\`activate-direction\`** — manually reactivate a staged or user-paused direction back to active. Use when the operator or the analysis concludes that the direction's hold condition no longer applies and work should resume immediately rather than waiting for the next version-promote cycle.
 
-**Staging (next-version work).** A fourth move exists alongside create/update/retire: you can **stage** a direction to begin only after the current version promotes and the next one opens. A staged direction is inert — it spawns no work — until that version-open transition auto-activates it. The "Staged for next version" block above lists what is already staged; **do not re-propose work that is already staged there.**
+**Staging (next-version work).** A fifth move exists alongside create/update/retire: you can **stage** a direction to begin only after the current version promotes and the next one opens. A staged direction is inert — it spawns no work — until that version-open transition auto-activates it; it can also be manually reactivated earlier with \`activate-direction\` if the hold condition resolves mid-version. The "Staged for next version" block above lists what is already staged; **do not re-propose work that is already staged there.**
 
 Staging is NOT deferral, and it is not an escape from the "you're not allowed to defer" rule. Staging is itself a DECISION — a hard call that the work genuinely belongs to the NEXT version's scope, not this one. The natural case: the project is in its stabilize/hardening phase (see the version-phase section, when present) and a strong *build-phase* idea appears that would pollute the current version's scope if started now — stage it so it activates cleanly when the next build phase opens. Use it for genuinely next-version-scoped work. Do NOT use it to dodge a within-cycle call: if work belongs to THIS version, create it active now; if it's not worth doing, retire/don't-create it. "I'm not sure, I'll stage it" is deferral wearing staging's clothes — make the call instead.
 
@@ -532,12 +548,19 @@ Skip entirely if criteria already exist and are reasonably mapped. Do NOT fabric
 When criteria are warranted, write \`/tmp/proposed_criteria_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} as the backend payload shape:
 
 \`\`\`json
-{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}]}
+{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}],"retract":[{"criterion_key":"c-old-key","reason":"All directions that could produce covering evidence have been retired; this criterion is permanently uncoverable.","superseded_by_key":"c-new-key"}]}
 \`\`\`
 
 Each \`criteria\` item has:
 - \`text\`: a short, concrete, independently verifiable criterion statement for the VERSION, not a direction description.
 - \`direction_keys\`: the \`d-xxx\` identifiers of directions that contribute to that criterion; use an empty array only when no active direction maps cleanly yet.
+
+The optional top-level \`retract\` array lets you retract or supersede an existing **active** criterion that has become permanently uncoverable — for example, when every direction that could produce covering evidence has been retired and no realistic path to covering the criterion remains. Each retraction item has:
+- \`criterion_key\` (required): the \`c-xxx\` key of the active criterion to retract.
+- \`reason\` (required): a short explanation of why the criterion is permanently uncoverable.
+- \`superseded_by_key\` (optional): the \`c-xxx\` key of a different active criterion that replaces this one. Omit when retraction stands alone.
+
+Retractions are processed before additions this cycle. Omit the \`retract\` key entirely when no active criterion needs retraction — absence is the default. **Never fabricate retractions.** Only retract a criterion when it is demonstrably uncoverable given the current direction portfolio (not merely hard or slow to cover).
 
 Keep the total to 5-7 criteria maximum. Frame text as outcomes ("Users can X", "System handles Y"), not implementation steps ("Implement Z"). Ground every criterion in the version goal and active gap descriptions. If no criteria are needed this cycle, do not write the file at all.
 

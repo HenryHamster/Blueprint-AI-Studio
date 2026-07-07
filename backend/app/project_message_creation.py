@@ -139,7 +139,16 @@ async def create_operator_project_message(
         resident_session_is_active,
     )
 
-    resident_active = resident_session_is_active(read_resident_session(project.vision))
+    resident_blob = read_resident_session(project.vision)
+    resident_active = resident_session_is_active(resident_blob)
+    # Stamp the live session id so this operator message is scoped to the session
+    # it was sent into; NULL when no session is active (cadence path). See the
+    # scoping queries in strategic_resident_session.py and the poll endpoint.
+    resident_session_id = (
+        resident_blob.get("session_id")
+        if isinstance(resident_blob, dict) and resident_active
+        else None
+    )
     trimmed_content = content.strip()
     if not trimmed_content:
         raise HTTPException(status_code=400, detail="Content cannot be empty")
@@ -228,6 +237,7 @@ async def create_operator_project_message(
         content=trimmed_content,
         context=message_context,
         idempotency_key=idem_key,
+        resident_session_id=resident_session_id,
     )
     session.add(msg)
     try:

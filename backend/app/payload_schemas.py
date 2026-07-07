@@ -192,6 +192,89 @@ def _looks_like_test_file(path: str) -> bool:
     return in_test_dir or name_matches
 
 
+def _normalize_plan_acceptance_evidence(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    if not set(raw).issubset({"kind", "descriptor", "selector"}):
+        return None
+    kind = raw.get("kind")
+    if kind not in {"test", "behavior", "artifact", "visual"}:
+        return None
+    descriptor = raw.get("descriptor")
+    if not isinstance(descriptor, str):
+        return None
+    descriptor = descriptor.strip()
+    if not descriptor:
+        return None
+    result: dict[str, Any] = {"kind": kind, "descriptor": descriptor}
+    selector = raw.get("selector")
+    if selector is not None:
+        if not isinstance(selector, str):
+            return None
+        result["selector"] = selector
+    return result
+
+
+def _split_test_reference(value: str | None) -> tuple[str, str | None] | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    path_part, _, node_part = candidate.partition("::")
+    path_part = path_part.strip()
+    if not _looks_like_test_file(path_part):
+        return None
+    node_part = node_part.strip()
+    return path_part, node_part or None
+
+
+def _payload_acceptance_evidence_from_context(raw: Any) -> dict[str, Any] | None:
+    evidence = _normalize_plan_acceptance_evidence(raw)
+    if evidence is None:
+        return None
+
+    kind = evidence["kind"]
+    descriptor = evidence["descriptor"]
+    selector = evidence.get("selector")
+    if kind == "behavior":
+        return {"kind": "observable_behavior", "description": descriptor}
+    if kind == "artifact":
+        return {"kind": "downstream_artifact", "artifact_id": descriptor}
+    if kind == "visual":
+        if selector is None:
+            return None
+        try:
+            viewport_width = int(selector.strip())
+        except ValueError:
+            return None
+        return {
+            "kind": "visual",
+            "component": descriptor,
+            "viewport_width": viewport_width,
+        }
+    if kind == "test":
+        selector_ref = _split_test_reference(selector)
+        if selector_ref is not None:
+            path_part, node_part = selector_ref
+            result: dict[str, Any] = {"kind": "named_test", "test_path": path_part}
+            if node_part:
+                result["test_id"] = node_part
+            return result
+
+        descriptor_ref = _split_test_reference(descriptor)
+        if descriptor_ref is None:
+            return None
+        path_part, node_part = descriptor_ref
+        result = {"kind": "named_test", "test_path": path_part}
+        if node_part:
+            result["test_id"] = node_part
+        elif isinstance(selector, str) and selector.strip():
+            result["test_id"] = selector.strip()
+        return result
+    return None
+
+
 class AcceptanceEvidence(BaseModel):
     """A small, closed declaration of what would prove a code task's claim true.
 
@@ -236,6 +319,11 @@ class AcceptanceEvidence(BaseModel):
     component: str | None = None
     viewport_width: int | None = Field(default=None, ge=1, le=4096)
     assertion_type: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_context_shape(cls, value: Any) -> Any:
+        return _payload_acceptance_evidence_from_context(value) or value
 
     @model_validator(mode="after")
     def _check_kind_shape(self) -> AcceptanceEvidence:
@@ -319,6 +407,70 @@ def read_acceptance_evidence(first_payload: dict | None) -> AcceptanceEvidence |
         return AcceptanceEvidence.model_validate(raw)
     except Exception:  # noqa: BLE001 — malformed declaration reads as absent
         return None
+
+
+def _context_acceptance_evidence_from_payload(
+    evidence: AcceptanceEvidence,
+) -> dict[str, Any] | None:
+    if evidence.kind == "named_test":
+        test_path = (evidence.test_path or "").strip()
+        if not test_path:
+            return None
+        path_part, _, inline_node = test_path.partition("::")
+        result: dict[str, Any] = {
+            "kind": "test",
+            "descriptor": (evidence.test_id or inline_node or path_part.strip() or test_path).strip(),
+            "selector": test_path,
+        }
+        return result
+    if evidence.kind == "observable_behavior":
+        description = (evidence.description or "").strip()
+        if not description:
+            return None
+        return {"kind": "behavior", "descriptor": description}
+    if evidence.kind == "downstream_artifact":
+        artifact_id = (evidence.artifact_id or "").strip()
+        if not artifact_id:
+            return None
+        return {"kind": "artifact", "descriptor": artifact_id}
+    if evidence.kind == "visual":
+        component = (evidence.component or "").strip()
+        if not component or evidence.viewport_width is None:
+            return None
+        return {
+            "kind": "visual",
+            "descriptor": component,
+            "selector": str(evidence.viewport_width),
+        }
+    return None
+
+
+def normalize_acceptance_evidence(
+    raw: Any,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Normalize one acceptance-evidence value for both payload and context.
+
+    The payload channel consumes the strict ``AcceptanceEvidence`` vocabulary;
+    the context channel consumes the lighter ``PlanAcceptanceEvidence``
+    vocabulary. A planner may author either shape. Each side degrades
+    independently to ``None`` when it cannot be validly constructed.
+    """
+    context_evidence = _normalize_plan_acceptance_evidence(raw)
+    payload_model: AcceptanceEvidence | None = None
+    if isinstance(raw, AcceptanceEvidence):
+        payload_model = raw
+    elif isinstance(raw, dict):
+        try:
+            payload_model = AcceptanceEvidence.model_validate(raw)
+        except Exception:  # noqa: BLE001 — malformed side reads as absent
+            payload_model = None
+
+    payload_evidence = (
+        payload_model.model_dump(exclude_none=True) if payload_model is not None else None
+    )
+    if context_evidence is None and payload_model is not None:
+        context_evidence = _context_acceptance_evidence_from_payload(payload_model)
+    return payload_evidence, context_evidence
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +653,19 @@ class StrategicReviewPayload(_SystemPopulated):
     # runner OR declares the enforce-local policy. Optional + default None so
     # existing payloads without it still validate identically.
     local_runner_status: dict[str, Any] | None = None
+    # Trim-proof count of unresolved open operator messages, shipped at critical
+    # tier. Computed from the fetch window (_OPEN_MESSAGES_KEEP=40), so it may
+    # under-report when the live inbox exceeds that window — but it is always
+    # >= what byte-packing surfaces, so the agent can reliably distinguish a
+    # dropped inbox from a genuinely empty one and knows to ./fetch messages.
+    open_message_count: int | None = None
+    # Open FOUND leads from the resident session's examination ledger: surfaces
+    # keyed by the latest FOUND verdict that has not been superseded by a later
+    # CLEAR/advanced/unevidenced on the same surface. Compact shape per entry:
+    # {surfaceKey, note, at}. Optional + default None; injected only when the
+    # ledger is present and has at least one open FOUND entry, so existing
+    # payloads and callers are unaffected.
+    resident_exam_leads: list[dict[str, Any]] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
@@ -722,6 +887,47 @@ class PlanAcceptanceEvidence(BaseModel):
     selector: str | None = None
 
 
+def _normalize_payload_acceptance_evidence(raw: dict) -> dict | None:
+    """Normalize a *payload*-vocabulary acceptance-evidence dict into the lighter
+    ``{kind, descriptor[, selector]}`` context shape.
+
+    Findings and plan subtasks declare acceptance_evidence in the payload vocab
+    (:class:`AcceptanceEvidence`: ``named_test`` / ``observable_behavior`` /
+    ``downstream_artifact`` / ``visual``) — that is the shape the merge gate
+    (:func:`read_acceptance_evidence`) consumes. The context channel wants the
+    lighter :class:`PlanAcceptanceEvidence` vocab. Historically the two were
+    disjoint, so a finding that declared the payload vocab was silently dropped
+    from the child context. This maps one onto the other so a single declaration
+    populates BOTH channels. Returns ``None`` (never raises) when *raw* is not a
+    well-formed payload-vocab declaration, leaving the caller's fall-through to
+    treat it as absent.
+    """
+    try:
+        evidence = AcceptanceEvidence.model_validate(raw)
+    except Exception:  # noqa: BLE001 — not a payload-vocab declaration → treat as absent
+        return None
+    if evidence.kind == "named_test":
+        # Carry the full path (optionally ``path::node``) as the selector and a
+        # human-readable reference as the descriptor.
+        selector = (evidence.test_path or "").strip()
+        _, _, node = selector.partition("::")
+        descriptor = (evidence.test_id or node or selector).strip()
+        return {"kind": "test", "descriptor": descriptor, "selector": selector}
+    if evidence.kind == "observable_behavior":
+        return {"kind": "behavior", "descriptor": (evidence.description or "").strip()}
+    if evidence.kind == "downstream_artifact":
+        return {"kind": "artifact", "descriptor": (evidence.artifact_id or "").strip()}
+    if evidence.kind == "visual":
+        result: dict[str, Any] = {
+            "kind": "visual",
+            "descriptor": (evidence.component or "").strip(),
+        }
+        if evidence.viewport_width is not None:
+            result["selector"] = str(evidence.viewport_width)
+        return result
+    return None
+
+
 def parse_acceptance_evidence(raw: Any) -> dict | None:
     """Validate an arbitrary raw acceptance-evidence value into a normalized dict.
 
@@ -732,13 +938,22 @@ def parse_acceptance_evidence(raw: Any) -> dict | None:
     defensive read in ``task_evaluators._declared_success_criterion`` so an
     invalid declaration degrades to today's exact behavior rather than failing a
     decomposition or summary path.
+
+    Accepts BOTH historical shapes: the lighter context vocab
+    (:class:`PlanAcceptanceEvidence`: ``test`` / ``behavior`` / ``artifact`` /
+    ``visual`` with ``descriptor`` / ``selector``) round-trips unchanged, and the
+    payload vocab (:class:`AcceptanceEvidence`: ``named_test`` / … the shape the
+    merge gate consumes) is normalized into the lighter form. The two vocabularies
+    are disjoint on ``kind``, so a declaration matches at most one — previously a
+    payload-vocab declaration was silently dropped from the context channel.
     """
     if not isinstance(raw, dict):
         return None
     try:
         evidence = PlanAcceptanceEvidence.model_validate(raw)
-    except Exception:  # noqa: BLE001 — any validation error means treat as absent
-        return None
+    except Exception:  # noqa: BLE001 — fall through to payload-vocabulary bridge
+        _payload_evidence, context_evidence = normalize_acceptance_evidence(raw)
+        return context_evidence
     descriptor = evidence.descriptor.strip()
     if not descriptor:
         return None
@@ -1315,6 +1530,7 @@ def pack_under_budget(
     used = 0
     trimmed: list[dict] = []
     dropped: list[dict] = []
+    shipped: list[dict] = []
 
     for p in parts:
         key = p["key"]
@@ -1324,7 +1540,17 @@ def pack_under_budget(
             # while the OTHER floored keys' reservations stay protected.
             reserved_remaining -= floor["size"]
         if p["unserializable"]:
-            dropped.append({"key": key, "reason": "value not JSON-serializable"})
+            dropped.append(
+                {"key": key, "reason": "value not JSON-serializable", "priority": p["priority"]}
+            )
+            if p["priority"] in ("high", "critical"):
+                logger.error(
+                    "pack_under_budget: HIGH-TIER section %r (tier=%s) dropped "
+                    "(size unknown) — value not JSON-serializable",
+                    key, p["priority"],
+                )
+            else:
+                logger.warning("pack_under_budget: dropped %r — value not JSON-serializable", key)
             continue
         size = p["size"]
         assert size is not None
@@ -1332,6 +1558,7 @@ def pack_under_budget(
         if size <= remaining:
             packed[key] = p["value"]
             used += size
+            shipped.append({"key": key, "bytes": size, "priority": p["priority"]})
             continue
         included = False
         candidate = floors.get(key)
@@ -1342,14 +1569,28 @@ def pack_under_budget(
         ):
             packed[key] = candidate["value"]
             used += candidate["size"]
-            trimmed.append(candidate["meta"])
+            _trim_rec = {**candidate["meta"], "bytes_original": size, "bytes_trimmed": candidate["size"]}
+            if _fv := (schema.get(key) or {}).get("fetch_verb"):
+                _trim_rec["fetch_verb"] = _fv
+            trimmed.append(_trim_rec)
+            logger.info(
+                "pack_under_budget: trimmed %r (summarized from floor, %d→%d bytes)",
+                key, size, candidate["size"],
+            )
             included = True
         if not included:
             summarized = _compute_summarized_candidate(p)
             if summarized is not None and summarized["size"] <= remaining:
                 packed[key] = summarized["value"]
                 used += summarized["size"]
-                trimmed.append(summarized["meta"])
+                _trim_rec = {**summarized["meta"], "bytes_original": size, "bytes_trimmed": summarized["size"]}
+                if _fv := (schema.get(key) or {}).get("fetch_verb"):
+                    _trim_rec["fetch_verb"] = _fv
+                trimmed.append(_trim_rec)
+                logger.info(
+                    "pack_under_budget: trimmed %r (%d→%d bytes)",
+                    key, size, summarized["size"],
+                )
                 included = True
         if not included:
             if floor is not None:
@@ -1360,7 +1601,14 @@ def pack_under_budget(
                 # the last-resort working set the strategist must always receive.
                 packed[key] = floor["value"]
                 used += floor["size"]
-                trimmed.append({"key": key, "kind": "floored"})
+                _trim_rec = {"key": key, "kind": "floored", "bytes_original": size, "bytes_trimmed": floor["size"]}
+                if _fv := (schema.get(key) or {}).get("fetch_verb"):
+                    _trim_rec["fetch_verb"] = _fv
+                trimmed.append(_trim_rec)
+                logger.info(
+                    "pack_under_budget: trimmed %r to floor (%d→%d bytes)",
+                    key, size, floor["size"],
+                )
                 continue
             if p["priority"] == "critical":
                 top_keys = sorted(
@@ -1369,16 +1617,36 @@ def pack_under_budget(
                     reverse=True,
                 )
                 raise PayloadTooLargeError(used + (p["size"] or 0), budget, top_keys)
-            dropped.append(
-                {
-                    "key": key,
-                    "reason": (
-                        "exceeds remaining budget even after summarize"
-                        if p["summarize"]
-                        else "exceeds remaining budget (no summarize_fn)"
-                    ),
-                }
+            drop_reason = (
+                "exceeds remaining budget even after summarize"
+                if p["summarize"]
+                else "exceeds remaining budget (no summarize_fn)"
             )
+            _drop_rec: dict = {"key": key, "reason": drop_reason, "priority": p["priority"], "bytes": size}
+            if _fv := (schema.get(key) or {}).get("fetch_verb"):
+                _drop_rec["fetch_verb"] = _fv
+            dropped.append(_drop_rec)
+            has_floor_in_schema = (schema.get(key) or {}).get("floor") is not None
+            if has_floor_in_schema:
+                logger.error(
+                    "pack_under_budget: CORE section %r dropped (%d bytes) — "
+                    "floor guarantee lost; %s",
+                    key, size, drop_reason,
+                )
+            elif p["priority"] in ("high", "critical"):
+                # A high/critical-tier section dropping wholesale is a degraded
+                # payload the operator must see loudly — the 2026-07-04 incident
+                # (14 sections, whole open-message inbox) produced no loud signal.
+                logger.error(
+                    "pack_under_budget: HIGH-TIER section %r (tier=%s) dropped "
+                    "(%d bytes) — %s",
+                    key, p["priority"], size, drop_reason,
+                )
+            else:
+                logger.warning(
+                    "pack_under_budget: dropped %r (%d bytes) — %s",
+                    key, size, drop_reason,
+                )
 
     # Surface any pre-trim marker carried on a shipped section into the packer
     # metadata. The packed section still holds its own marker, but reflecting it
@@ -1396,6 +1664,7 @@ def pack_under_budget(
         "budget_used": used,
         "trimmed": trimmed,
         "dropped": dropped,
+        "shipped": shipped,
         "gap_memory_trimmed": gap_memory_trimmed,
     }
     return packed

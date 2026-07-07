@@ -1284,9 +1284,17 @@ def record_playbook_tombstone(
     *,
     archived_at: str | None = None,
 ) -> None:
-    """Record an operator-deletion tombstone and durable suppression key."""
-    tombstone = {"_retirement_reason": "operator_deleted"}
-    _append_archived_playbook_entry(doc, full_key, tombstone, archived_at=archived_at)
+    """Record an operator-deletion tombstone and durable suppression key (idempotent)."""
+    # Skip if an operator_deleted archive row already exists for this key.
+    existing_archive = doc.get("playbook_archive") or []
+    already_tombstoned = any(
+        e.get("_archived_key") == full_key
+        and e.get("_retirement_reason") == "operator_deleted"
+        for e in existing_archive
+    )
+    if not already_tombstoned:
+        tombstone = {"_retirement_reason": "operator_deleted"}
+        _append_archived_playbook_entry(doc, full_key, tombstone, archived_at=archived_at)
 
     deleted_keys = list(doc.get("playbook_deleted_keys") or [])
     if full_key not in deleted_keys:

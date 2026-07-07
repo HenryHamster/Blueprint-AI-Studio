@@ -74,6 +74,7 @@ function runtimeProps(runtimeSection: RuntimeSection) {
     apiHealthy: true,
     wsConnected: true,
     settingsRouterProps: {} as never,
+    addToast: vi.fn(),
     onViewTask: vi.fn(),
     onViewTaskById: vi.fn(),
     onOpenFleet: vi.fn(),
@@ -87,6 +88,11 @@ function runtimeProps(runtimeSection: RuntimeSection) {
     onDismissExperiment: vi.fn(async () => {}),
     onNavigateToKnowledge: vi.fn(),
     onRestartOrchestrator: vi.fn(async () => {}),
+    versionLifecycle: null,
+    versionLifecycleError: null,
+    versionLifecycleLastSuccessAt: null,
+    versionLifecycleRefreshing: false,
+    refreshVersionLifecycle: vi.fn(async () => {}),
   };
 }
 

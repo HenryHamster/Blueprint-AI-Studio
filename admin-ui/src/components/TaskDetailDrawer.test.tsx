@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 
 const apiMocks = vi.hoisted(() => ({
   authGet: vi.fn(),
+  fetchTask: vi.fn(),
   fetchTaskPrFiles: vi.fn(),
 }));
 
@@ -20,6 +21,7 @@ vi.mock('../firebase', () => ({
 vi.mock('../api', () => ({
   API_BASE_URL: '',
   authGet: apiMocks.authGet,
+  fetchTask: apiMocks.fetchTask,
   fetchTaskPrFiles: apiMocks.fetchTaskPrFiles,
 }));
 
@@ -84,6 +86,7 @@ describe('TaskDetailDrawer', () => {
     window.HTMLElement.prototype.scrollIntoView = vi.fn();
     writeTextSpy = vi.fn().mockResolvedValue(undefined);
     apiMocks.authGet.mockResolvedValue(jsonResponse(makeCancelImpact()));
+    apiMocks.fetchTask.mockResolvedValue(null);
     apiMocks.fetchTaskPrFiles.mockResolvedValue({ files: null, pr_number: null });
   });
 

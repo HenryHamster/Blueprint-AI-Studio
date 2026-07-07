@@ -1,7 +1,8 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { Compass, Cpu, Copy, Check, RefreshCw, Trash2 } from 'lucide-react';
-import { API_BASE_URL, listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api';
+import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2 } from 'lucide-react';
+import { API_BASE_URL, listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken } from '../api';
 import type { FleetRunner, FleetRunnerRegistrationResult } from '../api';
+import { ConfirmDialog } from './ConfirmDialog';
 import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
 import {
   formatBytes,
@@ -14,6 +15,7 @@ const LIVENESS_THRESHOLD_SEC = 300;
 const STALE_THRESHOLD_SEC = 600;
 
 type CopyTarget = 'token' | keyof RunnerSetupSnippetCommands;
+type TokenDialogMode = 'enroll' | 'rotate';
 
 function fallbackLivenessLabel(lastSeenAt: string | null): { label: string; cls: string } {
   if (!lastSeenAt) return { label: 'never seen', cls: 'text-neutral-500' };
@@ -256,6 +258,7 @@ function workdayReadinessLine(
 interface TokenDialogProps {
   runnerId: string;
   token: string;
+  mode?: TokenDialogMode;
   preset?: RunnerSetupPreset;
   tokenExpiresAt?: string | null;
   /** True once the just-enrolled runner has heartbeated and shows connected. */
@@ -265,7 +268,16 @@ interface TokenDialogProps {
   onDismiss: () => void;
 }
 
-function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, connected, connectedHostname, onDismiss }: TokenDialogProps) {
+function TokenDialog({
+  runnerId,
+  token,
+  mode = 'enroll',
+  preset = 'default',
+  tokenExpiresAt,
+  connected,
+  connectedHostname,
+  onDismiss,
+}: TokenDialogProps) {
   const [copied, setCopied] = useState<Record<CopyTarget, boolean>>({
     token: false,
     windowsPowerShell: false,
@@ -295,10 +307,16 @@ function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, conn
       <div className="absolute inset-0 bg-black/60" />
       <div className="relative z-10 w-full max-w-2xl bg-neutral-900 border border-neutral-700 rounded-lg p-5 shadow-2xl mx-4">
         <h3 className="text-sm font-semibold text-neutral-200 mb-1">
-          {preset === 'strategic_local' ? 'Strategic runner enrolled' : 'Runner enrolled'}
+          {mode === 'rotate'
+            ? 'Runner token rotated'
+            : preset === 'strategic_local'
+              ? 'Strategic runner enrolled'
+              : 'Runner enrolled'}
         </h3>
         <p className="text-xs text-amber-400 mb-3 font-medium">
-          This token is shown only once and cannot be retrieved again — copy it now.
+          {mode === 'rotate'
+            ? 'This replacement token is shown only once. Restart the existing runner process with it; the previous token no longer authenticates.'
+            : 'This token is shown only once and cannot be retrieved again — copy it now.'}
         </p>
 
         <div className="mb-3">
@@ -343,31 +361,45 @@ function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, conn
               </div>
             ))}
           </div>
-          <div className="text-ui-md text-neutral-500">Run this from the repo root; the first heartbeat connects it below.</div>
+          <div className="text-ui-md text-neutral-500">
+            {mode === 'rotate'
+              ? 'Stop the existing runner process, then restart it from the repo root with the new token.'
+              : 'Run this from the repo root; the first heartbeat connects it below.'}
+          </div>
         </div>
 
-        <div
-          className={`mb-4 flex items-center gap-2 rounded-md border px-3 py-2 text-xs ${
-            connected
-              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-              : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
-          }`}
-          data-testid="runner-connection-status"
-        >
-          {connected ? (
-            <>
-              <Check className="w-4 h-4 shrink-0 text-emerald-400" />
-              <span className="font-medium">
-                Connected on this project{connectedHostname ? ` — ${connectedHostname}` : ''}
-              </span>
-            </>
-          ) : (
-            <>
-              <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-amber-400 animate-pulse" />
-              <span>Waiting for your runner to connect…</span>
-            </>
-          )}
-        </div>
+        {mode === 'rotate' ? (
+          <div
+            className="mb-4 flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"
+            data-testid="runner-connection-status"
+          >
+            <KeyRound className="w-4 h-4 shrink-0 text-amber-300" />
+            <span>Restart required. Existing heartbeats may still reflect the old process until it is restarted.</span>
+          </div>
+        ) : (
+          <div
+            className={`mb-4 flex items-center gap-2 rounded-md border px-3 py-2 text-xs ${
+              connected
+                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+            }`}
+            data-testid="runner-connection-status"
+          >
+            {connected ? (
+              <>
+                <Check className="w-4 h-4 shrink-0 text-emerald-400" />
+                <span className="font-medium">
+                  Connected on this project{connectedHostname ? ` — ${connectedHostname}` : ''}
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-amber-400 animate-pulse" />
+                <span>Waiting for your runner to connect…</span>
+              </>
+            )}
+          </div>
+        )}
 
         <div className="text-xs text-neutral-500 mb-4">Runner ID: {runnerId}</div>
 
@@ -385,13 +417,18 @@ function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, conn
 interface Props {
   projectId: string;
   requireLocalRunner?: boolean;
+  refreshSignal?: number;
+  /** When true (WS stream connected), suppress the 30s blind poll — rely on
+   *  refreshSignal and post-mutation loads instead. Absent or false keeps the
+   *  poll running as a safety-net (WS down / prop not yet plumbed). */
+  live?: boolean;
 }
 
 function tokenExpiryFromRegisterResult(result: FleetRunnerRegistrationResult): string | null {
   return result.token_expires_at ?? result.expires_at ?? result.expiresAt ?? null;
 }
 
-export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Props) {
+export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live }: Props) {
   const [runners, setRunners] = useState<FleetRunner[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -399,10 +436,13 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
   const [pendingToken, setPendingToken] = useState<{
     runnerId: string;
     token: string;
+    mode: TokenDialogMode;
     preset: RunnerSetupPreset;
     tokenExpiresAt: string | null;
   } | null>(null);
+  const [rotating, setRotating] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -422,17 +462,19 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
   }, [projectId]);
 
   useEffect(() => { setLoading(true); load(); }, [load]);
+  useEffect(() => { if (refreshSignal !== undefined) load(); }, [load, refreshSignal]);
 
   useEffect(() => {
+    if (live === true) return;
     const interval = setInterval(load, 30000);
     return () => clearInterval(interval);
-  }, [load]);
+  }, [load, live]);
 
   // While the enroll dialog is open, resolve the just-enrolled runner from the
   // list so the dialog can show live "waiting… / connected" feedback. Poll faster
   // than the 30s baseline until it connects, closing the enrollment loop the
   // operator was previously left guessing at.
-  const enrolledRunner = pendingToken
+  const enrolledRunner = pendingToken?.mode === 'enroll'
     ? runners.find(r => r.id === pendingToken.runnerId)
     : undefined;
   const enrolledConnected = enrolledRunner ? isRunnerLive(enrolledRunner) : false;
@@ -452,6 +494,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
       setPendingToken({
         runnerId: result.runner_id,
         token: result.token,
+        mode: 'enroll',
         preset,
         tokenExpiresAt: tokenExpiryFromRegisterResult(result),
       });
@@ -463,16 +506,45 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
     }
   };
 
-  const handleRevoke = async (runner: FleetRunner) => {
-    if (!window.confirm(`Revoke runner ${runner.hostname ?? runner.id}? It will no longer be able to authenticate.`)) return;
-    setRevoking(runner.id);
-    try {
-      await revokeFleetRunner(projectId, runner.id);
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRevoking(null);
+  const handleRotate = (runner: FleetRunner) => {
+    setPendingConfirm({ type: 'rotate', runner });
+  };
+
+  const handleRevoke = (runner: FleetRunner) => {
+    setPendingConfirm({ type: 'revoke', runner });
+  };
+
+  const executeConfirmedAction = async () => {
+    if (!pendingConfirm) return;
+    const { type, runner } = pendingConfirm;
+    setPendingConfirm(null);
+    if (type === 'rotate') {
+      setRotating(runner.id);
+      try {
+        const result = await rotateFleetRunnerToken(projectId, runner.id);
+        setPendingToken({
+          runnerId: result.runner_id,
+          token: result.token,
+          mode: 'rotate',
+          preset: runner.capabilities.runner_preset === 'strategic_local' ? 'strategic_local' : 'default',
+          tokenExpiresAt: tokenExpiryFromRegisterResult(result),
+        });
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setRotating(null);
+      }
+    } else {
+      setRevoking(runner.id);
+      try {
+        await revokeFleetRunner(projectId, runner.id);
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setRevoking(null);
+      }
     }
   };
 
@@ -730,6 +802,15 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
                   </div>
                 </div>
                 <button
+                  onClick={() => handleRotate(runner)}
+                  disabled={rotating === runner.id}
+                  className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-amber-500/10 hover:text-amber-300 disabled:opacity-40 md:min-h-9 md:min-w-9"
+                  aria-label={`Rotate token for runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
+                  title="Rotate runner token"
+                >
+                  <KeyRound className="w-3.5 h-3.5" />
+                </button>
+                <button
                   onClick={() => handleRevoke(runner)}
                   disabled={revoking === runner.id}
                   className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40 md:min-h-9 md:min-w-9"
@@ -748,11 +829,24 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
         <TokenDialog
           runnerId={pendingToken.runnerId}
           token={pendingToken.token}
+          mode={pendingToken.mode}
           preset={pendingToken.preset}
           tokenExpiresAt={pendingToken.tokenExpiresAt}
-          connected={enrolledConnected}
-          connectedHostname={enrolledRunner?.hostname}
+          connected={pendingToken.mode === 'enroll' ? enrolledConnected : false}
+          connectedHostname={pendingToken.mode === 'enroll' ? enrolledRunner?.hostname : null}
           onDismiss={() => setPendingToken(null)}
+        />
+      )}
+
+      {pendingConfirm && (
+        <ConfirmDialog
+          title={pendingConfirm.type === 'rotate' ? 'Rotate runner token' : 'Revoke runner'}
+          message={pendingConfirm.type === 'rotate'
+            ? `Rotate token for runner ${pendingConfirm.runner.hostname ?? pendingConfirm.runner.id}? The current token will stop working immediately.`
+            : `Revoke runner ${pendingConfirm.runner.hostname ?? pendingConfirm.runner.id}? It will no longer be able to authenticate.`}
+          confirmLabel={pendingConfirm.type === 'rotate' ? 'Rotate token' : 'Revoke'}
+          onConfirm={() => void executeConfirmedAction()}
+          onCancel={() => setPendingConfirm(null)}
         />
       )}
     </div>

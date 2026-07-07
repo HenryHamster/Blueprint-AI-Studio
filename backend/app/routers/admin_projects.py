@@ -41,7 +41,7 @@ from app.ci_resolution import (
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
-from app.task_direction_refs import task_primary_direction_ids
+from app.task_direction_refs import task_primary_direction_ids_shallow
 from app.onboarding_proof import build_onboarding_proof_block
 
 router = APIRouter(
@@ -324,6 +324,81 @@ async def get_project(
     }
 
 
+@router.get("/projects/{project_id}/summary")
+@limiter.limit("30/minute")
+async def get_project_summary(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return a lightweight project summary excluding heavy JSONB fields.
+
+    Omits design_doc and self_reflection_log (which can be hundreds of KB)
+    so mount-time fetches stay small. Use GET /api/admin/projects/{id} for the
+    full record when design_doc or self_reflection_log are explicitly needed.
+    """
+    query = (
+        select(Project, ProjectMember.role)
+        .join(ProjectMember, ProjectMember.project_id == Project.id)
+        .where(
+            Project.id == project_id,
+            ProjectMember.user_id == current_user["user_id"],
+        )
+    )
+    row = (await session.execute(query)).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project, role = row
+    problem_model_dict = project.problem_model or {}
+    proof_problem_model = enrich_problem_model_capability_proofs(
+        problem_model_dict,
+        getattr(project, "capability_proof_records", None),
+    )
+    size_health = None
+    if problem_model_dict:
+        try:
+            pm = ProblemModel(**problem_model_dict)
+            size_health = compute_model_size_signal(pm)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[STRATEGIC_STATE] problem model size signal skipped: %s",
+                exc,
+            )
+    return {
+        "id": str(project.id),
+        "name": project.name,
+        "user_id": project.user_id,
+        "status": project.status,
+        "github_owner": project.github_owner,
+        "github_repo": project.github_repo,
+        "created_at": project.created_at.isoformat() if project.created_at else None,
+        "directions": project.directions,
+        "vision": project.vision or {},
+        "problem_model": proof_problem_model,
+        "problem_model_size_health": size_health,
+        "running_update": project.running_update,
+        "running_update_acknowledged_at": (
+            project.running_update_acknowledged_at.isoformat()
+            if project.running_update_acknowledged_at
+            else None
+        ),
+        "build_config": _redact_build_config(project.build_config or {}, role),
+        "build_config_warnings": build_config_lint_warnings(project.build_config),
+        "merge_verification_verdict": compute_merge_verification_verdict(project),
+        "merge_gate_runtime": merge_gate_runtime_block(project),
+        "autonomous_enabled": project.autonomous_enabled,
+        "paused": project.paused,
+        "is_self_repo": project.is_self_repo,
+        "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
+        "approval_gate_config": project.approval_gate_config or {},
+        "capability_proof_summary": _build_capability_proof_summary(
+            project.capability_proof_records or {}
+        ),
+        "capability_adoption_verdicts": get_trial_verdicts(project),
+        "my_role": role,
+        "onboarding_proof": build_onboarding_proof_block(project),
+    }
 
 
 class ProjectUpdate(BaseModel):
@@ -839,6 +914,8 @@ async def dismiss_pending_confirmation(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["problem_model"])
     current_model = parse_problem_model(project.problem_model)
     matched = next(
         (p for p in current_model.pending_user_confirmation if p.id == pending_id),
@@ -898,6 +975,8 @@ async def accept_pending_confirmation(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["problem_model"])
     current_model = parse_problem_model(project.problem_model)
 
     matched = next(
@@ -1283,9 +1362,9 @@ async def get_direction_task_counts(
                 Task.status,
                 Task.payloads,
                 Task.context,
-                Task.plan_output,
                 Task.title,
                 Task.latest_status_message,
+                Task.created_at,
                 raiseload=True,
             )
         )
@@ -1293,29 +1372,44 @@ async def get_direction_task_counts(
     )
     tasks = result.scalars().all()
 
+    # Per-direction cap on the returned active-task preview. `counts` and
+    # `counts_by_type` are still tallied across every matched task; only the
+    # `active_tasks` list is bounded so this ~10s-polled response can't grow
+    # without limit when a single direction accumulates thousands of live
+    # tasks. We keep the most-recent N by created_at, sorting in Python AFTER
+    # the scan so the query's (unordered) 5000-row set — and therefore the
+    # counts — stays byte-identical to the previous behavior.
+    _ACTIVE_TASKS_CAP = 50
+
     counts: Dict[str, int] = {}
     counts_by_type: Dict[str, Dict[str, int]] = {}
-    active_tasks: Dict[str, list[dict]] = {}
+    active_raw: Dict[str, list[tuple]] = {}
     for task in tasks:
         payload = task.first_payload
-        dir_ids = task_primary_direction_ids(task)
+        dir_ids = task_primary_direction_ids_shallow(task)
         if not dir_ids:
             continue
         task_type = payload.get("type") or "unknown"
+        entry = {
+            "id": str(task.id),
+            "status": task.status.value
+            if hasattr(task.status, "value")
+            else str(task.status),
+            "title": task.title or "",
+            "latest_status_message": (task.latest_status_message or "")[:200],
+        }
         for d_id in dir_ids:
             counts[d_id] = counts.get(d_id, 0) + 1
             counts_by_type.setdefault(d_id, {})
             counts_by_type[d_id][task_type] = counts_by_type[d_id].get(task_type, 0) + 1
-            active_tasks.setdefault(d_id, []).append(
-                {
-                    "id": str(task.id),
-                    "status": task.status.value
-                    if hasattr(task.status, "value")
-                    else str(task.status),
-                    "title": task.title or "",
-                    "latest_status_message": (task.latest_status_message or "")[:200],
-                }
-            )
+            active_raw.setdefault(d_id, []).append((task.created_at, entry))
+
+    active_tasks: Dict[str, list[dict]] = {}
+    for d_id, entries in active_raw.items():
+        # Sort on the created_at key only (never the tuple) so equal timestamps
+        # don't force a comparison of the unorderable dict payloads.
+        entries.sort(key=lambda e: e[0], reverse=True)
+        active_tasks[d_id] = [item for _, item in entries[:_ACTIVE_TASKS_CAP]]
 
     return {
         "counts": counts,
@@ -1505,12 +1599,20 @@ async def get_autonomous_status(
 ):
     from app.shared_state import autonomous_failure_counts, runtime_config
     from app.autonomous_research import project_parallelism_cap
+    from app.autonomous_spawn_budget import (
+        autonomous_spawn_budget_config_from_runtime,
+        classify_autonomous_spawn_budget_category,
+        compute_autonomous_spawn_budget_snapshot,
+    )
 
+    user_pids = (
+        await session.execute(_user_project_ids(current_user["user_id"]))
+    ).scalars().all()
     projects = (
         (
             await session.execute(
                 select(Project)
-                .where(Project.id.in_(_user_project_ids(current_user["user_id"])))
+                .where(Project.id.in_(user_pids))
                 .order_by(Project.created_at.desc())
             )
         )
@@ -1519,45 +1621,94 @@ async def get_autonomous_status(
     )
 
     one_hour_ago = _utcnow() - timedelta(hours=1)
-
-    # Count ALL orchestrator tasks per project in the last hour (mirrors the per-project
-    # rate guard in autonomous_research.py which counts all ORCHESTRATOR-created tasks).
-    user_pids = _user_project_ids(current_user["user_id"])
-    orch_count_rows = (
-        await session.execute(
-            select(Task.project_id, func.count().label("cnt"))
-            .where(
-                Task.project_id.in_(user_pids),
-                Task.created_by == "ORCHESTRATOR",
-                Task.created_at >= one_hour_ago,
-            )
-            .group_by(Task.project_id)
+    budget_snapshot = None
+    try:
+        budget_snapshot = await compute_autonomous_spawn_budget_snapshot(
+            session, runtime_config=runtime_config, now=_utcnow()
         )
-    ).all()
-    tasks_per_project: dict = {row.project_id: row.cnt for row in orch_count_rows}
-
-    # Batch query: most recent autonomous task per project (30-day lookback to
-    # avoid a full-table scan as task history grows; sufficient for rate display)
-    last_research_subq = (
-        select(
-            Task.project_id,
-            func.max(Task.created_at).label("max_created_at"),
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[AUTONOMOUS-STATUS] spawn budget snapshot failed open for user %s",
+            current_user["user_id"],
+            exc_info=True,
         )
-        .where(
-            Task.created_by == "ORCHESTRATOR",
-            Task.created_at >= _utcnow() - timedelta(days=30),
-        )
-        .group_by(Task.project_id)
-        .subquery()
-    )
-    last_research_rows = (
-        await session.execute(
-            select(last_research_subq.c.project_id, last_research_subq.c.max_created_at)
-        )
-    ).all()
-    last_research_map = {
-        row.project_id: row.max_created_at for row in last_research_rows
+    project_stats: dict = {
+        project.id: {
+            "tasks_spawned_last_hour": 0,
+            "initiative_tasks_spawned_last_hour": 0,
+            "servicing_tasks_spawned_last_hour": 0,
+            "other_tasks_spawned_last_hour": 0,
+            "research_create_tasks_spawned_last_hour": 0,
+            "last_research_at": None,
+        }
+        for project in projects
     }
+    if user_pids:
+        budget_config = autonomous_spawn_budget_config_from_runtime(runtime_config)
+        recent_autonomous_rows = (
+            await session.execute(
+                select(
+                    Task.project_id,
+                    Task.payloads,
+                    Task.context,
+                    Task.parent_task_id,
+                    Task.depends_on,
+                    Task.created_at,
+                ).where(
+                    Task.project_id.in_(user_pids),
+                    Task.created_by == "ORCHESTRATOR",
+                    Task.created_at >= one_hour_ago,
+                )
+            )
+        ).all()
+        for row in recent_autonomous_rows:
+            stats = project_stats.get(row.project_id)
+            if stats is None:
+                continue
+            payloads = row.payloads if isinstance(row.payloads, list) else []
+            payload = payloads[0] if payloads and isinstance(payloads[0], dict) else {}
+            task_type = str(payload.get("type") or "").strip()
+            category = classify_autonomous_spawn_budget_category(
+                task_type=task_type,
+                config=budget_config,
+                parent_task_id=row.parent_task_id,
+                depends_on=row.depends_on,
+                payload=payload,
+                context=row.context if isinstance(row.context, dict) else {},
+            )
+            stats["tasks_spawned_last_hour"] += 1
+            stats[f"{category}_tasks_spawned_last_hour"] += 1
+            if task_type in {"research", "create"}:
+                stats["research_create_tasks_spawned_last_hour"] += 1
+                last_research_at = stats["last_research_at"]
+                if last_research_at is None or row.created_at > last_research_at:
+                    stats["last_research_at"] = row.created_at
+
+    if resolve_dialect_name(session) == "sqlite":
+        initiative_type_expr = func.json_extract(Task.payloads, "$[0].type")
+    else:
+        initiative_type_expr = Task.payloads[0]["type"].as_string()
+    if user_pids:
+        last_research_rows = (
+            await session.execute(
+                select(
+                    Task.project_id,
+                    func.max(Task.created_at).label("max_created_at"),
+                )
+                .where(
+                    Task.project_id.in_(user_pids),
+                    Task.created_by == "ORCHESTRATOR",
+                    Task.created_at >= _utcnow() - timedelta(days=30),
+                    initiative_type_expr.in_(["research", "create"]),
+                )
+                .group_by(Task.project_id)
+            )
+        ).all()
+        last_research_map = {
+            row.project_id: row.max_created_at for row in last_research_rows
+        }
+    else:
+        last_research_map = {}
 
     fleet_default = runtime_config["max_autonomous_tasks_per_hour"]
     result = []
@@ -1587,7 +1738,21 @@ async def get_autonomous_status(
                 "last_research_at": last_research_map[project.id].isoformat()
                 if last_research_map.get(project.id)
                 else None,
-                "tasks_spawned_last_hour": tasks_per_project.get(project.id, 0),
+                "tasks_spawned_last_hour": project_stats[project.id][
+                    "tasks_spawned_last_hour"
+                ],
+                "initiative_tasks_spawned_last_hour": project_stats[project.id][
+                    "initiative_tasks_spawned_last_hour"
+                ],
+                "servicing_tasks_spawned_last_hour": project_stats[project.id][
+                    "servicing_tasks_spawned_last_hour"
+                ],
+                "other_tasks_spawned_last_hour": project_stats[project.id][
+                    "other_tasks_spawned_last_hour"
+                ],
+                "research_create_tasks_spawned_last_hour": project_stats[project.id][
+                    "research_create_tasks_spawned_last_hour"
+                ],
                 "rate_limit": effective_cap,
                 "fleet_default_rate_limit": fleet_default,
                 "rate_limit_source": "project_override"
@@ -1596,7 +1761,12 @@ async def get_autonomous_status(
             }
         )
 
-    return {"projects": result}
+    return {
+        "projects": result,
+        "global_rate_limit": budget_snapshot.as_log_fields()
+        if budget_snapshot is not None
+        else None,
+    }
 
 
 @router.post("/projects/{project_id}/bootstrap/retry")

@@ -7,6 +7,7 @@ import {
   listFleetRunners,
   purgeArchive,
   registerFleetRunner,
+  rotateFleetRunnerToken,
   type FleetRunner,
   type FleetUtilizationResponse,
 } from './api';
@@ -509,6 +510,7 @@ describe('operator workbench contract fixtures', () => {
       .mockResolvedValueOnce(jsonResponse(fleetFixture))
       .mockResolvedValueOnce(jsonResponse([runnerFixture]))
       .mockResolvedValueOnce(jsonResponse({ runner_id: 'runner-new', token: 'runner-token' }))
+      .mockResolvedValueOnce(jsonResponse({ runner_id: 'runner-1', token: 'rotated-token' }))
       .mockResolvedValueOnce(jsonResponse({ deleted_count: 3, has_more: false }));
 
     await expect(fetchFleetUtilization()).resolves.toMatchObject({
@@ -529,8 +531,17 @@ describe('operator workbench contract fixtures', () => {
       preset: 'strategic_local',
     });
 
+    await expect(rotateFleetRunnerToken('proj-1', 'runner-1')).resolves.toEqual({
+      runner_id: 'runner-1',
+      token: 'rotated-token',
+    });
+    expect(String(fetchMock.mock.calls[3][0])).toContain(
+      '/api/admin/projects/proj-1/runners/runner-1/rotate-token',
+    );
+    expect((fetchMock.mock.calls[3][1] as RequestInit).method).toBe('POST');
+
     await expect(purgeArchive(90)).resolves.toEqual({ deleted_count: 3, has_more: false });
-    expect(JSON.parse(String((fetchMock.mock.calls[3][1] as RequestInit).body))).toEqual({
+    expect(JSON.parse(String((fetchMock.mock.calls[4][1] as RequestInit).body))).toEqual({
       older_than_days: 90,
     });
   });

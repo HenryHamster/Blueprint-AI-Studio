@@ -19,7 +19,6 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
-    DateTime,
     String,
     Integer,
     Float,
@@ -34,11 +33,27 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session as _OrmSession
-from sqlalchemy.types import TypeDecorator
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from app.capability_registry import derive_provider_marker
+from app.models_base import NaiveUTCDateTime
+# Release / qualification domain models were peeled into ``app.release_models``
+# (see the marker comment further down where they used to be defined) to keep
+# this module under its size guardrail. They are imported here and re-exported
+# so ``from app.models import ReleaseVersion`` (and siblings) is unchanged and
+# so importing this module registers their tables on ``SQLModel.metadata``.
+# ``app.release_models`` depends only on ``app.models_base`` / ``app.time_utils``
+# (never on ``app.models``), so this import forms no cycle.
+from app.release_models import (  # noqa: F401
+    AuditFindingResolution,
+    CompletionDebtEntry,
+    CriterionEvidence,
+    QualificationVerdict,
+    ReleaseDeployArtifact,
+    ReleaseVersion,
+    VersionAcceptanceCriterion,
+)
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,
@@ -46,37 +61,9 @@ from app.vm_cost_rates import (
 )
 
 
-class NaiveUTCDateTime(TypeDecorator):
-    """TIMESTAMPTZ in DB, naive UTC datetime in Python.
-
-    Phase D2 (alembic 0061) migrated several columns to TIMESTAMPTZ for
-    server-default support and clock-skew safety, but the rest of the codebase
-    uses naive UTC throughout (_utcnow() returns naive). Rather than sweep
-    every comparison site to handle aware datetimes, strip tz on read.
-
-    Round 3 audit (M1): symmetric write path. Future tz-aware writers
-    (e.g. anything calling ``datetime.now(timezone.utc)`` instead of
-    ``_utcnow()``) get normalized to naive UTC on the way to the DB so the
-    column stays internally consistent. asyncpg sends naive datetimes to
-    TIMESTAMPTZ columns and Postgres interprets them as UTC.
-
-    Pairs with the F1 helper rename _to_naive_utc -> _strip_tz_assume_utc;
-    after this decorator lands, ORM-loaded datetimes are already naive and
-    callsite strips become no-ops (audit 2026-04-29 round 2 / C3 + H1).
-    """
-
-    impl = DateTime(timezone=True)
-    cache_ok = True
-
-    def process_bind_param(self, value, dialect):
-        if value is not None and value.tzinfo is not None:
-            return value.astimezone(timezone.utc).replace(tzinfo=None)
-        return value
-
-    def process_result_value(self, value, dialect):
-        if value is not None and value.tzinfo is not None:
-            return value.astimezone(timezone.utc).replace(tzinfo=None)
-        return value
+# ``NaiveUTCDateTime`` now lives in :mod:`app.models_base` (a dependency-free
+# module shared with the peeled-out domain model modules) and is imported at
+# the top of this module. It remains importable as ``app.models.NaiveUTCDateTime``.
 
 
 logger = logging.getLogger(__name__)
@@ -562,7 +549,7 @@ class Project(SQLModel, table=True):
     is_self_repo: bool = Field(default=False)
     # Archived flag: durable, reversible "set aside" state so a project can be
     # hidden without deletion. Server default false backfills existing rows.
-    archived: bool = Field(default=False)
+    archived: bool = Field(default=False, index=True)
     # Build configuration: onboarding seeds repo-derived defaults here, and
     # admin PATCH / re-detect preserves operator-owned branch/cleanup overrides.
     build_config: Dict[str, Any] | None = Field(
@@ -1536,6 +1523,17 @@ class Task(SQLModel, table=True):
         # this metadata Index registers the name for
         # test_model_indexes_covered_by_migrations.
         Index("ix_task_created_at", "created_at"),
+        Index("ix_task_started_at", "started_at"),
+        # Partial index on vm_stopped_at for anomaly_detection cost-window queries
+        # that filter vm_stopped_at IS NOT NULL and order by vm_stopped_at.
+        # Without this, the query full-scans all task history linearly.
+        # Postgres-only predicate; alembic 0381 creates it CONCURRENTLY.
+        Index(
+            "ix_task_vm_stopped_at",
+            "vm_stopped_at",
+            postgresql_where=text("vm_stopped_at IS NOT NULL"),
+            sqlite_where=text("vm_stopped_at IS NOT NULL"),
+        ),
     )
 
     # Optimistic concurrency: ``version_id_col`` mapper arg was dropped in
@@ -1893,6 +1891,27 @@ def bank_task_current_attempt(
     if cache_creation_tokens > 0 or cache_read_tokens > 0:
         snapshot["llm_cache_creation_input_tokens"] = cache_creation_tokens
         snapshot["llm_cache_read_input_tokens"] = cache_read_tokens
+    # Carry num_turns only when the agent reported it; older agents that omit the
+    # field produce banked rows without this key so per-turn metrics stay None.
+    num_turns_val = (task.api_call_summary or {}).get("num_turns")
+    if isinstance(num_turns_val, int) and num_turns_val >= 0:
+        snapshot["num_turns"] = num_turns_val
+    # Carry total_tool_result_bytes only when the agent reported it; omit the key
+    # for older agents so downstream analysis can distinguish zero from unreported.
+    tool_result_bytes_val = (task.api_call_summary or {}).get("total_tool_result_bytes")
+    if isinstance(tool_result_bytes_val, int) and tool_result_bytes_val >= 0:
+        snapshot["total_tool_result_bytes"] = tool_result_bytes_val
+    # Carry prompt-size telemetry only when present; omit for older agents or
+    # non-research/plan tasks so downstream attribution can distinguish unknown.
+    prompt_size_val = (task.api_call_summary or {}).get("prompt_size_bytes")
+    if isinstance(prompt_size_val, int) and prompt_size_val >= 0:
+        snapshot["prompt_size_bytes"] = prompt_size_val
+    prompt_section_count_val = (task.api_call_summary or {}).get("prompt_section_count")
+    if isinstance(prompt_section_count_val, int) and prompt_section_count_val >= 0:
+        snapshot["prompt_section_count"] = prompt_section_count_val
+    prompt_section_sizes_val = (task.api_call_summary or {}).get("prompt_section_sizes")
+    if isinstance(prompt_section_sizes_val, list):
+        snapshot["prompt_section_sizes"] = prompt_section_sizes_val
     history = list(task.attempt_history or [])
     history.append(snapshot)
     task.attempt_history = history
@@ -2415,9 +2434,65 @@ def _stamp_task_provider_floor(mapper, connection, target: Task):
         logger.warning("[MODELS] before_insert provider-floor stamp failed: %s", exc)
 
 
+def _terminal_time_from_status_log(target: Task) -> datetime | None:
+    """Best-effort terminal timestamp from the last ``status_log`` entry.
+
+    Mirrors ``admin_analytics._derive_completed_at``'s status_log tail read so a
+    task inserted already-terminal records the SAME instant those helpers would
+    otherwise derive from the log. Returns a naive-UTC datetime, or None when the
+    log is empty/malformed.
+    """
+    log = target.status_log
+    if not log:
+        return None
+    last = log[-1]
+    if not isinstance(last, dict):
+        return None
+    ts = last.get("t")
+    if not isinstance(ts, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+
+
+@event.listens_for(Task, "before_insert")
+def _stamp_task_completed_at_on_insert(mapper, connection, target: Task):
+    """Persist completion time for terminal tasks constructed already-terminal.
+
+    Derives the stamp from the task's own terminal signal — the last
+    ``status_log`` entry's timestamp, else ``created_at`` — rather than
+    wall-clock now, so a task inserted already-terminal (a backfill, a replayed
+    row, or a backdated test fixture) records its ACTUAL completion time. This
+    mirrors the transition path, where ``_on_status_set`` stamps ``completed_at``
+    with the same instant it appends to ``status_log``, keeping the durable
+    column and the log tail consistent for downstream terminal-time helpers.
+    """
+    try:
+        if (
+            target.status in TASK_OUTCOME_TERMINAL_STATUSES
+            and target.completed_at is None
+        ):
+            target.completed_at = (
+                _terminal_time_from_status_log(target)
+                or target.created_at
+                or _utcnow()
+            )
+    except Exception as exc:  # noqa: BLE001 — never block the flush
+        logger.warning(
+            "[MODELS] before_insert completed_at stamp failed: %s",
+            exc,
+        )
+
+
 @event.listens_for(Task.status, "set")
 def _on_status_set(target: Task, value, oldvalue, initiator):
-    if value and isinstance(oldvalue, str) and value != oldvalue:
+    is_terminal = value in TASK_OUTCOME_TERMINAL_STATUSES
+    was_terminal = oldvalue in TASK_OUTCOME_TERMINAL_STATUSES
+    status_changed = bool(value and isinstance(oldvalue, str) and value != oldvalue)
+    if status_changed:
         now = _utcnow()
         entry = {
             "t": now.isoformat(),
@@ -2444,31 +2519,53 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
                 "[MODELS] _on_status_set: skipped updated_at stamp (%s)",
                 e,
             )
-        task_id = str(target.id)
-        # Notify JWT revocation when task reaches a resource-releasing state.
-        # BLOCKED/PARKED are recoverable, but both release the active agent/VM
-        # binding and must revoke the old token until a fresh QUEUED claim revives it.
-        if task_status_releases_agent_resources(value):
-            for cb in _on_task_terminal_callbacks:
-                try:
-                    cb(task_id)
-                except Exception as e:  # noqa: PERF203
-                    logger.error(
-                        f"[MODELS] Terminal callback failed for task {task_id}: {e}",
-                        exc_info=True,
-                    )
-        else:
-            # Non-terminal status set (QUEUED, PROVISIONING, IN_PROGRESS,
-            # EVALUATING). Fire revive callbacks so any deny-list entries
-            # populated by an earlier terminal transition are cleared.
-            for cb in _on_task_revive_callbacks:
-                try:
-                    cb(task_id)
-                except Exception as e:  # noqa: PERF203
-                    logger.error(
-                        f"[MODELS] Revive callback failed for task {task_id}: {e}",
-                        exc_info=True,
-                    )
+    else:
+        now = _utcnow()
+    if is_terminal:
+        try:
+            if target.completed_at is None:
+                target.completed_at = now
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "[MODELS] _on_status_set: skipped completed_at stamp (%s)",
+                e,
+            )
+    elif was_terminal:
+        try:
+            if target.completed_at is not None:
+                target.completed_at = None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "[MODELS] _on_status_set: skipped completed_at clear (%s)",
+                e,
+            )
+    if not status_changed:
+        return
+    task_id = str(target.id)
+    # Notify JWT revocation when task reaches a resource-releasing state.
+    # BLOCKED/PARKED are recoverable, but both release the active agent/VM
+    # binding and must revoke the old token until a fresh QUEUED claim revives it.
+    if task_status_releases_agent_resources(value):
+        for cb in _on_task_terminal_callbacks:
+            try:
+                cb(task_id)
+            except Exception as e:  # noqa: PERF203
+                logger.error(
+                    f"[MODELS] Terminal callback failed for task {task_id}: {e}",
+                    exc_info=True,
+                )
+    else:
+        # Non-terminal status set (QUEUED, PROVISIONING, IN_PROGRESS,
+        # EVALUATING). Fire revive callbacks so any deny-list entries
+        # populated by an earlier terminal transition are cleared.
+        for cb in _on_task_revive_callbacks:
+            try:
+                cb(task_id)
+            except Exception as e:  # noqa: PERF203
+                logger.error(
+                    f"[MODELS] Revive callback failed for task {task_id}: {e}",
+                    exc_info=True,
+                )
 
 
 class AlertSeverity(str, Enum):
@@ -2525,6 +2622,7 @@ class Alert(SQLModel, table=True):
         Index("ix_alert_project_severity", "project_id", "severity"),
         Index("ix_alert_project_domain", "project_id", "domain"),
         Index("ix_alert_project_event_type", "project_id", "event_type"),
+        Index("ix_alert_project_source", "project_id", "source"),
         Index(
             "ux_alert_active_dedupe_key",
             "project_id",
@@ -2543,6 +2641,7 @@ CYCLE_META_MEMOS_AVAILABLE = "memos_available"
 CYCLE_META_MEMOS_CITED = "memos_cited"
 CYCLE_META_KNOWLEDGE_AVAILABLE = "knowledge_available"
 CYCLE_META_KNOWLEDGE_CITED = "knowledge_cited"
+CYCLE_META_INTEGRITY_CONFLICT_COUNTS = "integrity_conflict_counts"
 
 
 class StrategicCycle(SQLModel, table=True):
@@ -2826,6 +2925,16 @@ class ProjectMessage(SQLModel, table=True):
     idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
+    # Resident-session identity stamp. Set to the live resident Workday session's
+    # ``session_id`` when the message is created while a session is active, so each
+    # session's poll / unattended-cap / pacing queries can scope to their OWN
+    # conversation instead of every open operator message project-wide. NULL means
+    # the row predates the feature (legacy) or was created outside an active
+    # session (cadence path); NULL is always treated as unscoped/visible so no
+    # pre-migration backlog is silently dropped (see alembic 0396).
+    resident_session_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
     resolved_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -2852,6 +2961,23 @@ class ProjectMessage(SQLModel, table=True):
         ),
         Index("ix_projectmessage_created_at", "created_at"),
         Index("ix_projectmessage_project_created_at", "project_id", "created_at"),
+        Index("ix_projectmessage_from_task_id", "from_task_id"),
+        # Accelerates high-signal message fetches filtered by (project_id, message_type)
+        # and ordered by created_at DESC (build_operator_attention, get_operator_message_counts).
+        Index(
+            "ix_projectmessage_project_message_created",
+            "project_id",
+            "message_type",
+            "created_at",
+        ),
+        # Serves the session-scoped poll / unattended-cap / pacing queries
+        # (project_id + resident_session_id + created_at ordering/aggregation).
+        Index(
+            "ix_projectmessage_project_session_created",
+            "project_id",
+            "resident_session_id",
+            "created_at",
+        ),
     )
 
 
@@ -3234,6 +3360,7 @@ class Artifact(SQLModel, table=True):
             postgresql_ops={"pr_url": "gin_trgm_ops"},
         ),
         Index("ix_artifact_artifact_type", "artifact_type"),
+        Index("ix_artifact_task_type", "task_id", "artifact_type"),
     )
 
     # Git-based outputs
@@ -3496,6 +3623,7 @@ class KnowledgeDocument(SQLModel, table=True):
         Index("ix_knowledge_document_origin_challenge_state", "origin_challenge_state"),
         Index("ix_knowledge_document_origin_finding_hash", "origin_finding_hash"),
         Index("ix_knowledge_document_sweep_id", "sweep_id"),
+        Index("ix_knowledge_document_project_direction", "project_id", "direction_id"),
     )
 
 
@@ -3659,6 +3787,13 @@ class Direction(SQLModel, table=True):
         ),
         # Hot path: list a project's directions, often filtered by status.
         Index("ix_direction_project_status", "project_id", "status"),
+        # Reaper sweeps filter cross-project on status='staged' alone;
+        # the composite index above cannot be used for a leading-column miss.
+        Index(
+            "ix_direction_status_staged",
+            "status",
+            postgresql_where=text("status = 'staged'"),
+        ),
     )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -3734,23 +3869,24 @@ class Direction(SQLModel, table=True):
     )
 
 
-class ReleaseVersion(SQLModel, table=True):
-    """Release-version lifecycle record for automain → main promotion gating.
+class DirectionEvent(SQLModel, table=True):
+    """Append-only event log for direction lifecycle transitions.
 
-    A "version" is the span of automain between two promotions.  The strategic
-    layer drives phase transitions:
+    One row per notable lifecycle moment on a direction: creation, status
+    transitions (active→paused, active→expired/retired, paused→active, ...),
+    and hard deletion (``pruned``) from the table.  The table is written as a
+    best-effort side-effect inside ``directions_repo.upsert_direction`` and
+    ``sync_directions`` so every write path — lifecycle auto-pauses, strategic
+    ops, user PATCH, staged activation, and whole-array pruning — emits events
+    without touching any in-flight code.
 
-      build      — normal feature work on automain
-      stabilize  — shift work-mix to audit/cleanup/hardening before qualify
-      qualify    — heavy gate running once per version (Phase 3)
-      promote    — transition to next version after successful promotion
-
-    Only one row per project should have ``status="open"`` at a time.
-    ``version_number`` is monotonically increasing per project.
-
-    Columns named *_sha are nullable per migration linter rules.
-    All non-null columns carry ``server_default`` for safe backfill.
+    Queryable via ``GET /api/admin/projects/{pid}/directions/{key}/events``.
     """
+
+    __tablename__ = "direction_event"
+    __table_args__ = (
+        Index("ix_direction_event_project_key", "project_id", "direction_key", "recorded_at"),
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
 
@@ -3759,356 +3895,34 @@ class ReleaseVersion(SQLModel, table=True):
             GUID(),
             ForeignKey("project.id", ondelete="CASCADE"),
             nullable=False,
-            index=True,
         ),
     )
 
-    # Monotonically increasing per project (1-based).
-    version_number: int = Field(
-        default=1,
-        sa_column=Column(Integer, nullable=False, server_default=text("1")),
+    direction_key: str = Field(sa_column=Column(String(128), nullable=False))
+
+    # "created" | "status_changed" | "pruned"
+    event_kind: str = Field(sa_column=Column(String(32), nullable=False))
+
+    prior_status: str | None = Field(
+        default=None, sa_column=Column(String(32), nullable=True)
+    )
+    new_status: str | None = Field(
+        default=None, sa_column=Column(String(32), nullable=True)
     )
 
-    # phase: build | stabilize  (qualify / promote are transient orchestrator ops,
-    # not durable DB phases — they are reflected by status transitions).
-    phase: str = Field(
-        default="build",
-        sa_column=Column(String(32), nullable=False, server_default="build"),
+    # Optional actor (agent id, "system", "operator") and human-readable reason.
+    actor: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    reason: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
     )
 
-    # status: open | promoted | abandoned
-    status: str = Field(
-        default="open",
-        sa_column=Column(String(32), nullable=False, server_default="open"),
-    )
-
-    # The version's goal — a concise statement of what this version is for,
-    # authored by the strategist (new_version_goal field) or an operator.
-    # Frozen for the version's lifetime so each version keeps a stable record
-    # of its objective. Nullable: pre-0111 rows carry no goal.
-    goal: str | None = Field(
-        default=None,
-        sa_column=Column(Text, nullable=True),
-    )
-
-    # Stamped when the goal is edited by an operator.
-    goal_updated_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # Editor provenance for the goal: "[operator:email]" format, mirroring phase_reasoning.
-    # Populated only when an operator edits the goal; auto-derived goals carry no editor info.
-    goal_editor_info: str | None = Field(
-        default=None,
-        sa_column=Column(String(255), nullable=True),
-    )
-
-    opened_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
-    )
-
-    # Stamped when phase changes (build → stabilize, etc.).
-    phase_changed_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # Stamped when status transitions to "promoted".
-    promoted_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # SHA columns are nullable per migration linter rules.
-    # base_sha: automain HEAD when this version was opened.
-    base_sha: str | None = Field(
-        default=None,
-        sa_column=Column(String(40), nullable=True),
-    )
-
-    # promoted_sha: automain HEAD at the time of successful promotion.
-    promoted_sha: str | None = Field(
-        default=None,
-        sa_column=Column(String(40), nullable=True),
-    )
-
-    # Structured result of the last qualification run (Phase 3).
-    # Shape: {score, sub_scores, blocker, attempted_at, …}
-    last_qualification: Dict[str, Any] | None = Field(
+    # Full direction dict at the moment of the event (nullable to keep row small
+    # for no-op probes; always populated for created/status_changed/pruned).
+    snapshot_data: Dict[str, Any] | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
-    )
-
-    # Total number of qualification attempts on this version (Phase 3).
-    qualification_attempts: int = Field(
-        default=0,
-        sa_column=Column(Integer, nullable=False, server_default=text("0")),
-    )
-
-    # Free-form reasoning text from the strategic agent explaining the latest
-    # phase decision.
-    phase_reasoning: str | None = Field(
-        default=None,
-        sa_column=Column(Text, nullable=True),
-    )
-
-    # Durable deduplication anchor for calcification alerting.
-    # Set to the blocker code when _check_version_calcification posts an alert.
-    # The next sweep compares this field against the current blocker: if they
-    # match, the alert has already been posted for this stall and is skipped;
-    # if they differ (or the field is NULL), a new alert is warranted.
-    # Storing the dedup state here avoids relying solely on Alert row existence
-    # (which can be lost when an operator clears alerts).
-    calcification_alerted_blocker: str | None = Field(
-        default=None,
-        sa_column=Column(String(128), nullable=True),
-    )
-
-    # Durable deduplication anchor for build-stall alerting.
-    # Set to the build-phase START reference time (phase_changed_at, falling
-    # back to opened_at) when the build-stall sweep posts an alert for a version
-    # sitting too long in the 'build' phase without advancing. The next sweep
-    # compares this field against the current build-phase reference time: if
-    # they match, the alert has already been posted for this stall and is
-    # skipped; if they differ (or the field is NULL), a new alert is warranted.
-    # Because a version can move build → stabilize → build again (each
-    # transition re-stamps phase_changed_at), storing the reference time lets
-    # the dedup reset naturally when a fresh build phase begins while never
-    # re-firing for the same stall. Storing the dedup state here avoids relying
-    # solely on Alert row existence (which can be lost when an operator clears
-    # alerts).
-    build_stall_alerted_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # Durable deduplication anchor for stabilize-stall alerting.
-    # Set to the stabilize-phase START reference time (phase_changed_at,
-    # falling back to opened_at) when the stabilize-stall sweep posts an
-    # alert for a version sitting too long in 'stabilize' without requesting
-    # qualification.  Same dedup semantics as build_stall_alerted_at: storing
-    # the reference time lets the dedup reset naturally when a fresh stabilize
-    # phase begins (phase_changed_at re-stamped) while never re-firing for the
-    # same stall.
-    stabilize_stall_alerted_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # Durable deduplication anchor for promotion-readiness alerting.
-    # Set to True when a promotion_readiness_reached notification fires for
-    # the current ready window. Reset to False when compute_promotion_readiness
-    # returns ready=False so the next not-ready→ready recovery can notify again.
-    promotion_ready_notified: bool = Field(
-        default=False,
-        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
-    )
-
-    # ----- Post-promotion serving confirmation -----
-    # Whether the promoted version's code is actually serving in production.
-    # ``status`` flips to "promoted" the instant the candidate merges; these
-    # columns track whether the deploy then stabilized.  All nullable so the
-    # migration is purely additive and pre-existing rows backfill naturally.
-    #
-    # **IMPORTANT: This field is a legacy projection for single-artifact releases.**
-    # It mirrors the ``backend_revision`` artifact's serving_status via
-    # ``project_backend_revision_artifact()`` during multi-artifact windows.
-    # When multiple required artifacts are registered (e.g. backend_revision + other
-    # services), this scalar reflects ONLY the backend artifact's state, not the
-    # whole-release aggregate. For the authoritative whole-release status, use
-    # ``aggregate_required_artifact_status()`` to compute from the full
-    # ReleaseDeployArtifact rows. This scalar is whole-release-accurate only
-    # while backend_revision is the sole required artifact.
-    #
-    #   serving_status values: NULL (not-yet-promoted / NA) | "unconfirmed"
-    #     | "serving_confirmed" | "confirmation_timed_out" | "deploy_failed".
-    #   "confirmation_timed_out" = the confirmation window elapsed with NO active
-    #     failure (no rollback/halt/sha-mismatch) — the promoted SHA just could
-    #     not be confirmed serving in time; distinct from "deploy_failed" (an
-    #     active failure) and recoverable to "serving_confirmed" if later observed.
-    serving_status: str | None = Field(
-        default=None,
-        sa_column=Column(String(32), nullable=True),
-    )
-
-    # The production serving SHA captured when serving was confirmed.
-    # **IMPORTANT: This is a legacy projection field.**
-    # It mirrors ``ReleaseDeployArtifact.served_identifier`` for the backend_revision
-    # artifact via ``project_backend_revision_artifact()``. During multi-artifact
-    # windows, this scalar reflects ONLY the backend artifact's serving SHA.
-    # The authoritative per-artifact serving identity is stored in
-    # ReleaseDeployArtifact.served_identifier. This field is whole-release-accurate
-    # only while backend_revision is the sole required artifact.
-    served_sha: str | None = Field(
-        default=None,
-        sa_column=Column(String(40), nullable=True),
-    )
-
-    # When serving was confirmed.
-    served_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # Bounded confirmation-window deadline, stamped at promotion.
-    deploy_confirm_deadline: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # Durable deduplication anchor for the deploy-failed operator alert.
-    # Mirrors the *_alerted_at dedup convention on this model: stamped when the
-    # alert fires so the next sweep skips re-posting for the same failure.
-    deploy_confirm_alerted_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # Short code for why confirmation did not reach serving_confirmed:
-    #   active failure (serving_status=deploy_failed): rolled_back | halted
-    #     | sha_mismatch
-    #   timeout (serving_status=confirmation_timed_out): no_new_revision
-    #     | serving_sha_unobservable
-    deploy_failure_reason: str | None = Field(
-        default=None,
-        sa_column=Column(String(128), nullable=True),
-    )
-
-    deploy_artifacts: List["ReleaseDeployArtifact"] = Relationship(
-        back_populates="version"
-    )
-
-    created_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
-    )
-    updated_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(
-            NaiveUTCDateTime,
-            nullable=False,
-            server_default=func.now(),
-            onupdate=_utcnow,
-        ),
-    )
-
-    __table_args__ = (
-        Index("ix_releaseversion_project_status", "project_id", "status"),
-        UniqueConstraint(
-            "project_id",
-            "version_number",
-            name="uq_releaseversion_project_version",
-        ),
-    )
-
-
-class VersionAcceptanceCriterion(SQLModel, table=True):
-    """A single verifiable acceptance criterion scoped to a release version.
-
-    Criteria are stable-ID records authored by the strategist or an operator
-    before a version opens for feature work.  Each criterion has a
-    ``criterion_key`` (e.g. ``c-<8hexchars>``) that is unique within the
-    version and that Direction.criterion_keys / Task.criterion_ids reference so
-    criterion coverage can be computed without joining on UUIDs.
-    """
-
-    __tablename__ = "versionacceptancecriterion"
-    __table_args__ = (
-        UniqueConstraint(
-            "release_version_id",
-            "criterion_key",
-            name="uq_vac_version_key",
-        ),
-        Index("ix_vac_version", "release_version_id"),
-        Index("ix_vac_project", "project_id"),
-    )
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-
-    project_id: uuid.UUID = Field(
-        sa_column=Column(
-            GUID(),
-            ForeignKey("project.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-    )
-
-    release_version_id: uuid.UUID = Field(
-        sa_column=Column(
-            GUID(),
-            ForeignKey("releaseversion.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-    )
-
-    # Stable string ID, e.g. 'c-1a2b3c4d'.  Unique within the version.
-    criterion_key: str = Field(sa_column=Column(String(64), nullable=False))
-
-    # Human-readable criterion description.
-    text: str = Field(sa_column=Column(Text, nullable=False))
-
-    # Provenance: 'strategist' | 'operator' | etc. Nullable.
-    created_by: str | None = Field(
-        default=None,
-        sa_column=Column(String(64), nullable=True),
-    )
-
-    created_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
-    )
-
-
-class CriterionEvidence(SQLModel, table=True):
-    """A single piece of evidence satisfying a VersionAcceptanceCriterion.
-
-    One criterion can accumulate many evidence rows over the version's lifetime
-    (e.g. multiple task merges, an operator attestation, a reachability signal).
-    Coverage is derived by querying whether at least one evidence row exists for
-    each criterion on the version.
-    """
-
-    __tablename__ = "criterionevidence"
-    __table_args__ = (
-        Index("ix_criterionevidence_criterion_id", "criterion_id"),
-        Index("ix_criterionevidence_project", "project_id"),
-        Index(
-            "uq_criterionevidence_dedup",
-            "criterion_id",
-            "source_kind",
-            "source_id",
-            unique=True,
-            postgresql_where=text("source_id IS NOT NULL"),
-        ),
-    )
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-
-    project_id: uuid.UUID = Field(
-        sa_column=Column(
-            GUID(),
-            ForeignKey("project.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-    )
-
-    criterion_id: uuid.UUID = Field(
-        sa_column=Column(
-            GUID(),
-            ForeignKey("versionacceptancecriterion.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-    )
-
-    # 'task_merge' | 'operator' | 'reachability' | etc.
-    source_kind: str = Field(sa_column=Column(String(64), nullable=False))
-
-    # Task UUID (as string) or other source identifier.  Nullable.
-    source_id: str | None = Field(
-        default=None,
-        sa_column=Column(String(255), nullable=True),
     )
 
     recorded_at: datetime = Field(
@@ -4116,428 +3930,15 @@ class CriterionEvidence(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
 
-    # Arbitrary evidence metadata (JSONB).
-    detail: Dict[str, Any] | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
 
-
-class ReleaseDeployArtifact(SQLModel, table=True):
-    """Per-artifact serving confirmation record for a promoted release version."""
-
-    __tablename__ = "releasedeployartifact"
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-
-    version_id: uuid.UUID | None = Field(
-        default=None,
-        sa_column=Column(
-            GUID(),
-            ForeignKey("releaseversion.id", ondelete="CASCADE"),
-            nullable=True,
-            index=True,
-        ),
-    )
-
-    artifact_kind: str | None = Field(
-        default=None,
-        sa_column=Column(String(64), nullable=True),
-    )
-
-    # Values: "unconfirmed" | "serving_confirmed" | "confirmation_timed_out"
-    #   | "deploy_failed".
-    serving_status: str | None = Field(
-        default=None,
-        sa_column=Column(String(32), nullable=True),
-    )
-
-    # Generic observed identity for the served artifact (SHA, fingerprint, etc).
-    served_identifier: str | None = Field(
-        default=None,
-        sa_column=Column(String(128), nullable=True),
-    )
-
-    confirmation_deadline: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    reason_code: str | None = Field(
-        default=None,
-        sa_column=Column(String(128), nullable=True),
-    )
-
-    served_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    created_at: datetime | None = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=True, server_default=func.now()),
-    )
-    updated_at: datetime | None = Field(
-        default_factory=_utcnow,
-        sa_column=Column(
-            NaiveUTCDateTime,
-            nullable=True,
-            server_default=func.now(),
-            onupdate=_utcnow,
-        ),
-    )
-
-    version: ReleaseVersion | None = Relationship(back_populates="deploy_artifacts")
-
-    __table_args__ = (
-        UniqueConstraint(
-            "version_id",
-            "artifact_kind",
-            name="uq_releasedeployartifact_version_kind",
-        ),
-    )
-
-
-class QualificationVerdict(SQLModel, table=True):
-    """Immutable per-verdict history of release-qualifier finalize outcomes.
-
-    Phase 4 ("Calibration") of the automain LTS design.  ``ReleaseVersion.
-    last_qualification`` is OVERWRITTEN on every finalize, so only the latest
-    verdict survives there — and while ``promotion_enabled`` is False the open
-    version is never closed, so cross-version history cannot be reconstructed.
-    This table appends ONE row per finalized qualification verdict that is never
-    overwritten, so the dry-run track record is durably retained and can be
-    aggregated into a promotion-readiness recommendation
-    (``release_qualifier.compute_promotion_readiness``).
-
-    Additive only: it lives ALONGSIDE ``last_qualification`` and does not change
-    how that field is written.  Writes are best-effort — a failure to record
-    must never break or roll back a qualification or promotion.
-    """
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-
-    project_id: uuid.UUID = Field(
-        sa_column=Column(
-            GUID(),
-            ForeignKey("project.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        ),
-    )
-
-    release_version_id: uuid.UUID = Field(
-        sa_column=Column(
-            GUID(),
-            ForeignKey("releaseversion.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        ),
-    )
-
-    # The automain HEAD SHA that was scored.  Nullable per migration linter rules.
-    candidate_sha: str | None = Field(
-        default=None,
-        sa_column=Column(String(40), nullable=True),
-    )
-
-    # Composite promotion confidence in [0,1].
-    confidence: float = Field(
-        default=0.0,
-        sa_column=Column(Float, nullable=False, server_default=text("0")),
-    )
-
-    # Per-dimension sub-scores: {audit, test_erosion, smoketest}.
-    sub_scores: Dict[str, Any] | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-
-    # Hard-blocker code (compute_composite), or NULL when none fired.
-    blocker: str | None = Field(
-        default=None,
-        sa_column=Column(String(64), nullable=True),
-    )
-
-    # Reason the audit sub-score was missing/unscoreable (from release_scoring).
-    audit_missing_reason: str | None = Field(
-        default=None,
-        sa_column=Column(String(64), nullable=True),
-    )
-
-    # Whether the candidate cleared the promotion threshold.
-    would_promote: bool = Field(
-        default=False,
-        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
-    )
-
-    # The runtime_config["promotion_enabled"] state AT THE TIME of this verdict.
-    promotion_enabled: bool = Field(
-        default=False,
-        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
-    )
-
-    # Terminal outcome: dry_run | not_promoted | promoted | promotion_failed.
-    terminal_status: str = Field(
-        default="",
-        sa_column=Column(String(32), nullable=False, server_default=""),
-    )
-
-    # The promotion threshold in force when this verdict was scored.
-    threshold: float | None = Field(
-        default=None,
-        sa_column=Column(Float, nullable=True),
-    )
-
-    # When the qualification started / finalized (carried from the verdict).
-    started_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-    finalized_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # ----- Post-promotion serving outcome -----
-    # Immutable record of how this verdict's promotion actually played out in
-    # production.  Nullable: only set for verdicts that promoted and then had
-    # their deploy confirmed/failed.
-    #   post_promotion_outcome values: "serving_confirmed" | "deploy_failed"
-    #     | "confirmation_timed_out" | "unconfirmed".
-    post_promotion_outcome: str | None = Field(
-        default=None,
-        sa_column=Column(String(32), nullable=True),
-    )
-
-    # When the post-promotion outcome was recorded.
-    post_promotion_outcome_at: datetime | None = Field(
-        default=None,
-        sa_column=Column(NaiveUTCDateTime, nullable=True),
-    )
-
-    # --- Per-attempt evidence mirrored from ``last_qualification`` ----------
-    # These NULLABLE columns durably retain the richer evidence the qualifier
-    # assembles into the ``last_qualification`` base_record but which was
-    # previously dropped when the verdict row was written, so blocked/held
-    # attempts no longer lose it on the next re-qualification overwrite.  All
-    # are nullable — existing verdict rows carry no such evidence.
-
-    # Migration-safety verdicts (e.g. 'pass'/'block') and their detail strings.
-    migration_safety: str | None = Field(
-        default=None,
-        sa_column=Column(String(32), nullable=True),
-    )
-    migration_safety_detail: str | None = Field(
-        default=None,
-        sa_column=Column(Text, nullable=True),
-    )
-    migration_apply_safety: str | None = Field(
-        default=None,
-        sa_column=Column(String(32), nullable=True),
-    )
-    migration_apply_safety_detail: str | None = Field(
-        default=None,
-        sa_column=Column(Text, nullable=True),
-    )
-
-    # Audit findings and the findings excluded from scoring (JSONB lists).
-    audit_findings: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-    excluded_audit_findings: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-    # Challenger-confirmed false positives: findings the independent challenger
-    # marked refuted_false_positive with auditable reasons.  DISTINCT from
-    # excluded_audit_findings (which captures the unverified-primary gap).
-    # Each entry: {severity, summary, file, challenger_reason}.
-    challenger_refuted_audit_findings: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-
-    # Structured erosion / smoketest / audit-reconciliation detail (JSONB).
-    test_erosion_detail: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-    smoketest_detail: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-    audit_reconciliation: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-
-    # Goal-alignment grade: {covered, rationale, ...}
-    # Nullable: existing verdict rows carry no goal_alignment data.
-    goal_alignment: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-
-    # Blind merge-grade certificate: {candidate_sha, coverage_verdict,
-    # biggest_gap, model, pr_count, graded_at}.
-    # Nullable: existing verdict rows carry no blind merge-grade data.
-    blind_merge_grade: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-
-    # --- Blind merge-grade goal-coverage gate (dir d-c0fe439f) --------------
-    # An uninvested release_merge_grade agent grades the merged DIFFS against
-    # the frozen version.goal (BLIND to running_update) and emits a goal-coverage
-    # verdict.  These NULLABLE columns durably retain that verdict alongside the
-    # other per-attempt evidence so a re-qualification overwrite of
-    # last_qualification does not drop it.  All nullable with safe server
-    # defaults so pre-existing verdict rows (written before this gate) stay
-    # readable / backward-compatible.
-    #   merge_grade_status: "pass" | "fail" | "not_applicable" (empty goal).
-    #   merge_grade_coverage: goal-coverage score in [0,1] (NULL when ungraded).
-    #   merge_grade_biggest_gap: one-sentence biggest thing not done toward goal.
-    #   merge_grade_detail: the raw graded artifact (covers_goal, scores, etc.).
-    merge_grade_status: str | None = Field(
-        default=None,
-        sa_column=Column(String(16), nullable=True),
-    )
-    merge_grade_coverage: float | None = Field(
-        default=None,
-        sa_column=Column(Float, nullable=True),
-    )
-    merge_grade_biggest_gap: str | None = Field(
-        default=None,
-        sa_column=Column(Text, nullable=True),
-    )
-    merge_grade_detail: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-
-    # Promotion-attempt context (only set on the promotion_failed / promoted
-    # paths): the merge PR URL, whether the merge hit a conflict, and the
-    # error/detail string describing why the merge failed.
-    promotion_pr_url: str | None = Field(
-        default=None,
-        sa_column=Column(String(512), nullable=True),
-    )
-    promotion_conflict: bool | None = Field(
-        default=None,
-        sa_column=Column(Boolean, nullable=True),
-    )
-    promotion_error_detail: str | None = Field(
-        default=None,
-        sa_column=Column(Text, nullable=True),
-    )
-
-    created_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
-    )
-
-    __table_args__ = (
-        Index(
-            "ix_qualificationverdict_project_created",
-            "project_id",
-            "created_at",
-        ),
-    )
-
-
-class AuditFindingResolution(SQLModel, table=True):
-    """Durable per-finding resolution ledger for carried qualification audit findings.
-
-    The re-qualification trigger ("all high+medium carried audit findings
-    merged-fixed or code-verified stale") needs per-finding resolution state that
-    SURVIVES qualification finalize.  Today nothing tracks it: every finalize
-    overwrites ``ReleaseVersion.last_qualification`` wholesale, and each immutable
-    ``QualificationVerdict`` row is a point-in-time snapshot, not a mutable
-    resolution record.  This table records ONE row per
-    ``(release_version, finding_key)`` resolution, keyed on the deterministic
-    content key ``release_scoring._audit_finding_key`` attaches to every carried
-    finding.  It lives in its OWN table — never inside ``last_qualification`` —
-    so it is never clobbered by a subsequent finalize overwrite.
-
-    A unique constraint on ``(release_version_id, finding_key)`` makes a repeat
-    write an UPSERT (latest write wins) rather than a duplicate; the write helper
-    ``release_readiness.apply_finding_resolution`` performs that upsert.
-    """
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-
-    project_id: uuid.UUID = Field(
-        sa_column=Column(
-            GUID(),
-            ForeignKey("project.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        ),
-    )
-
-    release_version_id: uuid.UUID = Field(
-        sa_column=Column(
-            GUID(),
-            ForeignKey("releaseversion.id", ondelete="CASCADE"),
-            nullable=False,
-            index=True,
-        ),
-    )
-
-    # Deterministic content key (release_scoring._audit_finding_key — sha256 of
-    # normalized file|summary, 16 hex) of the carried finding this row resolves.
-    finding_key: str = Field(
-        sa_column=Column(String(64), nullable=False, index=True),
-    )
-
-    # The carried finding's severity at resolution time (low/medium/high/critical/...).
-    severity: str | None = Field(
-        default=None,
-        sa_column=Column(String(32), nullable=True),
-    )
-
-    # Resolution state: "resolved" (a merged fix addressed it) or "stale" (it was
-    # code-verified to no longer apply on the candidate).
-    state: str = Field(
-        sa_column=Column(String(16), nullable=False),
-    )
-
-    # Optional human/agent note explaining the resolution.
-    note: str | None = Field(
-        default=None,
-        sa_column=Column(Text, nullable=True),
-    )
-
-    # Optional resolving reference — e.g. the merged PR number or URL that fixed it.
-    resolving_ref: str | None = Field(
-        default=None,
-        sa_column=Column(String(512), nullable=True),
-    )
-
-    # The candidate SHA the resolution/staleness verification was performed against.
-    verified_against_sha: str | None = Field(
-        default=None,
-        sa_column=Column(String(40), nullable=True),
-    )
-
-    created_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
-    )
-    updated_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            "release_version_id",
-            "finding_key",
-            name="uq_auditfindingresolution_version_key",
-        ),
-    )
+# --- Release / qualification domain models ---
+# This cohesive domain cluster — ReleaseVersion, VersionAcceptanceCriterion,
+# CriterionEvidence, CompletionDebtEntry, ReleaseDeployArtifact,
+# QualificationVerdict, and AuditFindingResolution — was peeled into
+# ``app.release_models`` to keep this module under its size guardrail. Those
+# classes are imported and re-exported at the top of this module, so
+# ``from app.models import ReleaseVersion`` (and siblings) still resolves and
+# their tables register on ``SQLModel.metadata`` exactly as before.
 
 
 class MigrationReservation(SQLModel, table=True):
@@ -5215,4 +4616,24 @@ class LocalRunner(SQLModel, table=True):
             "project_id",
             "status",
         ),
+    )
+
+
+class UiLoadTimingSample(SQLModel, table=True):
+    """Persisted admin-UI initial-load timing sample.
+
+    Written on every POST /api/admin/ui-load-timing so samples survive
+    process restarts and can span before/after deploy comparisons.
+    Capped at 200 rows per surface via application-layer trim on insert.
+    """
+
+    __tablename__ = "ui_load_timing_sample"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    surface: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    page_ready_ms: int = Field(sa_column=Column(Integer, nullable=False))
+    sample_type: str = Field(default="first_commit", sa_column=Column(String(32), nullable=False))
+    recorded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )

@@ -1669,6 +1669,174 @@ async def test_backstop_no_early_recovery_when_review_child_in_progress(
     assert rl.get("review_recovery_attempted") is not True
 
 
+@pytest.mark.asyncio
+async def test_backstop_resolves_clean_rollup_via_rollup_pr_number(eval_db, mocker):
+    """PR-identity split-brain: a rollup parked past the CI backstop with
+    ci_waiting=True but NO review_loop.pr_number and NO cached head_sha — its PR
+    identity living only at context.rollup_pr_number — must be VERIFIED live
+    (PR resolved via the fallback, head_sha looked up) and routed to the
+    completion handler on a green verdict, NOT hard-killed."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "head": {"sha": "deadbeef"},
+            "base": {"ref": "automain"},
+            "mergeable": True,
+        },
+    )
+    mock_resolve = mocker.patch(
+        "app.ci_resolution.resolve_pr_ci_status",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "green",
+            "conclusion": "success",
+            "details": [],
+            "head_sha_resolved": "deadbeef",
+            "source": "branch_head",
+        },
+    )
+    mock_hcc = mocker.patch(
+        "app.ci_completion.handle_ci_completion",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    project = Project(name="Split-brain rollup", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(minutes=120).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    # The identity-less shape: ci_waiting with no review_loop.pr_number / head_sha.
+    parent.context = {
+        "rollup_pr_number": 5555,
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_wait_started": _naive_utc_ago(minutes=90).isoformat(),
+            "base_branch": "automain",
+        },
+    }
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Backstop must verify (not kill) a resolvable rollup, got "
+        f"{parent.status}: {parent.latest_status_message!r}"
+    )
+    # Resolver called with the PR number resolved from context.rollup_pr_number.
+    mock_resolve.assert_awaited_once()
+    assert mock_resolve.call_args.kwargs["pr_number"] == 5555
+    # Green verdict routed to the shared completion handler (merge path).
+    mock_hcc.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_backstop_no_checks_keep_polling_fails_open_and_kills(eval_db, mocker):
+    """Fail-open safety: a 0-check PR on a CI-gated repo (no-checks →
+    keep_polling) must NOT be merged on absence of signal — the verify falls
+    through and the backstop still terminates the stuck parent."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "head": {"sha": "cafe1234"},
+            "base": {"ref": "main"},
+            "mergeable": True,
+        },
+    )
+    mocker.patch(
+        "app.ci_resolution.resolve_pr_ci_status",
+        new_callable=AsyncMock,
+        return_value={"state": "no_checks", "details": [], "source": "branch_head"},
+    )
+    # CI-gated repo: the no-checks policy says keep polling — never auto-merge.
+    mocker.patch(
+        "app.ci_resolution.resolve_no_checks_escalation", return_value="keep_polling"
+    )
+    mock_hcc = mocker.patch(
+        "app.ci_completion.handle_ci_completion", new_callable=AsyncMock
+    )
+
+    project = Project(name="No-checks keep polling", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "stuck no-checks"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(minutes=120).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    parent.context = {
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_wait_started": _naive_utc_ago(minutes=90).isoformat(),
+            "pr_number": 7777,
+            "base_branch": "main",
+        }
+    }
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected FAILED (no-checks keep_polling → fail-open → backstop kill), "
+        f"got {parent.status}: {parent.latest_status_message!r}"
+    )
+    # Never merged on absence of signal for a CI-gated repo.
+    mock_hcc.assert_not_awaited()
+
+
 # ── Chain-active / hard-timeout bypass tests ──────────────────────────────────
 
 
@@ -3892,14 +4060,18 @@ async def test_ci_backstop_routes_concluded_failure_to_ci_completion(eval_db, mo
         "app.routers.agent.get_github_token_for_task",
         new=AsyncMock(return_value=("tok", "owner", "repo")),
     )
+    # The backstop verifier now routes through the strict resolver
+    # (ci_resolution.resolve_pr_ci_status), the SAME path the poll loop uses —
+    # a red verdict is what drives the CI-failure route.
     mocker.patch(
-        "app.github_checks.get_check_runs_cached",
+        "app.ci_resolution.resolve_pr_ci_status",
         new=AsyncMock(
             return_value={
-                "status": "completed",
+                "state": "red",
                 "conclusion": "failure",
                 "details": [],
                 "failed_logs": "boom",
+                "source": "branch_head",
             }
         ),
     )
@@ -3957,14 +4129,16 @@ async def test_ci_backstop_routes_concluded_success_to_ci_completion(eval_db, mo
         "app.routers.agent.get_github_token_for_task",
         new=AsyncMock(return_value=("tok", "owner", "repo")),
     )
+    # Verifier routes through the strict resolver — a green verdict records the
+    # pass / clears the wait via handle_ci_completion instead of timing out.
     mocker.patch(
-        "app.github_checks.get_check_runs_cached",
+        "app.ci_resolution.resolve_pr_ci_status",
         new=AsyncMock(
             return_value={
-                "status": "completed",
+                "state": "green",
                 "conclusion": "success",
                 "details": [],
-                "failed_logs": "",
+                "source": "branch_head",
             }
         ),
     )

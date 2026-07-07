@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { NewProjectModal } from './NewProjectModal';
@@ -28,20 +28,21 @@ const mocks = vi.hoisted(() => ({
     build_config: {},
     default_branch: 'main',
   })),
+  apiFetchMock: vi.fn(async (url: string) => {
+    if (url.includes('/auto-remediation')) {
+      return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
+    }
+    if (url.includes('/issue-implementation')) {
+      return new Response(JSON.stringify({ config: { enabled: false, trigger_label: 'auto:implement', max_per_hour: 5, max_concurrent: 2, base_branch: 'main', default_effort: 'medium' } }), { status: 200 });
+    }
+    return new Response('{}', { status: 200 });
+  }),
 }));
 
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');
   return createApiMock({
-    apiFetch: vi.fn(async (url: string) => {
-      if (url.includes('/auto-remediation')) {
-        return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
-      }
-      if (url.includes('/issue-implementation')) {
-        return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
-      }
-      return new Response('{}', { status: 200 });
-    }),
+    apiFetch: mocks.apiFetchMock,
     authGet: vi.fn(async () => new Response(JSON.stringify({ repositories: [] }), { status: 200 })),
     previewOnboardProject: mocks.previewOnboardProjectMock,
     onboardProject: mocks.onboardProjectMock,
@@ -49,7 +50,118 @@ vi.mock('../api', async () => {
   });
 });
 
+async function advanceToSuccess(user: ReturnType<typeof userEvent.setup>) {
+  render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+  const repoInput = await screen.findByPlaceholderText('owner/repo or https://github.com/owner/repo');
+  await user.type(repoInput, 'acme/platform');
+  await user.click(screen.getByRole('button', { name: 'Continue' }));
+  await screen.findByText('Merge-gate draft');
+  await user.click(await screen.findByRole('button', { name: 'Create Project' }));
+  await screen.findByText('Project created');
+}
+
+describe('NewProjectModal toggle error handling', () => {
+  beforeEach(() => {
+    mocks.apiFetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('/auto-remediation')) {
+        return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
+      }
+      if (url.includes('/issue-implementation')) {
+        return new Response(JSON.stringify({ config: { enabled: false, trigger_label: 'auto:implement', max_per_hour: 5, max_concurrent: 2, base_branch: 'main', default_effort: 'medium' } }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+  });
+
+  it('reverts the setup toggle and surfaces error when the PATCH is rejected', async () => {
+    const user = userEvent.setup();
+    await advanceToSuccess(user);
+
+    // Now make the auto-remediation PATCH return a non-ok response
+    mocks.apiFetchMock.mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (url.includes('/auto-remediation') && opts?.method === 'PATCH') {
+        return new Response(JSON.stringify({ detail: 'Forbidden' }), { status: 403 });
+      }
+      if (url.includes('/auto-remediation')) {
+        return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
+      }
+      if (url.includes('/issue-implementation')) {
+        return new Response(JSON.stringify({ config: { enabled: false, trigger_label: 'auto:implement', max_per_hour: 5, max_concurrent: 2, base_branch: 'main', default_effort: 'medium' } }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    // Toggle should be present and enabled (config loaded)
+    const toggleBtn = await screen.findByRole('button', { name: /Toggle Auto-Remediation/i });
+    await user.click(toggleBtn);
+
+    // After rejection, error message appears and toggle reverts to prior state (false→false)
+    await waitFor(() => expect(screen.getByTestId('toggle-error')).toBeInTheDocument());
+    expect(screen.getByTestId('toggle-error').textContent).toContain('Failed to update');
+  });
+
+  it('reverts issue-implementation toggle and surfaces error when the PATCH is rejected', async () => {
+    const user = userEvent.setup();
+    await advanceToSuccess(user);
+
+    mocks.apiFetchMock.mockImplementation(async (url: string, opts?: RequestInit) => {
+      if (url.includes('/issue-implementation') && opts?.method === 'PATCH') {
+        return new Response(JSON.stringify({ detail: 'Forbidden' }), { status: 403 });
+      }
+      if (url.includes('/auto-remediation')) {
+        return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
+      }
+      if (url.includes('/issue-implementation')) {
+        return new Response(JSON.stringify({ config: { enabled: false, trigger_label: 'auto:implement', max_per_hour: 5, max_concurrent: 2, base_branch: 'main', default_effort: 'medium' } }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    const toggleBtn = await screen.findByRole('button', { name: /Toggle Issue-to-Implementation/i });
+    await user.click(toggleBtn);
+
+    await waitFor(() => expect(screen.getByTestId('toggle-error')).toBeInTheDocument());
+    expect(screen.getByTestId('toggle-error').textContent).toContain('Failed to update');
+  });
+
+  it('does NOT reset to config step when post-create feature-config fetch fails', async () => {
+    const user = userEvent.setup();
+
+    // Make the feature-config GETs fail after project creation
+    mocks.apiFetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('/auto-remediation') || url.includes('/issue-implementation')) {
+        return new Response('Internal Server Error', { status: 500 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+    const repoInput = await screen.findByPlaceholderText('owner/repo or https://github.com/owner/repo');
+    await user.type(repoInput, 'acme/platform');
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await screen.findByText('Merge-gate draft');
+    await user.click(await screen.findByRole('button', { name: 'Create Project' }));
+
+    // Must reach success step despite feature-config failing
+    await screen.findByText('Project created');
+    // Must NOT show submitError or revert to config
+    expect(screen.queryByText('Merge-gate draft')).toBeNull();
+  });
+});
+
 describe('NewProjectModal onboarding steering', () => {
+  beforeEach(() => {
+    mocks.apiFetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('/auto-remediation')) {
+        return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
+      }
+      if (url.includes('/issue-implementation')) {
+        return new Response(JSON.stringify({ config: { enabled: false, trigger_label: 'auto:implement', max_per_hour: 5, max_concurrent: 2, base_branch: 'main', default_effort: 'medium' } }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+  });
+
   it('previews the detected merge-gate draft and posts the edited override on create', async () => {
     const user = userEvent.setup();
     render(

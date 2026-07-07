@@ -329,19 +329,22 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     total_task_count = 0
     total_merged_count = 0
     total_verified_merged_count = 0
+    total_tool_result_bytes: int | None = None
 
     for t in tasks:
         merged = is_merged_completion(t)
         verified = is_verified_merge(t)
         is_fallback = _task_ran_on_fallback(t)
-        # Tokens/cost/task_count accumulate per attempt-row (automain
-        # convention), but a task's merge is a single TASK-level outcome: it
-        # must be credited at most ONCE per distinct bucket it touched, never
-        # once per attempt-row. Collect the distinct buckets this task
-        # contributed a row to, then credit the merge after the attempt loop.
+        # Tokens/cost accumulate per attempt-row, but task_count and merge
+        # outcomes are TASK-level: each must be credited at most ONCE per
+        # distinct bucket the task touched, never once per attempt-row.
+        # Collect the distinct buckets this task contributed a row to, then
+        # credit task_count and merge outcomes after the attempt loop.
         task_model_keys: set[tuple[str, str]] = set()
         task_provider_keys: set[str] = set()
         task_contributed = False
+        task_had_priced = False
+        task_had_unpriced = False
         for (
             provider,
             model,
@@ -372,7 +375,7 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
                     output_rate,
                 )
                 priced_combos.add(key)
-                priced_task_count += 1
+                task_had_priced = True
                 # Track approximate-priced combos (proxy rate, not exactly published).
                 if key in LLM_APPROXIMATE_PRICED:
                     combo = f"{provider}:{model}"
@@ -383,7 +386,7 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
                         approximate_priced_combos.append(combo)
             else:
                 cost = 0.0
-                unpriced_task_count += 1
+                task_had_unpriced = True
                 unpriced_providers.add(provider)
                 combo = f"{provider}:{model}"
                 if (
@@ -406,7 +409,6 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             mb["cache_read_input_tokens"] += cr
             mb["output_tokens"] += int(output_tokens)
             mb["llm_call_count"] += call_count
-            mb["task_count"] += 1
             mb["cost_usd"] += cost
 
             pb = provider_buckets[provider]
@@ -415,7 +417,6 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             pb["cache_read_input_tokens"] += cr
             pb["output_tokens"] += int(output_tokens)
             pb["llm_call_count"] += call_count
-            pb["task_count"] += 1
             pb["cost_usd"] += cost
 
             total_input += int(input_tokens)
@@ -423,15 +424,27 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             total_cache_read += cr
             total_output += int(output_tokens)
             total_cost += cost
-            total_task_count += 1
 
             task_model_keys.add(key)
             task_provider_keys.add(provider)
             task_contributed = True
 
-        # Credit the task's merge once per distinct bucket it touched, and once
-        # to the grand total — so multi-attempt and multi-model merged tasks
-        # never inflate merged_count beyond the actual merged-task count.
+        # Credit task_count, merge outcomes, and priced/unpriced counts once
+        # per distinct bucket the task touched — never once per attempt-row —
+        # so multi-attempt tasks don't inflate task_count or deflate merge_rate.
+        if task_contributed:
+            for key in task_model_keys:
+                model_buckets[key]["task_count"] += 1
+            for provider in task_provider_keys:
+                provider_buckets[provider]["task_count"] += 1
+            total_task_count += 1
+            # A task that had at least one priced attempt counts as priced;
+            # only tasks with zero priced attempts count as unpriced.
+            if task_had_priced:
+                priced_task_count += 1
+            elif task_had_unpriced:
+                unpriced_task_count += 1
+
         if merged and task_contributed:
             for key in task_model_keys:
                 model_buckets[key]["merged_count"] += 1
@@ -449,6 +462,15 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
         # Count each fallback task once (cost already accumulated per-attempt).
         if is_fallback and task_contributed:
             fallback_task_count += 1
+
+        # Accumulate total_tool_result_bytes across attempt_history + live api_call_summary.
+        for attempt in t.attempt_history or []:
+            trb = attempt.get("total_tool_result_bytes")
+            if isinstance(trb, int) and trb >= 0:
+                total_tool_result_bytes = (total_tool_result_bytes or 0) + trb
+        current_trb = (t.api_call_summary or {}).get("total_tool_result_bytes")
+        if isinstance(current_trb, int) and current_trb >= 0:
+            total_tool_result_bytes = (total_tool_result_bytes or 0) + current_trb
 
     def _share(cost: float) -> float | None:
         if total_cost <= 0:
@@ -563,6 +585,7 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "unpriced_coverage_fraction": unpriced_coverage_fraction,
             "fallback_task_count": fallback_task_count,
             "fallback_cost_usd": round(fallback_cost_usd, 6),
+            "total_tool_result_bytes": total_tool_result_bytes,
         },
         "unpriced_combos": unpriced_combos,
         "approximate_priced_combos": approximate_priced_combos,
@@ -807,6 +830,16 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
             "merged_count": 0,
             "verified_merged_count": 0,
             "cost_usd": 0.0,
+            # num_turns is None when no task in the bucket reported it, an int otherwise.
+            "num_turns": None,
+            # total_tool_result_bytes is None when no task reported it (absent tolerance).
+            "total_tool_result_bytes": None,
+            # prompt_size_bytes is None when no task in the bucket reported it.
+            # Accumulated from api_call_summary.prompt_size_bytes and attempt_history rows.
+            "prompt_size_bytes": None,
+            # Count of tasks in this bucket that reported a non-None prompt_size_bytes.
+            # Used as the mean denominator so absent tasks don't dilute the average.
+            "prompt_size_reporting_count": 0,
         }
     )
     total_cost = 0.0
@@ -864,6 +897,42 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
 
         total_cost += task_cost
 
+        # Accumulate num_turns from attempt_history and current api_call_summary.
+        # Only counts when at least one attempt carried the field; absent = None so
+        # per-turn metrics degrade gracefully for tasks that predate turn tracking.
+        for attempt in t.attempt_history or []:
+            turns = attempt.get("num_turns")
+            if isinstance(turns, int) and turns >= 0:
+                bucket["num_turns"] = (bucket["num_turns"] or 0) + turns
+        current_turns = (t.api_call_summary or {}).get("num_turns")
+        if isinstance(current_turns, int) and current_turns >= 0:
+            bucket["num_turns"] = (bucket["num_turns"] or 0) + current_turns
+
+        # Accumulate total_tool_result_bytes from attempt_history and api_call_summary.
+        # None until at least one task reports it; absent key ≠ zero (older agents omit).
+        for attempt in t.attempt_history or []:
+            trb = attempt.get("total_tool_result_bytes")
+            if isinstance(trb, int) and trb >= 0:
+                bucket["total_tool_result_bytes"] = (bucket["total_tool_result_bytes"] or 0) + trb
+        current_trb = (t.api_call_summary or {}).get("total_tool_result_bytes")
+        if isinstance(current_trb, int) and current_trb >= 0:
+            bucket["total_tool_result_bytes"] = (bucket["total_tool_result_bytes"] or 0) + current_trb
+
+        # Accumulate prompt_size_bytes from attempt_history and current api_call_summary.
+        # Mean is over reporting tasks only (tasks that carried prompt_size_bytes ≥ 0)
+        # so absent tasks don't dilute the average; absent buckets yield None.
+        task_prompt_size: int | None = None
+        for attempt in t.attempt_history or []:
+            ps = attempt.get("prompt_size_bytes")
+            if isinstance(ps, int) and ps >= 0:
+                task_prompt_size = (task_prompt_size or 0) + ps
+        current_ps = (t.api_call_summary or {}).get("prompt_size_bytes")
+        if isinstance(current_ps, int) and current_ps >= 0:
+            task_prompt_size = (task_prompt_size or 0) + current_ps
+        if task_prompt_size is not None:
+            bucket["prompt_size_bytes"] = (bucket["prompt_size_bytes"] or 0) + task_prompt_size
+            bucket["prompt_size_reporting_count"] += 1
+
     def _share(cost: float) -> float | None:
         if total_cost <= 0:
             return None
@@ -902,6 +971,48 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
             "mean_input_tokens_per_call": (
                 round(b["input_tokens"] / b["llm_call_count"])
                 if b["llm_call_count"] > 0
+                else None
+            ),
+            # Per-turn metrics — None when no task in this bucket reported num_turns,
+            # or when the denominator is zero (absent-counter tolerant).
+            "mean_turns_per_call": (
+                round(b["num_turns"] / b["llm_call_count"], 2)
+                if b["num_turns"] is not None and b["llm_call_count"] > 0
+                else None
+            ),
+            "mean_input_tokens_per_turn": (
+                round(b["input_tokens"] / b["num_turns"])
+                if b["num_turns"] is not None and b["num_turns"] > 0
+                else None
+            ),
+            "mean_uncached_input_tokens_per_call": (
+                round(
+                    (b["input_tokens"] - b["cache_creation_input_tokens"] - b["cache_read_input_tokens"])
+                    / b["llm_call_count"]
+                )
+                if b["llm_call_count"] > 0
+                else None
+            ),
+            "cache_read_share": (
+                round(b["cache_read_input_tokens"] / b["input_tokens"], 4)
+                if b["input_tokens"] > 0
+                else None
+            ),
+            # Tool-result bytes — None when no task in this bucket reported the field.
+            "total_tool_result_bytes": b["total_tool_result_bytes"],
+            "mean_tool_result_bytes_per_task": (
+                round(b["total_tool_result_bytes"] / b["task_count"])
+                if b["total_tool_result_bytes"] is not None and b["task_count"] > 0
+                else None
+            ),
+            # Prompt-size metrics — None when no task in this bucket reported
+            # prompt_size_bytes. Mean denominator is the reporting-task count
+            # (tasks that carried a non-None prompt_size_bytes), not the total
+            # task count, so absent tasks do not dilute the average.
+            "total_prompt_size_bytes": b["prompt_size_bytes"],
+            "mean_prompt_size_bytes": (
+                round(b["prompt_size_bytes"] / b["prompt_size_reporting_count"])
+                if b["prompt_size_bytes"] is not None and b["prompt_size_reporting_count"] > 0
                 else None
             ),
         }
@@ -1053,6 +1164,9 @@ def _compact_llm_cost_attribution(
             "task_type": r["task_type"],
             "cost_usd": r["total_cost_usd"],
             "mean_input_tokens_per_call": r.get("mean_input_tokens_per_call"),
+            "total_tool_result_bytes": r.get("total_tool_result_bytes"),
+            "total_prompt_size_bytes": r.get("total_prompt_size_bytes"),
+            "mean_prompt_size_bytes": r.get("mean_prompt_size_bytes"),
         }
         for r in by_type_rows
         if r["total_cost_usd"] > 0
@@ -1126,4 +1240,5 @@ def _compact_llm_cost_attribution(
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
         SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
         "strategic_cycle_cost_per_event": strategic_cycle_cost_per_event,
+        "total_tool_result_bytes": breakdown["totals"].get("total_tool_result_bytes"),
     }

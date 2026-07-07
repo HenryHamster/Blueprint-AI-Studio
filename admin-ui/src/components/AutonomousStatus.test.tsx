@@ -205,6 +205,107 @@ describe('AutonomousStatus expanded dropdown', () => {
     expect(screen.getByText("Why autonomy isn't spawning")).toBeTruthy();
     expect(screen.getByText(/Rate limit: 10\/10 tasks this hour/)).toBeTruthy();
   });
+
+  it('shows error when toggle autonomy fails with non-OK response', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    fetchMock.mockResolvedValueOnce(statusResponse([makeProject({ autonomous_enabled: false })])); // summary fetch
+    fetchMock.mockResolvedValueOnce({ ok: false } as Response); // toggle fetch fails
+    apiFetchMock.mockResolvedValue({ ok: false });
+
+    const user = userEvent.setup();
+    await act(async () => { render(<AutonomousStatus />); });
+    await user.click(screen.getByTitle('Autonomous Pipeline Status'));
+    await act(async () => {});
+
+    const toggleBtn = screen.getByText('Disabled');
+    await user.click(toggleBtn);
+    await act(async () => {});
+
+    expect(screen.getByText('Failed to toggle autonomy')).toBeTruthy();
+  });
+
+  it('shows error when toggle autonomy fails with network error', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValueOnce(new Error('Network error')));
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      if (url.includes('/autonomous-status')) {
+        return Promise.resolve(statusResponse([makeProject({ autonomous_enabled: false })]));
+      }
+      return Promise.reject(new Error('Network error'));
+    }));
+    apiFetchMock.mockResolvedValue({ ok: false });
+
+    const user = userEvent.setup();
+    await act(async () => { render(<AutonomousStatus />); });
+    await user.click(screen.getByTitle('Autonomous Pipeline Status'));
+    await act(async () => {});
+
+    const toggleBtn = screen.getByText('Disabled');
+    await user.click(toggleBtn);
+    await act(async () => {});
+
+    expect(screen.getByText('Failed to toggle autonomy')).toBeTruthy();
+  });
+
+  it('shows error when reset circuit breaker fails', async () => {
+    const openDebug = makeDebug({
+      circuit_breaker: {
+        state: 'OPEN',
+        failure_count: 3,
+        success_count: 0,
+        opened_at: new Date().toISOString(),
+        cooldown_seconds: 300,
+        cooldown_ends_at: new Date(Date.now() + 200000).toISOString(),
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(statusResponse([makeProject({ autonomous_enabled: true })])));
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path.includes('/autonomy-debug')) return Promise.resolve(jsonResponse(openDebug));
+      if (path.includes('/circuit-breaker/reset')) return Promise.resolve({ ok: false } as Response);
+      return Promise.resolve({ ok: false });
+    });
+
+    const user = userEvent.setup();
+    await act(async () => { render(<AutonomousStatus />); });
+    await user.click(screen.getByTitle('Autonomous Pipeline Status'));
+    await act(async () => {});
+
+    const resetBtn = screen.getByText('Reset Circuit Breaker');
+    await user.click(resetBtn);
+    await act(async () => {});
+
+    expect(screen.getByText('Failed to reset circuit breaker')).toBeTruthy();
+  });
+
+  it('clears error when toggle autonomy succeeds', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    apiFetchMock.mockResolvedValue({ ok: false });
+
+    // First render: status fetch succeeds with disabled project
+    fetchMock.mockResolvedValueOnce(statusResponse([makeProject({ autonomous_enabled: false })]));
+
+    const user = userEvent.setup();
+    await act(async () => { render(<AutonomousStatus />); });
+    await user.click(screen.getByTitle('Autonomous Pipeline Status'));
+    await act(async () => {});
+
+    // First toggle attempt: fails
+    fetchMock.mockResolvedValueOnce({ ok: false } as Response);
+    let toggleBtn = screen.getByText('Disabled');
+    await user.click(toggleBtn);
+    await act(async () => {});
+    expect(screen.getByText('Failed to toggle autonomy')).toBeTruthy();
+
+    // Second toggle attempt: succeeds
+    fetchMock.mockResolvedValueOnce({ ok: true } as Response);
+    fetchMock.mockResolvedValueOnce(statusResponse([makeProject({ autonomous_enabled: true })]));
+    toggleBtn = screen.getByText('Disabled');
+    await user.click(toggleBtn);
+    await act(async () => {});
+
+    expect(screen.queryByText('Failed to toggle autonomy')).toBeNull();
+  });
 });
 
 describe('AutonomousStatus staleness', () => {

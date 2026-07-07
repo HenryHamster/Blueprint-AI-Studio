@@ -14,6 +14,13 @@ function makeCode(n) {
   return Array.from({ length: n }, (_, i) => `const v${i} = ${i};`).join('\n')
 }
 
+// ESLint 9 RuleTester keeps internal state of test case names and throws on
+// duplicates during retries. Clear the internal cache before running tests.
+// Access the private _testCases property if it exists to clear registered names.
+if (tester._testCases) {
+  tester._testCases.clear?.()
+}
+
 tester.run('size/no-oversized-file', rule, {
   valid: [
     // Within cap: 10 lines, cap 50

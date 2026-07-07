@@ -811,17 +811,15 @@ async def _compute_sr_catch_rate_trends_impl(
     current_total_reviewers = 0
     previous_total_hits = 0
     previous_total_reviewers = 0
-    for data in categories.values():
-        curr_hit_rate = data.get("current_hit_rate")
-        curr_reviewer_count = _reviewer_finding_count(data, "current")
-        prev_hit_rate = data.get("previous_hit_rate")
-        prev_reviewer_count = _reviewer_finding_count(data, "previous")
-        if curr_hit_rate is not None and curr_reviewer_count > 0:
-            current_total_hits += round(curr_hit_rate * curr_reviewer_count)
-            current_total_reviewers += curr_reviewer_count
-        if prev_hit_rate is not None and prev_reviewer_count > 0:
-            previous_total_hits += round(prev_hit_rate * prev_reviewer_count)
-            previous_total_reviewers += prev_reviewer_count
+    for cat in all_cats:
+        curr = current_stats.get(cat, empty_cat)
+        prev = previous_stats.get(cat, empty_cat)
+        if curr.get("human_count", 0) > 0:
+            current_total_hits += curr.get("hit_count", 0)
+            current_total_reviewers += curr["human_count"]
+        if prev.get("human_count", 0) > 0:
+            previous_total_hits += prev.get("hit_count", 0)
+            previous_total_reviewers += prev["human_count"]
     overall_hit_rate = (
         round(current_total_hits / current_total_reviewers, 3)
         if current_total_reviewers > 0

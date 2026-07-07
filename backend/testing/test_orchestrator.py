@@ -75,6 +75,161 @@ def test_resolved_red_ci_status_handoff_falls_back_to_check_names():
     assert result["failed_logs"] == "CI checks failed: CI / Backend, CI / Frontend"
 
 
+@pytest.mark.asyncio
+async def test_ci_monitor_extraction_contract(db_session, mocker):
+    """Contract for the EVALUATING/CI-waiting monitor extraction.
+
+    The sweep formerly inlined in ``orchestrator_worker`` now lives in
+    ``app.orchestrator_ci_monitor._monitor_evaluating_tasks``. This test pins
+    the extraction so a future edit cannot silently regress it:
+
+    (1) Every extracted symbol is re-exported from ``app.orchestrator`` with
+        *identical object identity* (so ``from app.orchestrator import X``
+        keeps working for callers and tests), and ``_monitor_evaluating_tasks``
+        is genuinely owned by the new module.
+    (2) ``orchestrator_worker`` delegates to the extracted sweep rather than
+        re-inlining the loop.
+    (3) The extracted sweep actually RUNS against a live session: given an
+        ``EVALUATING`` row armed with ``review_loop.ci_waiting``, it selects
+        the row through the extracted ``_ci_waiting_sql_filter`` prefilter and
+        locks it via ``_lock_task_for_mutation`` — exercising the moved
+        production code end-to-end (not just introspecting it).
+    """
+    import inspect
+
+    import app.orchestrator as orch
+    import app.orchestrator_ci_monitor as cim
+
+    # (1) re-export identity — same objects, new home.
+    reexported = (
+        "_VERIFY_TESTS_MAX_RETRIES",
+        "_VERIFY_TESTS_SPAWN_DEFERRAL_CAP",
+        "_apply_ci_merged_landed_signal",
+        "_capture_ci_polling_snapshot",
+        "_ci_result_from_resolved_pr_ci_status",
+        "_ci_waiting_sql_filter",
+        "_clear_retry_after_state",
+        "_monitor_evaluating_tasks",
+        "_resolve_ci_fix_branch",
+    )
+    for name in reexported:
+        assert getattr(orch, name) is getattr(cim, name), (
+            f"{name} must be re-exported from app.orchestrator with identical "
+            "identity"
+        )
+    assert (
+        cim._monitor_evaluating_tasks.__module__ == "app.orchestrator_ci_monitor"
+    )
+
+    # (2) the worker delegates to the extracted sweep.
+    worker_src = inspect.getsource(orch.orchestrator_worker)
+    assert "_monitor_evaluating_tasks(session)" in worker_src
+
+    # (3) drive the extracted sweep against a live session. A ci_waiting row
+    # with no resolvable PR number locks and short-circuits before any GitHub
+    # I/O, so we exercise the moved SELECT + lock path without the network.
+    ci_filter_spy = mocker.spy(cim, "_ci_waiting_sql_filter")
+    lock_spy = mocker.spy(orch, "_lock_task_for_mutation")
+
+    project = make_project(name="ci-monitor-contract", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "review", "prompt": "p"}],
+        context={"review_loop": {"ci_waiting": True}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    await cim._monitor_evaluating_tasks(db_session)
+
+    assert ci_filter_spy.called, (
+        "the extracted sweep must run the ci_waiting SQL prefilter"
+    )
+    assert lock_spy.await_count >= 1, (
+        "the extracted sweep must lock the ci_waiting EVALUATING row it found"
+    )
+    # The no-PR row is left intact (locked, inspected, rolled back) — the sweep
+    # is behaviour-preserving and does not mutate it out of EVALUATING.
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed is not None
+    assert refreshed.status == TaskStatus.EVALUATING
+
+
+# ── Main-loop sleep selection (WI-4: gate fast cycle on dispatch progress) ───
+
+
+def test_select_cycle_sleep_backs_off_when_nothing_dispatched():
+    """A cycle whose only queued tasks are held/deferred dispatches nothing
+    (_cycle_dispatched == 0) ⇒ the loop takes the slow 5s idle path, NOT the
+    2 Hz fast path. This is the WI-4 fix: queue-presence alone no longer spins."""
+    from app.orchestrator import _select_cycle_sleep
+
+    sleep = _select_cycle_sleep(
+        consecutive_errors=0,
+        consecutive_monitoring_errors=0,
+        cycle_dispatched=0,
+        error_backoff=99.0,
+        monitoring_backoff=88.0,
+    )
+
+    assert sleep == 5.0
+
+
+def test_select_cycle_sleep_fast_path_when_dispatch_made_progress():
+    """A cycle that actually moved a task out of QUEUED (_cycle_dispatched > 0)
+    grabs the next batch on the 0.5s fast path."""
+    from app.orchestrator import _select_cycle_sleep
+
+    sleep = _select_cycle_sleep(
+        consecutive_errors=0,
+        consecutive_monitoring_errors=0,
+        cycle_dispatched=3,
+        error_backoff=99.0,
+        monitoring_backoff=88.0,
+    )
+
+    assert sleep == 0.5
+
+
+def test_select_cycle_sleep_error_backoff_wins_over_dispatch():
+    """Consecutive cycle errors take the error backoff even if the cycle also
+    dispatched — the error path has highest precedence."""
+    from app.orchestrator import _select_cycle_sleep
+
+    sleep = _select_cycle_sleep(
+        consecutive_errors=2,
+        consecutive_monitoring_errors=0,
+        cycle_dispatched=5,
+        error_backoff=99.0,
+        monitoring_backoff=88.0,
+    )
+
+    assert sleep == 99.0
+
+
+def test_select_cycle_sleep_monitoring_backoff_wins_over_dispatch():
+    """Monitoring errors (no cycle errors) take the monitoring backoff even if
+    the cycle dispatched work."""
+    from app.orchestrator import _select_cycle_sleep
+
+    sleep = _select_cycle_sleep(
+        consecutive_errors=0,
+        consecutive_monitoring_errors=1,
+        cycle_dispatched=5,
+        error_backoff=99.0,
+        monitoring_backoff=88.0,
+    )
+
+    assert sleep == 88.0
+
+
 # ── Helper: redirect AsyncSessionLocal to the test database ─────────────────
 
 
@@ -2653,6 +2808,7 @@ class TestProjectConcurrencyCap:
                 expire_on_commit=False,
             )
             mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+            mocker.patch("app.dep_lifecycle.AsyncSessionLocal", _Session)
             mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)
@@ -3739,6 +3895,9 @@ class TestPersistDepsSatisfied:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         await _persist_deps_satisfied(task)
 
@@ -3766,8 +3925,12 @@ class TestPersistDepsSatisfied:
         )
         # If the helper opened a session it would hit this un-redirected factory
         # and fail; the early-return guard means it never does.
-        sentinel = mocker.patch(
+        mocker.patch(
             "app.orchestrator.AsyncSessionLocal",
+            side_effect=AssertionError("should not open a session when marker present"),
+        )
+        sentinel = mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal",
             side_effect=AssertionError("should not open a session when marker present"),
         )
         await _persist_deps_satisfied(task)
@@ -3820,6 +3983,9 @@ class TestMarkUnblockedDependents:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
         assert marked == 1
@@ -3868,6 +4034,9 @@ class TestMarkUnblockedDependents:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         before = get_reuse_funnel_snapshot()["completion_dependents_marked"]
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
@@ -3915,6 +4084,9 @@ class TestMarkUnblockedDependents:
 
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
 
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
@@ -4003,6 +4175,9 @@ class TestMarkUnblockedDependents:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
         assert marked == 1
@@ -4081,6 +4256,9 @@ class TestMarkUnblockedDependents:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         # Re-cut conflicts → no dependents marked.
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
@@ -4154,6 +4332,9 @@ class TestMarkUnblockedDependents:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         # Transient error → no dependents marked.
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
@@ -4176,31 +4357,38 @@ class TestOrchestratorClosureSafety:
     skipped → tasks stuck in PROVISIONING. Guard the names that matter."""
 
     def test_provision_and_handle_has_no_get_vm_zone_freevar(self):
-        """Static check: the inner _provision_and_handle closure must not
-        treat get_vm_zone as a free variable. If it does, orchestrator_worker
-        is locally re-importing get_vm_zone somewhere, and provisioning will
-        crash silently the moment the local import branch hasn't run."""
-        from app import orchestrator
+        """Static check: ``provision_and_handle`` must not treat ``get_vm_zone``
+        as a free variable.
 
-        # Find the nested _provision_and_handle code object inside orchestrator_worker
-        worker_code = orchestrator.orchestrator_worker.__code__
-        provision_code = None
-        for const in worker_code.co_consts:
-            if hasattr(const, "co_name") and const.co_name == "_provision_and_handle":
-                provision_code = const
-                break
-        assert provision_code is not None, (
-            "_provision_and_handle not found in orchestrator_worker"
+        ``provision_and_handle`` now lives at module level in
+        ``app.orchestrator_provision`` (re-exported via ``app.orchestrator``),
+        so ``get_vm_zone`` should resolve as that module's global. If it ever
+        shows up in ``co_freevars`` the function has been nested back inside a
+        scope that re-imports ``get_vm_zone`` as a local — the exact shape that
+        produced ``cannot access free variable 'get_vm_zone'`` in production
+        (vm_provisioned_at refresh skipped → tasks stuck in PROVISIONING)."""
+        from app import orchestrator, orchestrator_provision
+
+        # Same object via the facade re-export and the canonical home.
+        assert (
+            orchestrator.provision_and_handle
+            is orchestrator_provision.provision_and_handle
         )
 
-        # If get_vm_zone is in co_freevars, it's being captured from the
-        # enclosing scope as a closure cell — which means orchestrator_worker
-        # has it as a local. That's the bug.
+        provision_code = orchestrator_provision.provision_and_handle.__code__
+        assert provision_code.co_name == "provision_and_handle"
+
+        # A module-level function has no enclosing scope, so get_vm_zone must be
+        # a global (co_names), never a closure cell (co_freevars).
         assert "get_vm_zone" not in provision_code.co_freevars, (
-            "_provision_and_handle is capturing get_vm_zone as a closure variable, "
-            "which means orchestrator_worker has it as a local (likely from a "
-            "`from app.compute import get_vm_zone` somewhere). Move the import "
-            "to module level."
+            "provision_and_handle is capturing get_vm_zone as a closure variable, "
+            "which means it was nested inside a scope that has it as a local "
+            "(likely from a `from app.compute import get_vm_zone`). Keep the "
+            "import at module level."
+        )
+        assert "get_vm_zone" in provision_code.co_names, (
+            "provision_and_handle no longer references get_vm_zone as a module "
+            "global — the extraction's import wiring may have drifted."
         )
 
 
@@ -4274,6 +4462,7 @@ class TestWarmVMSkipProvision:
                 expire_on_commit=False,
             )
             mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+            mocker.patch("app.dep_lifecycle.AsyncSessionLocal", _Session)
             mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)
@@ -8237,6 +8426,7 @@ class TestDispatchCrashContainment:
                 expire_on_commit=False,
             )
             mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+            mocker.patch("app.dep_lifecycle.AsyncSessionLocal", _Session)
             mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)
@@ -8392,6 +8582,37 @@ class TestDispatchCrashContainment:
         )
 
     @staticmethod
+    def _contend_staleness_recompute(mocker, contend_task_id):
+        """Make recompute_launch_staleness raise a TRANSIENT DB lock-timeout —
+        the prod shape: an asyncpg LockNotAvailableError (SQLSTATE 55P03) wrapped
+        by SQLAlchemy's PendingRollbackError, whose own message omits the lock
+        cause so detection must walk the __cause__ chain — for ONE task; behaves
+        normally (no context change) for every other task."""
+        from sqlalchemy.exc import PendingRollbackError
+
+        class _FakeLockNotAvailableError(Exception):
+            sqlstate = "55P03"
+
+            def __str__(self):
+                return "canceling statement due to lock timeout"
+
+        async def _contended(session, task):
+            if task.id == contend_task_id:
+                try:
+                    raise _FakeLockNotAvailableError()
+                except _FakeLockNotAvailableError as _orig:
+                    raise PendingRollbackError(
+                        "This Session's transaction has been rolled back due to "
+                        "a previous exception during flush."
+                    ) from _orig
+            return False
+
+        return mocker.patch(
+            "app.research_completion.recompute_launch_staleness",
+            side_effect=_contended,
+        )
+
+    @staticmethod
     def _set_slots(_orch_module, n=4):
         _orch_module._runtime_config["max_concurrent_vms"] = n
         _orch_module._runtime_config["warm_pool_enabled"] = False
@@ -8485,6 +8706,79 @@ class TestDispatchCrashContainment:
         )
 
     @pytest.mark.asyncio
+    async def test_transient_contention_not_quarantined(
+        self, orch_crash_db, mocker
+    ):
+        """A dispatch-prep failure that is TRANSIENT DB row/lock contention (the
+        30s lock_timeout expiring, surfaced as a PendingRollbackError wrapping an
+        asyncpg LockNotAvailableError) must NOT be treated as a poison task: the
+        _dispatch_prep_failures counter must not increment and the task must stay
+        QUEUED — even when it is already one crash away from the quarantine
+        threshold. Contention self-heals when the lock releases; quarantining
+        healthy tasks (review/fix/design_doc_update) was the prod bug."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._mock_dispatch_runtime(mocker)
+        self._set_slots(_orch_module)
+
+        threshold = _orch_module.DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD
+        async with orch_crash_db() as session:
+            project = make_project(name="Contention Not Poison", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            # Pre-seed the counter to threshold-1: a genuine crash here WOULD
+            # quarantine (FAILED). Proving the task stays QUEUED at counter==
+            # threshold-1 is the strong form of "contention never fails a task".
+            contended = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "review", "prompt": "healthy review task"}],
+                context={"_dispatch_prep_failures": threshold - 1},
+            )
+            session.add(contended)
+            await session.commit()
+            await session.refresh(contended)
+            contended_id = contended.id
+
+        self._contend_staleness_recompute(mocker, contended_id)
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            self._clear_slots(_orch_module)
+
+        async with orch_crash_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == contended_id)))
+                .scalars()
+                .first()
+            )
+
+        assert row is not None
+        # Primary invariant: contention never transitions the task to FAILED —
+        # it is left QUEUED to retry when the lock releases. (A genuine crash at
+        # this same pre-seeded threshold-1 WOULD quarantine to FAILED, per
+        # test_poison_task_quarantined_at_threshold.)
+        assert row.status == TaskStatus.QUEUED, (
+            "Transient DB contention must leave the task QUEUED for retry, "
+            f"never FAILED/quarantined — got {row.status}"
+        )
+        # The quarantine counter must NOT have advanced to the threshold: the
+        # contention branch never touches it (in prod the rollback of the
+        # poisoned txn preserves the prior committed value; either way it must
+        # stay strictly below the quarantine threshold).
+        _counter = (row.context or {}).get("_dispatch_prep_failures")
+        assert _counter is None or _counter < threshold, (
+            "Transient contention must NOT accrue toward the quarantine "
+            f"counter; expected < {threshold}, got {_counter!r}"
+        )
+        assert (row.context or {}).get("failure_category") != "PROVISION_FAILURE"
+        assert "quarantined" not in (row.latest_status_message or "")
+
+    @pytest.mark.asyncio
     async def test_post_dispatch_ci_poll_still_reached(self, orch_crash_db, mocker):
         """The post-loop CI polling stage must still run — and the cycle must
         complete without feeding the consecutive-error backoff — in a cycle
@@ -8495,11 +8789,15 @@ class TestDispatchCrashContainment:
         coroutine races the cycle and the consecutive-error assertion is
         deterministic."""
         import app.orchestrator as _orch_module
+        import app.orchestrator_ci_monitor as _ci_monitor_module
 
         self._mock_dispatch_runtime(mocker)
         self._set_slots(_orch_module)
         _orch_module._orchestrator_consecutive_errors = 0
-        ci_filter_spy = mocker.spy(_orch_module, "_ci_waiting_sql_filter")
+        # The EVALUATING/CI-waiting monitor sweep was extracted to
+        # app.orchestrator_ci_monitor; the ci_waiting SQL prefilter now
+        # resolves as a local of that module, so spy it there.
+        ci_filter_spy = mocker.spy(_ci_monitor_module, "_ci_waiting_sql_filter")
 
         async with orch_crash_db() as session:
             project = make_project(name="CI Poll Survives", user_id=_TEST_USER)
@@ -9264,3 +9562,154 @@ class TestCloudRunAllowlistValidation:
             assert _ss.runtime_config.get("cloud_run_task_type_allowlist") == []
         finally:
             _ss.runtime_config["cloud_run_task_type_allowlist"] = original
+
+
+class TestRunnerDispatchExtractionContract:
+    """Guards the ``app.orchestrator_runner_dispatch`` extraction seam.
+
+    The local-runner + compute-experiment dispatch cluster was lifted out of
+    ``app.orchestrator`` into ``app.orchestrator_runner_dispatch`` (a pure,
+    behaviour-preserving refactor). This exercises the facade contract AND the
+    runtime behaviour of the moved helpers so a regression that reverts the
+    move, breaks the re-export, or changes the moved logic is caught:
+
+      1. Each moved symbol is re-exported from ``app.orchestrator`` and is the
+         *same object* as the canonical definition in the new module.
+      2. The moved helpers are no longer defined at ``orchestrator.py``
+         top-level (no shadowing, monolith does not re-grow).
+      3. The moved pure helpers still compute the correct result via BOTH the
+         re-exported binding and the canonical binding — proving the extracted
+         production code actually runs.
+    """
+
+    MOVED_SYMBOLS = (
+        "RunnerDispatchSnapshot",
+        "_runner_handles_task_type",
+        "_runner_active_task_count",
+        "_runner_active_compute_job_count",
+        "_runner_active_work_count",
+        "_runner_agent_available",
+        "_runner_at_capacity",
+        "_load_active_runners_cache",
+        "_load_runner_compute_job_assignments",
+        "_try_runner_dispatch",
+        "_task_requires_strategic_local_runner",
+        "_hold_strategic_local_runner_task",
+        "_try_strategic_local_required_runner_path",
+        "_num_or_none",
+        "_select_eligible_runner",
+        "_build_compute_launch_kwargs",
+        "_fail_compute_experiment_task",
+        "_dispatch_compute_experiment_directly",
+        "_deactivate_stale_runners",
+        "_parse_local_runner_hold_timestamp",
+        "_create_strategic_local_cloud_fallback_alert",
+        "_strategic_local_hold_timeout_seconds",
+        "_fail_stale_local_runner_holds",
+        "_emit_all_accounts_blocked_stall",
+        "_RUNNER_LIVENESS_SECONDS",
+        "_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS",
+    )
+
+    def test_moved_symbols_reexported_and_identical(self):
+        import app.orchestrator as orch
+        import app.orchestrator_runner_dispatch as rd
+
+        for name in self.MOVED_SYMBOLS:
+            assert hasattr(rd, name), (
+                f"{name} missing from app.orchestrator_runner_dispatch — the "
+                f"canonical home for the extracted symbol no longer defines it."
+            )
+            assert hasattr(orch, name), (
+                f"app.orchestrator.{name} is no longer importable. Add the "
+                f"re-export: from app.orchestrator_runner_dispatch import {name}."
+            )
+            assert getattr(orch, name) is getattr(rd, name), (
+                f"app.orchestrator.{name} is not the same object as "
+                f"app.orchestrator_runner_dispatch.{name} — the orchestrator is "
+                f"shadowing the canonical implementation."
+            )
+
+    def test_moved_functions_not_redefined_in_orchestrator(self):
+        import ast
+        import os
+
+        orch_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "app", "orchestrator.py"
+        )
+        with open(orch_path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        top_level_defs: set[str] = set()
+        for node in tree.body:
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                top_level_defs.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        top_level_defs.add(target.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(
+                node.target, ast.Name
+            ):
+                top_level_defs.add(node.target.id)
+
+        redefined = sorted(top_level_defs & set(self.MOVED_SYMBOLS))
+        assert not redefined, (
+            "orchestrator.py re-defines extracted runner-dispatch symbols "
+            f"(shadowing app.orchestrator_runner_dispatch): {redefined}. Move "
+            "the definition into the sibling module and rely on the re-export."
+        )
+
+    def test_moved_pure_helpers_behave_identically(self):
+        """The extracted pure helpers still compute correct results via both
+        the re-exported and canonical bindings — proving the moved code runs."""
+        import app.orchestrator as orch
+        import app.orchestrator_runner_dispatch as rd
+
+        # _num_or_none: coercion + rejection semantics preserved.
+        for fn in (orch._num_or_none, rd._num_or_none):
+            assert fn(3) == 3.0
+            assert fn("2.5") == 2.5
+            assert fn(True) is None  # bools are not numbers
+            assert fn(None) is None
+            assert fn("not-a-number") is None
+            assert fn(float("nan")) is None
+            assert fn(float("inf")) is None
+
+        # _runner_handles_task_type over a RunnerDispatchSnapshot: policy
+        # allowlist (ceiling) intersected with declared agent floor.
+        allow_all = orch.RunnerDispatchSnapshot(
+            id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities={"task_types": "all"}
+        )
+        restricted = orch.RunnerDispatchSnapshot(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            capabilities={"task_types": ["research"]},
+        )
+        assert orch._runner_handles_task_type(allow_all, "fix") is True
+        assert orch._runner_handles_task_type(restricted, "fix") is False
+        assert orch._runner_handles_task_type(restricted, "research") is True
+        # compute_experiment is exempt from the agent-declared floor.
+        docker_only = orch.RunnerDispatchSnapshot(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            capabilities={
+                "task_types": "all",
+                "supported_agent_task_types": ["research"],
+            },
+        )
+        assert orch._runner_handles_task_type(docker_only, "fix") is False
+        assert orch._runner_handles_task_type(docker_only, "compute_experiment") is True
+
+        # _runner_active_work_count = agent tasks + compute jobs (heartbeat view).
+        busy = orch.RunnerDispatchSnapshot(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            capabilities={
+                "active_task_ids": ["a", "b"],
+                "active_compute_job_ids": ["c"],
+            },
+        )
+        assert orch._runner_active_work_count(busy) == 3
+        assert rd._runner_active_work_count(busy) == 3

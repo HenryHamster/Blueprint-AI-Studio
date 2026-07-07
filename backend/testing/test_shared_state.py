@@ -424,16 +424,18 @@ class TestBackfillBranchColumns:
         assert _shared_state.get_project_promotion_target(project) == "develop"
 
 
-def _flush_session(existing=None):
+def _flush_session(existing_alerts=None):
     """Async-session double for flush_pending_branch_alerts tests.
 
-    ``existing`` is returned by ``result.scalars().first()`` to simulate an
-    already-persisted undismissed alert (idempotency path).
+    ``existing_alerts`` is a list of Alert-like objects (each with ``project_id``
+    and ``title`` attributes) returned by ``result.scalars().all()`` to simulate
+    already-persisted undismissed alerts (idempotency path).  Pass an empty list
+    or omit for the no-existing-alert case.
     """
     session = AsyncMock()
     result = MagicMock()
     scalars = MagicMock()
-    scalars.first.return_value = existing
+    scalars.all.return_value = list(existing_alerts) if existing_alerts else []
     result.scalars.return_value = scalars
     session.execute = AsyncMock(return_value=result)
     session.add = MagicMock()
@@ -521,7 +523,7 @@ class TestProjectBranchResolvers:
         _shared_state.get_project_promotion_target(project)
         assert len(branch_resolution._pending_durable_branch_alerts) == 2
 
-        session = _flush_session(existing=None)
+        session = _flush_session()
         with patch(
             "app.broadcast.broadcast_to_project", new=AsyncMock()
         ) as mock_broadcast:
@@ -549,7 +551,7 @@ class TestProjectBranchResolvers:
         with patch("app.broadcast.broadcast_to_project", new=AsyncMock()):
             assert (
                 await branch_resolution.flush_pending_branch_alerts(
-                    _flush_session(existing=None)
+                    _flush_session()
                 )
                 == 2
             )
@@ -561,10 +563,17 @@ class TestProjectBranchResolvers:
         _shared_state.get_project_promotion_target(project)
         assert len(branch_resolution._pending_durable_branch_alerts) == 2
 
-        # But the durable SELECT finds the existing undismissed alert, so no
-        # second row is created — the signal stays one-per-misconfiguration.
-        existing_alert = MagicMock()
-        session = _flush_session(existing=existing_alert)
+        # But the durable SELECT finds both existing undismissed alerts, so no
+        # second rows are created — the signal stays one-per-misconfiguration.
+        # The mock must carry matching (project_id, title) so the batched dedup
+        # check in flush_pending_branch_alerts rejects both re-creates.
+        existing_int = SimpleNamespace(
+            project_id=project.id, title="Missing integration_branch"
+        )
+        existing_promo = SimpleNamespace(
+            project_id=project.id, title="Missing promotion_target"
+        )
+        session = _flush_session(existing_alerts=[existing_int, existing_promo])
         with patch("app.broadcast.broadcast_to_project", new=AsyncMock()):
             created = await branch_resolution.flush_pending_branch_alerts(session)
 

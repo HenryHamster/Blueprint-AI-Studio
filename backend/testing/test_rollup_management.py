@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm.attributes import flag_modified
 from unittest.mock import AsyncMock, MagicMock
 
-from app.models import TaskStatus
+from app.models import Task, TaskStatus
 
 # Reuse the in-memory DB fixture + rollup-parent/child builders.
 from testing.test_rollup_cleanup import (
@@ -111,6 +111,11 @@ def _mock_automerge_deps(mocker, *, pr_files, merge_merged=True):
         new_callable=AsyncMock,
         return_value=(MagicMock(id="fix-task-id"), True),
     )
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("ok", None),
+    )
     return mock_merge, mock_spawn
 
 
@@ -185,6 +190,72 @@ async def test_rollup_guard_block_skips_auto_merge(cleanup_db, mocker):
     await cleanup_db.refresh(parent)
     assert parent.requires_approval is True
     assert "alembic" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_rollup_size_cap_breach_auto_bumped_defers(cleanup_db, mocker):
+    """Size-cap preflight returns 'bumped' → merge NOT called, autobump counter stamped."""
+    mock_merge, _mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/app/models.py"),
+    )
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("bumped", "models.py: 500 -> 750"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_merge.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is False
+    assert parent.context.get("_size_cap_autobump_count") == 1
+    assert "auto-bumped" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_rollup_size_cap_breach_hold_when_cap_exhausted(cleanup_db, mocker):
+    """Size-cap autobump counter already at cap → merge NOT called, requires_approval set."""
+    mock_merge, _mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/app/models.py"),
+    )
+    mock_preflight = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("hold", "auto-bump budget exhausted; breach: models.py: 500 -> 750"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    # Seed the parent context so the autobump counter is already at the cap (2).
+    # _make_rollup_parent_with_pr uses rollup_pr_number=4242.
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db,
+        project.id,
+        extra_context={"_size_cap_autobump_count": 2, "_size_cap_autobump_pr": 4242},
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # Budget exhausted → preflight called with commit_bump=False
+    mock_preflight.assert_awaited_once()
+    _, preflight_kwargs = mock_preflight.call_args
+    assert preflight_kwargs.get("commit_bump") is False
+
+    mock_merge.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "size" in (parent.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio
@@ -2395,6 +2466,11 @@ def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
     )
     # Skip the asyncio sleep in the repoll loop so tests don't block.
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("ok", None),
+    )
 
 
 @pytest.mark.asyncio
@@ -2538,6 +2614,11 @@ def _mock_repoll_or_escalation_landing_deps(mocker, *, get_pr_side_effect, merge
         "app.rollup_management._nudge_sibling_rollup_prs", new_callable=AsyncMock
     )
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("ok", None),
+    )
 
 
 @pytest.mark.asyncio
@@ -2808,6 +2889,71 @@ async def test_propagate_landed_bfs_stamps_grandchildren(cleanup_db):
     )
     assert (grandchild.context or {}).get("landed_on_integration") is True
     assert "_non_merge_unblock_reason" not in (grandchild.context or {})
+
+
+@pytest.mark.asyncio
+async def test_propagate_landed_descendants_returns_stamped_and_is_idempotent(
+    cleanup_db,
+):
+    """The BFS sweep RETURNS the descendants it newly stamped so callers (the
+    ci_completion rollup-landing path) can re-credit their directions, and it is
+    idempotent: a second sweep, with everything already landed, stamps nothing and
+    returns []. Force-dropped children are never stamped nor returned.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.landed_signal import has_landed_signal
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+    outer = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    # staging-merged child — must be stamped AND returned
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=outer.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # force-dropped child (never genuinely merged) — must NOT be stamped or returned
+    dropped = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=outer.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "rollup_no_pr_artifact",
+        },
+    )
+
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        outer.id, cleanup_db
+    )
+    await cleanup_db.commit()
+
+    stamped_ids = {t.id for t in stamped}
+    assert child.id in stamped_ids
+    assert dropped.id not in stamped_ids
+    assert has_landed_signal(child)
+    await cleanup_db.refresh(dropped)
+    assert (dropped.context or {}).get("landed_on_integration") is False
+
+    # Idempotent: everything is already landed / force-dropped, so a re-run stamps
+    # nothing and returns an empty list (no double-credit).
+    again = await _propagate_landed_to_staging_merged_descendants(outer.id, cleanup_db)
+    assert again == []
 
 
 # ---------------------------------------------------------------------------
@@ -3165,8 +3311,8 @@ async def test_rollup_post_merge_housekeeping_records_criterion_evidence_for_all
     assert source_kinds == {"task_merge", "reachability"}, (
         f"Expected source_kinds {{'task_merge', 'reachability'}}, got {source_kinds!r}"
     )
-    assert all(e.detail == {"proven": True} for e in evidence), (
-        "All evidence rows must carry detail={'proven': True}"
+    assert all(e.detail.get("proven") is True for e in evidence), (
+        "All evidence rows must carry detail with proven=True"
     )
     assert all(str(e.source_id) == str(child.id) for e in evidence), (
         "All evidence rows must reference the merged child task"
@@ -3404,3 +3550,268 @@ async def test_multi_child_rollup_criterion_evidence_satisfies_release_scoring_g
     assert result["blocker"] is None, (
         f"No blocker expected for a fully-covered version; got {result['blocker']!r}"
     )
+
+
+# ── Retroactive merge-credit backfill for landed rollups ────────────────────
+#
+# PR #12971 fixed FORWARD propagation of merge credit; these tests cover the
+# RETROACTIVE, idempotent backfill (app.merge_credit_backfill) that heals
+# rollups which landed BEFORE that fix and left their credited children
+# stamped landed_on_integration=False forever.
+
+from app.landed_signal import (  # noqa: E402
+    has_landed_signal,
+    has_merge_unblock_signal,
+    mark_landed_on_integration,
+    mark_unblocked_non_merge,
+)
+from app.merge_credit_backfill import (  # noqa: E402
+    backfill_landed_rollup_merge_credit,
+)
+
+
+async def _setup_landed_rollup_with_undercredited_child(
+    session,
+    *,
+    child_reason: str = "merged_pr_non_integration_branch",
+    landed_rollup: bool = True,
+):
+    """Build a rollup (doubling as the research-cycle root) plus one merged
+    child that is under-credited (pr_merged=True, landed_on_integration=False).
+
+    Returns (project, rollup, child, direction_id). The rollup task IS the
+    research_history entry's ``task_id`` so the propagation subtree walk (from
+    the rollup) and the direction-outcome child query (children of the research
+    task) both resolve to the same child.
+    """
+    direction_id = "d-backfill"
+    project = await _make_project(session)
+
+    rollup = await _make_task(
+        session,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={"_is_rollup_review": True, "rollup_pr_number": 4242},
+    )
+    if landed_rollup:
+        mark_landed_on_integration(rollup)
+        flag_modified(rollup, "context")
+        session.add(rollup)
+
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "Backfill direction",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "research_history": [
+                {"task_id": str(rollup.id), "tasks_created": 1, "cycle": 1}
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    session.add(project)
+    await session.commit()
+
+    child = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=rollup.id,
+        context={"direction_id": direction_id, "research_task_id": str(rollup.id)},
+    )
+    mark_unblocked_non_merge(child, reason=child_reason)
+    flag_modified(child, "context")
+    session.add(child)
+    await session.commit()
+
+    return project, rollup, child, direction_id
+
+
+@pytest.mark.asyncio
+async def test_backfill_stamps_landed_and_recomputes_direction(cleanup_db):
+    """(a) A landed rollup's under-credited merged child is stamped landed and
+    its direction's prs_merged recomputes to reflect the merge."""
+    project, rollup, child, direction_id = (
+        await _setup_landed_rollup_with_undercredited_child(cleanup_db)
+    )
+
+    # Precondition: child carries the merge-unblock signal but is NOT yet landed,
+    # so is_merged_completion is False and the direction reads zero merges.
+    assert has_merge_unblock_signal(child) is True
+    assert has_landed_signal(child) is False
+
+    stamped = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+
+    assert stamped == 1
+
+    refreshed_child = await cleanup_db.get(Task, child.id)
+    assert has_landed_signal(refreshed_child) is True
+
+    await cleanup_db.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry.get("prs_merged") == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_is_idempotent_second_run_noop(cleanup_db):
+    """(b) A second backfill run stamps nothing — already-landed children are
+    skipped, so the sweep converges to a cheap no-op."""
+    project, rollup, child, _ = (
+        await _setup_landed_rollup_with_undercredited_child(cleanup_db)
+    )
+
+    first = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+    assert first == 1
+
+    second = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+    assert second == 0
+
+    refreshed_child = await cleanup_db.get(Task, child.id)
+    assert has_landed_signal(refreshed_child) is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_force_dropped_child(cleanup_db):
+    """(c) A force-dropped child is NOT stamped even under a landed rollup —
+    the propagation helper's force-drop exclusion is preserved."""
+    project, rollup, child, direction_id = (
+        await _setup_landed_rollup_with_undercredited_child(
+            cleanup_db, child_reason="rollup_no_pr_artifact"
+        )
+    )
+
+    stamped = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+
+    assert stamped == 0
+
+    refreshed_child = await cleanup_db.get(Task, child.id)
+    assert has_landed_signal(refreshed_child) is False
+
+    await cleanup_db.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry.get("prs_merged", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_leaves_unlanded_rollup_children_untouched(cleanup_db):
+    """(d) A rollup that has NOT landed on integration leaves its children
+    untouched — its own landed signal is the ancestry gate."""
+    project, rollup, child, _ = (
+        await _setup_landed_rollup_with_undercredited_child(
+            cleanup_db, landed_rollup=False
+        )
+    )
+
+    # Guard: the rollup really is un-landed, so it must be ignored by the sweep.
+    assert has_landed_signal(rollup) is False
+
+    stamped = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+
+    assert stamped == 0
+
+    refreshed_child = await cleanup_db.get(Task, child.id)
+    assert has_landed_signal(refreshed_child) is False
+    # The merge-unblock signal is still present — it simply was not promoted.
+    assert has_merge_unblock_signal(refreshed_child) is True
+
+
+# ── Structural OWNER-gate: only a staging branch's owner rolls it up ──────────
+
+
+def test_task_owns_staging_branch_gate():
+    """Ownership is proven off the branch name: the trailing segment is the
+    OWNER's 8-hex id-prefix. Foreign id-prefixes → not owned; anything without a
+    valid id-suffix (legacy / custom) defers to owned so we never strand work."""
+    from app.rollup_management import _task_owns_staging_branch
+
+    task = Task(
+        id=uuid.UUID("bdb302f7-61f8-43d4-aa71-7754a623750a"),
+        payloads=[{}],
+        context={},
+    )
+    # Own id-prefix (research + plan mints) → owned.
+    assert _task_owns_staging_branch(task, "research/bdb302f7") is True
+    assert _task_owns_staging_branch(task, "plan/bdb302f7") is True
+    # A DIFFERENT valid id-prefix → inherited from an ancestor → not owned.
+    assert _task_owns_staging_branch(task, "research/2fea759a") is False
+    # Non-id-prefix trailing segments default to owned (no positive foreign proof).
+    assert _task_owns_staging_branch(task, "research/dup-stg") is True
+    assert _task_owns_staging_branch(task, "feature/some-branch") is True
+    # No branch at all → nothing to roll up.
+    assert _task_owns_staging_branch(task, None) is False
+    assert _task_owns_staging_branch(task, "") is False
+
+
+@pytest.mark.asyncio
+async def test_inherited_staging_branch_completes_without_duplicate_rollup(
+    cleanup_db, mocker
+):
+    """A parent whose staging branch was INHERITED from an ancestor (a foreign
+    id-prefix, no durable owns flag, no PR marker) must NOT open a duplicate
+    rollup PR — it completes and defers the roll-up to the branch's owner."""
+    mock_create = _mock_rollup_create_path(mocker)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_no_pr(
+        cleanup_db,
+        project.id,
+        extra_context={"research_branch": "research/aabbccdd"},
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_create.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+    assert "owner" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_adopted_branch_recreates_rollup(cleanup_db, mocker):
+    """Invariant #2: a requeue-clone that legitimately adopted a foreign-named
+    branch carries the durable ``owns_rollup_branch`` flag. Even with no
+    ``rollup_pr_number`` marker (transiently cleared), the OWNER-gate must NOT
+    fire — the self-heal recreates the rollup PR."""
+    mock_create = _mock_rollup_create_path(
+        mocker,
+        create_return={
+            "empty_diff": True,
+            "merged": True,
+            "html_url": "",
+            "number": 0,
+        },
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_no_pr(
+        cleanup_db,
+        project.id,
+        extra_context={
+            "research_branch": "research/aabbccdd",
+            "owns_rollup_branch": True,
+        },
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_create.assert_awaited_once()

@@ -440,4 +440,60 @@ describe('DirectionCard — viewport regression', () => {
       });
     });
   });
+
+  test('churn-retirement banner renders without horizontal overflow at 1280px', async () => {
+    const churnDirection: Direction = {
+      ...richDirection,
+      id: 'dir-churn-rec',
+      status: 'paused',
+      churn_retirement_recommended: true,
+      churn_retirement_recommended_reason: 'Direction has exceeded max pause cycles with no merges in window.',
+      churn_retirement_recommended_at: '2026-06-01T00:00:00Z',
+    };
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DirectionCard
+            {...noopProps}
+            statusKey="paused"
+            direction={churnDirection}
+            decideChurnRetirement={async () => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('churn-retirement banner has no undocumented small touch targets at 1280px', async () => {
+    const churnDirection: Direction = {
+      ...richDirection,
+      id: 'dir-churn-rec-targets',
+      status: 'paused',
+      churn_retirement_recommended: true,
+      churn_retirement_recommended_reason: 'Exceeded max pause cycles.',
+      churn_retirement_recommended_at: '2026-06-01T00:00:00Z',
+    };
+    await expectMinTouchTargetAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DirectionCard
+            {...noopProps}
+            statusKey="paused"
+            direction={churnDirection}
+            decideChurnRetirement={async () => {}}
+          />,
+        );
+      });
+    });
+  });
 });

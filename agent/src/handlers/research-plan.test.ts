@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync as realReadFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { CAPABILITY_DECLARATION_DOC as CAP_DOC_FROM_BLOCKS, ACCEPTANCE_EVIDENCE_RUBRIC } from './research-plan-prompt-blocks.js';
 
 const {
   INDEX_EXPORT_NAMES,
@@ -119,6 +122,8 @@ const {
     'recordInitialOAuthAuthHash',
     'recordLlmCallStart',
     'recordLlmTokens',
+    'recordNumTurns',
+    'recordToolResultBytes',
     'recordToolUse',
     'refreshRuntimeState',
     'registerSizeCapMergeDriver',
@@ -150,20 +155,25 @@ const {
   ],
   WORKSPACE_PREP_EXPORT_NAMES: [
     'getLastWorkspacePrepOutcome',
+    'listWorkspaceTopDirs',
     'prepareWorkspaceForRole',
     'resetWorkspacePrepOutcome',
     'resolveReferenceRepo',
   ],
 }));
 
-vi.mock('fs', () => ({
-  default: {
-    readFileSync: vi.fn().mockReturnValue(''),
-    writeFileSync: vi.fn(),
-    existsSync: vi.fn().mockReturnValue(false),
-    appendFileSync: vi.fn(),
-  },
-}));
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  return {
+    readFileSync: actual.readFileSync,
+    default: {
+      readFileSync: vi.fn().mockReturnValue(''),
+      writeFileSync: vi.fn(),
+      existsSync: vi.fn().mockReturnValue(false),
+      appendFileSync: vi.fn(),
+    },
+  };
+});
 
 vi.mock('../index.js', () => ({
   ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
@@ -236,6 +246,14 @@ vi.mock('../prompt.js', async (importOriginal) => {
   };
 });
 
+vi.mock('../providers/runners.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../providers/runners.js')>();
+  return {
+    ...actual,
+    providerAutoInjectsClaudeMd: vi.fn().mockReturnValue(true),
+  };
+});
+
 import fs from 'fs';
 import * as mockedIndexModule from '../index.js';
 import { runClaudeCode, persistAndPostStatus, getProviderRunner, apiGet } from '../index.js';
@@ -243,9 +261,10 @@ import { execFileSync } from 'child_process';
 import * as mockedWorkspacePrepModule from '../workspacePrep.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
-import { writeDesignDocHelper } from '../prompt.js';
+import { writeDesignDocHelper, readClaudeMd, buildContextPrefix } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
-import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
+import { recordFormatRepairAttempt, recordFormatRepairSuccess, getLlmTelemetry, resetLlmTelemetry } from '../telemetry.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -535,13 +554,13 @@ describe('aggregateDirectionStats', () => {
   });
 
   it('omits conversion when all tasks are ineligible types', () => {
-    // Only research tasks, no PR-eligible work
+    // Only ineligible task types (research, investigate) — no PR-eligible work
     const history = [{
       tasks_created: 2,
       prs_merged: 0,
       type_breakdown: {
         research: { created: 1, merged: 0, failed: 0 },
-        audit: { created: 1, merged: 0, failed: 0 },
+        investigate: { created: 1, merged: 0, failed: 0 },
       },
     }];
     const result = aggregateDirectionStats(history, {});
@@ -1530,6 +1549,51 @@ describe('buildVersionPhaseSection', () => {
     expect(buildVersionPhaseSection({ version_number: 1, phase: 'unknown' })).toBe('');
   });
 
+  it('renders failure marker block when lifecycle_signal is unavailable', () => {
+    const result = buildVersionPhaseSection({
+      lifecycle_signal: 'unavailable',
+      signal_status: 'build_failed',
+      error: "RuntimeError('simulated failure')",
+      integration_branch: 'automain',
+      promotion_target: 'main',
+    });
+    expect(result).toContain('Version Phase');
+    expect(result).toContain('unavailable');
+    expect(result).toContain('build_failed');
+    expect(result).toContain('automain');
+    expect(result).toContain('main');
+    expect(result).toContain("RuntimeError('simulated failure')");
+    // Must explain this is an infrastructure failure, not a lifecycle omission.
+    expect(result).toContain('infrastructure failure');
+  });
+
+  it('failure marker block renders without error field when error is absent', () => {
+    const result = buildVersionPhaseSection({
+      lifecycle_signal: 'unavailable',
+      signal_status: 'build_failed',
+      integration_branch: 'automain',
+      promotion_target: 'main',
+    });
+    expect(result).toContain('Version Phase');
+    expect(result).toContain('unavailable');
+    // Should not crash with no error field.
+    expect(result).not.toContain('Error: `');
+  });
+
+  it('renders failure advisory when build_unavailable is true (without lifecycle_signal)', () => {
+    const result = buildVersionPhaseSection({ build_unavailable: true });
+    expect(result).toContain('Version Phase');
+    expect(result).toContain('infrastructure failure');
+  });
+
+  it('does not trigger failure marker for normal payloads lacking lifecycle_signal', () => {
+    const result = buildVersionPhaseSection({ version_number: 3, phase: 'build' });
+    // Normal path — should render normally, not as a failure marker.
+    expect(result).toContain('v3');
+    expect(result).toContain('BUILD');
+    expect(result).not.toContain('infrastructure failure');
+  });
+
   it('renders build phase with version number', () => {
     const result = buildVersionPhaseSection({ version_number: 3, phase: 'build' });
     expect(result).toContain('v3');
@@ -2203,6 +2267,73 @@ describe('buildVersionPhaseSection', () => {
     expect(result).not.toContain('AC-1: covered');
   });
 
+  it('renders stuck_reason inline for uncovered criteria and omits it for covered/null', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      criterion_coverage: {
+        total: 3,
+        covered: 1,
+        partial: 0,
+        uncovered: 2,
+        criteria: [
+          { criterion_key: 'AC-1', text: 'Covered criterion.', coverage: 'covered', evidence_count: 2, stuck_reason: null },
+          { criterion_key: 'AC-2', text: 'No direction mapped yet.', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'no_mapping' },
+          { criterion_key: 'AC-3', text: 'All directions retired.', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'direction_retired' },
+        ],
+      },
+    });
+
+    expect(result).toContain('AC-2: uncovered, evidence=0 [stuck: no_mapping] — No direction mapped yet.');
+    expect(result).toContain('AC-3: uncovered, evidence=0 [stuck: direction_retired] — All directions retired.');
+    // Covered criteria are not rendered; null stuck_reason does not appear
+    expect(result).not.toContain('AC-1: covered');
+    const coveredLine = result.split('\n').find((l) => l.includes('AC-1'));
+    expect(coveredLine).toBeUndefined();
+  });
+
+  it('does not surface retracted criteria as needing evidence', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      criterion_coverage: {
+        total: 3,
+        covered: 1,
+        partial: 1,
+        uncovered: 1,
+        criteria: [
+          { criterion_key: 'AC-1', text: 'Active and uncovered.', coverage: 'uncovered', evidence_count: 0, status: 'active' },
+          { criterion_key: 'AC-2', text: 'Retracted but still uncovered.', coverage: 'uncovered', evidence_count: 0, status: 'retracted' },
+          { criterion_key: 'AC-3', text: 'Covered and superseded.', coverage: 'covered', evidence_count: 2, status: 'superseded' },
+        ],
+      },
+    });
+
+    expect(result).toContain('AC-1: uncovered, evidence=0 — Active and uncovered.');
+    expect(result).not.toContain('AC-2');
+    expect(result).not.toContain('AC-3');
+  });
+
+  it('does not surface superseded criteria as needing evidence', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      criterion_coverage: {
+        total: 3,
+        covered: 1,
+        partial: 1,
+        uncovered: 1,
+        criteria: [
+          { criterion_key: 'AC-1', text: 'Active and partial.', coverage: 'partial', evidence_count: 1, status: 'active' },
+          { criterion_key: 'AC-2', text: 'Superseded and partial.', coverage: 'partial', evidence_count: 0, status: 'superseded' },
+        ],
+      },
+    });
+
+    expect(result).toContain('AC-1: partial, evidence=1 — Active and partial.');
+    expect(result).not.toContain('AC-2');
+  });
+
   it('renders counts-only criterion coverage without requiring a criteria list', () => {
     const result = buildVersionPhaseSection({
       version_number: 5,
@@ -2392,6 +2523,58 @@ describe('buildVersionPhaseSection', () => {
     expect(result).not.toContain('CURRENT');
   });
 
+  it('renders candidate currency as API UNREACHABLE (not STALE) for verdict api_unreachable', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        verdict: 'api_unreachable',
+        resolved: false,
+        reason: 'github_http_502',
+        candidate_sha: 'candsha012345',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: API UNREACHABLE');
+    expect(result).toContain('github_http_502');
+    expect(result).toContain('candsha01234');
+    // Regression: a transient GitHub outage must NOT be framed as STALE.
+    expect(result).not.toContain('candidate currency: STALE');
+    expect(result).toContain('temporary reachability problem');
+  });
+
+  it('renders candidate currency as UNKNOWN (not STALE) for genuine indeterminacy', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        verdict: 'unknown',
+        resolved: false,
+        reason: 'repo_credentials_unavailable',
+        candidate_sha: 'candsha678901',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: UNKNOWN');
+    expect(result).toContain('Not confirmed stale');
+    expect(result).not.toContain('candidate currency: STALE');
+    expect(result).not.toContain('candidate currency: CURRENT');
+  });
+
+  it('renders STALE when verdict is stale even without a boolean current field', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        verdict: 'stale',
+        resolved: true,
+        current: false,
+        candidate_sha: 'oldsha1234567890',
+        head_sha: 'newsha9876543210',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: STALE');
+    expect(result).toContain('oldsha123456');
+  });
+
   it('omits candidate currency block when last_qualification_candidate_currency is absent', () => {
     const result = buildVersionPhaseSection({ version_number: 3, phase: 'stabilize' });
     expect(result).not.toContain('Qualification candidate currency');
@@ -2404,6 +2587,50 @@ describe('buildVersionPhaseSection', () => {
       last_qualification_candidate_currency: null,
     });
     expect(result).not.toContain('Qualification candidate currency');
+  });
+
+  it('renders qualification_state_disagreement note when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'not_promoted', candidate_sha: 'deadbeef1234' },
+      qualification_state_disagreement: {
+        last_qualification_status: 'pending',
+        verdict_terminal_status: 'not_promoted',
+      },
+    });
+    expect(result).toContain('qualification_state_disagreement');
+    expect(result).toContain("last_qualification.status='pending'");
+    expect(result).toContain("finalized verdict reports 'not_promoted'");
+    expect(result).toContain('finalized verdict');
+  });
+
+  it('omits qualification_state_disagreement note when absent', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'not_promoted', candidate_sha: 'deadbeef1234' },
+    });
+    expect(result).not.toContain('qualification_state_disagreement');
+  });
+
+  it('renders enriched qualification_state and serving_status for recent_versions entries', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      recent_versions: [
+        {
+          version_number: 4,
+          status: 'promoted',
+          serving_status: 'serving',
+          last_qualification: { status: 'promoted', confidence: 0.88 },
+          qualification_state: { state: 'promoted', serving_status: 'serving' },
+        },
+      ],
+    });
+    expect(result).toContain('Recent versions');
+    expect(result).toContain('qual_state=promoted');
+    expect(result).toContain('serving=serving');
   });
 });
 
@@ -3206,17 +3433,30 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('admin-ui');
   });
 
-  it('handleResearch prompt documents the visual acceptance_evidence kind in BOTH the payload and context vocabularies', async () => {
+  it('handleResearch prompt documents acceptance_evidence in a SINGLE canonical (payload) vocab', async () => {
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
-    // Payload vocab (named_test/observable_behavior/downstream_artifact/visual).
+    // Canonical payload vocab (named_test/observable_behavior/downstream_artifact/visual)
+    // — the shape the merge gate consumes; the backend normalizes it into the
+    // lighter context form (parse_acceptance_evidence), so no second vocab is taught.
+    expect(p).toContain('"kind": "named_test"');
     expect(p).toContain('"kind": "visual"');
     expect(p).toContain('"viewport_width"');
-    // Context vocab (test|behavior|artifact|visual with descriptor/selector).
-    expect(p).toContain('"test"|"behavior"|"artifact"|"visual"');
-    // Documents the descriptor=component / selector=width mapping for visual.
-    expect(p).toMatch(/descriptor = the component name/);
     expect(p).toMatch(/FRONTEND-TOUCHING/);
+    // The contradictory second (lighter/context) vocab must NOT be re-taught — it
+    // was silently dropped by the finding parser and duplicated per-turn tokens.
+    expect(p).not.toContain('"test"|"behavior"|"artifact"|"visual"');
+    expect(p).not.toMatch(/descriptor = the component name/);
+  });
+
+  // Size/dedup assertion over the canonical static block: acceptance_evidence is
+  // documented by EXACTLY ONE rubric heading in the research prompt (previously
+  // two contradictory rubrics were re-read every turn).
+  it('handleResearch prompt declares the acceptance_evidence rubric exactly once', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const rubricHeadings = (p.match(/\*\*acceptance_evidence\*\*/g) || []).length;
+    expect(rubricHeadings).toBe(1);
   });
 
   // ── handlePlan atomic schema-change rule (no split model/migrate subtasks) ────
@@ -3429,6 +3669,62 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     // absent — the field-doc rules may still REFERENCE the vocabulary, but no
     // capability list is injected when none were supplied.
     expect(p).not.toContain('# AVAILABLE CAPABILITIES (shared vocabulary)');
+  });
+});
+
+// ── CLAUDE.md embed gating by provider ──────────────────────────────────────
+// When the active provider auto-injects the workspace CLAUDE.md (anthropic),
+// the plan and research prompts must NOT embed a second copy via
+// ## Codebase Instructions. For other providers the embed must be retained.
+describe('handlePlan / handleResearch CLAUDE.md embed gating', () => {
+  const GP_TASK_ID = 'gp-task-001';
+  const GP_GH_TOKEN = 'gh-token';
+  const GP_OWNER = 'owner';
+  const GP_REPO = 'repo';
+  const GP_WS = null;
+  const GP_STATUS_REF = () => ({ value: '' });
+  const GP_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+  const GP_PAYLOAD = { base_branch: 'main', prompt: 'analyze the codebase' };
+  const CLAUDE_MD_CONTENT = 'project-specific instructions here';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+    vi.mocked(readClaudeMd).mockReturnValue(CLAUDE_MD_CONTENT);
+  });
+
+  it('handlePlan omits ## Codebase Instructions when provider auto-injects CLAUDE.md', async () => {
+    vi.mocked(providerAutoInjectsClaudeMd).mockReturnValue(true);
+    await handlePlan(GP_TASK_ID, GP_PAYLOAD, GP_TASK, GP_GH_TOKEN, GP_OWNER, GP_REPO, GP_WS, GP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('## Codebase Instructions');
+  });
+
+  it('handlePlan includes ## Codebase Instructions when provider does not auto-inject CLAUDE.md', async () => {
+    vi.mocked(providerAutoInjectsClaudeMd).mockReturnValue(false);
+    await handlePlan(GP_TASK_ID, GP_PAYLOAD, GP_TASK, GP_GH_TOKEN, GP_OWNER, GP_REPO, GP_WS, GP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('## Codebase Instructions');
+    expect(p).toContain(CLAUDE_MD_CONTENT);
+  });
+
+  it('handleResearch omits ## Codebase Instructions when provider auto-injects CLAUDE.md', async () => {
+    vi.mocked(providerAutoInjectsClaudeMd).mockReturnValue(true);
+    await handleResearch(GP_TASK_ID, GP_PAYLOAD, GP_TASK, GP_GH_TOKEN, GP_OWNER, GP_REPO, GP_WS, GP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('## Codebase Instructions');
+  });
+
+  it('handleResearch includes ## Codebase Instructions when provider does not auto-inject CLAUDE.md', async () => {
+    vi.mocked(providerAutoInjectsClaudeMd).mockReturnValue(false);
+    await handleResearch(GP_TASK_ID, GP_PAYLOAD, GP_TASK, GP_GH_TOKEN, GP_OWNER, GP_REPO, GP_WS, GP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('## Codebase Instructions');
+    expect(p).toContain(CLAUDE_MD_CONTENT);
   });
 });
 
@@ -3829,8 +4125,8 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     const script = helperCall ? helperCall[1] : '';
     expect(script).toContain('set-evidence-progress)');
     expect(script).toContain('_call "set_evidence_progress"');
-    // Usage string advertises the new op.
-    expect(script).toContain('set-evidence-progress|set-acceptance-criteria <json-or-file>');
+    // Usage string advertises the new op (record-finding-resolution is the last CLI op).
+    expect(script).toContain('set-evidence-progress|set-acceptance-criteria|record-finding-resolution <json-or-file>');
   });
 });
 
@@ -4086,5 +4382,213 @@ describe('normalizePlanSubtaskTypes', () => {
     expect(normalizePlanSubtaskTypes(noOp)).toBe(noOp);
     const weird = JSON.stringify({ findings: [] });
     expect(normalizePlanSubtaskTypes(weird)).toBe(weird);
+  });
+});
+
+// ── Byte-budget ratchet — plan and research prompts ─────────────────────────
+// These tests assert that the static template size of the plan and research
+// prompts stays within a known ceiling. With all dynamic sections mocked to
+// empty strings, any silent regrowth of the static template causes a failure.
+// To raise the ceiling intentionally, bump the constant below and document why.
+//
+// Ceilings are set at measured-size + ~20% headroom. A future PR that exceeds
+// the ceiling MUST bump the constant — silent growth is the bug we are catching.
+//
+// PLAN_PROMPT_BYTE_CEILING: measured 16 298 bytes on first landing; set to
+// 19 600 (≈20% headroom) so minor wording tweaks are absorbed without noise.
+//
+// RESEARCH_PROMPT_BYTE_CEILING: measured 25 505 bytes on first landing; set
+// to 31 000 (≈21% headroom) for the same reason.
+const PLAN_PROMPT_BYTE_CEILING = 19_600;
+const RESEARCH_PROMPT_BYTE_CEILING = 31_000;
+
+describe('research/plan prompt byte-budget ratchet', () => {
+  const RB_TASK_ID = 'rb-task-001';
+  const RB_GH_TOKEN = 'gh-token';
+  const RB_OWNER = 'owner';
+  const RB_REPO = 'repo';
+  const RB_WS = null;
+  const RB_STATUS_REF = () => ({ value: '' });
+  const RB_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+  const RB_PAYLOAD = { base_branch: 'main', prompt: 'analyze the codebase' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('plan prompt static bytes stay within ratchet ceiling', async () => {
+    await handlePlan(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const bytes = Buffer.byteLength(prompt, 'utf8');
+    expect(bytes, `plan prompt grew to ${bytes} bytes (ceiling: ${PLAN_PROMPT_BYTE_CEILING}). Bump PLAN_PROMPT_BYTE_CEILING in research-plan.test.ts if this is intentional.`).toBeLessThan(PLAN_PROMPT_BYTE_CEILING);
+  });
+
+  it('research prompt static bytes stay within ratchet ceiling', async () => {
+    await handleResearch(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const bytes = Buffer.byteLength(prompt, 'utf8');
+    expect(bytes, `research prompt grew to ${bytes} bytes (ceiling: ${RESEARCH_PROMPT_BYTE_CEILING}). Bump RESEARCH_PROMPT_BYTE_CEILING in research-plan.test.ts if this is intentional.`).toBeLessThan(RESEARCH_PROMPT_BYTE_CEILING);
+  });
+
+  it('records prompt size telemetry in the startup heartbeat for plan and research', async () => {
+    resetLlmTelemetry();
+    await handlePlan(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+    const planTelemetry = getLlmTelemetry();
+
+    resetLlmTelemetry();
+    await handleResearch(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+    const researchTelemetry = getLlmTelemetry();
+
+    // prompt_size_bytes must be the real assembled-prompt byte length — positive
+    expect(planTelemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(planTelemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(planTelemetry.prompt_section_sizes).not.toBeNull();
+    // 'prompt_body' must NOT appear as a section (the whole prompt is not a component of itself)
+    expect((planTelemetry.prompt_section_sizes ?? []).map(s => s.name)).not.toContain('prompt_body');
+    // Component sections summed must not exceed the total (no double-counting)
+    const planSectionSum = (planTelemetry.prompt_section_sizes ?? []).reduce((s, e) => s + e.bytes, 0);
+    expect(planSectionSum).toBeLessThanOrEqual(planTelemetry.prompt_size_bytes ?? 0);
+
+    expect(researchTelemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(researchTelemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(researchTelemetry.prompt_section_sizes).not.toBeNull();
+    expect((researchTelemetry.prompt_section_sizes ?? []).map(s => s.name)).not.toContain('prompt_body');
+    const researchSectionSum = (researchTelemetry.prompt_section_sizes ?? []).reduce((s, e) => s + e.bytes, 0);
+    expect(researchSectionSum).toBeLessThanOrEqual(researchTelemetry.prompt_size_bytes ?? 0);
+  });
+});
+
+// ── Owning-direction narrative deduplication ─────────────────────────────────
+// Verifies that when a task has direction_context, the owning direction's
+// research_context-derived prose (failed approaches, open questions) is NOT
+// re-emitted by renderDirection — buildContextPrefix already ships it once.
+// Non-owning directions must still render their research_context.
+describe('owning direction narrative deduplication', () => {
+  const ND_TASK_ID = 'nd-task-001';
+  const ND_GH_TOKEN = 'gh-token';
+  const ND_OWNER = 'owner';
+  const ND_REPO = 'repo';
+  const ND_WS = null;
+  const ND_STATUS_REF = () => ({ value: '' });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('test_owning_direction_narrative_rendered_once', async () => {
+    const UNIQUE_FAILED = 'approach-zeta-unique-dedup-marker';
+    const UNIQUE_OPEN = 'question-eta-unique-dedup-marker';
+    const OTHER_CTX_ITEM = 'approach-theta-other-direction-marker';
+
+    // Simulate buildContextPrefix emitting the owning direction's narrative once
+    // (as ## Direction Context built from task.direction_context)
+    vi.mocked(buildContextPrefix).mockReturnValueOnce(
+      `## Direction Context\nFailed approaches:\n- ${UNIQUE_FAILED}\nOpen questions:\n- ${UNIQUE_OPEN}\n`,
+    );
+
+    const payload = {
+      base_branch: 'main',
+      current_direction_id: 'd-owning',
+      directions: [
+        {
+          id: 'd-owning',
+          text: 'Owning direction',
+          priority: 'medium',
+          status: 'active',
+          research_context: [
+            '## Established Findings',
+            '- finding 1 (merged)',
+            '## Failed Approaches',
+            `- ${UNIQUE_FAILED}`,
+            '## Open Questions',
+            `- ${UNIQUE_OPEN}`,
+          ].join('\n'),
+        },
+        {
+          id: 'd-other',
+          text: 'Other direction',
+          priority: 'medium',
+          status: 'active',
+          research_context: [
+            '## Failed Approaches',
+            `- ${OTHER_CTX_ITEM}`,
+          ].join('\n'),
+        },
+      ],
+    };
+
+    const task = {
+      title: 'Research task',
+      description: 'research',
+      context: {},
+      project_context: {},
+      direction_context: {
+        direction_id: 'd-owning',
+        narrative: {
+          failed_approaches: [UNIQUE_FAILED],
+          open_questions: [UNIQUE_OPEN],
+        },
+      },
+    };
+
+    await handleResearch(ND_TASK_ID, payload, task, ND_GH_TOKEN, ND_OWNER, ND_REPO, ND_WS, ND_STATUS_REF());
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+
+    // Owning direction's unique markers appear exactly once (from buildContextPrefix),
+    // not doubled by renderDirection's research_context parsing.
+    const failedCount = (prompt.match(new RegExp(UNIQUE_FAILED, 'g')) ?? []).length;
+    const openCount = (prompt.match(new RegExp(UNIQUE_OPEN, 'g')) ?? []).length;
+    expect(
+      failedCount,
+      `'${UNIQUE_FAILED}' should appear exactly once — not re-emitted by renderDirection for the owning direction`,
+    ).toBe(1);
+    expect(
+      openCount,
+      `'${UNIQUE_OPEN}' should appear exactly once — not re-emitted by renderDirection for the owning direction`,
+    ).toBe(1);
+
+    // Non-owning direction's research_context items must still appear
+    expect(prompt).toContain(OTHER_CTX_ITEM);
+  });
+});
+
+// ── Shared boilerplate blocks (extracted to research-plan-prompt-blocks.ts) ───
+describe('shared prompt boilerplate blocks', () => {
+  const RESEARCH_PLAN_SRC = realReadFileSync(
+    fileURLToPath(new URL('./research-plan.ts', import.meta.url)),
+    'utf-8',
+  );
+
+  it('test_shared_boilerplate_blocks_present_in_both_prompts', () => {
+    // CAPABILITY_DECLARATION_DOC is defined in research-plan-prompt-blocks.ts and
+    // re-exported from research-plan.ts — both sources must expose the same string.
+    expect(CAPABILITY_DECLARATION_DOC).toBe(CAP_DOC_FROM_BLOCKS);
+
+    // Both the plan and research prompts must interpolate the shared blocks so
+    // the extracted constants actually reach both prompt strings.
+    const capRefs = RESEARCH_PLAN_SRC.match(/\$\{CAPABILITY_DECLARATION_DOC\}/g) ?? [];
+    expect(capRefs.length).toBe(2);
+
+    const rubricRefs = RESEARCH_PLAN_SRC.match(/\$\{ACCEPTANCE_EVIDENCE_RUBRIC\}/g) ?? [];
+    expect(rubricRefs.length).toBe(2);
+
+    // The shared blocks contain the expected vocabulary.
+    expect(CAPABILITY_DECLARATION_DOC).toContain('provides_capability');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('AVAILABLE CAPABILITIES');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('every other task type');
+    expect(CAPABILITY_DECLARATION_DOC).toMatch(/never rejected/);
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('named_test');
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('observable_behavior');
   });
 });

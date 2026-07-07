@@ -871,6 +871,47 @@ async def persist_trial_verdicts_in_transaction(
                             cap_name,
                             project_id,
                         )
+                # Completion-debt ledger: a capability sitting in observe/trial
+                # (continue-trial) with no decided enforce verdict is a standing
+                # obligation; a decided verdict discharges it. Best-effort and
+                # deduped per (project, capability) so the row is unique.
+                try:
+                    from app.completion_debt import (
+                        arecord_completion_debt,
+                        aresolve_completion_debt,
+                        KIND_CAPABILITY_TRIAL,
+                    )
+
+                    _debt_key = f"capability_trial:{project_id}:{cap_name}"
+                    if actual_verdict in _CONTINUE_VERDICTS:
+                        await arecord_completion_debt(
+                            session,
+                            dedupe_key=_debt_key,
+                            kind=KIND_CAPABILITY_TRIAL,
+                            title=(
+                                f"Capability '{cap_name}' in observe/trial mode "
+                                "with no decided enforce verdict"
+                            ),
+                            project_id=project_id,
+                            source="capability_trial_verdict",
+                            detail={
+                                "capability": cap_name,
+                                "verdict": actual_verdict,
+                            },
+                        )
+                    elif actual_verdict in _DECIDED_VERDICTS:
+                        await aresolve_completion_debt(
+                            session,
+                            _debt_key,
+                            reason=f"decided:{actual_verdict}",
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "[CAPABILITY_TRIAL] completion-debt record failed for "
+                        "%s on project %s (non-fatal)",
+                        cap_name,
+                        project_id,
+                    )
                 if (
                     actual_verdict in _DECIDED_VERDICTS
                     and actual_verdict != prior_verdict

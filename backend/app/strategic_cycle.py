@@ -26,7 +26,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models import StrategicCycle, Task
+from app.models import CYCLE_META_INTEGRITY_CONFLICT_COUNTS, StrategicCycle, Task
 from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 from app.time_utils import _utcnow
 
@@ -620,6 +620,127 @@ def advance_running_update_baseline(cycle: StrategicCycle, value: str) -> None:
     flag_modified(cycle, "cycle_metadata")
 
 
+def record_integrity_conflict_counts(
+    cycle: StrategicCycle,
+    counts: dict[str, int],
+) -> None:
+    """Stamp integrity-conflict counts computed at cycle start into cycle_metadata.
+
+    ``counts`` must carry the four conflict classes: orphaned_gaps,
+    ungrounded_directions, stale_active_moves, and staffed_but_deferred.
+    All four are stored as explicit integers so a value of 0 is
+    distinguishable from a missing key (legacy cycle with no stamp).
+    Callers are responsible for ``session.add(cycle)`` / commit.
+    """
+    new_meta = dict(cycle.cycle_metadata or {})
+    new_meta[CYCLE_META_INTEGRITY_CONFLICT_COUNTS] = {
+        "orphaned_gaps": int(counts.get("orphaned_gaps") or 0),
+        "ungrounded_directions": int(counts.get("ungrounded_directions") or 0),
+        "stale_active_moves": int(counts.get("stale_active_moves") or 0),
+        "staffed_but_deferred": int(counts.get("staffed_but_deferred") or 0),
+    }
+    cycle.cycle_metadata = new_meta
+    flag_modified(cycle, "cycle_metadata")
+
+
+async def recent_integrity_conflict_trend(
+    session: AsyncSession,
+    project_id,
+    *,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Return integrity-conflict trend data over the last ``limit`` completed cycles.
+
+    Scans completed cycles newest-first, reads the stamped
+    ``CYCLE_META_INTEGRITY_CONFLICT_COUNTS`` value, and counts how many
+    consecutive cycles (from the most recent backward) are clean — i.e. all
+    three conflict classes are zero.  Only cycles that actually carry the stamp
+    contribute to the clean streak; cycles that predate the feature are skipped
+    when computing the streak (they don't break it but they also don't extend
+    it, so the caller can distinguish "2 verified clean" from "unknown history").
+
+    Returns::
+
+        {
+            "stamped_cycles": int,          # cycles in window with a stamp
+            "consecutive_clean_cycles": int,# unbroken clean streak from most-recent
+            "last_counts": dict | None,     # counts from the most-recent stamped cycle
+        }
+    """
+    stmt = (
+        select(StrategicCycle)
+        .where(
+            StrategicCycle.project_id == project_id,
+            StrategicCycle.outcome == OUTCOME_COMPLETED,
+        )
+        .order_by(desc(StrategicCycle.phase1_started_at))
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    stamped: list[dict[str, int]] = []
+    for row in rows:
+        meta = row.cycle_metadata or {}
+        raw = meta.get(CYCLE_META_INTEGRITY_CONFLICT_COUNTS)
+        if isinstance(raw, dict):
+            stamped.append(
+                {
+                    "orphaned_gaps": int(raw.get("orphaned_gaps") or 0),
+                    "ungrounded_directions": int(raw.get("ungrounded_directions") or 0),
+                    "stale_active_moves": int(raw.get("stale_active_moves") or 0),
+                    # Legacy stamps (pre-staffed_but_deferred) omit this key; treat
+                    # as absent rather than 0 so the caller can distinguish "verified
+                    # clean on all four classes" from "old stamp, class unknown".
+                    **(
+                        {"staffed_but_deferred": int(raw["staffed_but_deferred"] or 0)}
+                        if "staffed_but_deferred" in raw
+                        else {}
+                    ),
+                }
+            )
+
+    # Walk rows newest-first to compute the streak. Unstamped cycles break the
+    # streak just like dirty cycles do: an unstamped completed cycle (e.g. one
+    # spawned via the resident-minimal path, which skips reconciliation) is an
+    # unverified interval — claiming a clean streak through it is incorrect.
+    # Legacy pre-feature cycles naturally appear at the tail of the window; if
+    # all rows in the window are unstamped the streak stays 0, which is the
+    # correct "unknown history" signal.
+    # For the clean-streak, legacy stamps without staffed_but_deferred are not
+    # counted as clean for that class — they break the streak to avoid silently
+    # crediting cycles that never tracked the class.
+    consecutive_clean = 0
+    for row in rows:
+        meta = row.cycle_metadata or {}
+        raw = meta.get(CYCLE_META_INTEGRITY_CONFLICT_COUNTS)
+        if not isinstance(raw, dict):
+            break
+        if "staffed_but_deferred" not in raw:
+            # Legacy stamp — class was not tracked; break the streak.
+            break
+        counts = {
+            "orphaned_gaps": int(raw.get("orphaned_gaps") or 0),
+            "ungrounded_directions": int(raw.get("ungrounded_directions") or 0),
+            "stale_active_moves": int(raw.get("stale_active_moves") or 0),
+            "staffed_but_deferred": int(raw["staffed_but_deferred"] or 0),
+        }
+        if (
+            counts["orphaned_gaps"] == 0
+            and counts["ungrounded_directions"] == 0
+            and counts["stale_active_moves"] == 0
+            and counts["staffed_but_deferred"] == 0
+        ):
+            consecutive_clean += 1
+        else:
+            break
+
+    return {
+        "stamped_cycles": len(stamped),
+        "consecutive_clean_cycles": consecutive_clean,
+        "last_counts": stamped[0] if stamped else None,
+    }
+
+
 def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
     """Render a StrategicCycle row in the legacy cycle_history JSONB shape.
 
@@ -702,6 +823,23 @@ async def find_stalled(
         .limit(limit * 4)  # over-fetch so phase-2 stall checks find candidates
     )
     candidates = (await session.execute(stmt)).scalars().all()
+    # Batch-load the phase-1/phase-2 linked tasks once (was one session.get per
+    # candidate per phase) and look them up in-memory; a missing id resolves to
+    # None exactly as session.get would, preserving the hold-check semantics.
+    _linked_task_ids: set = set()
+    for c in candidates:
+        if c.phase1_task_id is not None:
+            _linked_task_ids.add(c.phase1_task_id)
+        if c.phase2_task_id is not None:
+            _linked_task_ids.add(c.phase2_task_id)
+    linked_tasks_by_id: dict = {}
+    if _linked_task_ids:
+        _linked_task_rows = (
+            (await session.execute(select(Task).where(Task.id.in_(_linked_task_ids))))
+            .scalars()
+            .all()
+        )
+        linked_tasks_by_id = {t.id: t for t in _linked_task_rows}
     stalled: list[StrategicCycle] = []
     for c in candidates:
         if c.outcome in (
@@ -715,7 +853,7 @@ async def find_stalled(
                 and c.phase2_started_at is None
             ):
                 if c.phase1_task_id is not None:
-                    linked_task = await session.get(Task, c.phase1_task_id)
+                    linked_task = linked_tasks_by_id.get(c.phase1_task_id)
                     if task_is_strategic_local_runner_hold(linked_task):
                         continue
                 stalled.append(c)
@@ -723,7 +861,7 @@ async def find_stalled(
             ref = c.phase2_started_at or c.phase1_started_at
             if ref and ref < phase2_cutoff:
                 if c.phase2_task_id is not None:
-                    linked_task = await session.get(Task, c.phase2_task_id)
+                    linked_task = linked_tasks_by_id.get(c.phase2_task_id)
                     if task_is_strategic_local_runner_hold(linked_task):
                         continue
                 stalled.append(c)

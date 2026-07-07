@@ -9,6 +9,7 @@ from sqlmodel import select
 from app.models import MessageType, Project, ProjectMember, ProjectMessage
 from app.project_message_projection import (
     admin_message_dict,
+    admin_message_list_dict,
     agent_fetch_message_dict,
     agent_thread_message_dict,
     legacy_direction_message_dict,
@@ -382,3 +383,56 @@ async def test_strategic_open_message_payload_keeps_agent_aliases(db_session):
     assert item["resolved_at"] is None
     assert "message_type" not in item
     assert "from_type" not in item
+
+
+def test_admin_message_list_dict_returns_compact_context():
+    """admin_message_list_dict preserves UI-needed context keys and strips large keys."""
+    msg_with_context = _message(
+        context={"event_type": "task_failed", "severity": "error", "strategic_session": {"version": 1}}
+    )
+    msg_no_context = _message(context=None)
+
+    data_with = admin_message_list_dict(msg_with_context)
+    data_none = admin_message_list_dict(msg_no_context)
+
+    # UI-needed keys are preserved
+    assert data_with["context"]["event_type"] == "task_failed"
+    assert data_with["context"]["severity"] == "error"
+    # Large keys not in the compact set are stripped
+    assert "strategic_session" not in data_with["context"]
+    # No context → empty dict
+    assert data_none["context"] == {}
+    # All other fields are still present and correct
+    assert data_with["message_type"] == "BLOCKER"
+    assert data_with["from_type"] == "system"
+    assert data_with["status"] == "linked"
+
+
+@pytest.mark.asyncio
+async def test_admin_messages_list_strips_large_context_keys(
+    client: AsyncClient,
+    db_session,
+):
+    """List endpoint returns compact context (UI-needed keys only), stripping large keys like strategic_session."""
+    project = await _make_project(db_session)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="system",
+        content="Message with large context",
+        context={"event_type": "task_failed", "strategic_session": {"version": 1, "huge": "x" * 10_000}},
+        status="open",
+    )
+    db_session.add(msg)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/messages?project_id={project.id}")
+
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["messages"]
+    assert len(items) == 1
+    # event_type is a UI-needed key and must be present
+    assert items[0]["context"]["event_type"] == "task_failed"
+    # strategic_session is a large key excluded from the compact set
+    assert "strategic_session" not in items[0]["context"]
+    assert items[0]["content"] == "Message with large context"

@@ -1,6 +1,8 @@
 """Direction management endpoints for project autonomous improvement steering."""
 
+import json
 import uuid
+import hashlib
 import logging
 from math import ceil
 from datetime import datetime
@@ -30,8 +32,19 @@ from app.task_locking import (
     acquire_direction_research_spawn_lock,
     lock_project_or_429,
     with_directions_locked,
+    with_problem_model_locked,
+    with_vision_locked,
 )
-from app.direction_lifecycle import _reset_outcome_detection_state
+from app.direction_lifecycle import (
+    _clear_direction_reactivation_state,
+    _reset_outcome_detection_state,
+    apply_churn_retirement_keep,
+    apply_churn_retirement_retire,
+    direction_has_churn_retirement_recommendation,
+    reactivate_paused_direction,
+    resurrect_direction,
+)
+from app.direction_event_trail import latest_direction_snapshot
 from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.direction_refractory import get_direction_refractory_info
@@ -40,7 +53,13 @@ from app.project_message_creation import (
     create_operator_project_message,
     parse_operator_message_type,
 )
-from app.problem_model import compute_model_size_signal, ProblemModel
+from app.problem_model import (
+    ProblemModel,
+    check_gap_id_write,
+    compute_model_size_signal,
+    reconcile_gap_staffing_raw_result,
+    reconcile_gaps_for_retired_directions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +71,61 @@ router = APIRouter(
 DIRECTION_TEXT_MAX = 2000
 COMPLETION_CRITERIA_MAX = 500
 DIRECTION_CONTEXT_FIELD_MAX = 500
+
+# Module-level cache for per-direction metric enrichment. The four computation
+# functions (_compute_direction_quality_score, _compute_lifetime_generalized_outcome_state,
+# _compute_churn_metrics, _compute_lifetime_burn_metrics) are pure given the direction
+# dict contents. On a 10s poll cadence with 20+ directions this avoids 80+ Python function
+# calls per tick when direction data hasn't changed.
+_DIRECTION_METRIC_CACHE: dict[tuple, dict] = {}
+_DIRECTION_METRIC_CACHE_MAX = 512
+
+
+def _direction_metric_cache_key(d: dict) -> tuple:
+    """Stable cache key covering all fields read by the four metric functions.
+
+    Hashes the full history list so in-place mutations (e.g. stranded_prs_merged
+    incremented on a non-last entry by _apply_stranded_discount) are detected even
+    when len(history) and history[-1] remain unchanged.  Also includes the
+    direction_churn_window_cycles config value because _compute_churn_metrics slices
+    the window by that setting.
+    """
+    from app.shared_state import runtime_config as _runtime_config
+
+    history = d.get("research_history") or []
+    history_hash = hashlib.sha1(
+        json.dumps(history, sort_keys=True, default=str).encode()
+    ).hexdigest()[:16]
+    agg = json.dumps(d.get("history_aggregate") or {}, sort_keys=True, default=str)
+    churn_window = int(_runtime_config.get("direction_churn_window_cycles", 5) or 5)
+    return (str(d.get("id", "")), history_hash, agg, churn_window)
+
+
+def _log_gap_staffing_reconcile_result(
+    *,
+    source: str,
+    project_id: uuid.UUID,
+    result: dict[str, Any],
+) -> None:
+    details = result.get("result") if isinstance(result, dict) else None
+    if not isinstance(details, dict):
+        return
+    if details.get("malformed_model"):
+        logger.warning(
+            "[directions] gap staffing reconciliation skipped malformed problem_model",
+            extra={"source": source, "project_id": str(project_id)},
+        )
+    unresolved = details.get("unresolved_gap_ids") or {}
+    if unresolved:
+        logger.warning(
+            "[directions] gap staffing reconciliation unresolved gap link",
+            extra={
+                "source": source,
+                "project_id": str(project_id),
+                "direction_id": details.get("direction_id"),
+                "unresolved_gap_ids": unresolved,
+            },
+        )
 
 
 def _compute_direction_merges_per_cycle(d: dict) -> Any:
@@ -69,25 +143,6 @@ def _compute_direction_merges_per_cycle(d: dict) -> Any:
 
 
 VALID_CATEGORIES = {"product", "structural", "mixed"}
-
-
-def _clear_direction_reactivation_state(direction: dict) -> None:
-    """Drop transient status residue so active/staged transitions start clean."""
-    for key in (
-        "paused_reason",
-        "paused_at",
-        "auto_paused",
-        "expired_at",
-        "needs_manual_intervention",
-        "needs_manual_intervention_at",
-        "escalation_notification_pending",
-        "escalation_notification_retries",
-        "last_researched_at",
-        "staged_activated_at",
-        "staged_for_version",
-    ):
-        direction.pop(key, None)
-    direction["remediation_attempts"] = 0
 
 
 class _DirectionPayload(BaseModel):
@@ -227,8 +282,29 @@ async def get_directions(
         refractory_until = refractory_info["refractory_until"]
         refractory_reason = refractory_info["refractory_reason"]
         refractory_remaining_minutes = refractory_info["refractory_remaining_minutes"]
-        generalized_state = _compute_lifetime_generalized_outcome_state(d)
-        raw_churn = _compute_churn_metrics(d)
+
+        cache_key = _direction_metric_cache_key(d)
+        cached = _DIRECTION_METRIC_CACHE.get(cache_key)
+        if cached is None:
+            generalized_state = _compute_lifetime_generalized_outcome_state(d)
+            raw_churn = _compute_churn_metrics(d)
+            raw_lifetime = _compute_lifetime_burn_metrics(d)
+            cached = {
+                "merges_per_cycle": _compute_direction_merges_per_cycle(d),
+                "quality_score": round(_compute_direction_quality_score(d), 3),
+                "generalized_state": generalized_state,
+                "raw_churn": raw_churn,
+                "raw_lifetime": raw_lifetime,
+            }
+            if len(_DIRECTION_METRIC_CACHE) >= _DIRECTION_METRIC_CACHE_MAX:
+                # Evict oldest half when the cache is full to bound memory growth.
+                evict = list(_DIRECTION_METRIC_CACHE.keys())[: _DIRECTION_METRIC_CACHE_MAX // 2]
+                for k in evict:
+                    _DIRECTION_METRIC_CACHE.pop(k, None)
+            _DIRECTION_METRIC_CACHE[cache_key] = cached
+
+        generalized_state = cached["generalized_state"]
+        raw_churn = cached["raw_churn"]
         churn_metrics = (
             {
                 **raw_churn,
@@ -238,7 +314,7 @@ async def get_directions(
             if raw_churn is not None
             else None
         )
-        raw_lifetime = _compute_lifetime_burn_metrics(d)
+        raw_lifetime = cached["raw_lifetime"]
         lifetime_burn_metrics = (
             {
                 **raw_lifetime,
@@ -251,8 +327,8 @@ async def get_directions(
         enriched.append(
             {
                 **d,
-                "merges_per_cycle": _compute_direction_merges_per_cycle(d),
-                "quality_score": round(_compute_direction_quality_score(d), 3),
+                "merges_per_cycle": cached["merges_per_cycle"],
+                "quality_score": cached["quality_score"],
                 "generalized_successes": generalized_state["generalized_successes"],
                 "generalized_health_rate": generalized_state["generalized_health_rate"],
                 "outcome_kind_breakdown": generalized_state["outcome_kind_breakdown"],
@@ -341,6 +417,14 @@ async def add_direction(
             status_code=400,
             detail=f"category must be one of: {sorted(VALID_CATEGORIES)}",
         )
+
+    if payload.gap_id:
+        _gap_err, _open_ids = check_gap_id_write(payload.gap_id, project.problem_model)
+        if _gap_err:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "gap_link_invalid", "reason": _gap_err, "open_gap_ids": _open_ids},
+            )
 
     from app.shared_state import runtime_config as _runtime_config
 
@@ -446,6 +530,30 @@ async def add_direction(
             detail="Project row locked by concurrent write, retry",
             headers={"Retry-After": "2"},
         )
+    if not existing_direction and direction.get("gap_id") and not payload.staged:
+        _reconcile_holder: list[dict] = []
+        _dir_id = direction["id"]
+        _gap_id = direction["gap_id"]
+        _dir_status = direction.get("status")
+        _now_iso = _utcnow().isoformat()
+
+        def _reconcile_pm_add(pm: dict) -> None:
+            _r = reconcile_gap_staffing_raw_result(
+                pm, _dir_id, _gap_id, None,
+                new_status=_dir_status, now_iso=_now_iso,
+            )
+            _reconcile_holder.append(_r)
+            if _r.get("problem_model") is not None:
+                pm.clear()
+                pm.update(_r["problem_model"])
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm_add)
+        if _reconcile_holder:
+            _log_gap_staffing_reconcile_result(
+                source="operator_create_direction",
+                project_id=project.id,
+                result=_reconcile_holder[0],
+            )
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
 
@@ -821,6 +929,13 @@ async def update_direction(
             status_code=400,
             detail="gap_id must be a string of at most 100 characters",
         )
+    if "gap_id" in payload and payload["gap_id"] is not None:
+        _gap_err, _open_ids = check_gap_id_write(payload["gap_id"], project.problem_model)
+        if _gap_err:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "gap_link_invalid", "reason": _gap_err, "open_gap_ids": _open_ids},
+            )
 
     # Resolve and validate the staging TARGET version. Triggered both when a
     # direction transitions to ``staged`` AND when an already-staged direction is
@@ -861,6 +976,7 @@ async def update_direction(
             staged_for_version = target
 
     updated_direction: list = []  # [d] populated by mutate_fn
+    staffing_transition: list[dict[str, Any]] = []
 
     def _mutate_update(directions: list) -> None:
         # Cap check (needs locked data): if reactivating, ensure cap won't be exceeded
@@ -902,13 +1018,25 @@ async def update_direction(
                 _pre_ctx = d.get("context") or {}
                 _pre_se = _pre_ctx.get("success_evidence")
                 _pre_rc = _pre_ctx.get("retirement_condition")
+                _pre_gap_id = d.get("gap_id")
+                _pre_status = d.get("status")
 
                 if "priority" in payload:
                     d["priority"] = payload["priority"]
                 if "status" in payload:
-                    d["status"] = payload["status"]
-                    if payload["status"] in ("active", "staged"):
-                        _clear_direction_reactivation_state(d)
+                    if payload["status"] == "active":
+                        # Reactivating a paused/staged direction goes through the
+                        # shared seam so it clears residue AND stamps the lifecycle
+                        # grace marker (auto_recovered_at) when resuming from paused,
+                        # preventing frozen research_history from immediately
+                        # re-pausing/zombie-retiring it. Operators may resume their
+                        # own user-paused directions (allow_user_paused=True), so the
+                        # helper never blocks here.
+                        reactivate_paused_direction(d, allow_user_paused=True)
+                    else:
+                        d["status"] = payload["status"]
+                        if payload["status"] == "staged":
+                            _clear_direction_reactivation_state(d)
                     if payload["status"] == "staged":
                         d["staged_for_version"] = staged_for_version
                         d["staged_at"] = _utcnow().isoformat()
@@ -1040,6 +1168,15 @@ async def update_direction(
                 ):
                     _reset_outcome_detection_state(d)
 
+                if "gap_id" in payload or "status" in payload:
+                    staffing_transition.append(
+                        {
+                            "prior_gap_id": _pre_gap_id,
+                            "new_gap_id": d.get("gap_id"),
+                            "prior_status": _pre_status,
+                            "new_status": d.get("status"),
+                        }
+                    )
                 updated_direction.append(d)
                 return
         raise HTTPException(status_code=404, detail="Direction not found")
@@ -1053,9 +1190,363 @@ async def update_direction(
             detail="Project row locked by concurrent write, retry",
             headers={"Retry-After": "2"},
         )
+    if staffing_transition:
+        transition = staffing_transition[0]
+        _reconcile_holder: list[dict] = []
+        _new_gap_id = transition.get("new_gap_id")
+        _prior_gap_id = transition.get("prior_gap_id")
+        _new_status = transition.get("new_status")
+        _prior_status = transition.get("prior_status")
+        _now_iso = _utcnow().isoformat()
+
+        def _reconcile_pm_update(pm: dict) -> None:
+            _r = reconcile_gap_staffing_raw_result(
+                pm, direction_id, _new_gap_id, _prior_gap_id,
+                new_status=_new_status, prior_status=_prior_status, now_iso=_now_iso,
+            )
+            _reconcile_holder.append(_r)
+            if _r.get("problem_model") is not None:
+                pm.clear()
+                pm.update(_r["problem_model"])
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm_update)
+        if _reconcile_holder:
+            _log_gap_staffing_reconcile_result(
+                source="operator_update_direction",
+                project_id=project.id,
+                result=_reconcile_holder[0],
+            )
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
     return {"direction": updated_direction[0]}
+
+
+_RESURRECTABLE_TERMINAL_STATUSES = {"completed", "expired", "superseded"}
+
+
+def _is_terminal_direction(d: dict) -> bool:
+    return (
+        d.get("status") in _RESURRECTABLE_TERMINAL_STATUSES
+        or bool(d.get("auto_completed"))
+    )
+
+
+@router.post("/projects/{project_id}/directions/{direction_id}/resurrect")
+async def resurrect_direction_endpoint(
+    project_id: uuid.UUID,
+    direction_id: str,
+    payload: Dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Sanctioned, guarded revival of a wrongly auto-retired direction.
+
+    Undo path for the d-21efb120 class of incident. A raw completed->active flip
+    re-retires almost immediately (ladder counters stay primed, terminal residue
+    stays stamped, no grace, gap not re-staffed); this endpoint applies
+    ``resurrect_direction`` — which resets every ladder counter, strips terminal
+    residue, and grants one grace window — and re-staffs the owning gap.
+
+    Handles both cases:
+      * direction still in ``project.directions`` and terminal -> revive in place
+      * direction already pruned from ``project.directions`` -> reconstruct from
+        the latest ``DirectionEvent`` snapshot (404 if none) and re-insert.
+
+    Enforces the active-direction cap (409 at cap) exactly like reactivation.
+    Optional body ``{"rationale"?: str}`` is recorded on the audit note.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    rationale: str | None = None
+    if isinstance(payload, dict):
+        raw_rationale = payload.get("rationale")
+        if raw_rationale is not None:
+            if not isinstance(raw_rationale, str):
+                raise HTTPException(
+                    status_code=400, detail="rationale must be a string or null"
+                )
+            rationale = raw_rationale
+
+    # Reconstruct-from-snapshot data must be fetched BEFORE the (sync) locked
+    # mutate. It is only consumed when the direction is absent from the locked
+    # list, so the live row always wins when present.
+    snapshot = await latest_direction_snapshot(session, project.id, direction_id)
+
+    from app.shared_state import runtime_config as _runtime_config
+
+    max_active = _runtime_config.get("max_active_directions", 5)
+    now_iso = _utcnow().isoformat()
+
+    resurrected_holder: list[dict] = []
+    staffing_holder: list[dict[str, Any]] = []
+    actor = current_user.get("email") or current_user.get("user_id") or "operator"
+
+    def _mutate_resurrect(directions: list) -> None:
+        existing = next(
+            (d for d in directions if d.get("id") == direction_id), None
+        )
+
+        if existing is not None:
+            if not _is_terminal_direction(existing):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Direction is not retired "
+                        f"(status={existing.get('status')!r}); resurrection only "
+                        "applies to a terminal/auto-retired direction"
+                    ),
+                )
+            target = existing
+            reinsert = False
+        else:
+            if not snapshot:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        "No snapshot found to resurrect this direction — it was "
+                        "never recorded in the direction event trail"
+                    ),
+                )
+            snapshot_candidate = dict(snapshot)
+            snapshot_candidate["id"] = direction_id
+            # Apply the same terminal-status guard as the live-direction branch:
+            # a snapshot may have been taken while the direction was 'rejected'
+            # or in some other non-resurrectable state, and the prune that removed
+            # the live record doesn't change that constraint.
+            if not _is_terminal_direction(snapshot_candidate):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Snapshot direction is not in a resurrectable terminal state "
+                        f"(status={snapshot_candidate.get('status')!r}); resurrection "
+                        "only applies to a completed/expired/superseded direction"
+                    ),
+                )
+            target = snapshot_candidate
+            reinsert = True
+
+        # Active-direction cap (evaluated inside the lock against live data).
+        active_count = sum(
+            1
+            for d in directions
+            if d.get("status") == "active" and d.get("id") != direction_id
+        )
+        if active_count >= max_active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Direction cap reached: max {max_active} active directions allowed",
+            )
+
+        prior_status = target.get("status")
+        prior_gap_id = target.get("gap_id")
+
+        resurrect_direction(
+            target,
+            now_iso=now_iso,
+            actor=actor,
+            rationale=rationale,
+        )
+
+        if reinsert:
+            directions.append(target)
+
+        staffing_holder.append(
+            {
+                "prior_gap_id": prior_gap_id,
+                "new_gap_id": target.get("gap_id"),
+                "prior_status": prior_status,
+                "new_status": "active",
+            }
+        )
+        resurrected_holder.append(target)
+
+    applied = await with_directions_locked(
+        session, project.id, _mutate_resurrect, skip_locked=True
+    )
+    if not applied:
+        raise HTTPException(
+            status_code=429,
+            detail="Project row locked by concurrent write, retry",
+            headers={"Retry-After": "2"},
+        )
+
+    # Re-staff the owning gap: add the resurrected direction id back into its
+    # gap's active_moves and drop it from past_moves (same reconciliation the
+    # operator PATCH status/gap_id path runs).
+    if staffing_holder:
+        transition = staffing_holder[0]
+        _reconcile_holder: list[dict] = []
+        _new_gap_id = transition.get("new_gap_id")
+        _prior_gap_id = transition.get("prior_gap_id")
+        _new_status = transition.get("new_status")
+        _prior_status = transition.get("prior_status")
+
+        def _reconcile_pm_resurrect(pm: dict) -> None:
+            _r = reconcile_gap_staffing_raw_result(
+                pm, direction_id, _new_gap_id, _prior_gap_id,
+                new_status=_new_status, prior_status=_prior_status,
+                now_iso=now_iso, rationale="direction resurrected",
+            )
+            _reconcile_holder.append(_r)
+            if _r.get("problem_model") is not None:
+                pm.clear()
+                pm.update(_r["problem_model"])
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm_resurrect)
+        if _reconcile_holder:
+            _log_gap_staffing_reconcile_result(
+                source="operator_resurrect_direction",
+                project_id=project.id,
+                result=_reconcile_holder[0],
+            )
+
+    await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
+    return {
+        "direction": resurrected_holder[0],
+        "resurrected_at": now_iso,
+    }
+
+
+_CHURN_DECISIONS = {"KEEP", "RETIRE"}
+_CHURN_RATIONALE_MAX = 512
+
+
+@router.post(
+    "/projects/{project_id}/directions/{direction_id}/churn-retirement-decision"
+)
+async def decide_churn_retirement(
+    project_id: uuid.UUID,
+    direction_id: str,
+    payload: Dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Operator keep/retire decision for a churn-retirement-recommended direction.
+
+    The churn/zombie retire ladder flags a direction
+    ``churn_retirement_recommended=True`` and HOLDS it paused pending an explicit
+    decision (see ``direction_lifecycle``). This is the first-class decision seam:
+
+    * ``KEEP``   — clear the recommendation, reactivate the direction to
+      ``active``, and reset the churn-family ladder counter to 0 (a genuine fresh
+      start). Routed through ``reactivate_paused_direction`` so the user-paused
+      reactivation block is preserved and pause residue / grace are handled the
+      same way every other reactivation is.
+    * ``RETIRE`` — confirm the terminal outcome the recommendation proposed
+      (``completed``/``auto_completed``) with a reason attributing it to the
+      explicit decision, clear the recommendation, and reconcile the freed
+      problem-model gap plus record retired-direction memory (mirroring the
+      auto-retire ladders / strategist retire op).
+
+    Idempotent: a direction with no pending recommendation returns a clear no-op
+    response rather than a 500. Follows the resurrect/unhold conventions —
+    project role check + locked JSONB mutation via ``with_directions_locked``.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="request body required")
+    decision = payload.get("decision")
+    if not isinstance(decision, str) or decision.upper() not in _CHURN_DECISIONS:
+        raise HTTPException(
+            status_code=400, detail="decision must be 'KEEP' or 'RETIRE'"
+        )
+    decision = decision.upper()
+    rationale = payload.get("rationale")
+    if rationale is not None and not isinstance(rationale, str):
+        raise HTTPException(
+            status_code=400, detail="rationale must be a string or null"
+        )
+
+    actor = current_user.get("email") or current_user.get("user_id") or "operator"
+    now_iso = _utcnow().isoformat()
+
+    outcome: Dict[str, Any] = {}
+    result_holder: list[dict] = []
+    retire_holder: list[dict] = []
+
+    def _mutate(directions: list) -> None:
+        target = next(
+            (d for d in directions if d.get("id") == direction_id), None
+        )
+        if target is None:
+            raise HTTPException(status_code=404, detail="Direction not found")
+        if not direction_has_churn_retirement_recommendation(target):
+            # Idempotent no-op: nothing pending to decide (never a 500).
+            outcome["status"] = "noop"
+            result_holder.append(target)
+            return
+        if decision == "KEEP":
+            # Operator may resume even a user-paused direction; a churn-recommended
+            # direction is auto_paused so this never hits the user-paused block,
+            # but pass allow_user_paused=True to match the operator PATCH convention.
+            apply_churn_retirement_keep(target, allow_user_paused=True)
+            outcome["status"] = "kept"
+        else:
+            reason = (
+                f"Retired by explicit keep/retire decision ({actor}): "
+                "churn/zombie retirement recommendation confirmed."
+            )
+            if rationale and rationale.strip():
+                reason = f"{reason} {rationale.strip()[:_CHURN_RATIONALE_MAX]}"
+            apply_churn_retirement_retire(target, reason=reason, now_iso=now_iso)
+            outcome["status"] = "retired"
+            retire_holder.append(dict(target))
+        result_holder.append(target)
+
+    applied = await with_directions_locked(
+        session, project.id, _mutate, skip_locked=True
+    )
+    if not applied:
+        raise HTTPException(
+            status_code=429,
+            detail="Project row locked by concurrent write, retry",
+            headers={"Retry-After": "2"},
+        )
+
+    if outcome.get("status") == "retired" and retire_holder:
+        # Reconcile the freed gap and record retired-direction memory in the SAME
+        # committed transaction, mirroring the strategist retire_direction op so a
+        # decided-retire direction cannot linger in a gap's active_moves and blocks
+        # a same-gap / text-overlap re-spawn next cycle.
+        def _reconcile_pm(pm: dict) -> None:
+            reconcile_gaps_for_retired_directions(pm, [direction_id], now_iso)
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm)
+
+        from app.strategic_completion import (  # noqa: PLC0415
+            record_retired_direction_memory,
+        )
+
+        _retire_snapshot = retire_holder[0]
+
+        def _record_memory(vision: dict) -> None:
+            record_retired_direction_memory(
+                vision,
+                _retire_snapshot,
+                reason="churn_retirement_decision",
+                outcome=(rationale.strip() if rationale and rationale.strip() else None),
+            )
+
+        await with_vision_locked(session, project.id, _record_memory)
+
+    await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
+
+    resp: Dict[str, Any] = {
+        "status": outcome.get("status", "noop"),
+        "decision": decision,
+        "direction_id": direction_id,
+    }
+    if result_holder:
+        resp["direction"] = result_holder[0]
+    if outcome.get("status") == "noop":
+        resp["reason"] = "No pending churn-retirement recommendation"
+    return resp
 
 
 @router.post("/projects/{project_id}/directions/{direction_id}/research")
@@ -1127,6 +1618,33 @@ async def create_direction_research_task(
             ),
         )
 
+    # Semi-modern fast path: tasks that carry current_direction_id but predate
+    # the idempotency-key stamp (and so weren't caught above).  An existence
+    # check with LIMIT 1 avoids scanning unrelated active research tasks.
+    semi_modern_dup = (
+        await session.execute(
+            select(Task.id, Task.status)
+            .where(
+                Task.project_id == project.id,
+                Task.status.in_(active_statuses),
+                Task.payloads[0]["type"].as_string() == "research",
+                Task.payloads[0]["current_direction_id"].as_string() == direction_id,
+            )
+            .limit(1)
+        )
+    ).first()
+    if semi_modern_dup is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Research is already in progress on this direction "
+                f"(task {str(semi_modern_dup.id)[:8]}, status {semi_modern_dup.status}). "
+                "Cancel it before starting another."
+            ),
+        )
+
+    # Legacy fallback: very old tasks that stored the direction in the
+    # 'directions' payload array rather than a top-level current_direction_id.
     active_research = (
         (
             await session.execute(

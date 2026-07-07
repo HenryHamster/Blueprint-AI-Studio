@@ -120,8 +120,14 @@ const COVERAGE_BADGE: Record<CriterionCoverageEntry['coverage'], { label: string
   uncovered: { label: 'uncovered', className: 'bg-slate-700/60 text-slate-400 border border-slate-600/40' },
 };
 
-function CriterionCoveragePanel({ coverage }: { coverage: VersionCriterionCoverage }): JSX.Element {
-  if (coverage.total === 0) {
+const STATUS_BADGE: Record<NonNullable<CriterionCoverageEntry['status']>, { label: string; className: string }> = {
+  active:     { label: 'active',     className: 'bg-slate-700/50 text-slate-500 border border-slate-600/40' },
+  retracted:  { label: 'retracted',  className: 'bg-rose-500/15 text-rose-300 border border-rose-500/30' },
+  superseded: { label: 'superseded', className: 'bg-sky-500/15 text-sky-300 border border-sky-500/30' },
+};
+
+function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirection }: { coverage: VersionCriterionCoverage; onReinstate?: (criterionKey: string) => Promise<void>; onAttest?: (criterionKey: string) => void; onLinkDirection?: (criterionKey: string) => void }): JSX.Element {
+  if (coverage.criteria.length === 0) {
     return (
       <div className="mb-3" data-testid="criterion-coverage-panel">
         <div className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500 mb-1">Version acceptance criteria</div>
@@ -129,25 +135,109 @@ function CriterionCoveragePanel({ coverage }: { coverage: VersionCriterionCovera
       </div>
     );
   }
+
+  const rowInactiveCount = coverage.criteria.filter((c) => (c.status ?? 'active') !== 'active').length;
+  const inactiveCount = coverage.inactive ?? rowInactiveCount;
+  const retractedCount = coverage.retracted ?? coverage.criteria.filter((c) => c.status === 'retracted').length;
+  const supersededCount = coverage.superseded ?? coverage.criteria.filter((c) => c.status === 'superseded').length;
+
   return (
     <div className="mb-3" data-testid="criterion-coverage-panel">
-      <div className="flex items-center gap-2 mb-1">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mb-1">
         <span className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500">Version acceptance criteria</span>
-        <span className="text-ui-sm text-slate-400 font-medium">{coverage.covered}/{coverage.total} covered</span>
+        <span className="text-ui-sm text-slate-400 font-medium">
+          {coverage.total === 0 ? '0 active criteria' : `${coverage.covered}/${coverage.total} active covered`}
+        </span>
         {coverage.partial > 0 && <span className="text-ui-sm text-amber-400">{coverage.partial} partial</span>}
         {coverage.uncovered > 0 && <span className="text-ui-sm text-slate-500">{coverage.uncovered} uncovered</span>}
+        {inactiveCount > 0 && (
+          <span className="text-ui-sm text-slate-500" data-testid="inactive-count-badge">{inactiveCount} inactive</span>
+        )}
+        {retractedCount > 0 && <span className="text-ui-sm text-rose-300">{retractedCount} retracted</span>}
+        {supersededCount > 0 && <span className="text-ui-sm text-sky-300">{supersededCount} superseded</span>}
+        {coverage.stuck_count != null && coverage.stuck_count > 0 && (
+          <span className="text-ui-sm text-red-400" data-testid="stuck-count-badge" title="Uncovered criteria with no active direction mapping — need remapping or operator attestation">
+            {coverage.stuck_count} stuck
+          </span>
+        )}
       </div>
       <ul className="space-y-1">
         {coverage.criteria.map((c) => {
           const badge = COVERAGE_BADGE[c.coverage];
+          const status = c.status ?? 'active';
+          const statusBadge = STATUS_BADGE[status];
+          const stuckLabel = c.stuck_reason === 'no_mapping'
+            ? 'no direction'
+            : c.stuck_reason === 'direction_retired'
+              ? 'direction retired'
+              : null;
+          const isInProgress = status === 'active' && c.coverage === 'uncovered' && stuckLabel == null;
           return (
-            <li key={c.criterion_key} className="flex items-start gap-2" data-testid={`criterion-row-${c.criterion_key}`}>
+            <li
+              key={c.criterion_key}
+              className={`flex items-start gap-2 ${status !== 'active' ? 'opacity-80' : ''}`}
+              data-testid={`criterion-row-${c.criterion_key}`}
+            >
               <span className={`shrink-0 rounded px-1.5 py-0.5 text-ui-sm font-medium ${badge.className}`}>
                 {badge.label}
               </span>
+              {status !== 'active' && (
+                <span
+                  className={`shrink-0 rounded px-1.5 py-0.5 text-ui-sm font-medium ${statusBadge.className}`}
+                  data-testid={`criterion-status-${c.criterion_key}`}
+                >
+                  {statusBadge.label}
+                </span>
+              )}
               <span className="text-xs text-slate-300 break-words min-w-0">{c.text}</span>
+              {stuckLabel != null && (
+                <span className="shrink-0 text-ui-sm text-red-400 ml-1" data-testid={`stuck-reason-${c.criterion_key}`} title={`Stuck: ${c.stuck_reason}`}>
+                  {stuckLabel}
+                </span>
+              )}
+              {isInProgress && (
+                <span className="shrink-0 text-ui-sm text-slate-400 ml-1" data-testid={`in-progress-${c.criterion_key}`} title="Active direction is working on this criterion">
+                  in progress
+                </span>
+              )}
               {c.evidence_count > 0 && (
                 <span className="shrink-0 text-ui-sm text-slate-500 ml-auto">{c.evidence_count} ev.</span>
+              )}
+              {status === 'active' && stuckLabel != null && onAttest != null && (
+                <button
+                  className="shrink-0 text-ui-sm text-amber-400 hover:text-amber-200 ml-1 transition-colors"
+                  data-testid={`attest-btn-${c.criterion_key}`}
+                  onClick={() => onAttest(c.criterion_key)}
+                >
+                  Attest
+                </button>
+              )}
+              {status === 'active' && stuckLabel != null && onLinkDirection != null && (
+                <button
+                  className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
+                  data-testid={`link-direction-btn-${c.criterion_key}`}
+                  onClick={() => onLinkDirection(c.criterion_key)}
+                >
+                  Link direction
+                </button>
+              )}
+              {isInProgress && onLinkDirection != null && (
+                <button
+                  className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
+                  data-testid={`relink-direction-btn-${c.criterion_key}`}
+                  onClick={() => onLinkDirection(c.criterion_key)}
+                >
+                  Relink
+                </button>
+              )}
+              {status !== 'active' && onReinstate != null && (
+                <button
+                  className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
+                  data-testid={`reinstate-btn-${c.criterion_key}`}
+                  onClick={() => onReinstate(c.criterion_key)}
+                >
+                  Reinstate
+                </button>
               )}
             </li>
           );
@@ -178,11 +268,17 @@ export function VersionSummaryPanel({
   heading,
   acceptanceAggregate,
   criterionCoverage,
+  onReinstate,
+  onAttest,
+  onLinkDirection,
 }: {
   tasksMerged: ChangelogEntry[] | undefined;
   heading?: string;
   acceptanceAggregate?: Record<string, number> | null;
   criterionCoverage?: VersionCriterionCoverage | null;
+  onReinstate?: (criterionKey: string) => Promise<void>;
+  onAttest?: (criterionKey: string) => void;
+  onLinkDirection?: (criterionKey: string) => void;
 }): JSX.Element | null {
   const [copied, setCopied] = useState(false);
   const [filter, setFilter] = useState('');
@@ -195,7 +291,7 @@ export function VersionSummaryPanel({
         data-testid="version-summary-panel-empty"
         className="mt-3 rounded border border-slate-700/60 bg-slate-800/40 px-3 py-2"
       >
-        {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} />}
+        {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} />}
         <div className="text-ui-md text-slate-500 italic">No tasks merged into this version yet.</div>
       </div>
     );
@@ -241,7 +337,7 @@ export function VersionSummaryPanel({
           {copied ? 'Copied!' : 'Copy markdown'}
         </button>
       </div>
-      {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} />}
+      {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} />}
       {acceptanceAggregate && <AcceptanceBucketBreakdown aggregate={acceptanceAggregate} />}
       {/* Per-type count summary — lets operator grasp shape of release at a glance */}
       <div className="flex flex-wrap gap-1 mb-2" data-testid="type-count-summary">

@@ -15,6 +15,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.admin import _get_user_project_with_role
@@ -30,8 +31,12 @@ from app.compute_jobs_aggregation import (
     aggregate_criterion_summary,
 )
 from app.database import get_session
-from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
+from app.models import Artifact, ComputeJob, ComputeJobStatus, LocalRunner, Task
 from app.schemas import serialize_compute_job_response_safe
+from app.strategic_runtime_work import (
+    local_runner_hold_task_filters,
+    task_awaiting_local_runner_since,
+)
 from app.task_evaluators import (
     _declared_success_criterion,
     evaluate_compute_success_criterion,
@@ -121,7 +126,13 @@ async def _build_compute_job_payload(
     task_meta: Dict[uuid.UUID, tuple[str | None, str | None, Any, Any, Any]] = {}
     if task_ids:
         rows = (
-            (await session.execute(select(Task).where(Task.id.in_(task_ids))))
+            (
+                await session.execute(
+                    select(Task)
+                    .options(load_only(Task.id, Task.payloads, Task.title, Task.plan_output, Task.context, raiseload=True))
+                    .where(Task.id.in_(task_ids))
+                )
+            )
             .scalars()
             .all()
         )
@@ -164,6 +175,29 @@ async def _build_compute_job_payload(
             .all()
         )
         artifacts = {artifact.id: artifact for artifact in artifact_rows}
+
+    # Batch-load LocalRunner rows for jobs that carry a runner_target_id in
+    # their polling_metadata. One query covers all jobs in the page.
+    runner_target_ids: set[uuid.UUID] = set()
+    for job in jobs:
+        raw_id = (job.polling_metadata or {}).get("runner_target_id")
+        if raw_id:
+            try:
+                runner_target_ids.add(uuid.UUID(str(raw_id)))
+            except (ValueError, AttributeError):
+                pass
+    runner_map: Dict[uuid.UUID, LocalRunner] = {}
+    if runner_target_ids:
+        runner_rows = (
+            (
+                await session.execute(
+                    select(LocalRunner).where(LocalRunner.id.in_(runner_target_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        runner_map = {r.id: r for r in runner_rows}
 
     payload: list[Dict[str, Any]] = []
     for job in jobs:
@@ -208,6 +242,33 @@ async def _build_compute_job_payload(
             experiment = str(raw_experiment) if raw_experiment else None
             benchmark = str(raw_benchmark) if raw_benchmark else None
             hypothesis = str(raw_hypothesis) if raw_hypothesis else None
+        launch_params: dict | None = None
+        if task_obj is not None:
+            fp = task_obj.first_payload
+            raw_arms = fp.get("arms")
+            arms_val = raw_arms if isinstance(raw_arms, list) else None
+            raw_env = fp.get("env")
+            env_key_names = sorted(raw_env.keys()) if isinstance(raw_env, dict) else None
+            raw_provenance = fp.get("provenance")
+            raw_spend = fp.get("spend_cap_usd")
+            raw_deadline = fp.get("deadline_seconds")
+            launch_params = {
+                "command": fp.get("command") or None,
+                "arms": arms_val,
+                "declared_metric": fp.get("declared_metric") or None,
+                "metric": fp.get("metric") or None,
+                "cwd": fp.get("cwd") or None,
+                "env_keys": env_key_names,
+                "accelerator": fp.get("accelerator") or None,
+                "machine_type": fp.get("machine_type") or None,
+                "container_image": fp.get("container_image") or None,
+                "provisioning_model": fp.get("provisioning_model") or None,
+                "provenance": raw_provenance if isinstance(raw_provenance, dict) else None,
+                "spend_cap_usd": float(raw_spend) if raw_spend is not None else None,
+                "deadline_seconds": int(raw_deadline) if raw_deadline is not None else None,
+                "require_live_release": bool(fp.get("require_live_release")) if fp.get("require_live_release") is not None else None,
+                "require_durable_artifact": bool(fp.get("require_durable_artifact")) if fp.get("require_durable_artifact") is not None else None,
+            }
         data["task_title"] = title
         data["task_type"] = task_type
         data["success_criterion"] = success_criterion
@@ -217,10 +278,37 @@ async def _build_compute_job_payload(
         data["experiment"] = experiment
         data["benchmark"] = benchmark
         data["hypothesis"] = hypothesis
+        data["launch_params"] = launch_params
         linked_artifact = artifacts.get(job.artifact_id) if job.artifact_id else None
         data["artifact"] = (
             _artifact_descriptor(linked_artifact) if linked_artifact else None
         )
+        # Runner identity and wait-state fields.
+        pm = job.polling_metadata or {}
+        raw_runner_id = pm.get("runner_target_id")
+        runner_target_id_str: str | None = str(raw_runner_id) if raw_runner_id else None
+        data["runner_target_id"] = runner_target_id_str
+        data["runner_claimed_at"] = pm.get("runner_claimed_at")
+        runner_descriptor: Dict[str, Any] | None = None
+        if runner_target_id_str:
+            try:
+                runner_obj = runner_map.get(uuid.UUID(runner_target_id_str))
+                if runner_obj is not None:
+                    runner_descriptor = {
+                        "id": str(runner_obj.id),
+                        "hostname": runner_obj.hostname,
+                        "status": runner_obj.status,
+                    }
+            except (ValueError, AttributeError):
+                pass
+        data["runner"] = runner_descriptor
+        # awaiting_local_runner_since lives on the launching task's context, not
+        # the job row. The task_obj is already loaded in the batch above.
+        awaiting: str | None = None
+        if task_obj is not None:
+            raw_awaiting = (task_obj.context or {}).get("awaiting_local_runner_since")
+            awaiting = str(raw_awaiting) if raw_awaiting else None
+        data["awaiting_local_runner_since"] = awaiting
         payload.append(data)
     return payload
 
@@ -278,6 +366,85 @@ async def get_project_compute_jobs(
         "offset": offset,
         "summary": summary,
     }
+
+
+def _awaiting_local_runner_entry(task: Task) -> Dict[str, Any]:
+    """Serialize a compute_experiment task held awaiting a local runner.
+
+    These tasks have NO ComputeJob row (the orchestrator holds them QUEUED
+    before any job is created), so this is the only surface that exposes them.
+    The response shape is a stable contract the compute-workspace UI depends on:
+
+        {
+          "id": str,                            # task id
+          "title": str | None,
+          "awaiting_local_runner_since": str,   # ISO stamp from task.context
+          "created_at": str | None,             # ISO
+          "requires_approval": bool,
+          "spend_cap_usd": float | None,        # launch essentials from payload
+          "command": str | None,
+          "machine_type": str | None,
+          "accelerator": str | None,
+          "container_image": str | None,
+          "provisioning_model": str | None,
+          "deadline_seconds": int | None,
+        }
+    """
+    fp = task.first_payload
+    raw_spend = fp.get("spend_cap_usd")
+    raw_deadline = fp.get("deadline_seconds")
+    return {
+        "id": str(task.id),
+        "title": task.title,
+        "awaiting_local_runner_since": task_awaiting_local_runner_since(task),
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "requires_approval": bool(task.requires_approval),
+        "spend_cap_usd": float(raw_spend) if raw_spend is not None else None,
+        "command": fp.get("command") or None,
+        "machine_type": fp.get("machine_type") or None,
+        "accelerator": fp.get("accelerator") or None,
+        "container_image": fp.get("container_image") or None,
+        "provisioning_model": fp.get("provisioning_model") or None,
+        "deadline_seconds": int(raw_deadline) if raw_deadline is not None else None,
+    }
+
+
+@router.get("/projects/{project_id}/compute-jobs/awaiting-local-runner")
+async def get_project_awaiting_local_runner_holds(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """List compute_experiment tasks held QUEUED awaiting a local runner (viewer+).
+
+    When project policy requires local execution and no eligible runner is live,
+    the orchestrator holds a ``compute_experiment`` task in QUEUED with an
+    ``awaiting_local_runner_since`` stamp on ``task.context`` and never creates a
+    ComputeJob row. The regular ``/compute-jobs`` listing only surfaces ComputeJob
+    rows, so these blocked experiments are otherwise invisible in the workspace.
+
+    Returns a JSON list (newest ``created_at`` first). The filter is the shared
+    ``local_runner_hold_task_filters`` predicate: QUEUED, not archived,
+    ``requires_approval`` is not True, payload type ``compute_experiment``, and a
+    non-empty awaiting stamp. Each entry's shape is documented on
+    ``_awaiting_local_runner_entry`` and is a stable contract for the UI.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*local_runner_hold_task_filters(project_id))
+                .order_by(Task.created_at.desc())
+                .limit(500)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [_awaiting_local_runner_entry(task) for task in rows]
 
 
 @router.get("/projects/{project_id}/compute-jobs/summary")

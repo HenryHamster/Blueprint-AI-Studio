@@ -6,32 +6,42 @@ not create a second task/message/alert lifecycle.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, func, not_
+from sqlalchemy import and_, case, func, not_, or_, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.message_convergence import OPEN_STATUS
+from app.acceptance_criteria import (
+    get_criteria_for_version,
+    get_version_coverage_summary,
+)
 from app.failure_classification import is_non_death_cancellation
 from app.models import (
     Alert,
     AlertSeverity,
     Artifact,
     ArtifactType,
+    CompletionDebtEntry,
     LocalRunner,
     MessageType,
     MessagesLastSeen,
     Project,
     ProjectMessage,
+    ReleaseVersion,
+    VersionAcceptanceCriterion,
     Task,
     TaskStatus,
     VmContact,
 )
+from app.completion_debt import STATUS_OPEN as _DEBT_STATUS_OPEN, resolve_linked_task_statuses as _resolve_linked_task_statuses
 from app.reaper_orphan_classify import _classify_orphan
+from app.release_version import current_open_version
 from app.routers.admin_runners import _runner_health
 from app.strategic_runtime_work import (
     local_runner_hold_task_filters,
@@ -50,6 +60,8 @@ _HIGH_SIGNAL_MESSAGE_TYPES = (
     MessageType.BUG_REPORT,
     MessageType.FEEDBACK,
 )
+# Reserved keys in MessagesNoisePrefs.prefs that are not event-type visibility prefs.
+_PREFS_RESERVED_KEYS = frozenset({"_temp_mutes", "_mute_window", "_strategic_workbench"})
 _NEEDS_OPERATOR_MESSAGE_TYPES = (MessageType.QUESTION, MessageType.BLOCKER)
 _APPROVAL_TASK_STATUSES = (
     TaskStatus.QUEUED,
@@ -75,20 +87,50 @@ _MESSAGE_WATCH_PREVIEW_LIMIT = 24
 _ALERT_ERROR_PREVIEW_LIMIT = 4
 _ALERT_WARNING_PREVIEW_LIMIT = 4
 _DEAD_RUNNER_PREVIEW_LIMIT = 4
+_STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT = 4
+_STALE_COMPLETION_DEBT_AFTER = timedelta(hours=24)
+_STALE_COMPLETION_DEBT_PREVIEW_LIMIT = 4
+
+# Scalar columns consumed by _task_attention_item / build_task_movement_explanation.
+# Used with load_only(..., raiseload=True) on every bare select(Task) for attention
+# item builders to avoid transferring large JSONB blobs that are never read there.
+_TASK_ATTENTION_COLS = (
+    Task.id,
+    Task.project_id,
+    Task.status,
+    Task.title,
+    Task.latest_status_message,
+    Task.blocked_reason,
+    Task.park_reason,
+    Task.description,
+    Task.requires_approval,
+    Task.blocker_kind,
+    Task.depends_on,
+    Task.priority,
+    Task.created_at,
+    Task.updated_at,
+)
 
 _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "approval_required"): 10,
+    ("needs_operator", "hand_merge_required"): 15,
     ("needs_operator", "alert"): 20,
     ("needs_operator", "local_runner_hold"): 30,
     ("needs_operator", "stale_runner_pin"): 40,
     ("needs_operator", "dead_runner"): 45,
     ("needs_operator", "stale_provisioning_task"): 50,
     ("needs_operator", "stale_queued_task"): 60,
+    ("needs_operator", "stuck_criteria"): 65,
+    ("needs_operator", "stuck_acceptance_criterion"): 65,
+    ("needs_operator", "coverage_blocked"): 66,
     ("needs_operator", "manual_intervention"): 70,
+    ("needs_operator", "churn_retirement_recommended"): 72,
+    ("needs_operator", "stale_completion_debt"): 75,
     ("needs_operator", "blocker"): 80,
     ("needs_operator", "question"): 90,
     ("watch", "alert"): 200,
     ("watch", "dead_runner"): 205,
+    ("watch", "experiment_outcome"): 215,
     ("watch", "failed_task"): 210,
     ("watch", "blocked_task"): 220,
     ("watch", "parked_task"): 230,
@@ -134,6 +176,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
+    "hand_merge_required": {
+        "mode": "task_lifecycle",
+        "clears_when": "task_archived_or_pr_merged_or_closed",
+        "operator_action": "hand_merge_or_archive_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
     "local_runner_hold": {
         "mode": "runtime_lifecycle",
         "clears_when": "eligible_runner_available_or_task_dispatches_expires_terminal_or_archived",
@@ -169,10 +218,38 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
+    "stuck_criteria": {
+        "mode": "version_lifecycle",
+        "clears_when": "criterion_mapped_to_active_direction_or_operator_attested",
+        "operator_action": "remap_or_attest_criterion",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
     "manual_intervention": {
         "mode": "direction_lifecycle",
         "clears_when": "direction_flag_cleared_or_direction_inactive",
         "operator_action": "update_direction",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "stuck_acceptance_criterion": {
+        "mode": "acceptance_criteria_lifecycle",
+        "clears_when": "criterion_covered_or_version_closed_or_attested",
+        "operator_action": "remap_direction_or_attest_criterion",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "coverage_blocked": {
+        "mode": "acceptance_criteria_lifecycle",
+        "clears_when": "criterion_covered_or_version_closed",
+        "operator_action": "monitor_active_direction_progress",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "stale_completion_debt": {
+        "mode": "completion_debt_lifecycle",
+        "clears_when": "debt_resolved_dismissed_or_linked_to_work",
+        "operator_action": "link_task_or_resolve_debt",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -204,6 +281,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
+    "experiment_outcome": {
+        "mode": "task_lifecycle",
+        "clears_when": "task_archived_or_outside_6h_window",
+        "operator_action": "inspect_experiment_result",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
 }
 
 _DEFAULT_ATTENTION_LIFECYCLE = {
@@ -213,6 +297,9 @@ _DEFAULT_ATTENTION_LIFECYCLE = {
     "acknowledgeable": False,
     "acknowledge_effect": "none",
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 def _enum_value(value: Any) -> str:
@@ -279,6 +366,20 @@ def _direction_manual_intervention(direction: Any) -> bool:
     return context.get("needs_manual_intervention") is True
 
 
+def _direction_churn_retirement_recommended(direction: Any) -> bool:
+    """True when a direction is held PAUSED pending a keep/retire decision.
+
+    The churn/zombie retire ladder flags ``churn_retirement_recommended=True`` and
+    holds the direction paused (not active), so the ``status=='active'``
+    manual-intervention path never surfaces it — this makes the pending decision
+    visible to the operator instead.
+    """
+    return (
+        isinstance(direction, dict)
+        and bool(direction.get("churn_retirement_recommended"))
+    )
+
+
 def _direction_priority(direction: dict[str, Any]) -> int:
     priority = str(direction.get("priority") or "").lower()
     return {"critical": 0, "high": 1, "medium": 2, "normal": 3, "low": 4}.get(
@@ -327,6 +428,7 @@ def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str,
     status = _enum_value(task.status)
     label = {
         "approval_required": "Approval required",
+        "hand_merge_required": "Hand-merge required",
         "failed_task": "Task failed",
         "blocked_task": "Task blocked",
         "parked_task": "Task parked",
@@ -529,6 +631,75 @@ def _direction_attention_item(
     }
 
 
+def _churn_retirement_recommended_attention_item(
+    project_id: uuid.UUID,
+    direction: dict[str, Any],
+) -> dict[str, Any]:
+    """Attention item for a paused-pending-decision churn-retirement recommendation."""
+    direction_id = str(direction.get("id") or "unknown")
+    detail = direction.get("churn_retirement_recommended_reason") or direction.get(
+        "text"
+    )
+    return {
+        "id": f"direction:{direction_id}:churn_retirement_recommended",
+        "kind": "direction",
+        "severity": "needs_operator",
+        "reason": "churn_retirement_recommended",
+        "label": "Direction retirement recommended",
+        "detail": _compact_text(detail, max_chars=180),
+        "ref": {
+            "kind": "direction",
+            "id": direction_id,
+            "project_id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "directions",
+            "direction_id": direction_id,
+        }),
+    }
+
+
+def _stuck_acceptance_criterion_attention_item(
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+    criterion: VersionAcceptanceCriterion,
+    summary_row: dict[str, Any],
+) -> dict[str, Any]:
+    stuck_reason = str(summary_row.get("stuck_reason") or "")
+    reason_label = {
+        "no_mapping": "Acceptance criterion is unmapped",
+        "direction_retired": "Acceptance criterion points to a retired direction",
+    }.get(stuck_reason, "Acceptance criterion needs attention")
+    detail_parts = [criterion.text, reason_label]
+    detail = " - ".join(part for part in detail_parts if part)
+    return {
+        "id": f"version:{version.id}:acceptance_criterion:{criterion.criterion_key}",
+        "kind": "acceptance_criterion",
+        "severity": "needs_operator",
+        "reason": "stuck_acceptance_criterion",
+        "label": reason_label,
+        "detail": _compact_text(detail, max_chars=180),
+        "status": _enum_value(criterion.status),
+        "created_at": criterion.created_at.isoformat() if criterion.created_at else None,
+        "criterion_key": criterion.criterion_key,
+        "stuck_reason": stuck_reason or None,
+        "release_version_id": str(version.id),
+        "release_version_number": version.version_number,
+        "ref": {
+            "kind": "acceptance_criterion",
+            "id": criterion.criterion_key,
+            "project_id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "manage",
+        }),
+    }
+
+
 def _runner_pin_filter(project_id: uuid.UUID) -> tuple[Any, ...]:
     return (
         Task.project_id == project_id,
@@ -546,6 +717,15 @@ def _runner_is_stale_or_missing(runner: LocalRunner | None) -> bool:
     return not bool(_runner_health(runner).get("is_live"))
 
 
+def _handmerge_preserved_task_filter(project_id: uuid.UUID) -> tuple[Any, ...]:
+    return (
+        Task.project_id == project_id,
+        Task.archived.is_(False),
+        Task.status == TaskStatus.FAILED,
+        Task.context["pr_preserved_for_handmerge"].as_boolean().is_(True),
+    )
+
+
 async def _load_stale_runner_pins(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -554,6 +734,14 @@ async def _load_stale_runner_pins(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        *_TASK_ATTENTION_COLS,
+                        Task.vm_instance_id,
+                        Task.context,
+                        raiseload=True,
+                    )
+                )
                 .where(*_runner_pin_filter(project_id))
                 .order_by(Task.priority.asc(), Task.created_at.asc())
             )
@@ -763,6 +951,19 @@ async def _load_stale_provisioning_tasks(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        *_TASK_ATTENTION_COLS,
+                        Task.vm_instance_id,
+                        Task.context,
+                        Task.last_heartbeat,
+                        Task.last_tool_use_at,
+                        Task.vm_provisioned_at,
+                        Task.started_at,
+                        Task.payloads,
+                        raiseload=True,
+                    )
+                )
                 .where(
                     Task.project_id == project_id,
                     Task.archived.is_(False),
@@ -948,6 +1149,368 @@ async def _load_stale_queued_dependency_tasks(
     return len(stale), stale[:_STALE_TASK_PREVIEW_LIMIT]
 
 
+_EXPERIMENT_OUTCOME_WINDOW = timedelta(hours=6)
+_EXPERIMENT_OUTCOME_PREVIEW_LIMIT = 4
+_EXPERIMENT_TERMINAL_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+)
+
+
+def _experiment_outcome_attention_item(task: Task) -> dict[str, Any]:
+    plan_output = task.plan_output or {}
+    compute_result = plan_output.get("compute_result") or {} if isinstance(plan_output, dict) else {}
+    criterion = compute_result.get("criterion") if isinstance(compute_result, dict) else {}
+    criterion = criterion if isinstance(criterion, dict) else {}
+    criterion_met = criterion.get("met")
+    if criterion_met is False and criterion.get("measurable") is not False:
+        outcome_label = "unmet"
+    else:
+        outcome_label = "inconclusive"
+    criterion_summary = _compact_text(
+        criterion.get("summary") or criterion.get("description"), max_chars=180
+    )
+    detail = criterion_summary or _compact_text(
+        task.latest_status_message or task.title, max_chars=180
+    )
+    return {
+        "id": f"task:{task.id}:experiment_outcome",
+        "kind": "task",
+        "severity": "watch",
+        "reason": "experiment_outcome",
+        "label": f"Experiment criterion {outcome_label}",
+        "detail": detail,
+        "status": _enum_value(task.status),
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+        "ref": {
+            "kind": "task",
+            "id": str(task.id),
+            "project_id": str(task.project_id),
+        },
+        "target": _attention_target({
+            "surface": "runtime",
+            "project_id": str(task.project_id),
+            "section": "compute",
+            "task_id": str(task.id),
+        }),
+    }
+
+
+def _stuck_criteria_attention_item(
+    project_id: uuid.UUID,
+    stuck_count: int,
+    no_mapping_count: int,
+    direction_retired_count: int,
+) -> dict[str, Any]:
+    parts = []
+    if no_mapping_count:
+        noun = "criterion" if no_mapping_count == 1 else "criteria"
+        parts.append(f"{no_mapping_count} {noun} with no direction mapping")
+    if direction_retired_count:
+        noun = "criterion" if direction_retired_count == 1 else "criteria"
+        parts.append(f"{direction_retired_count} {noun} whose direction is retired")
+    detail = "; ".join(parts) if parts else f"{stuck_count} stuck criteria"
+    plural = "criteria" if stuck_count != 1 else "criterion"
+    return {
+        "id": f"project:{project_id}:stuck_criteria",
+        "kind": "version",
+        "severity": "needs_operator",
+        "reason": "stuck_criteria",
+        "label": f"{stuck_count} acceptance {plural} stuck",
+        "detail": _compact_text(detail, max_chars=180),
+        "ref": {
+            "kind": "project",
+            "id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "acceptance_criteria",
+        }),
+    }
+
+
+def _coverage_blocked_attention_item(
+    project_id: uuid.UUID,
+    coverage_blocked_count: int,
+) -> dict[str, Any]:
+    plural = "criteria" if coverage_blocked_count != 1 else "criterion"
+    return {
+        "id": f"project:{project_id}:coverage_blocked",
+        "kind": "version",
+        "severity": "needs_operator",
+        "reason": "coverage_blocked",
+        "label": f"{coverage_blocked_count} acceptance {plural} awaiting active direction",
+        "detail": (
+            f"{coverage_blocked_count} uncovered {plural} mapped to active "
+            "direction(s) — promotion is blocked until covered"
+        ),
+        "ref": {
+            "kind": "project",
+            "id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "acceptance_criteria",
+        }),
+    }
+
+
+# Statuses that indicate a linked task is genuinely in-flight or already
+# succeeded — a debt with at least one such task is NOT stale-unworked.
+# FAILED, CANCELLED, and missing (unknown) task ids do NOT count.
+_DEBT_LINKED_WORKING_STATUSES: frozenset[str] = frozenset({
+    "QUEUED",
+    "PROVISIONING",
+    "IN_PROGRESS",
+    "EVALUATING",
+    "BLOCKED",
+    "PARKED",
+    "COMPLETED",
+})
+
+# Upper bound on aged-open-debt candidates we inspect per call. A debt with
+# more than this many aged open rows is an anomaly; the count is therefore
+# capped at this many.
+_STALE_DEBT_SCAN_LIMIT = 200
+
+
+async def _load_stale_unworked_completion_debts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> tuple[int, list[CompletionDebtEntry]]:
+    """Return (count, oldest_preview) of aged open debts with no genuinely
+    active or successful linked task.
+
+    Scoped to the project plus global (project_id IS NULL) rows, matching the
+    visibility rule used by the strategist completion-debt fetch.
+
+    A debt is considered UNWORKED unless it has at least one linked task whose
+    live status is in :data:`_DEBT_LINKED_WORKING_STATUSES` (QUEUED/IN_PROGRESS/
+    EVALUATING/BLOCKED/PARKED or COMPLETED).  Linked task ids that resolve to
+    FAILED, CANCELLED, or no Task row at all do NOT count as work-in-progress
+    and the debt resurfaces as stale after the age threshold.
+    """
+    cutoff = _utcnow() - _STALE_COMPLETION_DEBT_AFTER
+    base_filters = (
+        or_(
+            CompletionDebtEntry.project_id == project_id,
+            CompletionDebtEntry.project_id.is_(None),
+        ),
+        CompletionDebtEntry.status == _DEBT_STATUS_OPEN,
+        CompletionDebtEntry.created_at < cutoff,
+    )
+    # Load a bounded set of aged open candidates (all linked-task configurations).
+    candidates = list(
+        (
+            await session.execute(
+                select(CompletionDebtEntry)
+                .where(*base_filters)
+                .order_by(
+                    CompletionDebtEntry.created_at.asc(),
+                    CompletionDebtEntry.id.asc(),
+                )
+                .limit(_STALE_DEBT_SCAN_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not candidates:
+        return 0, []
+
+    # Collect all referenced task ids so we can resolve statuses in one query.
+    all_task_ids: list[str] = []
+    for entry in candidates:
+        detail_dict = entry.detail if isinstance(entry.detail, dict) else {}
+        linked = detail_dict.get("linked_tasks")
+        if isinstance(linked, list):
+            for x in linked:
+                if isinstance(x, dict) and x.get("task_id"):
+                    all_task_ids.append(str(x["task_id"]))
+
+    status_map = await _resolve_linked_task_statuses(session, all_task_ids)
+
+    # Keep only debts with no genuinely active or successful linked task.
+    unworked: list[CompletionDebtEntry] = []
+    for entry in candidates:
+        detail_dict = entry.detail if isinstance(entry.detail, dict) else {}
+        linked = detail_dict.get("linked_tasks")
+        if not isinstance(linked, list) or len(linked) == 0:
+            unworked.append(entry)
+            continue
+        has_working = any(
+            status_map.get(str(x.get("task_id")), "") in _DEBT_LINKED_WORKING_STATUSES
+            for x in linked
+            if isinstance(x, dict) and x.get("task_id")
+        )
+        if not has_working:
+            unworked.append(entry)
+
+    count = len(unworked)
+    return count, unworked[:_STALE_COMPLETION_DEBT_PREVIEW_LIMIT]
+
+
+def _stale_completion_debt_attention_item(
+    project_id: uuid.UUID,
+    count: int,
+    entries: list[CompletionDebtEntry],
+) -> dict[str, Any]:
+    plural = "obligations" if count != 1 else "obligation"
+    if entries:
+        first_title = _compact_text(entries[0].title, max_chars=140)
+        detail = first_title if count == 1 else f"{first_title} (+{count - 1} more)"
+    else:
+        detail = f"{count} unworked completion-debt {plural}"
+    return {
+        "id": f"project:{project_id}:stale_completion_debt",
+        "kind": "completion_debt",
+        "severity": "needs_operator",
+        "reason": "stale_completion_debt",
+        "label": f"{count} completion-debt {plural} unworked",
+        "detail": detail,
+        "count": count,
+        "ref": {
+            "kind": "project",
+            "id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "completion_debt",
+        }),
+    }
+
+
+async def get_operator_message_counts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    last_seen_at: datetime | None = None,
+    user_id: str | None = None,
+) -> dict[str, int]:
+    """Return high-signal open message counts by type plus an unread total.
+
+    Lightweight alternative to build_operator_attention for badge-poll callers
+    that only need integers, not full message previews.  Includes high-signal
+    NOTE escalations (event_type in HIGH_SIGNAL_NOTE_EVENT_TYPES) and honours
+    per-operator noise prefs / temp-mutes when user_id is provided.
+    """
+    from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
+    from app.messages_noise_prefs_store import get_messages_noise_prefs_row
+
+    # Build the set of event types the operator has muted.
+    muted_event_types: set[str] = set()
+    if user_id is not None:
+        prefs_row = await get_messages_noise_prefs_row(session, user_id, project_id)
+        if prefs_row is not None:
+            prefs_dict = dict(prefs_row.prefs or {})
+            # Permanent per-event-type mutes and routines (excluded from badge)
+            muted_event_types = {
+                et
+                for et, pref in prefs_dict.items()
+                if et not in _PREFS_RESERVED_KEYS and pref in ("mute", "routine")
+            }
+            # Active temporary mutes
+            now_ms = int(_utcnow().timestamp() * 1000)
+            temp_mutes = prefs_dict.get("_temp_mutes") or {}
+            if isinstance(temp_mutes, dict):
+                muted_event_types |= {
+                    et
+                    for et, exp in temp_mutes.items()
+                    if isinstance(exp, (int, float)) and exp > now_ms
+                }
+
+    _hs_types = list(_HIGH_SIGNAL_MESSAGE_TYPES)
+    count_rows = (
+        await session.execute(
+            select(ProjectMessage.message_type, func.count())
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.status == OPEN_STATUS,
+                ProjectMessage.from_type != "user",
+                ProjectMessage.message_type.in_(_hs_types),
+            )
+            .group_by(ProjectMessage.message_type)
+        )
+    ).all()
+    counts = {mt: int(cnt or 0) for mt, cnt in count_rows}
+
+    # Count high-signal NOTE escalations, excluding muted event types.
+    included_note_ets = list(HIGH_SIGNAL_NOTE_EVENT_TYPES - muted_event_types)
+    note_count = 0
+    if included_note_ets:
+        note_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.status == OPEN_STATUS,
+                        ProjectMessage.from_type != "user",
+                        ProjectMessage.message_type == MessageType.NOTE,
+                        ProjectMessage.context.op("->>")(
+                            "event_type"
+                        ).in_(included_note_ets),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
+    _base_unread = [
+        ProjectMessage.project_id == project_id,
+        ProjectMessage.status == OPEN_STATUS,
+        ProjectMessage.from_type != "user",
+    ]
+    _ts_filter = (
+        [ProjectMessage.created_at > last_seen_at] if last_seen_at is not None else []
+    )
+    unread = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(ProjectMessage)
+                .where(
+                    *_base_unread,
+                    ProjectMessage.message_type.in_(_hs_types),
+                    *_ts_filter,
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    if included_note_ets:
+        unread += int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ProjectMessage)
+                    .where(
+                        *_base_unread,
+                        ProjectMessage.message_type == MessageType.NOTE,
+                        ProjectMessage.context.op("->>")(
+                            "event_type"
+                        ).in_(included_note_ets),
+                        *_ts_filter,
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+    return {
+        "blocker": counts.get(MessageType.BLOCKER, 0),
+        "question": counts.get(MessageType.QUESTION, 0),
+        "bug_report": counts.get(MessageType.BUG_REPORT, 0),
+        "feedback": counts.get(MessageType.FEEDBACK, 0),
+        "high_signal_note": note_count,
+        "unread": unread,
+    }
+
+
 async def build_operator_attention(
     session: AsyncSession,
     project: Project,
@@ -969,60 +1532,45 @@ async def build_operator_attention(
         )
     ).scalar_one_or_none()
 
-    blocker_message_rows = list(
+    _common_message_filters = [
+        ProjectMessage.project_id == project.id,
+        ProjectMessage.status == OPEN_STATUS,
+        ProjectMessage.from_type != "user",
+    ]
+    # UNION ALL with per-type LIMITs: one round-trip while preserving independent
+    # per-priority caps so a burst of BUG_REPORT/FEEDBACK can't crowd out BLOCKERs.
+    _blocker_q = (
+        select(ProjectMessage)
+        .where(*_common_message_filters, ProjectMessage.message_type == MessageType.BLOCKER)
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(_MESSAGE_BLOCKER_PREVIEW_LIMIT)
+    )
+    _question_q = (
+        select(ProjectMessage)
+        .where(*_common_message_filters, ProjectMessage.message_type == MessageType.QUESTION)
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(_MESSAGE_QUESTION_PREVIEW_LIMIT)
+    )
+    _watch_q = (
+        select(ProjectMessage)
+        .where(
+            *_common_message_filters,
+            ProjectMessage.message_type.in_([MessageType.BUG_REPORT, MessageType.FEEDBACK]),
+        )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(_MESSAGE_WATCH_PREVIEW_LIMIT)
+    )
+    message_rows = list(
         (
             await session.execute(
-                select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.status == OPEN_STATUS,
-                    ProjectMessage.from_type != "user",
-                    ProjectMessage.message_type == MessageType.BLOCKER,
+                select(ProjectMessage).from_statement(
+                    union_all(_blocker_q, _question_q, _watch_q)
                 )
-                .order_by(ProjectMessage.created_at.desc())
-                .limit(_MESSAGE_BLOCKER_PREVIEW_LIMIT)
             )
         )
         .scalars()
         .all()
     )
-    question_message_rows = list(
-        (
-            await session.execute(
-                select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.status == OPEN_STATUS,
-                    ProjectMessage.from_type != "user",
-                    ProjectMessage.message_type == MessageType.QUESTION,
-                )
-                .order_by(ProjectMessage.created_at.desc())
-                .limit(_MESSAGE_QUESTION_PREVIEW_LIMIT)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    watch_message_rows = list(
-        (
-            await session.execute(
-                select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.status == OPEN_STATUS,
-                    ProjectMessage.from_type != "user",
-                    ProjectMessage.message_type.in_(
-                        [MessageType.BUG_REPORT, MessageType.FEEDBACK]
-                    ),
-                )
-                .order_by(ProjectMessage.created_at.desc())
-                .limit(_MESSAGE_WATCH_PREVIEW_LIMIT)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    message_rows = [*blocker_message_rows, *question_message_rows, *watch_message_rows]
     message_count_rows = (
         await session.execute(
             select(ProjectMessage.message_type, func.count())
@@ -1132,32 +1680,58 @@ async def build_operator_attention(
     blocked_count = int(task_count_result.blocked or 0)
     parked_count = int(task_count_result.parked or 0)
 
+    handmerge_preserved_filters = _handmerge_preserved_task_filter(project.id)
+    _handmerge_all = list(
+        (
+            await session.execute(
+                select(Task)
+                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
+                .where(*handmerge_preserved_filters)
+                .order_by(Task.updated_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    handmerge_preserved_count = len(_handmerge_all)
+    handmerge_preserved_tasks = _handmerge_all[:_STALE_TASK_PREVIEW_LIMIT]
+    # Keep preserved hand-merge PRs visible as their own operator item rather
+    # than letting the generic FAILED-task watch preview consume the signal.
+    generic_failed_count = max(failed_count - handmerge_preserved_count, 0)
+
     local_runner_hold_filters = local_runner_hold_task_filters(project.id)
     strategic_local_runner_hold_filters = strategic_local_runner_hold_task_filters(
         project.id
     )
-    local_runner_hold_count = int(
-        (
-            await session.execute(
-                select(func.count()).select_from(Task).where(*local_runner_hold_filters)
+    _hold_counts = (
+        await session.execute(
+            select(
+                func.count().filter(and_(*local_runner_hold_filters)).label("local"),
+                func.count().filter(and_(*strategic_local_runner_hold_filters)).label("strategic"),
             )
-        ).scalar()
-        or 0
-    )
-    strategic_local_runner_hold_count = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(Task)
-                .where(*strategic_local_runner_hold_filters)
+            .select_from(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.archived.is_(False),
+                Task.status == TaskStatus.QUEUED,
+                Task.requires_approval.is_not(True),
             )
-        ).scalar()
-        or 0
-    )
+        )
+    ).one()
+    local_runner_hold_count = int(_hold_counts.local or 0)
+    strategic_local_runner_hold_count = int(_hold_counts.strategic or 0)
     compute_local_runner_hold_tasks = list(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        *_TASK_ATTENTION_COLS,
+                        Task.vm_instance_id,
+                        Task.context,
+                        raiseload=True,
+                    )
+                )
                 .where(*local_runner_hold_filters)
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(4)
@@ -1170,6 +1744,14 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        *_TASK_ATTENTION_COLS,
+                        Task.vm_instance_id,
+                        Task.context,
+                        raiseload=True,
+                    )
+                )
                 .where(*strategic_local_runner_hold_filters)
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(4)
@@ -1212,6 +1794,63 @@ async def build_operator_attention(
         stale_queued_tasks,
     ) = await _load_stale_queued_dependency_tasks(session, project.id)
 
+    (
+        stale_debt_count,
+        stale_debt_entries,
+    ) = await _load_stale_unworked_completion_debts(session, project.id)
+
+    experiment_cutoff = _utcnow() - _EXPERIMENT_OUTCOME_WINDOW
+    # JSONB `->` yields JSON null (not SQL NULL) when "met" is present with a
+    # null value, so IS NOT NULL means the criterion carries a "met" key at
+    # all; `->>` then yields SQL NULL for JSON null, and IS DISTINCT FROM
+    # 'true' keeps both null (inconclusive) and false (unmet) verdicts.
+    experiment_criterion_met = Task.plan_output["compute_result"]["criterion"]["met"]
+    experiment_outcome_filters = (
+        Task.project_id == project.id,
+        Task.archived.is_(False),
+        Task.payloads[0]["type"].as_string() == "compute_experiment",
+        Task.status.in_(list(_EXPERIMENT_TERMINAL_STATUSES)),
+        Task.completed_at.is_not(None),
+        Task.completed_at >= experiment_cutoff,
+        experiment_criterion_met.is_not(None),
+        experiment_criterion_met.as_string().is_distinct_from("true"),
+    )
+    unmet_experiment_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(*experiment_outcome_filters)
+            )
+        ).scalar_one()
+        or 0
+    )
+    unmet_experiment_preview = list(
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.project_id,
+                        Task.status,
+                        Task.title,
+                        Task.latest_status_message,
+                        Task.created_at,
+                        Task.updated_at,
+                        Task.plan_output,
+                        raiseload=True,
+                    )
+                )
+                .where(*experiment_outcome_filters)
+                .order_by(Task.completed_at.desc())
+                .limit(_EXPERIMENT_OUTCOME_PREVIEW_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     alert_count_rows = (
         await session.execute(
             select(Alert.severity, func.count()).where(
@@ -1233,6 +1872,7 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(Task)
+                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
                 .where(
                     Task.project_id == project.id,
                     Task.archived.is_(False),
@@ -1250,10 +1890,12 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(Task)
+                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
                 .where(
                     Task.project_id == project.id,
                     Task.archived.is_(False),
                     Task.status == TaskStatus.FAILED,
+                    Task.context["pr_preserved_for_handmerge"].as_boolean().is_not(True),
                 )
                 .order_by(Task.updated_at.desc())
                 .limit(3)
@@ -1266,6 +1908,7 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(Task)
+                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
                 .where(
                     Task.project_id == project.id,
                     Task.archived.is_(False),
@@ -1313,6 +1956,66 @@ async def build_operator_attention(
     )
     alerts = [*error_alerts, *warning_alerts]
 
+    # Stuck acceptance criteria: uncovered active criteria with no active direction.
+    stuck_criteria_count = 0
+    stuck_no_mapping_count = 0
+    stuck_direction_retired_count = 0
+    stuck_acceptance_criteria_count = 0
+    stuck_acceptance_criteria: list[dict[str, Any]] = []
+    coverage_blocked_count = 0
+    try:
+        open_version = await current_open_version(session, project.id)
+        if open_version is not None:
+            coverage = await get_version_coverage_summary(session, open_version.id)
+            stuck_criteria_count = coverage.get("stuck_count", 0)
+            for criterion in coverage.get("criteria", []):
+                reason = criterion.get("stuck_reason")
+                if reason == "no_mapping":
+                    stuck_no_mapping_count += 1
+                elif reason == "direction_retired":
+                    stuck_direction_retired_count += 1
+                elif (
+                    criterion.get("status") == "active"
+                    and criterion.get("coverage") == "uncovered"
+                    and reason is None
+                ):
+                    coverage_blocked_count += 1
+            stuck_by_key = {
+                c["criterion_key"]: c
+                for c in coverage.get("criteria", [])
+                if c["status"] == "active"
+                and c["coverage"] == "uncovered"
+                and c.get("stuck_reason") is not None
+            }
+            stuck_acceptance_criteria_count = len(stuck_by_key)
+            if stuck_acceptance_criteria_count:
+                try:
+                    criterion_rows = await get_criteria_for_version(
+                        session, open_version.id
+                    )
+                    for criterion in criterion_rows:
+                        summary_row = stuck_by_key.get(criterion.criterion_key)
+                        if summary_row is None:
+                            continue
+                        stuck_acceptance_criteria.append(
+                            _stuck_acceptance_criterion_attention_item(
+                                project.id,
+                                open_version,
+                                criterion,
+                                summary_row,
+                            )
+                        )
+                    stuck_acceptance_criteria = stuck_acceptance_criteria[
+                        :_STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT
+                    ]
+                except Exception:
+                    logger.exception(
+                        "operator_attention: failed to load stuck acceptance criteria for project %s",
+                        project.id,
+                    )
+    except Exception:
+        pass
+
     directions = project.directions if isinstance(project.directions, list) else []
     manual_directions = [
         direction
@@ -1322,6 +2025,17 @@ async def build_operator_attention(
         and direction.get("status") == "active"
     ]
     manual_directions.sort(key=_direction_priority)
+
+    # Churn-retirement-recommended directions are held PAUSED (not active) pending
+    # an explicit keep/retire decision, so the active-only manual-intervention path
+    # above skips them. Surface them as their own needs_operator items so the
+    # pending decision is visible even though the direction is paused.
+    churn_recommended_directions = [
+        direction
+        for direction in directions
+        if _direction_churn_retirement_recommended(direction)
+    ]
+    churn_recommended_directions.sort(key=_direction_priority)
 
     candidate_items: list[dict[str, Any]] = []
 
@@ -1357,15 +2071,46 @@ async def build_operator_attention(
         )
     for task in stale_queued_tasks:
         add_candidate(_stale_task_attention_item(task, reason="stale_queued_task"))
+    if stale_debt_count > 0:
+        add_candidate(
+            _stale_completion_debt_attention_item(project.id, stale_debt_count, stale_debt_entries)
+        )
+    if stuck_criteria_count > 0:
+        add_candidate(
+            _stuck_criteria_attention_item(
+                project.id,
+                stuck_criteria_count,
+                stuck_no_mapping_count,
+                stuck_direction_retired_count,
+            )
+        )
+    if coverage_blocked_count > 0:
+        add_candidate(_coverage_blocked_attention_item(project.id, coverage_blocked_count))
     for direction in manual_directions[:3]:
         add_candidate(_direction_attention_item(project.id, direction))
+    for direction in churn_recommended_directions[:3]:
+        add_candidate(
+            _churn_retirement_recommended_attention_item(project.id, direction)
+        )
+    for item in stuck_acceptance_criteria:
+        add_candidate(item)
     for alert in alerts:
         add_candidate(_alert_attention_item(alert))
     for task in held_tasks:
         reason = "parked_task" if task.status == TaskStatus.PARKED else "blocked_task"
         add_candidate(_task_attention_item(task, reason=reason, severity="watch"))
+    for task in handmerge_preserved_tasks:
+        add_candidate(
+            _task_attention_item(
+                task,
+                reason="hand_merge_required",
+                severity="needs_operator",
+            )
+        )
     for task in failed_tasks:
         add_candidate(_task_attention_item(task, reason="failed_task", severity="watch"))
+    for task in unmet_experiment_preview:
+        add_candidate(_experiment_outcome_attention_item(task))
     for message in watch_messages:
         add_candidate(
             _message_attention_item(
@@ -1387,22 +2132,28 @@ async def build_operator_attention(
         open_question_count
         + open_blocker_count
         + approval_count
+        + handmerge_preserved_count
         + total_local_runner_hold_count
         + stale_runner_pin_count
         + dead_runner_needs_operator_count
         + stale_provisioning_count
         + stale_queued_count
         + len(manual_directions)
+        + len(churn_recommended_directions)
         + error_alert_count
+        + stuck_criteria_count
+        + coverage_blocked_count
+        + (1 if stale_debt_count > 0 else 0)
     )
     total_watch = (
-        failed_count
+        generic_failed_count
         + blocked_count
         + parked_count
         + warning_alert_count
         + dead_runner_watch_count
         + bug_report_count
         + feedback_count
+        + unmet_experiment_count
     )
     level = (
         "needs_operator"
@@ -1434,6 +2185,7 @@ async def build_operator_attention(
             "stale_task_preview": _STALE_TASK_PREVIEW_LIMIT,
             "alert_error_preview": _ALERT_ERROR_PREVIEW_LIMIT,
             "alert_warning_preview": _ALERT_WARNING_PREVIEW_LIMIT,
+            "stuck_acceptance_criteria_preview": _STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT,
         },
         "counts": {
             "needs_operator": total_needs_operator,
@@ -1453,13 +2205,20 @@ async def build_operator_attention(
             "dead_runners": dead_runner_needs_operator_count + dead_runner_watch_count,
             "stale_provisioning_tasks": stale_provisioning_count,
             "stale_queued_tasks": stale_queued_count,
+            "stuck_acceptance_criteria": stuck_acceptance_criteria_count,
             "manual_directions": len(manual_directions),
+            "churn_retirement_recommended": len(churn_recommended_directions),
+            "stuck_criteria": stuck_criteria_count,
+            "coverage_blocked": coverage_blocked_count,
             "alerts": error_alert_count + warning_alert_count,
             "error_alerts": error_alert_count,
             "warning_alerts": warning_alert_count,
-            "failed_tasks": failed_count,
+            "failed_tasks": generic_failed_count,
             "blocked_tasks": blocked_count,
             "parked_tasks": parked_count,
+            "handmerge_preserved_tasks": handmerge_preserved_count,
+            "experiment_outcomes": unmet_experiment_count,
+            "stale_completion_debts": stale_debt_count,
         },
         "items": items,
     }

@@ -6,12 +6,13 @@ extracted from routers/admin_project_strategic_session.py.
 
 import uuid
 from typing import Dict, Any
-from sqlalchemy import func
+from sqlalchemy import func, case, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.models import (
+    CYCLE_META_INTEGRITY_CONFLICT_COUNTS,
     Project,
     ProjectMessage,
     StrategicCycle,
@@ -21,6 +22,7 @@ from app.models import (
 from app import strategic_cycle
 from app.shared_state import runtime_config
 from app.strategic_resident_session import (
+    RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
     RESIDENT_SESSION_REASON_RUNNER_OFFLINE,
     RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
     STRATEGIC_SESSION_ENABLED_SETTING,
@@ -195,17 +197,13 @@ async def _task_focus_bucket(
     filters: list[Any],
     order_by: list[Any],
     limit: int = TASK_FOCUS_BUCKET_LIMIT,
+    total: int | None = None,
 ) -> Dict[str, Any]:
     base_filters = [
         Task.project_id == project_id,
         Task.archived.is_(False),
         *filters,
     ]
-    total = (
-        await session.execute(
-            select(func.count()).select_from(Task).where(*base_filters)
-        )
-    ).scalar() or 0
     direction_id_expr = func.coalesce(
         Task.context["direction_id"].as_string(),
         Task.context["current_direction_id"].as_string(),
@@ -215,39 +213,44 @@ async def _task_focus_bucket(
         Task.payloads[0]["target_direction_id"].as_string(),
     ).label("direction_id")
     task_type_expr = Task.payloads[0]["type"].as_string().label("task_type")
-    rows = (
-        await session.execute(
-            select(Task, task_type_expr, direction_id_expr)
-            .where(*base_filters)
-            .options(
-                load_only(
-                    Task.id,
-                    Task.status,
-                    Task.title,
-                    Task.latest_status_message,
-                    Task.requires_approval,
-                    Task.parent_task_id,
-                    Task.created_at,
-                    Task.started_at,
-                    Task.completed_at,
-                    Task.depends_on,
-                    Task.blocker_kind,
-                    Task.blocked_reason,
-                    Task.blocked_at,
-                    Task.recheck_after,
-                    Task.park_reason,
-                    Task.parked_at,
-                    raiseload=True,
-                )
-            )
-            .order_by(*order_by)
-            .limit(limit)
+    if total is None:
+        count_result = await session.execute(
+            select(func.count()).select_from(Task).where(*base_filters)
         )
-    ).all()
+        total = count_result.scalar() or 0
+    rows_result = await session.execute(
+        select(Task, task_type_expr, direction_id_expr)
+        .where(*base_filters)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.title,
+                Task.latest_status_message,
+                Task.requires_approval,
+                Task.parent_task_id,
+                Task.created_at,
+                Task.started_at,
+                Task.completed_at,
+                Task.depends_on,
+                Task.blocker_kind,
+                Task.blocked_reason,
+                Task.blocked_at,
+                Task.recheck_after,
+                Task.park_reason,
+                Task.parked_at,
+                raiseload=True,
+            )
+        )
+        .order_by(*order_by)
+        .limit(limit)
+    )
+    total = int(total)
+    rows = rows_result.all()
     return {
-        "total": int(total),
+        "total": total,
         "limit": limit,
-        "has_more": int(total) > limit,
+        "has_more": total > limit,
         "items": [
             _task_focus_item(
                 task,
@@ -272,57 +275,100 @@ async def _build_task_focus(
         TaskStatus.BLOCKED,
         TaskStatus.PARKED,
     )
+    # Single query replaces five individual COUNTs (10 → 6 round-trips total).
+    counts_row = (await session.execute(
+        select(
+            func.count(case((
+                and_(Task.requires_approval.is_(True), Task.status.in_(nonterminal)),
+                1,
+            ))).label("needs_judgment"),
+            func.count(case((
+                Task.status.in_([
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                    TaskStatus.EVALUATING,
+                ]),
+                1,
+            ))).label("active"),
+            func.count(case((
+                Task.status.in_([TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.PARKED]),
+                1,
+            ))).label("friction"),
+            func.count(case((
+                and_(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)),
+                1,
+            ))).label("queued"),
+            func.count(case((
+                Task.status == TaskStatus.COMPLETED,
+                1,
+            ))).label("recent_completed"),
+        ).select_from(Task).where(
+            Task.project_id == project_id,
+            Task.archived.is_(False),
+        )
+    )).one()
+
+    needs_judgment_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="needs_judgment",
+        filters=[
+            Task.requires_approval.is_(True),
+            Task.status.in_(nonterminal),
+        ],
+        order_by=[Task.created_at.asc(), Task.id.asc()],
+        total=int(counts_row.needs_judgment or 0),
+    )
+    active_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="active",
+        filters=[
+            Task.status.in_(
+                [
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                    TaskStatus.EVALUATING,
+                ]
+            )
+        ],
+        order_by=[Task.started_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
+        total=int(counts_row.active or 0),
+    )
+    friction_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="friction",
+        filters=[
+            Task.status.in_(
+                [TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.PARKED]
+            )
+        ],
+        order_by=[Task.created_at.desc(), Task.id.desc()],
+        total=int(counts_row.friction or 0),
+    )
+    queued_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="queued",
+        filters=[Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)],
+        order_by=[Task.created_at.asc(), Task.id.asc()],
+        total=int(counts_row.queued or 0),
+    )
+    recent_completed_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="recent_completed",
+        filters=[Task.status == TaskStatus.COMPLETED],
+        order_by=[Task.completed_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
+        total=int(counts_row.recent_completed or 0),
+    )
     buckets = {
-        "needs_judgment": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="needs_judgment",
-            filters=[
-                Task.requires_approval.is_(True),
-                Task.status.in_(nonterminal),
-            ],
-            order_by=[Task.created_at.asc(), Task.id.asc()],
-        ),
-        "active": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="active",
-            filters=[
-                Task.status.in_(
-                    [
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                    ]
-                )
-            ],
-            order_by=[Task.started_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
-        ),
-        "friction": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="friction",
-            filters=[
-                Task.status.in_(
-                    [TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.PARKED]
-                )
-            ],
-            order_by=[Task.created_at.desc(), Task.id.desc()],
-        ),
-        "queued": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="queued",
-            filters=[Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)],
-            order_by=[Task.created_at.asc(), Task.id.asc()],
-        ),
-        "recent_completed": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="recent_completed",
-            filters=[Task.status == TaskStatus.COMPLETED],
-            order_by=[Task.completed_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
-        ),
+        "needs_judgment": needs_judgment_result,
+        "active": active_result,
+        "friction": friction_result,
+        "queued": queued_result,
+        "recent_completed": recent_completed_result,
     }
     return {
         "version": 1,
@@ -373,6 +419,7 @@ def _cycle_summary(
         "vision_updated": cycle.vision_updated,
         "problem_model_changed": bool(metadata.get("problem_model_changed")),
         "running_update_changed": bool(metadata.get("running_update_changed")),
+        "integrity_conflict_counts": metadata.get(CYCLE_META_INTEGRITY_CONFLICT_COUNTS),
     }
 
 
@@ -657,6 +704,13 @@ def _resident_session_availability(
         # runner count — the last auto-start genuinely errored.
         reason = recorded_reason
         state = "error"
+    elif recorded_reason == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:
+        # A batch strategic cycle is in flight — not an error, just a transient
+        # wait. The completion handler re-tries the auto-start when the blocking
+        # cycle finishes, so this resolves on its own. Slot before the
+        # has_live_runner check so a live runner does not hide the conflict.
+        reason = recorded_reason
+        state = "blocked"
     elif has_live_runner:
         # A live runner is plainly attached. A positive count OVERRIDES a stale
         # recorded ``no_runner`` — it is only authoritative while the live count
@@ -675,3 +729,232 @@ def _resident_session_availability(
     else:
         state = "ready"
     return {"available": enabled, "state": state, "reason": reason}
+
+
+# Concise, operator-facing recovery hints keyed by conflict class. Kept short
+# so both the admin workspace panel and the agent section renderer can surface
+# the same actionable text without re-deriving it per surface.
+_RECOVERY_HINTS: dict[str, str] = {
+    "orphaned_gap": "Assign an active direction to this gap or record a deferral.",
+    "ungrounded_no_gap_id": "Link this direction to an open gap or retire it.",
+    "ungrounded_gap_not_active": "Reground this direction to an active gap — its current gap is closed.",
+    "stale_active_moves": "Reconcile the gap's active_moves — the listed directions are no longer active.",
+    "criterion_inactive": "Remap to an active criterion — this key is retracted or superseded.",
+    "criterion_dangling": "Remap to a criterion in the open version — this key is unknown there.",
+}
+
+
+def compute_model_integrity_conflicts(
+    problem_model: Any,
+    directions: Any,
+    *,
+    criterion_links: Any = None,
+    active_criterion_keys: Any = None,
+    inactive_criterion_keys: Any = None,
+) -> dict | None:
+    """Compute integrity conflict classes from the live problem model.
+
+    Returns None when the model is clean (no conflicts). When conflicts exist,
+    returns a dict with four lists — orphaned_gaps, ungrounded_directions,
+    stale_active_moves, criterion_link_conflicts — each entry carrying a
+    concise ``recovery_hint``, plus aggregate counts.
+
+    Gap integrity (the first three classes) is derived purely from
+    ``problem_model`` and ``directions``. Criterion-mapping integrity is
+    optional: pass ``criterion_links`` (a list of ``{"id","text","status",
+    "criterion_keys"}`` dicts sourced from Direction rows) together with the
+    open version's ``active_criterion_keys`` / ``inactive_criterion_keys``
+    frozensets. When those are omitted, criterion conflicts are simply not
+    computed and the returned shape stays backward compatible.
+
+    Pure and side-effect-free; operates only on the data handed in.
+    """
+    pm = problem_model if isinstance(problem_model, dict) else {}
+    dirs = directions if isinstance(directions, list) else []
+
+    gaps: list[Any] = pm.get("gaps") if isinstance(pm.get("gaps"), list) else []
+
+    active_dirs = [
+        d for d in dirs
+        if isinstance(d, dict) and (d.get("status") or "active") == "active"
+    ]
+    active_dir_ids: set[str] = {str(d["id"]) for d in active_dirs if d.get("id")}
+    referenced_gap_ids: set[str] = {
+        str(d["gap_id"]) for d in active_dirs if d.get("gap_id")
+    }
+    active_gap_ids: set[str] = {
+        str(g["id"])
+        for g in gaps
+        if isinstance(g, dict) and g.get("id") and g.get("status") == "active"
+    }
+
+    # 1. Open gaps with no active direction linked and no explicit deferral.
+    orphaned_gaps: list[dict] = []
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") not in ("active", "blocked"):
+            continue
+        gap_id = str(g.get("id") or "")
+        if not gap_id or g.get("deferral"):
+            continue
+        if gap_id not in referenced_gap_ids:
+            orphaned_gaps.append({
+                "id": gap_id,
+                "name": str(g.get("name") or "")[:80],
+                "status": g.get("status") or "active",
+                "recovery_hint": _RECOVERY_HINTS["orphaned_gap"],
+            })
+
+    # 2. Active directions whose gap_id is absent or points to a non-active gap.
+    ungrounded_directions: list[dict] = []
+    for d in active_dirs:
+        gap_id = d.get("gap_id")
+        if not gap_id or str(gap_id) not in active_gap_ids:
+            reason = "no_gap_id" if not gap_id else "gap_not_active"
+            ungrounded_directions.append({
+                "id": str(d.get("id") or ""),
+                "text": str(d.get("text") or "")[:120],
+                "gap_id": str(gap_id) if gap_id else None,
+                "reason": reason,
+                "recovery_hint": _RECOVERY_HINTS[
+                    "ungrounded_no_gap_id" if reason == "no_gap_id"
+                    else "ungrounded_gap_not_active"
+                ],
+            })
+
+    # 3. Gaps whose active_moves list cites direction IDs that are no longer active.
+    stale_active_moves: list[dict] = []
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") not in ("active", "blocked"):
+            continue
+        gap_id = str(g.get("id") or "")
+        active_moves = g.get("active_moves")
+        if not isinstance(active_moves, list) or not active_moves:
+            continue
+        stale_ids = [
+            m for m in active_moves
+            if isinstance(m, str) and m not in active_dir_ids
+        ]
+        if stale_ids:
+            stale_active_moves.append({
+                "gap_id": gap_id,
+                "gap_name": str(g.get("name") or "")[:80],
+                "stale_direction_ids": stale_ids[:8],
+                "recovery_hint": _RECOVERY_HINTS["stale_active_moves"],
+            })
+
+    # 4. Active directions whose criterion_keys point at inactive or unknown
+    #    (dangling / wrong-version) acceptance criteria for the open version.
+    criterion_link_conflicts = _compute_criterion_link_conflicts(
+        criterion_links,
+        active_criterion_keys,
+        inactive_criterion_keys,
+    )
+
+    if (
+        not orphaned_gaps
+        and not ungrounded_directions
+        and not stale_active_moves
+        and not criterion_link_conflicts
+    ):
+        return None
+
+    return {
+        "orphaned_gaps": orphaned_gaps,
+        "ungrounded_directions": ungrounded_directions,
+        "stale_active_moves": stale_active_moves,
+        "criterion_link_conflicts": criterion_link_conflicts,
+        "counts": {
+            "orphaned_gaps": len(orphaned_gaps),
+            "ungrounded_directions": len(ungrounded_directions),
+            "stale_active_moves": len(stale_active_moves),
+            "criterion_link_conflicts": len(criterion_link_conflicts),
+            "total": (
+                len(orphaned_gaps)
+                + len(ungrounded_directions)
+                + len(stale_active_moves)
+                + len(criterion_link_conflicts)
+            ),
+        },
+    }
+
+
+async def _integrity_conflict_trend(
+    session: AsyncSession,
+    project_id,
+    *,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Return durable integrity-conflict trend data for the strategic-state endpoint.
+
+    Delegates to :func:`strategic_cycle.recent_integrity_conflict_trend` and
+    wraps the result for the HTTP response body.  Fails open — an empty trend
+    dict is returned when the query raises so a DB hiccup doesn't take down
+    the entire strategic-state endpoint.
+    """
+    try:
+        return await strategic_cycle.recent_integrity_conflict_trend(
+            session, project_id, limit=limit
+        )
+    except Exception:
+        import logging  # noqa: PLC0415
+        logging.getLogger(__name__).exception(
+            "[STRATEGIC_STATE] integrity_conflict_trend query failed for project %s",
+            project_id,
+        )
+        return {
+            "stamped_cycles": 0,
+            "consecutive_clean_cycles": 0,
+            "last_counts": None,
+        }
+
+
+def _compute_criterion_link_conflicts(
+    criterion_links: Any,
+    active_criterion_keys: Any,
+    inactive_criterion_keys: Any,
+) -> list[dict]:
+    """Classify each active direction's criterion_keys against the open version.
+
+    Returns one conflict entry per (direction, offending key) pair for keys that
+    are ``inactive`` (retracted/superseded) or ``dangling`` (absent from the
+    open version — which also covers keys carried over from a different
+    version). Valid keys and inputs that are absent/malformed yield an empty
+    list, so the caller can pass this through unconditionally.
+    """
+    if not isinstance(criterion_links, list) or active_criterion_keys is None:
+        return []
+
+    from app.direction_referential_guard import classify_criterion_key
+
+    active_keys = frozenset(active_criterion_keys or ())
+    inactive_keys = frozenset(inactive_criterion_keys or ())
+
+    conflicts: list[dict] = []
+    for link in criterion_links:
+        if not isinstance(link, dict):
+            continue
+        if (link.get("status") or "active") != "active":
+            continue
+        keys = link.get("criterion_keys")
+        if not isinstance(keys, list):
+            continue
+        direction_id = str(link.get("id") or "")
+        direction_text = str(link.get("text") or "")[:120]
+        for raw_key in keys:
+            key = str(raw_key or "")
+            if not key:
+                continue
+            cls = classify_criterion_key(key, active_keys, inactive_keys)
+            if cls == "valid":
+                continue
+            conflicts.append({
+                "direction_id": direction_id,
+                "direction_text": direction_text,
+                "criterion_key": key,
+                "classification": cls,
+                "recovery_hint": _RECOVERY_HINTS[
+                    "criterion_inactive" if cls == "inactive"
+                    else "criterion_dangling"
+                ],
+            })
+    return conflicts

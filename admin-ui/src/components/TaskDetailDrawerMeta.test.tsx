@@ -1174,6 +1174,14 @@ describe('DetailsTab — Knowledge Document', () => {
     expect(await screen.findByText(/Full body/)).toBeInTheDocument();
     expect(screen.queryByTestId('release-evidence-chip')).toBeNull();
   });
+
+  it('knowledge_document_section_surfaces_body_load_failure', async () => {
+    const { fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocument).mockRejectedValueOnce(new Error('Network error'));
+    render(<DetailsTab task={knowledgeTask()} />);
+    screen.getByText('View document').click();
+    expect(await screen.findByText('Failed to load document body.')).toBeInTheDocument();
+  });
 });
 
 describe('DetailsTab — Structural Gating', () => {

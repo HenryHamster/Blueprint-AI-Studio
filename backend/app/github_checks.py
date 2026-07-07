@@ -55,6 +55,13 @@ def _github_request(*args, **kwargs):
     return _gh._github_request(*args, **kwargs)
 
 
+def _deferrable_quota_active() -> bool:
+    """Delegate to app.github._deferrable_quota_active at call time."""
+    from app import github as _gh
+
+    return _gh._deferrable_quota_active()
+
+
 # GitHub-generated setup-phase step names. These are emitted by GitHub Actions
 # for every job (repo-agnostic, not workflow config). A job whose *only* failed
 # steps are these failed during infra setup — container/runner init, before any
@@ -360,6 +367,19 @@ async def get_check_runs(
     # setup steps (infra flake). failed_run_ids: the workflow run(s) to re-run.
     setup_phase_failure = False
     failed_run_ids: list[int] = []
+    if failed_names and _deferrable_quota_active():
+        logger.warning(
+            "[CI LOGS] quota floor active — skipping failure-detail fan-out for %s",
+            ref[:8] if ref else ref,
+        )
+        return {
+            "status": agg_status,
+            "conclusion": agg_conclusion,
+            "details": details,
+            "failed_logs": "",
+            "setup_phase_failure": False,
+            "failed_run_ids": [],
+        }
     if failed_names:
         log_lines = []
 
@@ -519,6 +539,68 @@ async def get_check_runs(
 # for a promoted SHA succeeded — without changing the workflow itself.
 AGENT_BAKE_WORKFLOW_FILE = "packer-agent.yml"
 
+# The main CI workflow file (.github/workflows/ci.yml).  Its ``detect`` job forces
+# frontend/backend/agent all-true on a ``workflow_dispatch``, so dispatching it on
+# the integration branch runs the FULL 8-shard backend + frontend + agent matrix.
+# The promotion_failed re-driver dispatches this to obtain a real full-suite green
+# signal for the integration HEAD before re-entering qualification.
+CI_WORKFLOW_FILE = "ci.yml"
+
+
+async def dispatch_workflow_run(
+    token: str,
+    owner: str,
+    repo: str,
+    workflow_file: str,
+    ref: str,
+    project_id: str | None = None,
+) -> bool:
+    """Trigger a ``workflow_dispatch`` run of ``workflow_file`` on ``ref``.
+
+    POSTs to ``/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches``
+    with body ``{"ref": ref}``.  Returns True on GitHub's documented 204 success,
+    False (with a warning log) on any other status or on any transport error.
+    Never raises — graceful degradation, mirroring the sibling read-only helpers
+    (:func:`get_workflow_run_for_sha`, :func:`rerun_failed_jobs`).  The workflow
+    file must expose a ``workflow_dispatch:`` trigger for this to succeed.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        response = await _github_request(
+            "POST",
+            f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/"
+            f"{workflow_file}/dispatches",
+            headers,
+            json={"ref": ref},
+            project_id=project_id,
+            timeout=10.0,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "[GITHUB] dispatch_workflow_run request failed for %s/%s workflow=%s ref=%s",
+            owner,
+            repo,
+            workflow_file,
+            ref,
+        )
+        return False
+    if response.status_code == 204:
+        return True
+    logger.warning(
+        "[GITHUB] dispatch_workflow_run: %s/%s workflow=%s ref=%s returned %s: %s",
+        owner,
+        repo,
+        workflow_file,
+        ref,
+        response.status_code,
+        response.text[:200],
+    )
+    return False
+
 
 async def get_workflow_run_for_sha(
     token: str,
@@ -551,6 +633,12 @@ async def get_workflow_run_for_sha(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    if _deferrable_quota_active():
+        logger.warning(
+            "[GITHUB] get_workflow_run_for_sha: quota floor active — returning None for %s",
+            head_sha[:8] if head_sha else head_sha,
+        )
+        return None
     response = await _github_request(
         "GET",
         f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/"

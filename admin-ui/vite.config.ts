@@ -12,6 +12,13 @@ export default defineConfig({
     reportCompressedSize: false,
     rollupOptions: {
       maxParallelFileOps: 3,
+      output: {
+        manualChunks: {
+          'vendor-react': ['react', 'react-dom'],
+          'vendor-recharts': ['recharts'],
+          'vendor-firebase': ['firebase/app', 'firebase/auth'],
+        },
+      },
     },
   },
   server: {

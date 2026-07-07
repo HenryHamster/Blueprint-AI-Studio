@@ -2,6 +2,7 @@ import fs from 'fs';
 import { WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { SHELL_CMD_RE } from '../shell-safety.js';
+import { agentTokenShellFn } from '../token-file.js';
 import { writeCheckHelper } from './check-helper.js';
 import { writeDoneHelper } from './done-helper.js';
 import { writePrHelper } from './pr-helper.js';
@@ -301,6 +302,7 @@ function writeFailHelper(cfg: CodeChangeHelperConfig): void {
   // can't be completed (e.g. scope is wrong, blocker found, conflicting
   // requirements). Posts FAILED with the reason. Wrapper sees the marker
   // and exits cleanly without trying its own fallback push.
+  const agentTokenFn = agentTokenShellFn();
   const script = `#!/bin/bash
 # ./fail "reason" — mark task FAILED with an operator-readable reason.
 # Use when the task can't be completed cleanly: scope is wrong, blocker
@@ -308,10 +310,11 @@ function writeFailHelper(cfg: CodeChangeHelperConfig): void {
 # failures — keep iterating with ./check instead.
 
 set -uo pipefail
+${agentTokenFn}
 REASON="\${1:?Usage: ./fail \\"<reason>\\"}"
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+_load_agent_token
 TASK="${cfg.taskId}"
 
 if [ -f /tmp/fail_${cfg.taskId} ]; then
@@ -361,6 +364,7 @@ function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
   // rather than CODE_ERROR — review-fix iterations don't burn against the
   // chain, and the strategic agent gets a ProjectMessage so it can decide
   // whether to spawn a precondition-fix direction.
+  const agentTokenFn = agentTokenShellFn();
   const script = `#!/bin/bash
 # ./blocked "<reason>" — mark task BLOCKED_PRECONDITION (no retry burn).
 #
@@ -386,6 +390,7 @@ function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
 # to spawn a precondition-fix direction.
 
 set -uo pipefail
+${agentTokenFn}
 
 # Optional structured prerequisite flags. When given, the blocker carries a
 # normalized machine-resolvable need ({kind, ref}) alongside the free-text
@@ -420,7 +425,7 @@ if [ "$NEED_KIND" = "task" ] && [ -n "$NEED_REF" ]; then
 fi
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+_load_agent_token
 TASK="${cfg.taskId}"
 
 if [ -f /tmp/blocked_${cfg.taskId} ]; then

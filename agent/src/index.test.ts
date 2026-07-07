@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, resolveBaseBranch, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { jaccardSimilarity } from './utils/diff-detection.js';
 import {
@@ -560,6 +560,33 @@ describe('validateBranchName', () => {
   });
 });
 
+// ── resolveBaseBranch ────────────────────────────────────────────────────────
+describe('resolveBaseBranch', () => {
+  it('prefers payload.base_branch over project_metadata.integration_branch', () => {
+    expect(resolveBaseBranch({ base_branch: 'feature/x' }, { project_metadata: { integration_branch: 'develop' } })).toBe('feature/x');
+  });
+
+  it('falls back to project_metadata.integration_branch when payload has no base_branch', () => {
+    expect(resolveBaseBranch({}, { project_metadata: { integration_branch: 'develop' } })).toBe('develop');
+  });
+
+  it('falls back to "main" when neither payload nor metadata has a branch', () => {
+    expect(resolveBaseBranch({}, {})).toBe('main');
+  });
+
+  it('trims whitespace from payload.base_branch', () => {
+    expect(resolveBaseBranch({ base_branch: '  main  ' }, {})).toBe('main');
+  });
+
+  it('trims whitespace from integration_branch and falls through on whitespace-only value', () => {
+    expect(resolveBaseBranch({}, { project_metadata: { integration_branch: '  ' } })).toBe('main');
+  });
+
+  it('accepts custom fallback when no branch configured', () => {
+    expect(resolveBaseBranch({}, {}, 'master')).toBe('master');
+  });
+});
+
 // ── deriveTaskBranch ─────────────────────────────────────────────────────────
 // Pins the task-type → branch-prefix mapping so drift between the agent and
 // backend/app/services.py _TASK_TYPE_BRANCH_PREFIX is caught immediately.
@@ -885,11 +912,16 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
     expect(getCurrentPromptFingerprint()).toBeNull();
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 0,
+      num_turns: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
     expect(_getWarmStartForTesting()).toBe(true);
   });
@@ -2580,7 +2612,7 @@ describe('setupWorkspace reference-cache reuse', () => {
 
   function findCloneArgs(): string[] {
     const cloneCall = vi.mocked(execFileSync).mock.calls.find(
-      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[])[0] === 'clone',
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('clone'),
     );
     expect(cloneCall).toBeDefined();
     return cloneCall?.[1] as string[];
@@ -2607,6 +2639,21 @@ describe('setupWorkspace reference-cache reuse', () => {
 
     const cloneArgs = findCloneArgs();
     expect(cloneArgs).not.toContain('--reference-if-able');
+  });
+
+  it('setupWorkspace does not embed token in clone URL', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    stubExecFileSyncNoStaleBranch();
+
+    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' }, 'blueprint');
+
+    const cloneArgs = findCloneArgs();
+    // Clean URL — no x-access-token embedded.
+    const urlArg = cloneArgs[cloneArgs.length - 2]; // second-to-last is the URL
+    expect(urlArg).toBe('https://github.com/owner/repo.git');
+    expect(urlArg).not.toContain('x-access-token');
+    // Credential helper -c flag present.
+    expect(cloneArgs.some(a => a.startsWith('credential.https://github.com.helper='))).toBe(true);
   });
 
   it('registers the sizecap merge driver after configuring user.* git config', async () => {
@@ -2688,6 +2735,46 @@ describe('failure category classification', () => {
     expect((caughtError as Error & { failureCategory?: string }).failureCategory).toBe('clone_failed');
   });
 
+  it('pushAndCreatePR does not embed token in remote set-url', async () => {
+    vi.mocked(execFileSync).mockReturnValue('');
+    vi.mocked(spawn).mockImplementation(() => {
+      const proc = {
+        pid: 123,
+        stderr: { on: vi.fn() },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') setImmediate(() => { cb(0); });
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: { token: 'fresh-push-token' } }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: { pr_url: 'https://github.com/owner/repo/pull/1', pr_number: 1 } }),
+      }),
+    );
+
+    await pushAndCreatePR('owner', 'repo', 'task-id', 'blueprint/branch', 'main', 'Title', 'Body', null, { value: '' }, true);
+
+    const setUrlCalls = vi.mocked(execFileSync).mock.calls.filter(
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('set-url'),
+    );
+    expect(setUrlCalls.length).toBeGreaterThanOrEqual(1);
+    for (const call of setUrlCalls) {
+      const args = call[1] as string[];
+      const urlInCall = args[args.length - 1];
+      expect(urlInCall).toBe('https://github.com/owner/repo.git');
+      expect(urlInCall).not.toContain('x-access-token');
+      expect(urlInCall).not.toContain('fresh-push-token');
+    }
+  });
+
   it('pushAndCreatePR attaches pr_creation_failed when GitHub PR creation returns 403', async () => {
     // Allow all execFileSync calls (git remote set-url, curl heartbeat)
     vi.mocked(execFileSync).mockReturnValue('');
@@ -2713,6 +2800,7 @@ describe('failure category classification', () => {
       .mockResolvedValueOnce({
         ok: false,
         status: 403,
+        headers: { get: () => null },
         text: () => Promise.resolve('Forbidden'),
       }),
     );
@@ -4663,7 +4751,7 @@ describe('main pool-mode startup ordering', () => {
       }
       if (url.endsWith('/api/agent/claim')) {
         events.push('claim-replay');
-        return Promise.resolve({ status: 400, ok: false, text: () => Promise.resolve('claim replay stopped test') });
+        return Promise.resolve({ status: 400, ok: false, headers: { get: () => null }, text: () => Promise.resolve('claim replay stopped test') });
       }
       throw new Error(`unexpected fetch ${url}`);
     });
@@ -6779,6 +6867,73 @@ describe('apiRequest body-read timeout', () => {
   });
 });
 
+describe('apiRequest 503 / Retry-After backoff (create-PR fail-closed contract)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('retries a 503 honoring Retry-After, then returns the success body', async () => {
+    vi.useFakeTimers();
+    let calls = 0;
+    const fetchMock = makeFetchMock().mockImplementation(() => {
+      calls += 1;
+      if (calls === 1) {
+        // The backend returns 503 + Retry-After when it refuses to create a PR
+        // because it cannot confirm no-duplicate while the GitHub quota is drained.
+        // Retry-After is 10s — deliberately LARGER than the exponential fallback
+        // (< 2s on the first retry) so the two-phase advance below can prove the
+        // header is honored rather than the exponential window.
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          text: () => Promise.resolve('{"error":{"message":"rate-limited"}}'),
+          json: () => Promise.resolve({}),
+          headers: { get: (h: string) => (h === 'Retry-After' ? '10' : null) },
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ status: 'success', data: { html_url: 'u' } }),
+        text: () => Promise.resolve(''),
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    // timeout=30s so the per-attempt abort timer never fires during the 10s wait.
+    const p = apiPost('/api/agent/github/pull-requests', {}, 3, 30_000);
+    // After 2.1s the retry must NOT have fired: the exponential fallback would
+    // have (< 2s), so a still-pending retry proves the 10s Retry-After is honored.
+    await vi.advanceTimersByTimeAsync(2_100);
+    expect(calls).toBe(1);
+    // Advance past the 10s Retry-After — now the retry fires and succeeds.
+    await vi.advanceTimersByTimeAsync(8_000);
+    await expect(p).resolves.toEqual({ status: 'success', data: { html_url: 'u' } });
+    expect(calls).toBe(2);
+  });
+
+  it('does NOT retry a 403 without a Retry-After header (fails fast)', async () => {
+    let calls = 0;
+    const fetchMock = makeFetchMock().mockImplementation(() => {
+      calls += 1;
+      return Promise.resolve({
+        ok: false,
+        status: 403,
+        text: () => Promise.resolve('Forbidden'),
+        json: () => Promise.resolve({}),
+        headers: { get: () => null },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      apiPost('/api/agent/github/pull-requests', {}, 3, 5_000),
+    ).rejects.toThrow(/failed \(403\)/);
+    expect(calls).toBe(1);
+  });
+});
+
 describe('agent runtime fingerprint heartbeats', () => {
   let fetchMock: FetchMock;
   const runtimeFingerprint = 'a'.repeat(64);
@@ -7009,11 +7164,16 @@ describe('LLM telemetry counters', () => {
   it('starts at zero', () => {
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 0,
+      num_turns: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
 
@@ -7024,11 +7184,16 @@ describe('LLM telemetry counters', () => {
     recordLlmTokens(200, 75);
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 2,
+      num_turns: 0,
       total_input_tokens: 300,
       total_output_tokens: 125,
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
 
@@ -7038,11 +7203,16 @@ describe('LLM telemetry counters', () => {
     recordLlmTokens(100, Number.POSITIVE_INFINITY);
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 0,
+      num_turns: 0,
       total_input_tokens: 100,
       total_output_tokens: 50,
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
 
@@ -7052,11 +7222,16 @@ describe('LLM telemetry counters', () => {
     resetLlmTelemetry();
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 0,
+      num_turns: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
 });

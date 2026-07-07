@@ -21,6 +21,7 @@ from sqlalchemy.orm import aliased
 
 from app.database import get_session
 from app.deploy_identity import deploy_repo_identity as _deploy_repo_identity
+from app.inline_llm import validate_inline_llm_runtime_config
 from app.url_security import _is_safe_external_url
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
 from app.models import (
@@ -46,6 +47,12 @@ from app.task_capabilities import (
     PROVIDER_CONFIGURABLE_TASK_TYPES,
     RESERVABLE_TASK_TYPES,
     task_capability_contract,
+)
+from app.autonomous_spawn_budget import (
+    default_autonomous_spawn_budget_categories,
+    normalize_autonomous_initiative_cap,
+    normalize_autonomous_spawn_budget_categories,
+    normalize_autonomous_spawn_budget_mode,
 )
 
 _VALID_PROVIDER_SELECTION_MODES = frozenset({"balanced", "preferred", "exclusive"})
@@ -86,6 +93,7 @@ def _reject_unknown_task_types(
 _KNOWN_SETTINGS_KEYS = frozenset(
     {
         "agent_prompt_suffixes",
+        "adversarial_spawn_gate_infra_failure_mode",
         "architecture_review_frequency",
         "auto_archive_enabled",
         "auto_archive_interval_minutes",
@@ -96,6 +104,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "autonomous_direction_cooldown_minutes",
         "autonomous_periodic_tasks",
         "autonomous_research_interval_minutes",
+        "autonomous_spawn_budget_categories",
+        "autonomous_spawn_budget_mode",
         "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
@@ -107,6 +117,13 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "structural_health_audit_mode",
         "structural_health_audit_interval_minutes",
         "structural_health_audit_fat_row_bytes",
+        "metrics_integrity_sweep_mode",
+        "metrics_integrity_sweep_interval_minutes",
+        "metrics_integrity_sweep_max_checks",
+        "metrics_integrity_sweep_max_projects",
+        "metrics_integrity_sweep_sample_limit",
+        "metrics_integrity_sweep_window_days",
+        "completion_debt_weight_mode",
         "category_routing",
         "ci_backstop_timeout_minutes",
         "cochange_decomposition_enabled",
@@ -127,6 +144,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "max_concurrent_tasks_by_project",
         "max_concurrent_vms",
         "max_global_autonomous_tasks_per_hour",
+        "max_global_autonomous_initiative_tasks_per_hour",
         "max_parallel_research_per_project",
         "max_pipeline_slots",
         "max_provision_retries",
@@ -172,6 +190,9 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "strategic_local_hold_timeout_seconds",
         "strategic_session_idle_tick_seconds",
         "strategic_session_turn_timeout_seconds",
+        "strategic_session_min_tick_seconds",
+        "strategic_session_max_ops_per_turn",
+        "strategic_session_autonomous_turn_timeout_seconds",
         "strategic_session_max_unattended_seconds",
         "resident_session_heartbeat_stale_seconds",
         "task_type_categories",
@@ -201,8 +222,18 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "warm_pool_cross_provider_retarget_enabled",
         "diagnostics_after_edit_holdback_fraction",
         "diagnostics_after_edit_enabled",
+        "inline_llm",
         "improvement_lanes_enabled",
         "review_fix_lane_pilot_enabled",
+        "direction_gap_respawn_block_mode",
+        "direction_gap_respawn_cooldown_days",
+        # Direction guardrail knobs (churn/lifetime pause thresholds + review ladder)
+        "direction_churn_window_cycles",
+        "direction_churn_non_merge_threshold",
+        "direction_churn_min_merge_rate",
+        "direction_lifetime_non_merge_threshold",
+        "direction_lifetime_min_merge_rate",
+        "direction_review_recommendation_threshold",
     }
 )
 
@@ -338,7 +369,17 @@ async def get_settings(
             "max_autonomous_tasks_per_hour"
         ],
         "max_global_autonomous_tasks_per_hour": _runtime_config.get(
-            "max_global_autonomous_tasks_per_hour", 50
+            "max_global_autonomous_tasks_per_hour", 500
+        ),
+        "autonomous_spawn_budget_mode": str(
+            _runtime_config.get("autonomous_spawn_budget_mode", "observe")
+        ),
+        "max_global_autonomous_initiative_tasks_per_hour": int(
+            _runtime_config.get("max_global_autonomous_initiative_tasks_per_hour", 50)
+        ),
+        "autonomous_spawn_budget_categories": _runtime_config.get(
+            "autonomous_spawn_budget_categories",
+            default_autonomous_spawn_budget_categories(),
         ),
         "autonomous_research_interval_minutes": _runtime_config.get(
             "autonomous_research_interval_minutes", 30
@@ -370,6 +411,32 @@ async def get_settings(
         ),
         "structural_health_audit_fat_row_bytes": int(
             _runtime_config.get("structural_health_audit_fat_row_bytes", 1048576)
+        ),
+        "metrics_integrity_sweep_mode": str(
+            _runtime_config.get("metrics_integrity_sweep_mode", "observe")
+        ),
+        "metrics_integrity_sweep_interval_minutes": int(
+            _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
+        ),
+        "metrics_integrity_sweep_max_checks": int(
+            _runtime_config.get("metrics_integrity_sweep_max_checks", 25)
+        ),
+        "metrics_integrity_sweep_max_projects": int(
+            _runtime_config.get("metrics_integrity_sweep_max_projects", 25)
+        ),
+        "metrics_integrity_sweep_sample_limit": int(
+            _runtime_config.get("metrics_integrity_sweep_sample_limit", 200)
+        ),
+        "metrics_integrity_sweep_window_days": int(
+            _runtime_config.get("metrics_integrity_sweep_window_days", 14)
+        ),
+        "completion_debt_weight_mode": str(
+            _runtime_config.get("completion_debt_weight_mode", "observe")
+        ),
+        "adversarial_spawn_gate_infra_failure_mode": str(
+            _runtime_config.get(
+                "adversarial_spawn_gate_infra_failure_mode", "observe"
+            )
         ),
         "max_concurrent_auto_remediations": _runtime_config.get(
             "max_concurrent_auto_remediations", 2
@@ -414,6 +481,7 @@ async def get_settings(
         "provider_settings_defaults": _runtime_config.get(
             "provider_settings_defaults", {}
         ),
+        "inline_llm": _runtime_config.get("inline_llm", {}),
         "provider_settings_by_effort": _runtime_config.get(
             "provider_settings_by_effort", {}
         ),
@@ -482,6 +550,15 @@ async def get_settings(
         ),
         "strategic_session_turn_timeout_seconds": _runtime_config.get(
             "strategic_session_turn_timeout_seconds", 120
+        ),
+        "strategic_session_min_tick_seconds": _runtime_config.get(
+            "strategic_session_min_tick_seconds", 600
+        ),
+        "strategic_session_max_ops_per_turn": _runtime_config.get(
+            "strategic_session_max_ops_per_turn", 3
+        ),
+        "strategic_session_autonomous_turn_timeout_seconds": _runtime_config.get(
+            "strategic_session_autonomous_turn_timeout_seconds", 300
         ),
         "strategic_session_max_unattended_seconds": _runtime_config.get(
             "strategic_session_max_unattended_seconds", 14400
@@ -684,6 +761,31 @@ async def get_settings(
         "cloud_run_task_type_allowlist": sorted(
             _runtime_config.get("cloud_run_task_type_allowlist") or []
         ),
+        "direction_gap_respawn_block_mode": str(
+            _runtime_config.get("direction_gap_respawn_block_mode", "observe") or "observe"
+        ),
+        "direction_gap_respawn_cooldown_days": float(
+            _runtime_config.get("direction_gap_respawn_cooldown_days", 14) or 14
+        ),
+        # Direction guardrail knobs
+        "direction_churn_window_cycles": int(
+            _runtime_config.get("direction_churn_window_cycles", 5)
+        ),
+        "direction_churn_non_merge_threshold": int(
+            _runtime_config.get("direction_churn_non_merge_threshold", 15)
+        ),
+        "direction_churn_min_merge_rate": float(
+            _runtime_config.get("direction_churn_min_merge_rate", 0.10)
+        ),
+        "direction_lifetime_non_merge_threshold": int(
+            _runtime_config.get("direction_lifetime_non_merge_threshold", 150)
+        ),
+        "direction_lifetime_min_merge_rate": float(
+            _runtime_config.get("direction_lifetime_min_merge_rate", 0.10)
+        ),
+        "direction_review_recommendation_threshold": int(
+            _runtime_config.get("direction_review_recommendation_threshold", 2)
+        ),
     }
 
 
@@ -729,6 +831,8 @@ async def _apply_settings(
     # Snapshot config so we can restore on DB commit failure
     _config_snapshot = dict(_runtime_config)
     clear_pause_state = False
+    # Dormant-knob debts to resolve when a knob graduates to an enforcing value.
+    _debt_keys_to_resolve: list[str] = []
 
     # Validate the payload keys BEFORE applying anything. An unknown/misspelled
     # key was previously silently ignored — a typo like "promotion_treshold"
@@ -806,6 +910,37 @@ async def _apply_settings(
                 detail="max_global_autonomous_tasks_per_hour must be between 1 and 500",
             )
         _runtime_config["max_global_autonomous_tasks_per_hour"] = val
+    if "autonomous_spawn_budget_mode" in payload:
+        try:
+            _runtime_config["autonomous_spawn_budget_mode"] = (
+                normalize_autonomous_spawn_budget_mode(
+                    payload["autonomous_spawn_budget_mode"]
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if _runtime_config["autonomous_spawn_budget_mode"] == "enforce":
+            _debt_keys_to_resolve.append(
+                "dormant_knob:autonomous_spawn_budget_mode"
+            )
+    if "max_global_autonomous_initiative_tasks_per_hour" in payload:
+        try:
+            _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = (
+                normalize_autonomous_initiative_cap(
+                    payload["max_global_autonomous_initiative_tasks_per_hour"]
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if "autonomous_spawn_budget_categories" in payload:
+        try:
+            _runtime_config["autonomous_spawn_budget_categories"] = (
+                normalize_autonomous_spawn_budget_categories(
+                    payload["autonomous_spawn_budget_categories"]
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if "autonomous_research_interval_minutes" in payload:
         try:
             val = int(payload["autonomous_research_interval_minutes"])
@@ -828,6 +963,8 @@ async def _apply_settings(
                 detail="evergreen_fill_mode must be one of: off, observe, enforce",
             )
         _runtime_config["evergreen_fill_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:evergreen_fill_mode")
     if "evergreen_fill_interval_minutes" in payload:
         try:
             val = int(payload["evergreen_fill_interval_minutes"])
@@ -914,6 +1051,35 @@ async def _apply_settings(
                 detail="structural_health_audit_mode must be one of: off, observe, enforce",
             )
         _runtime_config["structural_health_audit_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:structural_health_audit_mode")
+    if "completion_debt_weight_mode" in payload:
+        val = str(payload["completion_debt_weight_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="completion_debt_weight_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["completion_debt_weight_mode"] = val
+        # Graduating the debt-pressure signal to enforce resolves its standing
+        # dormant-knob completion-debt row (mirrors evergreen_fill_mode).
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:completion_debt_weight_mode")
+    if "adversarial_spawn_gate_infra_failure_mode" in payload:
+        val = (
+            str(payload["adversarial_spawn_gate_infra_failure_mode"] or "")
+            .strip()
+            .lower()
+        )
+        if val not in ("observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "adversarial_spawn_gate_infra_failure_mode must be one of: "
+                    "observe, enforce"
+                ),
+            )
+        _runtime_config["adversarial_spawn_gate_infra_failure_mode"] = val
     if "structural_health_audit_interval_minutes" in payload:
         try:
             val = int(payload["structural_health_audit_interval_minutes"])
@@ -944,6 +1110,37 @@ async def _apply_settings(
                 detail="structural_health_audit_fat_row_bytes must be between 1024 and 1073741824",
             )
         _runtime_config["structural_health_audit_fat_row_bytes"] = val
+    if "metrics_integrity_sweep_mode" in payload:
+        val = str(payload["metrics_integrity_sweep_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="metrics_integrity_sweep_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["metrics_integrity_sweep_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:metrics_integrity_sweep_mode")
+    for _mi_key, _mi_lo, _mi_hi in (
+        ("metrics_integrity_sweep_interval_minutes", 1, 1440),
+        ("metrics_integrity_sweep_max_checks", 1, 1000),
+        ("metrics_integrity_sweep_max_projects", 1, 10000),
+        ("metrics_integrity_sweep_sample_limit", 1, 100000),
+        ("metrics_integrity_sweep_window_days", 1, 365),
+    ):
+        if _mi_key in payload:
+            try:
+                val = int(payload[_mi_key])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_mi_key} must be a number",
+                )
+            if not (_mi_lo <= val <= _mi_hi):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_mi_key} must be between {_mi_lo} and {_mi_hi}",
+                )
+            _runtime_config[_mi_key] = val
     if "evaluating_pipeline_timeout_minutes" in payload:
         try:
             val = int(payload["evaluating_pipeline_timeout_minutes"])
@@ -1066,12 +1263,18 @@ async def _apply_settings(
                 status_code=400, detail="promotion_weights must be a dict"
             )
         _PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion", "smoketest")
-        if set(val.keys()) != set(_PROMOTION_WEIGHT_KEYS):
+        # ``completion_debt`` is an OPTIONAL, SEPARATE blend factor (NOT part of
+        # the three-core-weight sum) — accept it but require the three core keys.
+        _allowed_weight_keys = set(_PROMOTION_WEIGHT_KEYS) | {"completion_debt"}
+        missing_core = set(_PROMOTION_WEIGHT_KEYS) - set(val.keys())
+        extra_keys = set(val.keys()) - _allowed_weight_keys
+        if missing_core or extra_keys:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "promotion_weights must have exactly the keys "
-                    f"{sorted(_PROMOTION_WEIGHT_KEYS)}"
+                    "promotion_weights must have the keys "
+                    f"{sorted(_PROMOTION_WEIGHT_KEYS)} "
+                    "and may optionally include 'completion_debt'"
                 ),
             )
         cleaned_weights: Dict[str, float] = {}
@@ -1093,16 +1296,33 @@ async def _apply_settings(
         # saturates confidence (gate effectively disabled) or makes it
         # unreachable (gate stuck closed). Reject a mis-weighted set rather than
         # silently honour it — same invariant release_qualifier._load_policy
-        # enforces on the YAML file.
+        # enforces on the YAML file.  Only the THREE CORE weights participate in
+        # this sum; completion_debt is validated separately below.
         weight_sum = sum(cleaned_weights.values())
         if abs(weight_sum - 1.0) > 0.01:
             raise HTTPException(
                 status_code=400,
                 detail=(f"promotion_weights must sum to ~1.0 (got {weight_sum:.4f})"),
             )
-        _runtime_config["promotion_weights"] = {
+        stored_weights = {
             wk: round(cleaned_weights[wk], 4) for wk in _PROMOTION_WEIGHT_KEYS
         }
+        # Optional completion_debt blend factor: a number in [0.0, 0.5].
+        if "completion_debt" in val:
+            try:
+                cd_weight = float(val["completion_debt"])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="promotion_weights[completion_debt] must be a number",
+                )
+            if not (0.0 <= cd_weight <= 0.5):
+                raise HTTPException(
+                    status_code=400,
+                    detail="promotion_weights[completion_debt] must be between 0.0 and 0.5",
+                )
+            stored_weights["completion_debt"] = round(cd_weight, 4)
+        _runtime_config["promotion_weights"] = stored_weights
     if "merge_grade_block_threshold" in payload:
         try:
             val = float(payload["merge_grade_block_threshold"])
@@ -1156,6 +1376,8 @@ async def _apply_settings(
                 detail="strategic_session_enabled must be a boolean",
             )
         _runtime_config["strategic_session_enabled"] = val
+        if val:
+            _debt_keys_to_resolve.append("dormant_knob:strategic_session_enabled")
     # Resident strategic-session integer knobs. Each is clamped to a sane range:
     # the continuation TTL and local-hold timeout are the safety windows (min 60s
     # so a live session can never be reaped mid-turn; ceiling 7200s / 2h so an
@@ -1170,6 +1392,16 @@ async def _apply_settings(
         ("strategic_local_hold_timeout_seconds", 60, 7_200),
         ("strategic_session_idle_tick_seconds", 1, 300),
         ("strategic_session_turn_timeout_seconds", 10, 3_600),
+        # Floor-tick cadence: >=60s (never busy-loop) and <=3600s (review at
+        # least hourly). The design default 600s sits well under the 25-min
+        # continuation TTL so the session reviews before the lease can lapse.
+        ("strategic_session_min_tick_seconds", 60, 3_600),
+        # Soft per-turn op cap: 1..20. Advisory prompt hint only; the hard
+        # per-op spawn/retire gates are unaffected.
+        ("strategic_session_max_ops_per_turn", 1, 20),
+        # Deep-turn stall budget for autonomous turns: 30..3600s, all under the
+        # 15-min absolute hard ceiling enforced agent-side.
+        ("strategic_session_autonomous_turn_timeout_seconds", 30, 3_600),
         ("strategic_session_max_unattended_seconds", 60, 28_800),
         ("resident_session_heartbeat_stale_seconds", 60, 7_200),
     ):
@@ -1302,6 +1534,10 @@ async def _apply_settings(
                 ),
             )
         _runtime_config["strategic_retirement_challenge_gate_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append(
+                "dormant_knob:strategic_retirement_challenge_gate_mode"
+            )
     if "cochange_decomposition_enabled" in payload:
         val = payload["cochange_decomposition_enabled"]
         if not isinstance(val, bool):
@@ -1773,6 +2009,118 @@ async def _apply_settings(
                     },
                 )
         _runtime_config["review_fix_lane_pilot_enabled"] = val
+    if "direction_gap_respawn_block_mode" in payload:
+        val = (
+            str(payload["direction_gap_respawn_block_mode"] or "").strip().lower()
+        )
+        if val not in ("observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "direction_gap_respawn_block_mode must be one of: observe, enforce"
+                ),
+            )
+        _runtime_config["direction_gap_respawn_block_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:direction_gap_respawn_block_mode")
+    if "direction_gap_respawn_cooldown_days" in payload:
+        try:
+            fval = float(payload["direction_gap_respawn_cooldown_days"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_gap_respawn_cooldown_days must be a number",
+            )
+        if not (1.0 <= fval <= 365.0):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_gap_respawn_cooldown_days must be between 1 and 365",
+            )
+        _runtime_config["direction_gap_respawn_cooldown_days"] = fval
+    if "direction_churn_window_cycles" in payload:
+        try:
+            val = int(payload["direction_churn_window_cycles"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_window_cycles must be an integer",
+            )
+        if not (1 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_window_cycles must be between 1 and 100",
+            )
+        _runtime_config["direction_churn_window_cycles"] = val
+    if "direction_churn_non_merge_threshold" in payload:
+        try:
+            val = int(payload["direction_churn_non_merge_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_non_merge_threshold must be an integer",
+            )
+        if not (1 <= val <= 10000):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_non_merge_threshold must be between 1 and 10000",
+            )
+        _runtime_config["direction_churn_non_merge_threshold"] = val
+    if "direction_churn_min_merge_rate" in payload:
+        try:
+            fval = float(payload["direction_churn_min_merge_rate"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_min_merge_rate must be a number",
+            )
+        if not (0.0 <= fval <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_min_merge_rate must be between 0.0 and 1.0",
+            )
+        _runtime_config["direction_churn_min_merge_rate"] = fval
+    if "direction_lifetime_non_merge_threshold" in payload:
+        try:
+            val = int(payload["direction_lifetime_non_merge_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_lifetime_non_merge_threshold must be an integer",
+            )
+        if not (1 <= val <= 100000):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_lifetime_non_merge_threshold must be between 1 and 100000",
+            )
+        _runtime_config["direction_lifetime_non_merge_threshold"] = val
+    if "direction_lifetime_min_merge_rate" in payload:
+        try:
+            fval = float(payload["direction_lifetime_min_merge_rate"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_lifetime_min_merge_rate must be a number",
+            )
+        if not (0.0 <= fval <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_lifetime_min_merge_rate must be between 0.0 and 1.0",
+            )
+        _runtime_config["direction_lifetime_min_merge_rate"] = fval
+    if "direction_review_recommendation_threshold" in payload:
+        try:
+            val = int(payload["direction_review_recommendation_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_review_recommendation_threshold must be an integer",
+            )
+        if not (1 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_review_recommendation_threshold must be between 1 and 100",
+            )
+        _runtime_config["direction_review_recommendation_threshold"] = val
     if "drift_stall_min_claims" in payload:
         try:
             val = int(payload["drift_stall_min_claims"])
@@ -2004,6 +2352,13 @@ async def _apply_settings(
                         detail=f"Invalid model in model preferences for {task_type}",
                     )
         _runtime_config["task_type_model_preferences"] = val
+    if "inline_llm" in payload:
+        val = payload["inline_llm"]
+        try:
+            cleaned_inline_llm = validate_inline_llm_runtime_config(val)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        _runtime_config["inline_llm"] = cleaned_inline_llm
     # provider_selection_mode is the canonical control; cross_provider_fallback_enabled
     # is accepted as a compatibility shim (True→"preferred", False→"exclusive").
     # When both are present in the same PATCH, the enum wins.
@@ -2661,6 +3016,21 @@ async def _apply_settings(
             raise HTTPException(status_code=502, detail=f"Webhook request failed: {e}")
         return {"ok": True, "test_notification_sent": True}
 
+    # Best-effort: resolve dormant-knob debts for any knobs that graduated this
+    # request. Each call uses its own SAVEPOINT so a ledger failure never rolls
+    # back the config change.
+    if _debt_keys_to_resolve:
+        from app.completion_debt import aresolve_completion_debt
+
+        for _dk in _debt_keys_to_resolve:
+            await aresolve_completion_debt(session, _dk, reason="graduated:enforce")
+
+    # Best-effort: reconcile the full dormant-knob registry against the new
+    # runtime config so demotions back to observe/off reopen immediately.
+    from app.completion_debt import areconcile_dormant_knob_debts
+
+    await areconcile_dormant_knob_debts(session, _runtime_config)
+
     # Detect a genuine warm_pool_enabled True→False transition. Computed here —
     # after all config changes but before the DB persist block — so the flag is
     # available in both the early-return (no DeploymentState row) and normal
@@ -2761,6 +3131,7 @@ async def _apply_settings(
                     "provider_settings_defaults": _runtime_config.get(
                         "provider_settings_defaults", {}
                     ),
+                    "inline_llm": _runtime_config.get("inline_llm", {}),
                     "provider_settings_by_effort": _runtime_config.get(
                         "provider_settings_by_effort", {}
                     ),
@@ -2784,6 +3155,18 @@ async def _apply_settings(
                     ),
                     "autonomous_periodic_tasks": _runtime_config.get(
                         "autonomous_periodic_tasks", {}
+                    ),
+                    "autonomous_spawn_budget_mode": str(
+                        _runtime_config.get("autonomous_spawn_budget_mode", "observe")
+                    ),
+                    "max_global_autonomous_initiative_tasks_per_hour": int(
+                        _runtime_config.get(
+                            "max_global_autonomous_initiative_tasks_per_hour", 50
+                        )
+                    ),
+                    "autonomous_spawn_budget_categories": _runtime_config.get(
+                        "autonomous_spawn_budget_categories",
+                        default_autonomous_spawn_budget_categories(),
                     ),
                     "health_check_urls": _runtime_config.get("health_check_urls", []),
                     "strategic_research_frequency": _runtime_config.get(
@@ -3091,6 +3474,16 @@ async def _apply_settings(
                     "structural_health_audit_fat_row_bytes": int(
                         _runtime_config.get("structural_health_audit_fat_row_bytes", 1048576)
                     ),
+                    # Persist the completion-debt weight-mode graduation knob so an
+                    # operator's enforce graduation survives a Cloud Run restart.
+                    "completion_debt_weight_mode": str(
+                        _runtime_config.get("completion_debt_weight_mode", "observe")
+                    ),
+                    "adversarial_spawn_gate_infra_failure_mode": str(
+                        _runtime_config.get(
+                            "adversarial_spawn_gate_infra_failure_mode", "observe"
+                        )
+                    ),
                     # Persist the Cloud Run task-type allowlist so an operator
                     # configuration survives a Cloud Run restart. runtime_config_state.
                     # sync_* reads this key back on boot; without it the in-memory
@@ -3124,6 +3517,17 @@ async def _apply_settings(
                             "strategic_session_turn_timeout_seconds", 120
                         )
                     ),
+                    "strategic_session_min_tick_seconds": int(
+                        _runtime_config.get("strategic_session_min_tick_seconds", 600)
+                    ),
+                    "strategic_session_max_ops_per_turn": int(
+                        _runtime_config.get("strategic_session_max_ops_per_turn", 3)
+                    ),
+                    "strategic_session_autonomous_turn_timeout_seconds": int(
+                        _runtime_config.get(
+                            "strategic_session_autonomous_turn_timeout_seconds", 300
+                        )
+                    ),
                     "strategic_session_max_unattended_seconds": int(
                         _runtime_config.get(
                             "strategic_session_max_unattended_seconds", 14400
@@ -3132,6 +3536,38 @@ async def _apply_settings(
                     "resident_session_heartbeat_stale_seconds": int(
                         _runtime_config.get(
                             "resident_session_heartbeat_stale_seconds", 1500
+                        )
+                    ),
+                    "direction_gap_respawn_block_mode": str(
+                        _runtime_config.get(
+                            "direction_gap_respawn_block_mode", "observe"
+                        )
+                        or "observe"
+                    ),
+                    "direction_gap_respawn_cooldown_days": float(
+                        _runtime_config.get("direction_gap_respawn_cooldown_days", 14)
+                        or 14
+                    ),
+                    "direction_churn_window_cycles": int(
+                        _runtime_config.get("direction_churn_window_cycles", 5)
+                    ),
+                    "direction_churn_non_merge_threshold": int(
+                        _runtime_config.get("direction_churn_non_merge_threshold", 15)
+                    ),
+                    "direction_churn_min_merge_rate": float(
+                        _runtime_config.get("direction_churn_min_merge_rate", 0.10)
+                    ),
+                    "direction_lifetime_non_merge_threshold": int(
+                        _runtime_config.get(
+                            "direction_lifetime_non_merge_threshold", 150
+                        )
+                    ),
+                    "direction_lifetime_min_merge_rate": float(
+                        _runtime_config.get("direction_lifetime_min_merge_rate", 0.10)
+                    ),
+                    "direction_review_recommendation_threshold": int(
+                        _runtime_config.get(
+                            "direction_review_recommendation_threshold", 2
                         )
                     ),
                 }
@@ -3473,6 +3909,9 @@ async def reset_github_quota_tracking(
     )
     _ss.github_call_counts.clear()
     _ss.github_call_counts_window_reset_at = None
+    _ss.github_off_backend_estimate["cumulative_this_window"] = 0
+    _ss.github_off_backend_estimate["_last_remaining"] = None
+    _ss.github_off_backend_estimate["_last_backend_calls"] = 0
     # Immediately probe to repopulate with a fresh observation.
     from app.github import probe_rate_limit  # noqa: PLC0415
 

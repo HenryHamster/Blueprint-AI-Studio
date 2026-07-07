@@ -55,6 +55,7 @@ from app.models import (
     Project,
     ProjectMessage,
     QualificationVerdict,
+    CompletionDebtEntry,
     CriterionEvidence,
     Task,
     TaskStatus,
@@ -616,6 +617,337 @@ class TestComputeCompositeSmoketestDisabled:
             policy=_POLICY,
         )
         assert result["blocker"] == "smoketest_startup_failed"
+
+
+# ===========================================================================
+# compute_composite — debt-pressure signal (observe mode)
+# ===========================================================================
+
+
+class TestComputeCompositeDebtPressure:
+    """Observe-mode debt-pressure signal: debt_pressure appears in sub_scores
+    without altering confidence or promote when no completion_debt weight is
+    set in the policy (the default)."""
+
+    def test_completion_debt_pressure_recorded_in_observe_mode(self):
+        """Observe mode: debt_pressure_score is recorded in sub_scores but
+        confidence and promote are identical to a call without the score."""
+        # Baseline: same inputs, no debt_pressure_score passed.
+        base = rq.compute_composite(
+            ci_green=True,
+            audit_score=0.8,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+        )
+        # With debt pressure — policy has no completion_debt weight → observe mode.
+        with_debt = rq.compute_composite(
+            ci_green=True,
+            audit_score=0.8,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            debt_pressure_score=0.2,
+        )
+        # Observe mode: confidence and promote are unchanged.
+        assert with_debt["confidence"] == base["confidence"]
+        assert with_debt["promote"] == base["promote"]
+        assert with_debt["blocker"] is None
+        # debt_pressure sub-score is recorded for observability.
+        assert "debt_pressure" in with_debt["sub_scores"]
+        assert with_debt["sub_scores"]["debt_pressure"] == pytest.approx(0.2)
+        # Baseline call without the score has no debt_pressure key.
+        assert "debt_pressure" not in base["sub_scores"]
+
+    def test_debt_pressure_none_omits_key_from_sub_scores(self):
+        """When debt_pressure_score is None (debt module unavailable), the
+        debt_pressure key is absent from sub_scores."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+        )
+        assert "debt_pressure" not in result["sub_scores"]
+
+    def test_debt_pressure_recorded_even_when_blocker_fires(self):
+        """debt_pressure_score appears in sub_scores even when a hard blocker
+        forces confidence to zero — consistent with how other sub-scores work."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            debt_pressure_score=0.5,
+        )
+        assert result["blocker"] == "ci_not_green"
+        assert result["confidence"] == 0.0
+        assert "debt_pressure" in result["sub_scores"]
+        assert result["sub_scores"]["debt_pressure"] == pytest.approx(0.5)
+
+    def test_debt_pressure_blended_when_policy_weight_set(self):
+        """When completion_debt_weight > 0 in policy, the score is blended:
+        confidence = (1 - w) * existing + w * debt_pressure."""
+        policy_with_debt = {
+            "weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+                "completion_debt": 0.1,
+            },
+            "threshold": 0.75,
+        }
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=policy_with_debt,
+            debt_pressure_score=0.0,  # zero pressure (high debt)
+        )
+        # existing_confidence = 1.0; blended = 0.9 * 1.0 + 0.1 * 0.0 = 0.9
+        assert result["confidence"] == pytest.approx(0.9)
+        assert result["promote"] is True  # 0.9 >= 0.75
+
+    def test_project_actionable_open_preferred_over_total_open(self):
+        """Scoring-only project_actionable_open overrides deployment-wide total_open."""
+        assert rq._score_completion_debt_pressure(
+            {"total_open": 10, "project_actionable_open": 0}
+        ) == pytest.approx(1.0)
+        assert rq._score_completion_debt_pressure({"total_open": 10}) == pytest.approx(
+            0.5
+        )
+
+    def test_global_standing_debt_does_not_block_passing_candidate_on_enforce(self):
+        """NAMED ACCEPTANCE TEST — global debt does not drag enforce-mode promotion.
+
+        A 0.92 candidate should remain above the 0.90 threshold when the only
+        open debt is deployment-global standing debt.  The scoring snapshot may
+        still report total_open=10 for visibility, but the blend must use the
+        project-actionable count of zero.
+        """
+        policy_with_default_enforce_debt = {
+            "weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+                "completion_debt": rq.DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT,
+            },
+            "threshold": 0.90,
+        }
+        debt_pressure = rq._score_completion_debt_pressure(
+            {"total_open": 10, "project_actionable_open": 0}
+        )
+
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=0.92,
+            test_erosion=0.92,
+            smoketest_score=0.92,
+            policy=policy_with_default_enforce_debt,
+            debt_pressure_score=debt_pressure,
+        )
+
+        assert debt_pressure == pytest.approx(1.0)
+        assert result["confidence"] == pytest.approx(0.932)
+        assert result["promote"] is True
+
+
+# ===========================================================================
+# completion_debt_weight_mode — the graduation gate that makes the debt-pressure
+# blend reachable end-to-end (Defect 1 + Defect 2).
+# ===========================================================================
+
+
+class TestCompletionDebtWeightModeGate:
+    """The completion_debt weight is READ + PRESERVED through resolution and the
+    completion_debt_weight_mode knob gates whether it reaches compute_composite."""
+
+    @staticmethod
+    def _seed_runtime_config(mocker, *, weights, mode):
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.90,
+                "promotion_weights": weights,
+                "completion_debt_weight_mode": mode,
+            },
+            clear=False,
+        )
+
+    def test_completion_debt_weight_mode_enforce_reachable(self, mocker):
+        """NAMED ACCEPTANCE TEST — end-to-end enforce reachability.
+
+        With completion_debt_weight_mode='enforce' AND a completion_debt weight
+        configured in runtime_config, the resolved policy MUST carry a nonzero
+        completion_debt weight (Defect 1: the tier no longer strips it) and the
+        enforce blend in compute_composite MUST actually be reached — confidence
+        under enforce differs from confidence under observe for the same debt
+        pressure (Defect 2: the mode gate arms the blend)."""
+        weights = {
+            "audit": 0.40,
+            "test_erosion": 0.30,
+            "smoketest": 0.30,
+            "completion_debt": 0.2,
+        }
+        # --- enforce: the configured completion_debt weight survives resolution
+        self._seed_runtime_config(mocker, weights=weights, mode="enforce")
+        enforce_policy = rq._load_policy()
+        assert enforce_policy["weights"].get("completion_debt") == pytest.approx(0.2), (
+            "enforce mode must preserve the configured completion_debt weight so "
+            "the compute_composite blend is reachable"
+        )
+        enforce_result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=enforce_policy,
+            debt_pressure_score=0.0,  # maximum open debt
+        )
+        # existing_confidence = 1.0; blended = 0.8 * 1.0 + 0.2 * 0.0 = 0.8
+        assert enforce_result["confidence"] == pytest.approx(0.8)
+
+        # --- observe: the SAME configured weight is forced to 0.0 (dropped)
+        self._seed_runtime_config(mocker, weights=weights, mode="observe")
+        observe_policy = rq._load_policy()
+        assert "completion_debt" not in observe_policy["weights"], (
+            "observe mode must force the effective completion_debt weight to 0.0"
+        )
+        observe_result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=observe_policy,
+            debt_pressure_score=0.0,
+        )
+        assert observe_result["confidence"] == pytest.approx(1.0)
+
+        # Graduation actually changed the composite.
+        assert enforce_result["confidence"] != pytest.approx(
+            observe_result["confidence"]
+        )
+
+    def test_observe_and_off_force_effective_weight_zero(self, mocker):
+        """observe/off both force the effective completion_debt weight to 0.0
+        even when a nonzero weight is configured (behaviour-preserving)."""
+        weights = {
+            "audit": 0.40,
+            "test_erosion": 0.30,
+            "smoketest": 0.30,
+            "completion_debt": 0.5,
+        }
+        for mode in ("observe", "off"):
+            self._seed_runtime_config(mocker, weights=weights, mode=mode)
+            policy = rq._load_policy()
+            assert "completion_debt" not in policy["weights"], (
+                f"mode={mode} must drop the completion_debt blend factor"
+            )
+
+    def test_enforce_with_unset_weight_falls_back_to_default(self, mocker):
+        """Graduating to enforce with NO completion_debt weight configured falls
+        back to the module default so graduation still changes the composite."""
+        weights = {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30}
+        self._seed_runtime_config(mocker, weights=weights, mode="enforce")
+        policy = rq._load_policy()
+        assert policy["weights"]["completion_debt"] == pytest.approx(
+            rq.DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+        )
+        assert rq.DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT > 0.0
+
+    def test_enforce_weight_clamped_to_max(self, mocker):
+        """A configured completion_debt weight above the cap is clamped."""
+        weights = {
+            "audit": 0.40,
+            "test_erosion": 0.30,
+            "smoketest": 0.30,
+            "completion_debt": 0.9,
+        }
+        self._seed_runtime_config(mocker, weights=weights, mode="enforce")
+        policy = rq._load_policy()
+        assert policy["weights"]["completion_debt"] == pytest.approx(
+            rq.MAX_COMPLETION_DEBT_WEIGHT
+        )
+
+    def test_legacy_three_key_weights_still_resolve(self, mocker):
+        """Backward compatibility: a legacy 3-key promotion_weights (no
+        completion_debt) resolves exactly as before, with an effective
+        completion_debt weight of 0.0 (key absent) under the default observe
+        mode."""
+        weights = {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30}
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.90,
+                "promotion_weights": weights,
+                # No completion_debt_weight_mode set → default observe applies.
+                "completion_debt_weight_mode": "observe",
+            },
+            clear=False,
+        )
+        policy = rq._load_policy()
+        assert policy["weights"] == {
+            "audit": pytest.approx(0.40),
+            "test_erosion": pytest.approx(0.30),
+            "smoketest": pytest.approx(0.30),
+        }
+        assert policy["threshold"] == pytest.approx(0.90)
+
+
+# ===========================================================================
+# compute_enforce_confidence_preview — pure unit tests
+# ===========================================================================
+
+
+class TestComputeEnforceConfidencePreview:
+    """compute_enforce_confidence_preview returns what enforce would have done."""
+
+    def test_returns_enforce_confidence_and_effective_weight(self):
+        """Basic: existing_confidence=0.9, debt=1.0, no configured weight."""
+        result = rs.compute_enforce_confidence_preview(0.9, 1.0)
+        w = rs.DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+        expected = round((1 - w) * 0.9 + w * 1.0, 4)
+        assert result["enforce_confidence"] == pytest.approx(expected)
+        assert result["effective_weight"] == pytest.approx(w)
+
+    def test_configured_weight_used_when_positive(self):
+        """When configured_weight > 0, it overrides the default."""
+        result = rs.compute_enforce_confidence_preview(0.8, 0.5, configured_weight=0.2)
+        assert result["effective_weight"] == pytest.approx(0.2)
+        expected = round((1 - 0.2) * 0.8 + 0.2 * 0.5, 4)
+        assert result["enforce_confidence"] == pytest.approx(expected)
+
+    def test_zero_configured_weight_falls_back_to_default(self):
+        """configured_weight=0 falls back to DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT."""
+        result_zero = rs.compute_enforce_confidence_preview(0.9, 0.5, configured_weight=0.0)
+        result_none = rs.compute_enforce_confidence_preview(0.9, 0.5)
+        assert result_zero["effective_weight"] == result_none["effective_weight"]
+        assert result_zero["enforce_confidence"] == result_none["enforce_confidence"]
+
+    def test_configured_weight_clamped_to_max(self):
+        """Weights above MAX_COMPLETION_DEBT_WEIGHT are clamped."""
+        result = rs.compute_enforce_confidence_preview(0.9, 0.5, configured_weight=0.9)
+        assert result["effective_weight"] == pytest.approx(rs.MAX_COMPLETION_DEBT_WEIGHT)
+
+    def test_zero_debt_pressure_lowers_confidence(self):
+        """Zero debt pressure (max open debt) must lower enforce confidence vs observe."""
+        observe_confidence = 0.95
+        result = rs.compute_enforce_confidence_preview(observe_confidence, 0.0)
+        assert result["enforce_confidence"] < observe_confidence
+
+    def test_full_debt_pressure_raises_or_keeps_confidence(self):
+        """Full debt pressure (no open debt) must not lower enforce confidence."""
+        observe_confidence = 0.85
+        result = rs.compute_enforce_confidence_preview(observe_confidence, 1.0)
+        assert result["enforce_confidence"] >= observe_confidence
+
+    def test_result_clamped_to_unit_interval(self):
+        """Output is always in [0.0, 1.0]."""
+        result = rs.compute_enforce_confidence_preview(1.5, -0.5)
+        assert 0.0 <= result["enforce_confidence"] <= 1.0
 
 
 # ===========================================================================
@@ -6706,6 +7038,209 @@ async def test_run_qualification_promotion_in_flight_is_noop(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_ignores_stale_pending_when_verdict_finalized(
+    db_session, mocker
+):
+    """Stale-pending window: last_qualification.status='pending' with a
+    promotion_pending sub-key but the newest QualificationVerdict row already
+    has a finalized terminal_status (e.g. 'promoted'). In this window the
+    effective state is NOT promotion_in_flight — the verdict already resolved.
+    run_qualification must proceed (return 'spawned'), not block with a false
+    promotion_in_flight refusal."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Need a terminal audit child so _qualification_in_flight sees no live child.
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-stale-verdict",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-stale-verdict",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    # Stale-pending: last_qualification says promotion is in flight...
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "cafe" * 10,
+        "ci_green": True,
+        "started_at": "2026-06-01T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "smoketest_enabled": False,
+        "promotion_pending": {
+            "pr_number": 9999,
+            "pr_url": "https://github.com/o/r/pull/9999",
+            "auto_merge_enabled": True,
+        },
+    }
+    db_session.add(version)
+
+    # ...but the verdict row already says 'promoted' — finalized.
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="cafe" * 10,
+        terminal_status="promoted",
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Advance the automain SHA so the pre-lock hash-reuse check doesn't fire.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="a1b2c3d4" * 5),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Must NOT refuse with promotion_in_flight — the verdict already resolved.
+    assert result["status"] == "spawned", (
+        f"expected 'spawned' but got {result['status']!r}; "
+        "stale-pending+finalized-verdict should be transparent to action guards"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_stale_verdict_still_blocks_live_promotion(
+    db_session, mocker
+):
+    """Temporal-ordering fix regression: a finalized verdict for the SAME
+    candidate_sha that is OLDER than the live promotion_pending must NOT
+    suppress the promotion_pending guard.
+
+    Scenario: a 'dry_run' verdict was recorded for sha ABCD, then the operator
+    force-promoted that sha, opening a new promotion PR.  The verdict row is NOW
+    stale relative to the live attempt.  apply_verdict_substitution must NOT use
+    the pre-attempt verdict to classify the state as 'dry_run' — it must keep
+    promotion_pending visible so run_qualification blocks with promotion_in_flight.
+    """
+    from datetime import datetime
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-done",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-stale-temporal",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    # Verdict was written BEFORE the current promotion attempt (2026-01-01),
+    # promotion attempt started AFTER (enabled_at = 2026-06-01).
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abcd" * 10,
+        terminal_status="dry_run",
+        created_at=datetime(2026, 1, 1),  # OLDER than the pending attempt
+    )
+    db_session.add(verdict)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-01T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "smoketest_enabled": False,
+        "promotion_pending": {
+            "pr_number": 7070,
+            "pr_url": "https://github.com/o/r/pull/7070",
+            "auto_merge_enabled": True,
+            "enabled_at": "2026-06-01T00:00:00",  # AFTER the verdict
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="cafe" * 10),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # The stale verdict must NOT unblock the live promotion — should still block.
+    assert result["status"] == "promotion_in_flight", (
+        f"expected 'promotion_in_flight' but got {result['status']!r}; "
+        "a pre-attempt verdict must not suppress an active promotion_pending"
+    )
+    assert result["promotion_pr_number"] == 7070
+
+
+@pytest.mark.asyncio
+async def test_abandon_current_version_stale_verdict_still_blocks_live_promotion(
+    db_session,
+):
+    """Temporal-ordering fix regression (abandon surface): a finalized verdict for
+    the SAME candidate_sha that is OLDER than the live promotion_pending must NOT
+    suppress the promotion_pending guard on abandon_current_version.
+
+    Scenario: a 'not_promoted' verdict was written for sha BEEF, then a same-sha
+    re-run opened a new promotion PR.  abandon_current_version must still raise
+    VersionCutBlockedByPromotion — the stale verdict must not be used to clear
+    the live in-flight state.
+    """
+    from datetime import datetime
+
+    from app.release_version import VersionCutBlockedByPromotion
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Verdict written BEFORE the current promotion attempt.
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="beef" * 10,
+        terminal_status="not_promoted",
+        created_at=datetime(2026, 1, 1),  # OLDER than the pending attempt
+    )
+    db_session.add(verdict)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "beef" * 10,
+        "ci_green": False,
+        "promotion_pending": {
+            "pr_number": 8080,
+            "pr_url": "https://github.com/o/r/pull/8080",
+            "auto_merge_enabled": False,
+            "enabled_at": "2026-06-01T00:00:00",  # AFTER the verdict
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    with pytest.raises(VersionCutBlockedByPromotion) as exc_info:
+        await rv.abandon_current_version(
+            db_session,
+            project.id,
+            reason="operator cut",
+            operator_id="op@example.com",
+        )
+
+    assert exc_info.value.promotion_pr_number == 8080, (
+        "abandon_current_version must block with the live PR number, "
+        "not be cleared by the pre-attempt verdict"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_managed_check_wait_is_noop(db_session, mocker):
     """A version whose migration-carrying promotion PR is held in
     managed_check_wait (status='pending' + promotion_pending.managed_check_wait)
@@ -7853,6 +8388,397 @@ async def test_run_qualification_ci_unresolved_bypasses_cached_verdict(
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_criterion_coverage_still_cached_while_uncovered(
+    db_session, mocker
+):
+    """A same-SHA not_promoted/criterion_coverage_incomplete verdict stays cached
+    while an uncovered ACTIVE criterion remains — the safety-valve exception must
+    NOT relax caching until coverage actually clears."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "covwedge" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-covered1", text="Covered criterion", source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-missing1", text="Uncovered criterion",
+    )
+    attempts_before = version.qualification_attempts
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Coverage still incomplete (1 of 2 active covered) → the verdict is cached.
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "not_promoted"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.qualification_attempts == attempts_before
+    assert len(await _audit_tasks(db_session, project.id)) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_criterion_retraction_clears_coverage_bypasses_cache(
+    db_session, mocker
+):
+    """The acceptance-contract safety valve: author a criterion, land a same-SHA
+    not_promoted/criterion_coverage_incomplete verdict, retract the uncoverable
+    criterion, and a fresh re-qualification is PERMITTED on the SAME SHA (not
+    served as cached_verdict) once the live coverage gate would no longer fire."""
+    from app.acceptance_criteria import retract_criterion
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "critclr0" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # A single uncoverable active criterion — coverage gate fires (0 of 1 covered).
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-uncoverable", text="Cannot ever be covered",
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    # Before retraction: the uncovered active criterion keeps the verdict cached.
+    cached = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    assert cached["status"] == "cached_verdict"
+    assert len(await _audit_tasks(db_session, project.id)) == 0
+
+    # Retract the uncoverable criterion — no active criteria remain, so the
+    # coverage gate would no longer fire on the SAME candidate SHA.
+    await db_session.refresh(version)
+    row = await retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-uncoverable",
+        reason="uncoverable — retracted by the safety valve",
+        retracted_by="strategist",
+    )
+    assert row is not None and row.status == "retracted"
+
+    # After retraction: a fresh qualification is permitted on the SAME SHA.
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["candidate_sha"] == candidate_sha
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_criterion_supersession_clears_coverage_bypasses_cache(
+    db_session, mocker
+):
+    """Superseding the only uncovered criterion also frees same-SHA requalification."""
+    from app import acceptance_criteria as ac
+    from app.acceptance_criteria import retract_criterion
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "suprclr0" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    source = await _add_version_criterion(
+        db_session, project, version,
+        key="c-supersede-me", text="Replacement will supersede this",
+    )
+    successor = await _add_version_criterion(
+        db_session, project, version,
+        key="c-superseding", text="Replacement criterion",
+        source_kind="task_merge",
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    cached = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    assert cached["status"] == "cached_verdict"
+    assert len(await _audit_tasks(db_session, project.id)) == 0
+
+    await db_session.refresh(version)
+    row = await retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=source.criterion_key,
+        reason="replaced by sharper criterion",
+        retracted_by="strategist",
+        superseded_by_key=successor.criterion_key,
+    )
+    assert row is not None and row.status == "superseded"
+    coverage = await ac.get_version_coverage_summary(db_session, version.id)
+    assert coverage["total"] == 1
+    assert coverage["covered"] == 1
+    assert coverage["superseded"] == 1
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["candidate_sha"] == candidate_sha
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_if_criterion_coverage_now_complete_respawns_after_retraction(
+    db_session, mocker
+):
+    """The scheduled trigger: the sweep reconciler re-drives a stranded
+    not_promoted/criterion_coverage_incomplete version once a retraction clears
+    coverage on the unchanged automain SHA."""
+    from app.acceptance_criteria import retract_criterion
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "sweepcvr" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-sweep-uncoverable", text="Uncoverable criterion",
+    )
+    await retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-sweep-uncoverable",
+        reason="uncoverable",
+        retracted_by="strategist",
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    # The reconciler runs in its own dedicated session; feed it the shared test
+    # session factory so it operates against the same SQLite database.
+    reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_coverage_recovery_backfills_stranded_evidence_before_check(
+    db_session, mocker
+):
+    """Reconciler replays merge evidence for stranded tasks before deciding
+    whether coverage is complete.
+
+    A task may have merged BEFORE the criterion-direction mapping was created,
+    leaving it with a proven acceptance verdict but no CriterionEvidence row.
+    The reconciler must call backfill_direction_merge_evidence for active
+    directions that cover uncovered criteria, then re-evaluate coverage — not
+    hard-return False on the first snapshot.
+    """
+    from app.acceptance_criteria import get_version_coverage_summary
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.models import Direction
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "bkfill00" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create an uncovered acceptance criterion for this version.
+    criterion = await _add_version_criterion(
+        db_session, project, version,
+        key="c-backfill-stranded", text="Stranded criterion needing backfill",
+    )
+
+    # Create a Direction mapped to that criterion.
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-backfill01",
+        data={"id": "d-backfill01", "text": "Fix stranded criterion", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+
+    # Create a COMPLETED task with pr_merged=True (landed signal) and a proven
+    # acceptance verdict, carrying direction_id in context.  This simulates a
+    # task that merged BEFORE the criterion-direction mapping was created and
+    # thus never had record_task_merge_evidence called on its behalf.
+    task = Task(
+        project_id=project.id,
+        title="Fix stranded criterion task",
+        payloads=[{"type": "create", "prompt": "fix it"}],
+        context={
+            "direction_id": "d-backfill01",
+            "pr_merged": True,
+            "review_loop": {"pr_number": 42},
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test ran green under verified merge",
+                "proof_ref": "testing/test_backfill.py::test_stranded_criterion",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Pre-condition: coverage is incomplete before the reconciler runs.
+    pre_coverage = await get_version_coverage_summary(db_session, version.id)
+    assert pre_coverage["covered"] == 0
+    assert pre_coverage["total"] == 1
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # The reconciler must have backfilled the evidence and then spawned
+    # a fresh qualification — not returned False on the stale snapshot.
+    assert reconciled is True, (
+        "Expected reconciled=True after backfill cleared coverage; "
+        "reconciler may have returned False on the pre-backfill snapshot"
+    )
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+    # Post-condition: evidence was recorded.
+    from app.acceptance_criteria import get_evidence_for_criterion
+    evidence = await get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) > 0, "Expected evidence rows after backfill"
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_cached_promoted_same_sha_is_noop(db_session, mocker):
     """Idempotent qualification: when a conclusive promoted verdict exists
     for this candidate_sha and automain HEAD still equals it, run_qualification
@@ -8207,6 +9133,85 @@ async def test_criterion_coverage_incomplete_blocks_qualification(
     assert version.last_qualification["criterion_coverage"]["total"] == 2
     assert version.last_qualification["criterion_coverage"]["covered"] == 1
     assert version.last_qualification["criterion_coverage"]["uncovered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
+    client, db_session
+):
+    """The agent qualification read surfaces ``qualification_trigger_state`` and
+    explains BOTH an armed trigger (stabilize phase, no prior attempt, complete
+    criterion coverage) and a blocked trigger (coverage incomplete) with the
+    correct machine-readable reason and coverage counts.
+
+    Exercises the production read-surface wiring in
+    ``routers/agent_strategic_fetch.py`` (which threads the shared
+    ``compute_qualification_trigger_state`` classifier onto every branch of
+    ``agent_fetch_qualification``), end-to-end over the real HTTP route.
+    """
+    from httpx import AsyncClient  # noqa: PLC0415
+    from app.auth import create_agent_token  # noqa: PLC0415
+
+    assert isinstance(client, AsyncClient)
+
+    # Stabilize-phase open version with no prior qualification attempt.
+    project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    assert version.last_qualification is None
+    assert (version.qualification_attempts or 0) == 0
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-trigger"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    headers = {"x-agent-token": token}
+    url = f"/api/agent/projects/{project.id}/qualification"
+
+    # ARMED: one active criterion, fully covered by proven merge-test evidence,
+    # no prior attempt → the initial trigger would fire now.
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-covered-armed",
+        text="Covered criterion",
+        source_kind="task_merge",
+    )
+
+    res = await client.get(url, headers=headers)
+    assert res.status_code == 200, res.text
+    armed = res.json()["qualification_trigger_state"]
+    assert armed is not None
+    assert armed["trigger_state"] == "armed"
+    assert armed["reason"] == "armed"
+    assert armed["open_version_id"] == str(version.id)
+    assert armed["coverage_total"] == 1
+    assert armed["coverage_covered"] == 1
+
+    # BLOCKED: add a second active criterion with no covering evidence →
+    # coverage becomes incomplete (1/2) so the trigger is blocked, and the
+    # surface explains exactly why with the live coverage counts.
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-uncovered-blocked",
+        text="Uncovered criterion",
+    )
+
+    res = await client.get(url, headers=headers)
+    assert res.status_code == 200, res.text
+    blocked = res.json()["qualification_trigger_state"]
+    assert blocked is not None
+    assert blocked["trigger_state"] == "blocked"
+    assert blocked["reason"] == "coverage_incomplete"
+    assert blocked["open_version_id"] == str(version.id)
+    assert blocked["coverage_total"] == 2
+    assert blocked["coverage_covered"] == 1
 
 
 @pytest.mark.asyncio
@@ -8730,7 +9735,10 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
         "covered": 0,
         "partial": 0,
         "uncovered": 0,
+        "retracted": 0,
         "stuck_count": 0,
+        "inactive": 0,
+        "superseded": 0,
         "criteria": [],
     }
     promote_spy.assert_not_called()
@@ -12741,6 +13749,63 @@ async def test_force_promote_refuses_when_promotion_in_flight(db_session, mocker
     await db_session.refresh(version)
     # The in-flight promotion record is untouched.
     assert version.last_qualification["promotion_pending"]["pr_number"] == 42
+
+
+@pytest.mark.asyncio
+async def test_force_promote_proceeds_when_verdict_finalized(db_session, mocker):
+    """Stale-pending window: last_qualification has promotion_pending but the
+    newest QualificationVerdict row already carries terminal_status='promoted'.
+    force_promote must not refuse with promotion_in_flight — the verdict resolved."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "pr_number": 77,
+            "pr_url": "http://pr/77",
+            "enabled_at": "2026-07-02T00:00:00",
+        },
+    }
+    db_session.add(version)
+
+    # Finalized verdict already exists — promotion resolved.
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abcd" * 10,
+        terminal_status="promoted",
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain="facec0de" * 5),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    mocker.patch("app.github.create_pull_request", new=AsyncMock())
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="op",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    # Must NOT refuse with promotion_in_flight — verdict already resolved.
+    assert result["status"] != "promotion_in_flight", (
+        "stale-pending+finalized-verdict should not block force_promote"
+    )
 
 
 @pytest.mark.asyncio
@@ -16787,6 +17852,13 @@ async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
         "app.github.get_branch_sha",
         side_effect=RuntimeError("transient GitHub 503"),
     )
+    # Prevent _redrive_error_qualification from picking up the sha_error status
+    # written by the deferred_unsynced re-drive and committing it — that loop
+    # runs after the deferred_unsynced rollback in the same sweep cycle.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_error_qualification",
+        new=AsyncMock(return_value=False),
+    )
 
     count = await rq.sweep_stuck_qualifications(
         db_session, session_factory=_shared_session_factory(db_session)
@@ -16802,6 +17874,425 @@ async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
     assert version.last_qualification["first_deferred_at"] == first_deferred
     # No audit task should have been spawned.
     assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_redrives_transient_sha_error_version(db_session, mocker):
+    """A stabilize version stranded at status=error/sha_error is re-driven by
+    the sweep once GitHub recovers.
+
+    Acceptance proof: after the sweep, version transitions from error to pending
+    — the transient outage is recovered automatically.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "aabbcc" * 6 + "aabb"
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "detail": "ReadTimeout: ",
+        "started_at": "2026-07-05T11:00:00",
+    }
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+
+    audit_task = Task(
+        project_id=project.id,
+        title="release-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-err",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    # The autouse fixture _qualifier_ci_resolves_green handles token + CI
+    # resolution mocks. Only need to override get_branch_sha and spawn.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-abc",
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count >= 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_sweep_error_redrive_respects_attempt_cap(db_session, mocker):
+    """A stabilize version at status=error is NOT re-driven once
+    last_qualification["error_redrive_count"] reaches _MAX_ERROR_REDRIVE_ATTEMPTS,
+    preventing infinite retries on a permanently broken path."""
+    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "detail": "HTTPException: connection refused",
+        "started_at": "2026-07-05T10:00:00",
+        "error_redrive_count": _MAX_ERROR_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # No spawn should have happened — attempt cap blocks re-drive.
+    spawn_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_sweep_error_redrive_accumulates_attempts_until_capped(
+    db_session, mocker
+):
+    """A persistently-failing transient path is re-driven only a BOUNDED number
+    of times: last_qualification["error_redrive_count"] must ACCUMULATE across
+    sweeps and converge on _MAX_ERROR_REDRIVE_ATTEMPTS, at which point re-drive stops.
+
+    Here get_branch_sha ALWAYS raises, so every re-drive returns sha_error; the
+    per-episode counter must stop climbing at the cap and the GitHub call count
+    must be bounded, not unbounded.
+    """
+    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "detail": "ReadTimeout: ",
+        "started_at": "2026-07-05T11:00:00",
+    }
+    # Start from a clean slate — the cap must be reached purely by accumulation.
+    version.qualification_attempts = 0
+    db_session.add(version)
+    await db_session.commit()
+
+    sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        side_effect=RuntimeError("transient GitHub 503 — permanently down"),
+    )
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    # Run the sweep more times than the cap allows — extra sweeps must be no-ops.
+    for _ in range(_MAX_ERROR_REDRIVE_ATTEMPTS + 3):
+        await rq.sweep_stuck_qualifications(
+            db_session, session_factory=_shared_session_factory(db_session)
+        )
+        await db_session.commit()
+
+    await db_session.refresh(version)
+    # The per-episode counter persisted across sweeps and converged on the cap
+    # exactly — never exceeding it, never stalling below it.
+    assert version.last_qualification.get("error_redrive_count") == _MAX_ERROR_REDRIVE_ATTEMPTS
+    # GitHub was hit at most once per re-drive and re-drive stopped at the cap:
+    # the API call count is bounded, not unbounded.
+    assert sha_mock.call_count == _MAX_ERROR_REDRIVE_ATTEMPTS
+    # Never spawned (every attempt failed) and stays in the transient-error state.
+    spawn_mock.assert_not_called()
+    assert version.last_qualification["status"] == "error"
+    assert version.last_qualification["error"] == "sha_error"
+
+
+@pytest.mark.asyncio
+async def test_sweep_error_redrive_allows_versions_with_many_lifetime_attempts(
+    db_session, mocker
+):
+    """A version with many lifetime qualification_attempts is still re-driven on
+    its first error episode — the cap must be per-episode (error_redrive_count in
+    last_qualification), NOT the lifetime qualification_attempts column.
+
+    Regression test for the v22 bug: the deployed re-driver used
+    qualification_attempts >= _MAX_ERROR_REDRIVE_ATTEMPTS as its guard, so any
+    version that had accumulated 5+ prior spawn attempts of ANY kind was silently
+    blocked from ALL transient-error re-drives and stranded at status=error
+    indefinitely, regardless of how many times it had actually been re-driven for
+    the current error episode.
+    """
+    sha = "aabbcc" * 6 + "aabb"
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "detail": "ReadTimeout: ",
+        "started_at": "2026-07-05T11:00:00",
+        # No error_redrive_count — this is the first error episode.
+    }
+    # Many lifetime attempts from previous qualification episodes (the bug trigger).
+    version.qualification_attempts = 10
+    db_session.add(version)
+    await db_session.commit()
+
+    audit_task = Task(
+        project_id=project.id,
+        title="release-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-long-lived",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-longv",
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # The version MUST have been re-driven despite high lifetime attempts.
+    assert count >= 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_redrive_non_transient_error(db_session, mocker):
+    """A status=error version with an error code NOT in _TRANSIENT_ERROR_CODES
+    is not re-driven by the sweep — only transient errors are retried."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",  # not in _TRANSIENT_ERROR_CODES
+        "started_at": "2026-07-05T10:00:00",
+    }
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Non-transient error: no spawn.
+    spawn_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_sweep_redrives_infra_failure_version(db_session, mocker):
+    """A stabilize version stranded at status=infra_failure is re-driven by
+    the sweep — the only non-conclusive qualification outcome with no scheduled
+    re-entry (live v22 stranded exactly this way on 2026-07-06).
+
+    Acceptance proof: after the sweep, version transitions from infra_failure
+    to pending — the transient infrastructure problem is recovered automatically.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "aabbcc" * 6 + "aabb"
+    version.last_qualification = {
+        "status": "infra_failure",
+        "blocker": "qualification_timeout",
+        "detail": "qualification pending 361 min (> 360 min limit)",
+        "started_at": "2026-07-06T00:00:00",
+        "finalized_at": "2026-07-06T06:01:00",
+    }
+    version.qualification_attempts = 2
+    db_session.add(version)
+    await db_session.commit()
+
+    audit_task = Task(
+        project_id=project.id,
+        title="release-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-infra",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-infra",
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count >= 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_redrive_infra_failure_respects_attempt_cap(db_session, mocker):
+    """A stabilize version at status=infra_failure is NOT re-driven once the
+    PERSISTED last_qualification["consecutive_infra_errors"] streak reaches
+    _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS, preventing infinite retries.
+
+    Regression for audit acaa610d: the cap must key on the streak the finalize
+    path maintains, NOT the dead ``infra_failure_redrive_count`` field (deliberately
+    absent here — the old code read it, defaulting to 0, and would re-drive)."""
+    from app.release_qualifier_sweep import _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "capca0de" * 5,
+        "error": "migration_identity_check_unavailable",
+        "consecutive_infra_errors": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # No spawn should have happened — attempt cap blocks re-drive.
+    spawn_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_redrive_infra_failure_noop_when_not_stabilize_phase(db_session, mocker):
+    """A version in a phase other than stabilize with status=infra_failure is
+    NOT re-driven — the re-driver is scoped to stabilize-phase versions only."""
+    project, version = await _make_project_and_version(db_session, phase="build")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "blocker": "qualification_timeout",
+        "detail": "qualification pending 361 min (> 360 min limit)",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    spawn_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_redrive_infra_failure_cap_keyed_on_persisted_streak(
+    db_session, mocker
+):
+    """The infra-failure circuit-breaker keys on the PERSISTED
+    ``consecutive_infra_errors`` streak (which ``_handle_infra_failure`` maintains
+    on the finalized verdict), NOT on a re-driver-local counter and NOT on the
+    synchronous ``run_qualification`` return value.
+
+    Regression for audit acaa610d: the old code only incremented
+    ``infra_failure_redrive_count`` when ``run_qualification`` synchronously
+    returned status=='infra_failure' — which it NEVER does (that verdict is only
+    written asynchronously at finalize).  So the counter stayed 0, the cap never
+    tripped, and re-drives were unbounded.  Here ``run_qualification`` returns the
+    realistic ``spawned`` and we assert the cap is driven purely by the persisted
+    streak: a stale/dead ``infra_failure_redrive_count`` is ignored.
+    """
+    from app.release_qualifier_sweep import (
+        _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+        _redrive_infra_failure_qualification,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Real streak BELOW the cap, but a stale/dead infra_failure_redrive_count ABOVE
+    # the cap.  The old code (keyed on infra_failure_redrive_count) would have
+    # blocked; the fixed code ignores that field and re-drives because the persisted
+    # consecutive_infra_errors streak is below the cap.
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "5treakab" * 5,
+        "error": "migration_identity_check_unavailable",
+        "consecutive_infra_errors": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS - 1,
+        "infra_failure_redrive_count": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS + 5,
+    }
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # run_qualification returns the realistic "spawned" — it NEVER synchronously
+    # returns infra_failure.
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Below the persisted-streak cap → the re-driver fires (proves the dead
+    # infra_failure_redrive_count field no longer gates the breaker).
+    assert result is True
+    run_qual.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -17907,6 +19398,165 @@ async def test_keyless_blocker_consumed_marker_does_not_block_new_head(
 
 
 @pytest.mark.asyncio
+async def test_auto_stale_file_anchored_finding_not_staled_when_file_unchanged(
+    db_session, mocker
+):
+    """File-anchored audit finding is NOT auto-staled when its file did not
+    change between the not_promoted candidate SHA and the new automain HEAD.
+
+    This is the acceptance test for the fix that prevents _auto_stale_not_promoted_findings
+    from blindly staleing every unresolved finding on any automain advance —
+    previously the sweep marked ALL findings stale even when the flagged file was
+    completely untouched by the new commits, triggering a needless re-audit cycle.
+
+    The test stores a real QualificationVerdict row (the 'merge-test verdict'
+    required by the acceptance gate) and exercises the production code path
+    through _auto_stale_not_promoted_findings without mocking that function.
+    """
+    from app.models import AuditFindingResolution, QualificationVerdict
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha9" * 5 + "00000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Seed a real QualificationVerdict row (the merge-test verdict).
+    verdict_row = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        confidence=0.41,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        blocker="below_threshold",
+        audit_findings=[
+            {
+                "key": "FILE_ANCHORED_FINDING",
+                "severity": "high",
+                "summary": "Leaked credential in config",
+                "file": "backend/app/config.py",
+            },
+        ],
+    )
+    db_session.add(verdict_row)
+    await db_session.commit()
+
+    # automain HEAD has advanced past the candidate SHA.
+    new_sha = "newhead9" * 5
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+    # The changed files between old_sha and new_sha do NOT include the finding's file.
+    mocker.patch(
+        "app.github.get_files_changed_between_refs",
+        new=AsyncMock(return_value=["backend/app/other_module.py", "README.md"]),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # No stale row written: finding's file did not change, so it may still be live.
+    ledger_rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert ledger_rows == [], (
+        f"expected no stale rows when finding file unchanged; got {ledger_rows}"
+    )
+
+    # No re-drive: the finding was not cleared, so requalification is not ready.
+    assert count == 0
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+
+
+@pytest.mark.asyncio
+async def test_auto_stale_file_anchored_finding_staled_when_file_changed(
+    db_session, mocker
+):
+    """File-anchored audit finding IS auto-staled when its file changed between
+    the not_promoted candidate SHA and the new automain HEAD.
+
+    Companion test to test_auto_stale_file_anchored_finding_not_staled_when_file_unchanged:
+    when the finding's file IS in the changed-file set, the sweep must stale it
+    and re-drive the qualification as before.
+    """
+    from app.models import AuditFindingResolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha8" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "FILE_CHANGED_FINDING",
+                "severity": "high",
+                "summary": "SQL injection in query builder",
+                "file": "backend/app/query.py",
+            },
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    new_sha = "newhead8" * 5
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+    # The changed files include the finding's file.
+    mocker.patch(
+        "app.github.get_files_changed_between_refs",
+        new=AsyncMock(
+            return_value=["backend/app/query.py", "backend/app/other_module.py"]
+        ),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Stale row written for the finding whose file changed.
+    ledger_rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0].finding_key == "FILE_CHANGED_FINDING"
+    assert ledger_rows[0].state == "stale"
+
+    # Re-drive fired: fresh qualification spawned.
+    assert count == 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_zero_gating_ready_version(db_session, mocker):
     """A stabilize-phase version with not_promoted verdict, a non-audit blocker,
     ZERO carried high/medium audit findings, and automain advanced to a new SHA
@@ -18409,6 +20059,12 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
     )
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -18465,6 +20121,10 @@ async def test_timed_out_already_promoted_uses_qualification_superseded(db_sessi
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
     )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -18518,6 +20178,10 @@ async def test_timed_out_not_promoted_uses_qualification_timeout(db_session, moc
     mocker.patch(
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
     )
     from datetime import timedelta
 
@@ -18575,6 +20239,10 @@ async def test_timed_out_supersession_check_exception_falls_back_to_qualificatio
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
     )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -18626,6 +20294,10 @@ async def test_timed_out_cred_missing_falls_back_to_qualification_timeout(
     mocker.patch(
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
     )
     from datetime import timedelta
 
@@ -18969,11 +20641,15 @@ async def test_sweep_does_not_time_out_a_fresh_qualification(db_session):
 
 
 @pytest.mark.asyncio
-async def test_sweep_timeout_takes_priority_over_terminal_children(db_session):
+async def test_sweep_timeout_takes_priority_over_terminal_children(db_session, mocker):
     """Audit H2: when a qualification is BOTH past the timeout AND has all
     children terminal, the timeout path wins — it is checked first and is
     child-state-independent (a stuck qualification this old should surface as
     a timeout, not silently finalize)."""
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -19157,6 +20833,12 @@ async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, 
         rq,
         "_finalize_qualification",
         new=AsyncMock(side_effect=RuntimeError("persistent finalize crash")),
+    )
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
     )
 
     count = await rq.sweep_stuck_qualifications(
@@ -19882,6 +21564,36 @@ async def test_qualification_attempts_increments_atomically_on_sha_error(
     assert version.qualification_attempts == 1
 
 
+@pytest.mark.asyncio
+async def test_sha_error_detail_includes_exception_class(db_session, mocker):
+    """sha_error detail uses f"{type(exc).__name__}: {exc}" so that exceptions
+    with an empty str() (e.g. timeout-class errors) still record a useful label."""
+
+    class TimeoutError(Exception):
+        def __str__(self):
+            return ""  # empty str — the old format recorded an empty detail
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=TimeoutError()),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "sha_error"
+    await db_session.refresh(version)
+    detail = version.last_qualification["detail"]
+    # Must include the class name even when str(exc) is empty.
+    assert "TimeoutError" in detail
+
+
 # ===========================================================================
 # Round 5 — R4 MEDIUM: status!="open" guard before promoting
 # ===========================================================================
@@ -19984,6 +21696,12 @@ async def test_sweep_timeout_fires_when_started_at_unparseable(db_session, mocke
     mocker.patch(
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
+    )
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
     )
     from datetime import timedelta
 
@@ -26735,6 +28453,9 @@ async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
         "test_erosion_detail": {"deleted_test_files": ["t.py"]},
         "smoketest_detail": {"passed": False},
         "audit_reconciliation": {"reconciled": False},
+        "completion_debt": {"total_open": 5, "items": []},
+        "debt_enforce_confidence_preview": 0.31,
+        "debt_enforce_weight_preview": 0.15,
     }
     version.last_qualification = dict(base_record)
     db_session.add(version)
@@ -26764,6 +28485,9 @@ async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
     assert row.test_erosion_detail == {"deleted_test_files": ["t.py"]}
     assert row.smoketest_detail == {"passed": False}
     assert row.audit_reconciliation == {"reconciled": False}
+    assert row.sub_scores["completion_debt"] == {"total_open": 5, "items": []}
+    assert row.sub_scores["debt_enforce_confidence_preview"] == 0.31
+    assert row.sub_scores["debt_enforce_weight_preview"] == 0.15
     # Promotion-attempt columns stay NULL on a non-promotion attempt.
     assert row.promotion_pr_url is None
     assert row.promotion_conflict is None
@@ -26803,6 +28527,13 @@ async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
     # The new attempt carries its own (different) evidence.
     assert second.migration_safety == "pass"
     assert second.migration_safety_detail == "clean"
+
+    from app import release_readiness as rr
+
+    api_view = rr.format_verdict_for_api(first)
+    assert api_view["completion_debt"] == {"total_open": 5, "items": []}
+    assert api_view["debt_enforce_confidence_preview"] == 0.31
+    assert api_view["debt_enforce_weight_preview"] == 0.15
 
 
 @pytest.mark.asyncio
@@ -28273,11 +30004,16 @@ async def test_apply_finding_resolution_rejects_bad_state(db_session):
 
 
 @pytest.mark.asyncio
-async def test_requalification_truncated_findings_never_ready(db_session):
-    """When the carried list was clipped at the cap, readiness stays conservative.
+async def test_requalification_truncated_all_resolved_is_ready(db_session):
+    """A truncated list with every VISIBLE gating finding resolved is ready.
 
-    Even with every VISIBLE gating finding resolved, a truncated list cannot
-    assert ready — there may be unseen gating findings.
+    The carried list was clipped at the cap, but blocking forever on a
+    truncated-but-fully-resolved list permanently wedges the auto-redrive —
+    a fresh qualification run re-scores the full finding set anyway.  The
+    reason carries the re-score caveat, and ``audit_findings_truncated``
+    stays surfaced.  Truncated with UNRESOLVED visible gating findings
+    remains not-ready (unit-covered by test_truncated_partial_resolved_not_ready
+    in test_release_readiness.py).
     """
     from app import release_readiness as rr
 
@@ -28296,8 +30032,9 @@ async def test_requalification_truncated_findings_never_ready(db_session):
 
     out = await rr.compute_requalification_readiness(db_session, project.id)
     assert out["audit_findings_truncated"] is True
-    assert out["requalification_ready"] is False
+    assert out["requalification_ready"] is True
     assert "truncated" in out["reason"].lower()
+    assert "re-score" in out["reason"].lower()
 
 
 @pytest.mark.asyncio
@@ -29330,6 +31067,11 @@ async def test_redrive_promotion_failed_spawns_qualification(db_session, mocker)
         "app.release_readiness.compute_requalification_readiness",
         new=AsyncMock(return_value={"requalification_ready": True}),
     )
+    # Full-suite CI green gate reports green → the re-driver may proceed.
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(return_value={"gate_state": "green", "head_sha": "dead" * 10}),
+    )
     mocker.patch(
         "app.release_qualifier.run_qualification",
         new=AsyncMock(return_value={"status": "spawned"}),
@@ -29340,6 +31082,246 @@ async def test_redrive_promotion_failed_spawns_qualification(db_session, mocker)
     )
 
     assert result is True
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_defers_when_ci_gate_not_green(
+    db_session, mocker
+):
+    """When the full-suite CI green gate is in a transient non-green state (e.g.
+    pending), the re-driver must return False WITHOUT calling run_qualification —
+    no audit is burned and no circuit-breaker attempt is consumed."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": "face" * 10,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(return_value={"requalification_ready": True}),
+    )
+    gate = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "pending",
+                "head_sha": "face" * 10,
+                "reason": "ci.yml run for integration HEAD is in progress",
+            }
+        ),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+    # The read-only gate check runs with dispatch=False (no run is triggered here).
+    gate.assert_awaited_once()
+    assert gate.await_args.kwargs.get("dispatch") is False
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_red_ci_alerts_and_harvests(
+    db_session, mocker
+):
+    """When the preflight gate concludes red, the re-driver must raise a
+    dedup-keyed Alert and call _harvest_promotion_ci_failures WITHOUT calling
+    run_qualification (no requalify attempt consumed) and return False."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+    from sqlalchemy import select as _select
+
+    HEAD_SHA = "deadbeef" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": HEAD_SHA,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(return_value={"requalification_ready": True}),
+    )
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": HEAD_SHA,
+                "run_id": 99,
+                "html_url": "https://github.com/runs/99",
+                "reason": "ci.yml concluded failure",
+            }
+        ),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+    harvest_mock = mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+
+    # An Alert with a dedupe key must have been created.
+    alert = (
+        await db_session.execute(
+            _select(Alert).where(Alert.project_id == project.id)
+        )
+    ).scalars().first()
+    assert alert is not None
+    assert HEAD_SHA[:8] in alert.title
+    assert alert.dedupe_key is not None
+    assert "preflight_ci:red:" in alert.dedupe_key
+
+    # Harvest was called once with the version_id (promotion-tagged) and HEAD SHA.
+    harvest_mock.assert_awaited_once()
+    kw = harvest_mock.await_args.kwargs
+    assert kw["ci_source_sha"] == HEAD_SHA
+    assert kw["version_id"] == version.id
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_red_ci_deduplicates_on_same_sha(
+    db_session, mocker
+):
+    """A second sweep at the same red HEAD must NOT create a second Alert or call
+    harvest again — the dedup guard prevents double-spawn."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+    from sqlalchemy import select as _select
+
+    HEAD_SHA = "cafebabe" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": HEAD_SHA,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(return_value={"requalification_ready": True}),
+    )
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": HEAD_SHA,
+                "run_id": 7,
+                "reason": "ci.yml concluded failure",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+    harvest_mock = mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value=None),
+    )
+
+    factory = _shared_session_factory(db_session)
+    # First sweep — creates the Alert and calls harvest.
+    await _redrive_promotion_failed_qualification(version.id, session_factory=factory)
+    # Second sweep at the same SHA — must be a no-op.
+    await _redrive_promotion_failed_qualification(version.id, session_factory=factory)
+
+    alerts = (
+        await db_session.execute(
+            _select(Alert).where(Alert.project_id == project.id)
+        )
+    ).scalars().all()
+    assert len(alerts) == 1, "dedup guard must prevent a second Alert for the same SHA"
+    assert harvest_mock.await_count == 1, "harvest must be called only once per SHA"
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_no_signal_dispatches_and_defers(
+    db_session, mocker
+):
+    """When there is no ci.yml run for the integration HEAD (no_signal), the
+    re-driver must dispatch a fresh full-matrix run, persist the preflight marker,
+    and defer WITHOUT calling run_qualification."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    head = "0ff1ce" * 6 + "0000"
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": head,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(return_value={"requalification_ready": True}),
+    )
+
+    async def _gate(session, project_id, *, dispatch=True):
+        # dispatch=False (the redrive's read) reports no_signal; dispatch=True
+        # (the _maybe_dispatch_ci_preflight follow-up) reports it kicked one off.
+        if dispatch:
+            return {"gate_state": "dispatched", "head_sha": head, "run_id": 4242}
+        return {"gate_state": "no_signal", "head_sha": head}
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(side_effect=_gate),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+    # The preflight marker must have been persisted (committed) for the HEAD sha.
+    await db_session.refresh(version)
+    marker = version.last_qualification.get("promotion_ci_preflight")
+    assert marker is not None
+    assert marker["sha"] == head
+    assert marker["run_id"] == 4242
 
 
 @pytest.mark.asyncio
@@ -29422,6 +31404,195 @@ async def test_redrive_promotion_failed_defers_when_remediation_in_flight(db_ses
 
     assert result is False
     run_qual.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sweep_promotes_dry_run_pass_after_promotion_enabled(db_session, mocker):
+    """sweep_stuck_qualifications promotes a dry-run-pass candidate once promotion
+    is enabled and the candidate SHA is still the current integration-branch HEAD.
+
+    Scenario: _finalize_qualification recorded status='dry_run' with
+    would_promote=True while promotion was disabled.  The operator later enables
+    promotion.  The sweep must detect the open dry-run-pass version and invoke
+    the force-promote path, incrementing the finalized count.
+    """
+    from app import shared_state
+
+    candidate_sha = "d7e5ca11" * 5  # 40-char placeholder SHA
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "candidate_diff_hash": "hashvalue",
+        "confidence": 0.92,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    force_promote_spy = mocker.patch(
+        "app.release_qualifier._force_promote_in_dedicated_session",
+        new=AsyncMock(return_value={"status": "promotion_pending"}),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count >= 1
+    force_promote_spy.assert_awaited_once()
+    call_kwargs = force_promote_spy.call_args
+    assert call_kwargs.args[1] == candidate_sha
+
+
+@pytest.mark.asyncio
+async def test_sweep_current_dry_run_uses_cheap_promote_not_requalify(
+    db_session, mocker
+):
+    """For a dry-run-pass candidate that is STILL the integration-branch HEAD, the
+    sweep must promote it via the cheap deterministic direct-promote path and MUST
+    NOT also trigger the expensive non-deterministic full re-qualification.
+
+    Regression for audit 8989794e: the two dry_run triggers overlapped for the
+    identical state, with the expensive ``_redrive_dry_run_candidate`` running
+    before (and shadowing) the purpose-built cheap ``_promote_dry_run_pass_if_enabled``.
+    They must be mutually exclusive with the cheap path taking precedence for a
+    current candidate — so ``run_qualification`` (the expensive re-audit) is never
+    invoked for a candidate the direct-promote already handled.
+    """
+    from app import shared_state
+
+    candidate_sha = "cur12345" * 5  # 40-char placeholder SHA (still == HEAD)
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "candidate_diff_hash": "hashvalue",
+        "confidence": 0.94,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    force_promote_spy = mocker.patch(
+        "app.release_qualifier._force_promote_in_dedicated_session",
+        new=AsyncMock(return_value={"status": "promotion_pending"}),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Cheap direct-promote fired exactly once for the current candidate...
+    force_promote_spy.assert_awaited_once()
+    assert force_promote_spy.call_args.args[1] == candidate_sha
+    # ...and the expensive re-qualification was NOT run (mutual exclusion).
+    run_qual.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_promote_dry_run_pass_noop_when_promotion_still_disabled(
+    db_session, mocker
+):
+    """_promote_dry_run_pass_if_enabled must return False when promotion is
+    still disabled — the dry-run verdict stays untouched."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _promote_dry_run_pass_if_enabled
+
+    candidate_sha = "fa115afe" * 5
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "confidence": 0.91,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    force_promote_spy = mocker.patch(
+        "app.release_qualifier._force_promote_in_dedicated_session",
+        new=AsyncMock(return_value={"status": "promotion_pending"}),
+    )
+
+    result = await _promote_dry_run_pass_if_enabled(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    force_promote_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_promote_dry_run_pass_noop_when_candidate_stale(db_session, mocker):
+    """_promote_dry_run_pass_if_enabled must return False when automain has
+    advanced past the dry-run candidate SHA — a stale candidate must not promote."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _promote_dry_run_pass_if_enabled
+
+    candidate_sha = "0ldcand1" * 5
+    new_head_sha = "newhead1" * 5
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "confidence": 0.95,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=new_head_sha),
+    )
+    force_promote_spy = mocker.patch(
+        "app.release_qualifier._force_promote_in_dedicated_session",
+        new=AsyncMock(return_value={"status": "promotion_pending"}),
+    )
+
+    result = await _promote_dry_run_pass_if_enabled(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    force_promote_spy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -29739,3 +31910,1111 @@ class TestComputeGoalCoverageDrift:
             merges_since_grade=0,
         )
         assert result["signal"] == "drifting"
+
+
+# ===========================================================================
+# _collect_terminal_infra_child_events — batch-fetch fix (perf)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_collect_terminal_infra_child_events_batch_fetches_tasks(db_session):
+    """_collect_terminal_infra_child_events must fetch all terminal task IDs in
+    one batch SELECT instead of one session.get per leg, and must correctly
+    filter by seen_failed_ids and task status."""
+    from app.release_qualifier_audit import _collect_terminal_infra_child_events
+
+    project = Project(
+        name="Audit-batch-test",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a FAILED audit task and a CANCELLED smoketest task.
+    audit_task = Task(
+        project_id=project.id,
+        title="Audit task",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    smoke_task = Task(
+        project_id=project.id,
+        title="Smoketest task",
+        payloads=[{"type": "smoketest"}],
+        status=TaskStatus.CANCELLED,
+        created_by="ORCHESTRATOR",
+    )
+    # A task in a non-terminal status that must NOT appear in output.
+    running_task = Task(
+        project_id=project.id,
+        title="Running audit",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add_all([audit_task, smoke_task, running_task])
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    await db_session.refresh(smoke_task)
+    await db_session.refresh(running_task)
+
+    qual = {
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id),
+        "infra_failure_child_events": [],
+    }
+
+    result = await _collect_terminal_infra_child_events(
+        db_session, qual, infra_error="audit_failed"
+    )
+
+    # Both terminal tasks must appear; the in-progress task must be absent.
+    legs = {e["leg"] for e in result}
+    assert "audit" in legs
+    assert "smoketest" in legs
+    assert len(result) == 2
+
+    # Running task must not be included (non-terminal status).
+    task_ids_in_result = {str(e.get("failed_task_id")) for e in result}
+    assert str(running_task.id) not in task_ids_in_result
+
+
+@pytest.mark.asyncio
+async def test_collect_terminal_infra_child_events_skips_seen_failed(db_session):
+    """Tasks already in seen_failed_ids must not appear in the output."""
+    from app.release_qualifier_audit import _collect_terminal_infra_child_events
+
+    project = Project(
+        name="Audit-seen-test",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Already-recorded audit",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    qual = {
+        "audit_task_id": str(task.id),
+        # Pretend this task was already recorded.
+        "infra_failure_child_events": [{"leg": "audit", "failed_task_id": str(task.id)}],
+    }
+
+    result = await _collect_terminal_infra_child_events(
+        db_session, qual, infra_error="audit_failed"
+    )
+
+    # The existing entry must be preserved; no duplicate must appear.
+    assert len(result) == 1
+    assert result[0]["failed_task_id"] == str(task.id)
+
+
+# ===========================================================================
+# Completion-debt block in qualification verdicts
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_qualification_verdict_includes_completion_debt_block(
+    db_session, mocker
+):
+    """Completion-debt snapshot flows through finalize → last_qualification and verdict row.
+
+    When completion_debt.get_open_completion_debt returns a non-empty snapshot,
+    the finalized last_qualification carries a `completion_debt` key with the
+    correct shape, and the persisted QualificationVerdict row's sub_scores embed
+    the same snapshot.  The debt block is purely informational and must not
+    change the blocker or confidence.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.9,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    _debt_snapshot = {
+        "open_count": 3,
+        "per_kind": {"evergreen_fill": 2, "observe_mode": 1},
+        "oldest_age_days": 14,
+    }
+
+    # Mock the completion_debt module so finalize picks up the snapshot even
+    # though the real module is not yet landed.
+    _mock_cd = MagicMock()
+    _mock_cd.get_open_completion_debt = AsyncMock(return_value=_debt_snapshot)
+    mocker.patch.dict("sys.modules", {"app.completion_debt": _mock_cd})
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Status must still be dry_run — debt block is informational, not a blocker.
+    assert result["status"] == "dry_run", f"unexpected status: {result['status']}"
+    assert result.get("blocker") is None, f"unexpected blocker: {result.get('blocker')}"
+
+    # last_qualification carries the snapshot.
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual.get("completion_debt") == _debt_snapshot, (
+        f"completion_debt missing or wrong in last_qualification: {qual.get('completion_debt')}"
+    )
+
+    # QualificationVerdict row's sub_scores embed the same snapshot.
+    stmt = select(QualificationVerdict).where(
+        QualificationVerdict.release_version_id == version.id
+    )
+    rows = (await db_session.execute(stmt)).scalars().all()
+    assert rows, "no QualificationVerdict row recorded"
+    verdict_row = rows[-1]
+    assert isinstance(verdict_row.sub_scores, dict), "sub_scores is not a dict"
+    assert verdict_row.sub_scores.get("completion_debt") == _debt_snapshot, (
+        f"completion_debt missing or wrong in verdict sub_scores: "
+        f"{verdict_row.sub_scores.get('completion_debt')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_debt_pressure_uses_project_actionable_open_count(
+    db_session, mocker
+):
+    """Finalize scores project-owned open debt without mutating the public snapshot."""
+    from app import shared_state
+
+    mocker.patch.dict(
+        shared_state.runtime_config,
+        {
+            "promotion_enabled": False,
+            "completion_debt_weight_mode": "enforce",
+            "promotion_threshold": 0.90,
+            "promotion_weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+            },
+        },
+        clear=False,
+    )
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.92,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-project-debt", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    for idx in range(10):
+        db_session.add(
+            CompletionDebtEntry(
+                project_id=None,
+                kind="seed_inventory",
+                dedupe_key=f"global-standing-{idx}",
+                title=f"Global standing debt {idx}",
+            )
+        )
+    db_session.add(
+        CompletionDebtEntry(
+            project_id=project.id,
+            kind="retirement_residual",
+            dedupe_key="project-actionable-one",
+            title="Project actionable debt",
+        )
+    )
+    await db_session.commit()
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual["completion_debt"]["total_open"] == 11
+    assert "project_actionable_open" not in qual["completion_debt"]
+    assert qual["sub_scores"]["debt_pressure"] == pytest.approx(0.95)
+    assert qual["confidence"] == pytest.approx(0.9925)
+
+
+@pytest.mark.asyncio
+async def test_qualification_verdict_completion_debt_absent_when_module_missing(
+    db_session, mocker
+):
+    """When completion_debt module is unavailable, finalize succeeds and omits the block.
+
+    The best-effort try/except in _finalize_qualification must swallow any
+    import or runtime error from the completion_debt module so that the
+    qualification verdict is still written.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-b", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Simulate a missing module by making the import raise ImportError.
+    _mock_cd = MagicMock()
+    _mock_cd.get_open_completion_debt = AsyncMock(side_effect=ImportError("not landed"))
+    mocker.patch.dict("sys.modules", {"app.completion_debt": _mock_cd})
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Finalize must still succeed (best-effort — never fatal).
+    assert result["status"] in ("dry_run", "not_promoted", "promoted"), (
+        f"unexpected status: {result['status']}"
+    )
+
+    # completion_debt key should be None (not set) in last_qualification.
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual.get("completion_debt") is None, (
+        f"expected completion_debt=None, got {qual.get('completion_debt')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_records_enforce_preview_without_changing_confidence(
+    db_session, mocker
+):
+    """NAMED ACCEPTANCE TEST — observe mode records enforce-mode confidence preview.
+
+    With completion_debt_weight_mode='observe', _finalize_qualification must:
+      1. Leave the live composite confidence UNCHANGED (debt not blended).
+      2. Record debt_enforce_confidence_preview and debt_enforce_weight_preview in
+         last_qualification — showing what enforce would have done.
+      3. The preview confidence must differ from the observe confidence when there
+         is non-zero debt pressure (proving the preview calculation ran).
+    This exercises the production path end-to-end: observe mode → debt snapshot
+    → compute_enforce_confidence_preview → base_record fields.
+    """
+    from app import shared_state
+
+    audit_score = 0.92
+    mocker.patch.dict(
+        shared_state.runtime_config,
+        {
+            "promotion_enabled": False,
+            "completion_debt_weight_mode": "observe",
+            "promotion_threshold": 0.90,
+            "promotion_weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+            },
+        },
+        clear=False,
+    )
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": audit_score,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-preview", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Seed open completion debt — 5 items gives a pressure score of 0.75 (1 - 5/20).
+    for i in range(5):
+        db_session.add(
+            CompletionDebtEntry(
+                project_id=project.id,
+                kind="seed_inventory",
+                dedupe_key=f"preview-debt-{i}",
+                title=f"Open debt item {i}",
+            )
+        )
+    await db_session.commit()
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] in ("dry_run", "not_promoted"), (
+        f"unexpected status: {result['status']}"
+    )
+    assert result.get("blocker") is None, f"unexpected blocker: {result.get('blocker')}"
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+
+    # 1. Live confidence is the observe-mode composite (no debt blend).
+    observe_confidence = qual["confidence"]
+    assert observe_confidence > 0.0, "observe confidence should be positive"
+
+    # 2. Preview fields must be present.
+    assert "debt_enforce_confidence_preview" in qual, (
+        "debt_enforce_confidence_preview must be recorded in observe mode"
+    )
+    assert "debt_enforce_weight_preview" in qual, (
+        "debt_enforce_weight_preview must be recorded in observe mode"
+    )
+
+    preview_confidence = qual["debt_enforce_confidence_preview"]
+    preview_weight = qual["debt_enforce_weight_preview"]
+
+    # 3. Preview confidence must differ from observe confidence (debt < 1.0 → blends down).
+    assert preview_confidence != pytest.approx(observe_confidence), (
+        f"preview {preview_confidence} should differ from observe {observe_confidence} "
+        f"when there is open debt"
+    )
+    # Debt pressure < 1.0 → enforce blend must pull confidence down.
+    assert preview_confidence < observe_confidence, (
+        "enforce preview with open debt should lower confidence vs observe"
+    )
+
+    # 4. Preview weight is the default enforce weight (no configured weight set).
+    assert preview_weight == pytest.approx(rs.DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT)
+
+    # 5. format_qualification_for_api passes the preview fields through.
+    from app.release_readiness import format_qualification_for_api
+    api_view = format_qualification_for_api(qual)
+    assert api_view["debt_enforce_confidence_preview"] == pytest.approx(preview_confidence)
+    assert api_view["debt_enforce_weight_preview"] == pytest.approx(preview_weight)
+
+
+# ===========================================================================
+# _redrive_dry_run_candidate — post-dry-run candidate trigger on promotion enable
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_redrive_dry_run_candidate_triggers_when_promotion_enabled(
+    db_session, mocker
+):
+    """_redrive_dry_run_candidate must rewrite last_qualification to non-conclusive
+    and call run_qualification when the version is dry_run+would_promote=True and
+    promotion has since been enabled."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _redrive_dry_run_candidate
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": "dryc0de0" * 5,
+        "would_promote": True,
+        "confidence": 0.95,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_dry_run_candidate(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is True
+    run_qual.assert_awaited_once()
+    # run_qualification was called with the version carrying the placeholder status.
+    call_version = run_qual.call_args[0][2]
+    assert call_version.last_qualification["status"] == "requalification_requested"
+    assert call_version.last_qualification["previous_status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_redrive_dry_run_candidate_noop_when_promotion_still_disabled(
+    db_session, mocker
+):
+    """_redrive_dry_run_candidate must return False without touching run_qualification
+    when promotion is still disabled for the project."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _redrive_dry_run_candidate
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": "beef0000" * 5,
+        "would_promote": True,
+        "confidence": 0.91,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_dry_run_candidate(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_redrive_dry_run_candidate_noop_when_would_promote_false(
+    db_session, mocker
+):
+    """_redrive_dry_run_candidate must return False when would_promote is absent/False —
+    the candidate did not pass the confidence threshold even before the dry-run gate."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _redrive_dry_run_candidate
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": "cafe0000" * 5,
+        "would_promote": False,
+        "confidence": 0.55,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_dry_run_candidate(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sweep_promotes_dry_run_candidate_when_promotion_enabled(
+    db_session, mocker
+):
+    """Integration: sweep_stuck_qualifications re-drives a dry_run+would_promote version
+    once promotion is enabled, increments the finalized count, and spawns qualification."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": "0a1b2c3d" * 5,
+        "would_promote": True,
+        "confidence": 0.93,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session,
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    # At least the dry_run re-drive must have contributed to the finalized count.
+    assert count >= 1
+
+
+# ---------------------------------------------------------------------------
+# compute_qualification_trigger_state + _fire_initial_qualification tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_armed(db_session, mocker):
+    """open stabilize-phase version, no prior attempt, coverage complete → armed."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Add a covered criterion so total > 0 and covered == total.
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-trig-armed", text="Covered criterion",
+        source_kind="task_merge",
+    )
+    assert version.last_qualification is None
+    assert (version.qualification_attempts or 0) == 0
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "armed"
+    assert result["open_version_id"] == str(version.id)
+    assert result["reason"] == "armed"
+    assert result["coverage_total"] == 1
+    assert result["coverage_covered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_armed_no_criteria(db_session):
+    """No active criteria (total == 0) is not incomplete → trigger armed."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "armed"
+    assert result["coverage_total"] == 0
+    assert result["coverage_covered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_no_version(db_session):
+    """No open version → reason=no_open_version."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project = Project(
+        name="NoVer-Project",
+        user_id="rq-user-nv",
+        github_owner="acme",
+        github_repo="nover",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["open_version_id"] is None
+    assert result["reason"] == "no_open_version"
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_wrong_phase(db_session):
+    """Version in 'build' phase → reason=wrong_phase."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["reason"] == "wrong_phase"
+    assert result["open_version_id"] == str(version.id)
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_prior_attempt_last_qual(
+    db_session,
+):
+    """last_qualification is set → reason=prior_attempt_exists."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "candidate_sha": "err00000" * 5,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["reason"] == "prior_attempt_exists"
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_prior_attempt_attempts_count(
+    db_session,
+):
+    """qualification_attempts > 0 (even with no last_qualification) → reason=prior_attempt_exists."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["reason"] == "prior_attempt_exists"
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_coverage_incomplete(
+    db_session,
+):
+    """total > 0 and covered < total → reason=coverage_incomplete."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-covered", text="Covered", source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-missing", text="Not covered yet",
+    )
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["reason"] == "coverage_incomplete"
+    assert result["coverage_total"] == 2
+    assert result["coverage_covered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete_spawns(
+    db_session, mocker
+):
+    """Armed version: sweep function fires the first qualification."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-init-covered", text="Covered criterion for initial qual",
+        source_kind="task_merge",
+    )
+
+    automain_sha = "initfire" * 5
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=automain_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned", "candidate_sha": automain_sha}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True
+
+
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete_noop_coverage_incomplete(
+    db_session, mocker
+):
+    """Coverage incomplete → function returns False without calling run_qualification."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-partial", text="Covered", source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-missing-init", text="Not yet covered",
+    )
+
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_qual_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete_noop_wrong_phase(
+    db_session, mocker
+):
+    """Build-phase version → function returns False without calling run_qualification."""
+    project, version = await _make_project_and_version(db_session, phase="build")
+
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_qual_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete_noop_prior_attempt(
+    db_session, mocker
+):
+    """Prior attempt exists → function returns False without calling run_qualification."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "prior000" * 5,
+        "blocker": "ci_not_green",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_qual_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sweep_initial_qualification_wired(db_session, mocker):
+    """Integration: sweep picks up a stabilize-phase version with no prior attempt
+    and complete coverage and fires the initial qualification."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-sweep-init", text="Covered criterion for sweep integration",
+        source_kind="task_merge",
+    )
+
+    automain_sha = "swpinit0" * 5
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=automain_sha)
+    )
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned", "candidate_sha": automain_sha}),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session,
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert count >= 1
+    run_qual_mock.assert_called()
+
+
+# Named acceptance test: test_fire_initial_qualification_if_coverage_complete
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete(db_session, mocker):
+    """Named acceptance test: sweep fires the initial qualification for a
+    stabilize-phase version with complete criterion coverage and no prior attempt
+    (last_qualification is None, qualification_attempts == 0); the trigger-state
+    surface reports 'armed' for such a version and 'blocked' with specific reasons
+    for all the failing cases."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    # --- Part 1: verify trigger_state surface ---
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-accept-covered", text="Acceptance test covered criterion",
+        source_kind="task_merge",
+    )
+
+    trigger = await compute_qualification_trigger_state(db_session, project.id)
+    assert trigger["trigger_state"] == "armed", (
+        f"Expected armed trigger, got: {trigger}"
+    )
+    assert trigger["coverage_total"] == 1
+    assert trigger["coverage_covered"] == 1
+
+    # --- Part 2: sweep fires the initial qualification ---
+
+    automain_sha = "accept00" * 5
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=automain_sha)
+    )
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned", "candidate_sha": automain_sha}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert fired is True
+    run_qual_mock.assert_called_once()
+
+    # --- Part 3: blocked cases ---
+
+    # After firing (mocked), a real version would have last_qualification set;
+    # test blocking on a fresh version with an existing attempt.
+    project2, version2 = await _make_project_and_version(db_session, phase="stabilize")
+    version2.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "prior111" * 5,
+    }
+    db_session.add(version2)
+    await db_session.commit()
+    await db_session.refresh(version2)
+
+    blocked = await compute_qualification_trigger_state(db_session, project2.id)
+    assert blocked["trigger_state"] == "blocked"
+    assert blocked["reason"] == "prior_attempt_exists"
+
+    # Coverage incomplete blocks.
+    project3, version3 = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project3, version3,
+        key="c-blk-covered", text="Covered", source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session, project3, version3,
+        key="c-blk-missing", text="Not covered",
+    )
+
+    blocked2 = await compute_qualification_trigger_state(db_session, project3.id)
+    assert blocked2["trigger_state"] == "blocked"
+    assert blocked2["reason"] == "coverage_incomplete"
+
+
+# ===========================================================================
+# _check_full_suite_drift_sentinel
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_skips_when_flag_disabled(db_session):
+    """Sentinel returns False immediately when build_config flag is absent."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # No build_config flag set — sentinel must no-op.
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_skips_non_stabilize_version(db_session, mocker):
+    """Sentinel returns False for a build-phase version even when flag is set."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_dispatches_when_no_ci_run(db_session, mocker):
+    """Sentinel returns True and logs when ci.yml is dispatched for HEAD."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "dispatched",
+                "head_sha": "abc12345" * 5,
+                "run_id": 999,
+                "html_url": "https://github.com/runs/999",
+                "reason": "no run for HEAD — dispatched",
+            }
+        ),
+    )
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_alerts_and_harvests_on_red(db_session, mocker):
+    """Sentinel raises an Alert and calls harvest when CI concludes red."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+    from sqlalchemy import select
+
+    HEAD_SHA = "deadbeef" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": HEAD_SHA,
+                "run_id": 42,
+                "html_url": "https://github.com/runs/42",
+                "reason": "ci.yml concluded failure",
+            }
+        ),
+    )
+    harvest_mock = mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+
+    # An Alert should have been created.
+    alert = (
+        await db_session.execute(
+            select(Alert).where(Alert.project_id == project.id)
+        )
+    ).scalars().first()
+    assert alert is not None
+    assert HEAD_SHA[:8] in alert.title
+    assert alert.dedupe_key is not None
+
+    # Harvest was called once.
+    harvest_mock.assert_called_once()
+    call_kwargs = harvest_mock.call_args.kwargs
+    assert call_kwargs["ci_source_sha"] == HEAD_SHA
+    assert call_kwargs["selfheal_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_deduplicates_alert_on_same_sha(db_session, mocker):
+    """Sentinel does not create a second Alert when one for the SHA already exists."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+    from sqlalchemy import select
+
+    HEAD_SHA = "cafebabe" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": HEAD_SHA,
+                "run_id": 7,
+                "html_url": "",
+                "reason": "red",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value=None),
+    )
+
+    # First call — creates the Alert.
+    await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Second call — same SHA, same project.
+    await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Exactly one Alert row despite two calls.
+    alerts = (
+        await db_session.execute(
+            select(Alert).where(Alert.project_id == project.id)
+        )
+    ).scalars().all()
+    assert len(alerts) == 1

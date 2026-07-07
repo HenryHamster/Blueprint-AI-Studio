@@ -535,6 +535,17 @@ async def _record_remediation_outcome(
                 direction_id=str(direction_id),
             )
             return None
+        # Dedup: the rollup merge flow calls this function twice for the same
+        # task (intermediate merge + rollup landing). Skip any repeat recording
+        # for the same task_id to prevent inflated attempt counts and duplicate
+        # history entries.
+        task_id_str = str(task.id)
+        if any(
+            e.get("task_id") == task_id_str
+            for e in (target.get("remediation_history") or [])
+        ):
+            recorded["v"] = True
+            return None
         proj_shim = SimpleNamespace(directions=directions)
         fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
         prior_fingerprint = target.get("last_remediation_fingerprint")
@@ -684,6 +695,7 @@ def _propagate_remediation_success_to_siblings(
             continue
         # Clear the auto-pause so the direction can resume on the next lifecycle
         # sweep without waiting out its own cooldown.
+        _prior_status = direction.get("status")
         direction["status"] = "active"
         for field in (
             "auto_paused",
@@ -693,6 +705,13 @@ def _propagate_remediation_success_to_siblings(
             "escalation_notification_pending",
         ):
             direction.pop(field, None)
+        # Grace period: when this resumes a paused direction, stamp the recovery
+        # marker consumed by _check_direction_health so the same frozen
+        # research_history that drove the pause cannot immediately re-pause or
+        # zombie-retire the direction before a new research cycle is appended —
+        # matching cooldown auto-recovery and the operator/strategist surfaces.
+        if _prior_status == "paused":
+            direction["auto_recovered_at"] = now_iso
         # Stamp prior art so autonomous_research_diagnosis can surface what
         # worked if the same fingerprint resurfaces on this direction.
         direction["last_remediation_task_id"] = str(task.id)
@@ -824,6 +843,10 @@ async def _record_project_remediation_outcome(
         entry["failure_class"] = failure_class
         entry["error_summary"] = error_summary
     history = list(state.get("history") or [])
+    # Dedup: skip if this task_id was already recorded in the project history.
+    task_id_str = str(task.id)
+    if any(e.get("task_id") == task_id_str for e in history):
+        return True
     history.append(entry)
     state["history"] = history[-_PROJECT_REMEDIATION_HISTORY_MAX:]
     state["attempts"] = int(state.get("attempts") or 0) + 1
@@ -1568,12 +1591,19 @@ async def _maybe_release_safeguard_gate(
     orig_ctx = dict(orig.context or {})
     _fire_completed_orig_merge = False
     if orig.status == TaskStatus.EVALUATING and pr_num:
-        # Review already approved while safeguard was pending; hand off to CI polling loop.
-        orig_ctx["review_loop"] = {
-            **(orig_ctx.get("review_loop") or {}),
-            "ci_waiting": True,
-            "pr_number": pr_num,
-        }
+        # Review already approved while safeguard was pending; hand off to CI
+        # polling loop. arm_ci_wait co-stamps pr_number + a fresh ci_wait_started
+        # so this re-arm never parks the identity-less {ci_waiting} shape that the
+        # merge poll would skip / that would silently disable the CI-wait timeout.
+        from app.ci_merge_helpers import arm_ci_wait  # noqa: PLC0415
+
+        _rearm_loop = dict(orig_ctx.get("review_loop") or {})
+        arm_ci_wait(
+            _rearm_loop,
+            pr_number=pr_num,
+            now_iso=_utcnow().isoformat(),
+        )
+        orig_ctx["review_loop"] = _rearm_loop
         orig.context = orig_ctx
         flag_modified(orig, "context")
     elif (
@@ -2423,6 +2453,11 @@ async def _persist_compute_experiment_knowledge_best_effort(
         # fallback write starts from a clean transaction.
         try:
             await session.rollback()
+            # rollback expired `task`; re-materialise it so the fallback
+            # breadcrumb read+write below runs on a live instance instead of
+            # firing a sync lazy-load -> MissingGreenlet (swallowed by the
+            # except, silently dropping the {"persisted": False} breadcrumb).
+            await session.refresh(task)
             plan_output = dict(task.plan_output or {})
             plan_output["knowledge_document"] = {"persisted": False}
             task.plan_output = plan_output
@@ -2656,6 +2691,11 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
         # retried every cycle, which would starve newer marked rows.
         with contextlib.suppress(Exception):
             await session.rollback()
+            # rollback expired `registration`; re-materialise it so the backoff
+            # read/schedule below runs on a live instance instead of firing a
+            # sync lazy-load -> MissingGreenlet (swallowed by the suppress,
+            # silently skipping the anti-starvation backoff).
+            await session.refresh(registration)
             marker = dict(registration.source_metadata or {})
             marker_meta = dict(marker.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) or {})
             attempts = int(marker_meta.get("attempts", 0) or 0)
@@ -3191,6 +3231,36 @@ async def _maybe_spawn_sweep_aggregate_followon(
     )
 
     # Collect durable artifact pointers from all arms (Pillar 5 spawn-forward).
+    # Batch-load the arms' artifacts once (was one session.get per sibling) and
+    # look them up in-memory; the per-sibling UUID parse + None-handling below is
+    # preserved exactly so invalid/missing ids skip just as before.
+    _sweep_artifact_uuids: set[uuid.UUID] = set()
+    for sibling in sibling_rows:
+        sibling_result = (
+            (sibling.plan_output or {}).get("compute_result")
+            if isinstance(sibling.plan_output, dict)
+            else None
+        )
+        if sibling_result:
+            artifact_id = sibling_result.get("artifact_id")
+            if artifact_id:
+                try:
+                    _sweep_artifact_uuids.add(uuid.UUID(str(artifact_id)))
+                except (ValueError, TypeError):
+                    pass
+    artifacts_by_id: dict[uuid.UUID, Artifact] = {}
+    if _sweep_artifact_uuids:
+        _artifact_rows = (
+            (
+                await session.execute(
+                    select(Artifact).where(Artifact.id.in_(_sweep_artifact_uuids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        artifacts_by_id = {a.id: a for a in _artifact_rows}
+
     artifact_prereqs: list[dict] = []
     for sibling in sibling_rows:
         sibling_result = (
@@ -3202,7 +3272,7 @@ async def _maybe_spawn_sweep_aggregate_followon(
             artifact_id = sibling_result.get("artifact_id")
             if artifact_id:
                 try:
-                    artifact = await session.get(Artifact, uuid.UUID(str(artifact_id)))
+                    artifact = artifacts_by_id.get(uuid.UUID(str(artifact_id)))
                 except (ValueError, TypeError):
                     artifact = None
                 if artifact is not None:
@@ -4504,6 +4574,9 @@ async def _handle_design_doc_completion(
     """
     # Deferred imports to avoid circular dependency
     from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415
+    from app.strategic_spawning import (  # noqa: PLC0415
+        STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY,
+    )
     from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
     from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
     from app.strategic_events import emit_strategic_cycle_completed  # noqa: PLC0415
@@ -4612,6 +4685,9 @@ async def _handle_design_doc_completion(
     # Do this BEFORE committing task status so a failed spawn doesn't leave
     # the task as COMPLETED with no Phase 2 follow-up.
     cycle_id = phase1_cycle_id
+    apply_spawn_budget_guard = not bool(
+        (task.context or {}).get(STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY)
+    )
     # Architecture-cycle operator steering: the pending refresh marker was
     # consumed when Phase 1 (this design_doc task) was spawned, so it no longer
     # reads as operator-origin in vision. The flag was stamped on the task
@@ -4636,6 +4712,7 @@ async def _handle_design_doc_completion(
         spawned = await _spawn_strategic_review(
             project,
             session,
+            apply_spawn_budget_guard=apply_spawn_budget_guard,
             cycle_id=cycle_id,
             operator_steered=operator_steered,
             steering_excerpt=steering_excerpt,

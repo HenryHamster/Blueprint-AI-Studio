@@ -24,7 +24,9 @@ from sqlalchemy import func, update, case, delete, and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
-from app.database import get_session, resolve_async_engine
+from app.database import get_session, resolve_async_engine, resolve_dialect_name
+from app.direct_llm_client import get_anthropic_api_key
+from app.inline_llm import call_inline_llm_json, resolve_inline_llm_settings
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
     backfill_branch_columns,
@@ -78,7 +80,7 @@ from app.schemas import (
 )
 from app.project_message_projection import compact_text, message_preview_dict
 from app.task_outcomes import build_task_evaluation_summary
-from app.task_direction_refs import first_task_direction_id, task_related_direction_ids
+from app.task_direction_refs import first_task_direction_id
 from app.task_movement import build_task_movement_explanation
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
@@ -110,6 +112,25 @@ from app.routers.admin_operator_triggers import (  # noqa: F401
 # high_iter > max_iter/2 trouble heuristic in this file.
 _LOOP_MAX_ATTEMPTS: Dict[str, int] = {"lint": 5, "test": 3, "check": 5}
 _FIX_LOOP_SUCCESS_REASONS = frozenset({"passed", "early_unchanged"})
+
+
+def _plan_subtasks(
+    plan_output: Dict[str, Any] | None,
+) -> List[Dict[str, Any]] | None:
+    """Return slim subtask list (title + dependency indices) for task card display."""
+    if not isinstance(plan_output, dict):
+        return None
+    subtasks = plan_output.get("subtasks")
+    if not isinstance(subtasks, list):
+        return None
+    return [
+        {
+            "title": s.get("title", ""),
+            "depends_on_indices": s.get("depends_on_indices", []),
+        }
+        for s in subtasks
+        if isinstance(s, dict)
+    ]
 
 
 def _fix_loop_summary(
@@ -212,7 +233,22 @@ TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELL
 # up to ~100KB of research_findings plus unbounded status_log, so 500 rows
 # x large-tail payload stays safely under Cloud Run's 32 MB response limit.
 ADMIN_TASKS_MAX_LIMIT = 500
-ADMIN_TASKS_DIRECTION_SCAN_BATCH = 500
+
+# Columns loaded for the task list endpoint. Excludes the three JSONB blobs that
+# are only accessed in the detail endpoint: attempt_history_db, api_call_summary,
+# format_compliance_summary.
+_TASK_LIST_COLS = [
+    Task.id, Task.project_id, Task.title, Task.description, Task.status,
+    Task.payloads, Task.vm_instance_id, Task.latest_status_message,
+    Task.created_by, Task.requires_approval, Task.parent_task_id, Task.depends_on,
+    Task.plan_output, Task.created_at, Task.started_at, Task.last_heartbeat,
+    Task.last_metrics_json, Task.last_tool_use_at, Task.attempt_count,
+    Task.blocker_kind, Task.blocked_reason, Task.blocked_at, Task.recheck_after,
+    Task.parked_at, Task.park_reason, Task.context, Task.archived,
+    Task.vm_runtime_cost_banked_db, Task.vm_provisioned_at, Task.vm_stopped_at,
+    Task.post_commit_pending, Task.updated_at,
+    Task.vm_machine_type, Task.vm_spot, Task.prompt_fingerprint,
+]
 
 
 @router.get("/tasks")
@@ -278,68 +314,63 @@ async def get_all_tasks(
         filters.append(Task.requires_approval == approval_needed)
 
     if direction_id:
-        matching_task_ids: list[uuid.UUID] = []
-        last_seen_created_at: datetime | None = None
-        last_seen_id: uuid.UUID | None = None
-        while True:
-            scan_query = (
-                select(Task)
-                .options(
-                    load_only(
-                        Task.id,
-                        Task.created_at,
-                        Task.context,
-                        Task.payloads,
-                        Task.plan_output,
-                        raiseload=True,
-                    )
-                )
-                .order_by(Task.created_at.desc(), Task.id.desc())
-                .limit(ADMIN_TASKS_DIRECTION_SCAN_BATCH)
+        # Push direction matching to SQL to eliminate the Python cursor scan.
+        # Dialect-aware: PostgreSQL uses indexed JSONB @> containment; SQLite
+        # falls back to json_extract for the common single-level keys.
+        if resolve_dialect_name(session) == "sqlite":
+            _jx = func.json_extract
+            direction_filter = or_(
+                _jx(Task.context, "$.direction_id") == direction_id,
+                _jx(Task.context, "$.current_direction_id") == direction_id,
+                _jx(Task.payloads, "$[0].direction_id") == direction_id,
+                _jx(Task.payloads, "$[0].current_direction_id") == direction_id,
+                _jx(Task.payloads, "$[0].source_direction_id") == direction_id,
+                _jx(Task.payloads, "$[0].target_direction_id") == direction_id,
+                # directions array (first entry only — SQLite lacks array containment)
+                _jx(Task.payloads, "$[0].directions[0].id") == direction_id,
+                # plan_output keys
+                _jx(Task.plan_output, "$.source_direction_id") == direction_id,
+                _jx(Task.plan_output, "$.findings[0].direction_id") == direction_id,
             )
-            for f in filters:
-                scan_query = scan_query.where(f)
-            if last_seen_created_at is not None and last_seen_id is not None:
-                scan_query = scan_query.where(
-                    (Task.created_at < last_seen_created_at)
-                    | (
-                        (Task.created_at == last_seen_created_at)
-                        & (Task.id < last_seen_id)
-                    )
-                )
-            batch = (await session.execute(scan_query)).scalars().all()
-            if not batch:
-                break
-            for task in batch:
-                if direction_id in task_related_direction_ids(task):
-                    matching_task_ids.append(task.id)
-            last_seen = batch[-1]
-            last_seen_created_at = last_seen.created_at
-            last_seen_id = last_seen.id
-            if len(batch) < ADMIN_TASKS_DIRECTION_SCAN_BATCH:
-                break
-
-        total = len(matching_task_ids)
-        page_task_ids = matching_task_ids[offset : offset + limit]
-        if page_task_ids:
-            page_order = {task_id: index for index, task_id in enumerate(page_task_ids)}
-            page_query = select(Task).where(Task.id.in_(page_task_ids))
-            result = await session.execute(page_query)
-            tasks = sorted(result.scalars().all(), key=lambda task: page_order[task.id])
         else:
-            tasks = []
-    else:
-        count_query = select(func.count()).select_from(Task)
-        for f in filters:
-            count_query = count_query.where(f)
-        total = (await session.execute(count_query)).scalar() or 0
+            from sqlalchemy import cast as _cast
+            from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+            direction_filter = or_(
+                # context keys — covered by GIN index ix_task_context_gin
+                Task.context.op("@>")(_cast({"direction_id": direction_id}, _JSONB)),
+                Task.context.op("@>")(_cast({"current_direction_id": direction_id}, _JSONB)),
+                # payload top-level direction keys
+                Task.payloads[0]["direction_id"].as_string() == direction_id,
+                Task.payloads[0]["current_direction_id"].as_string() == direction_id,
+                Task.payloads[0]["source_direction_id"].as_string() == direction_id,
+                Task.payloads[0]["target_direction_id"].as_string() == direction_id,
+                # payload directions-array containment
+                Task.payloads.op("@>")(_cast([{"directions": [{"id": direction_id}]}], _JSONB)),
+                # plan_output direction keys and nested findings
+                Task.plan_output["source_direction_id"].as_string() == direction_id,
+                Task.plan_output.op("@>")(_cast(
+                    {"findings": [{"direction_id": direction_id}]}, _JSONB
+                )),
+            )
+        filters.append(direction_filter)
 
-        query = select(Task).order_by(Task.created_at.desc()).offset(offset).limit(limit)
-        for f in filters:
-            query = query.where(f)
+    count_query = select(func.count()).select_from(Task)
+    for f in filters:
+        count_query = count_query.where(f)
+    total = (await session.execute(count_query)).scalar() or 0
 
-        result = await session.execute(query)
-        tasks = result.scalars().all()
+    query = (
+        select(Task)
+        .options(load_only(*_TASK_LIST_COLS, raiseload=True))
+        .order_by(Task.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    for f in filters:
+        query = query.where(f)
+
+    result = await session.execute(query)
+    tasks = result.scalars().all()
 
     # Join artifacts to include all artifacts per task
     task_ids = [t.id for t in tasks]
@@ -394,16 +425,24 @@ async def get_all_tasks(
             if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
                 commit_map[tid] = {"commit_hash": a.commit_hash, "repo_url": a.repo_url}
 
-        # Fetch logs columns separately to avoid loading large blobs in the main query
-        logs_stmt = (
-            select(Artifact)
-            .options(
-                load_only(
-                    Artifact.task_id,
-                    Artifact.artifact_type,
-                    Artifact.logs,
-                    raiseload=True,
-                )
+        # Fetch logs columns separately to avoid loading large blobs in the main query.
+        # A per-(task_id, artifact_type) ROW_NUMBER() window keeps only the most-recent
+        # row of each type per task, so a few high-activity tasks with many ERROR_LOG /
+        # MERGE_TEST_RESULT rows can't exhaust a global budget and starve other tasks.
+        _logs_rn = (
+            func.row_number()
+            .over(
+                partition_by=[Artifact.task_id, Artifact.artifact_type],
+                order_by=Artifact.created_at.desc(),
+            )
+            .label("rn")
+        )
+        _ranked_logs = (
+            select(
+                Artifact.task_id,
+                Artifact.artifact_type,
+                Artifact.logs,
+                _logs_rn,
             )
             .where(
                 Artifact.task_id.in_(task_ids),
@@ -415,16 +454,17 @@ async def get_all_tasks(
                     ]
                 ),
             )
-            .order_by(Artifact.created_at.asc())
+            .subquery()
         )
-        logs_artifacts = (await session.execute(logs_stmt)).scalars().all()
+        logs_stmt = select(_ranked_logs).where(_ranked_logs.c.rn == 1)
+        logs_artifacts = (await session.execute(logs_stmt)).all()
         for a in logs_artifacts:
             tid = str(a.task_id)
-            if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
+            if a.artifact_type == ArtifactType.ERROR_LOG and a.logs and tid not in logs_map:
                 logs_map[tid] = a.logs[:2000]
-            if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
+            if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs and tid not in research_artifact_logs_map:
                 research_artifact_logs_map[tid] = a.logs[:100000]
-            if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
+            if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs and tid not in merge_test_map:
                 try:
                     parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
                     if isinstance(parsed, dict):
@@ -490,12 +530,11 @@ async def get_all_tasks(
             "task_type": task_type,
             "vm_instance_id": t.vm_instance_id,
             "latest_status_message": t.latest_status_message,
-            "status_log": t.status_log or [],
             "created_by": t.created_by,
             "requires_approval": t.requires_approval,
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
             "depends_on": t.depends_on or [],
-            "plan_output": t.plan_output,
+            "plan_subtasks": _plan_subtasks(t.plan_output),
             "created_at": t.created_at.isoformat() if t.created_at else None,
             "started_at": t.started_at.isoformat() if t.started_at else None,
             "last_heartbeat": t.last_heartbeat.isoformat()
@@ -551,7 +590,7 @@ async def get_all_tasks(
             and t.latest_status_message
             else None,
             "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(t),
-            "fix_loop_summary": _fix_loop_summary(t.fix_loop_history),
+            "fix_loop_summary": None,
             "post_commit_pending": t.post_commit_pending,
         }
         result_list.append(task_dict)
@@ -977,6 +1016,12 @@ async def bulk_action_tasks(
     # window. approve/cancel still use the shared session — they don't call
     # _requeue_parent_task and their per-task commits already release locks
     # immediately.
+    # A per-item rollback (in the except handlers below) expires EVERY ORM object
+    # in `fetched` / `_cancel_children_by_parent` regardless of expire_on_commit;
+    # once that happens, subsequent iterations must re-fetch fresh or their reads
+    # fire a sync lazy-load -> MissingGreenlet (caught, but it cascades every
+    # remaining item to a spurious "error"). `_batch_dirty` flips on first rollback.
+    _batch_dirty = False
     for raw_id in body.task_ids:
         if raw_id not in valid_map:
             continue  # already reported as invalid
@@ -986,6 +1031,17 @@ async def bulk_action_tasks(
                 {"task_id": raw_id, "status": "error", "error": "Task not found"}
             )
             continue
+        if _batch_dirty:
+            # Re-fetch this task fresh (populate_existing overwrites the expired
+            # instance) so the reads/mutations below run inside the async greenlet.
+            task = await session.get(
+                Task, valid_map[raw_id], populate_existing=True
+            )
+            if task is None:
+                results.append(
+                    {"task_id": raw_id, "status": "error", "error": "Task not found"}
+                )
+                continue
 
         try:
             if body.action == "retry":
@@ -1078,8 +1134,24 @@ async def bulk_action_tasks(
                     )
                     continue
 
-                # Use pre-fetched children (batch query before loop, no N+1)
-                active_children = _cancel_children_by_parent.get(task.id, [])
+                # Use pre-fetched children (batch query before loop, no N+1).
+                # If a prior item rolled back, the prefetch is expired — re-fetch
+                # this parent's active children fresh to avoid MissingGreenlet.
+                if _batch_dirty:
+                    active_children = list(
+                        (
+                            await session.execute(
+                                select(Task).where(
+                                    Task.parent_task_id == task.id,
+                                    Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                else:
+                    active_children = _cancel_children_by_parent.get(task.id, [])
 
                 # Save VM and account info before any commit so we can access
                 # them after session.commit() expires ORM object attributes.
@@ -1170,9 +1242,11 @@ async def bulk_action_tasks(
             results.append({"task_id": raw_id, "status": "ok"})
         except HTTPException as e:
             await session.rollback()
+            _batch_dirty = True  # rollback expired the prefetched batch
             results.append({"task_id": raw_id, "status": "error", "error": e.detail})
         except Exception as e:
             await session.rollback()
+            _batch_dirty = True  # rollback expired the prefetched batch
             logger.error(
                 f"[ADMIN] Bulk action {body.action} failed for task {raw_id}: {e}",
                 exc_info=True,
@@ -1648,11 +1722,12 @@ async def get_task(
             commit_hash = a.commit_hash
             repo_url = a.repo_url
 
-    # Fetch full task history (all entries, not capped at 10)
+    # Fetch task history capped at 200 most recent entries
     history_stmt = (
         select(TaskHistory)
         .where(TaskHistory.task_id == tid)
         .order_by(TaskHistory.timestamp.desc())
+        .limit(200)
     )
     all_history = (await session.execute(history_stmt)).scalars().all()
     history = [
@@ -2059,6 +2134,9 @@ class ComputeExperimentTaskPayload(BaseModel):
     github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
     title: str = Field(..., min_length=1, max_length=200)
     prompt: str = Field(..., min_length=1, max_length=50000)
+    idea: str | None = Field(default=None, min_length=1, max_length=10000)
+    draft_notes: str | None = Field(default=None, min_length=1, max_length=10000)
+    drafted_from_refinement: bool | None = None
     base_branch: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
@@ -2505,6 +2583,9 @@ class ComputeExperimentDraftRequest(BaseModel):
         default=None, pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$"
     )
     base_branch: str | None = Field(default=None, max_length=255)
+    # Optional prior draft for multi-turn refinement: if present the LLM receives
+    # the prior response as context so follow-ups like "make it 3 arms" are coherent.
+    prior_draft: dict | None = None
 
 
 class ComputeExperimentDraftSuccessCriterion(BaseModel):
@@ -2532,9 +2613,6 @@ class ComputeExperimentDraft(BaseModel):
     machine_type: str | None = None
 
 
-_DRAFT_LLM_MODEL = "claude-haiku-4-5-20251001"
-_DRAFT_LLM_TIMEOUT = 30.0
-_DRAFT_LLM_MAX_TOKENS = 2000
 _DISABLE_DRAFT_LLM_ENV = "DISABLE_COMPUTE_EXPERIMENT_DRAFT_LLM"
 
 _DRAFT_LLM_SYSTEM = """You are an expert at designing compute experiments for ML/research projects.
@@ -2667,7 +2745,13 @@ def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
     )
 
 
-async def _call_draft_llm(api_key: str, idea: str, github_repo: str | None, base_branch: str | None) -> dict | None:
+async def _call_draft_llm(
+    api_key: str,
+    idea: str,
+    github_repo: str | None,
+    base_branch: str | None,
+    prior_draft: dict | None = None,
+) -> dict | None:
     """Call Anthropic to produce a draft compute-experiment contract. Returns dict or None."""
     context_parts = [f"Research idea: {idea}"]
     if github_repo:
@@ -2676,37 +2760,22 @@ async def _call_draft_llm(api_key: str, idea: str, github_repo: str | None, base
         context_parts.append(f"Base branch: {base_branch}")
     user_message = "\n".join(context_parts)
 
-    for attempt in range(2):
-        try:
-            import anthropic as _anthropic
-
-            client = _anthropic.AsyncAnthropic(api_key=api_key)
-            resp = await client.messages.create(
-                model=_DRAFT_LLM_MODEL,
-                max_tokens=_DRAFT_LLM_MAX_TOKENS,
-                timeout=_DRAFT_LLM_TIMEOUT,
-                system=_DRAFT_LLM_SYSTEM,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            raw_text = resp.content[0].text.strip()
-            parsed = _parse_draft_json(raw_text)
-            if parsed is None:
-                if attempt == 0:
-                    logger.info("[DRAFT] JSON parse failed on first attempt, retrying")
-                    continue
-                logger.info("[DRAFT] JSON parse failed on retry; draft unavailable")
-                return None
-            return parsed
-        except (json.JSONDecodeError, ValueError, KeyError, IndexError) as exc:
-            if attempt == 0:
-                logger.info("[DRAFT] parse error %s, retrying once", exc)
-                continue
-            logger.info("[DRAFT] parse error on retry; draft unavailable")
-            return None
-        except Exception as exc:  # noqa: BLE001
-            logger.info("[DRAFT] LLM call failed (%s); draft unavailable", exc)
-            return None
-    return None
+    if prior_draft is not None:
+        # Multi-turn: inject the prior draft as the assistant's previous response so
+        # the LLM can refine specific fields without starting from scratch.
+        messages: list[dict] = [
+            {"role": "user", "content": "Generate an experiment draft."},
+            {"role": "assistant", "content": json.dumps(prior_draft)},
+            {"role": "user", "content": user_message},
+        ]
+    else:
+        messages = [{"role": "user", "content": user_message}]
+    return await call_inline_llm_json(
+        "compute_draft",
+        user_message,
+        system=_DRAFT_LLM_SYSTEM,
+        messages=messages,
+    )
 
 
 @router.post("/tasks/compute-experiment/draft")
@@ -2727,14 +2796,19 @@ async def compute_experiment_draft(
             notes="Draft LLM is disabled via environment configuration.",
         )
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = get_anthropic_api_key()
     if not api_key:
         return ComputeExperimentDraft(
             draft_available=False,
             notes="Draft generation is unavailable: ANTHROPIC_API_KEY is not configured.",
         )
+    if resolve_inline_llm_settings("compute_draft").disabled:
+        return ComputeExperimentDraft(
+            draft_available=False,
+            notes="Draft LLM is disabled via environment configuration.",
+        )
 
-    raw = await _call_draft_llm(api_key, payload.idea, payload.github_repo, payload.base_branch)
+    raw = await _call_draft_llm(api_key, payload.idea, payload.github_repo, payload.base_branch, payload.prior_draft)
     if raw is None:
         return ComputeExperimentDraft(
             draft_available=False,
@@ -2921,6 +2995,15 @@ async def create_compute_experiment_task(
         launch_contract["command"] = payload.command
     if payload.success_criterion is not None:
         launch_contract["success_criterion"] = payload.success_criterion.model_dump()
+    provenance: dict[str, Any] = {}
+    if payload.idea is not None:
+        provenance["idea"] = payload.idea
+    if payload.draft_notes is not None:
+        provenance["draft_notes"] = payload.draft_notes
+    if payload.drafted_from_refinement is not None:
+        provenance["drafted_from_refinement"] = payload.drafted_from_refinement
+    if provenance:
+        launch_contract["provenance"] = provenance
     for opt_key in (
         "accelerator",
         "machine_type",
@@ -3008,6 +3091,11 @@ async def create_compute_experiment_task(
         **(
             {"success_criterion": launch_contract["success_criterion"]}
             if launch_contract.get("success_criterion") is not None
+            else {}
+        ),
+        **(
+            {"provenance": launch_contract["provenance"]}
+            if launch_contract.get("provenance") is not None
             else {}
         ),
         **{

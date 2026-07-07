@@ -58,6 +58,7 @@ const REQUIRED_OPERATOR_ROUTE_COMMANDS = [
   { id: 'runtime.settings.provider-settings', section: 'Runtime' },
   { id: 'runtime.settings.notifications', section: 'Runtime' },
   { id: 'runtime.settings.advanced', section: 'Runtime' },
+  { id: 'runtime.version-lifecycle', section: 'Runtime' },
   { id: 'activity.open', section: 'Workbench' },
   { id: 'research.open', section: 'Workbench' },
   { id: 'knowledge.open', section: 'Workbench' },
@@ -2089,5 +2090,17 @@ describe('useWorkbenchCommands', () => {
     mount({ hasDesignDoc: true });
 
     expect(captured.find(command => command.id === 'project.design')?.disabled).toBe(false);
+  });
+
+  test('disables runtime.version-lifecycle command when hasVersionLifecycle is false', () => {
+    mount({ hasVersionLifecycle: false });
+
+    expect(captured.find(command => command.id === 'runtime.version-lifecycle')?.disabled).toBe(true);
+  });
+
+  test('enables runtime.version-lifecycle command when hasVersionLifecycle is true', () => {
+    mount({ hasVersionLifecycle: true });
+
+    expect(captured.find(command => command.id === 'runtime.version-lifecycle')?.disabled).toBe(false);
   });
 });

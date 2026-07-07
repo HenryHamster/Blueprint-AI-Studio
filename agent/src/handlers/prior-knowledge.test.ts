@@ -10,6 +10,7 @@ vi.mock('../index.js', () => ({
 import {
   fetchPriorKnowledge,
   buildPriorKnowledgeSection,
+  filterKnowledgeDuplicates,
   PRIOR_KNOWLEDGE_LIMIT,
   fetchKnowledgeDocumentById,
   fetchArtifactDownloadUrl,
@@ -209,6 +210,45 @@ describe('buildPrerequisiteKnowledgeSection', () => {
       new Map(),
     );
     expect(section).toBe('');
+  });
+});
+
+describe('filterKnowledgeDuplicates', () => {
+  it('returns all docs when knownIds is empty', () => {
+    const docs = [
+      { id: 'doc-1', title: 'First', summary: 'S1' },
+      { id: 'doc-2', title: 'Second', summary: 'S2' },
+    ];
+    expect(filterKnowledgeDuplicates(docs, new Set())).toEqual(docs);
+  });
+
+  it('drops docs whose id is in knownIds', () => {
+    const docs = [
+      { id: 'doc-1', title: 'First', summary: 'S1' },
+      { id: 'doc-2', title: 'Second', summary: 'S2' },
+      { id: 'doc-3', title: 'Third', summary: 'S3' },
+    ];
+    const result = filterKnowledgeDuplicates(docs, new Set(['doc-1', 'doc-3']));
+    expect(result).toEqual([{ id: 'doc-2', title: 'Second', summary: 'S2' }]);
+  });
+
+  it('passes through docs whose id is not in knownIds', () => {
+    const docs = [{ id: 'doc-99', title: 'Unknown', summary: 'S' }];
+    const result = filterKnowledgeDuplicates(docs, new Set(['doc-1', 'doc-2']));
+    expect(result).toEqual(docs);
+  });
+
+  it('returns [] when all docs are known duplicates', () => {
+    const docs = [
+      { id: 'a', title: 'A', summary: '' },
+      { id: 'b', title: 'B', summary: '' },
+    ];
+    expect(filterKnowledgeDuplicates(docs, new Set(['a', 'b']))).toEqual([]);
+  });
+
+  it('returns [] when docs list is empty regardless of knownIds', () => {
+    expect(filterKnowledgeDuplicates([], new Set(['x', 'y']))).toEqual([]);
+    expect(filterKnowledgeDuplicates([], new Set())).toEqual([]);
   });
 });
 

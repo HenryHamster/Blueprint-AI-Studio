@@ -1,8 +1,10 @@
 import { useState } from 'react';
+import { CheckCircle2, Circle } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { useTaskCapabilities } from '../taskCapabilities';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
+import type { OnboardingProof } from '../types/project';
 
 const REFRESH_PRESETS = [
   { label: '10s', value: 10000 },
@@ -38,6 +40,7 @@ interface SettingsGeneralSectionProps {
   notifyOnHighSignalMessage: boolean;
   onUpdateNotifyOnHighSignalMessage: (value: boolean) => void;
   onNavigateToNotifications: () => void;
+  selectedProjectOnboardingProof?: OnboardingProof | null;
 }
 
 function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
@@ -76,6 +79,7 @@ export function SettingsGeneralSection({
   notifyOnHighSignalMessage,
   onUpdateNotifyOnHighSignalMessage,
   onNavigateToNotifications,
+  selectedProjectOnboardingProof,
 }: SettingsGeneralSectionProps) {
   const { userLaunchableOptions } = useTaskCapabilities();
   const [refreshInputVal, setRefreshInputVal] = useState('');
@@ -87,8 +91,43 @@ export function SettingsGeneralSection({
     () => JSON.parse(localStorage.getItem('blueprint-admin:defaultEffort') ?? 'null') ?? ''
   );
 
+  const milestones = selectedProjectOnboardingProof ? [
+    { key: 'repo_added_at', label: 'Repository Added' },
+    { key: 'bootstrap_completed_at', label: 'Bootstrap Completed' },
+    { key: 'first_task_spawned_at', label: 'First Task Spawned' },
+    { key: 'first_pr_opened_at', label: 'First PR Opened' },
+    { key: 'first_merge_gate_verdict_at', label: 'First Merge Gate Verdict' },
+    { key: 'first_pr_merged_at', label: 'First PR Merged' },
+    { key: 'first_autonomous_improvement_at', label: 'First Autonomous Improvement' },
+  ] as const : [];
+
   return (
     <div className="space-y-6">
+      {/* Onboarding progress */}
+      {selectedProjectOnboardingProof && milestones.length > 0 && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Onboarding Progress</h3>
+          <div className="space-y-2">
+            {milestones.map(m => {
+              const value = selectedProjectOnboardingProof[m.key as keyof OnboardingProof];
+              const completed = value !== null && value !== undefined;
+              return (
+                <div key={m.key} className="flex items-center gap-3">
+                  {completed ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
+                  ) : (
+                    <Circle className="w-4 h-4 text-neutral-600 shrink-0" />
+                  )}
+                  <span className={`text-xs ${completed ? 'text-neutral-300' : 'text-neutral-500'}`}>
+                    {m.label}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Connection status */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Connection Status</h3>

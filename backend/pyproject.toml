@@ -119,11 +119,25 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # PR files / diffs / target migrations). Narrowing risks merging on an unknown
 # migration state — strictly worse than logging and retrying next sweep.
 "app/rollup_migration_validation.py" = ["BLE001"]
+# rollup_size_preflight.py uses the same fail-safe pattern: any GitHub API blip
+# fetching the caps JSON, PR files, or file content → "defer" (retry next cycle),
+# never merge unvalidated. Narrowing the except type risks masking transient
+# network / httpx errors that don't descend from a single base class.
+"app/rollup_size_preflight.py" = ["BLE001"]
 # orchestrator.py is the background provisioning + monitoring loop. Same
 # log-and-continue policy: crash here halts all task dispatch and health monitoring.
 # E402: re-exports symbols extracted to app.orchestrator_health via deferred mid-module
 # imports (circular-dependency / load-order) — the same intentional pattern as main.py.
 "app/orchestrator.py" = ["BLE001", "E402"]
+# orchestrator_ci_monitor.py is the EVALUATING/CI-waiting monitor sweep lifted
+# verbatim out of orchestrator_worker. Same log-and-continue policy (BLE001):
+# a crash in per-task CI polling must never abort the whole leader cycle.
+"app/orchestrator_ci_monitor.py" = ["BLE001"]
+# orchestrator_provision.py is the VM provisioning + provision-failure coroutine
+# lifted verbatim out of orchestrator_worker. Same log-and-continue policy
+# (BLE001): a crash mid-provision must be logged, the slot/VM cleaned up, and the
+# task requeued — never propagate out and abort the dispatch loop.
+"app/orchestrator_provision.py" = ["BLE001"]
 # routers/agent.py re-exports the GitHub-token cache helpers extracted to
 # app.github_token_resolver via a deferred mid-module import (keeps the 15+
 # `from app.routers.agent import get_github_token_for_task` call sites working).

@@ -45,6 +45,7 @@ type WorkSessionCommandRunStatus = {
 interface UseWorkbenchCommandsOptions {
   selectedProjectId: string | null;
   selectedProjectRepoLabel: string | null;
+  hasVersionLifecycle?: boolean;
   directionsCount: number;
   filteredTaskCount: number;
   visibleActiveCount: number;
@@ -481,6 +482,7 @@ function workSessionCommandExecutionPayload(command: StrategicWorkSessionCommand
 export function useWorkbenchCommands({
   selectedProjectId,
   selectedProjectRepoLabel,
+  hasVersionLifecycle = false,
   directionsCount,
   filteredTaskCount,
   visibleActiveCount,
@@ -1518,6 +1520,15 @@ export function useWorkbenchCommands({
         run: () => openSettingsSectionHome('advanced'),
       },
       {
+        id: 'runtime.version-lifecycle',
+        label: 'Version lifecycle',
+        section: 'Runtime',
+        detail: 'Qualification status, promotion controls, Run Qualify',
+        keywords: ['version', 'lifecycle', 'qualify', 'promotion', 'release', 'candidate', 'sha', 'run qualify'],
+        disabled: projectDisabled || !hasVersionLifecycle,
+        run: () => openRuntimeSection('version-lifecycle'),
+      },
+      {
         id: 'activity.open',
         label: 'Activity stream',
         section: 'Workbench',
@@ -1574,6 +1585,7 @@ export function useWorkbenchCommands({
     focusStrategicComposer,
     handleTabChange,
     hasDesignDoc,
+    hasVersionLifecycle,
     isAdmin,
     maxPlanAccountCount,
     openStrategicContextWorkspace,

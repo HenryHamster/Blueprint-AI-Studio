@@ -3242,6 +3242,65 @@ async def test_process_post_commit_task_not_found_returns_accepted(tl_db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["fix", "review", "research", "create"])
+async def test_process_post_commit_locks_project_before_task_for_nonstrategic(
+    tl_db, mocker, task_type
+):
+    """WI-6: _process_post_commit acquires the Project lock BEFORE the Task
+    lock for NON-strategic task types too — enforcing the canonical
+    Project-before-Task ordering for the whole post-commit unit.
+
+    Prior code only used the canonical ``lock_project_then_task``
+    (Project-before-Task) pair-locker for strategic types (design_doc_update,
+    strategic_review) and locked the Task first (task-only FOR UPDATE) for
+    every other type, reaching the Project lock only downstream. Two
+    concurrent non-strategic post-commits in the same project therefore
+    acquired Task→Project while a strategic / dispatch / reaper path acquired
+    Project→Task — the opposite orders deadlocked (Postgres 40P01
+    DeadlockDetected, ~6/hr on bursty concurrent agent-status callbacks).
+
+    This asserts the canonical pair-locker is invoked with the task's
+    (project_id, task_id) under skip_locked for plain non-strategic types.
+    A true concurrency race is non-deterministic to unit-test, so we assert
+    the code path takes the Project lock first via the canonical helper rather
+    than racing threads (see test_lock_ordering.py for the helper-level
+    contention regression on Postgres).
+    """
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type=task_type, status=TaskStatus.COMPLETED
+    )
+
+    calls: dict = {}
+
+    class _StopAfterLock(Exception):
+        pass
+
+    @contextlib.asynccontextmanager
+    async def _spy_lock_project_then_task(session_, project_id, task_id, **kw):
+        calls["project_id"] = project_id
+        calls["task_id"] = task_id
+        calls["skip_locked"] = kw.get("skip_locked")
+        # Short-circuit before the heavy downstream post-commit machinery — we
+        # only need to prove the canonical pair-locker was invoked first.
+        raise _StopAfterLock()
+        yield (None, None)  # pragma: no cover — makes this an async generator
+
+    mocker.patch("app.task_locking.lock_project_then_task", _spy_lock_project_then_task)
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    with pytest.raises(_StopAfterLock):
+        await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert calls["project_id"] == project.id, (
+        "post-commit must lock the task's OWNING project first"
+    )
+    assert calls["task_id"] == task.id
+    assert calls["skip_locked"] is True
+
+
+@pytest.mark.asyncio
 async def test_process_post_commit_persists_timing_fields(tl_db, mocker):
     """Phase 0 telemetry: setup_secs, warm_start, prior_role_vm_id round-trip
     into task.context["_timing"] (mirrors _shown_playbook_keys storage pattern)."""
@@ -7271,7 +7330,7 @@ class TestMarkDependentsWarmClaimable:
         )
 
         spy = mocker.patch(
-            "app.orchestrator._mark_unblocked_dependents",
+            "app.dep_lifecycle._mark_unblocked_dependents",
             new_callable=AsyncMock,
             return_value=2,
         )
@@ -7295,7 +7354,7 @@ class TestMarkDependentsWarmClaimable:
         )
 
         mocker.patch(
-            "app.orchestrator._mark_unblocked_dependents",
+            "app.dep_lifecycle._mark_unblocked_dependents",
             new_callable=AsyncMock,
             side_effect=RuntimeError("boom"),
         )

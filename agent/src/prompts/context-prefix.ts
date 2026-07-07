@@ -313,7 +313,7 @@ export function formatStrategicIntent(intent: Record<string, unknown> | undefine
   return lines.join('\n') + '\n';
 }
 
-export function buildContextPrefix(task: Record<string, unknown>): string {
+export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppressTaskLists?: boolean }): string {
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
   const payload = payloads[0] as Record<string, unknown> | undefined;
@@ -340,8 +340,10 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     const userPurpose = strVal(strategicIntent.user_purpose);
     if (userPurpose) siLines.push(`**Operator Purpose (immutable):** ${userPurpose}`);
     // Agent-volatile purpose — may have been rewritten by the strategic cycle.
+    // Omit when it is identical to userPurpose (strategist has healed them to equal) to avoid
+    // shipping the same string twice.
     const purpose = strVal(strategicIntent.purpose);
-    if (purpose) siLines.push(`**Purpose:** ${purpose}`);
+    if (purpose && purpose.trim() !== userPurpose.trim()) siLines.push(`**Purpose:** ${purpose}`);
     // Rolling current focus narrative — omitted for utility task types (repo_bootstrap, etc.)
     // that should act on durable steering only, not the strategist's volatile narrative.
     const currentFocus = strVal(strategicIntent.current_focus);
@@ -509,7 +511,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         (payload?.related_files as string[] | undefined) ||
         (taskContext?.related_files as string[] | undefined) ||
         [];
-      prefix += formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length) + '\n\n';
+      prefix += formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length, opts) + '\n\n';
       if (REVIEW_GATED_TASK_TYPES.includes(taskType)) {
         prefix += formatSelfReviewCalibrationSection(
           (projectCtx.self_review_catch_rate as SRCatchRateSource | undefined) ||

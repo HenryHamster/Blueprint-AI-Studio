@@ -517,7 +517,7 @@ describe('mid-run ./fetch provisioning for create/refactor', () => {
     const prompt = capturedPrompt();
     expect(prompt).toContain('MID-RUN FETCH (./fetch)');
     // Only the provisioned read-only verbs are advertised.
-    expect(prompt).toContain('./fetch direction <id>');
+    expect(prompt).toContain('./fetch direction [id]');
     expect(prompt).toContain('./fetch section <key>');
     expect(prompt).toContain('./fetch playbook <key>');
     // problem-model/gap/message are NOT provisioned for code-change agents.
@@ -4208,8 +4208,10 @@ describe('handleCreate — SCOPE_EMPTY pre-flight guard', () => {
 
 // ── operator_requested_review_for branch-existence short-circuit ──────────────
 describe('operator_requested_review_for branch-existence check', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    const fsModule = (await import('fs')).default;
+    vi.mocked(fsModule.writeFileSync).mockReset();
   });
 
   it('short-circuits with COMPLETED when ls-remote returns empty (branch deleted)', async () => {
@@ -4322,7 +4324,7 @@ describe('operator_requested_review_for branch-existence check', () => {
 function capturedRepoMapHeartbeatOpts(): Record<string, unknown> | undefined {
   const calls = vi.mocked(sendHeartbeatSync).mock.calls;
   const call = calls.find(([, , opts]) => opts != null && typeof opts === 'object' && 'had_repo_map' in opts);
-  return call ? (call[2] as Record<string, unknown>) : undefined;
+  return call ? call[2] : undefined;
 }
 
 describe('receipt-only capability trial arm assignment', () => {
@@ -4554,7 +4556,7 @@ function capturedDiagnosticsHeartbeatOpts(): Record<string, unknown> | undefined
   const call = calls.find(([, , opts]) => opts != null && typeof opts === 'object' && (
     'diagnostics_after_edit_arm' in opts || 'had_diagnostics_after_edit' in opts
   ));
-  return call ? (call[2] as Record<string, unknown>) : undefined;
+  return call ? call[2] : undefined;
 }
 
 describe('diagnostics-after-edit arm assignment in sendHeartbeatSync', () => {

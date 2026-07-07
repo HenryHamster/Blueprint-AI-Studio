@@ -12,6 +12,10 @@ vi.mock('../index.js', async (importOriginal) => {
     sendLog: vi.fn(),
     persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
     validateBranchName: vi.fn((b: string) => b),
+    // execFileAsync drives the diff computation and acceptance probes; mocked
+    // so tests never shell out to git/filesystem operations. Avoids ~3.2s per
+    // call which would hit the 5s vitest timeout under CI contention.
+    execFileAsync: vi.fn().mockResolvedValue(''),
   };
 });
 

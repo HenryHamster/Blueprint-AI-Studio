@@ -30,7 +30,10 @@ from app.models import (
     TaskStatus,
 )
 from app.broadcast import broadcast_to_project
-from app.direction_metrics import _fold_evicted_into_aggregate
+from app.direction_metrics import (
+    _fold_evicted_into_aggregate,
+    build_evicted_cycle_snapshot,
+)
 from app.direction_outcomes import credit_gate_merged_count
 from app.research_context import (
     _build_research_context,
@@ -548,6 +551,36 @@ async def apply_post_spawn_state(
                         _merge_finding_challenge_summary(
                             _summary, _summarize_finding_challenge(_challenge)
                         )
+            # Batch-load undismissed deadlock alerts for this project once (was up
+            # to 2*N per-direction Alert existence queries). Dedup is matched
+            # in-memory below by checking whether any alert of the relevant title
+            # already references the direction id in its message text — the exact
+            # equivalent of the per-direction ``Alert.message.contains(did)`` check.
+            _dedup_deadlock_alert_messages: list[str] = []
+            _af_deadlock_alert_messages: list[str] = []
+            _undismissed_deadlock_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == task.project_id,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.in_(
+                                [
+                                    "Dedup deadlock detected",
+                                    "Already-fixed deadlock detected",
+                                ]
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for _alert in _undismissed_deadlock_alerts:
+                if _alert.title == "Dedup deadlock detected":
+                    _dedup_deadlock_alert_messages.append(_alert.message or "")
+                elif _alert.title == "Already-fixed deadlock detected":
+                    _af_deadlock_alert_messages.append(_alert.message or "")
             for d in directions:
                 did = d.get("id")
                 if did in direction_ids_with_findings:
@@ -634,6 +667,18 @@ async def apply_post_spawn_state(
                         d["history_aggregate"] = _fold_evicted_into_aggregate(
                             d.get("history_aggregate"), new_history[:-10]
                         )
+                        # Store compact per-cycle snapshots so post-eviction patch paths
+                        # (post-merge recompute, stranded-PR discount) can apply deltas to the
+                        # aggregate rather than silently no-oping when the live entry is gone.
+                        _evicted_snaps = d["history_aggregate"].setdefault(
+                            "_evicted_cycle_snapshots", {}
+                        )
+                        for _ev in new_history[:-10]:
+                            _tid = _ev.get("task_id")
+                            if _tid:
+                                _evicted_snaps[str(_tid)] = (
+                                    build_evicted_cycle_snapshot(_ev)
+                                )
                     d["research_history"] = new_history[-10:]
                     d["possibly_saturated"] = _compute_saturation(d["research_history"])
                     # Saturated directions get a longer refractory so the portfolio
@@ -682,19 +727,8 @@ async def apply_post_spawn_state(
                             and f.get("title")
                         ][:3]
                         # Guard: only create alert if no undismissed alert exists for this direction
-                        _existing_deadlock_alert = (
-                            (
-                                await session.execute(
-                                    select(Alert).where(
-                                        Alert.project_id == task.project_id,
-                                        Alert.title == "Dedup deadlock detected",
-                                        Alert.dismissed_at.is_(None),
-                                        Alert.message.contains(did),
-                                    )
-                                )
-                            )
-                            .scalars()
-                            .first()
+                        _existing_deadlock_alert = any(
+                            did in _msg for _msg in _dedup_deadlock_alert_messages
                         )
                         if not _existing_deadlock_alert:
                             _deadlock_alert = Alert(
@@ -802,20 +836,8 @@ async def apply_post_spawn_state(
                             exhausted=True,
                         )
                     if _af_deadlocked and d.get("status") == "active":
-                        _existing_af_alert = (
-                            (
-                                await session.execute(
-                                    select(Alert).where(
-                                        Alert.project_id == task.project_id,
-                                        Alert.title
-                                        == "Already-fixed deadlock detected",
-                                        Alert.dismissed_at.is_(None),
-                                        Alert.message.contains(did),
-                                    )
-                                )
-                            )
-                            .scalars()
-                            .first()
+                        _existing_af_alert = any(
+                            did in _msg for _msg in _af_deadlock_alert_messages
                         )
                         if not _existing_af_alert:
                             _af_alert = Alert(
@@ -978,19 +1000,30 @@ async def apply_post_spawn_state(
                     if history:
                         last_entry = history[-1]
                         sub_notes = last_entry.get("sub_research_notes", [])
-                        sub_notes.append(
-                            {
-                                "sub_task_id": str(task.id),
-                                "depth": research_depth,
-                                "tasks_created": len(child_tasks),
-                                "finding_titles": [
-                                    f.get("title", "") for _, f, _ in deduplicated[:3]
-                                ],
-                                "insights": [
-                                    i["summary"][:150] for i in insights[:2]
-                                ],  # up to 2 insights, capped
-                            }
-                        )
+                        # Deduplicate by sub_task_id to prevent retried/replayed
+                        # completions from appending the same note twice. Check against
+                        # all notes in this entry and previous entries.
+                        subtask_id = str(task.id)
+                        all_subtask_ids = {note.get("sub_task_id") for note in sub_notes}
+                        for prev_entry in history[:-1]:
+                            all_subtask_ids.update(
+                                note.get("sub_task_id")
+                                for note in prev_entry.get("sub_research_notes", [])
+                            )
+                        if subtask_id not in all_subtask_ids:
+                            sub_notes.append(
+                                {
+                                    "sub_task_id": subtask_id,
+                                    "depth": research_depth,
+                                    "tasks_created": len(child_tasks),
+                                    "finding_titles": [
+                                        f.get("title", "") for _, f, _ in deduplicated[:3]
+                                    ],
+                                    "insights": [
+                                        i["summary"][:150] for i in insights[:2]
+                                    ],  # up to 2 insights, capped
+                                }
+                            )
                         last_entry["sub_research_notes"] = sub_notes[-5:]  # keep last 5
                         history[-1] = last_entry
                         d["research_history"] = history

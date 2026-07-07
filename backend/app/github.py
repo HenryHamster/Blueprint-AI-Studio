@@ -96,6 +96,20 @@ def _record_call(method: str, url: str) -> None:
     _ss.github_call_counts[template] = _ss.github_call_counts.get(template, 0) + 1
 
 
+def _record_consumer_call(consumer: str | None, url: str) -> None:
+    """Bump the per-consumer counter alongside _record_call.
+
+    ``consumer`` names the high-level caller (e.g. "release_qualifier",
+    "ci_monitor") so post-incident analysis can see WHICH loop/sweep drained
+    the install-token budget.  Falls back to "unknown" when no tag is supplied.
+    Only counts install-token paths (same scope as github_call_counts).
+    """
+    import app.shared_state as _ss
+
+    key = consumer or "unknown"
+    _ss.github_consumer_counts[key] = _ss.github_consumer_counts.get(key, 0) + 1
+
+
 async def probe_rate_limit() -> bool:
     """Ping /rate_limit (free call) to keep github_quota fresh for the dashboard.
 
@@ -145,6 +159,12 @@ RATE_LIMIT_FAST_FAIL_THRESHOLD_S = 5
 # pipeline. Env-overridable to match the pipeline-health threshold style.
 GITHUB_BUDGET_ALERT_FRACTION = float(os.getenv("GITHUB_BUDGET_ALERT_FRACTION", "0.20"))
 _last_budget_alert_window: int | None = None
+
+# Deferrable consumers (CI failure-detail fan-out, workflow-run diagnostics) skip
+# their expensive multi-call fan-out when the install bucket falls to this floor.
+# Lower than GROUNDING_QUOTA_RESERVE (500) — diagnostics are less critical than
+# existence checks, but still leaves headroom for promotion/merge ops.
+DEFERRABLE_QUOTA_FLOOR = 300
 
 
 def _relevant_bucket(url: str, headers: dict | None) -> dict:
@@ -211,6 +231,11 @@ def _update_quota_state(
         # Endpoint counter reset only makes sense for the install bucket — the
         # counter scopes to "this 5000/hr window", not to JWT activity.
         if bucket_name == "install":
+            # Snapshot consumer counts before clearing so the previous window's
+            # breakdown survives for post-incident inspection.
+            if _ss.github_consumer_counts:
+                _ss.github_consumer_counts_snapshot = dict(_ss.github_consumer_counts)
+                _ss.github_consumer_counts.clear()
             _ss.github_call_counts.clear()
             for k in _ss.github_cache_hits:
                 _ss.github_cache_hits[k] = 0
@@ -226,6 +251,29 @@ def _update_quota_state(
         if bucket_name == "install" and _ss.github_call_counts_window_reset_at is None:
             _ss.github_call_counts_window_reset_at = reset_ts
     q["last_updated"] = now_iso
+
+    # Accumulate off-backend burn estimate for the install bucket.
+    # Compares observed X-RateLimit-Remaining drop to locally-counted backend
+    # calls; the gap represents external consumption (agent VMs, CI scripts).
+    if bucket_name == "install":
+        est = _ss.github_off_backend_estimate
+        if accept_unconditional:
+            # Rollover: github_call_counts was just cleared above, so anchor to 0.
+            est["cumulative_this_window"] = 0
+            est["_last_remaining"] = remaining
+            est["_last_backend_calls"] = sum(_ss.github_call_counts.values())
+        elif est.get("_last_remaining") is not None:
+            current_backend_calls = sum(_ss.github_call_counts.values())
+            observed_drop = est["_last_remaining"] - remaining
+            local_delta = current_backend_calls - est["_last_backend_calls"]
+            drift = max(0, observed_drop - local_delta)
+            est["cumulative_this_window"] = est.get("cumulative_this_window", 0) + drift
+            est["_last_remaining"] = remaining
+            est["_last_backend_calls"] = current_backend_calls
+        else:
+            # First observation this window — establish anchor, nothing to diff.
+            est["_last_remaining"] = remaining
+            est["_last_backend_calls"] = sum(_ss.github_call_counts.values())
 
     # Budget alert: warn ONCE per hourly window when the install bucket first
     # crosses <=20% remaining, so an operator sees exhaustion coming instead of
@@ -255,12 +303,25 @@ def _post_github_budget_alert(remaining: int, limit: int, reset_ts: int) -> None
     plus a detached webhook — rather than a project-scoped ``Alert`` DB row.
     All dispatch errors are swallowed; a failed alert must never break a request.
     """
+    import app.shared_state as _ss
+
+    # Snapshot consumer counts at alert time so the post-incident breakdown
+    # captures who was burning quota at the moment the low-budget threshold
+    # fired. Unlike rollover, we do NOT clear the live dict here — the window
+    # is still active and counts keep accumulating.
+    if _ss.github_consumer_counts:
+        _ss.github_consumer_counts_snapshot = dict(_ss.github_consumer_counts)
+
     pct = (100 * remaining / limit) if limit else 0
     title = "GitHub install-token budget low"
+    _backend_calls = sum(_ss.github_call_counts.values())
+    _ext_estimate = _ss.github_off_backend_estimate.get("cumulative_this_window", 0)
     message = (
         f"{remaining}/{limit} ({pct:.0f}%) install-token budget remaining; "
-        f"resets in {max(0, reset_ts - int(time.time()))}s. Top burn endpoints: "
-        f"see github_call_counts on /api/health/detailed."
+        f"resets in {max(0, reset_ts - int(time.time()))}s. "
+        f"Backend calls this window: {_backend_calls}; "
+        f"estimated off-backend burn: {_ext_estimate}. "
+        f"Top consumers: see github_consumer_counts_snapshot on /api/health/detailed."
     )
     logger.error(
         title,
@@ -285,6 +346,26 @@ def _post_github_budget_alert(remaining: int, limit: int, reset_ts: int) -> None
         pass
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[GITHUB] budget alert webhook dispatch skipped: {e}")
+
+
+def _deferrable_quota_active() -> bool:
+    """Whether deferrable consumers should skip diagnostic fan-out.
+
+    True only when the install bucket has been observed below DEFERRABLE_QUOTA_FLOOR
+    with a reset still in the future. An unobserved bucket (remaining is None)
+    never gates — only gate on observed evidence, not boot-time unknowns.
+    """
+    import app.shared_state as _ss
+
+    q = _ss.github_quota
+    remaining = q.get("remaining")
+    if remaining is None or remaining >= DEFERRABLE_QUOTA_FLOOR:
+        return False
+    reset_at = q.get("reset_at")
+    if reset_at is not None and int(reset_at) <= int(time.time()):
+        # Window already rolled over; stale low reading is meaningless.
+        return False
+    return True
 
 
 def _synthetic_rate_limited_response(bucket: dict) -> httpx.Response:
@@ -315,6 +396,7 @@ async def _github_request(
     headers: dict,
     max_retries: int = 3,
     project_id: str | None = None,
+    consumer: str | None = None,
     **kwargs,
 ) -> httpx.Response:
     """Coalescing dispatcher in front of :func:`_github_request_uncoalesced`.
@@ -336,7 +418,7 @@ async def _github_request(
         or "content" in kwargs
     ):
         return await _github_request_uncoalesced(
-            method, url, headers, max_retries, project_id, **kwargs
+            method, url, headers, max_retries, project_id, consumer=consumer, **kwargs
         )
     key = ("GET", url)
     existing = _inflight_reads.get(key)
@@ -349,7 +431,7 @@ async def _github_request(
         return await existing
     task = asyncio.ensure_future(
         _github_request_uncoalesced(
-            method, url, headers, max_retries, project_id, **kwargs
+            method, url, headers, max_retries, project_id, consumer=consumer, **kwargs
         )
     )
     _inflight_reads[key] = task
@@ -363,6 +445,7 @@ async def _github_request_uncoalesced(
     headers: dict,
     max_retries: int = 3,
     project_id: str | None = None,
+    consumer: str | None = None,
     **kwargs,
 ) -> httpx.Response:
     """Make a GitHub API request with retry on 5xx/network/rate-limit errors."""
@@ -398,6 +481,7 @@ async def _github_request_uncoalesced(
             # endpoint" which is what we care about when diagnosing burn
             # (though per GitHub docs 403s don't consume quota themselves).
             _record_call(method, url)
+            _record_consumer_call(consumer, url)
             response = await client.request(method, url, headers=headers, **kwargs)
             # 429 or 403 rate limit — GitHub uses 403 for primary rate limit
             # exhaustion (5,000 req/hr) and 429 for secondary/search limits.
@@ -1046,6 +1130,8 @@ from app.github_checks import (  # noqa: F401
     get_check_runs,
     get_workflow_run_for_sha,
     AGENT_BAKE_WORKFLOW_FILE,
+    CI_WORKFLOW_FILE,
+    dispatch_workflow_run,
     invalidate_check_runs_cache,
     get_check_runs_cached,
     _CHECK_RUNS_CACHE_TTL_S,

@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react';
-import { apiFetch, fetchVersionLifecycle } from '../api';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { apiFetch, fetchVersionLifecycle, submitChurnRetirementDecision } from '../api';
 import type { CurrentVersion } from '../api';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { useDirectionForm } from './useDirectionForm';
@@ -14,6 +14,59 @@ interface UseDirectionsDataDeps {
   // Optional ref the live WS handler (useLogViewer) calls to trigger a refetch
   // when the strategist emits an update. Populated here, reset to a no-op on unmount.
   fetchDirectionsRef?: React.MutableRefObject<() => void>;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function areJsonLikeEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (!areJsonLikeEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
+    if (aKeys.length !== bKeys.length) return false;
+    for (const key of aKeys) {
+      if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+      if (!areJsonLikeEqual(a[key], b[key])) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function preserveDirectionArray(prev: Direction[], next: Direction[]): Direction[] {
+  if (prev.length === 0) return next;
+  const prevById = new Map(prev.map(direction => [direction.id, direction]));
+  let changed = prev.length !== next.length;
+  const shared = next.map((direction, index) => {
+    const previous = prevById.get(direction.id);
+    if (previous && areJsonLikeEqual(previous, direction)) {
+      if (previous !== prev[index]) changed = true;
+      return previous;
+    }
+    changed = true;
+    return direction;
+  });
+  return changed ? shared : prev;
+}
+
+function preserveRecordValues<T extends Record<string, unknown>>(prev: T, next: T): T {
+  if (areJsonLikeEqual(prev, next)) return prev;
+  const shared = { ...next } as T;
+  for (const key of Object.keys(next) as Array<keyof T>) {
+    if (Object.prototype.hasOwnProperty.call(prev, key) && areJsonLikeEqual(prev[key], next[key])) {
+      shared[key] = prev[key];
+    }
+  }
+  return shared;
 }
 
 /**
@@ -95,6 +148,10 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   const fetchDirectionsLatestRef = useRef(fetchDirections);
   fetchDirectionsLatestRef.current = fetchDirections;
 
+  // Stable ref so memoized handlers can read current directions without deps churn.
+  const directionsRef = useRef(directions);
+  directionsRef.current = directions;
+
   // Register a stable callback into the externally-owned ref so the live WS
   // handler can trigger a refetch. Reset to a no-op on unmount to avoid a
   // stale-closure setState after the panel closes.
@@ -107,7 +164,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   }, [fetchDirectionsRef]);
 
   async function fetchDirections({ lite = false }: { lite?: boolean } = {}) {
-    setLoading(true);
+    if (!lite) setLoading(true);
     try {
       const baseUrl = `/api/admin/projects/${selectedProjectId}/directions`;
       const directionsUrl = lite ? `${baseUrl}?lite=1` : baseUrl;
@@ -125,7 +182,8 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       ]);
       if (!res.ok) throw new Error('Failed to fetch directions');
       const data = await res.json();
-      setDirections(data.directions ?? []);
+      const nextDirections = data.directions ?? [];
+      setDirections(prev => preserveDirectionArray(prev, nextDirections));
       setAutonomousEnabled(data.autonomous_enabled ?? false);
       setRunningUpdate(typeof data.running_update === 'string' ? data.running_update : null);
       setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
@@ -140,8 +198,10 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       }
       if (countsRes.ok) {
         const countsData = await countsRes.json();
-        setTaskCounts(countsData.counts ?? {});
-        setActiveTasks(countsData.active_tasks ?? {});
+        const nextCounts = countsData.counts ?? {};
+        const nextActiveTasks = countsData.active_tasks ?? {};
+        setTaskCounts(prev => preserveRecordValues(prev, nextCounts));
+        setActiveTasks(prev => preserveRecordValues(prev, nextActiveTasks));
       }
       // Await the version lifecycle that was already running in parallel (full load only).
       if (versionLifecyclePromise) {
@@ -153,10 +213,10 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       console.error('Failed to fetch directions:', err);
       addToast('Failed to load directions', 'error');
     }
-    setLoading(false);
+    if (!lite) setLoading(false);
   }
 
-  async function triggerCycle(phase: 'design_doc' | 'strategic_review' | 'full') {
+  const triggerCycle = useCallback(async (phase: 'design_doc' | 'strategic_review' | 'full') => {
     if (!selectedProjectId) return;
     const apiPhase = phase === 'full' ? 'design_doc' : phase;
     const labels = {
@@ -180,9 +240,9 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
         'error',
       );
     }
-  }
+  }, [selectedProjectId, addToast]);
 
-  async function addDirection() {
+  const addDirection = useCallback(async () => {
     if (!form.newText.trim() || !selectedProjectId) return;
     setError(null);
     try {
@@ -213,14 +273,14 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       // logical add already landed — that is a clean success, not an error.
       await res.json().catch(() => ({}));
       form.resetAddForm();
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       form.markAddAttemptFailed();
       setError('Failed to add direction. Please try again.');
     }
-  }
+  }, [selectedProjectId, openVersionNumber, form.newText, form.newPriority, form.newPathTags, form.newCategory, form.newCompletionCriteria, form.newSuccessEvidence, form.newRetirementCondition, form.newStaged, form.newLinkedGapId, form.resetAddForm, form.markAddAttemptFailed]);
 
-  async function updateDirection(id: string) {
+  const updateDirection = useCallback(async (id: string) => {
     setError(null);
     try {
       const costBudget = form.editCostBudget.trim() !== '' ? parseFloat(form.editCostBudget) : null;
@@ -230,13 +290,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       });
       if (!res.ok) throw new Error('Failed to update direction');
       form.setEditingId(null);
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to update direction. Please try again.');
     }
-  }
+  }, [selectedProjectId, form.editCostBudget, form.editText, form.editPriority, form.editStatus, form.editPathTags, form.editCategory, form.editCompletionCriteria, form.editSuccessEvidence, form.editRetirementCondition, form.setEditingId]);
 
-  async function quickToggleStatus(id: string, currentStatus: 'active' | 'paused') {
+  const quickToggleStatus = useCallback(async (id: string, currentStatus: 'active' | 'paused') => {
     setError(null);
     const newStatus = currentStatus === 'active' ? 'paused' : 'active';
     try {
@@ -245,13 +305,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
         body: JSON.stringify({ status: newStatus }),
       });
       if (!res.ok) throw new Error('Failed to update status');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to update status. Please try again.');
     }
-  }
+  }, [selectedProjectId]);
 
-  async function reactivateDirection(id: string) {
+  const reactivateDirection = useCallback(async (id: string) => {
     setError(null);
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
@@ -259,15 +319,15 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
         body: JSON.stringify({ status: 'active' }),
       });
       if (!res.ok) throw new Error('Failed to reactivate direction');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to reactivate direction. Please try again.');
     }
-  }
+  }, [selectedProjectId]);
 
   // Activate a staged direction immediately instead of waiting for the next
   // version to open. Reuses the PATCH status:'active' transition.
-  async function activateStagedDirection(id: string) {
+  const activateStagedDirection = useCallback(async (id: string) => {
     setError(null);
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
@@ -276,17 +336,17 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       });
       if (!res.ok) throw new Error('Failed to activate staged direction');
       addToast('Staged direction activated', 'success');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to activate staged direction. Please try again.');
     }
-  }
+  }, [selectedProjectId, addToast]);
 
   // Retarget an already-staged direction to a different (current-or-future)
   // version. Sends only staged_for_version so the backend keeps the direction
   // staged and re-binds its marker; it validates the target (rejecting an
   // already-promoted version) and 409s if the direction is no longer staged.
-  async function retargetStagedDirection(id: string, version: number) {
+  const retargetStagedDirection = useCallback(async (id: string, version: number) => {
     setError(null);
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
@@ -295,15 +355,15 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       });
       if (!res.ok) throw new Error('Failed to retarget staged direction');
       addToast(`Retargeted to v${version}`, 'success');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to retarget staged direction. Please try again.');
     }
-  }
+  }, [selectedProjectId, addToast]);
 
   // Cancel a staged direction. DELETE leaves a tombstone (handled backend-side)
   // so the strategist won't immediately re-stage the same idea.
-  async function cancelStagedDirection(id: string) {
+  const cancelStagedDirection = useCallback(async (id: string) => {
     if (!window.confirm('Cancel this staged direction? It will not auto-activate at the next version.')) return;
     setError(null);
     try {
@@ -312,26 +372,26 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       });
       if (!res.ok) throw new Error('Failed to cancel staged direction');
       addToast('Staged direction cancelled', 'info');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to cancel staged direction. Please try again.');
     }
-  }
+  }, [selectedProjectId, addToast]);
 
-  async function unholdDirection(id: string) {
+  const unholdDirection = useCallback(async (id: string) => {
     setError(null);
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}/unhold`, {
         method: 'POST',
       });
       if (!res.ok) throw new Error('Failed to unhold direction');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to unhold direction. Please try again.');
     }
-  }
+  }, [selectedProjectId]);
 
-  async function markDirectionComplete(id: string) {
+  const markDirectionComplete = useCallback(async (id: string) => {
     setError(null);
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
@@ -339,13 +399,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
         body: JSON.stringify({ status: 'completed' }),
       });
       if (!res.ok) throw new Error('Failed to mark direction as complete');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to mark direction as complete. Please try again.');
     }
-  }
+  }, [selectedProjectId]);
 
-  async function approveProposal(id: string) {
+  const approveProposal = useCallback(async (id: string) => {
     setError(null);
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
@@ -354,13 +414,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       });
       if (!res.ok) throw new Error('Failed to approve proposal');
       addToast('Direction approved and activated', 'success');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to approve proposal. Please try again.');
     }
-  }
+  }, [selectedProjectId, addToast]);
 
-  async function rejectProposal(id: string) {
+  const rejectProposal = useCallback(async (id: string) => {
     setError(null);
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
@@ -368,13 +428,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       });
       if (!res.ok) throw new Error('Failed to reject proposal');
       addToast('Direction proposal rejected', 'info');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to reject proposal. Please try again.');
     }
-  }
+  }, [selectedProjectId, addToast]);
 
-  async function reviveProposal(id: string) {
+  const reviveProposal = useCallback(async (id: string) => {
     setError(null);
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
@@ -383,13 +443,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       });
       if (!res.ok) throw new Error('Failed to revive proposal');
       addToast('Expired proposal revived', 'success');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to revive proposal. Please try again.');
     }
-  }
+  }, [selectedProjectId, addToast]);
 
-  async function applyDirectionUpdate(d: Direction) {
+  const applyDirectionUpdate = useCallback(async (d: Direction) => {
     if (!d.pending_update) return;
     setError(null);
     try {
@@ -402,13 +462,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
         body: JSON.stringify(updated),
       });
       if (!res.ok) throw new Error('Failed to apply direction update');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to apply direction update. Please try again.');
     }
-  }
+  }, [selectedProjectId]);
 
-  async function dismissDirectionUpdate(id: string) {
+  const dismissDirectionUpdate = useCallback(async (id: string) => {
     setError(null);
     try {
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
@@ -416,13 +476,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
         body: JSON.stringify({ pending_update: null }),
       });
       if (!res.ok) throw new Error('Failed to dismiss direction update');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to dismiss direction update. Please try again.');
     }
-  }
+  }, [selectedProjectId]);
 
-  async function deleteDirection(id: string) {
+  const deleteDirection = useCallback(async (id: string) => {
     if (!window.confirm('Are you sure you want to delete this direction?')) return;
     setError(null);
     try {
@@ -430,13 +490,13 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
         method: 'DELETE',
       });
       if (!res.ok) throw new Error('Failed to delete direction');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to delete direction. Please try again.');
     }
-  }
+  }, [selectedProjectId]);
 
-  async function toggleAutonomous() {
+  const toggleAutonomous = useCallback(async () => {
     setError(null);
     const newValue = !autonomousEnabled;
     try {
@@ -449,10 +509,11 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     } catch {
       setError('Failed to toggle autonomous mode. Please try again.');
     }
-  }
+  }, [selectedProjectId, autonomousEnabled]);
 
-  async function reorderDirections(newOrder: Direction[]) {
-    const previousDirections = directions;
+  const reorderDirections = useCallback(async (newOrder: Direction[]) => {
+    // Capture previous directions via ref to avoid including `directions` in deps.
+    const previousDirections = directionsRef.current;
     setDirections(prev => {
       const nonActive = prev.filter(d => d.status !== 'active');
       return [...newOrder, ...nonActive];
@@ -470,9 +531,9 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       setDirections(previousDirections);
       setError('Failed to reorder directions. Please try again.');
     }
-  }
+  }, [selectedProjectId]);
 
-  async function linkDirectionToGap(directionId: string, gapId: string) {
+  const linkDirectionToGap = useCallback(async (directionId: string, gapId: string) => {
     if (!selectedProjectId) return;
     setError(null);
     try {
@@ -482,13 +543,25 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       });
       if (!res.ok) throw new Error('Failed to link direction to gap');
       addToast('Direction linked to gap', 'success');
-      fetchDirections();
+      fetchDirectionsLatestRef.current();
     } catch {
       setError('Failed to link direction to gap. Please try again.');
     }
-  }
+  }, [selectedProjectId, addToast]);
 
-  async function triggerResearch(id: string, bypass = false) {
+  const decideChurnRetirement = useCallback(async (id: string, decision: 'KEEP' | 'RETIRE', rationale?: string) => {
+    if (!selectedProjectId) return;
+    setError(null);
+    try {
+      await submitChurnRetirementDecision(selectedProjectId, id, decision, rationale);
+      addToast(decision === 'KEEP' ? 'Direction kept — retirement recommendation cleared' : 'Direction retired', 'success');
+      fetchDirectionsLatestRef.current();
+    } catch {
+      setError('Failed to submit churn-retirement decision. Please try again.');
+    }
+  }, [selectedProjectId, addToast]);
+
+  const triggerResearch = useCallback(async (id: string, bypass = false) => {
     setResearchingIds(prev => ({ ...prev, [id]: true }));
     setForceConfirmId(null);
     setError(null);
@@ -502,7 +575,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     } finally {
       setResearchingIds(prev => ({ ...prev, [id]: false }));
     }
-  }
+  }, [selectedProjectId]);
 
   return {
     // Data state
@@ -553,6 +626,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     toggleAutonomous,
     reorderDirections,
     triggerResearch,
+    decideChurnRetirement,
     linkDirectionToGap,
   };
 }

@@ -554,8 +554,14 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     _ctx = task.context or {}
     _inherited_plan_branch = _ctx.get("plan_branch")
     _has_rollup_pr = bool(_ctx.get("rollup_pr_number"))
+    _adopted_foreign_branch = False
     if _inherited_plan_branch and _has_rollup_pr:
         plan_branch = _inherited_plan_branch
+        # This requeue-clone adopts an ancestor-named (foreign) staging branch
+        # to keep the merge-guard invariant intact. Stamp a DURABLE ownership
+        # flag so the rollup OWNER-gate lets this task carry the branch to base
+        # even though the name doesn't match its own id-prefix (invariant #2).
+        _adopted_foreign_branch = True
     else:
         plan_branch = f"{plan_branch_prefix}{short_id}"
 
@@ -571,6 +577,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         **(task.context or {}),
         "plan_branch": plan_branch,
         "parent_base": parent_base,
+        **({"owns_rollup_branch": True} if _adopted_foreign_branch else {}),
     }
     session.add(task)
 

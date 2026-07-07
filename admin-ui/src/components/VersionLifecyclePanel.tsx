@@ -1,10 +1,14 @@
 import { useState, useEffect, useRef } from 'react';
+import { ConfirmDialog } from './ConfirmDialog';
 import { VersionSummaryPanel } from './VersionSummaryPanel';
 import {
+  attestAcceptanceCriterion,
   clearDeployFailed,
   cutVersion,
   fetchQualificationVerdicts,
+  linkCriteriaToDirection,
   patchAdminSettings,
+  reinstateAcceptanceCriterion,
   setProjectPromotionEnabled,
   setVersionPhase,
   setVersionGoal,
@@ -55,6 +59,33 @@ function generateIdempotencyKey(): string {
   return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function DebtEnforcePreview({
+  q,
+}: {
+  q: {
+    debt_enforce_confidence_preview?: number | null;
+    debt_enforce_weight_preview?: number | null;
+  } | null;
+}) {
+  if (
+    !q ||
+    q.debt_enforce_confidence_preview == null ||
+    q.debt_enforce_weight_preview == null
+  ) {
+    return null;
+  }
+  return (
+    <span
+      data-testid="debt-enforce-preview"
+      className="text-ui-xs font-mono text-cyan-400"
+      title="Observe-mode confidence preview if completion-debt weight mode were enforced"
+    >
+      enforce {Math.round(q.debt_enforce_confidence_preview * 100)}%
+      {` @w${q.debt_enforce_weight_preview.toFixed(2)}`}
+    </span>
+  );
+}
+
 interface VersionLifecyclePanelProps {
   data: VersionLifecycleResponse | null;
   loading: boolean;
@@ -67,10 +98,20 @@ interface VersionLifecyclePanelProps {
   agentServingShas?: AgentServingShasResponse | null;
 }
 
+interface LocalDialogConfig {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  attestationInput?: { label: string; placeholder?: string };
+  onConfirm: (reason?: string) => void;
+}
+
 export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole, refreshError, lastSuccessfulRefreshAt, refreshing = false, agentServingShas }: VersionLifecyclePanelProps) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [localDialog, setLocalDialog] = useState<LocalDialogConfig | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
+  const [verdictsError, setVerdictsError] = useState<string | null>(null);
   const [editingGoal, setEditingGoal] = useState<boolean>(false);
   const [goalInput, setGoalInput] = useState<string>('');
   const [optimisticOverrides, setOptimisticOverrides] = useState<Partial<CurrentVersion> | null>(null);
@@ -83,9 +124,11 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // a lost-response retry, cleared on success so the next cut gets a fresh key.
   const cutIdempotencyKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!projectId) { setVerdicts([]); return; }
-    fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
-  }, [projectId]);
+    if (!projectId) { setVerdicts([]); setVerdictsError(null); return; }
+    fetchQualificationVerdicts(projectId, 10)
+      .then(r => { setVerdicts(r.verdicts); setVerdictsError(null); })
+      .catch(() => { setVerdictsError('Failed to load verdict history.'); });
+  }, [projectId, data]);
   useEffect(() => {
     if (data?.current_version?.goal !== undefined) {
       setGoalInput(data.current_version.goal || '');
@@ -215,41 +258,63 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     }
   };
 
-  const handleTogglePromotionEnabled = async () => {
+  const handleTogglePromotionEnabled = () => {
     const nextValue = !optimisticPromotionEnabled;
-    if (nextValue && !window.confirm('Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.')) return;
-    setActionLoading('promotion');
-    setActionMsg(null);
-    setPromotionEnabledOverride(nextValue);
-    try {
-      await patchAdminSettings({ promotion_enabled: nextValue });
-      setActionMsg(nextValue ? 'Live promotion enabled' : 'Live promotion disabled');
-      onRefresh();
-    } catch {
-      setActionMsg('Request failed');
-      setPromotionEnabledOverride(null);
-    } finally {
-      setActionLoading(null);
+    const doAction = async () => {
+      setActionLoading('promotion');
+      setActionMsg(null);
+      setPromotionEnabledOverride(nextValue);
+      try {
+        await patchAdminSettings({ promotion_enabled: nextValue });
+        setActionMsg(nextValue ? 'Live promotion enabled' : 'Live promotion disabled');
+        onRefresh();
+      } catch {
+        setActionMsg('Request failed');
+        setPromotionEnabledOverride(null);
+      } finally {
+        setActionLoading(null);
+      }
+    };
+    if (nextValue) {
+      setLocalDialog({
+        title: 'Enable fleet-wide live promotion?',
+        message: 'Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.',
+        confirmLabel: 'Enable',
+        onConfirm: () => { setLocalDialog(null); doAction(); },
+      });
+    } else {
+      doAction();
     }
   };
 
-  const handleSetProjectPromotion = async (enabled: boolean | null) => {
+  const handleSetProjectPromotion = (enabled: boolean | null) => {
     if (!projectId) return;
-    if (enabled === true && !window.confirm('Arm live promotion for THIS project only? Passing qualify runs will push this project to main.')) return;
-    setActionLoading('project-promotion');
-    setActionMsg(null);
-    try {
-      await setProjectPromotionEnabled(projectId, enabled);
-      setActionMsg(enabled === null ? 'Using fleet default' : enabled ? 'Project live promotion armed' : 'Project live promotion held');
-      onRefresh();
-    } catch {
-      setActionMsg('Request failed');
-    } finally {
-      setActionLoading(null);
+    const doAction = async () => {
+      setActionLoading('project-promotion');
+      setActionMsg(null);
+      try {
+        await setProjectPromotionEnabled(projectId, enabled);
+        setActionMsg(enabled === null ? 'Using fleet default' : enabled ? 'Project live promotion armed' : 'Project live promotion held');
+        onRefresh();
+      } catch {
+        setActionMsg('Request failed');
+      } finally {
+        setActionLoading(null);
+      }
+    };
+    if (enabled === true) {
+      setLocalDialog({
+        title: 'Arm project live promotion?',
+        message: 'Arm live promotion for THIS project only? Passing qualify runs will push this project to main.',
+        confirmLabel: 'Arm',
+        onConfirm: () => { setLocalDialog(null); doAction(); },
+      });
+    } else {
+      doAction();
     }
   };
 
-  const handleCutVersion = async () => {
+  const handleCutVersion = () => {
     if (!projectId || !cv) return;
     const activating = stagedActivatedByCut(data?.staged_directions ?? [], cv.version_number);
     const inFlight = cv.in_flight_task_count ?? 0;
@@ -272,65 +337,157 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     const msg = consequences.length
       ? `Abandon v${cv.version_number} and open a fresh version?\n\nThis will: ${consequences.join('; ')}.`
       : `Abandon v${cv.version_number} and open a fresh version?`;
-    if (!window.confirm(msg)) return;
-    setActionLoading('cut');
-    setActionMsg(null);
-    if (!cutIdempotencyKeyRef.current) {
-      cutIdempotencyKeyRef.current = generateIdempotencyKey();
-    }
-    try {
-      const result = await cutVersion(projectId, cutReason || undefined, cutIdempotencyKeyRef.current);
-      setActionMsg(`Cut v${result.abandoned_version.version_number} → opened v${result.new_version.version_number}`);
-      setCuttingVersion(false);
-      setCutReason('');
-      cutIdempotencyKeyRef.current = null;
-      onRefresh();
-    } catch (error) {
-      setActionMsg(error instanceof Error ? error.message : 'Request failed');
-    } finally {
-      setActionLoading(null);
-    }
+    setLocalDialog({
+      title: `Abandon v${cv.version_number}?`,
+      message: msg,
+      confirmLabel: 'Abandon',
+      onConfirm: async () => {
+        setLocalDialog(null);
+        setActionLoading('cut');
+        setActionMsg(null);
+        if (!cutIdempotencyKeyRef.current) {
+          cutIdempotencyKeyRef.current = generateIdempotencyKey();
+        }
+        try {
+          const result = await cutVersion(projectId, cutReason || undefined, cutIdempotencyKeyRef.current);
+          setActionMsg(`Cut v${result.abandoned_version.version_number} → opened v${result.new_version.version_number}`);
+          setCuttingVersion(false);
+          setCutReason('');
+          cutIdempotencyKeyRef.current = null;
+          onRefresh();
+        } catch (error) {
+          setActionMsg(error instanceof Error ? error.message : 'Request failed');
+        } finally {
+          setActionLoading(null);
+        }
+      },
+    });
   };
 
   // Clear a stale post-promotion deploy_failed serving state. First attempts the
   // verify path (no force) — the backend clears only if the promoted SHA is
-  // independently observed serving. If it refuses (live SHA unobservable), prompt
-  // for an attestation reason and retry the operator-attested force path.
-  const handleClearDeployFailed = async () => {
+  // independently observed serving. If it refuses (live SHA unobservable), show
+  // an attestation-reason dialog and retry the operator-attested force path.
+  const handleClearDeployFailed = () => {
     if (!projectId) return;
-    if (!window.confirm('Clear the stale deploy-failed serving state for the promoted version?\n\nThe deploy must be independently confirmed serving, or you will be asked to attest it is live.')) return;
-    setActionLoading('clear-deploy-failed');
-    setActionMsg(null);
-    try {
-      const result = await clearDeployFailed(projectId);
-      setActionMsg(`Deploy-failed cleared (${result.clear_mode}) → ${result.serving_status ?? 'n/a'}`);
-      onRefresh();
-    } catch (verifyError) {
-      const msg = verifyError instanceof Error ? verifyError.message : '';
-      // Only offer the attested override when the backend explicitly asked for it
-      // (the verify path could not confirm the deploy live).
-      if (!msg.includes('force=true')) {
-        setActionMsg(msg || 'Request failed');
-        setActionLoading(null);
-        return;
-      }
-      const reason = window.prompt('The deploy could not be independently verified live. To force-clear, enter an attestation reason (required):');
-      if (!reason || !reason.trim()) {
-        setActionMsg(msg);
-        setActionLoading(null);
-        return;
-      }
-      try {
-        const result = await clearDeployFailed(projectId, true, reason.trim());
-        setActionMsg(`Deploy-failed cleared (operator-attested) → ${result.serving_status ?? 'n/a'}`);
-        onRefresh();
-      } catch (forceError) {
-        setActionMsg(forceError instanceof Error ? forceError.message : 'Request failed');
-      }
-    } finally {
-      setActionLoading(null);
-    }
+    setLocalDialog({
+      title: 'Clear deploy-failed?',
+      message: 'Clear the stale deploy-failed serving state for the promoted version?\n\nThe deploy must be independently confirmed serving, or you will be asked to attest it is live.',
+      confirmLabel: 'Clear',
+      onConfirm: async () => {
+        setLocalDialog(null);
+        setActionLoading('clear-deploy-failed');
+        setActionMsg(null);
+        try {
+          const result = await clearDeployFailed(projectId);
+          setActionMsg(`Deploy-failed cleared (${result.clear_mode}) → ${result.serving_status ?? 'n/a'}`);
+          onRefresh();
+          setActionLoading(null);
+        } catch (verifyError) {
+          const msg = verifyError instanceof Error ? verifyError.message : '';
+          // Only offer the attested override when the backend explicitly asked for it.
+          if (!msg.includes('force=true')) {
+            setActionMsg(msg || 'Request failed');
+            setActionLoading(null);
+            return;
+          }
+          setActionLoading(null);
+          setLocalDialog({
+            title: 'Attest deploy is live',
+            message: 'The deploy could not be independently verified live. To force-clear, enter an attestation reason (required).',
+            confirmLabel: 'Force clear',
+            attestationInput: { label: 'Attestation reason', placeholder: 'e.g. verified live by hand' },
+            onConfirm: async (reason?: string) => {
+              setLocalDialog(null);
+              if (!reason || !reason.trim()) {
+                setActionMsg(msg);
+                return;
+              }
+              setActionLoading('clear-deploy-failed');
+              try {
+                const result = await clearDeployFailed(projectId, true, reason.trim());
+                setActionMsg(`Deploy-failed cleared (operator-attested) → ${result.serving_status ?? 'n/a'}`);
+                onRefresh();
+              } catch (forceError) {
+                setActionMsg(forceError instanceof Error ? forceError.message : 'Request failed');
+              } finally {
+                setActionLoading(null);
+              }
+            },
+          });
+        }
+      },
+    });
   };
+
+  const handleReinstate = projectId
+    ? async (criterionKey: string) => {
+        try {
+          await reinstateAcceptanceCriterion(projectId, criterionKey);
+          onRefresh();
+        } catch (err) {
+          setActionMsg(err instanceof Error ? err.message : 'Failed to reinstate criterion');
+        }
+      }
+    : undefined;
+
+  const handleAttest = projectId
+    ? (criterionKey: string) => {
+        setLocalDialog({
+          title: 'Attest criterion',
+          message: `Record an operator attestation that criterion "${criterionKey}" is intentionally accepted despite being stuck.`,
+          confirmLabel: 'Attest',
+          attestationInput: { label: 'Attestation reason', placeholder: 'e.g. direction retired; criterion superseded by new approach' },
+          onConfirm: async (reason?: string) => {
+            setLocalDialog(null);
+            if (!reason || !reason.trim()) {
+              setActionMsg('Attestation reason is required');
+              return;
+            }
+            setActionLoading('attest');
+            setActionMsg(null);
+            try {
+              await attestAcceptanceCriterion(projectId, criterionKey, reason.trim());
+              setActionMsg('Criterion attested');
+              onRefresh();
+            } catch (err) {
+              setActionMsg(err instanceof Error ? err.message : 'Failed to attest criterion');
+            } finally {
+              setActionLoading(null);
+            }
+          },
+        });
+      }
+    : undefined;
+
+  const handleLinkDirection = projectId
+    ? (criterionKey: string) => {
+        setLocalDialog({
+          title: 'Link criterion to direction',
+          message: `Link criterion "${criterionKey}" to a direction by entering the direction key. This replaces the direction's existing criterion links.`,
+          confirmLabel: 'Link',
+          attestationInput: { label: 'Direction key', placeholder: 'e.g. d-abc12345' },
+          onConfirm: async (directionKey?: string) => {
+            setLocalDialog(null);
+            if (!directionKey || !directionKey.trim()) {
+              setActionMsg('Direction key is required');
+              return;
+            }
+            setActionLoading('link-direction');
+            setActionMsg(null);
+            try {
+              await linkCriteriaToDirection(projectId, directionKey.trim(), [criterionKey]);
+              setActionMsg('Criterion linked to direction');
+              onRefresh();
+            } catch (err) {
+              setActionMsg(err instanceof Error ? err.message : 'Failed to link criterion');
+            } finally {
+              setActionLoading(null);
+            }
+          },
+        });
+      }
+    : undefined;
 
   return (
     <section data-testid="version-lifecycle-panel">
@@ -595,6 +752,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2">
                   <QualSummary q={cv.last_qualification} />
+                  <DebtEnforcePreview q={cv.last_qualification} />
                   {cv.last_qualification.candidate_sha && (() => {
                     const matchedVerdict = verdicts.find(v => v.candidate_sha === cv.last_qualification?.candidate_sha);
                     return matchedVerdict?.terminal_status === 'promoted' ? (
@@ -628,11 +786,35 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                           ? <span className="text-neutral-600 italic">smoke disabled</span>
                           : <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
                         }
+                        {cv.last_qualification.sub_scores.debt_pressure != null && (
+                          cv.last_qualification.completion_debt?.total_open === 0
+                            ? <span className="text-emerald-600">debt: none</span>
+                            : <span className={cv.last_qualification.completion_debt != null && cv.last_qualification.completion_debt.total_open > 0 ? 'text-amber-400' : undefined}>
+                                debt: {cv.last_qualification.completion_debt?.total_open ?? '?'} open
+                              </span>
+                        )}
                       </>
                     )}
                     {cv.last_qualification.ci_resolution && (
                       <CiBadge ci={cv.last_qualification.ci_resolution} />
                     )}
+                  </div>
+                )}
+                {cv.last_qualification.completion_debt != null && cv.last_qualification.completion_debt.total_open > 0 && (
+                  <div className="text-ui-sm text-neutral-500 pl-2 border-l border-neutral-700/40 space-y-0.5" data-testid="debt-items-list">
+                    <span className="text-neutral-400">
+                      {cv.last_qualification.completion_debt.total_open} open debt{cv.last_qualification.completion_debt.total_open !== 1 ? 's' : ''} at qualification time
+                      {cv.last_qualification.completion_debt.total_open > cv.last_qualification.completion_debt.items.length && (
+                        <span className="text-neutral-600"> (showing {cv.last_qualification.completion_debt.items.length} oldest)</span>
+                      )}
+                    </span>
+                    {cv.last_qualification.completion_debt.items.map(item => (
+                      <div key={item.id} className="flex gap-x-2 text-neutral-500">
+                        <span className="font-mono text-ui-xs text-neutral-600">{item.kind}</span>
+                        <span className="truncate">{item.title}</span>
+                        {item.age_days != null && <span className="text-neutral-600 shrink-0">{item.age_days}d</span>}
+                      </div>
+                    ))}
                   </div>
                 )}
                 {cv.last_qualification.blocker && (
@@ -688,7 +870,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </span>
                 </button>
                 {changelogExpanded && (
-                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} />
+                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} onReinstate={handleReinstate} onAttest={handleAttest} onLinkDirection={handleLinkDirection} />
                 )}
               </div>
             )}
@@ -810,6 +992,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         {data.staged_directions && data.staged_directions.length > 0 && (
           <StagedDirectionsSummary staged={data.staged_directions} />
         )}
+        {verdictsError && (
+          <p data-testid="verdicts-error" className="text-ui-sm text-red-400">{verdictsError}</p>
+        )}
         {verdicts.length > 0 && (
           <div data-testid="verdict-history">
             <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
@@ -821,7 +1006,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
                     <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
                     {v.promotion_enabled && <span className="text-ui-xs font-mono text-emerald-600">LIVE</span>}
-                    {v.sub_scores && <span className="text-neutral-600 font-mono text-ui-xs">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)}{v.smoketest_enabled === false ? ' s:—' : ` s:${Math.round(v.sub_scores.smoketest * 100)}`}</span>}
+                    <DebtEnforcePreview q={v} />
+                    {v.sub_scores && <span className="text-neutral-600 font-mono text-ui-xs">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)}{v.smoketest_enabled === false ? ' s:—' : ` s:${Math.round(v.sub_scores.smoketest * 100)}`}{v.sub_scores.debt_pressure != null ? ` d:${v.completion_debt?.total_open ?? '?'}open` : ''}</span>}
                     {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
                     {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
                     {v.terminal_status === 'promoted' && (
@@ -896,6 +1082,16 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
           </div>
         )}
       </div>
+      {localDialog && (
+        <ConfirmDialog
+          title={localDialog.title}
+          message={localDialog.message}
+          confirmLabel={localDialog.confirmLabel}
+          attestationInput={localDialog.attestationInput}
+          onConfirm={localDialog.onConfirm}
+          onCancel={() => setLocalDialog(null)}
+        />
+      )}
     </section>
   );
 }

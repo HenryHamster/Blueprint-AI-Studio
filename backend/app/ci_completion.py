@@ -42,10 +42,70 @@ from app.ci_merge_helpers import (  # noqa: F401
     _pr_number_match,
     _relock_merge_task,
     _review_approved,
+    arm_ci_wait,
+    effective_pr_number,
 )
 from app.models import Task, TaskStatus, _utcnow
 
 logger = logging.getLogger(__name__)
+
+
+async def _auto_resolve_audit_findings_on_merge(
+    project_id,
+    finding_keys: list,
+    resolving_ref: str | None,
+    session,
+) -> None:
+    """Auto-resolve AuditFindingResolution ledger rows for a merged fix task.
+
+    Called on a successful PR merge when the (orig) task context carries
+    ``resolving_finding_keys``.  Best-effort: commits its own work and logs
+    failures per key; never re-raises (callers wrap in try/except).  Skips
+    silently when no open version exists for the project.
+    """
+    if not finding_keys:
+        return
+    from app.release_readiness import apply_finding_resolution
+    from app.release_version import current_open_version
+
+    version = await current_open_version(session, project_id)
+    if version is None:
+        logger.info(
+            "[CI] audit-finding auto-resolve: no open version for project %s — skipping",
+            project_id,
+        )
+        return
+
+    resolved = []
+    for key in finding_keys:
+        if not key or not isinstance(key, str):
+            continue
+        try:
+            await apply_finding_resolution(
+                session,
+                project_id,
+                version.id,
+                key,
+                "resolved",
+                resolving_ref=resolving_ref,
+            )
+            resolved.append(key)
+        except Exception:
+            logger.warning(
+                "[CI] audit-finding auto-resolve: failed for key %r (project %s) — continuing",
+                key,
+                project_id,
+                exc_info=True,
+            )
+    if resolved:
+        await session.commit()
+        logger.info(
+            "[CI] auto-resolved %d audit finding(s) for project %s version %s: %s",
+            len(resolved),
+            project_id,
+            version.id,
+            resolved,
+        )
 
 
 async def _refresh_empty_build_config_after_integration_landing(
@@ -87,6 +147,7 @@ async def _attempt_merge_with_retry_and_escalation(
     *,
     source: str,
     precomputed_migration_guard: tuple[bool, str | None] | None = None,
+    precomputed_size_cap: tuple[str, str | None] | None = None,
 ) -> bool:
     """Both gates are open — try to merge. Mutates ``task`` in place; caller commits.
 
@@ -159,7 +220,16 @@ async def _attempt_merge_with_retry_and_escalation(
         return False
 
     ci_loop = (task.context or {}).get("review_loop", {})
-    ci_pr_number = ci_loop.get("pr_number")
+    # PR-identity split-brain fix: resolve via the canonical accessor
+    # (review_loop.pr_number OR context.rollup_pr_number) so a rollup parked with
+    # its identity only at context.rollup_pr_number still merges here, and stamp
+    # it back onto the loop so every downstream read (the merge call below) and
+    # the recovery sweeps agree. Caller commits.
+    ci_pr_number = effective_pr_number(task)
+    if ci_pr_number and not ci_loop.get("pr_number"):
+        ci_loop["pr_number"] = ci_pr_number
+        task.context = {**(task.context or {}), "review_loop": ci_loop}
+        flag_modified(task, "context")
     ci_payload = task.first_payload
     ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get(
         "original_task_id", ""
@@ -244,7 +314,15 @@ async def _attempt_merge_with_retry_and_escalation(
                     from app.task_completion import _reset_review_loop_pr_head_cache
 
                     review_loop = _reset_review_loop_pr_head_cache(ci_loop)
-                    review_loop.update({"ci_waiting": True, "ci_passed": False})
+                    # Re-arm the CI wait on the rewritten PR head. arm_ci_wait
+                    # co-stamps pr_number + a fresh ci_wait_started so the merge
+                    # poll never sees the identity-less {ci_waiting} shape.
+                    arm_ci_wait(
+                        review_loop,
+                        pr_number=ci_pr_number,
+                        now_iso=_utcnow().isoformat(),
+                    )
+                    review_loop["ci_passed"] = False
                     task.context = {
                         **(task.context or {}),
                         "_migration_finalization": finalization,
@@ -268,6 +346,59 @@ async def _attempt_merge_with_retry_and_escalation(
             )[:500]
             session.add(task)
             return False
+
+    # Size-cap preflight for direct (non-rollup) task PRs.  Rollup parents
+    # run this check in rollup_management.py before reaching this path; skip
+    # here to avoid redundant GitHub I/O and a double-bump risk.
+    if ci_pr_number and ci_branch and not (task.context or {}).get("rollup_pr_number"):
+        from app.rollup_size_preflight import preflight_rollup_size_caps
+        from app.task_completion import _reset_review_loop_pr_head_cache
+
+        if precomputed_size_cap is not None:
+            _sc_verdict, _sc_reason = precomputed_size_cap
+        else:
+            _sc_verdict, _sc_reason = await preflight_rollup_size_caps(
+                gh_token,
+                owner,
+                repo,
+                ci_pr_number,
+                ci_branch,
+                project_id=str(task.project_id) if task.project_id else None,
+            )
+        from app.shared_state import runtime_config as _rt_cfg
+
+        _gates_on = _rt_cfg.get("require_approval_gates", True)
+        if _sc_verdict == "hold":
+            if _gates_on:
+                task.requires_approval = True
+            task.latest_status_message = (
+                f"Merge held — size-cap: {_sc_reason}"
+            )[:500]
+            session.add(task)
+            return False
+        if _sc_verdict == "bumped":
+            _sc_loop = _reset_review_loop_pr_head_cache(ci_loop)
+            arm_ci_wait(_sc_loop, pr_number=ci_pr_number, now_iso=_utcnow().isoformat())
+            _sc_loop["ci_passed"] = False
+            task.context = {
+                **(task.context or {}),
+                "_size_cap_bumped": _sc_reason,
+                "review_loop": _sc_loop,
+            }
+            flag_modified(task, "context")
+            task.latest_status_message = (
+                f"Merge deferred — size-cap bumped: {_sc_reason}; awaiting fresh CI"
+            )[:500]
+            session.add(task)
+            return False
+        if _sc_verdict == "defer":
+            logger.info(
+                "[CI] PR #%s size-cap preflight transient error — deferring: %s",
+                ci_pr_number,
+                _sc_reason,
+            )
+            return False
+        # "ok" → fall through to merge
 
     # Round 4 W1: capture a content snapshot BEFORE releasing the lock.
     # ``parent_id_local`` mirrors the snapshot-stale convention from
@@ -595,8 +726,18 @@ async def _attempt_merge_with_retry_and_escalation(
                                 == "stranded"
                             ):
                                 record_pr_merged = False
+                        # One representative task id per distinct direction among the
+                        # rollup's descendants that this landing newly credits —
+                        # populated by the membership propagation below and consumed by
+                        # the post-commit direction recompute so multi-direction rollups
+                        # heal every affected direction, not just orig's own. Storing the
+                        # id (a plain value) rather than the ORM object keeps the loop
+                        # safe across a mid-refresh session.rollback() that would expire
+                        # every instance and turn a stale attribute read into a
+                        # MissingGreenlet lazy-load.
+                        _orig_dir_reps: dict = {}
                         if record_pr_merged:
-                            apply_merged_landed_signal(
+                            _orig_landed_on_integration = apply_merged_landed_signal(
                                 orig,
                                 orig_project,
                                 base_branch=ci_base,
@@ -606,6 +747,40 @@ async def _attempt_merge_with_retry_and_escalation(
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
                             )
+                            # Membership-based merge-credit propagation across the
+                            # nested-rollup + squash boundary. apply_merged_landed_signal
+                            # above stamps only the rollup ITSELF; when it landed on the
+                            # integration branch every child whose PR merged onto the
+                            # rollup's staging branch also reached the trunk — but
+                            # squash-merge leaves each child's own merge commit an
+                            # ancestor of NOTHING on integration, so per-task ancestry
+                            # reconciliation (verify_rollup_merge_landed) can never
+                            # re-credit it. Stamp the landed signal by lineage subtree
+                            # instead — idempotent, force-drop aware — mirroring the
+                            # rollup-management sweep. Snapshot one representative task
+                            # id per distinct direction now (a plain value, safe across
+                            # a later session.rollback()) so the recompute below
+                            # re-credits each direction's churn / merge-rate counters.
+                            if _orig_landed_on_integration:
+                                from app.rollup_management import (
+                                    _propagate_landed_to_staging_merged_descendants,
+                                )
+
+                                _orig_stamped = (
+                                    await _propagate_landed_to_staging_merged_descendants(
+                                        orig.id, _orig_session
+                                    )
+                                )
+                                for _desc in _orig_stamped:
+                                    _desc_ctx = _desc.context or {}
+                                    _desc_did = _desc_ctx.get("direction_id")
+                                    _desc_rid = _desc_ctx.get("research_task_id")
+                                    if (
+                                        _desc_did
+                                        and _desc_rid
+                                        and _desc_did not in _orig_dir_reps
+                                    ):
+                                        _orig_dir_reps[_desc_did] = _desc.id
                         await _finalize_migration_reservation_after_merge(
                             orig,
                             _orig_session,
@@ -652,41 +827,93 @@ async def _attempt_merge_with_retry_and_escalation(
                             await refresh_direction_outcomes_after_merge(
                                 orig, _orig_session
                             )
-                        if record_pr_merged and orig.criterion_ids:
-                            try:
-                                from app import acceptance_criteria as _ac
-                                from app.release_version import (
-                                    current_open_version as _cur_open_version,
-                                )
+                            # The rollup can carry children in directions OTHER than
+                            # orig's own (a multi-direction research cycle). The
+                            # refresh above only heals orig's direction; recompute
+                            # each DISTINCT direction among the descendants just
+                            # stamped landed so its churn / merge-rate counters pick
+                            # up the merges that reached the trunk this tick. Deduped
+                            # by direction, so a rollup with many same-direction
+                            # children recomputes once.
+                            #
+                            # Re-materialize each rep by id inside the loop:
+                            # refresh_direction_outcomes_after_merge rolls the session
+                            # back on an internal recompute error, which expires every
+                            # ORM instance — a stale rep read on the next iteration
+                            # would then lazy-load under the async session and raise
+                            # MissingGreenlet. A fresh .get after a rollback reloads
+                            # cleanly (or returns None if the row vanished). Isolate
+                            # each rep in its own try/except so one direction's failure
+                            # can't abort the remaining recomputes for this tick.
+                            for _rep_id in _orig_dir_reps.values():
+                                try:
+                                    _rep = await _orig_session.get(Task, _rep_id)
+                                    if _rep is None:
+                                        continue
+                                    await refresh_direction_outcomes_after_merge(
+                                        _rep, _orig_session
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "[CI] direction recompute failed for rep "
+                                        "task %s after rollup merge (non-fatal)",
+                                        _rep_id,
+                                        exc_info=True,
+                                    )
+                        # criterion evidence is recorded unconditionally inside
+                        # refresh_direction_outcomes_after_merge (direction_outcomes.py)
+                        # — no separate call needed here.
 
-                                _open_ver = await _cur_open_version(
-                                    _orig_session, orig.project_id
+                        # Auto-resolve audit findings tagged on the fix task.
+                        # The finding keys live in the ORIG task's context under
+                        # ``resolving_finding_keys``; for direct merges (orig == task)
+                        # the same context applies. Best-effort: isolated try/except
+                        # so a resolution failure never aborts the merge.
+                        _resolving_keys = (orig.context or {}).get(
+                            "resolving_finding_keys"
+                        ) or []
+                        if _resolving_keys and orig.project_id:
+                            try:
+                                await _auto_resolve_audit_findings_on_merge(
+                                    orig.project_id,
+                                    list(_resolving_keys),
+                                    str(ci_pr_number) if ci_pr_number else None,
+                                    _orig_session,
                                 )
-                                if _open_ver is not None:
-                                    for _ckey in orig.criterion_ids:
-                                        _crit = await _ac.get_criterion_by_key(
-                                            _orig_session, _open_ver.id, _ckey
-                                        )
-                                        if _crit is not None:
-                                            await _ac.record_evidence(
-                                                _orig_session,
-                                                criterion_id=_crit.id,
-                                                project_id=orig.project_id,
-                                                source_kind="task_merge",
-                                                source_id=str(orig.id),
-                                                detail={"pr": ci_pr_number},
-                                            )
                             except Exception:
                                 logger.warning(
-                                    "[CI] Failed to record criterion evidence for "
-                                    "task %s after merge (non-fatal)",
-                                    orig.id,
+                                    "[CI] audit-finding auto-resolve failed for "
+                                    "PR #%s (non-fatal)",
+                                    ci_pr_number,
                                     exc_info=True,
                                 )
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True
                 )
+        # Fallback: auto-resolve finding keys on the parking task itself when
+        # there is no orig task (ci_orig_id absent) — covers rare cases where
+        # the task directly carries resolving_finding_keys without a parent orig.
+        if not ci_orig_id:
+            _direct_keys = (task.context or {}).get("resolving_finding_keys") or []
+            if _direct_keys and task.project_id:
+                try:
+                    from app.database import AsyncSessionLocal
+
+                    async with AsyncSessionLocal() as _direct_resolve_session:
+                        await _auto_resolve_audit_findings_on_merge(
+                            task.project_id,
+                            list(_direct_keys),
+                            str(ci_pr_number) if ci_pr_number else None,
+                            _direct_resolve_session,
+                        )
+                except Exception:
+                    logger.warning(
+                        "[CI] audit-finding auto-resolve (no-orig path) failed for "
+                        "PR #%s (non-fatal)",
+                        ci_pr_number,
+                        exc_info=True,
+                    )
         # Once a bootstrapped repo gains a project structure on its landed
         # integration branch, refresh an empty build_config so verification
         # commands exist without a manual step. Keep this isolated from the
@@ -1620,7 +1847,15 @@ async def handle_ci_completion(
         return False
 
     ci_loop = (task.context or {}).get("review_loop", {})
-    ci_pr_number = ci_loop.get("pr_number")
+    # Canonical PR-identity resolve (review_loop.pr_number OR
+    # context.rollup_pr_number). Stamp it back so the merge path below and the
+    # recovery sweeps agree — a rollup whose identity lived only at
+    # context.rollup_pr_number is no longer skipped by the merger.
+    ci_pr_number = effective_pr_number(task)
+    if ci_pr_number and not ci_loop.get("pr_number"):
+        ci_loop["pr_number"] = ci_pr_number
+        task.context = {**(task.context or {}), "review_loop": ci_loop}
+        flag_modified(task, "context")
     ci_payload = task.first_payload
     ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
     _ci_project = (

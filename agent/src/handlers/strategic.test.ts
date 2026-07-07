@@ -132,7 +132,9 @@ const {
     'recordInitialOAuthAuthHash',
     'recordLlmCallStart',
     'recordLlmTokens',
+    'recordNumTurns',
     'recordToolUse',
+    'recordToolResultBytes',
     'refreshRuntimeState',
     'registerSizeCapMergeDriver',
     'replayLogBufferRateLimited',
@@ -164,11 +166,13 @@ const {
   WORKSPACE_PREP_EXPORT_NAMES: [
     'getLastWorkspacePrepOutcome',
     'prepareWorkspaceForRole',
+    'listWorkspaceTopDirs',
     'resetWorkspacePrepOutcome',
     'resolveReferenceRepo',
   ],
   STRATEGIC_HELPERS_EXPORT_NAMES: [
     'DESIGN_DOC_FETCH_VERBS',
+    'FETCH_VERB_HELP',
     'PLAN_FETCH_VERBS',
     'RESEARCH_FETCH_VERBS',
     'STRATEGIC_CHALLENGE_VERSION',
@@ -179,6 +183,7 @@ const {
     'buildStrategicChallengePrompt',
     'parseStrategicChallengeRecord',
     'portfolioOperationFingerprint',
+    'renderStrategicFetchVerbHelpLines',
     'runStrategicChallenge',
     'writeFetchHelper',
     'writeStrategicHelpers',
@@ -198,10 +203,12 @@ const {
     'formatPastRetirementCritiques',
     'formatPreviousDecisionOutcomes',
     'formatRetiredDirectionsSummary',
+    'formatRetiredDirectionGrounding',
   ],
   RESEARCH_PLAN_EXPORT_NAMES: [
     'CAPABILITY_DECLARATION_DOC',
     'PR_INELIGIBLE_TASK_TYPES',
+    'QUALIFICATION_STATE_VOCAB',
     'aggregateDirectionStats',
     'buildAvailableCapabilitiesSection',
     'buildCapabilityVerificationSection',
@@ -236,6 +243,7 @@ const {
   STRATEGIC_SECTIONS_EXPORT_NAMES: [
     'buildCapabilityVerificationSection',
     'buildCiComplianceSection',
+    'buildCompletionDebtSection',
     'buildClockAndRecentWorkSection',
     'buildConversationThreadSection',
     'buildCycleStartReconciliationSection',
@@ -250,6 +258,7 @@ const {
     'buildPayloadStalenessSection',
     'buildPruneCandidatesSection',
     'buildQuestionSection',
+    'buildResidentExamLeadsSection',
     'buildSweepComparisonSection',
     'buildSystemMaturitySection',
     'fmtScalar',
@@ -269,10 +278,13 @@ const {
     'recordFormatRepairTokens',
     'recordLlmCallStart',
     'recordLlmTokens',
+    'recordNumTurns',
+    'recordToolResultBytes',
     'recordViewportScreenshotDownload',
     'resetFormatComplianceTelemetry',
     'resetLlmTelemetry',
     'setCurrentPromptFingerprint',
+    'setPromptSizeTelemetry',
   ],
 }));
 
@@ -330,50 +342,56 @@ const { DEFAULT_CHALLENGE_RECORD } = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('./strategic-helpers.js', () => ({
-  ...Object.fromEntries(STRATEGIC_HELPERS_EXPORT_NAMES.map((name) => [name, vi.fn()])),
-  DESIGN_DOC_FETCH_VERBS: [],
-  PLAN_FETCH_VERBS: [],
-  RESEARCH_FETCH_VERBS: [],
-  STRATEGIC_CHALLENGE_VERSION: 1,
-  STRATEGIC_FETCH_VERBS: [],
-  writeStrategicHelpers: vi.fn(),
-  // Mocked so the wiring tests do NOT spawn the real challenge runClaudeCode
-  // pass — that keeps runClaudeCode.mock.calls[0] the executor prompt for the
-  // existing executor-prompt assertions.
-  runStrategicChallenge: vi.fn().mockResolvedValue(DEFAULT_CHALLENGE_RECORD),
-  // Degraded record the handler substitutes when the challenge persist fails:
-  // a blocked record approves nothing, so the executor section renders
-  // status=blocked with no approved pairs (matches the backend's fail-closed gate).
-  blockedChallengeRecord: (note: string) => ({
-    challenge_version: 1,
-    status: 'blocked' as const,
-    evidence_progress: [],
-    retirement_approvals: [],
-    retirement_critique_quality: { verdict: 'not_assessed', rationale: note },
-    portfolio_shape_risk: { verdict: 'not_assessed', rationale: note },
-    portfolio_operations: [],
-    notes: note,
-  }),
-  // Echo the record's status + approved pairs so wiring tests can assert the
-  // section is built from the record runStrategicChallenge returned and is
-  // threaded into the executor prompt.
-  buildStrategicChallengeExecutorSection: (record: {
-    status: string;
-    evidence_progress: Array<{ direction_id: string; status: string; verdict: string }>;
-    retirement_approvals?: Array<{ direction_id: string; verdict: string }>;
-  }) => {
-    const approved = record.evidence_progress
-      .filter(e => e.verdict === 'approved' && (e.status === 'advancing' || e.status === 'met'))
-      .map(e => `${e.direction_id}:${e.status}`)
-      .join(',');
-    const retirementApproved = (record.retirement_approvals || [])
-      .filter(r => r.verdict === 'approved')
-      .map(r => r.direction_id)
-      .join(',');
-    return `CHALLENGE_SECTION(status=${record.status};approved=${approved};retirements=${retirementApproved})`;
-  },
-}));
+vi.mock('./strategic-helpers.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./strategic-helpers.js')>();
+  return {
+    ...Object.fromEntries(STRATEGIC_HELPERS_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+    DESIGN_DOC_FETCH_VERBS: [],
+    FETCH_VERB_HELP: actual.FETCH_VERB_HELP,
+    PLAN_FETCH_VERBS: [],
+    RESEARCH_FETCH_VERBS: [],
+    STRATEGIC_CHALLENGE_VERSION: 1,
+    STRATEGIC_FETCH_VERBS: [],
+    writeStrategicHelpers: vi.fn(),
+    // Use the real implementation so prompt blocks that call this get actual verb lines.
+    renderStrategicFetchVerbHelpLines: actual.renderStrategicFetchVerbHelpLines,
+    // Mocked so the wiring tests do NOT spawn the real challenge runClaudeCode
+    // pass — that keeps runClaudeCode.mock.calls[0] the executor prompt for the
+    // existing executor-prompt assertions.
+    runStrategicChallenge: vi.fn().mockResolvedValue(DEFAULT_CHALLENGE_RECORD),
+    // Degraded record the handler substitutes when the challenge persist fails:
+    // a blocked record approves nothing, so the executor section renders
+    // status=blocked with no approved pairs (matches the backend's fail-closed gate).
+    blockedChallengeRecord: (note: string) => ({
+      challenge_version: 1,
+      status: 'blocked' as const,
+      evidence_progress: [],
+      retirement_approvals: [],
+      retirement_critique_quality: { verdict: 'not_assessed', rationale: note },
+      portfolio_shape_risk: { verdict: 'not_assessed', rationale: note },
+      portfolio_operations: [],
+      notes: note,
+    }),
+    // Echo the record's status + approved pairs so wiring tests can assert the
+    // section is built from the record runStrategicChallenge returned and is
+    // threaded into the executor prompt.
+    buildStrategicChallengeExecutorSection: (record: {
+      status: string;
+      evidence_progress: Array<{ direction_id: string; status: string; verdict: string }>;
+      retirement_approvals?: Array<{ direction_id: string; verdict: string }>;
+    }) => {
+      const approved = record.evidence_progress
+        .filter(e => e.verdict === 'approved' && (e.status === 'advancing' || e.status === 'met'))
+        .map(e => `${e.direction_id}:${e.status}`)
+        .join(',');
+      const retirementApproved = (record.retirement_approvals || [])
+        .filter(r => r.verdict === 'approved')
+        .map(r => r.direction_id)
+        .join(',');
+      return `CHALLENGE_SECTION(status=${record.status};approved=${approved};retirements=${retirementApproved})`;
+    },
+  };
+});
 
 vi.mock('../utils/time.js', () => ({
   parseBackendTimestamp: () => null,
@@ -395,6 +413,7 @@ vi.mock('./research-direction-context.js', () => ({
   formatPreviousDecisionOutcomes: () => '',
   formatPastRetirementCritiques: () => '',
   formatRetiredDirectionsSummary: () => '',
+  formatRetiredDirectionGrounding: () => '',
 }));
 
 vi.mock('../prompts/thinker.js', async (importOriginal) => {
@@ -427,6 +446,7 @@ vi.mock('./research-plan.js', () => ({
   buildUserPausedSection: () => '',
   buildVersionPhaseSection: () => '',
   buildMemoCitationsSection: () => '',
+  QUALIFICATION_STATE_VOCAB: new Set<string>(),
   resolveMemoHandles: () => [],
   buildEfficiencySnapshotSection: () => '',
   // Echo the authoritative active-total arg so wiring tests can assert the
@@ -493,6 +513,7 @@ vi.mock('../telemetry.js', () => ({
   recordFormatRepairMiss: vi.fn(),
   recordLlmCallStart: vi.fn(),
   recordLlmTokens: vi.fn(),
+  recordNumTurns: vi.fn(),
   recordViewportScreenshotDownload: vi.fn(),
   resetFormatComplianceTelemetry: vi.fn(),
   resetLlmTelemetry: vi.fn(),
@@ -501,6 +522,7 @@ vi.mock('../telemetry.js', () => ({
   getFormatComplianceTelemetry: vi.fn().mockReturnValue({}),
   getLlmTelemetry: vi.fn().mockReturnValue({
     llm_call_count: 0,
+    num_turns: 0,
     total_input_tokens: 100,
     total_output_tokens: 50,
     viewport_screenshot_forwarded_count: 0,
@@ -786,6 +808,103 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).toContain('./fetch version-phase');
   });
 
+  it('dropped retired/prior-decision sections advertise the section endpoint, not ./fetch direction', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        // fetch_verb: 'sections' is what the backend schema now carries for these
+        // sections (recoverable via GET /projects/{project_id}/sections/{name}).
+        dropped: [
+          { key: 'retired_directions_summary', reason: 'budget exhausted', bytes: 4096, fetch_verb: 'sections' },
+          { key: 'past_retirement_critiques', reason: 'budget exhausted', bytes: 2048, fetch_verb: 'sections' },
+        ],
+        trimmed: [
+          { key: 'previous_decision_outcomes', kind: 'summarized', bytes_original: 8192, bytes_trimmed: 1024, fetch_verb: 'sections' },
+        ],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-retired-fetch', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    // The ./fetch sections <name> CLI verb is advertised for each retired/prior section.
+    expect(section).toContain('./fetch sections retired_directions_summary');
+    expect(section).toContain('./fetch sections past_retirement_critiques');
+    expect(section).toContain('./fetch sections previous_decision_outcomes');
+    // The misleading broad per-direction fetch is NOT advertised for these keys.
+    expect(section).not.toContain('./fetch direction');
+  });
+
+  it('per-key fetch hints appear for dropped and trimmed entries with byte sizes', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        dropped: [{ key: 'open_messages', reason: 'budget exhausted', bytes: 20480, fetch_verb: 'message' }],
+        trimmed: [{ key: 'directions_summary', kind: 'list_trimmed', shown: 5, total: 20, bytes_original: 10240, bytes_trimmed: 2048 }],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-per-key-hints', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    // Per-key hint for dropped open_messages → message verb (via fetch_verb field)
+    expect(section).toContain('./fetch message');
+    // Per-key hint for trimmed directions_summary → direction verb (via PAYLOAD_KEY_FETCH_VERB)
+    expect(section).toContain('./fetch direction');
+    // Byte size info appears for both entries
+    expect(section).toContain('20480');   // bytes for open_messages
+    expect(section).toContain('10240');   // bytes_original for directions_summary
+    expect(section).toContain('2048');    // bytes_trimmed for directions_summary
+    // Unrelated verbs are not shown (no generic trailing list)
+    expect(section).not.toContain('./fetch gap');
+    expect(section).not.toContain('./fetch playbook');
+  });
+
+  it('dropped section without backend fetch_verb uses PAYLOAD_KEY_FETCH_VERB fallback', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        dropped: [{ key: 'retired_directions_summary', reason: 'budget exhausted', bytes: 8192 }],
+        trimmed: [],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-drop-fallback', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    // Fallback hint from PAYLOAD_KEY_FETCH_VERB, shown on the → line (no inline fetch_verb on the drop record)
+    expect(section).toContain('./fetch sections retired_directions_summary');
+    // Byte size still rendered
+    expect(section).toContain('8192');
+  });
+
+  it('newly-mapped sections-type keys render correct recovery hints when dropped', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        dropped: [
+          { key: 'self_reflection_log', reason: 'budget exhausted', bytes: 1024 },
+          { key: 'anomaly_summary', reason: 'budget exhausted', bytes: 2048 },
+          { key: 'outcome_evaluation', reason: 'budget exhausted', bytes: 4096 },
+          { key: 'rejected_proposals', reason: 'budget exhausted', bytes: 512 },
+          { key: 'past_retirement_critiques', reason: 'budget exhausted', bytes: 3000 },
+        ],
+        trimmed: [],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-sections-hints', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    expect(section).toContain('./fetch sections self_reflection_log');
+    expect(section).toContain('./fetch sections anomaly_summary');
+    expect(section).toContain('./fetch sections outcome_evaluation');
+    expect(section).toContain('./fetch sections rejected_proposals');
+    expect(section).toContain('./fetch sections past_retirement_critiques');
+    // Stale direction-verb entries are gone from previously incorrect mappings
+    expect(section).not.toContain('./fetch direction');
+  });
+
   it('true-empty: no packer drop/trim and empty model → bootstrap framing (first cycle)', async () => {
     const payload: Record<string, unknown> = {
       project_name: 'Blueprint',
@@ -903,6 +1022,7 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     expect(executorPrompt).toBeDefined();
     expect(executorPrompt).toContain('"staged": true');
     expect(executorPrompt).toContain('one atomic op');
+    expect(executorPrompt).toContain('./messages send --stdin <<\'EOF\'');
     // Steers AWAY from the old create-then-stage sequence for new ideas.
     expect(executorPrompt).toContain('Do NOT create-then-stage');
   });
@@ -935,6 +1055,49 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     expect(executorPrompt).toContain('if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen');
   });
 
+
+  it('dropped inbox: executor prompt contains fetch-message guidance with correct command when open_message_count > 0 and open_messages dropped', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-dropped-inbox',
+      {
+        project_name: 'Blueprint',
+        // open_messages absent (dropped under byte budget) but count is known
+        open_message_count: 3,
+        _packer_meta: {
+          dropped: [{ key: 'open_messages', reason: 'exceeds remaining budget even after summarize' }],
+          trimmed: [],
+        },
+      },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(executorPrompt).toBeDefined();
+    // Must render the fallback section (not the full open_messages section)
+    expect(executorPrompt).toContain('inbox not shipped');
+    expect(executorPrompt).toContain('3 messages available');
+    // Must use the correct singular fetch verb with no subcommand
+    expect(executorPrompt).toContain('./fetch message`');
+    // Must NOT use the invalid 'messages list' form
+    expect(executorPrompt).not.toContain('./fetch messages list');
+  });
 
   it('does not record format miss or repair attempt for a command-mode strategic run', async () => {
     vi.mocked(runClaudeCode).mockClear();
@@ -1615,6 +1778,40 @@ describe('handleStrategic executor prompt: proposed acceptance criteria handoff'
     vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValue('');
   });
 
+  it('retries_when_proposed_acceptance_criteria_handoff_missing', async () => {
+    const taskId = 'task-criteria-retry';
+    const criteriaPath = `/tmp/proposed_criteria_${taskId}.json`;
+    const criteriaPayload = '{"criteria":[{"text":"Users can promote only when canonical criteria pass."}]}';
+    vi.mocked(fs.existsSync).mockImplementation(
+      (path: Parameters<typeof fs.existsSync>[0]) => String(path) === criteriaPath,
+    );
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => (path === criteriaPath ? criteriaPayload : ''),
+    );
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\nProblem model set at revision 42.',
+        lastResultText: 'Commands ran successfully.',
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    await handleStrategic(
+      taskId,
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const retryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(retryPrompt).toContain('./strategic set-acceptance-criteria');
+  });
+
   it('injects the proposed criteria block and conditional command when the thinker wrote a non-empty file', async () => {
     const taskId = 'task-criteria';
     const criteriaPath = `/tmp/proposed_criteria_${taskId}.json`;
@@ -1666,6 +1863,31 @@ describe('handleStrategic executor prompt: proposed acceptance criteria handoff'
     expect(executorPrompt).not.toContain('# Proposed acceptance criteria');
     expect(executorPrompt).toContain(`./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"`);
     expect(executorPrompt).toContain('If the file is absent or empty, SKIP');
+  });
+
+  it('documents the retract shape and permanently-uncoverable trigger in the executor prompt', async () => {
+    const taskId = 'task-retract-doc';
+
+    await handleStrategic(
+      taskId,
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The executor prompt must document the retract array shape so the strategist knows it can retract criteria.
+    expect(executorPrompt).toContain('retract');
+    expect(executorPrompt).toContain('criterion_key');
+    expect(executorPrompt).toContain('reason');
+    // Must mention the trigger condition: permanently uncoverable
+    expect(executorPrompt).toContain('permanently uncoverable');
+    // Must guard against fabrication
+    expect(executorPrompt).toContain('Never fabricate retractions');
   });
 });
 

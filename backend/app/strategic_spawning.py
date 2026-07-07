@@ -20,6 +20,7 @@ from sqlmodel import select
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import (
+    compute_direction_autonomy_state,
     declared_merged_count,
     discount_stranded_pr_from_direction_credit,
     proven_merged_count,
@@ -36,16 +37,15 @@ from app.models import (
     MessageType,
     ProjectMessage,
     SystemMaturity,
-    LocalRunner,
 )
 from app.deploy_identity import project_matches_deploy_identity
 from app.resource_envelope import resolve_project_require_local_runner
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.strategic_payload_compaction import (
-    _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED,
     _OUTCOME_DIRECTION_OUTCOMES_KEEP,
     _VERSION_PHASE_RECENT_VERSIONS_CAP,
     _direction_activity_score,  # noqa: F401 — re-exported for test imports
+    _directions_summary_floor,
     _enrich_drift_with_trend,
     _summarize_directions,
     _summarize_drift_signals,
@@ -56,6 +56,13 @@ from app.release_artifacts import (
     summarize_required_artifact_gap,
     version_serving_summary as _version_serving_summary,
 )
+from app.autonomous_spawn_budget import (
+    DEFAULT_AUTONOMOUS_SPAWN_BUDGET_MODE,
+    autonomous_spawn_budget_config_from_runtime,
+    build_autonomous_spawn_budget_guard,
+    compute_autonomous_spawn_budget_snapshot,
+)
+from app.release_version import QUALIFICATION_STATE_VOCAB
 from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
@@ -67,7 +74,34 @@ from app.capability_registry import (
     registry_capability_vocabulary,
 )
 from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
-from app.problem_model import compute_model_size_signal, parse_problem_model
+
+# The agent-view problem_model builder cluster (count-based trim, guaranteed-
+# small floor shrink, and the packer summarize/floor callbacks) lives in a
+# sibling module to keep this file under its size cap. Re-imported into this
+# namespace so every existing `from app.strategic_spawning import ...` call
+# site and test keeps resolving these names unchanged.
+from app.strategic_problem_view import (  # noqa: F401 — re-exported for callers/tests
+    _AGENT_VIEW_FLOOR_BYTES,
+    _CAP_KEEP_RANK,
+    _CAP_SKELETON_KEEP,
+    _FLOOR_MARKER_RESERVE,
+    _FLOOR_MIN_GAPS,
+    _FLOOR_SHRINK_LEVELS,
+    _FRICTION_KEEP_RANK,
+    _FRICTION_SKELETON_KEEP,
+    _GAP_EVIDENCE_KEEP,
+    _GAP_HISTORY_KEEP,
+    _GAP_PAST_MOVES_KEEP,
+    _GAP_PRIORITY_RANK,
+    _agent_view_problem_model,
+    _agent_view_problem_model_floor,
+    _agent_view_problem_model_packed,
+    _compute_model_health,
+    _gap_floor_keep_rank,
+    _serialized_bytes,
+    _shrink_pm_to_floor,
+    _skeletonize_caps_friction,
+)
 from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
 from app.source_ref_validation import (
     classify_paths_tristate,
@@ -96,18 +130,100 @@ from app.shared_state import (
     get_project_promotion_target,
     runtime_config as _runtime_config,
 )
+from app.size_limit_policy import classify_breach
 from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
 from app.landed_signal import LANDED_ON_INTEGRATION_KEY, mark_stranded_non_landing
 from app.project_message_projection import agent_thread_message_dict
 from app.workbench_state import (
-    STRATEGIC_LOCAL_CONTINUATION_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
-    strategic_local_continuation_status_from_vision,
 )
 
+from app.strategic_local_runner import (  # noqa: F401 — re-exported for callers/tests
+    _RUNNER_LIVENESS_SECONDS,
+    _load_local_runner_status,
+    _agent_visible_vision,
+    _local_runner_handles_task_type,
+    _local_runner_is_live,
+    _local_runner_agent_available,
+    _resolve_local_continuation_runner_affinity,
+    _resolve_local_continuation_runner_intent,
+)
+
+from app.strategic_payload_summaries import (  # noqa: F401 — re-exported for callers/tests
+    _summarize_conversation_thread,
+    _MEMO_CITATIONS_KEEP,
+    _MEMO_EXCERPT_MAX_CHARS,
+    _MEMO_HEAVY_FIELDS,
+    _MEMO_VERBOSE_FIELDS,
+    _strip_verbose_fields,
+    _cap_excerpt,
+    _summarize_memo_citations,
+    _OPEN_MESSAGES_FETCH_LIMIT,
+    _OPEN_MESSAGES_KEEP,
+    _OPEN_MESSAGES_KEEP_WHEN_TRIMMED,
+    _OPEN_MESSAGE_EXCERPT_MAX_CHARS,
+    _CRITICAL_OPEN_MESSAGE_TYPES,
+    _OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT,
+    _OPERATOR_CONTEXT_REQUESTS_KEEP,
+    _OPERATOR_CONTEXT_REFS_KEEP,
+    _OPERATOR_CONTEXT_REF_SCAN_LIMIT,
+    _OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT,
+    _OPERATOR_CONTEXT_FROM_TYPES,
+    _OPERATOR_CONTEXT_TARGET_KEYS,
+    _open_message_survival_key,
+    _bound_open_messages,
+    _summarize_open_messages,
+    _OPEN_MESSAGES_FLOOR_KEEP,
+    _OPEN_MESSAGE_FLOOR_EXCERPT_MAX_CHARS,
+    _floor_open_messages,
+    _operator_context_text,
+    _operator_context_ref,
+    _operator_context_target,
+    _operator_context_descriptor,
+    _operator_context_descriptor_map,
+    _operator_context_package_descriptor,
+    _operator_context_created_sort_value,
+    _build_operator_context_refs_from_messages,
+    _fetch_operator_context_refs,
+    _open_message_citation_summary,
+    _fetch_open_messages,
+    _summarize_recent_interventions,
+    _summarize_capability_trial_verdicts,
+    _OPERATOR_OVERRIDES_SUMMARIZE_KEEP,
+    _OVERRIDE_VALUE_SUMMARIZE_CAP,
+    _summarize_operator_overrides,
+    _KNOWLEDGE_INDEX_SUMMARIZE_KEEP,
+    _KNOWLEDGE_INDEX_SUMMARIZE_SUMMARY_CAP,
+    _KNOWLEDGE_INDEX_HEAVY_FIELDS,
+    _KNOWLEDGE_INDEX_KEEP_KEYS,
+    _summarize_knowledge_index,
+    _PREV_OUTCOMES_ROLE_KEEP,
+    _PREV_OUTCOMES_TEXT_CAP,
+    _PREV_OUTCOMES_SUMMARY_TEXT_CAP,
+    _PREV_OUTCOMES_RATIONALE_CAP,
+    _PREV_OUTCOMES_HEAVY_FIELDS,
+    _summarize_previous_decision_outcome_entry,
+    _summarize_previous_decision_outcomes,
+    _PLAYBOOK_SUMMARY_ENTRIES_KEEP,
+    _PLAYBOOK_SUMMARY_CONTENT_CAP,
+    _PLAYBOOK_SUMMARY_DROP_FIELDS,
+    _summarize_playbook_summary,
+    _PAST_CRITIQUES_KEEP,
+    _PAST_CRITIQUE_TEXT_CAP,
+    _PAST_CRITIQUE_TEXT_FIELDS,
+    _summarize_past_retirement_critiques,
+    _SELF_REFLECTION_KEEP,
+    _SELF_REFLECTION_TEXT_CAP,
+    _SELF_REFLECTION_TEXT_FIELDS,
+    _summarize_self_reflection_log,
+)
+
+
 logger = logging.getLogger(__name__)
+
+STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY = "strategic_cycle_manual"
 
 _CHALLENGE_BOUNDARY_BUCKETS = (
     CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
@@ -119,179 +235,6 @@ _CHALLENGE_AGREEMENT_BUCKETS = (
     CHALLENGE_DISAGREES,
     CHALLENGE_INDETERMINATE,
 )
-
-# Mirrors ``orchestrator._RUNNER_LIVENESS_SECONDS`` (300): a registered runner is
-# considered live only if it heartbeated within this window. Replicated here
-# rather than imported to avoid an ``orchestrator -> autonomous_research ->
-# strategic_spawning`` import cycle (strategic_spawning is pulled in lazily by
-# the orchestrator's autonomous_research call chain; importing orchestrator at
-# this module's top would invert that order). Keep in sync with orchestrator.
-_RUNNER_LIVENESS_SECONDS = 300
-
-
-async def _load_local_runner_status(
-    session: AsyncSession, project_id: uuid.UUID
-) -> dict[str, Any]:
-    """Live self-hosted local-runner availability for the strategist's context.
-
-    Surfaces whether the operator's self-hosted GPU hardware is up so the
-    strategist can avoid authoring GPU ``compute_experiment`` tasks that would
-    otherwise silently fall back to billable cloud GPU while the hardware is
-    offline. Informational only — there is NO dispatch effect or hard block.
-
-    Returns ``{"ever_registered": bool, "active_total": int, "active_gpu": int}``:
-
-    * ``ever_registered`` — the project has >=1 non-deleted ``LocalRunner`` row
-      (operator set up local hardware at some point).
-    * ``active_total`` — runners with ``status=='active'`` that heartbeated within
-      the liveness window (mirrors the orchestrator dispatch-cache predicate).
-    * ``active_gpu`` — subset of ``active_total`` whose ``capabilities.has_gpu`` is
-      truthy.
-
-    One query (non-deleted runners for the project — a small set); the liveness
-    + GPU filtering is done in Python to stay dialect-agnostic over the JSONB
-    ``capabilities`` column.
-    """
-    rows = (
-        await session.execute(
-            select(LocalRunner).where(
-                LocalRunner.project_id == project_id,
-                LocalRunner.status != "deleted",
-            )
-        )
-    ).scalars().all()
-    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
-    active_total = 0
-    active_gpu = 0
-    for runner in rows:
-        last_seen = runner.last_seen_at
-        if runner.status == "active" and last_seen is not None and last_seen > cutoff:
-            active_total += 1
-            if (runner.capabilities or {}).get("has_gpu"):
-                active_gpu += 1
-    return {
-        "ever_registered": len(rows) > 0,
-        "active_total": active_total,
-        "active_gpu": active_gpu,
-    }
-
-
-def _agent_visible_vision(vision: dict[str, Any] | None) -> dict[str, Any]:
-    """Return project vision without backend-only operator session metadata."""
-
-    visible = dict(vision or {})
-    visible.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
-    return visible
-
-
-def _local_runner_handles_task_type(runner: LocalRunner, task_type: str) -> bool:
-    task_types = (runner.capabilities or {}).get("task_types", "all")
-    if task_types == "all":
-        return True
-    if isinstance(task_types, (list, tuple, set)):
-        return task_type in task_types
-    return False
-
-
-def _local_runner_is_live(runner: LocalRunner) -> bool:
-    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
-    return (
-        runner.status == "active"
-        and runner.last_seen_at is not None
-        and runner.last_seen_at > cutoff
-    )
-
-
-def _local_runner_agent_available(runner: LocalRunner) -> bool:
-    return (runner.capabilities or {}).get("agent_available") is not False
-
-
-async def _resolve_local_continuation_runner_affinity(
-    session: AsyncSession,
-    project_id: Any,
-    task_type: str,
-) -> str | None:
-    """Return advisory runner affinity for fresh continuous local Strategic mode."""
-
-    current_vision = (
-        await session.execute(select(Project.vision).where(Project.id == project_id))
-    ).scalar_one_or_none()
-    status = strategic_local_continuation_status_from_vision(current_vision or {})
-    if not status.get("enabled") or not status.get("fresh"):
-        return None
-
-    rows = (
-        await session.execute(
-            select(LocalRunner)
-            .where(
-                LocalRunner.project_id == project_id,
-                LocalRunner.status != "deleted",
-            )
-            .order_by(
-                LocalRunner.last_seen_at.desc(),
-                LocalRunner.created_at.desc(),
-            )
-        )
-    ).scalars().all()
-    live_capable = [
-        runner
-        for runner in rows
-        if _local_runner_is_live(runner)
-        and _local_runner_handles_task_type(runner, task_type)
-        and _local_runner_agent_available(runner)
-    ]
-    if not live_capable:
-        return None
-
-    preferred_runner_id = status.get("preferred_runner_id")
-    if isinstance(preferred_runner_id, str) and preferred_runner_id.strip():
-        preferred_runner_id = preferred_runner_id.strip()
-        for runner in live_capable:
-            if str(runner.id) == preferred_runner_id:
-                return preferred_runner_id
-
-    return str(live_capable[0].id)
-
-
-async def _resolve_local_continuation_runner_intent(
-    session: AsyncSession,
-    project_id: Any,
-    task_type: str,
-) -> dict[str, Any]:
-    """Return dispatch context for fresh continuous local Strategic mode.
-
-    A fresh continuation marker is a hard local intent, even when no runner is
-    live at spawn time. The runner id remains advisory within the local fleet;
-    the explicit required flag is what prevents cloud fallback later.
-
-    Freshness ("fresh") is resolved by
-    ``strategic_local_continuation_status_from_vision``, which reads the live
-    ``strategic_continuation_ttl_seconds`` runtime setting (default 1500s / 25
-    min) rather than the retired hardcoded 12h TTL — so a marker that stopped
-    renewing (no operator interaction / no applied strategic op) goes stale
-    within the short lease window and this hard-local intent is NOT applied,
-    letting the next spawn dispatch to cloud.
-    """
-
-    current_vision = (
-        await session.execute(select(Project.vision).where(Project.id == project_id))
-    ).scalar_one_or_none()
-    status = strategic_local_continuation_status_from_vision(current_vision or {})
-    if not status.get("enabled") or not status.get("fresh"):
-        return {}
-
-    context: dict[str, Any] = {
-        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
-        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
-    }
-    preferred_runner_target_id = await _resolve_local_continuation_runner_affinity(
-        session,
-        project_id,
-        task_type,
-    )
-    if preferred_runner_target_id:
-        context["preferred_runner_target_id"] = preferred_runner_target_id
-    return context
 
 
 def _empty_finding_challenge_summary() -> dict[str, Any]:
@@ -329,20 +272,20 @@ def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> Non
 
 
 def _strategic_recent_version_entry(version, project=None) -> dict[str, Any]:
-    from app.release_version import summarize_qualification_state as _summarize
+    from app.qualification_state_resolver import (
+        resolve_effective_qualification_state,
+    )
 
     aggregate, artifacts = _version_serving_summary(version, project)
+    qualification_state, _ = resolve_effective_qualification_state(
+        version, project, serving=(aggregate, artifacts)
+    )
     return {
         "version_number": version.version_number,
         "status": version.status,
         "phase": version.phase,
         "last_qualification": version.last_qualification,
-        "qualification_state": _summarize(
-            version.last_qualification,
-            aggregate_serving_status=aggregate["serving_status"],
-            aggregate_deploy_failure_reason=aggregate["reason_code"],
-            artifact_evidence=artifacts,
-        ),
+        "qualification_state": qualification_state,
         "serving_status": aggregate["serving_status"],
         "served_sha": (version.served_sha or "")[:12] or None,
         "deploy_failure_reason": aggregate["reason_code"],
@@ -561,349 +504,6 @@ def _summarize_design_doc_index(index: Any) -> Any:
         for entry in sections
     ]
     return {**index, "sections": skeleton}
-
-
-# Maximum history/past_moves entries to keep per active gap when shipping the
-# problem model to the strategic agent. Active gaps accumulate move records and
-# evidence over time; shipping the full lineage every cycle pushes the strategic
-# payload past the 256 KB hard cap (see _MAX_PAYLOAD_BYTES rationale). Keep
-# enough to reason about recent direction trajectory without dragging months
-# of stale context.
-_GAP_HISTORY_KEEP = 5
-_GAP_PAST_MOVES_KEEP = 5
-_GAP_EVIDENCE_KEEP = 8
-
-
-def _compute_model_health(pm: dict | None) -> dict | None:
-    """Fail-open wrapper around :func:`compute_model_size_signal`.
-
-    Computes the soft model size/health signal from the DURABLE problem_model
-    (honest pre-trim counts). Returns ``None`` when the durable blob fails strict
-    schema validation (``parse_problem_model`` raises ``ValidationError`` on a
-    malformed model) so a legacy/loose stored model never crashes strategic
-    spawning — the signal is advisory, so omitting it on parse failure is the
-    safe degradation. Callers conditionally include the key only when non-None.
-    """
-    if not pm:
-        # Empty/absent durable model — report an honest 'healthy' zero signal.
-        return compute_model_size_signal(parse_problem_model(None))
-    try:
-        return compute_model_size_signal(parse_problem_model(pm))
-    except Exception:  # noqa: BLE001 — advisory soft signal must degrade, never raise
-        logger.warning(
-            "[STRATEGIC] could not compute model_health (durable problem_model "
-            "failed strict validation); omitting the soft signal this cycle",
-            exc_info=True,
-        )
-        return None
-
-
-def _agent_view_problem_model(pm: dict | None) -> dict:
-    """Trim Project.problem_model for inclusion in strategic-agent payloads.
-
-    Two sources of unbounded growth get capped here:
-
-    1. ``archived_gaps`` — closed gaps retained for operator/UI reference.
-       The strategic agent does not act on them; if it needs historical
-       context it can pull a specific gap by id from the full record.
-       This was 24 KB / 31 entries on the Blueprint project at the time
-       this was added.
-    2. Per-active-gap ``history`` / ``past_moves`` / ``evidence`` arrays
-       grow with every cycle. Trim to the most recent N entries each so
-       the per-gap footprint stays bounded.
-
-    Together these two trims drop the problem_model from ~78 KB to ~50 KB
-    on a mature project — enough headroom under the 256 KB payload cap
-    for the rest of the strategic context to keep working.
-    """
-    if not pm:
-        return {}
-    trimmed = dict(pm)
-    trimmed.pop("archived_gaps", None)
-    # The rejected-agent-edits ledger is surfaced to the agent through the
-    # dedicated, consolidated ``operator_overrides`` payload key (see
-    # :func:`_build_operator_overrides_summary`) — strip it here so the raw,
-    # unbounded ledger is not double-shipped inside problem_model.
-    trimmed.pop("rejected_agent_edits", None)
-    gaps = trimmed.get("gaps") or []
-    if gaps:
-        new_gaps = []
-        gap_memory_trimmed: list[dict] = []
-        for g in gaps:
-            if not isinstance(g, dict):
-                new_gaps.append(g)
-                continue
-            g2 = dict(g)
-            shortened: dict[str, dict] = {}
-            for key, keep in (
-                ("history", _GAP_HISTORY_KEEP),
-                ("past_moves", _GAP_PAST_MOVES_KEEP),
-                ("evidence", _GAP_EVIDENCE_KEEP),
-            ):
-                arr = g2.get(key)
-                if isinstance(arr, list) and len(arr) > keep:
-                    shortened[key] = {"shown": keep, "total": len(arr)}
-                    g2[key] = arr[-keep:]
-            if shortened:
-                gap_memory_trimmed.append({"gap_id": g2.get("id"), "fields": shortened})
-            new_gaps.append(g2)
-        trimmed["gaps"] = new_gaps
-        # Surface the pre-trim so the strategic agent can tell a gap's
-        # append-only memory was shortened to a recent window for payload
-        # size. This trim runs BEFORE the byte-budget packer, so it would
-        # otherwise never appear in the payload's packer metadata and the
-        # agent would mistake the shortened view for the gap's full arc.
-        # The marker rides in the agent-facing problem_model (the durable
-        # project.problem_model is never mutated — this operates on a copy)
-        # and steers the agent to ./fetch full gap history before deciding
-        # whether to push, refine, or retire a long-lived gap.
-        if gap_memory_trimmed:
-            trimmed["_gap_memory_trimmed"] = gap_memory_trimmed
-    return trimmed
-
-
-# Guaranteed-small floor for the agent-view problem_model when it is packed
-# under genuine byte-budget pressure. The byte-budget packer registers
-# ``_agent_view_problem_model_packed`` as problem_model's summarize_fn at
-# "high" priority — NOT "critical" — so a count-trimmed-but-still-oversized
-# model would otherwise be DROPPED entirely and the strategist would run a
-# cycle with NO problem_model at all (recorded only in packer metadata).
-# Active gaps have no count cap (they are live state), so the count-based
-# trims above cannot guarantee the result fits. The floor makes the summarize
-# path budget-aware: it progressively strips the lowest-value per-gap detail,
-# then drops the lowest-value gaps, until the serialized model is under a small
-# floor that comfortably fits the remaining budget — so the model is ALWAYS
-# delivered. What was shortened is marked in ``_agent_view_floor_applied`` so
-# the agent can ``./fetch`` fuller detail (and so an unfittable model is a
-# LOUD, visible signal rather than a quiet drop).
-_AGENT_VIEW_FLOOR_BYTES = 32 * 1024
-# Headroom reserved below the floor for the ``_agent_view_floor_applied`` marker
-# (added AFTER the size checks), so the final serialized model — marker included
-# — still lands under the floor.
-_FLOOR_MARKER_RESERVE = 1024
-# Never shrink below this many gaps — the strategist needs at least the
-# highest-value live gaps to reason at all.
-_FLOOR_MIN_GAPS = 12
-# Per-gap detail stripped at each escalating floor level, lowest-value first
-# (append-only memory and free-text evidence before the human-readable body).
-_FLOOR_SHRINK_LEVELS: tuple[tuple[str, ...], ...] = (
-    ("history", "past_moves", "active_moves", "evidence"),
-    ("description",),
-)
-_GAP_PRIORITY_RANK = {"critical": 3, "high": 2, "medium": 1, "low": 0}
-
-# When gap-shrinking alone cannot reach the floor (a model whose bulk lives in
-# capabilities/friction rather than gaps), these sections are reduced to a
-# minimal name+status skeleton, lowest-value first. The dropped detail (notes,
-# backing paths, descriptions, seen-in, mitigations-tried, source provenance)
-# is recoverable via the strategic problem_model fetch endpoint, so the shrink
-# is non-destructive to the durable model.
-_CAP_SKELETON_KEEP = ("name", "status")
-_FRICTION_SKELETON_KEEP = ("id", "name", "status")
-# Higher rank keeps its detail longer (reduced last); lowest-value first.
-_CAP_KEEP_RANK = {"working": 2, "partial": 1, "planned": 0}
-_FRICTION_KEEP_RANK = {"active": 2, "mitigated": 1, "resolved": 0}
-
-
-def _serialized_bytes(value: Any) -> int:
-    """Serialized JSON byte length using the project-standard ``default=str``
-    (matches the packer's own ``_serialized_size`` measurement)."""
-    return len(json.dumps(value, default=str).encode())
-
-
-def _gap_floor_keep_rank(g: dict) -> tuple:
-    """Sort key for floor eviction — HIGHER sorts first (kept). Active beats
-    closed/abandoned, higher priority beats lower, newer-opened beats older."""
-    closed = bool(g.get("closed")) or g.get("status") in ("closed", "abandoned")
-    return (
-        0 if closed else 1,
-        _GAP_PRIORITY_RANK.get(g.get("priority"), 1),
-        g.get("opened") or "",
-    )
-
-
-def _skeletonize_caps_friction(trimmed: dict, target: int) -> dict:
-    """Reduce ``capabilities`` and ``friction`` to a minimal name+status
-    skeleton, lowest-value first, until *trimmed* serializes under *target*
-    (or both sections are exhausted). The full detail (notes, backing paths,
-    descriptions, seen-in, mitigations-tried, source provenance) is recoverable
-    via the strategic problem_model fetch endpoint, so this is non-destructive.
-
-    Returns the count of entries reduced per section. Copies the section lists
-    and entries before mutating so the durable model (which *trimmed* only
-    shallow-copies) is never touched."""
-    counts = {"capabilities": 0, "friction": 0}
-    worklist: list[tuple[int, str, int]] = []
-    sections: dict[str, tuple[list, tuple[str, ...]]] = {}
-    for section_key, keep_fields, rank_map in (
-        ("capabilities", _CAP_SKELETON_KEEP, _CAP_KEEP_RANK),
-        ("friction", _FRICTION_SKELETON_KEEP, _FRICTION_KEEP_RANK),
-    ):
-        items = trimmed.get(section_key)
-        if not isinstance(items, list) or not items:
-            continue
-        copied = [dict(it) if isinstance(it, dict) else it for it in items]
-        trimmed[section_key] = copied
-        sections[section_key] = (copied, keep_fields)
-        for idx, item in enumerate(copied):
-            if isinstance(item, dict):
-                worklist.append((rank_map.get(item.get("status"), 1), section_key, idx))
-    worklist.sort(key=lambda t: t[0])
-    for _rank, section_key, idx in worklist:
-        if _serialized_bytes(trimmed) <= target:
-            break
-        copied, keep_fields = sections[section_key]
-        item = copied[idx]
-        skeleton = {k: item[k] for k in keep_fields if k in item}
-        if skeleton != item:
-            copied[idx] = skeleton
-            counts[section_key] += 1
-    return counts
-
-
-def _shrink_pm_to_floor(trimmed: dict) -> dict:
-    """Progressively shrink *trimmed* (an already ``_agent_view_problem_model``-
-    trimmed model) until it serializes under :data:`_AGENT_VIEW_FLOOR_BYTES`,
-    so it always fits the packer's remaining budget and is never silently
-    dropped. Mutates and returns *trimmed* (caller passes a fresh copy)."""
-    if _serialized_bytes(trimmed) <= _AGENT_VIEW_FLOOR_BYTES:
-        return trimmed
-    target = _AGENT_VIEW_FLOOR_BYTES - _FLOOR_MARKER_RESERVE
-    stripped: list[str] = []
-    gaps = trimmed.get("gaps")
-    if isinstance(gaps, list) and gaps:
-        for level in _FLOOR_SHRINK_LEVELS:
-            gaps = [
-                {k: v for k, v in g.items() if k not in level}
-                if isinstance(g, dict)
-                else g
-                for g in gaps
-            ]
-            trimmed["gaps"] = gaps
-            stripped.extend(level)
-            if _serialized_bytes(trimmed) <= target:
-                trimmed["_agent_view_floor_applied"] = {
-                    "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
-                    "stripped_gap_fields": stripped,
-                    "dropped_gaps": 0,
-                }
-                return trimmed
-    # Gap-shrinking alone did not reach the floor (a capability/friction-heavy
-    # model, or a pathological active-gap count). Reduce capabilities and
-    # friction to a name+status skeleton, lowest-value first, before resorting
-    # to dropping live gaps — their detail is the recoverable bulk.
-    reduced = _skeletonize_caps_friction(trimmed, target)
-    if _serialized_bytes(trimmed) <= target:
-        trimmed["_agent_view_floor_applied"] = {
-            "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
-            "stripped_gap_fields": stripped,
-            "dropped_gaps": 0,
-            "summarized_capabilities": reduced["capabilities"],
-            "summarized_friction": reduced["friction"],
-        }
-        return trimmed
-    # Still over floor. Drop the lowest-value gaps (keeping the highest-value),
-    # summarizing the rest as a count, so the model is delivered not dropped.
-    gaps = trimmed.get("gaps")
-    if not isinstance(gaps, list) or not gaps:
-        # No gaps to drop (a caps/friction-only model already skeletonized).
-        still_over = _serialized_bytes(trimmed) > _AGENT_VIEW_FLOOR_BYTES
-        if still_over:
-            logger.warning(
-                "[STRATEGIC] agent-view problem_model still exceeds the %d-byte "
-                "floor after skeletonizing capabilities/friction — shipping anyway "
-                "with a loud marker so the strategist is never silently deprived",
-                _AGENT_VIEW_FLOOR_BYTES,
-            )
-        trimmed["_agent_view_floor_applied"] = {
-            "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
-            "stripped_gap_fields": stripped,
-            "dropped_gaps": 0,
-            "summarized_capabilities": reduced["capabilities"],
-            "summarized_friction": reduced["friction"],
-            "still_over_floor": still_over,
-        }
-        return trimmed
-    base = dict(trimmed)
-    base["gaps"] = []
-    running = _serialized_bytes(base)
-    kept: list = []
-    dropped = 0
-    for g in sorted(
-        (g for g in gaps if isinstance(g, dict)),
-        key=_gap_floor_keep_rank,
-        reverse=True,
-    ):
-        gsize = _serialized_bytes(g) + 1  # +1 ~ list separator
-        if running + gsize <= target or len(kept) < _FLOOR_MIN_GAPS:
-            kept.append(g)
-            running += gsize
-        else:
-            dropped += 1
-    trimmed["gaps"] = kept
-    still_over = _serialized_bytes(trimmed) > _AGENT_VIEW_FLOOR_BYTES
-    if still_over:
-        logger.warning(
-            "[STRATEGIC] agent-view problem_model still exceeds the %d-byte floor "
-            "after shrinking to %d gaps — shipping anyway with a loud marker so "
-            "the strategist is never silently deprived of its model",
-            _AGENT_VIEW_FLOOR_BYTES,
-            len(kept),
-        )
-    trimmed["_agent_view_floor_applied"] = {
-        "floor_bytes": _AGENT_VIEW_FLOOR_BYTES,
-        "stripped_gap_fields": stripped,
-        "dropped_gaps": dropped,
-        "summarized_capabilities": reduced["capabilities"],
-        "summarized_friction": reduced["friction"],
-        "still_over_floor": still_over,
-    }
-    return trimmed
-
-
-def _agent_view_problem_model_packed(pm: dict | None) -> dict:
-    """Budget-pressure ``summarize`` callback for the ``problem_model`` payload
-    key. Runs ONLY when the (already agent-view-trimmed) model still exceeds the
-    packer's remaining byte budget: it re-applies the agent-view trim, then
-    shrinks to a guaranteed-small floor so the model ALWAYS fits and is never
-    silently dropped from the strategist's cycle payload."""
-    return _shrink_pm_to_floor(_agent_view_problem_model(pm))
-
-
-def _agent_view_problem_model_floor(pm: dict | None) -> dict:
-    """``floor`` callback for the ``problem_model`` payload key.
-
-    Reserves and returns the WHOLE agent-view model handed to it, so the packer
-    reserves the full model's bytes off the top of the budget. Every other
-    recoverable sibling (design_doc index, playbook indices, outcome_evaluation,
-    conversation_thread, directions_summary overflow, …) must therefore degrade
-    or drop BEFORE the problem_model is ever reduced. Under normal cycle sizes
-    the whole model ships intact via the packer's direct fit-path and the
-    skeletonizing ``summarize`` callback never fires.
-
-    Only genuinely exceptional overflow degrades the model: when the full model
-    cannot fit at all, this floor's reservation alone exceeds the budget, the
-    packer drops the floor guarantee wholesale, and the ``summarize`` callback
-    (:func:`_agent_view_problem_model_packed` → :func:`_shrink_pm_to_floor`)
-    takes over — stamping the loud ``_agent_view_floor_applied`` marker, shipping
-    a bounded floored skeleton, and recording the trim in ``_packer_meta`` so the
-    agent's ``problemModelRecovery`` resolves to ``'fetch'``. The degraded path
-    is the visibly exceptional case, never the normal operating mode.
-
-    Deliberately INDEPENDENT of the summarize callback and defensively coded: a
-    failure in the summarize path never abandons this reservation, and the floor
-    itself never crashes the packer (which already wraps it in try/except). It
-    only ever returns the value handed to it — already an
-    ``_agent_view_problem_model``-trimmed copy whose durable source is never
-    mutated — or a minimal empty skeleton for a missing/garbage model.
-    """
-    if not pm or not isinstance(pm, dict):
-        return {"gaps": [], "capabilities": [], "friction": []}
-    # Reserve the WHOLE agent-view model. The value handed to this callback is
-    # the same trimmed agent-view dict already placed in the payload, so the
-    # reservation equals the full shipped value's byte size — no other section
-    # can claim those bytes ahead of the problem_model.
-    return pm
 
 
 # Maximum operator-override entries surfaced to the next strategic cycle, and
@@ -1412,6 +1012,46 @@ _RECON_LIST_CAP = 12
 _RECENT_MERGED_TITLES_CAP = 10
 # Char cap for any direction/gap/capability label echoed into the block.
 _RECON_LABEL_MAXLEN = 120
+# Maps raw last_qualification.status values to the set of canonical
+# summarize_qualification_state states that legitimately arise under them.
+# Used by the status_state_mismatch conflict check so a new state added to the
+# classifier under an existing status is caught by tests rather than silently
+# producing false conflicts in every strategic payload.
+_QUAL_STATUS_STATE_MAP: dict[str, frozenset[str]] = {
+    "pending": frozenset(
+        {
+            "qualifying",
+            "promotion_in_flight",
+            "promotion_check_wait",
+            "audit_crashed",
+        }
+    ),
+    "promotion_failed": frozenset(
+        {
+            "promotion_failed",
+            "required_check_failed",
+            "protection_blocked_review",
+        }
+    ),
+    "promoted": frozenset(
+        {
+            "promoted",
+            "promoted_unconfirmed",
+            "promotion_deploy_failed",
+            "promotion_confirmation_timed_out",
+        }
+    ),
+}
+# Guard: ensure all declared states in _QUAL_STATUS_STATE_MAP are valid members of
+# the authoritative QUALIFICATION_STATE_VOCAB. A mismatch (e.g., renamed/removed state,
+# or a typo) trips here at module load time rather than silently causing false conflicts
+# in strategic payloads downstream.
+_declared_states = {state for states in _QUAL_STATUS_STATE_MAP.values() for state in states}
+assert _declared_states <= QUALIFICATION_STATE_VOCAB, (
+    f"_QUAL_STATUS_STATE_MAP declares invalid states not in QUALIFICATION_STATE_VOCAB: "
+    f"{_declared_states - QUALIFICATION_STATE_VOCAB!r}"
+)
+
 # Name-length threshold for the long-name hygiene signal in prune candidates.
 # Capability/gap names longer than this are flagged as advisory cleanup targets.
 _CAPABILITY_LONG_NAME_THRESHOLD = 80
@@ -1441,6 +1081,28 @@ _ANCESTRY_CALL_TIMEOUT_S = 15.0
 _QUAL_SHA_PAT = re.compile(r"(?<!-)\b([0-9a-f]{8})\b")
 
 
+def _stamp_direction_in_flight(
+    direction_stats: list[dict],
+    active_by_direction: dict[str, int] | None,
+) -> None:
+    """Stamp a per-direction ``in_flight`` task count onto each stat in place.
+
+    Drawn from the SAME ``active_by_direction`` mapping that feeds
+    :func:`_build_cycle_start_reconciliation` (``direction_pipeline[*].in_flight``)
+    so the floored/summarized ``directions_summary`` line and the reconciliation
+    surface can never silently disagree. The count is stamped EVEN WHEN ZERO so
+    the strategist can distinguish a staffed direction (>0) from an idle one (0)
+    even under extreme byte pressure where richer sections are dropped; a
+    direction absent from ``active_by_direction`` defaults to 0.
+    """
+    active = active_by_direction or {}
+    for stat in direction_stats:
+        if not isinstance(stat, dict):
+            continue
+        did = str(stat.get("id") or "")
+        stat["in_flight"] = int(active.get(did, 0) or 0)
+
+
 def _build_cycle_start_reconciliation(
     direction_stats: list[dict],
     problem_model: dict | None,
@@ -1449,6 +1111,7 @@ def _build_cycle_start_reconciliation(
     per_direction_delta: list[dict] | None = None,
     running_update: str | None = None,
     last_qual: dict | None = None,
+    version_phase_block: dict | None = None,
 ) -> dict | None:
     """Compute one authoritative cycle-start reconciliation of the strategic surfaces.
 
@@ -1501,6 +1164,12 @@ def _build_cycle_start_reconciliation(
         ``direction_stats``. A phantom ref means the prose narrates a direction
         that no longer exists (or was never created), silently persisting stale
         framing across cycles.
+      * ``qualification_surface_conflicts`` — disagreements between the payload's
+        qualification narrative surfaces (``last_qualification``, derived
+        ``qualification_state``, ``criterion_coverage``, ``promotion_readiness``,
+        and candidate currency). Populated only when ``version_phase_block`` is
+        present (LTS split). Each conflict names the two surfaces, what each
+        asserts, and a reason for the disagreement.
 
     Returns ``None`` when there is nothing to reconcile (no active directions and
     no conflicts), so the caller omits the field for cold-start projects. Pure
@@ -1720,9 +1389,11 @@ def _build_cycle_start_reconciliation(
     # accounting conflict; ``unverifiable`` is tallied as unknown, never
     # manufactured into a contradiction.
     merge_accounting: list[dict] = []
+    pending_rollup_accounting: list[dict] = []
     merge_landed_total = 0
     merge_not_landed_total = 0
     merge_unverifiable_total = 0
+    merge_pending_in_open_rollup_total = 0
     for delta in per_direction_delta or []:
         if not isinstance(delta, dict):
             continue
@@ -1746,11 +1417,15 @@ def _build_cycle_start_reconciliation(
         unverifiable_n = (
             _count_field(count_block, "unverifiable") if count_block else None
         )
+        pending_n = (
+            _count_field(count_block, "pending_in_open_rollup") if count_block else None
+        )
         if landed_n is None or not_landed_n is None or unverifiable_n is None:
             not_landed = []
             landed_n = 0
             not_landed_n = 0
             unverifiable_n = 0
+            pending_n = 0
             for entry in titles_list:
                 if not isinstance(entry, dict):
                     continue
@@ -1760,34 +1435,61 @@ def _build_cycle_start_reconciliation(
                     not_landed_n += 1
                 elif verdict == "verified_landed":
                     landed_n += 1
+                elif verdict == "pending_in_open_rollup":
+                    pending_n += 1
                 else:
                     # Absent/unknown verdict → unverifiable, NOT a conflict.
                     unverifiable_n += 1
-        elif not not_landed:
-            for entry in titles_list:
-                if not isinstance(entry, dict):
-                    continue
-                if entry.get("merge_verdict") == "verified_not_landed":
-                    not_landed.append(_label(entry.get("title")))
+        else:
+            if pending_n is None:
+                pending_n = 0
+            if not not_landed:
+                for entry in titles_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("merge_verdict") == "verified_not_landed":
+                        not_landed.append(_label(entry.get("title")))
         merge_landed_total += landed_n
         merge_not_landed_total += not_landed_n
         merge_unverifiable_total += unverifiable_n
+        merge_pending_in_open_rollup_total += pending_n
         # Surface only directions with a genuine verified-not-landed conflict.
-        if not_landed_n <= 0:
-            continue
-        merge_accounting.append(
-            {
-                "direction_id": delta.get("direction_id"),
-                "direction_text": _label(delta.get("direction_text")),
-                "not_landed_titles": not_landed,
-                "landed": landed_n,
-                "not_landed": not_landed_n,
-                "unverifiable": unverifiable_n,
-            }
-        )
+        if not_landed_n > 0:
+            merge_accounting.append(
+                {
+                    "direction_id": delta.get("direction_id"),
+                    "direction_text": _label(delta.get("direction_text")),
+                    "not_landed_titles": not_landed,
+                    "landed": landed_n,
+                    "not_landed": not_landed_n,
+                    "unverifiable": unverifiable_n,
+                }
+            )
+        # Surface directions with PRs pending in an open rollup branch.
+        if pending_n > 0:
+            pending_titles: list[str] = []
+            for entry in titles_list:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("merge_verdict") == "pending_in_open_rollup":
+                    pending_titles.append(_label(entry.get("title")))
+            pending_rollup_accounting.append(
+                {
+                    "direction_id": delta.get("direction_id"),
+                    "direction_text": _label(delta.get("direction_text")),
+                    "pending_in_open_rollup": pending_n,
+                    "pending_in_open_rollup_titles": pending_titles,
+                }
+            )
     merge_accounting.sort(
         key=lambda m: (
             -int(m.get("not_landed") or 0),
+            str(m.get("direction_text") or ""),
+        )
+    )
+    pending_rollup_accounting.sort(
+        key=lambda m: (
+            -int(m.get("pending_in_open_rollup") or 0),
             str(m.get("direction_text") or ""),
         )
     )
@@ -1845,6 +1547,136 @@ def _build_cycle_start_reconciliation(
                         }
                     )
 
+    # 8. Qualification surface coherence: cross-check the payload's own
+    # qualification narrative (last_qualification record, qualification_state,
+    # criterion_coverage, promotion_readiness, candidate currency) for
+    # disagreements. Only runs when version_phase_block is present (LTS split).
+    qualification_surface_conflicts: list[dict] = []
+    if isinstance(version_phase_block, dict):
+        vpb_last_qual = version_phase_block.get("last_qualification")
+        vpb_qual_state = version_phase_block.get("qualification_state")
+        vpb_criterion_cov = version_phase_block.get("criterion_coverage")
+        vpb_promotion_ready = version_phase_block.get("promotion_readiness")
+        vpb_candidate_currency = version_phase_block.get(
+            "last_qualification_candidate_currency"
+        )
+
+        # Disagreement 1: candidate currency says stale AND last_qual carries a
+        # 'promotion_failed' status. A pending+stale candidate is deliberately
+        # NOT flagged (integration-branch drift during an active qualification
+        # is expected); the conflict fires only when a *failed* promotion left
+        # the recorded candidate pinned to a now-stale SHA instead of advancing.
+        if isinstance(vpb_candidate_currency, dict) and isinstance(
+            vpb_last_qual, dict
+        ):
+            # The currency dict stored here is the raw return of
+            # ``_resolve_candidate_currency`` (verdict/resolved/current/
+            # candidate_sha/head_sha) — it emits "stale" as the verdict when
+            # the pinned SHA is resolved and no longer equals integration HEAD.
+            is_stale = vpb_candidate_currency.get("verdict") == "stale"
+            candidate_status = vpb_last_qual.get("status")
+            if (
+                is_stale
+                and candidate_status == "promotion_failed"
+            ):
+                qualification_surface_conflicts.append(
+                    {
+                        "conflict_type": "stale_candidate_with_promotion_failed_status",
+                        "description": (
+                            "Candidate currency says the pinned SHA is stale/behind "
+                            f"HEAD, but last_qualification.status is '{candidate_status}'. "
+                            "After a failed promotion the recorded candidate should "
+                            "have advanced past the now-stale SHA; a stale candidate "
+                            "still carrying a promotion_failed status means the "
+                            "qualification surface was not refreshed."
+                        ),
+                    }
+                )
+
+        # Disagreement 2: last_qualification.status vs qualification_state.
+        # Skip when qualification_state_disagreement is already present — the
+        # resolver documented the substitution explicitly, so the raw/derived
+        # divergence is an EXPLAINED mismatch, not an unexplained conflict.
+        vpb_qual_disagreement = version_phase_block.get(
+            "qualification_state_disagreement"
+        )
+        if (
+            vpb_qual_disagreement is None
+            and isinstance(vpb_last_qual, dict)
+            and isinstance(vpb_qual_state, dict)
+        ):
+            raw_status = vpb_last_qual.get("status")
+            derived_state = vpb_qual_state.get("state")
+            if (
+                raw_status is not None
+                and derived_state is not None
+                and raw_status != derived_state
+            ):
+                expected_states = _QUAL_STATUS_STATE_MAP.get(raw_status, frozenset())
+                if derived_state not in expected_states:
+                    qualification_surface_conflicts.append(
+                        {
+                            "conflict_type": "status_state_mismatch",
+                            "description": (
+                                f"last_qualification.status='{raw_status}' but "
+                                f"qualification_state.state='{derived_state}' "
+                                "(states do not align for this status)."
+                            ),
+                        }
+                    )
+
+        # Disagreement 3: criterion_coverage unmapped vs confidence/threshold
+        if isinstance(vpb_criterion_cov, dict) and isinstance(vpb_last_qual, dict):
+            covered = int(vpb_criterion_cov.get("covered", 0) or 0)
+            total = int(vpb_criterion_cov.get("total", 0) or 0)
+            confidence = vpb_last_qual.get("confidence")
+            threshold = vpb_last_qual.get("threshold")
+            # When confidence meets threshold but NOT all criteria are covered,
+            # the two surfaces disagree on "ready to promote" assessment.
+            if (
+                total > 0
+                and covered < total
+                and confidence is not None
+                and threshold is not None
+                and isinstance(confidence, (int, float))
+                and isinstance(threshold, (int, float))
+                and confidence >= threshold
+            ):
+                qualification_surface_conflicts.append(
+                    {
+                        "conflict_type": "criterion_coverage_vs_confidence",
+                        "description": (
+                            f"Confidence {confidence:.2%} meets threshold "
+                            f"{threshold:.2%}, but only {covered}/{total} criteria "
+                            "are covered. The version is deemed ready by confidence "
+                            "but incomplete by criterion coverage."
+                        ),
+                    }
+                )
+
+        # Disagreement 4: promotion_readiness trend vs current qualification status
+        if isinstance(vpb_promotion_ready, dict) and isinstance(vpb_last_qual, dict):
+            ready_state = vpb_promotion_ready.get("ready")
+            qual_status = vpb_last_qual.get("status")
+            # If promotion_readiness says not ready but status is
+            # "promotion_failed", the surfaces contradict.
+            if (
+                ready_state is False
+                and qual_status == "promotion_failed"
+                and vpb_promotion_ready.get("is_current_readiness") is not False
+            ):
+                qualification_surface_conflicts.append(
+                    {
+                        "conflict_type": "promotion_readiness_unready",
+                        "description": (
+                            "Promotion readiness is not ready, but "
+                            f"last_qualification.status is '{qual_status}'. "
+                            "The trend advises against promotion while the "
+                            "qualification is progressing."
+                        ),
+                    }
+                )
+
     # Nothing to reconcile (e.g. a cold-start project): let the caller omit it.
     if (
         not active_dirs
@@ -1854,8 +1686,10 @@ def _build_cycle_start_reconciliation(
         and not deferred_gap_count
         and not stale_active_moves
         and not merge_accounting
+        and not pending_rollup_accounting
         and not phantom_direction_refs
         and not qualification_prose_drift
+        and not qualification_surface_conflicts
     ):
         return None
 
@@ -1871,8 +1705,10 @@ def _build_cycle_start_reconciliation(
     capped_stale, stale_total = _cap(stale_active_moves)
     capped_pipeline, pipeline_dropped = _cap(direction_pipeline)
     capped_merge, merge_dropped = _cap(merge_accounting)
+    capped_pending_rollup, pending_rollup_dropped = _cap(pending_rollup_accounting)
     capped_phantoms, phantoms_total = _cap(phantom_direction_refs)
     capped_qual_drift, qual_drift_total = _cap(qualification_prose_drift)
+    capped_qual_conflicts, qual_conflicts_total = _cap(qualification_surface_conflicts)
     # Cap each surfaced direction's not-landed title list too, preserving the
     # true count (``not_landed``) so the renderer can show "+N more".
     for m in capped_merge:
@@ -1883,6 +1719,15 @@ def _build_cycle_start_reconciliation(
         m["not_landed_titles_overflow"] = max(
             0, int(m.get("not_landed") or 0) - len(shown_titles)
         )
+    # Cap each pending-rollup direction's title list too.
+    for m in capped_pending_rollup:
+        full_titles = m["pending_in_open_rollup_titles"]
+        if len(full_titles) > _RECON_LIST_CAP:
+            m["pending_in_open_rollup_titles"] = full_titles[:_RECON_LIST_CAP]
+        shown_titles = m["pending_in_open_rollup_titles"]
+        m["pending_in_open_rollup_titles_overflow"] = max(
+            0, int(m.get("pending_in_open_rollup") or 0) - len(shown_titles)
+        )
 
     return {
         "capability_contradictions": capped_caps,
@@ -1892,8 +1737,10 @@ def _build_cycle_start_reconciliation(
         "stale_active_moves": capped_stale,
         "direction_pipeline": capped_pipeline,
         "merge_accounting": capped_merge,
+        "pending_in_open_rollup": capped_pending_rollup,
         "phantom_direction_refs": capped_phantoms,
         "qualification_prose_drift": capped_qual_drift,
+        "qualification_surface_conflicts": capped_qual_conflicts,
         "counts": {
             # True totals (shown + overflow) so the renderer can say "+N more".
             "capability_contradictions": len(capped_caps) + caps_total,
@@ -1916,8 +1763,13 @@ def _build_cycle_start_reconciliation(
             "merge_landed": merge_landed_total,
             "merge_not_landed": merge_not_landed_total,
             "merge_unverifiable": merge_unverifiable_total,
+            # Pending rollup merges: PRs merged into staging branches not yet
+            # squash-merged into the integration branch. These are NOT conflicts.
+            "merge_pending_in_open_rollup": merge_pending_in_open_rollup_total,
+            "merge_pending_in_open_rollup_accounting": len(capped_pending_rollup) + pending_rollup_dropped,
             "phantom_direction_refs": len(capped_phantoms) + phantoms_total,
             "qualification_prose_drift": len(capped_qual_drift) + qual_drift_total,
+            "qualification_surface_conflicts": len(capped_qual_conflicts) + qual_conflicts_total,
         },
     }
 
@@ -2276,498 +2128,6 @@ def _build_operator_steering_directive(
     )
 
 
-def _summarize_conversation_thread(thread: list) -> list:
-    """Keep the most recent N conversation messages."""
-    if (
-        not isinstance(thread, list)
-        or len(thread) <= _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED
-    ):
-        return thread
-    return thread[-_CONVERSATION_THREAD_KEEP_WHEN_TRIMMED:]
-
-
-_MEMO_CITATIONS_KEEP = 5
-_MEMO_EXCERPT_MAX_CHARS = 400
-
-
-_MEMO_HEAVY_FIELDS = ("citations", "final_metrics")
-_MEMO_VERBOSE_FIELDS = ("rationale", "reasoning")
-
-
-def _strip_verbose_fields(m: dict) -> dict:
-    """Return a copy without heavy AND verbose optional fields."""
-    drop = set(_MEMO_HEAVY_FIELDS) | set(_MEMO_VERBOSE_FIELDS)
-    return {k: v for k, v in m.items() if k not in drop}
-
-
-def _cap_excerpt(m: dict) -> dict:
-    result = dict(m)
-    result["summary_excerpt"] = (m.get("summary_excerpt") or "")[
-        :_MEMO_EXCERPT_MAX_CHARS
-    ]
-    return result
-
-
-def _summarize_memo_citations(memos: list) -> list:
-    """Trim memo citations for inclusion in strategic-agent payloads.
-
-    Field-level trimming order (applied before entry-count capping):
-      1. Drop ``citations`` and ``final_metrics`` (largest optional fields).
-      2. Drop ``rationale`` and ``reasoning`` (verbose text fields; compact
-         ``*_excerpt`` variants are preserved).
-      3. Cap ``summary_excerpt`` to ``_MEMO_EXCERPT_MAX_CHARS``.
-    Then cap entry count to ``_MEMO_CITATIONS_KEEP`` (newest-first).
-
-    This ensures over-budget payloads degrade to a compact citable digest
-    rather than dropping the whole feed. ``task_id`` is always preserved.
-    """
-    if not isinstance(memos, list):
-        return memos
-    result = []
-    for m in memos:
-        if not isinstance(m, dict):
-            result.append(m)
-            continue
-        entry = _strip_verbose_fields(m)
-        entry = _cap_excerpt(entry)
-        result.append(entry)
-    return result[:_MEMO_CITATIONS_KEEP]
-
-
-# ── Open-message inbox (the strategist's authoritative feed) ──────────────────
-# The strategist's open-message inbox is its OWN status-filtered query — NOT a
-# slice of the capped conversation_thread. Without this, an OPEN BUG_REPORT or
-# BLOCKER older than the 15 newest messages ages out of the thread window and
-# the strategist never sees it, so it can never be acted on or resolved and
-# stays open forever. The feed is size-bounded two ways (a hard message count +
-# a per-message excerpt cap) and priority-ordered so unresolved
-# BUG_REPORT/BLOCKER items (then the oldest-open items) are the LAST to be
-# dropped under budget pressure, never the first.
-_OPEN_MESSAGES_FETCH_LIMIT = 200  # DB window over open-status rows
-_OPEN_MESSAGES_KEEP = 40  # count bound for the packed feed
-_OPEN_MESSAGES_KEEP_WHEN_TRIMMED = 20  # tighter bound for the summarize fallback
-_OPEN_MESSAGE_EXCERPT_MAX_CHARS = 800  # per-message content excerpt cap
-_CRITICAL_OPEN_MESSAGE_TYPES = (
-    MessageType.BUG_REPORT.value,
-    MessageType.BLOCKER.value,
-)
-_OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT = 30
-_OPERATOR_CONTEXT_REQUESTS_KEEP = 6
-_OPERATOR_CONTEXT_REFS_KEEP = 12
-_OPERATOR_CONTEXT_REF_SCAN_LIMIT = 24
-_OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT = 24
-_OPERATOR_CONTEXT_FROM_TYPES = ("user", "operator")
-_OPERATOR_CONTEXT_TARGET_KEYS = (
-    "surface",
-    "section",
-    "task_id",
-    "message_id",
-    "direction_id",
-    "document_id",
-    "artifact_id",
-    "cycle_id",
-)
-
-
-def _open_message_survival_key(msg: dict) -> tuple:
-    """Sort key ranking an open message's survival priority HIGH→LOW.
-
-    Critical types (BUG_REPORT/BLOCKER) rank first, with reproducing (non-stale)
-    ones ahead of stale (citation_state == "absent") ones; within each tier,
-    oldest-open items rank first (ascending created_at). The HEAD of the sorted
-    list survives when the feed must be bounded, so reproducing criticals are
-    last to be dropped, followed by stale criticals, then non-critical messages.
-    """
-    is_critical = msg.get("type") in _CRITICAL_OPEN_MESSAGE_TYPES
-    citation_state = msg.get("citation_state")
-    is_stale = citation_state == "absent"
-
-    # Tier 0: reproducing critical messages (highest priority)
-    # Tier 1: stale critical messages (lower than reproducing)
-    # Tier 2: non-critical messages
-    if is_critical and not is_stale:
-        tier = 0
-    elif is_critical and is_stale:
-        tier = 1
-    else:
-        tier = 2
-
-    return (tier, msg.get("created_at") or "")
-
-
-def _bound_open_messages(messages: list, keep: int) -> list:
-    """Bound *messages* to *keep* items and cap each message's excerpt length.
-
-    Lowest-priority survivors are dropped first: BUG_REPORT/BLOCKER (then the
-    oldest-open) items are the LAST to go. Survivors are returned in oldest-open
-    chronological order so the strategist reads a stable inbox regardless of
-    which items were trimmed.
-    """
-    if not isinstance(messages, list):
-        return messages
-    capped: list = []
-    for m in messages:
-        if isinstance(m, dict) and isinstance(m.get("content"), str):
-            content = m["content"]
-            if len(content) > _OPEN_MESSAGE_EXCERPT_MAX_CHARS:
-                m = {**m, "content": content[:_OPEN_MESSAGE_EXCERPT_MAX_CHARS]}
-        capped.append(m)
-    if len(capped) <= keep:
-        return capped
-    survivors = sorted(
-        (m for m in capped if isinstance(m, dict)),
-        key=_open_message_survival_key,
-    )[:keep]
-    # Re-sort survivors chronologically (oldest-open first) for a stable read.
-    survivors.sort(key=lambda m: m.get("created_at") or "")
-    return survivors
-
-
-def _summarize_open_messages(messages: list) -> list:
-    """Budget-pressure fallback for the open-message inbox.
-
-    Rather than dropping the entire inbox wholesale when the strategic payload
-    is over budget, trim it to a tighter bound that PRESERVES unresolved
-    BUG_REPORT/BLOCKER (and the oldest-open) items and drops the rest — so the
-    critical inbox items survive budget pressure instead of vanishing.
-    """
-    return _bound_open_messages(messages, _OPEN_MESSAGES_KEEP_WHEN_TRIMMED)
-
-
-def _operator_context_text(
-    value: Any,
-    *,
-    max_chars: int,
-    raw_max_chars: int | None = None,
-) -> str | None:
-    if not isinstance(value, str):
-        return None
-    raw_max = raw_max_chars if raw_max_chars is not None else max_chars * 4
-    if len(value) > raw_max:
-        return None
-    text = " ".join(value.strip().split())
-    if not text:
-        return None
-    return text[:max_chars]
-
-
-def _operator_context_ref(raw: Any) -> dict[str, str] | None:
-    if not isinstance(raw, dict):
-        return None
-    kind = _operator_context_text(raw.get("kind"), max_chars=40, raw_max_chars=160)
-    ref_id = _operator_context_text(raw.get("id"), max_chars=160, raw_max_chars=640)
-    if not kind or not ref_id:
-        return None
-    ref: dict[str, str] = {"kind": kind, "id": ref_id}
-    label = _operator_context_text(
-        raw.get("label"), max_chars=180, raw_max_chars=720
-    )
-    if label:
-        ref["label"] = label
-    return ref
-
-
-def _operator_context_target(raw: Any) -> dict[str, str] | None:
-    if not isinstance(raw, dict):
-        return None
-    target: dict[str, str] = {}
-    for key in _OPERATOR_CONTEXT_TARGET_KEYS:
-        value = _operator_context_text(
-            raw.get(key), max_chars=180, raw_max_chars=720
-        )
-        if value:
-            target[key] = value
-    return target or None
-
-
-def _operator_context_descriptor(raw: Any) -> dict[str, Any] | None:
-    if not isinstance(raw, dict):
-        return None
-    kind = _operator_context_text(raw.get("kind"), max_chars=40, raw_max_chars=160)
-    ref_id = _operator_context_text(raw.get("id"), max_chars=160, raw_max_chars=640)
-    if not kind or not ref_id:
-        return None
-
-    descriptor: dict[str, Any] = {"kind": kind, "id": ref_id}
-    label = _operator_context_text(
-        raw.get("label"), max_chars=180, raw_max_chars=720
-    )
-    if label:
-        descriptor["label"] = label
-    summary = _operator_context_text(
-        raw.get("summary"), max_chars=220, raw_max_chars=880
-    )
-    if summary:
-        descriptor["summary"] = summary
-    status = _operator_context_text(
-        raw.get("status"), max_chars=80, raw_max_chars=320
-    )
-    if status:
-        descriptor["status"] = status
-    target = _operator_context_target(raw.get("target"))
-    if target:
-        descriptor["target"] = target
-    return descriptor
-
-
-def _operator_context_descriptor_map(
-    snapshot: dict[str, Any],
-) -> dict[tuple[str, str], dict[str, Any]]:
-    raw_descriptors = snapshot.get("selected_ref_descriptors")
-    if not isinstance(raw_descriptors, list):
-        return {}
-    descriptors: dict[tuple[str, str], dict[str, Any]] = {}
-    for raw in raw_descriptors[:_OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT]:
-        descriptor = _operator_context_descriptor(raw)
-        if not descriptor:
-            continue
-        key = (descriptor["kind"], descriptor["id"])
-        if key not in descriptors:
-            descriptors[key] = descriptor
-    return descriptors
-
-
-def _operator_context_package_descriptor(raw: Any) -> dict[str, Any] | None:
-    descriptor = _operator_context_descriptor(raw)
-    if descriptor:
-        return descriptor
-    if not isinstance(raw, dict):
-        return None
-    package_id = _operator_context_text(
-        raw.get("id") or raw.get("context_package_id"),
-        max_chars=180,
-        raw_max_chars=720,
-    )
-    if not package_id:
-        return None
-    result: dict[str, Any] = {"id": package_id}
-    label = _operator_context_text(
-        raw.get("label") or raw.get("title"),
-        max_chars=180,
-        raw_max_chars=720,
-    )
-    if label:
-        result["label"] = label
-    summary = _operator_context_text(
-        raw.get("summary"), max_chars=220, raw_max_chars=880
-    )
-    if summary:
-        result["summary"] = summary
-    status = _operator_context_text(
-        raw.get("status"), max_chars=80, raw_max_chars=320
-    )
-    if status:
-        result["status"] = status
-    return result
-
-
-def _operator_context_created_sort_value(message: ProjectMessage) -> tuple:
-    created_at = message.created_at or datetime.min
-    return (created_at, str(message.id))
-
-
-def _build_operator_context_refs_from_messages(
-    messages: list[ProjectMessage],
-) -> list[dict[str, Any]]:
-    """Promote recent operator-selected Strategic context into pointer entries.
-
-    The source snapshots were already sanitized when ProjectMessage rows were
-    created. This bridge still treats the JSON defensively because rows may be
-    legacy or manually inserted: it copies only pointer-shaped fields, caps all
-    strings/counts, dedupes repeated refs globally, and never includes bodies,
-    logs, or arbitrary nested context.
-    """
-    requests: list[dict[str, Any]] = []
-    seen_refs: set[tuple[str, str]] = set()
-    seen_packages: set[str] = set()
-    total_refs = 0
-
-    for message in sorted(
-        (
-            m
-            for m in messages
-            if getattr(m, "from_type", None) in _OPERATOR_CONTEXT_FROM_TYPES
-        ),
-        key=_operator_context_created_sort_value,
-        reverse=True,
-    ):
-        context = message.context if isinstance(message.context, dict) else {}
-        snapshot = context.get("strategic_session")
-        if not isinstance(snapshot, dict):
-            continue
-
-        descriptors = _operator_context_descriptor_map(snapshot)
-        selected_refs: list[dict[str, Any]] = []
-        raw_refs = snapshot.get("selected_refs")
-        if isinstance(raw_refs, list):
-            for raw_ref in raw_refs[:_OPERATOR_CONTEXT_REF_SCAN_LIMIT]:
-                if total_refs >= _OPERATOR_CONTEXT_REFS_KEEP:
-                    break
-                ref = _operator_context_ref(raw_ref)
-                if not ref:
-                    continue
-                key = (ref["kind"], ref["id"])
-                if key in seen_refs:
-                    continue
-                seen_refs.add(key)
-                descriptor = descriptors.get(key)
-                if descriptor:
-                    ref = {**ref, "descriptor": descriptor}
-                selected_refs.append(ref)
-                total_refs += 1
-
-        entry: dict[str, Any] = {
-            "source_message_id": str(message.id),
-            "created_at": message.created_at.isoformat()
-            if message.created_at
-            else None,
-            "selected_refs": selected_refs,
-        }
-        for source_key, output_key, max_chars in (
-            ("context_package_id", "context_package_id", 180),
-            ("session_id", "session_id", 180),
-            ("id", "session_id", 180),
-            ("session_started_at", "session_started_at", 80),
-            ("captured_at", "captured_at", 80),
-        ):
-            if output_key in entry:
-                continue
-            value = _operator_context_text(
-                snapshot.get(source_key),
-                max_chars=max_chars,
-                raw_max_chars=max_chars * 4,
-            )
-            if value:
-                entry[output_key] = value
-
-        package_descriptor = _operator_context_package_descriptor(
-            snapshot.get("context_package_descriptor") or snapshot.get("context_package")
-        )
-        if package_descriptor:
-            entry["context_package_descriptor"] = package_descriptor
-
-        package_id = entry.get("context_package_id")
-        has_new_package = isinstance(package_id, str) and package_id not in seen_packages
-        if isinstance(package_id, str):
-            seen_packages.add(package_id)
-
-        if selected_refs or has_new_package or package_descriptor:
-            requests.append(entry)
-        if len(requests) >= _OPERATOR_CONTEXT_REQUESTS_KEEP:
-            break
-
-    return requests
-
-
-async def _fetch_operator_context_refs(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-) -> list[dict[str, Any]]:
-    result = await session.execute(
-        select(ProjectMessage)
-        .where(
-            ProjectMessage.project_id == project_id,
-            ProjectMessage.from_type.in_(_OPERATOR_CONTEXT_FROM_TYPES),
-        )
-        .order_by(ProjectMessage.created_at.desc(), ProjectMessage.id.desc())
-        .limit(_OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT)
-    )
-    return _build_operator_context_refs_from_messages(result.scalars().all())
-
-
-def _open_message_citation_summary(context: Any) -> dict:
-    """Promote a message's stored citation-grounding signal to a compact summary.
-
-    BUG_REPORT/BLOCKER ingestion stores a reproduce-on-HEAD citation signal under
-    ``context['_provenance_warnings']`` (the same key research findings use). This
-    surfaces it at the top level of the packed open-message dict so the strategist
-    sees the report's grounding state instead of trusting it blindly.
-
-    The signal is surfaced in two cases:
-
-    * ``citation_state == "absent"`` — the report is fully stale (cited code gone
-      on HEAD); the strategist must discount it.
-    * any state that still carries ``broken_refs``/``ungrounded_refs`` — the
-      report is only PARTIALLY grounded (mixed/indeterminate). The broken and
-      ungrounded references stay VISIBLE so the strategist can inspect them
-      during triage instead of having that detail stripped, while the non-absent
-      state keeps the report actionable (not discounted as stale).
-
-    Returns an empty dict (no key added) when there is no recorded warning, or
-    when a non-absent state carries no broken/ungrounded refs (nothing to flag).
-    """
-    if not isinstance(context, dict):
-        return {}
-    warnings = context.get("_provenance_warnings")
-    if not isinstance(warnings, dict):
-        return {}
-    state = warnings.get("citation_state")
-    broken = warnings.get("broken_refs")
-    broken_list = broken if isinstance(broken, list) and broken else []
-    ungrounded = warnings.get("ungrounded_refs")
-    ungrounded_list = ungrounded if isinstance(ungrounded, list) and ungrounded else []
-    # Surface when fully absent (stale) OR when a non-absent state still carries
-    # broken/ungrounded refs (mixed/partially grounded). A non-absent state with
-    # no refs has nothing to flag, so it is omitted (keeps the feed clean).
-    if state != "absent" and not broken_list and not ungrounded_list:
-        return {}
-    summary: dict = {}
-    if isinstance(state, str) and state:
-        summary["citation_state"] = state
-    if broken_list:
-        summary["broken_refs"] = broken_list
-    if ungrounded_list:
-        summary["ungrounded_refs"] = ungrounded_list
-    return summary
-
-
-async def _fetch_open_messages(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    limit: int = _OPEN_MESSAGES_KEEP,
-) -> list[dict]:
-    """Authoritative open-message feed for a strategic spawn payload.
-
-    Queries messages whose status is open DIRECTLY (backed by
-    ``ix_projectmessage_project_status``), independent of the capped
-    conversation_thread, so an OPEN BUG_REPORT/BLOCKER stays visible to the
-    strategist until it is fixed or explicitly resolved no matter how many newer
-    messages have accumulated. The result is size-bounded: at most *limit*
-    messages, priority-ordered so BUG_REPORT/BLOCKER and oldest-open items
-    survive, with per-message excerpts capped.
-
-    Shared by every strategic spawn path (strategic_review + design_doc_update)
-    so the open-message access pattern stops drifting apart. Each row carries
-    its full ``id`` (UUID string) so the agent can resolve it by reference.
-    """
-    # status == "open" is the ONLY actionable status. Messages in "linked"
-    # state (bug-class messages whose fix is in-flight, owned by a direction
-    # or task) are intentionally excluded here — they already have an owner
-    # and the strategist should not act on them again. Messages with status
-    # "resolved" are terminal and also excluded. This filter is sufficient:
-    # no extra clause is needed to exclude linked messages.
-    result = await session.execute(
-        select(ProjectMessage)
-        .where(
-            ProjectMessage.project_id == project_id,
-            ProjectMessage.status == "open",
-        )
-        .order_by(ProjectMessage.created_at.asc())
-        .limit(_OPEN_MESSAGES_FETCH_LIMIT)
-    )
-    messages = [
-        {
-            **agent_thread_message_dict(m),
-            # Promote the reproduce-on-HEAD citation signal (stored on the
-            # message context at ingestion) to the top level so a stale or
-            # broken-citation bug report is VISIBLY discounted to the strategist
-            # rather than silently trusted. Absent when no warning was recorded.
-            **_open_message_citation_summary(m.context),
-        }
-        for m in result.scalars().all()
-    ]
-    return _bound_open_messages(messages, limit)
 
 
 # Schemas for pack_under_budget. Each key declares its priority tier and an
@@ -2796,41 +2156,67 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # heavier ``directions_summary`` detail list is trimmed or dropped for budget.
     "direction_counts": {"priority": "critical"},
     "max_active_directions": {"priority": "critical"},
-    "prompt_suffix": {"priority": "high"},
+    # Trim-proof authoritative count of unresolved open operator messages computed
+    # BEFORE packing. Critical tier (tiny scalar) so the agent sees the true inbox
+    # depth even when ``open_messages`` itself is trimmed/dropped under byte budget.
+    "open_message_count": {"priority": "critical"},
+    "prompt_suffix": {"priority": "high", "exempt": True},
     # Vision + intent — small but load-bearing for every decision
     "vision": {"priority": "critical"},
-    # User-facing state the agent must respond to. The open-message inbox is
-    # packed high but with a summarize fallback so BUG_REPORT/BLOCKER (and the
-    # oldest-open) items survive budget pressure instead of the whole inbox
-    # being dropped wholesale.
-    "open_messages": {"priority": "high", "summarize": _summarize_open_messages},
-    "running_update": {"priority": "high"},
-    "running_update_acknowledged_at": {"priority": "high"},
-    "user_last_active_at": {"priority": "high"},
+    # User-facing state the agent must respond to. Core section: the open-message
+    # inbox has BOTH a summarize fallback AND a floor callback, so at least its
+    # floored form (top survival-priority items, tight excerpts) ALWAYS ships —
+    # the whole inbox is never dropped wholesale under budget pressure.
+    "open_messages": {
+        "priority": "high",
+        "summarize": _summarize_open_messages,
+        "floor": _floor_open_messages,
+        "fetch_verb": "message",
+    },
+    "running_update": {"priority": "high", "exempt": True},
+    "running_update_acknowledged_at": {"priority": "high", "exempt": True},
+    "user_last_active_at": {"priority": "high", "exempt": True},
+    # Timestamp when the first autonomous improvement (create/fix/refactor task)
+    # merged on external projects. Absent for self-repo and projects with no
+    # merged autonomous improvements yet. High priority, exempt: tiny scalar.
+    "first_autonomous_improvement_at": {"priority": "high", "exempt": True},
     # Bounded summary of the operator's recent reconciliation overrides (what the
     # agent proposed vs. what the operator kept, per document). Medium priority
     # with no summarize_fn: it is already capped + char-bounded at build time, so
     # the packer drops it whole under budget rather than trimming. Closes the
     # operator-wins reconciliation loop so the agent reconciles instead of
-    # re-proposing overridden values.
-    "operator_overrides": {"priority": "medium"},
+    # re-proposing overridden values. Summarize fallback keeps the newest few
+    # entries (routing keys + tightened values) instead of dropping the whole
+    # ledger; full detail is reconstructable from the live documents.
+    "operator_overrides": {
+        "priority": "medium",
+        "summarize": _summarize_operator_overrides,
+    },
     # Recent operator-selected Strategic workbench pointers promoted out of
     # ProjectMessage.context.strategic_session so selected refs survive when the
     # conversation thread is trimmed. Already capped and pointer-only.
-    "operator_context_refs": {"priority": "high"},
+    "operator_context_refs": {"priority": "high", "exempt": True},
     # Computed cycle-start reconciliation of the four strategic surfaces
     # (capabilities vs grounding, gaps vs directions, per-direction research
     # pipeline). Conflict-focused and bounded at build time, so it ships whole
     # or not at all. High priority: it is the authoritative starting state the
     # agent reasons from, and it is small.
-    "cycle_start_reconciliation": {"priority": "high"},
-    # Core working set (the big stuff) — summarize when over budget
-    "directions_summary": {"priority": "high", "summarize": _summarize_directions},
+    "cycle_start_reconciliation": {"priority": "high", "exempt": True},
+    # Core working set (the big stuff) — summarize when over budget. Core
+    # section: the floor callback guarantees a compact active-direction skeleton
+    # (top directions, id/status/headline only) ALWAYS ships, so per-direction
+    # detail degrades before the active-direction core disappears entirely.
+    "directions_summary": {
+        "priority": "high",
+        "summarize": _summarize_directions,
+        "floor": _directions_summary_floor,
+        "fetch_verb": "direction",
+    },
     # Directions already queued for the NEXT version (status=staged). Medium
     # priority with no summarize_fn: it is already capped at build time, so the
     # packer drops it whole under budget rather than trimming. Surfaced so the
     # strategist knows what is already staged and does NOT re-propose it.
-    "staged_directions": {"priority": "medium"},
+    "staged_directions": {"priority": "medium", "exempt": True},
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
@@ -2845,72 +2231,114 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         # independent function that cannot fail, so the reservation is honored
         # even if the summarize callback raises an exception.
         "floor": _agent_view_problem_model_floor,
+        "fetch_verb": "problem-model",
     },
     # Tiny, load-bearing soft size/health signal computed from the DURABLE
     # problem_model (honest counts, not the trimmed agent view). High priority,
-    # no summarize_fn — it should only drop under genuine budget exhaustion.
-    "model_health": {"priority": "high"},
+    # exempt — it should only drop under genuine budget exhaustion.
+    "model_health": {"priority": "high", "exempt": True},
     # Concrete cleanup candidates surfaced only when the model is large/oversized.
     # High priority so the block survives the same payload pressure that triggered
     # the large/oversized status — a medium-priority block would be dropped under
     # the exact budget conditions where the candidates are most actionable.
-    "prune_candidates": {"priority": "high"},
+    "prune_candidates": {"priority": "high", "exempt": True},
     # Compact index of all playbook keys — survives budget pressure so the
     # strategist always knows what operational knowledge exists and can fetch
     # entries on demand via `./fetch playbook <key>`. High priority to persist
     # under budget pressure, even if the heavier playbook_summary is dropped.
-    "playbook_keys_index": {"priority": "high"},
+    "playbook_keys_index": {"priority": "high", "exempt": True},
     # Compact, bounded navigation index over the grounded agent-view design doc
     # (one entry per non-internal section: key + bounded summary + reconciled
     # presence status/modules/warning for systems/capabilities). The full
     # per-section content is fetched on demand via POST /api/agent/design-doc
     # (op:get) — see _design_doc_index. The summarize fallback drops per-entry
     # summaries to a navigation skeleton under genuine budget exhaustion.
-    "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index},
+    "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index, "fetch_verb": "section"},
     # Compact, body-omitted index of existing knowledge documents (web_research /
-    # design output). Medium priority with no summarize_fn: it is already capped
-    # (count) and char-bounded (per-entry summary) at build time, so the packer
-    # drops it whole under budget rather than trimming — mirroring
-    # staged_directions / operator_overrides. Full bodies fetched on demand.
-    "knowledge_index": {"priority": "medium"},
+    # design output). Medium priority. Summarize fallback keeps the newest few
+    # entries with their navigation pointers (id/title/topic/direction) and drops
+    # the heavy per-arm-verdict / provenance sub-fields; full bodies remain
+    # fetchable on demand via ``./fetch knowledge <id>``.
+    "knowledge_index": {
+        "priority": "medium",
+        "summarize": _summarize_knowledge_index,
+        "fetch_verb": "knowledge",
+    },
     # Per-sweep comparative arm grouping — bounded at build time so the packer
     # drops it whole under budget rather than trimming. Same tier as
     # knowledge_index.
-    "compute_experiment_sweeps": {"priority": "medium"},
-    "capability_trial_verdicts": {"priority": "medium"},
+    "compute_experiment_sweeps": {"priority": "medium", "exempt": True},
+    "capability_trial_verdicts": {
+        "priority": "medium",
+        "summarize": _summarize_capability_trial_verdicts,
+    },
     "outcome_evaluation": {
         "priority": "medium",
         "summarize": _summarize_outcome_evaluation,
     },
-    "recent_interventions": {"priority": "medium"},
+    "recent_interventions": {
+        "priority": "medium",
+        "summarize": _summarize_recent_interventions,
+    },
     "conversation_thread": {
         "priority": "medium",
         "summarize": _summarize_conversation_thread,
     },
-    # Long-tail context — first to be dropped when budget is tight
-    "self_reflection_log": {"priority": "low"},
-    "previous_decision_outcomes": {"priority": "low"},
-    "anomaly_summary": {"priority": "low"},
-    "playbook_summary": {"priority": "low"},
-    "rejected_proposals": {"priority": "low"},
-    "running_update_superseded": {"priority": "low"},
-    "prediction_calibration_factor": {"priority": "low"},
-    "prediction_calibration_note": {"priority": "low"},
+    # Long-tail context — first to be dropped when budget is tight.
+    # All exempt: already bounded at build time (list caps + char limits applied
+    # before packing), so drop-whole is correct degradation for these low-priority
+    # sections. Fuller detail is fetchable via playbook/direction fetch verbs.
+    "self_reflection_log": {
+        "priority": "low",
+        "summarize": _summarize_self_reflection_log,
+    },
+    "previous_decision_outcomes": {
+        "priority": "low",
+        "summarize": _summarize_previous_decision_outcomes,
+        # Recoverable via the exact section-fetch endpoint (see
+        # SECTION_FETCH_INVENTORY "sections"); a broad ./fetch direction cannot
+        # return this section summary. Keep in sync with the inventory.
+        "fetch_verb": "sections",
+    },
+    "anomaly_summary": {"priority": "low", "exempt": True},
+    "playbook_summary": {
+        "priority": "low",
+        "summarize": _summarize_playbook_summary,
+        "fetch_verb": "playbook",
+    },
+    "rejected_proposals": {"priority": "low", "exempt": True},
+    "running_update_superseded": {"priority": "low", "exempt": True},
+    "prediction_calibration_factor": {"priority": "low", "exempt": True},
+    "prediction_calibration_note": {"priority": "low", "exempt": True},
     # Mode-aware additions: only present when non-empty
-    "system_maturity": {"priority": "low"},
+    "system_maturity": {"priority": "low", "exempt": True},
     # drift_signals is actionable mode-switch input (audit/pause triggers), so it
     # must survive budget pressure — promoted to medium alongside conversation_thread.
-    "drift_signals": {"priority": "medium"},
+    "drift_signals": {"priority": "medium", "summarize": _summarize_drift_signals},
     # Lessons from retired directions — helps the agent avoid repeating patterns.
-    "past_retirement_critiques": {"priority": "low"},
+    # Summarize fallback keeps the newest few critiques (direction_id + truncated
+    # lesson fields) rather than dropping the whole feed.
+    "past_retirement_critiques": {
+        "priority": "low",
+        "summarize": _summarize_past_retirement_critiques,
+        # Recoverable via the exact section-fetch endpoint (SECTION_FETCH_INVENTORY
+        # "sections"), not a per-direction fetch. Keep in sync with the inventory.
+        "fetch_verb": "sections",
+    },
     # Raw retired-direction context (metrics + failed_approaches). Lower priority
     # than past_retirement_critiques (curated) — dropped first when budget is tight.
-    "retired_directions_summary": {"priority": "low"},
+    # Recoverable via the exact section-fetch endpoint (SECTION_FETCH_INVENTORY
+    # "sections"), not a per-direction fetch. Keep in sync with the inventory.
+    "retired_directions_summary": {
+        "priority": "low",
+        "exempt": True,
+        "fetch_verb": "sections",
+    },
     # Bounded fail-closed retirement deferrals from the prior cycle. High
     # priority so a supported/unsupported retirement second opinion stays
     # visible to the next strategist pass instead of getting dropped behind
     # lower-value long-tail context.
-    "retirement_deferrals": {"priority": "high"},
+    "retirement_deferrals": {"priority": "high", "exempt": True},
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
     "version_phase": {
@@ -2921,11 +2349,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # Cycle-start SHA divergence check: present only when _resolve_candidate_currency
     # resolves.  Small dict of scalars — no summarize_fn, drops whole under extreme
     # pressure.  High priority so it ships alongside version_phase.
-    "payload_staleness": {"priority": "high"},
+    "payload_staleness": {"priority": "high", "exempt": True},
     # What is actually deployed (running live on the promotion target) vs what
     # has merged to the integration branch but is not yet promoted. High
     # priority: it is load-bearing for every runtime-metric judgment, and small.
-    "deployment_state": {"priority": "high"},
+    "deployment_state": {"priority": "high", "exempt": True},
     # Citable memo digest — terminal reasoning artifacts spawned from dropped research
     # findings. Medium priority so it survives typical payload pressure; the summarize_fn
     # trims memos and excerpts so it degrades gracefully (fewer memos / shorter text)
@@ -2942,28 +2370,53 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # guardrail breaches and branch-literal violations. Low priority — advisory
     # signal that degrades before load-bearing state. Dropped whole under budget;
     # full detail fetchable via ./fetch ci-compliance.
-    "ci_compliance": {"priority": "low"},
+    "ci_compliance": {"priority": "low", "exempt": True},
+    # Open completion-debt ledger: durable unfinished-work obligations from
+    # default-OFF feature merges, observe-mode knobs, and retirement residuals.
+    # Medium priority, exempt: bounded by the ledger query cap at build time.
+    # Fetchable via ./fetch completion-debt when dropped under budget pressure.
+    "open_completion_debt": {"priority": "medium", "exempt": True},
     # Held-directions block: directions that have hit the consecutive-failure
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
-    "held_directions": {"priority": "low"},
+    "held_directions": {"priority": "low", "exempt": True},
+    # Open FOUND leads from the resident exam ledger. Medium priority, exempt:
+    # bounded at build time (only open FOUND entries, compact shape). Absent
+    # when no resident session has run or no open leads exist.
+    "resident_exam_leads": {"priority": "medium", "exempt": True},
     # Aggregated missing-foundation demand (capability/foundation prerequisites
-    # declared by dependents that no task provides). Medium priority and bounded at
-    # build time by collect_missing_capability_demand, so the packer drops it whole
-    # under budget rather than trimming. Actionable: the strategist can open a
-    # foundation direction or record an explicit retirement.
-    "missing_capability_demand": {"priority": "medium"},
+    # declared by dependents that no task provides). Medium priority, exempt:
+    # bounded at build time by collect_missing_capability_demand.
+    "missing_capability_demand": {"priority": "medium", "exempt": True},
     # Shared capability vocabulary (canonical registry name + status) the strategist
-    # draws prerequisite / provides_capability refs from. Small and bounded; medium
-    # priority so it survives typical pressure but degrades before load-bearing state.
-    "available_capabilities": {"priority": "medium"},
+    # draws prerequisite / provides_capability refs from. Small and bounded; exempt.
+    "available_capabilities": {"priority": "medium", "exempt": True},
     # Live local-runner availability (ever_registered, active_total, active_gpu,
     # require_local_runner). Surfaced only when the project has ever registered a
     # runner OR declares the enforce-local policy. Medium priority: it is small
     # (4 scalars) and actionable — the strategist uses it to avoid authoring GPU
     # experiments that would fall back to billable cloud GPU (or be held
     # indefinitely when require_local_runner is set).
-    "local_runner_status": {"priority": "medium"},
+    "local_runner_status": {"priority": "medium", "exempt": True},
+    # Resident-session pacing knobs surfaced from _runtime_config onto the
+    # resident_minimal payload so the agent's residentConfig() reads live,
+    # operator-tunable values instead of falling back to hardcoded defaults.
+    # Critical tier, tiny scalars the packer ships verbatim (never trimmed) so
+    # pacing is never silently dropped under budget pressure. The agent reads
+    # each optionally and degrades to its own default when a key is absent.
+    "strategic_session_idle_tick_seconds": {"priority": "critical"},
+    "strategic_session_turn_timeout_seconds": {"priority": "critical"},
+    "strategic_session_message_poll_seconds": {"priority": "critical"},
+    "strategic_session_min_tick_seconds": {"priority": "critical"},
+    "strategic_session_max_ops_per_turn": {"priority": "critical"},
+    "strategic_session_autonomous_turn_timeout_seconds": {"priority": "critical"},
+    # Persisted integrity-conflict trend over the last 10 completed cycles.
+    # Three scalars (stamped_cycles, consecutive_clean_cycles) + last_counts
+    # dict. Low priority, exempt: absent until the first stamped cycle lands and
+    # tiny once present. Drives the '2 consecutive clean cycles' retirement
+    # condition for the direction-gap referential-integrity work. Fetchable on
+    # demand via ./fetch integrity-conflict-trend.
+    "integrity_conflict_trend": {"priority": "low", "exempt": True},
 }
 
 
@@ -2974,13 +2427,25 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
     "vision": {"priority": "critical"},
-    "open_messages": {"priority": "high", "summarize": _summarize_open_messages},
-    # See _STRATEGIC_REVIEW_SCHEMA: compact pointer-only operator context.
-    "operator_context_refs": {"priority": "high"},
+    # Trim-proof authoritative count of unresolved open operator messages — see
+    # _STRATEGIC_REVIEW_SCHEMA["open_message_count"]. Critical tier so the agent
+    # sees the true inbox depth even when open_messages is dropped under budget.
+    "open_message_count": {"priority": "critical"},
+    # Core section — see _STRATEGIC_REVIEW_SCHEMA["open_messages"]: floor callback
+    # guarantees the operator inbox never drops wholesale under budget pressure.
+    "open_messages": {
+        "priority": "high",
+        "summarize": _summarize_open_messages,
+        "floor": _floor_open_messages,
+        "fetch_verb": "message",
+    },
+    # See _STRATEGIC_REVIEW_SCHEMA: compact pointer-only operator context. Exempt:
+    # bounded at build time (short ref strings, no unbounded growth).
+    "operator_context_refs": {"priority": "high", "exempt": True},
     # Compact, bounded navigation index over the grounded agent-view design doc
     # — see _STRATEGIC_REVIEW_SCHEMA["design_doc"] and _design_doc_index. Full
     # per-section content is fetched on demand via POST /api/agent/design-doc.
-    "design_doc": {"priority": "high", "summarize": _summarize_design_doc_index},
+    "design_doc": {"priority": "high", "summarize": _summarize_design_doc_index, "fetch_verb": "section"},
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
@@ -2995,26 +2460,32 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
         # independent function that cannot fail, so the reservation is honored
         # even if the summarize callback raises an exception.
         "floor": _agent_view_problem_model_floor,
+        "fetch_verb": "problem-model",
     },
     # See _STRATEGIC_REVIEW_SCHEMA: tiny, load-bearing soft size/health signal.
-    "model_health": {"priority": "high"},
-    "proposed_changes": {"priority": "high"},
-    "shipped_changes_manifest": {"priority": "medium"},
+    # Exempt: small and bounded (a single computed dict).
+    "model_health": {"priority": "high", "exempt": True},
+    # Exempt: bounded at build time (list cap applied by _build_proposed_changes).
+    "proposed_changes": {"priority": "high", "exempt": True},
+    # Exempt: capped at 50 merged tasks at build time.
+    "shipped_changes_manifest": {"priority": "medium", "exempt": True},
     # Advisory prompt hint framing missing-foundation demand to act on. High
     # priority so the directive survives budget pressure (it is small).
-    "prompt_suffix": {"priority": "high"},
+    "prompt_suffix": {"priority": "high", "exempt": True},
     # Aggregated missing-foundation demand — see _STRATEGIC_REVIEW_SCHEMA. Medium
-    # priority; bounded at build time so the packer drops it whole under budget.
-    "missing_capability_demand": {"priority": "medium"},
+    # priority; exempt: bounded at build time by collect_missing_capability_demand.
+    "missing_capability_demand": {"priority": "medium", "exempt": True},
     # Compact, body-omitted index of existing knowledge documents — see
-    # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Capped at build time, dropped
-    # whole under budget; full bodies fetched on demand.
-    "knowledge_index": {"priority": "medium"},
-    # Per-sweep comparative arm grouping — bounded at build time, dropped whole
-    # under budget; full bodies fetched on demand.
-    "compute_experiment_sweeps": {"priority": "medium"},
-    # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Small, bounded.
-    "available_capabilities": {"priority": "medium"},
+    # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Summarize fallback degrades to
+    # the newest few navigation pointers rather than dropping the whole index.
+    "knowledge_index": {
+        "priority": "medium",
+        "summarize": _summarize_knowledge_index,
+    },
+    # Per-sweep comparative arm grouping — exempt: bounded at build time.
+    "compute_experiment_sweeps": {"priority": "medium", "exempt": True},
+    # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Exempt: small, bounded.
+    "available_capabilities": {"priority": "medium", "exempt": True},
 }
 
 
@@ -3139,19 +2610,30 @@ def _recent_commit_messages_match_task(
     title: str,
     pr_numbers: set[int],
 ) -> bool:
-    """Return True when a bounded commit-message sample names this task."""
+    """Return True when a bounded commit-message sample names this task.
 
-    normalized_messages = [" ".join(m.casefold().split()) for m in messages]
-    normalized_title = " ".join((title or "").casefold().split())
-    if len(normalized_title) >= 8 and any(
-        normalized_title in message for message in normalized_messages
-    ):
-        return True
+    PR-number references are the primary matching evidence. If PR numbers are
+    available, only they can rescue a task. Title substring matching is used
+    only as a fallback when no PR numbers are available for the task.
+    """
 
+    # Primary: Check PR numbers first — most reliable evidence.
     for pr_number in pr_numbers:
         pr_ref_re = re.compile(rf"(?<![\w#])#{pr_number}(?!\d)")
         if any(pr_ref_re.search(message) for message in messages):
             return True
+
+    # Fallback: Check title substring only if no PR numbers are available.
+    # If PR numbers exist but don't match, don't use title to avoid false
+    # rescues from similar/repeated task titles.
+    if not pr_numbers:
+        normalized_messages = [" ".join(m.casefold().split()) for m in messages]
+        normalized_title = " ".join((title or "").casefold().split())
+        if len(normalized_title) >= 8 and any(
+            normalized_title in message for message in normalized_messages
+        ):
+            return True
+
     return False
 
 
@@ -3383,6 +2865,7 @@ async def _build_recent_interventions(
     _promotion_target_ss = get_project_promotion_target(project)
     _automain_verified: dict[uuid.UUID, bool] = {}
     _on_main_verified: dict[uuid.UUID, bool] = {}
+    _open_rollup_task_ids: set[uuid.UUID] = set()
 
     try:
         from app import github as _github_ss
@@ -3478,14 +2961,16 @@ async def _build_recent_interventions(
 
         async def _verify_pr(
             _pr_num: int,
-        ) -> tuple[int, bool | None, bool | None]:
-            """Return (pr_num, automain_landed, on_main_landed) for one PR.
+        ) -> tuple[int, bool | None, bool | None, bool]:
+            """Return (pr_num, automain_landed, on_main_landed, is_open) for one PR.
 
             ``automain_landed``/``on_main_landed`` mirror the tri-state of
             ``is_ancestor_of``: True = verified landed, False = verified NOT
             landed / no merge SHA, None = unverifiable (API failure) → caller
             leaves the task absent from the verified map and the flag fallback
             applies. ``on_main_landed`` stays None when there is no LTS split.
+            ``is_open`` is True when the PR has no merge SHA and is still open
+            (state == "open") — distinguishes pending-rollup from genuinely lost.
             """
             async with _ancestry_sem:
                 try:
@@ -3501,8 +2986,11 @@ async def _build_recent_interventions(
                     )
                     _merge_sha = _pr_data.get("merge_commit_sha")
                     if not _merge_sha:
-                        # PR has no merge SHA (not yet merged or API gap) → not landed
-                        return _pr_num, False, None
+                        # PR has no merge SHA: open PRs are pending a rollup merge,
+                        # not genuinely lost. Closed PRs without a merge SHA are
+                        # unmerged/abandoned and treated as not-landed.
+                        _is_open = _pr_data.get("state") == "open"
+                        return _pr_num, False, None, _is_open
 
                     _is_anc = await asyncio.wait_for(
                         _github_ss.is_ancestor_of(
@@ -3542,7 +3030,7 @@ async def _build_recent_interventions(
                             timeout=_ANCESTRY_CALL_TIMEOUT_S,
                         )
                         _on_main_landed = _is_anc_main is True
-                    return _pr_num, _automain_landed, _on_main_landed
+                    return _pr_num, _automain_landed, _on_main_landed, False
                 except Exception as _exc_t:  # noqa: BLE001 — API failure → flag fallback
                     logger.debug(
                         "[STRATEGIC] ancestry check failed for pr=%s: %s",
@@ -3551,24 +3039,32 @@ async def _build_recent_interventions(
                     )
                     # None → leave the tasks absent from _automain_verified so the
                     # flag fallback applies (verdict "unverifiable").
-                    return _pr_num, None, None
+                    return _pr_num, None, None, False
 
         if _tasks_by_pr:
             _verify_results = await asyncio.gather(
                 *(_verify_pr(_pr_num) for _pr_num in _tasks_by_pr)
             )
-            for _pr_num, _automain_landed, _on_main_landed in _verify_results:
+            for _pr_num, _automain_landed, _on_main_landed, _is_open in _verify_results:
                 for _tid in _tasks_by_pr[_pr_num]:
                     if _automain_landed is not None:
                         _automain_verified[_tid] = _automain_landed
                     if _on_main_landed is not None:
                         _on_main_verified[_tid] = _on_main_landed
+                    if _is_open:
+                        _open_rollup_task_ids.add(_tid)
 
         # One bounded squash-body scan can rescue rollup-rewritten work from a
         # false NOT-landed verdict. Scan failure degrades those negatives to
         # unverifiable so merge accounting does not manufacture a conflict.
+        # Exclude open-rollup tasks: their pending_in_open_rollup verdict is
+        # already confirmed by a successful get_pull_request call — running the
+        # squash-body scan for them is pointless and, if it fails, would
+        # incorrectly pop() the confirmed verdict back to unverifiable.
         _ancestry_false_task_ids = [
-            _tid for _tid, _landed in _automain_verified.items() if _landed is False
+            _tid
+            for _tid, _landed in _automain_verified.items()
+            if _landed is False and _tid not in _open_rollup_task_ids
         ]
         if _ancestry_false_task_ids:
             try:
@@ -3681,11 +3177,13 @@ async def _build_recent_interventions(
         no second GitHub/ancestry pass.
         """
         if task.id in _automain_verified:
-            return (
-                "verified_landed"
-                if _automain_verified[task.id]
-                else "verified_not_landed"
-            )
+            if _automain_verified[task.id]:
+                return "verified_landed"
+            if task.id in _open_rollup_task_ids:
+                # PR is still open — merged into a staging branch not yet squash-merged
+                # into the integration branch. Not a real accounting conflict.
+                return "pending_in_open_rollup"
+            return "verified_not_landed"
         return "unverifiable"
 
     # For rollups: look up child titles so the agent sees what actually
@@ -3775,6 +3273,7 @@ async def _build_recent_interventions(
             "verified_landed": 0,
             "verified_not_landed": 0,
             "unverifiable": 0,
+            "pending_in_open_rollup": 0,
         }
         for t in d_tasks:
             if (
@@ -4337,7 +3836,65 @@ async def _maybe_notify_operator_bootstrap_deferred(
     await _maybe_notify_operator_refresh_deferred(project, session, reason)
 
 
-async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
+async def _strategic_spawn_budget_guard(
+    session: AsyncSession, spawn_category: str
+) -> dict[str, Any] | None:
+    """Return the autonomous budget guard for a strategic spawn, if any."""
+    try:
+        snapshot = await compute_autonomous_spawn_budget_snapshot(
+            session, runtime_config=_runtime_config
+        )
+        logger.info(
+            "[AUTONOMOUS] Spawn budget snapshot: %s",
+            snapshot.as_log_fields(),
+        )
+    except Exception as exc:  # snapshot read failed; fail posture is mode-dependent
+        # A persistent snapshot/DB failure must NOT silently disable an
+        # operator-enabled 'enforce' budget (that would be the exact opposite
+        # of enforcement). The configured mode comes from runtime_config and
+        # needs no DB, so we can still read it here. Fail CLOSED under enforce
+        # (block the spawn) and preserve fail-open for the observational
+        # off/observe modes where the guard is only advisory.
+        try:
+            mode = autonomous_spawn_budget_config_from_runtime(_runtime_config).mode
+        except Exception:  # noqa: BLE001 - malformed config; stay observational
+            mode = DEFAULT_AUTONOMOUS_SPAWN_BUDGET_MODE
+        if mode == "enforce":
+            logger.exception(
+                "[AUTONOMOUS] Spawn budget snapshot failed in enforce mode; "
+                "failing CLOSED (blocking %s spawn)",
+                spawn_category,
+            )
+            return {
+                "guard": "budget_snapshot_unavailable",
+                "reason": (
+                    "Autonomous spawn-budget snapshot could not be computed in "
+                    "enforce mode; failing closed to block unbounded spawns: "
+                    f"{exc}"
+                ),
+                "mode": mode,
+                "scope": "global",
+                "category": spawn_category,
+            }
+        logger.warning(
+            "[AUTONOMOUS] Spawn budget calculation failed open (mode=%s): %s",
+            mode,
+            exc,
+        )
+        return None
+    return build_autonomous_spawn_budget_guard(
+        snapshot=snapshot,
+        spawn_category=spawn_category,
+        enforce_initiative=snapshot.mode == "enforce",
+    )
+
+
+async def _spawn_design_doc_update(
+    project: Project,
+    session: AsyncSession,
+    *,
+    apply_spawn_budget_guard: bool = False,
+) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
     This runs as a separate task type so it doesn't block tactical research.
@@ -4366,6 +3923,12 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
             project.id,
         )
         return False
+
+    if apply_spawn_budget_guard:
+        budget_guard = await _strategic_spawn_budget_guard(session, "initiative")
+        if budget_guard is not None:
+            logger.warning("[AUTONOMOUS] Spawn budget block: %s", budget_guard)
+            return False
 
     doc_model = (
         _runtime_config.get("task_type_models", {}).get("design_doc_update")
@@ -4454,6 +4017,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
                 if (_dd_model_health := _compute_model_health(project.problem_model))
                 else {}
             ),
+            "open_message_count": len(open_msgs),
             "open_messages": open_msgs,
             **(
                 {"operator_context_refs": operator_context_refs}
@@ -4488,6 +4052,10 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         "design_doc_update",
     )
     task_context: dict = {"strategic_cycle_id": cycle_id, **local_runner_intent}
+    if not apply_spawn_budget_guard:
+        # Manual / operator-triggered cycles should not inherit the autonomous
+        # budget backstop when Phase 1 completes.
+        task_context[STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY] = True
     if operator_steered:
         task_context["operator_steered"] = True
         # Persist the operator steering excerpt alongside the flag: the marker is
@@ -4549,11 +4117,13 @@ def _freshness_generated_at() -> str:
 def _build_freshness_shas_block(currency: dict) -> dict:
     """Build a normalized SHA-freshness dict from a resolved candidate-currency dict.
 
-    Takes the ``{"current": bool, "candidate_sha": str, "head_sha": str}`` dict
-    returned by ``_resolve_candidate_currency`` and returns an additive block that
-    exposes payload_sha, active_candidate_sha, integration_head_sha, stale, and
+    Takes a RESOLVED ``{"current": bool, "candidate_sha": str, "head_sha": str}``
+    dict returned by ``_resolve_candidate_currency`` and returns an additive block
+    that exposes payload_sha, active_candidate_sha, integration_head_sha, stale, and
     stale_reason.  payload_compiled_sha is kept for backward-compat with older
-    agent consumers that read it directly.
+    agent consumers that read it directly.  Only call this for a resolved
+    (fresh/stale) currency dict — unresolved states go through the unknown /
+    api-unreachable builders which never set ``stale``.
     """
     from datetime import datetime
 
@@ -4573,19 +4143,99 @@ def _build_freshness_shas_block(currency: dict) -> dict:
     }
 
 
-def _build_unknown_freshness_block() -> dict:
-    """Build a freshness block for when currency resolution was indeterminate.
+def _build_unknown_freshness_block(currency: dict | None = None) -> dict:
+    """Build a freshness block for GENUINE local indeterminacy.
 
     Returns a block with verdict='unknown' so consumers can distinguish an
     unresolved freshness check from a confirmed-fresh or confirmed-stale result.
+    Genuine indeterminacy means the local state could not produce a comparison:
+    no open version, no candidate SHA, unavailable repo credentials, or a branch
+    that does not exist.  Never sets ``stale`` — an unknown state is not stale.
+    When available, carries the ``reason`` and ``active_candidate_sha`` so the
+    agent can see WHY the check was indeterminate.
     """
     from datetime import datetime
 
-    return {
+    block: dict = {
         "verdict": "unknown",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "generated_at": _freshness_generated_at(),
     }
+    if isinstance(currency, dict):
+        if isinstance(currency.get("reason"), str) and currency["reason"]:
+            block["reason"] = currency["reason"]
+        if isinstance(currency.get("candidate_sha"), str) and currency["candidate_sha"]:
+            block["active_candidate_sha"] = currency["candidate_sha"]
+    return block
+
+
+def _build_api_unreachable_freshness_block(currency: dict | None = None) -> dict:
+    """Build a freshness block for a TRANSIENT GitHub/API/transport failure.
+
+    Distinct from ``unknown``: the currency check could not complete because
+    GitHub was unreachable (5xx / rate-limit / transport / timeout) after a
+    bounded retry, NOT because the local state is genuinely indeterminate.  The
+    agent must treat this as a temporary API-reachability problem — the payload
+    is NOT known to be stale, so ``stale`` is never set.  Carries ``reason`` and
+    ``active_candidate_sha`` when available for diagnostics.
+    """
+    from datetime import datetime
+
+    block: dict = {
+        "verdict": "api_unreachable",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": _freshness_generated_at(),
+    }
+    if isinstance(currency, dict):
+        if isinstance(currency.get("reason"), str) and currency["reason"]:
+            block["reason"] = currency["reason"]
+        if isinstance(currency.get("candidate_sha"), str) and currency["candidate_sha"]:
+            block["active_candidate_sha"] = currency["candidate_sha"]
+    return block
+
+
+def _build_payload_staleness_block(currency: dict | None) -> dict:
+    """Dispatch a currency dict to the correct freshness block by verdict.
+
+    Resolved (fresh/stale) currency dicts produce a full SHA-freshness block;
+    ``api_unreachable`` produces the transient-failure block; everything else
+    (genuine local indeterminacy or a missing dict) produces the unknown block.
+    """
+    if not isinstance(currency, dict):
+        return _build_unknown_freshness_block()
+    # A resolved currency dict always carries a boolean ``current``.  Test this
+    # directly (rather than the newer ``resolved`` flag) so legacy callers/mocks
+    # that return the bare ``{"current", "candidate_sha", "head_sha"}`` shape are
+    # still recognised as resolved.
+    if isinstance(currency.get("current"), bool):
+        return _build_freshness_shas_block(currency)
+    if currency.get("verdict") == "api_unreachable":
+        return _build_api_unreachable_freshness_block(currency)
+    return _build_unknown_freshness_block(currency)
+
+
+def _currency_unknown(reason: str, *, candidate_sha: str | None = None) -> dict:
+    """Typed indeterminate-currency result (genuine local indeterminacy)."""
+    result: dict = {"verdict": "unknown", "resolved": False, "reason": reason}
+    if isinstance(candidate_sha, str) and candidate_sha:
+        result["candidate_sha"] = candidate_sha
+    return result
+
+
+def _currency_api_unreachable(reason: str, *, candidate_sha: str | None = None) -> dict:
+    """Typed transient-failure currency result (GitHub/API unreachable)."""
+    result: dict = {"verdict": "api_unreachable", "resolved": False, "reason": reason}
+    if isinstance(candidate_sha, str) and candidate_sha:
+        result["candidate_sha"] = candidate_sha
+    return result
+
+
+# Bounded retry for the transient GitHub path in _resolve_candidate_currency.
+# ``get_branch_sha`` already retries 5xx/rate-limit/transport failures inside
+# ``_github_request``; this is a thin outer bound so a single transient blip that
+# escapes that layer is retried once more before we classify api_unreachable.
+_CURRENCY_RETRY_ATTEMPTS = 2
+_CURRENCY_RETRY_DELAY_S = 0.75
 
 
 async def _resolve_candidate_currency(
@@ -4593,7 +4243,7 @@ async def _resolve_candidate_currency(
     project: Project,
     last_qual: dict,
     integration_branch: str,
-) -> dict | None:
+) -> dict:
     """Best-effort check: is a qualification's candidate commit still HEAD?
 
     The qualifier scores its audit findings against a pinned ``candidate_sha``
@@ -4601,39 +4251,100 @@ async def _resolve_candidate_currency(
     those very findings often land afterward.  Resolve the live integration
     branch HEAD and compare it to the qualification's candidate commit.
 
-    Returns ``{"current": bool, "candidate_sha": str, "head_sha": str}`` when
-    the comparison resolves, or ``None`` when it is indeterminate (no candidate
-    SHA on the record, GitHub unreachable, or the branch lookup failed).  Never
-    raises — a failure to resolve must never block the strategic payload build.
+    Always returns a typed dict with a ``verdict`` field; never raises — a
+    failure to resolve must never block the strategic payload build:
+
+    * ``{"verdict": "fresh"|"stale", "resolved": True, "current": bool,
+      "candidate_sha": str, "head_sha": str}`` when the comparison resolves.
+      The resolved shape keeps the legacy ``current``/``candidate_sha``/
+      ``head_sha`` keys for backward compatibility.
+    * ``{"verdict": "api_unreachable", "resolved": False, "reason": str, ...}``
+      when GitHub/transport failed transiently (5xx / rate-limit / timeout /
+      connect) after a bounded retry — a temporary reachability problem, NOT a
+      known-stale payload.
+    * ``{"verdict": "unknown", "resolved": False, "reason": str, ...}`` for
+      genuine local indeterminacy: no candidate SHA on the record, unavailable
+      repo credentials, or a branch that does not exist.
     """
+    import httpx
+    from fastapi import HTTPException
+
     candidate_sha = last_qual.get("candidate_sha")
     if not candidate_sha or not isinstance(candidate_sha, str):
-        return None
-    head_sha: str | None = None
+        return _currency_unknown("no_candidate_sha")
+
+    # Resolve repo credentials once.  A None result (or a resolver error) is
+    # genuine local indeterminacy — no transient GitHub call was even attempted.
     try:
-        from app import github as _github
         from app.release_qualifier import _resolve_github_with_session
 
         _resolved = await _resolve_github_with_session(session, project)
-        if _resolved is None:
-            return None
-        _gh_token, _gh_owner, _gh_repo = _resolved
-        head_sha = await _github.get_branch_sha(
-            _gh_token, _gh_owner, _gh_repo, integration_branch
-        )
     except Exception:
         logger.exception(
-            "[STRATEGIC] could not resolve integration branch HEAD for "
-            "candidate-currency check"
+            "[STRATEGIC] repo-credential resolution failed for candidate-currency check"
         )
-        return None
-    if not head_sha or not isinstance(head_sha, str):
-        return None
-    return {
-        "current": candidate_sha == head_sha,
-        "candidate_sha": candidate_sha,
-        "head_sha": head_sha,
-    }
+        return _currency_unknown("repo_credentials_error", candidate_sha=candidate_sha)
+    if _resolved is None:
+        return _currency_unknown(
+            "repo_credentials_unavailable", candidate_sha=candidate_sha
+        )
+    _gh_token, _gh_owner, _gh_repo = _resolved
+
+    from app import github as _github
+
+    last_transient_reason = "github_api_unreachable"
+    for _attempt in range(_CURRENCY_RETRY_ATTEMPTS):
+        try:
+            head_sha = await _github.get_branch_sha(
+                _gh_token, _gh_owner, _gh_repo, integration_branch
+            )
+        except HTTPException as exc:
+            status_code = getattr(exc, "status_code", None)
+            # A 404 means the integration branch genuinely does not exist — that
+            # is not a transient reachability problem and retrying cannot help.
+            if status_code == 404:
+                return _currency_unknown(
+                    "branch_not_found", candidate_sha=candidate_sha
+                )
+            last_transient_reason = (
+                f"github_http_{status_code}" if status_code else "github_http_error"
+            )
+        except httpx.HTTPError as exc:
+            # Transport-layer / timeout failure — transient by nature.
+            last_transient_reason = f"github_transport_{type(exc).__name__}"
+        except Exception:
+            # Unexpected failure (e.g. malformed payload): stay conservative and
+            # report genuine indeterminacy rather than claiming API-unreachable.
+            logger.exception(
+                "[STRATEGIC] could not resolve integration branch HEAD for "
+                "candidate-currency check"
+            )
+            return _currency_unknown("resolve_error", candidate_sha=candidate_sha)
+        else:
+            if not head_sha or not isinstance(head_sha, str):
+                return _currency_unknown(
+                    "head_sha_unavailable", candidate_sha=candidate_sha
+                )
+            is_current = candidate_sha == head_sha
+            return {
+                "verdict": "fresh" if is_current else "stale",
+                "resolved": True,
+                "current": is_current,
+                "candidate_sha": candidate_sha,
+                "head_sha": head_sha,
+            }
+        # Transient failure — retry once more within the bounded budget.
+        if _attempt < _CURRENCY_RETRY_ATTEMPTS - 1:
+            await asyncio.sleep(_CURRENCY_RETRY_DELAY_S)
+
+    logger.warning(
+        "[STRATEGIC] candidate-currency check unreachable after %d attempt(s): %s",
+        _CURRENCY_RETRY_ATTEMPTS,
+        last_transient_reason,
+    )
+    return _currency_api_unreachable(
+        last_transient_reason, candidate_sha=candidate_sha
+    )
 
 
 def ci_compliance_qualify_gate(
@@ -4718,12 +4429,32 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
         if isinstance(gate.get("branch_literal_violations"), list)
         else []
     )
-    violation_lines = "\n".join(
-        f"- {v.get('section')}/{v.get('rel')}: {v.get('count')} lines"
-        + (f" > cap {v.get('cap')}" if v.get("cap") is not None else " (uncapped)")
-        for v in violations
-        if isinstance(v, dict)
-    )
+
+    # Classify each capped violation as chronic or routine.
+    chronic_violations: list[dict[str, Any]] = []
+    routine_violations: list[dict[str, Any]] = []
+    for v in violations:
+        if not isinstance(v, dict):
+            continue
+        if v.get("cap") is None:
+            # Uncapped: new file, never chronic — always a routine bump.
+            routine_violations.append(v)
+            continue
+        try:
+            verdict = classify_breach(
+                module_key=v["rel"],
+                current_size=v["count"],
+                section=v.get("section", "backend"),
+            )
+        except Exception:  # noqa: BLE001 — advisory; fall back to routine
+            verdict = {"is_chronic": False}
+        if verdict.get("is_chronic"):
+            chronic_violations.append(v)
+        else:
+            routine_violations.append(v)
+
+    has_chronic = bool(chronic_violations)
+
     branch_literal_lines = "\n".join(
         f"- {v.get('section')}/{v.get('rel')}:{v.get('line')}: {v.get('text')}"
         for v in branch_literal_violations
@@ -4732,7 +4463,38 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
     prompt_parts = [
         "Automain HEAD is failing the CI-compliance guardrail.",
     ]
-    if violations:
+    if chronic_violations:
+        chronic_lines = "\n".join(
+            f"- {v.get('section')}/{v.get('rel')}: {v.get('count')} lines"
+            f" (cap {v.get('cap')} — chronic offender, decomposition required)"
+            for v in chronic_violations
+        )
+        prompt_parts += [
+            "CHRONIC SIZE OFFENDERS — do NOT run `--fix` or bump the cap for these files.",
+            "These modules have been cap-bumped repeatedly and must be DECOMPOSED:",
+            chronic_lines,
+            "For each chronic offender: extract cohesive clusters into a sibling module "
+            "so the file falls back under its existing cap. Do not raise the cap.",
+        ]
+    if routine_violations:
+        routine_lines = "\n".join(
+            f"- {v.get('section')}/{v.get('rel')}: {v.get('count')} lines"
+            + (f" > cap {v.get('cap')}" if v.get("cap") is not None else " (uncapped)")
+            for v in routine_violations
+        )
+        prompt_parts += [
+            "Routine size violations (run `python3 backend/testing/check_size_limits.py --fix` "
+            "from the repo root and commit the updated `backend/testing/module_size_limits.json`):",
+            routine_lines or "- see ci_compliance payload",
+        ]
+    if not chronic_violations and not routine_violations and violations:
+        # Fallback: emit --fix for any violations we couldn't classify.
+        violation_lines = "\n".join(
+            f"- {v.get('section')}/{v.get('rel')}: {v.get('count')} lines"
+            + (f" > cap {v.get('cap')}" if v.get("cap") is not None else " (uncapped)")
+            for v in violations
+            if isinstance(v, dict)
+        )
         prompt_parts += [
             "Size violations (run `python3 backend/testing/check_size_limits.py --fix` "
             "from the repo root and commit the updated `backend/testing/module_size_limits.json`):",
@@ -4745,10 +4507,27 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
         ]
     prompt_parts.append(f"\nHEAD: {head_sha}")
     prompt = "\n".join(prompt_parts)
+
+    if has_chronic:
+        task_title_payload = "Decompose chronic CI-compliance offenders"
+        task_title = f"Decompose chronic CI-compliance offenders for {head_sha[:8]}"
+        task_description = (
+            "One or more modules are chronic size-cap offenders. "
+            "Extract cohesive clusters into sibling modules to bring them under "
+            "the existing caps — do NOT bump the caps."
+        )
+    else:
+        task_title_payload = "Bump CI-compliance size caps"
+        task_title = f"Fix CI-compliance cap bump for {head_sha[:8]}"
+        task_description = (
+            "Run backend/testing/check_size_limits.py --fix and commit the "
+            "resulting size-cap update."
+        )
+
     payload = validate_internal_payload(
         {
             "type": "create",
-            "title": "Bump CI-compliance size caps",
+            "title": task_title_payload,
             "prompt": prompt,
             "base_branch": get_project_integration_branch(project),
             "acceptance_evidence": {
@@ -4760,11 +4539,8 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
     )
     task = Task(
         project_id=project.id,
-        title=f"Fix CI-compliance cap bump for {head_sha[:8]}",
-        description=(
-            "Run backend/testing/check_size_limits.py --fix and commit the "
-            "resulting size-cap update."
-        ),
+        title=task_title,
+        description=task_description,
         payloads=[payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -4789,6 +4565,55 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
         )
     )
     return task
+
+
+def _bound_retired_direction_grounding(
+    grounding: Any, *, field_max: int = 500
+) -> dict[str, Any] | None:
+    """Return a bounded copy of a direction's ``retired_direction_grounding``.
+
+    The write side (``build_retired_direction_grounding``) already produces a
+    compact dict, but this defends the payload against oversized ``reason`` /
+    ``summary`` text and drops any unexpected nested bodies so the active-
+    direction summary stays within the same char discipline as its sibling
+    context fields. Returns ``None`` when the input is not a usable mapping.
+    """
+    if not isinstance(grounding, dict):
+        return None
+    out: dict[str, Any] = {}
+    direction_id = str(grounding.get("direction_id") or "").strip()
+    if direction_id:
+        out["direction_id"] = direction_id[:field_max]
+    classification = str(grounding.get("classification") or "").strip()
+    if classification:
+        out["classification"] = classification[:field_max]
+    reason = str(grounding.get("reason") or "").strip()
+    if reason:
+        out["reason"] = reason[:field_max]
+    metrics = grounding.get("metrics")
+    if isinstance(metrics, dict):
+        bounded_metrics = {
+            str(k): v
+            for k, v in metrics.items()
+            if isinstance(v, (int, float, bool)) or v is None
+        }
+        if bounded_metrics:
+            out["metrics"] = bounded_metrics
+    gap_id = grounding.get("gap_id")
+    if gap_id:
+        out["gap_id"] = str(gap_id)[:field_max]
+    memo = grounding.get("retirement_memo")
+    if isinstance(memo, dict):
+        bounded_memo: dict[str, Any] = {}
+        memo_id = memo.get("knowledge_doc_id")
+        if memo_id:
+            bounded_memo["knowledge_doc_id"] = str(memo_id)[:field_max]
+        summary = str(memo.get("summary") or "").strip()
+        if summary:
+            bounded_memo["summary"] = summary[:field_max]
+        if bounded_memo:
+            out["retirement_memo"] = bounded_memo
+    return out or None
 
 
 def _build_direction_stats(
@@ -4875,15 +4700,15 @@ def _build_direction_stats(
         total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history) + (
             agg.get("total_tasks_failed_infra") or 0
         )
-        # Autonomy lifetime totals — legacy fallback treats prs_merged as autonomous
-        # (same interpretation as admin_digest.py and direction_metrics.py).
-        lifetime_autonomous = sum(
-            h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history
-        ) + (agg.get("total_autonomous_prs_merged") or 0)
-        lifetime_op_actions = sum(
-            h.get("operator_action_count", 0) for h in history
-        ) + (agg.get("total_operator_actions") or 0)
-        retirement_eligible = lifetime_autonomous >= 10 and lifetime_op_actions == 0
+        # Autonomy lifetime totals + retirement eligibility — derived by the
+        # single source of truth (compute_direction_autonomy_state) rather than
+        # re-computed inline, so this payload can never silently disagree with the
+        # helper. It credits only verifiably-landed autonomous merges toward the
+        # 10-merge milestone and applies the same two-step legacy fallback.
+        _autonomy_state = compute_direction_autonomy_state(d)
+        lifetime_autonomous = _autonomy_state["lifetime_autonomous_prs_merged"]
+        lifetime_op_actions = _autonomy_state["lifetime_operator_actions"]
+        retirement_eligible = _autonomy_state["retirement_eligible"]
         taxonomy_totals: dict[str, int] = {}
         for h in history:
             for tkey, tval in (h.get("taxonomy_summary") or {}).items():
@@ -4988,6 +4813,17 @@ def _build_direction_stats(
         ).strip()
         if _retirement_condition:
             stat_entry["retirement_condition"] = _retirement_condition[:_DIR_FIELD_MAX]
+        # Retired-origin grounding: when this direction was created as a
+        # continuation/re-staffing of a retired one, strategic_completion stores
+        # a compact grounding object under context["retired_direction_grounding"]
+        # (classification/metrics/reason + optional gap_id/retirement_memo). Surface
+        # it — bounded like the sibling context fields — so the strategist can tell
+        # an active direction picks up prior work and how that prior work ended.
+        _grounding = _bound_retired_direction_grounding(
+            dir_context.get("retired_direction_grounding"), field_max=_DIR_FIELD_MAX
+        )
+        if _grounding:
+            stat_entry["retired_direction_grounding"] = _grounding
         # Advisory outcome-less-scaffolding flag: surfaces a long-running direction
         # that keeps merging PRs but never advances its success_evidence, so the
         # strategic agent sees it as a first-class signal (not just merge/cost metrics).
@@ -5025,6 +4861,10 @@ def _build_direction_stats(
             stat_entry["auto_paused"] = bool(d.get("auto_paused"))
             if d.get("paused_reason"):
                 stat_entry["paused_reason"] = d.get("paused_reason")
+            if d.get("lifetime_burn_pause_count") is not None:
+                stat_entry["lifetime_burn_pause_count"] = d.get(
+                    "lifetime_burn_pause_count"
+                )
         elif d.get("status") == "proposed":
             if d.get("proposed_by"):
                 stat_entry["proposed_by"] = str(d["proposed_by"])
@@ -5032,6 +4872,38 @@ def _build_direction_stats(
                 stat_entry["proposal_rationale"] = d["proposal_rationale"]
             if d.get("proposed_at"):
                 stat_entry["proposed_at"] = d["proposed_at"]
+        # Surface auto_retire_pending metadata regardless of direction status:
+        # the scaffolding retire path sets auto_retire_pending=True while keeping
+        # the direction active (retired on the next lifecycle tick), so this must
+        # not be gated on status=="paused".
+        if d.get("auto_retire_pending"):
+            stat_entry["auto_retire_pending"] = True
+            if d.get("auto_retire_pending_reason"):
+                stat_entry["auto_retire_pending_reason"] = d.get(
+                    "auto_retire_pending_reason"
+                )
+            if d.get("auto_retire_pending_at"):
+                stat_entry["auto_retire_pending_at"] = d.get(
+                    "auto_retire_pending_at"
+                )
+        # Churn-family retirement recommendation (churn-guardrail redesign
+        # d-73f03cc0): the zombie ladder no longer auto-retires; it flags a
+        # reviewable recommendation and keeps the direction paused. Surface the
+        # flag + bounded evidence so the strategist can decide whether to retire
+        # it through the existing retirement path or give it a new approach.
+        if d.get("churn_retirement_recommended"):
+            stat_entry["churn_retirement_recommended"] = True
+            _cre_ev = d.get("churn_retirement_evidence")
+            if _cre_ev:
+                stat_entry["churn_retirement_evidence"] = _cre_ev
+            if d.get("churn_retirement_recommended_reason"):
+                stat_entry["churn_retirement_recommended_reason"] = d.get(
+                    "churn_retirement_recommended_reason"
+                )
+            if d.get("churn_retirement_recommended_at"):
+                stat_entry["churn_retirement_recommended_at"] = d.get(
+                    "churn_retirement_recommended_at"
+                )
         # Surface non-default recommended_mode so the strategic agent can bias
         # its direction decisions (audit/fundamentals → prefer non-feature work;
         # pause → tactical spawning should be skipped by autonomous_research).
@@ -5092,6 +4964,62 @@ def _build_direction_counts(project: Project) -> dict[str, Any]:
     }
 
 
+def _resident_open_found_leads(project: Project) -> list[dict[str, Any]] | None:
+    """Return compact open FOUND leads from the resident session's exam ledger.
+
+    Reads ``vision[RESIDENT_SESSION_KEY]["_exam_ledger"]``, deduplicates records
+    by ``surfaceKey`` keeping the latest by ``atTick``, then returns only those
+    whose final verdict is ``"found"`` as ``[{surfaceKey, note, at}]``.
+
+    Returns ``None`` when no ledger exists, the JSON is invalid, or no open
+    FOUND leads remain — so callers can skip injection on the common path.
+    """
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    vision = project.vision or {}
+    resident_blob = vision.get(RESIDENT_SESSION_KEY)
+    if not resident_blob or not isinstance(resident_blob, dict):
+        return None
+    raw_ledger = resident_blob.get("_exam_ledger")
+    if not raw_ledger or not isinstance(raw_ledger, str):
+        return None
+    try:
+        parsed = json.loads(raw_ledger)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    raw_records = parsed.get("records")
+    if not isinstance(raw_records, list):
+        return None
+
+    # Dedup by surfaceKey, keeping the record with the highest atTick.
+    latest: dict[str, dict] = {}
+    for rec in raw_records:
+        if not isinstance(rec, dict):
+            continue
+        surface_key = rec.get("surfaceKey")
+        if not isinstance(surface_key, str) or not surface_key:
+            continue
+        at_tick = rec.get("atTick")
+        at_tick = at_tick if isinstance(at_tick, (int, float)) else 0
+        prev = latest.get(surface_key)
+        prev_tick = prev.get("atTick", 0) if prev else -1
+        if at_tick >= prev_tick:
+            latest[surface_key] = rec
+
+    leads = [
+        {
+            "surfaceKey": r["surfaceKey"],
+            "note": str(r.get("note") or ""),
+            "at": str(r.get("at") or ""),
+        }
+        for r in latest.values()
+        if r.get("verdict") == "found"
+    ]
+    return leads if leads else None
+
+
 async def _finalize_strategic_review_spawn(
     session: AsyncSession,
     *,
@@ -5109,6 +5037,7 @@ async def _finalize_strategic_review_spawn(
     operator_steered: bool,
     steering_excerpt: str | None,
     runner_pin_id: str | None = None,
+    integrity_conflict_counts: dict[str, int] | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail shared by the cadence + resident spawn paths.
 
@@ -5245,11 +5174,14 @@ async def _finalize_strategic_review_spawn(
     # instead of patching vision._strategic_cycle_history JSONB. For a
     # strategy-only cycle this flips the just-created row to phase2_running with
     # phase1_completed_at set (its architecture phase is a no-op).
-    await strategic_cycle.mark_phase1_completed(
+    _cycle_row = await strategic_cycle.mark_phase1_completed(
         session,
         cycle_id,
         phase2_task_id=new_task.id,
     )
+    if _cycle_row is not None and integrity_conflict_counts is not None:
+        strategic_cycle.record_integrity_conflict_counts(_cycle_row, integrity_conflict_counts)
+        session.add(_cycle_row)
     await session.commit()
     # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
     from app.strategic_events import emit_strategic_cycle_started
@@ -5279,6 +5211,8 @@ async def _spawn_strategic_review(
     extra_context: dict[str, Any] | None = None,
     resident_minimal: bool = False,
     runner_pin_id: str | None = None,
+    *,
+    apply_spawn_budget_guard: bool = False,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -5385,6 +5319,12 @@ async def _spawn_strategic_review(
         )
         return False
 
+    if apply_spawn_budget_guard:
+        budget_guard = await _strategic_spawn_budget_guard(session, "initiative")
+        if budget_guard is not None:
+            logger.warning("[AUTONOMOUS] Spawn budget block: %s", budget_guard)
+            return False
+
     # Capture project scalars — and, for strategy-only cycles, the baseline
     # snapshots — NOW, while ``project`` is guaranteed live (it was fresh-read
     # under the caller's lock). The payload build below takes ~30s and
@@ -5447,12 +5387,13 @@ async def _spawn_strategic_review(
         # DB-only reads, none of which hold a connection across a network call —
         # so the resident agent is NOT context-blind at boot: without ``vision`` /
         # ``problem_model`` / ``running_update`` / ``directions_summary`` /
-        # ``direction_counts`` it would re-derive (and risk re-creating) existing
-        # directions, and without ``open_messages`` an operator message older than
-        # the resident's ~2-minute first-poll cursor would surface NOWHERE (not in
-        # bootstrap, not in the first poll). ``problem_model`` is the UNVERIFIED
-        # agent-view (the backing-path verification is exactly the skipped
-        # GitHub I/O). The transaction stays short: cheap reads only, zero network.
+        # ``direction_counts`` / the retired/prior-decision context below it would
+        # re-derive (and risk re-creating) existing directions, and without
+        # ``open_messages`` an operator message older than the resident's
+        # ~2-minute first-poll cursor would surface NOWHERE (not in bootstrap,
+        # not in the first poll). ``problem_model`` is the UNVERIFIED agent-view
+        # (the backing-path verification is exactly the skipped GitHub I/O). The
+        # transaction stays short: cheap reads only, zero network.
         review_model = (
             _runtime_config.get("task_type_models", {}).get("strategic_review")
             or _runtime_config.get("task_type_models", {}).get("research")
@@ -5465,7 +5406,45 @@ async def _spawn_strategic_review(
         )
         _res_direction_counts = _build_direction_counts(project)
         _res_direction_stats = _build_direction_stats(project)[1]
+        from app.strategic_analysis import _build_retired_directions_summary
+
+        cycle_history = await strategic_cycle.recent_for_agent_context(
+            session,
+            project.id,
+            limit=20,
+        )
+        _res_retired_summary = _build_retired_directions_summary(project)
+        _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
         _res_open_messages = await _fetch_open_messages(session, project.id)
+        # Ship the resident-session pacing knobs from _runtime_config onto the
+        # payload so the agent's residentConfig() reads LIVE, operator-tunable
+        # values instead of falling back to hardcoded defaults. All six knobs are
+        # wired end-to-end: idle_tick, turn_timeout, and message_poll (existing);
+        # min_tick, max_ops_per_turn, and autonomous_turn_timeout (new).
+        # All are tiny critical-tier scalars (never trimmed).
+        _res_pacing_knobs = {
+            "strategic_session_idle_tick_seconds": int(
+                _runtime_config.get("strategic_session_idle_tick_seconds", 5)
+            ),
+            "strategic_session_turn_timeout_seconds": int(
+                _runtime_config.get("strategic_session_turn_timeout_seconds", 120)
+            ),
+            "strategic_session_message_poll_seconds": float(
+                _runtime_config.get("strategic_session_message_poll_seconds", 1.5)
+            ),
+            "strategic_session_min_tick_seconds": int(
+                _runtime_config.get("strategic_session_min_tick_seconds", 600)
+            ),
+            "strategic_session_max_ops_per_turn": int(
+                _runtime_config.get("strategic_session_max_ops_per_turn", 3)
+            ),
+            "strategic_session_autonomous_turn_timeout_seconds": int(
+                _runtime_config.get(
+                    "strategic_session_autonomous_turn_timeout_seconds", 300
+                )
+            ),
+        }
+        _res_exam_leads = _resident_open_found_leads(project)
         minimal_payload = validate_internal_payload(
             pack_under_budget(
                 {
@@ -5481,12 +5460,32 @@ async def _spawn_strategic_review(
                     "directions_summary": _res_direction_stats,
                     "direction_counts": _res_direction_counts,
                     "max_active_directions": _res_direction_counts["max_active"],
+                    **(
+                        {"retired_directions_summary": _res_retired_summary}
+                        if _res_retired_summary
+                        else {}
+                    ),
+                    **(
+                        {"previous_decision_outcomes": _res_prev_outcomes}
+                        if _res_prev_outcomes
+                        else {}
+                    ),
                     # DB-only open-operator-message feed (no network) — the
                     # load-bearing key: surfaces messages older than the runner's
                     # first-poll cursor that would otherwise be missed entirely.
+                    "open_message_count": len(_res_open_messages),
                     "open_messages": _res_open_messages,
                     **({"model": review_model} if review_model else {}),
                     **({"effort": review_effort} if review_effort else {}),
+                    # Live, operator-tunable resident-session pacing knobs.
+                    **_res_pacing_knobs,
+                    # Open FOUND leads from the resident exam ledger (pure
+                    # in-memory read — no I/O). Absent when no ledger or no leads.
+                    **(
+                        {"resident_exam_leads": _res_exam_leads}
+                        if _res_exam_leads
+                        else {}
+                    ),
                 },
                 _STRATEGIC_REVIEW_SCHEMA,
             ),
@@ -5802,33 +5801,51 @@ async def _spawn_strategic_review(
                 _tasks_merged = await count_merged_since(
                     session, project.id, _open_version.opened_at
                 )
-                # Resolve the open version's audit child so a crashed audit
-                # (terminal-failed, no report) reconciles the qualification_state
-                # to ``audit_crashed`` instead of telling the strategic agent to
-                # wait on a dead audit (it would otherwise burn a cycle). Same
-                # version-scoped evidence the operator panel reads. Best-effort.
-                _audit_child = None
-                try:
-                    from app.release_qualifier_audit import (
-                        resolve_lifecycle_audit_evidence,
-                    )
+                # Resolve the open version's effective qualification_state through
+                # the shared async seam so this payload applies ALL THREE
+                # reconciliation enrichments — the serving aggregate, the
+                # version-scoped audit child (so a crashed audit reconciles to
+                # ``audit_crashed`` instead of telling the strategist to wait on a
+                # dead audit and burn a cycle), AND the newest finalized verdict
+                # (so a stale ``pending`` + ``promotion_pending`` record does not
+                # read ``promotion_in_flight`` when the promotion already
+                # resolved). Previously to_phase_block threaded only the audit
+                # child and never applied the finalized-verdict substitution, so
+                # this surface disagreed with the agent fetch verb in the
+                # stale-pending window. The helper keeps audit resolution
+                # best-effort internally so a failed resolve never blocks assembly.
+                from app.qualification_state_resolver import (
+                    resolve_open_version_qualification_state,
+                )
 
-                    _audit_evidence = await resolve_lifecycle_audit_evidence(
-                        session, _open_version
-                    )
-                    _audit_child = _audit_evidence["latest_audit"]
-                except Exception:
-                    logger.exception(
-                        "[STRATEGIC] audit-child resolution failed; continuing"
+                (
+                    _open_qual_state,
+                    _open_qual_disagreement,
+                ) = await resolve_open_version_qualification_state(
+                    session,
+                    _open_version,
+                    project,
+                    serving=(_open_aggregate, _open_artifacts),
+                )
+                _phase_block = to_phase_block(
+                    _open_version,
+                    aggregate_serving_status=_open_aggregate["serving_status"],
+                    aggregate_deploy_failure_reason=_open_aggregate["reason_code"],
+                    artifact_evidence=_open_artifacts,
+                )
+                # Override the block's own (audit/verdict-unaware)
+                # qualification_state with the fully-reconciled state, and surface
+                # any verdict disagreement explicitly so the reconciliation is
+                # visible rather than requiring manual cross-referencing. Every
+                # other to_phase_block field (last_qualification, serving_status,
+                # promotion_readiness, etc.) is preserved untouched.
+                _phase_block["qualification_state"] = _open_qual_state
+                if _open_qual_disagreement is not None:
+                    _phase_block["qualification_state_disagreement"] = (
+                        _open_qual_disagreement
                     )
                 _version_phase_block = {
-                    **to_phase_block(
-                        _open_version,
-                        audit_child=_audit_child,
-                        aggregate_serving_status=_open_aggregate["serving_status"],
-                        aggregate_deploy_failure_reason=_open_aggregate["reason_code"],
-                        artifact_evidence=_open_artifacts,
-                    ),
+                    **_phase_block,
                     "tasks_merged_this_version": _tasks_merged,
                     "qualification_attempts": _open_version.qualification_attempts,
                     # Signals the strategist to author the objective this cycle.
@@ -5897,8 +5914,34 @@ async def _spawn_strategic_review(
                 logger.exception(
                     "[STRATEGIC] criterion_coverage fetch failed; continuing"
                 )
-        except Exception:
+            try:
+                from app.release_readiness import (
+                    compute_qualification_trigger_state,
+                )
+
+                _trigger_state = await compute_qualification_trigger_state(
+                    session, project.id
+                )
+                if _trigger_state is not None:
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["qualification_trigger_state"] = (
+                        _trigger_state
+                    )
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] qualification_trigger_state fetch failed; continuing"
+                )
+        except Exception as _vpb_exc:
             logger.exception("[STRATEGIC] version_phase block build failed; continuing")
+            _version_phase_block = {
+                "lifecycle_signal": "unavailable",
+                "signal_status": "build_failed",
+                "build_unavailable": True,
+                "error": repr(_vpb_exc)[:240],
+                "integration_branch": _integration_branch,
+                "promotion_target": _promotion_target,
+            }
     # Deployment-state block — only under an LTS split (integration branch !=
     # promotion target). Grounds the deploy-model framing in concrete numbers:
     # what is actually DEPLOYED (running live on the promotion target) vs what
@@ -6256,6 +6299,22 @@ async def _spawn_strategic_review(
                     )
     except Exception:
         logger.exception("[STRATEGIC] held-directions block build failed; continuing")
+    # Integrity-conflict trend — persisted per-cycle counts for the four
+    # referential-integrity classes (orphaned_gaps, ungrounded_directions,
+    # stale_active_moves, staffed_but_deferred) over the last 10 completed
+    # cycles. Compact dict of three scalars + last_counts; low priority. Best-
+    # effort: absent when no stamped cycles exist yet or the query fails.
+    _integrity_trend: dict | None = None
+    try:
+        from app import strategic_cycle as _sc_trend  # noqa: PLC0415
+
+        _trend_result = await _sc_trend.recent_integrity_conflict_trend(
+            session, project.id, limit=10
+        )
+        if _trend_result.get("stamped_cycles", 0) > 0:
+            _integrity_trend = _trend_result
+    except Exception:
+        logger.exception("[STRATEGIC] integrity_conflict_trend fetch failed; continuing")
     # Post-promotion handoff — when a fresh version has just opened, it was
     # opened by the PROMOTION of the prior version: open_version() is only ever
     # called from _record_promotion_success and the v1 bootstrap, so a version
@@ -6542,7 +6601,6 @@ async def _spawn_strategic_review(
     if _open_version is not None:
         from app.release_version import (
             QUALIFICATION_STATE_VOCAB as _QUAL_STATE_VOCAB,
-            summarize_qualification_state as _summarize_qual_state,
         )
 
         _QUAL_HINT_STATES = {
@@ -6555,7 +6613,10 @@ async def _spawn_strategic_review(
         assert (
             _QUAL_HINT_STATES <= _QUAL_STATE_VOCAB
         ), "prompt-suffix states not in vocab"
-        _qual_state = _summarize_qual_state(_open_version.last_qualification)
+        # Use the resolver-applied qualification_state from _version_phase_block
+        # rather than re-deriving from the raw last_qualification record, so the
+        # hint reflects the finalized-verdict substitution (if any).
+        _qual_state = (_version_phase_block or {}).get("qualification_state")
         if _qual_state and _qual_state.get("state") in _QUAL_HINT_STATES:
             _qual_hint = (
                 f"Qualification sub-state: {_qual_state['state'].upper()} — "
@@ -6647,7 +6708,8 @@ async def _spawn_strategic_review(
             _currency = await _resolve_candidate_currency(
                 session, project, _last_qual, _integration_branch
             )
-            _candidate_behind = _currency is not None and not _currency["current"]
+            _currency_resolved = _currency.get("resolved") is True
+            _candidate_behind = _currency_resolved and not _currency["current"]
             if _version_phase_block is not None and _currency is not None:
                 _version_phase_block["last_qualification_candidate_currency"] = (
                     _currency
@@ -6749,7 +6811,7 @@ async def _spawn_strategic_review(
                     f"version_phase.last_qualification.audit_findings — and "
                     f"{_binding_desc}. Top findings: {_top}."
                 )
-                if _currency is None:
+                if not _currency_resolved:
                     _stabilize_hint += (
                         " (Could not confirm the candidate commit these findings "
                         "were scored against is still the integration-branch HEAD, "
@@ -6845,9 +6907,16 @@ async def _spawn_strategic_review(
                         f"v{_open_version.version_number} has been in the stabilize "
                         f"phase for {_stab_age_days} day(s) with {_stab_merged} merged "
                         f"task(s) without making progress toward qualification. "
-                        f"stabilize→qualify is agent-driven — consider emitting a "
-                        f"qualify_request now, or identifying and resolving whatever "
-                        f"is preventing qualification readiness."
+                        f"The FIRST qualification now fires AUTOMATICALLY once "
+                        f"criterion coverage is complete — qualify_request is no "
+                        f"longer required to start it. Check "
+                        f"version_phase.qualification_trigger_state: if it is "
+                        f"'blocked' the summary/reason tells you what to resolve "
+                        f"(e.g. coverage N/M) to let the trigger arm. "
+                        f"qualify_request only ACCELERATES the first qualification "
+                        f"(fires it before the next sweep) or re-drives after a "
+                        f"conclusive verdict — emit one to fire sooner, but "
+                        f"resolving the blocker is what actually unsticks the stall."
                     )
                     prompt_suffix = (
                         f"{prompt_suffix}\n{_stab_stall_hint}"
@@ -6926,16 +6995,23 @@ async def _spawn_strategic_review(
             logger.exception(
                 "[STRATEGIC] fallback candidate-currency resolution failed; continuing"
             )
-    # Derive structured payload-staleness signal from the already-resolved
-    # _currency dict.  Exposes payload_compiled_sha, active_candidate_sha,
-    # integration_head_sha, and an explicit stale/current verdict at cycle start
-    # so the agent can detect stale-context before making portfolio decisions.
-    # Always present: 'unknown' verdict when GitHub was unreachable so the agent
-    # can never mistake an indeterminate freshness check for a confirmed-fresh one.
-    if _currency is not None:
-        _payload_staleness: dict = _build_freshness_shas_block(_currency)
-    else:
-        _payload_staleness = _build_unknown_freshness_block()
+        # Surface the typed currency block through version_phase on the fallback
+        # path too (the stabilize+carried-findings path already set it above), so
+        # an api_unreachable/stale/fresh verdict reaches buildVersionPhaseSection
+        # on every cycle that has an open version.
+        if (
+            _currency is not None
+            and _version_phase_block is not None
+            and "last_qualification_candidate_currency" not in _version_phase_block
+        ):
+            _version_phase_block["last_qualification_candidate_currency"] = _currency
+    # Derive structured payload-staleness signal from the resolved _currency dict.
+    # A resolved dict exposes payload_compiled_sha, active_candidate_sha,
+    # integration_head_sha, and an explicit stale/current verdict; an unresolved
+    # dict carries verdict='unknown' (genuine local indeterminacy) or
+    # 'api_unreachable' (transient GitHub failure) WITHOUT a stale flag, so the
+    # agent can never mistake either indeterminate state for confirmed-fresh.
+    _payload_staleness: dict = _build_payload_staleness_block(_currency)
     # Inject explicit list of failed approaches from retired directions so the
     # agent has a clear "do not re-propose" block in the prompt.
     _retired_summary = _build_retired_directions_summary(project)
@@ -7031,6 +7107,14 @@ async def _spawn_strategic_review(
         _agent_view_problem_model(project.problem_model),
         **verification_kwargs,
     )
+    # Stamp per-direction in-flight counts onto direction_stats from the SAME
+    # active_by_direction mapping the reconciliation reads, so the (droppable)
+    # directions_summary floor and cycle_start_reconciliation.direction_pipeline
+    # can never disagree. Stamped even when 0 so staffed>0 stays distinguishable
+    # from idle=0 after the reconciliation section is dropped under byte pressure.
+    _stamp_direction_in_flight(
+        direction_stats, (recent_interventions or {}).get("active_by_direction")
+    )
     _cycle_start_reconciliation = _build_cycle_start_reconciliation(
         direction_stats,
         _verified_problem_model,
@@ -7039,6 +7123,7 @@ async def _spawn_strategic_review(
         (recent_interventions or {}).get("per_direction_delta"),
         running_update=project.running_update or "",
         last_qual=_open_version.last_qualification if _open_version is not None else None,
+        version_phase_block=_version_phase_block,
     )
     # Soft size/health signal from the DURABLE pre-trim model so counts are honest
     # (the agent view above is trimmed). Fail-open: None when the durable model
@@ -7092,6 +7177,16 @@ async def _spawn_strategic_review(
                 )
     except Exception:
         logger.exception("[STRATEGIC] ci_compliance signal build failed; continuing")
+    _open_completion_debt_block: dict[str, Any] | None = None
+    try:
+        from importlib import import_module
+
+        _completion_debt = import_module("app.completion_debt")
+        _open_completion_debt_block = await _completion_debt.get_open_completion_debt(
+            session, project.id
+        )
+    except Exception:
+        logger.exception("[STRATEGIC] open_completion_debt signal build failed; continuing")
     _active_direction_ids = [
         d.get("id")
         for d in (project.directions or [])
@@ -7100,6 +7195,7 @@ async def _spawn_strategic_review(
     _knowledge_by_direction = await fetch_direction_knowledge_index(
         session, project.id, _active_direction_ids
     )
+    _cadence_exam_leads = _resident_open_found_leads(project)
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -7210,6 +7306,7 @@ async def _spawn_strategic_review(
                 else {}
             ),
             "project_name": project.name,
+            "open_message_count": len(open_msgs),
             "open_messages": open_msgs,
             **(
                 {"operator_context_refs": operator_context_refs}
@@ -7243,6 +7340,11 @@ async def _spawn_strategic_review(
             **({"payload_staleness": _payload_staleness} if _payload_staleness else {}),
             **({"ci_compliance": _ci_compliance_block} if _ci_compliance_block else {}),
             **(
+                {"open_completion_debt": _open_completion_debt_block}
+                if _open_completion_debt_block
+                else {}
+            ),
+            **(
                 {"deployment_state": _deployment_state_block}
                 if _deployment_state_block
                 else {}
@@ -7273,6 +7375,11 @@ async def _spawn_strategic_review(
                 else {}
             ),
             **(
+                {"integrity_conflict_trend": _integrity_trend}
+                if _integrity_trend
+                else {}
+            ),
+            **(
                 {"held_directions": _held_directions_block}
                 if _held_directions_block
                 else {}
@@ -7292,6 +7399,11 @@ async def _spawn_strategic_review(
                 if _sr_capability_trial_verdicts
                 else {}
             ),
+            **(
+                {"resident_exam_leads": _cadence_exam_leads}
+                if _cadence_exam_leads
+                else {}
+            ),
             "base_branch": get_project_integration_branch(project),
             **({"model": review_model} if review_model else {}),
             **({"effort": review_effort} if review_effort else {}),
@@ -7299,6 +7411,20 @@ async def _spawn_strategic_review(
         _STRATEGIC_REVIEW_SCHEMA,
     )
     payload = validate_internal_payload(payload, "autonomous_research:strategic_review")
+
+    # Extract the three integrity-conflict counts from the reconciliation so they
+    # can be persisted on the cycle row for trend queries.
+    _recon_counts = (
+        (_cycle_start_reconciliation or {}).get("counts") or {}
+        if _cycle_start_reconciliation
+        else {}
+    )
+    _integrity_counts: dict[str, int] | None = {
+        "orphaned_gaps": int(_recon_counts.get("orphaned_gaps") or 0),
+        "ungrounded_directions": int(_recon_counts.get("ungrounded_directions") or 0),
+        "stale_active_moves": int(_recon_counts.get("stale_active_moves") or 0),
+        "staffed_but_deferred": int(_recon_counts.get("staffed_but_deferred") or 0),
+    }
 
     # Re-arm the duplicate-spawn guards, create the task, record the cycle, and
     # commit — the short finalize transaction shared with the resident-minimal
@@ -7318,6 +7444,7 @@ async def _spawn_strategic_review(
         extra_context=extra_context,
         operator_steered=operator_steered,
         steering_excerpt=steering_excerpt,
+        integrity_conflict_counts=_integrity_counts,
     )
 
 

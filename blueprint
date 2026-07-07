@@ -4,5 +4,5 @@
 # Usage: ./blueprint [--json] <subcommand> [args...]
 # Examples: ./blueprint status, ./blueprint --help, ./blueprint tasks list
 set -euo pipefail
-REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 exec python3 "$REPO_ROOT/scripts/blueprint.py" "$@"

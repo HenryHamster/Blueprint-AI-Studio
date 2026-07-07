@@ -184,6 +184,52 @@ describe('renderDirection', () => {
     expect(result).toContain('findings already completed');
   });
 
+  it('omits researchCtx prose (established/failed/open) for the current direction when currentDirectionId matches', () => {
+    const d = {
+      id: 'd-current',
+      text: 'Current dir',
+      priority: 'medium',
+      research_context: [
+        '## Established Findings',
+        '- finding 1 (merged)',
+        '## Failed Approaches',
+        '- approach-alpha-unique',
+        '## Open Questions',
+        '- question-beta-unique',
+      ].join('\n'),
+    };
+    const result = renderDirection(d, 0, 'd-current', noTasks, noTasks);
+    expect(result).not.toContain('findings already completed');
+    expect(result).not.toContain('Failed approaches');
+    expect(result).not.toContain('Open questions');
+    expect(result).not.toContain('approach-alpha-unique');
+    expect(result).not.toContain('question-beta-unique');
+    // Header line still present
+    expect(result).toContain('d-current');
+  });
+
+  it('still emits researchCtx prose for non-current directions even when currentDirectionId is set', () => {
+    const d = {
+      id: 'd-other',
+      text: 'Other dir',
+      priority: 'medium',
+      research_context: [
+        '## Established Findings',
+        '- finding 1 (merged)',
+        '## Failed Approaches',
+        '- approach-gamma-unique',
+        '## Open Questions',
+        '- question-delta-unique',
+      ].join('\n'),
+    };
+    const result = renderDirection(d, 0, 'd-current', noTasks, noTasks);
+    expect(result).toContain('findings already completed');
+    expect(result).toContain('Failed approaches');
+    expect(result).toContain('Open questions');
+    expect(result).toContain('approach-gamma-unique');
+    expect(result).toContain('question-delta-unique');
+  });
+
   it('renders calibration signal when history has code errors', () => {
     const d = {
       id: 'd-cal', text: 'Dir', priority: 'medium',

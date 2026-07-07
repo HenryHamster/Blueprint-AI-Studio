@@ -7,6 +7,7 @@ import {
   Settings,
   ShieldCheck,
   SlidersHorizontal,
+  Tag,
   Users,
   Wrench,
   type LucideIcon,
@@ -28,7 +29,7 @@ export type ProjectManageSection =
       | 'alert-domains'
       | 'access'
     >;
-export type RuntimeSection = 'health' | 'devices' | 'compute' | 'accounts' | 'settings' | 'analytics';
+export type RuntimeSection = 'health' | 'devices' | 'compute' | 'accounts' | 'settings' | 'analytics' | 'version-lifecycle';
 export type RuntimeSettingsSection = Extract<
   SectionId,
   | 'general'
@@ -81,6 +82,7 @@ export const RUNTIME_SECTIONS: SectionNavItem<RuntimeSection>[] = [
   { id: 'accounts', label: 'Accounts', description: 'GitHub identity, LLM account roster, usage caps, and pool availability.', icon: Users },
   { id: 'settings', label: 'Settings', description: 'Runtime defaults, automation limits, providers, deploy controls, and alerts.', icon: SlidersHorizontal },
   { id: 'analytics', label: 'Analytics', description: 'Cost, account health, portfolio signals, and provider/model breakdowns.', icon: Activity },
+  { id: 'version-lifecycle', label: 'Versions', description: 'Release version lifecycle, qualification status, and promotion controls.', icon: Tag },
 ];
 
 export const PROJECT_POLICY_SECTIONS = PROJECT_MANAGE_SECTIONS

@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, update, or_, and_
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -37,7 +38,11 @@ from app.project_message_creation import (
     create_operator_project_message,
     parse_operator_message_type,
 )
-from app.project_message_projection import admin_message_dict, message_event_payload
+from app.project_message_projection import (
+    admin_message_dict,
+    admin_message_list_dict,
+    message_event_payload,
+)
 from app.messages_noise_prefs_store import (
     get_messages_noise_prefs_row,
     mutate_messages_noise_prefs,
@@ -250,6 +255,9 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "capability_trial_stalled",
         "capability_verdict_decided",
         "capability_trial_ambiguous_lift_escalation",
+        "criterion_retracted",
+        "criterion_superseded",
+        "question_answer",
     }
 )
 
@@ -544,6 +552,25 @@ async def list_messages(
         )
     ).scalar() or 0
 
+    # Fetch context for list queries but strip large keys (e.g. strategic_session
+    # snapshots) in admin_message_list_dict before returning. This preserves the
+    # UI-needed context fields (event_type, severity, reply_to, etc.) while
+    # preventing full strategic-session payloads from inflating the poll response.
+    _LIST_LOAD_ONLY = load_only(
+        ProjectMessage.id,
+        ProjectMessage.project_id,
+        ProjectMessage.message_type,
+        ProjectMessage.from_type,
+        ProjectMessage.from_task_id,
+        ProjectMessage.content,
+        ProjectMessage.context,
+        ProjectMessage.status,
+        ProjectMessage.resolution,
+        ProjectMessage.resolved_at,
+        ProjectMessage.created_at,
+        raiseload=True,
+    )
+
     # Guarantee open high-signal messages are always returned regardless of routine volume.
     # Covers: user-authored, BLOCKER/FEEDBACK/BUG_REPORT, and system NOTE messages whose
     # event_type is classified as high_signal in the event-type snapshot.
@@ -579,6 +606,7 @@ async def list_messages(
             .where(*hs_filters)
             .order_by(ProjectMessage.created_at.desc())
             .limit(_HS_LIMIT)
+            .options(_LIST_LOAD_ONLY)
         )
         guaranteed_msgs = list((await session.execute(hs_q)).scalars().all())
 
@@ -588,15 +616,56 @@ async def list_messages(
         .order_by(ProjectMessage.created_at.desc())
         .offset(offset)
         .limit(limit)
+        .options(_LIST_LOAD_ONLY)
     )
     paged = list(result.scalars().all())
     guaranteed_ids = {m.id for m in guaranteed_msgs}
     messages = guaranteed_msgs + [m for m in paged if m.id not in guaranteed_ids]
 
     return {
-        "messages": [admin_message_dict(m) for m in messages],
+        "messages": [admin_message_list_dict(m) for m in messages],
         "total": total,
     }
+
+
+@router.get("/messages/counts")
+async def get_message_counts(
+    project_id: str = Query(...),
+    last_seen_ms: Optional[int] = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return high-signal open message counts by type plus an unread total.
+
+    Lightweight badge-poll alternative to GET /messages — returns only integers,
+    no message content or previews.
+    """
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    from app.messages_last_seen import timestamp_ms_to_naive_utc
+    from app.models import MessagesLastSeen
+    from app.operator_attention import get_operator_message_counts
+
+    client_last_seen_at = timestamp_ms_to_naive_utc(last_seen_ms) if last_seen_ms is not None else None
+    # Merge client-supplied timestamp with server-stored last_seen so the badge
+    # works correctly on a fresh device / cleared localStorage (cross-device).
+    server_last_seen_at = (
+        await session.execute(
+            select(MessagesLastSeen.last_seen_at).where(
+                MessagesLastSeen.project_id == pid,
+                MessagesLastSeen.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
+    if client_last_seen_at is not None and server_last_seen_at is not None:
+        last_seen_at = max(client_last_seen_at, server_last_seen_at)
+    else:
+        last_seen_at = client_last_seen_at or server_last_seen_at
+    return await get_operator_message_counts(session, pid, last_seen_at, user_id=current_user["user_id"])
 
 
 @router.post("/messages")

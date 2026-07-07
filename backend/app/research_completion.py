@@ -48,6 +48,7 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
     _HISTORY_AGG_DEFAULTS,
     _DECOMP_AGG_DEFAULTS,
     _fold_evicted_into_aggregate,
+    build_evicted_cycle_snapshot,
     _compute_momentum_factor,
     _compute_acceptance_rate,
     _compute_productivity_score,
@@ -76,6 +77,7 @@ from app.finding_deduplication import (
 )
 from app.task_blocked import NEED_REF_MAX_LEN
 from app.task_evaluators import (
+    ADVERSARIAL_PARSE_CHALLENGER_FAILED,
     ADVERSARIAL_PARSE_NO_HASH_MATCHES,
     ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES,
     CHALLENGE_AGREES,
@@ -94,8 +96,7 @@ from app.capability_registry import (
     registry_capability_vocabulary,
 )
 from app.payload_schemas import (
-    parse_acceptance_evidence,
-    read_acceptance_evidence,
+    normalize_acceptance_evidence,
     validate_internal_payload,
 )
 from app.playbook_learning import (
@@ -125,13 +126,11 @@ from app.source_ref_validation import (
     resolve_branch_verification_context,
     summarize_broken_refs,
     summarize_ungrounded_claims,  # noqa: F401 — re-exported for callers/tests
-    detect_absent_symbols,
     resolve_head_commit,
     cited_paths_changed_since,
     finding_cited_paths,
     classify_reproduction,
     _has_validation_backend,
-    _parse_path_symbol_refs,
     CITATION_STATE_ABSENT,
     CITATION_STATE_PRESENT,
     CITATION_STATE_INDETERMINATE,
@@ -170,6 +169,19 @@ from app.plan_completion import (
     TASK_PRIORITY_MAP,
 )
 from app.time_utils import _utcnow
+from app.research_provenance_validation import (  # noqa: F401 — re-exported for callers/tests
+    VERIFICATION_BASIS_TIERS,
+    VALID_VERIFICATION_BASES,
+    _HIGH_EVIDENCE_BASES,
+    _DOWNGRADED_VERIFICATION_BASIS,
+    _reconcile_verification_basis,
+    _staleness_provenance_warning,
+    _merge_provenance_warnings,
+    recompute_launch_staleness,
+    _summarize_ungrounded_claims_grounded,
+    _count_total_symbol_refs,
+    _file_source_present_count,
+)
 from app.research_scope_calibration import (  # noqa: F401 — re-exported for callers/tests
     MEDIUM_EXPLORATION_FLOOR,
     _avg_medium_expansion_ratio,
@@ -269,157 +281,9 @@ _ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
 # so the total grader budget is: initial + at most one targeted + at most one wholesale.
 _ADVERSARIAL_TARGETED_RETRY_KEY = "_adversarial_targeted_retry_count"
 _ADVERSARIAL_TARGETED_RETRY_LIMIT = 1
-
-# Verification-basis tiers, ordered from highest evidence (the finding's claim
-# was checked against real code) to lowest (asserted/deduced). Defined once here
-# so the normalization and the HEAD-reconciliation below share a single source
-# of truth instead of repeating the literal tier strings.
-VERIFICATION_BASIS_TIERS = (
-    "code_verified",
-    "path_verified",
-    "pattern_inferred",
-    "deduced",
-)
-VALID_VERIFICATION_BASES = frozenset(VERIFICATION_BASIS_TIERS)
-# Tiers that assert the finding was verified against real code. A self-reported
-# value in this set is only honest if the finding's own citations resolve at
-# HEAD; when they don't, it is capped to _DOWNGRADED_VERIFICATION_BASIS.
-_HIGH_EVIDENCE_BASES = frozenset({"code_verified", "path_verified"})
-# Honest fallback when a high-evidence self-claim is contradicted by broken
-# citations: the highest tier that does NOT assert verification-against-code.
-_DOWNGRADED_VERIFICATION_BASIS = "pattern_inferred"
-
-
-def _reconcile_verification_basis(
-    finding: Dict[str, Any],
-    broken_provenance: Dict[str, Any] | None,
-    ungrounded: Dict[str, Any] | None,
-) -> bool:
-    """Cap a self-reported high-evidence verification_basis against HEAD truth.
-
-    The tiers in :data:`_HIGH_EVIDENCE_BASES` assert the finding was checked
-    against real code. When the already-computed ingestion validation marks the
-    finding's file sources invalid (``broken_provenance`` from
-    :func:`summarize_broken_refs`) or finds ungrounded ``path:symbol`` claims
-    (``ungrounded`` from :func:`_summarize_ungrounded_claims_grounded`), that
-    self-assertion is contradicted by ground truth, so the stored basis is
-    downgraded to :data:`_DOWNGRADED_VERIFICATION_BASIS` — an honest tier that
-    makes no verified-against-code claim.
-
-    Findings with no citations, or whose citations validate cleanly, keep their
-    reported basis (both args are None). Mutates ``finding`` in place; returns
-    True when a downgrade occurred.
-    """
-    current = finding.get("verification_basis")
-    if current not in _HIGH_EVIDENCE_BASES:
-        return False
-    if not broken_provenance and not ungrounded:
-        return False
-    broken_count = int((broken_provenance or {}).get("broken_source_ref_count", 0) or 0)
-    ungrounded_count = int((ungrounded or {}).get("ungrounded_claim_count", 0) or 0)
-    finding["verification_basis_downgraded_from"] = current
-    finding["verification_basis_downgrade_reason"] = (
-        "HEAD validation failed: "
-        f"{broken_count} broken source ref{'s' if broken_count != 1 else ''}, "
-        f"{ungrounded_count} ungrounded claim{'s' if ungrounded_count != 1 else ''}"
-    )
-    finding["verification_basis"] = _DOWNGRADED_VERIFICATION_BASIS
-    logger.info(
-        "[RESEARCH] Capping verification_basis %s→%s for '%s' "
-        "(citations unresolved at HEAD: broken_refs=%d, ungrounded_claims=%d)",
-        current,
-        _DOWNGRADED_VERIFICATION_BASIS,
-        finding.get("title", "<untitled>"),
-        broken_count,
-        ungrounded_count,
-    )
-    return True
-
-
-def _staleness_provenance_warning(
-    finding: Dict[str, Any],
-) -> Dict[str, Any] | None:
-    """Return a provenance warning when deferred findings need HEAD revalidation."""
-    if finding.get("needs_revalidation") is not True:
-        return None
-    if (
-        finding.get("needs_revalidation_reason")
-        == "cited_files_changed_since_generation"
-    ):
-        return {"cited_files_changed_since_generation": True}
-    return None
-
-
-def _merge_provenance_warnings(
-    finding: Dict[str, Any],
-    *warnings: Dict[str, Any] | None,
-) -> None:
-    """Merge provenance warnings onto a finding, preserving existing signals."""
-    merged: Dict[str, Any] = {}
-    existing = finding.get("_provenance_warnings")
-    if isinstance(existing, dict):
-        merged.update(existing)
-    for warning in warnings:
-        if warning:
-            merged.update(warning)
-    if merged:
-        finding["_provenance_warnings"] = merged
-    else:
-        finding.pop("_provenance_warnings", None)
-
-
-async def recompute_launch_staleness(session: Any, task: Any) -> bool:
-    """Re-check cited-file freshness against the CURRENT integration HEAD at launch.
-
-    A finding-derived task carries the ``generated_head_sha`` it was generated
-    against and the file paths it cites (``_finding_cited_paths``), both stamped
-    onto its context at spawn. But the integration branch advances while the task
-    sits QUEUED, so the ingestion-time staleness warning is structurally inert
-    (generated HEAD == ingestion HEAD). This recomputes the diff against the branch
-    TIP at dispatch and, ONLY on an affirmative change verdict, merges
-    ``{'cited_files_changed_since_generation': True}`` into the context's
-    ``_provenance_warnings`` — reusing the exact shape the ingestion path emits.
-
-    Returns True iff it mutated ``task.context`` (the caller must persist + mark the
-    column modified). Conservative and best-effort by construction: a missing
-    ``generated_head_sha``, no cited paths, no research parent, an unresolvable
-    project, a None/False verdict, or ANY exception all leave the context untouched
-    and return False. It never raises and never flags on an indeterminate result,
-    so it can never block or delay dispatch nor false-positive a stale finding.
-    """
-    try:
-        context = task.context or {}
-        gen_sha = context.get("generated_head_sha")
-        cited_paths = context.get("_finding_cited_paths")
-        if not gen_sha or not isinstance(cited_paths, list) or not cited_paths:
-            return False
-        # Only annotate findings derived from a research parent.
-        if not (
-            context.get("research_task_id") or context.get("parent_research_task_id")
-        ):
-            return False
-        project = (
-            await session.get(Project, task.project_id) if task.project_id else None
-        )
-        if project is None:
-            return False
-        src_ref_ctx = await resolve_branch_verification_context(session, project)
-        changed = await cited_paths_changed_since(gen_sha, cited_paths, **src_ref_ctx)
-        if changed is not True:
-            return False
-        new_context = dict(context)
-        _merge_provenance_warnings(
-            new_context, {"cited_files_changed_since_generation": True}
-        )
-        task.context = new_context
-        return True
-    except Exception:  # noqa: BLE001 — launch recompute must never block dispatch
-        logger.debug(
-            "[RESEARCH] launch-time cited-file staleness recompute failed",
-            exc_info=True,
-        )
-        return False
-
+_ADVERSARIAL_INFRA_FAILURE_MODE_KEY = "adversarial_spawn_gate_infra_failure_mode"
+_ADVERSARIAL_INFRA_FAILURE_MODE_ENFORCE = "enforce"
+_ADVERSARIAL_INFRA_UNVERIFIED_VERDICT = "unverified"
 
 def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
     """Trim a dropped finding to a bounded dict for embedding in a MemoPayload.
@@ -1047,107 +911,6 @@ def _summarize_dispatch_outcome(
     return " | ".join(parts)[:500]
 
 
-async def _summarize_ungrounded_claims_grounded(
-    claims: list | None,
-    sources: list | None,
-    ctx: Dict[str, Any],
-) -> Dict[str, Any] | None:
-    """GitHub-context-aware variant of :func:`summarize_ungrounded_claims`.
-
-    The shared ``summarize_ungrounded_claims`` helper checks each
-    ``path:symbol`` reference against the local ``/tmp/workspace`` git
-    checkout, which the backend does not have — so at research-finding
-    ingestion the symbol-level grounding silently verifies nothing outside the
-    agent VM. This threads the already-resolved GitHub repo/branch verification
-    context (``ctx`` — the same dict the file-level source-ref validation uses)
-    through :func:`detect_absent_symbols` so the symbol check runs against the
-    project's real integration branch, reusing the GitHub file-content fetch
-    behind ``detect_absent_symbols`` rather than adding a second content path.
-
-    Returns the same ``{"ungrounded_claim_count", "ungrounded_refs"}`` shape as
-    ``summarize_ungrounded_claims`` (or None when nothing is ungrounded).
-    Conservative semantics are preserved: when no GitHub credentials resolved
-    (``ctx`` lacks a token), ``detect_absent_symbols`` falls back to local git
-    HEAD whose indeterminate result never flags, so an indeterminate check
-    never produces an ungrounded ref.
-    """
-    if not isinstance(claims, list):
-        claims = []
-    seen_refs: set = set()
-    ungrounded_refs: list = []
-    ungrounded_claim_count = 0
-    for claim in claims:
-        absent = await detect_absent_symbols(text_fields=[claim], **ctx)
-        if absent:
-            ungrounded_claim_count += 1
-        for ref in absent:
-            if ref not in seen_refs:
-                seen_refs.add(ref)
-                ungrounded_refs.append(ref)
-    # File-source excerpts contribute refs but never increment a claim count,
-    # mirroring summarize_ungrounded_claims' count_claim=False handling.
-    excerpts = [
-        s.get("quote") or s.get("excerpt")
-        for s in (sources or [])
-        if isinstance(s, dict) and str(s.get("type") or "").lower() == "file"
-    ]
-    if excerpts:
-        for ref in await detect_absent_symbols(text_fields=excerpts, **ctx):
-            if ref not in seen_refs:
-                seen_refs.add(ref)
-                ungrounded_refs.append(ref)
-    if not ungrounded_refs:
-        return None
-    return {
-        "ungrounded_claim_count": ungrounded_claim_count,
-        "ungrounded_refs": ungrounded_refs,
-    }
-
-
-def _count_total_symbol_refs(claims: list | None, sources: list | None) -> int:
-    """Count distinct ``path:symbol`` references across a finding's claims/excerpts.
-
-    The denominator for the reproduce-on-HEAD verdict: paired with the
-    ungrounded count from :func:`_summarize_ungrounded_claims_grounded`, it lets
-    :func:`classify_reproduction` tell "every cited symbol is absent" (reject)
-    apart from "some cited symbol still resolves" (partial grounding → pass).
-    Deduplicates ``(path, symbol)`` pairs the same way the ungrounded count does,
-    pulling from claims plus file-source excerpts (``quote``/``excerpt``).
-    """
-    seen: set = set()
-    texts: list = list(claims or [])
-    texts.extend(
-        s.get("quote") or s.get("excerpt")
-        for s in sources or []
-        if isinstance(s, dict) and str(s.get("type") or "").lower() == "file"
-    )
-    for text in texts:
-        for pair in _parse_path_symbol_refs(text):
-            seen.add(pair)
-    return len(seen)
-
-
-def _file_source_present_count(sources: list | None) -> int:
-    """Count file-type sources that survive validation (not marked invalid).
-
-    A source is counted present unless :func:`validate_source_refs` stamped it
-    ``valid: False`` — so an INDETERMINATE file ref (left untouched) counts as
-    present, keeping an unknowable citation from ever driving a rejection.
-    """
-    count = 0
-    for s in sources or []:
-        if not isinstance(s, dict):
-            continue
-        if str(s.get("type") or "").lower() != "file":
-            continue
-        if not s.get("ref"):
-            continue
-        if s.get("valid") is False:
-            continue
-        count += 1
-    return count
-
-
 # Finding ``type`` values that are processed separately and never spawn an
 # implementation/child task (direction proposals/notes, design-doc observations,
 # direction updates). Used by the blast-radius predicate below.
@@ -1196,6 +959,20 @@ def _is_high_stakes_finding(finding: Dict[str, Any]) -> bool:
     if finding.get("already_spawned"):
         return False
     if finding.get("actionability_grade") == "LOW":
+        return False
+    # Capability-foundation work is structurally non-adversarial: a finding that
+    # declares it provides a capability, or one that depends on a capability,
+    # should flow through the normal capability resolver instead of getting
+    # parked in the refute-first spawn gate.
+    if finding.get("_provides_capability") or finding.get("provides_capability"):
+        return False
+    _capability_prereq = finding.get("_prerequisite") or normalize_prerequisite(
+        finding.get("prerequisite") or finding.get("requires")
+    )
+    if (
+        isinstance(_capability_prereq, dict)
+        and _capability_prereq.get("kind") == "capability"
+    ):
         return False
 
     # Large blast radius: large scope
@@ -2318,6 +2095,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Decision-quality breakdown of the inclusive survived/refuted buckets.
     _spawn_gate_explicit_pass_count = 0
     _spawn_gate_fail_open_count = 0
+    _spawn_gate_infra_fail_open_count = 0
     _spawn_gate_unresolved_count = 0
     _spawn_gate_refuted_reasons: list[str] = []
     _spawn_gate_manifest_excluded_count = 0
@@ -2365,6 +2143,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             and _wholesale_parse_outcome in ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES
         )
         _spawn_gate_healthy_cycle = not _wholesale_non_response
+        _spawn_gate_cause_category = (
+            _spawn_gate_cause.get("category")
+            if isinstance(_spawn_gate_cause, dict)
+            else None
+        )
+        _infra_non_response_cause = (
+            _spawn_gate_cause_category in GRADER_TIMEOUT_CAUSES
+            or _spawn_gate_cause_category in GRADER_TRANSIENT_INFRA_CAUSES
+            or _wholesale_parse_outcome == ADVERSARIAL_PARSE_CHALLENGER_FAILED
+        )
 
         def _spawn_gate_dir_entry(_direction_id: str) -> dict:
             return _spawn_gate_by_direction.setdefault(
@@ -2389,9 +2177,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # Dispatch on the diagnosed non-response cause so the retry
             # strategy matches the failure mode rather than always doing the
             # same wholesale re-challenge.
-            _cause_category = (_adversarial_verdict_raw.get("cause") or {}).get(
-                "category"
-            ) or ""
+            _cause_category = _spawn_gate_cause_category or ""
             # _do_wholesale: True means fall through to the existing wholesale
             # retry logic.  The refusal path sets it False to skip retries.
             _do_wholesale = True
@@ -2599,21 +2385,38 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     task.context = _ctx
                     flag_modified(task, "context")
 
+        _infra_fail_open_unverified = bool(
+            _wholesale_non_response
+            and _infra_non_response_cause
+            and (task.context or {}).get("research_spawn_gate_wholesale_retry_exhausted")
+            and str(
+                _runtime_config.get(_ADVERSARIAL_INFRA_FAILURE_MODE_KEY, "observe")
+                or "observe"
+            )
+            .strip()
+            .lower()
+            != _ADVERSARIAL_INFRA_FAILURE_MODE_ENFORCE
+        )
+        _infra_fail_open_reason = (
+            "unverified: adversarial challenger infrastructure failed after "
+            "retry exhaustion"
+        )
+
         for _f in findings:
             _fhash = _fh(
                 str(_f.get("title", "")),
                 _canonical_finding_body(_f),
             )
             _verdict_obj = _adv_verdicts.get(_fhash)
+            _was_challenged = (
+                _fhash in _challenged_hashes_set
+                if _challenged_hashes_set
+                else _is_high_stakes_finding(_f)
+            )
             if _verdict_obj is None:
                 # Determine whether this finding was actually challenged.
                 # When _adversarial_challenged_hashes is stored, use it; otherwise
                 # fall back to high-stakes check (legacy / missing context).
-                _was_challenged = (
-                    _fhash in _challenged_hashes_set
-                    if _challenged_hashes_set
-                    else _is_high_stakes_finding(_f)
-                )
                 if not _was_challenged:
                     if _is_high_stakes_finding(_f):
                         # high-stakes findings must never bypass the gate
@@ -2664,6 +2467,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _explicit = (
                     explicit_value if isinstance(explicit_value, bool) else False
                 )
+            if (
+                _infra_fail_open_unverified
+                and _was_challenged
+                and not _explicit
+            ):
+                _passed = True
+                _reason = _infra_fail_open_reason
+                _f["_adversarial_unverified"] = True
+                _f["_adversarial_unverified_reason"] = _reason
+                _f["_adversarial_unverified_parse_outcome"] = _wholesale_parse_outcome
+                if _spawn_gate_cause:
+                    _f["_adversarial_unverified_cause"] = _spawn_gate_cause
             if not _passed:
                 _f["_adversarial_verdict"] = "fail"
                 if not _explicit:
@@ -2741,9 +2556,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     _dir_entry["survived_count"] += 1
             elif _passed and not _explicit:
                 _spawn_gate_fail_open_count += 1
+                if _f.get("_adversarial_unverified"):
+                    _spawn_gate_infra_fail_open_count += 1
                 if _direction_id:
                     _dir_entry["fail_open_count"] += 1
                     _dir_entry["survived_count"] += 1
+                    if _f.get("_adversarial_unverified"):
+                        _dir_entry["infra_fail_open_count"] = (
+                            int(_dir_entry.get("infra_fail_open_count") or 0) + 1
+                        )
             elif not _passed and not _explicit:
                 _spawn_gate_unresolved_count += 1
                 if _direction_id:
@@ -2891,8 +2712,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _rctx = task.context or {}
     _inherited_research_branch = _rctx.get("research_branch")
     _has_rollup_pr = bool(_rctx.get("rollup_pr_number"))
+    _adopted_foreign_branch = False
     if _inherited_research_branch and _has_rollup_pr:
         research_branch = _inherited_research_branch
+        # This requeue-clone adopts an ancestor-named (foreign) staging branch
+        # to keep the merge-guard invariant intact. Stamp a DURABLE ownership
+        # flag so the rollup OWNER-gate lets this task carry the branch to base
+        # even though the name doesn't match its own id-prefix (invariant #2).
+        _adopted_foreign_branch = True
     else:
         research_branch = f"{research_branch_prefix}{short_id}"
 
@@ -2903,6 +2730,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # the findings and re-running the agent.
     _ctx_sp = dict(task.context or {})
     _ctx_sp["_research_spawn_pending"] = True
+    if _adopted_foreign_branch:
+        _ctx_sp["owns_rollup_branch"] = True
     task.context = _ctx_sp
     flag_modified(task, "context")
 
@@ -2974,16 +2803,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         .all()
     )
     # Build compact active-task overlap candidates for region-identity dedup:
-    # (direction_id, title, task_type, related_files). The related_files (4th
-    # element) are the necessary signal for region matching — a spawned task
+    # (direction_id, title, task_type, related_files, claims). The related_files
+    # (4th element) are the necessary signal for region matching — a spawned task
     # records the finding's related_files in its context (see the spawn payload
-    # below), so in-flight work exposes the files it targets.
+    # below), so in-flight work exposes the files it targets. The claims (5th
+    # element) feed claim-agreement corroboration for small-file-set cases.
     existing_tasks_with_dirs = [
         (
             (t.context or {}).get("direction_id"),
             t.title.lower(),
             (t.first_payload or {}).get("type"),
             (t.context or {}).get("related_files"),
+            (t.context or {}).get("claims") or [],
         )
         for t in existing_tasks
     ]
@@ -3494,6 +3325,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # task would inherit no criterion_ids even though its direction has some.
     # Best-effort: a lookup failure leaves that direction absent from the cache.
     _direction_criterion_cache: dict[str, list[str]] = {}
+    _criterion_release_version_id = None
+    try:
+        from app.release_version import current_open_version as _current_open_version
+
+        _open_version = await _current_open_version(session, task.project_id)
+        if _open_version is not None:
+            _criterion_release_version_id = _open_version.id
+    except Exception:
+        logger.debug(
+            "[RESEARCH] open version lookup failed for project %s; "
+            "criterion cache will stay version-unscoped",
+            task.project_id,
+        )
     _dirs_to_prefetch: set[str] = set()
     if _parent_direction_id:
         _dirs_to_prefetch.add(_parent_direction_id)
@@ -3509,9 +3353,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 try:
                     _pf_row = await _get_dir_row(session, task.project_id, _pf_dir_id)
                     if _pf_row is not None and _pf_row.criterion_keys:
-                        _direction_criterion_cache[_pf_dir_id] = list(
-                            _pf_row.criterion_keys
+                        from app.acceptance_criteria import (
+                            filter_active_criterion_keys as _filter_active,
                         )
+                        _active_keys = await _filter_active(
+                            session,
+                            task.project_id,
+                            list(_pf_row.criterion_keys),
+                            release_version_id=_criterion_release_version_id,
+                        )
+                        if _active_keys:
+                            _direction_criterion_cache[_pf_dir_id] = _active_keys
                 except Exception:
                     logger.debug(
                         "[RESEARCH] criterion_keys lookup failed for direction %s",
@@ -3539,10 +3391,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         if finding_type == "design_doc_observation":
             # Append to design doc proposals for Phase 1 to review
+            _obs_text = finding.get("description", "")[:500]
+            _obs_section = finding.get("section", "general")
             _obs_entry = {
                 "id": f"pc-{uuid.uuid4().hex[:8]}",
-                "observation": finding.get("description", "")[:500],
-                "section": finding.get("section", "general"),
+                "observation": _obs_text,
+                "section": _obs_section,
                 "proposed_by_task": str(task.id),
                 "proposed_at": _utcnow().isoformat(),
                 "status": "pending",
@@ -3550,7 +3404,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
             def _add_obs_proposal(doc: dict) -> None:
                 proposals = doc.get("proposed_changes", [])
-                proposals.append(_obs_entry)
+                # Dedup: skip if identical observation already exists
+                existing = next(
+                    (p for p in proposals
+                     if p.get("observation") == _obs_text and p.get("section") == _obs_section),
+                    None
+                )
+                if not existing:
+                    proposals.append(_obs_entry)
                 doc["proposed_changes"] = proposals[-30:]  # cap at 30 pending
 
             await with_design_doc_locked(session, task.project_id, _add_obs_proposal)
@@ -4469,6 +4330,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _recent:
                 full_prompt = full_prompt + "\n\n" + _recent
 
+        _payload_acceptance_evidence, _context_acceptance_evidence = (
+            normalize_acceptance_evidence(finding.get("acceptance_evidence"))
+        )
+
         if task_type == "compute_experiment":
             # Build + validate the compute_experiment payload from the launch
             # contract authored above (already validated non-empty command /
@@ -4477,17 +4342,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # handler+metric gate read budget/deadline kills as intentional
             # terminal outcomes unchanged.
             _cc = _compute_contract or {}
-            # Forward-carry the finding's declared acceptance_evidence using the
-            # same lenient pre-validation pattern used by the else-branch below.
-            # A malformed LLM-authored declaration must NOT abort the completion.
-            _ce_finding_acceptance_evidence = finding.get("acceptance_evidence")
-            if _ce_finding_acceptance_evidence is not None and (
-                read_acceptance_evidence(
-                    {"acceptance_evidence": _ce_finding_acceptance_evidence}
-                )
-                is None
-            ):
-                _ce_finding_acceptance_evidence = None
             finding_payload = validate_internal_payload(
                 {
                     "type": "compute_experiment",
@@ -4530,30 +4384,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     **({"model": finding_model} if finding_model else {}),
                     **({"effort": finding_effort} if finding_effort else {}),
                     **(
-                        {"acceptance_evidence": _ce_finding_acceptance_evidence}
-                        if _ce_finding_acceptance_evidence
+                        {"acceptance_evidence": _payload_acceptance_evidence}
+                        if _payload_acceptance_evidence
                         else {}
                     ),
                 },
                 "research_completion:finding:compute_experiment",
             )
         else:
-            # Forward-carry the finding's declared acceptance_evidence (the
-            # evidence that will prove its claim true) onto the spawned child
-            # payload — distinct from the backward verification_basis. Pre-validate
-            # leniently: an LLM-generated finding declaration is untrusted, and a
-            # malformed one passed into the strict validate_internal_payload below
-            # would raise ValueError, aborting _handle_research_completion and
-            # losing ALL findings in this completion. Degrade a malformed
-            # declaration to 'no declaration' (key omitted) instead.
-            _finding_acceptance_evidence = finding.get("acceptance_evidence")
-            if _finding_acceptance_evidence is not None and (
-                read_acceptance_evidence(
-                    {"acceptance_evidence": _finding_acceptance_evidence}
-                )
-                is None
-            ):
-                _finding_acceptance_evidence = None
             finding_payload = validate_internal_payload(
                 {
                     "type": task_type,
@@ -4563,8 +4401,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     **({"effort": finding_effort} if finding_effort else {}),
                     **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
                     **(
-                        {"acceptance_evidence": _finding_acceptance_evidence}
-                        if _finding_acceptance_evidence
+                        {"acceptance_evidence": _payload_acceptance_evidence}
+                        if _payload_acceptance_evidence
                         else {}
                     ),
                     # Additive, optional shared-vocabulary field: the canonical
@@ -4589,12 +4427,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Optional plan-time acceptance-evidence contract. Read it straight off
         # the surviving ``finding`` dict (NOT routed through the
         # depends_on_indices remap), so it survives batch-cap truncation and
-        # dedup for every finding that survives. Validated via the shared helper:
-        # an absent or malformed declaration yields None and the child context is
-        # byte-for-byte unchanged from today.
-        _acceptance_evidence = parse_acceptance_evidence(
-            finding.get("acceptance_evidence")
-        )
+        # dedup for every finding that survives. Validated via the shared bridge:
+        # an absent or malformed declaration yields None on each side and the
+        # child context/payload stay byte-for-byte unchanged from today.
+        _acceptance_evidence = _context_acceptance_evidence
         _finding_lineage = {
             str(v).strip().lower()
             for v in (
@@ -4632,6 +4468,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "original_base": original_base,
                 "research_depth": research_depth + 1,
                 "related_files": related_files,
+                "claims": (finding.get("claims") or [])[:8],
                 "finding_hash": fhash,
                 "finding_lineage": sorted(_finding_lineage),
                 **(
@@ -4813,9 +4650,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _adversarial_verdict_raw is not None and _is_high_stakes_finding(finding)
         )
         _spawn_gate_verdict = (
-            "pass"
-            if _spawn_gate_challenged and finding.get("_adversarial_verdict") != "fail"
-            else None
+            _ADVERSARIAL_INFRA_UNVERIFIED_VERDICT
+            if _spawn_gate_challenged and finding.get("_adversarial_unverified")
+            else (
+                "pass"
+                if _spawn_gate_challenged
+                and finding.get("_adversarial_verdict") != "fail"
+                else None
+            )
         )
         new_task.context = {
             **(new_task.context or {}),
@@ -4828,6 +4670,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             else None,
             "research_spawn_gate_explicit": (
                 finding.get("_adversarial_verdict_explicit")
+            )
+            if _spawn_gate_challenged
+            else None,
+            "research_spawn_gate_unverified": (
+                bool(finding.get("_adversarial_unverified"))
+                if _spawn_gate_challenged
+                else None
+            ),
+            "research_spawn_gate_unverified_reason": (
+                finding.get("_adversarial_unverified_reason") or None
+            )
+            if _spawn_gate_challenged
+            else None,
+            "research_spawn_gate_cause": (
+                finding.get("_adversarial_unverified_cause") or None
+            )
+            if _spawn_gate_challenged
+            else None,
+            "research_spawn_gate_parse_outcome": (
+                finding.get("_adversarial_unverified_parse_outcome") or None
             )
             if _spawn_gate_challenged
             else None,
@@ -4884,7 +4746,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # missing-verdict deferral to its challenger task without opening each one.
     _adv_diagnostic = (task.context or {}).get("adversarial_gate_diagnostic") or {}
     _adv_challenger_id = (
-        str(_adv_diagnostic.get("challenger_task_id") or "").strip() or None
+        str(
+            _adv_diagnostic.get("challenger_task_id")
+            or (
+                _adversarial_verdict_raw.get("grader_task_id")
+                if isinstance(_adversarial_verdict_raw, dict)
+                else None
+            )
+            or ""
+        ).strip()
+        or None
     )
     # Machine-readable cause (taxonomy class / refusal / format-miss + optional
     # stale-image tag) for the grader non-response, lifted from the resolution-
@@ -4892,6 +4763,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # the challenger task. Observability only.
     _adv_cause = (
         _adv_diagnostic.get("cause") if isinstance(_adv_diagnostic, dict) else None
+    ) or (
+        _adversarial_verdict_raw.get("cause")
+        if isinstance(_adversarial_verdict_raw, dict)
+        else None
     )
     for _adf in _adversarial_gate_deferred:
         _adf_stamped = _stamp_deferral(_adf, "adversarial_gate")
@@ -5130,6 +5005,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _spawn_gate_explicit_pass_count
             )
             ctx["research_spawn_gate_fail_open_count"] = _spawn_gate_fail_open_count
+            ctx["research_spawn_gate_infra_fail_open_count"] = (
+                _spawn_gate_infra_fail_open_count
+            )
             ctx["research_spawn_gate_unresolved_count"] = _spawn_gate_unresolved_count
             if _spawn_gate_refuted_reasons:
                 ctx["research_spawn_gate_refuted_reasons"] = _spawn_gate_refuted_reasons
@@ -6069,6 +5947,16 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             target["history_aggregate"] = _fold_evicted_into_aggregate(
                 target.get("history_aggregate"), new_history[:-10]
             )
+            # Store compact per-cycle snapshots so post-eviction patch paths
+            # (post-merge recompute, stranded-PR discount) can apply deltas to the
+            # aggregate rather than silently no-oping when the live entry is gone.
+            _evicted_snaps = target["history_aggregate"].setdefault(
+                "_evicted_cycle_snapshots", {}
+            )
+            for _ev in new_history[:-10]:
+                _tid = _ev.get("task_id")
+                if _tid:
+                    _evicted_snaps[str(_tid)] = build_evicted_cycle_snapshot(_ev)
         target["research_history"] = new_history[-10:]
         target["last_researched_at"] = now_iso
         target["last_cycle_productive"] = productive

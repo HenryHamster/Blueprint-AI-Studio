@@ -236,6 +236,43 @@ def test_poison_classifier_ignores_routine_sql_errors():
     assert not _is_connection_poisoning_error(RuntimeError("routine error"))
 
 
+def test_deadlock_classifier_matches_sqlstate_name_and_message():
+    """WI-6 defense-in-depth: ``_is_deadlock_error`` flags a Postgres deadlock
+    (40P01) by SQLAlchemy-wrapped ``.orig.sqlstate``, by exception class name,
+    or by message substring — so a residual post-commit deadlock routes to the
+    retry-pending path (marker + sweep) instead of a 500 → Cloud Run quarantine.
+    """
+    from app.routers.agent_status import _is_deadlock_error
+
+    # SQLAlchemy wraps asyncpg's DeadlockDetectedError; the stable surface is
+    # the sqlstate on ``.orig``.
+    wrapped = _named_exc("DBAPIError", "deadlock detected")
+    wrapped.orig = _named_exc("DeadlockDetectedError", "deadlock detected")
+    wrapped.orig.sqlstate = "40P01"
+    assert _is_deadlock_error(wrapped)
+
+    # Class name only (no sqlstate attribute).
+    assert _is_deadlock_error(_named_exc("DeadlockDetectedError", "boom"))
+    # Message substring only.
+    assert _is_deadlock_error(_named_exc("OperationalError", "deadlock detected"))
+    assert _is_deadlock_error(_named_exc("OperationalError", "40P01"))
+
+
+def test_deadlock_classifier_ignores_non_deadlock_lock_errors():
+    """The classifier is scoped to deadlock ONLY — a plain lock_timeout /
+    LockNotAvailable (55P03) keeps its existing 500 path and must NOT be
+    misrouted to retry-pending as a deadlock."""
+    from app.routers.agent_status import _is_deadlock_error
+
+    assert not _is_deadlock_error(_named_exc("LockNotAvailableError", "55P03"))
+    assert not _is_deadlock_error(_named_exc("OperationalError", "lock timeout"))
+    assert not _is_deadlock_error(ValueError("routine error"))
+    lock_only = _named_exc("DBAPIError", "canceling statement due to lock timeout")
+    lock_only.orig = _named_exc("LockNotAvailableError", "lock not available")
+    lock_only.orig.sqlstate = "55P03"
+    assert not _is_deadlock_error(lock_only)
+
+
 def test_listener_invalidates_on_timeout_class_without_is_disconnect():
     """The core flap fix: a TimeoutError-class error does NOT set is_disconnect,
     but the listener must still eject the connection so it is not reused."""

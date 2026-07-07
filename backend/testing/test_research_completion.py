@@ -3630,11 +3630,13 @@ class TestRecomputeLaunchStaleness:
 
     def _patch_ctx(self, mocker, *, verdict):
         mocker.patch(
-            "app.research_completion.resolve_branch_verification_context",
+            "app.research_provenance_validation.resolve_branch_verification_context",
             new=AsyncMock(return_value={}),
         )
         m = AsyncMock(return_value=verdict)
-        mocker.patch("app.research_completion.cited_paths_changed_since", new=m)
+        mocker.patch(
+            "app.research_provenance_validation.cited_paths_changed_since", new=m
+        )
         return m
 
     @_pytest.mark.asyncio
@@ -3733,7 +3735,7 @@ class TestRecomputeLaunchStaleness:
         from app.research_completion import recompute_launch_staleness
 
         mocker.patch(
-            "app.research_completion.resolve_branch_verification_context",
+            "app.research_provenance_validation.resolve_branch_verification_context",
             new=AsyncMock(side_effect=RuntimeError("boom")),
         )
         task = self._task(
@@ -5060,6 +5062,69 @@ async def test_non_spawning_findings_skip_grader_even_when_enabled(db_session, m
     assert task.status != TaskStatus.EVALUATING, (
         "must not park when nothing would spawn"
     )
+
+
+@_pytest.mark.asyncio
+async def test_design_doc_observation_dedup_on_reprocessing(db_session, mocker):
+    """Re-processing the same design_doc_observation finding appends no duplicate."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-obs-dedup")
+    obs_finding = {
+        "title": "design observation",
+        "description": "An observation about the design doc",
+        "section": "architecture",
+        "prompt": "noted",
+        "type": "design_doc_observation",
+        "direction_id": direction["id"],
+    }
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[obs_finding],
+    )
+    _enable_grader(mocker)
+
+    # Process the same observation twice
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(_project)
+    proposals_after_first = _project.design_doc.get("proposed_changes", [])
+    first_count = len(proposals_after_first)
+
+    # Create a second task to simulate re-processing the same finding
+    task2 = _Task(
+        project_id=_project.id,
+        title="Research task 2",
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[obs_finding],
+    )
+    await _handle_research_completion(task2, "", db_session)
+    await db_session.refresh(_project)
+    proposals_after_second = _project.design_doc.get("proposed_changes", [])
+    second_count = len(proposals_after_second)
+
+    assert first_count == second_count, (
+        "re-processing identical design_doc_observation must not append duplicate"
+    )
+    # Verify the observation is still there
+    assert any(
+        p.get("observation") == "An observation about the design doc"
+        and p.get("section") == "architecture"
+        for p in proposals_after_second
+    ), "the original observation must still be in proposed_changes"
 
 
 @_pytest.mark.asyncio
@@ -8381,6 +8446,10 @@ class TestComputeExperimentSpawn:
         )
         assert evidence["kind"] == "downstream_artifact"
         assert evidence["artifact_id"] == "benchmark-result-bundle"
+        assert child.context["acceptance_evidence"] == {
+            "kind": "artifact",
+            "descriptor": "benchmark-result-bundle",
+        }
 
     @_pytest.mark.asyncio
     async def test_compute_experiment_sweep_id_propagated(self, db_session, mocker):
@@ -8460,6 +8529,7 @@ class TestComputeExperimentSpawn:
             "malformed acceptance_evidence must degrade to omitted, "
             f"got {payload.get('acceptance_evidence')!r}"
         )
+        assert "acceptance_evidence" not in (children[0].context or {})
 
 
 @_pytest.mark.asyncio
@@ -8634,7 +8704,7 @@ class TestAcceptanceEvidencePropagation:
         return children, task
 
     @_pytest.mark.asyncio
-    async def test_finding_acceptance_evidence_lands_on_child_payload(
+    async def test_finding_acceptance_evidence_populates_both_payload_and_context(
         self, db_session, mocker
     ):
         from test_autonomous_research import _make_finding
@@ -8654,6 +8724,10 @@ class TestAcceptanceEvidencePropagation:
         assert evidence is not None, "acceptance_evidence missing from child payload"
         assert evidence["kind"] == "observable_behavior"
         assert "promotion is in flight" in evidence["description"]
+        assert child.context["acceptance_evidence"] == {
+            "kind": "behavior",
+            "descriptor": "the endpoint returns 409 when promotion is in flight",
+        }
 
     @_pytest.mark.asyncio
     async def test_finding_without_acceptance_evidence_spawns_unchanged(
@@ -8702,6 +8776,7 @@ class TestAcceptanceEvidencePropagation:
             "malformed acceptance_evidence must degrade to omitted, got "
             f"{child.first_payload.get('acceptance_evidence')!r}"
         )
+        assert "acceptance_evidence" not in (child.context or {})
 
     @_pytest.mark.asyncio
     async def test_finding_acceptance_evidence_propagates_to_child_context(
@@ -8711,18 +8786,20 @@ class TestAcceptanceEvidencePropagation:
 
         finding = _make_finding(title="Declared proof", direction_id="d-ae-ctx01")
         finding["acceptance_evidence"] = {
-            "kind": "test",
-            "descriptor": "seam test exercises new path end-to-end",
-            "selector": "testing/test_foo.py::test_bar",
+            "kind": "behavior",
+            "descriptor": "endpoint scopes audit to the open candidate",
         }
         children, _task = await self._spawn_from_findings(
             db_session, mocker, direction_id="d-ae-ctx01", findings=[finding]
         )
         child = next(c for c in children if c.title == "Declared proof")
         assert child.context["acceptance_evidence"] == {
-            "kind": "test",
-            "descriptor": "seam test exercises new path end-to-end",
-            "selector": "testing/test_foo.py::test_bar",
+            "kind": "behavior",
+            "descriptor": "endpoint scopes audit to the open candidate",
+        }
+        assert child.first_payload["acceptance_evidence"] == {
+            "kind": "observable_behavior",
+            "description": "endpoint scopes audit to the open candidate",
         }
 
     @_pytest.mark.asyncio
@@ -8819,6 +8896,7 @@ class TestAcceptanceEvidencePropagation:
         )
         child = next(c for c in children if c.title == "Bad proof")
         assert "acceptance_evidence" not in (child.context or {})
+        assert "acceptance_evidence" not in child.first_payload
 
     @_pytest.mark.asyncio
     async def test_acceptance_evidence_survives_batch_cap_truncation(
@@ -8859,6 +8937,10 @@ class TestAcceptanceEvidencePropagation:
         assert survivor_child.context["acceptance_evidence"] == {
             "kind": "behavior",
             "descriptor": "endpoint scopes audit to the open candidate",
+        }
+        assert survivor_child.first_payload["acceptance_evidence"] == {
+            "kind": "observable_behavior",
+            "description": "endpoint scopes audit to the open candidate",
         }
 
 
@@ -9074,6 +9156,16 @@ class TestIsHighStakesFinding:
         assert not _is_high_stakes_finding(
             self._f(scope="large", actionability_grade="LOW")
         )
+
+    def test_capability_foundation_or_prerequisite_is_not_high_stakes(self):
+        foundation = self._f(risk="high", provides_capability="payment-core")
+        _annotate_capability_declarations([foundation], [])
+        assert not _is_high_stakes_finding(foundation)
+
+        prerequisite = self._f(risk="high")
+        prerequisite["prerequisite"] = {"kind": "capability", "ref": "payment-core"}
+        _annotate_capability_declarations([prerequisite], [])
+        assert not _is_high_stakes_finding(prerequisite)
 
     def test_non_dict_is_not_high_stakes(self):
         assert not _is_high_stakes_finding("not a dict")
@@ -10292,6 +10384,10 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
         "app.research_completion._parse_research_findings",
         return_value=[hs],
     )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"adversarial_spawn_gate_infra_failure_mode": "observe"},
+    )
 
     await _handle_research_completion(task, "", db_session)
     await db_session.refresh(task)
@@ -10434,20 +10530,21 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
         .scalars()
         .all()
     )
-    assert children == [], "retry-exhausted finding must not spawn"
-
-    # After both targeted and wholesale retries are exhausted, the failed finding
-    # must appear in deferred_findings for the next cycle.
-    deferred = (task.context or {}).get("deferred_findings", [])
-    assert any(d.get("title") == hs["title"] for d in deferred), (
-        "failed finding must be in deferred_findings"
+    assert len(children) == 1, (
+        "retry-exhausted challenger infra failure must spawn as unverified by default"
     )
+    child_ctx = children[0].context or {}
+    assert child_ctx.get("research_spawn_gate_verdict") == "unverified"
+    assert child_ctx.get("research_spawn_gate_unverified") is True
+    assert child_ctx.get("research_spawn_gate_parse_outcome") == "challenger_failed"
+
+    # After both targeted and wholesale retries are exhausted, an infrastructure
+    # failure is fail-open by default and must not decay as an adversarial deferral.
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert not any(d.get("title") == hs["title"] for d in deferred)
     assert task.context.get("research_spawn_gate_wholesale_retry_exhausted") is True
-    # _adversarial_verdict must be stripped from the deferred entry.
-    for d in deferred:
-        assert "_adversarial_verdict" not in d, (
-            "_adversarial_verdict must be cleared on deferral"
-        )
+    assert task.context.get("research_spawn_gate_refuted_count") == 0
+    assert task.context.get("research_spawn_gate_infra_fail_open_count") == 1
 
 
 @_pytest.mark.asyncio
@@ -10818,6 +10915,163 @@ async def test_adversarial_fail_closed_no_child_on_absent_hash(db_session, mocke
     assert task.context.get("research_spawn_gate_parse_outcome") == "no_hash_matches"
     scoped = task.context.get("research_spawn_gate_by_direction") or {}
     assert scoped[direction["id"]]["wholesale_retry_exhausted"] is True
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_infra_failure_fails_open_with_flag(
+    db_session, mocker
+):
+    """Retry-exhausted challenger infra failures spawn as unverified, not refuted."""
+    from app.failure_classification import EXTERNAL_API
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-adv-infra-open"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"adversarial_spawn_gate_infra_failure_mode": "observe"},
+    )
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Infra-failed challenger finding")
+    fhash = _finding_hash(
+        hs["title"], hs.get("description", "") or hs.get("prompt", "")
+    )
+
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {},
+            "grader_task_id": "test-grader-infra-open",
+            "parse_outcome": "challenger_failed",
+            "cause": {
+                "category": EXTERNAL_API,
+                "parse_outcome": "challenger_failed",
+                "source": "test",
+            },
+        },
+        "_adversarial_challenged_hashes": [fhash],
+        "_adversarial_wholesale_retry_count": 1,
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[hs])
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child_ctx = children[0].context or {}
+    assert child_ctx.get("research_spawn_gate_challenged") is True
+    assert child_ctx.get("research_spawn_gate_verdict") == "unverified"
+    assert child_ctx.get("research_spawn_gate_explicit") is False
+    assert child_ctx.get("research_spawn_gate_unverified") is True
+    assert child_ctx.get("research_spawn_gate_parse_outcome") == "challenger_failed"
+    assert child_ctx.get("research_spawn_gate_cause", {}).get("category") == EXTERNAL_API
+    assert "infrastructure failed" in (
+        child_ctx.get("research_spawn_gate_unverified_reason") or ""
+    )
+
+    ctx = task.context or {}
+    assert ctx.get("research_spawn_gate_wholesale_retry_exhausted") is True
+    assert ctx.get("research_spawn_gate_challenged_count") == 1
+    assert ctx.get("research_spawn_gate_refuted_count") == 0
+    assert ctx.get("research_spawn_gate_survived_count") == 1
+    assert ctx.get("research_spawn_gate_explicit_pass_count") == 0
+    assert ctx.get("research_spawn_gate_fail_open_count") == 1
+    assert ctx.get("research_spawn_gate_infra_fail_open_count") == 1
+    assert ctx.get("research_spawn_gate_unresolved_count") == 0
+    assert not any(
+        d.get("title") == hs["title"] for d in ctx.get("deferred_findings", [])
+    )
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_infra_failure_enforce_mode_fails_closed(
+    db_session, mocker
+):
+    """The infra-fail-open mode is reversible: enforce restores fail-closed."""
+    from app.failure_classification import EXTERNAL_API
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-adv-infra-enforce"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"adversarial_spawn_gate_infra_failure_mode": "enforce"},
+    )
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Strict infra-failed finding")
+    fhash = _finding_hash(
+        hs["title"], hs.get("description", "") or hs.get("prompt", "")
+    )
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {},
+            "grader_task_id": "test-grader-infra-enforce",
+            "parse_outcome": "challenger_failed",
+            "cause": {
+                "category": EXTERNAL_API,
+                "parse_outcome": "challenger_failed",
+                "source": "test",
+            },
+        },
+        "_adversarial_challenged_hashes": [fhash],
+        "_adversarial_wholesale_retry_count": 1,
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[hs])
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == []
+    deferred = (task.context or {}).get("deferred_findings", [])
+    matching = [d for d in deferred if d.get("title") == hs["title"]]
+    assert len(matching) == 1
+    assert matching[0].get("adversarial_gate_reason") == "challenger_failed"
+    assert matching[0].get("adversarial_gate_cause", {}).get("category") == EXTERNAL_API
+    assert task.context.get("research_spawn_gate_refuted_count") == 1
+    assert task.context.get("research_spawn_gate_infra_fail_open_count") == 0
 
 
 @_pytest.mark.asyncio
@@ -12189,6 +12443,52 @@ async def test_adversarial_gate_uses_bounded_valid_manifest_for_long_findings(
     assert source_hashes == grader_hashes, (
         "Source and grader _adversarial_challenged_hashes must be identical"
     )
+
+
+@_pytest.mark.asyncio
+async def test_capability_foundation_finding_bypasses_adversarial_gate(
+    db_session, mocker
+):
+    """Capability-providing findings should spawn directly instead of parking."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-capability-adv01"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.task_evaluators.spawn_forward_quality_grader",
+        new=AsyncMock(return_value=None),
+    )
+
+    finding = _make_finding(
+        title="Declare payment-core capability", direction_id=direction["id"]
+    )
+    finding["risk"] = "high"
+    finding["provides_capability"] = "payment-core"
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    ctx = task.context or {}
+    assert not ctx.get("awaiting_adversarial_grader")
+    assert "_adversarial_challenged_hashes" not in ctx
+    assert (task.plan_output or [{}])[0].get("_provides_capability") == "payment-core"
+
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders = [t for t in all_tasks if (t.context or {}).get("adversarial_grader")]
+    assert len(graders) == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -14979,6 +15279,37 @@ async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker
         text="All endpoints documented",
         created_by="strategist",
     )
+    inactive = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Deprecated endpoint docs",
+        created_by="strategist",
+    )
+    superseded = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Superseded endpoint docs",
+        created_by="strategist",
+    )
+    await _ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        inactive.criterion_key,
+        reason="superseded",
+        retracted_by="strategist",
+    )
+    await _ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        superseded.criterion_key,
+        reason="replaced",
+        retracted_by="strategist",
+        superseded_by_key=criterion.criterion_key,
+    )
 
     # Create a Direction ORM row with criterion_keys set (as the link-direction
     # endpoint would produce).
@@ -14987,7 +15318,11 @@ async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker
         direction_key=direction_id,
         data=direction_data,
         status="active",
-        criterion_keys=[criterion.criterion_key],
+        criterion_keys=[
+            criterion.criterion_key,
+            inactive.criterion_key,
+            superseded.criterion_key,
+        ],
     )
     db_session.add(dir_row)
     await db_session.commit()
@@ -15037,7 +15372,7 @@ async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker
     assert len(children) == 1, "expected exactly one spawned child task"
     child = children[0]
     assert child.criterion_ids == [criterion.criterion_key], (
-        f"spawned task must inherit criterion_ids from parent direction; "
+        f"spawned task must inherit only active criterion_ids from parent direction; "
         f"got {child.criterion_ids!r}"
     )
 
@@ -15080,12 +15415,47 @@ async def test_criterion_ids_propagated_from_finding_direction(db_session, mocke
         text="Child direction criterion",
         created_by="strategist",
     )
+    inactive = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Deprecated child direction criterion",
+        created_by="strategist",
+    )
+    superseded = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Superseded child direction criterion",
+        created_by="strategist",
+    )
+    await _ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        inactive.criterion_key,
+        reason="superseded",
+        retracted_by="strategist",
+    )
+    await _ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        superseded.criterion_key,
+        reason="replaced",
+        retracted_by="strategist",
+        superseded_by_key=criterion.criterion_key,
+    )
     child_dir_row = _Direction(
         project_id=project.id,
         direction_key=child_dir_id,
         data=child_direction_data,
         status="active",
-        criterion_keys=[criterion.criterion_key],
+        criterion_keys=[
+            criterion.criterion_key,
+            inactive.criterion_key,
+            superseded.criterion_key,
+        ],
     )
     # Parent direction has NO criterion_keys.
     parent_dir_row = _Direction(
@@ -15145,8 +15515,8 @@ async def test_criterion_ids_propagated_from_finding_direction(db_session, mocke
     assert len(children) == 1, "expected exactly one spawned child task"
     child = children[0]
     assert child.criterion_ids == [criterion.criterion_key], (
-        f"spawned task must inherit criterion_ids from the finding's direction "
-        f"(cross-direction); got {child.criterion_ids!r}"
+        f"spawned task must inherit only active criterion_ids from the finding's "
+        f"direction (cross-direction); got {child.criterion_ids!r}"
     )
 
 
@@ -15317,4 +15687,138 @@ async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_s
     assert d2.get("status") == "completed", (
         "Direction with 3 credit-eligible aggregate merges (5 verified − 2 stranded) "
         "must auto-complete via apply_post_spawn_state"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_sub_research_note_append_is_idempotent_on_replay(db_session):
+    """Sub-research notes must not duplicate when research task is replayed.
+
+    When a research task with research_depth > 0 is retried/replayed, apply_post_spawn_state
+    must not append a duplicate sub_research_note with the same sub_task_id. The deduplication
+    checks across the entire history to prevent duplicate notes from evicting distinct
+    legitimate ones when the last-5 truncation applies.
+    """
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task, _make_finding
+
+    direction_id = "d-sub-research-replay"
+    direction = {
+        **_active_direction(direction_id, "Test direction for sub-research replay"),
+        "research_history": [
+            {
+                "timestamp": _utcnow().isoformat(),
+                "task_id": "t-parent-task",
+                "tasks_created": 1,
+                "findings_produced": 1,
+                "filter_breakdown": {
+                    "hash_dedup": 0,
+                    "word_overlap_dedup": 0,
+                    "file_overlap_dedup": 0,
+                    "evidence_overlap_dedup": 0,
+                    "type_filtered": 0,
+                    "empty_prompt": 0,
+                },
+                "summary": "parent research cycle",
+            }
+        ],
+    }
+    project = _Project(
+        name="Sub-research replay test",
+        user_id="test-user-sub-research-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = await _make_research_task(project, direction, db_session)
+    parent_task.context = {**(parent_task.context or {}), "direction_id": direction_id}
+    db_session.add(parent_task)
+    await db_session.commit()
+
+    child = _Task(
+        project_id=project.id,
+        title="Sub-research child task",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent_task.id,
+        created_by="ORCHESTRATOR",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    finding = _make_finding("Test finding", direction_id=direction_id)
+
+    # First call to apply_post_spawn_state: adds sub_research_note to the history entry
+    await apply_post_spawn_state(
+        db_session,
+        parent_task,
+        [finding],
+        [child],
+        [(0, finding, "hash-123")],
+        [{"summary": "Test insight"}],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "research-branch",
+        "main",
+        1,  # research_depth = 1 (sub-research)
+        str(uuid.uuid4()),  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    # Verify first call added sub_research_notes
+    d = project.directions[0]
+    history = d.get("research_history", [])
+    assert len(history) >= 1, "History should have at least 1 entry"
+    last_entry = history[-1]
+    sub_notes_first = last_entry.get("sub_research_notes", [])
+    assert len(sub_notes_first) == 1, f"Expected 1 sub_research_note, got {len(sub_notes_first)}"
+
+    # Second call to apply_post_spawn_state: replay with same parent_task.id
+    # This simulates a retry scenario where the same findings are re-processed
+    await apply_post_spawn_state(
+        db_session,
+        parent_task,  # Same task ID
+        [finding],
+        [child],
+        [(0, finding, "hash-123")],
+        [{"summary": "Test insight"}],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "research-branch",
+        "main",
+        1,  # research_depth = 1 (same depth)
+        str(uuid.uuid4()),  # parent_research_task_id (different but same sub_task_id)
+    )
+    await db_session.refresh(project)
+
+    # Verify second call did NOT duplicate the note
+    d = project.directions[0]
+    history = d.get("research_history", [])
+    last_entry = history[-1]
+    sub_notes_second = last_entry.get("sub_research_notes", [])
+
+    # The key check: even on replay, the sub_research_note should only appear once
+    # (or if a new history entry was created, it shouldn't have duplicates)
+    subtask_ids = [note.get("sub_task_id") for note in sub_notes_second]
+    assert len(subtask_ids) == len(set(subtask_ids)), (
+        f"Sub_research_notes contain duplicate sub_task_ids: {subtask_ids}. "
+        "Replay must be idempotent."
     )

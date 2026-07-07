@@ -827,6 +827,95 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
   });
 });
 
+describe('buildContextPrefix — purpose dedup', () => {
+  it('renders only Operator Purpose line when purpose equals user_purpose', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'research' }],
+      strategic_intent: {
+        user_purpose: 'Make Blueprint handle any project well',
+        purpose: 'Make Blueprint handle any project well',
+        current_focus: 'Context efficiency',
+      },
+    });
+    expect(prefix).toContain('**Operator Purpose (immutable):** Make Blueprint handle any project well');
+    expect(prefix).not.toContain('**Purpose:** Make Blueprint handle any project well');
+    expect(prefix).toContain('**Current focus:** Context efficiency');
+  });
+
+  it('renders both Purpose lines when purpose differs from user_purpose', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'research' }],
+      strategic_intent: {
+        user_purpose: 'Original operator purpose',
+        purpose: 'Strategist revised purpose',
+        current_focus: 'Focus area',
+      },
+    });
+    expect(prefix).toContain('**Operator Purpose (immutable):** Original operator purpose');
+    expect(prefix).toContain('**Purpose:** Strategist revised purpose');
+  });
+
+  it('renders Purpose line alone when user_purpose is absent', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'research' }],
+      strategic_intent: {
+        purpose: 'Only purpose set',
+      },
+    });
+    expect(prefix).toContain('**Purpose:** Only purpose set');
+    expect(prefix).not.toContain('**Operator Purpose (immutable):**');
+  });
+});
+
+describe('buildContextPrefix — suppressTaskLists', () => {
+  const taskWithLists = {
+    payloads: [{ type: 'research' }],
+    project_context: {
+      active_tasks: [
+        { task_type: 'fix', title: 'Fix something', status: 'IN_PROGRESS', prompt: 'Fix the bug' },
+      ],
+      queued_tasks: [
+        { task_type: 'create', title: 'Build feature' },
+      ],
+      recently_completed_tasks: [
+        { task_type: 'refactor', title: 'Refactor module', pr_url: 'https://github.com/example/pull/1' },
+      ],
+      sibling_tasks: [
+        { status: 'QUEUED', title: 'Sibling task', active: false },
+      ],
+    },
+  };
+
+  it('includes task lists by default (no opts)', () => {
+    const prefix = buildContextPrefix(taskWithLists);
+    expect(prefix).toContain('### Active Tasks');
+    expect(prefix).toContain('### Queued Tasks');
+    expect(prefix).toContain('### Recently Completed Tasks');
+    expect(prefix).toContain('## Sibling Tasks');
+  });
+
+  it('suppresses active/queued/recently-completed lists when suppressTaskLists is true', () => {
+    const prefix = buildContextPrefix(taskWithLists, { suppressTaskLists: true });
+    expect(prefix).not.toContain('### Active Tasks');
+    expect(prefix).not.toContain('### Queued Tasks');
+    expect(prefix).not.toContain('### Recently Completed Tasks');
+    // sibling tasks are NOT task lists — they should still render
+    expect(prefix).toContain('## Sibling Tasks');
+  });
+
+  it('output is byte-identical to unsuppressed when all task-list inputs are empty', () => {
+    const noLists = {
+      payloads: [{ type: 'research' }],
+      project_context: {
+        sibling_tasks: [{ status: 'QUEUED', title: 'Sibling', active: false }],
+      },
+    };
+    const withOpt = buildContextPrefix(noLists, { suppressTaskLists: true });
+    const withoutOpt = buildContextPrefix(noLists);
+    expect(withOpt).toEqual(withoutOpt);
+  });
+});
+
 describe('buildContextPrefix — domain overview', () => {
   it('renders Domain Knowledge block when domain_overview is present', () => {
     const prefix = buildContextPrefix({

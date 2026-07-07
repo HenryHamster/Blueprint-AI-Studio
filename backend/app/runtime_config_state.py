@@ -14,6 +14,12 @@ import asyncio
 import logging
 from typing import Any, Dict
 
+from app.task_capabilities import (
+    ALL_TASK_TYPES,
+    AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES,
+    AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES,
+)
+
 logger = logging.getLogger(__name__)
 
 # Lock for multi-key runtime config updates (prevents reading partial state between two assignments)
@@ -92,7 +98,16 @@ runtime_config: Dict = {
         os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")
     ),
     "max_autonomous_tasks_per_hour": 12,
-    "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
+    "max_global_autonomous_tasks_per_hour": 500,  # Cross-project backstop ceiling
+    # Observe-only replacement accounting for the global autonomous spawn guard.
+    # Enforcement stays on the initiative budget until the dedicated rollout
+    # switches the gate over.
+    "autonomous_spawn_budget_mode": "observe",
+    "max_global_autonomous_initiative_tasks_per_hour": 50,
+    "autonomous_spawn_budget_categories": {
+        "initiative": sorted(AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES),
+        "servicing": sorted(AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES),
+    },
     "autonomous_research_interval_minutes": 30,
     # --- Utilization-triggered evergreen backlog auto-fill (d-2877ddc7) ---
     # Phase-0, defaulted OFF. When idle (low utilization) or all active
@@ -151,6 +166,59 @@ runtime_config: Dict = {
     "structural_health_audit_fat_row_bytes": int(
         os.getenv("STRUCTURAL_HEALTH_AUDIT_FAT_ROW_BYTES", "1048576")
     ),
+    # --- Metrics-integrity sweep lane (standing self-audit of counters) ---
+    # Recurring leader-only reaper sweep that recomputes selected self-reported
+    # counters (landed-vs-reported merges, playbook confirmation integrity,
+    # non-code outcome window accounting) from ground truth and FLAGS drift
+    # WITHOUT ever mutating the audited source counter. Mode mirrors
+    # structural_health_audit_mode exactly:
+    #   off     — never run.
+    #   observe — recompute + record to the in-memory observability ring (default).
+    #   enforce — additionally enroll a deduped evergreen finding per flagged drift.
+    "metrics_integrity_sweep_mode": os.getenv(
+        "METRICS_INTEGRITY_SWEEP_MODE", "observe"
+    ).lower()
+    if os.getenv("METRICS_INTEGRITY_SWEEP_MODE", "observe").lower()
+    in ("off", "observe", "enforce")
+    else "observe",
+    # Cadence (minutes) between metrics-integrity sweeps in the reaper loop.
+    "metrics_integrity_sweep_interval_minutes": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_INTERVAL_MINUTES", "60")
+    ),
+    # Max registered checks run per tick (backstop against an over-grown registry).
+    "metrics_integrity_sweep_max_checks": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_CHECKS", "25")
+    ),
+    # Max projects scanned per per-project check (bounds the scan fan-out).
+    "metrics_integrity_sweep_max_projects": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_PROJECTS", "25")
+    ),
+    # Max rows sampled per DB-backed check (bounds the recompute cost).
+    "metrics_integrity_sweep_sample_limit": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_SAMPLE_LIMIT", "200")
+    ),
+    # How far back (days) a windowed check recomputes ground truth.
+    "metrics_integrity_sweep_window_days": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_WINDOW_DAYS", "14")
+    ),
+    # --- Completion-debt pressure signal graduation gate ---
+    # Operator-facing graduation knob for blending the qualification debt-pressure
+    # signal into the promotion composite (release_qualifier._load_policy →
+    # compute_composite).  Mirrors evergreen_fill_mode / structural_health_audit_mode.
+    #   off      — never blend; the completion_debt weight is forced to 0.0.
+    #   observe  — (default) the debt-pressure score is recorded in sub_scores but
+    #              the effective completion_debt weight is 0.0 (never blended).
+    #   enforce  — the configured completion_debt weight is applied (falling back
+    #              to a sensible nonzero default when the operator left it unset),
+    #              so open completion debt actually erodes promotion confidence.
+    # Default "observe" is a member of _DORMANT_KNOB_VALUES, so this knob seeds its
+    # own dormant_knob completion-debt row via iter_dormant_knob_debts.
+    "completion_debt_weight_mode": os.getenv(
+        "COMPLETION_DEBT_WEIGHT_MODE", "observe"
+    ).lower()
+    if os.getenv("COMPLETION_DEBT_WEIGHT_MODE", "observe").lower()
+    in ("off", "observe", "enforce")
+    else "observe",
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:
@@ -244,6 +312,13 @@ runtime_config: Dict = {
         "ADVERSARIAL_SPAWN_GATE_ENABLED", "true"
     ).lower()
     not in ("0", "false", "no"),
+    # Observe/enforce rollback for exhausted adversarial-grader infrastructure
+    # failures. "observe" (default) lets the high-stakes finding spawn with an
+    # auditable unverified flag when the challenger infra failed after retries;
+    # "enforce" restores strict fail-closed behavior.
+    "adversarial_spawn_gate_infra_failure_mode": os.getenv(
+        "ADVERSARIAL_SPAWN_GATE_INFRA_FAILURE_MODE", "observe"
+    ).lower(),
     # Long-EVALUATING parents stop blocking new research on the same direction
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new
@@ -479,6 +554,7 @@ runtime_config: Dict = {
             "max": {"model": "glm-5.2", "effort": "max"},
         },
     },
+    "inline_llm": {},
     # Sparse per-(task_type, provider) surgical overrides. For cases that
     # don't fit the matrix — e.g. "when this task type routes to openai,
     # also force verbosity=low". Wins over the effort matrix.
@@ -509,6 +585,12 @@ runtime_config: Dict = {
     # (order-of-hundreds) so healthy high-throughput directions are never paused.
     "direction_lifetime_non_merge_threshold": 150,
     "direction_lifetime_min_merge_rate": 0.10,
+    # Churn-family pause-ladder threshold: how many churn-family auto-pause cycles
+    # must accumulate before a flagged, strategist-reviewable retirement
+    # RECOMMENDATION is recorded (non-terminal — the direction stays paused, no
+    # auto-retire). Replaces the hardcoded _MAX_CHURN_PAUSE_CYCLES=2 constant in
+    # direction_lifecycle.py so operators can tune the ladder without a redeploy.
+    "direction_review_recommendation_threshold": 2,
     # Outcome-progress (scaffolding) detector — ADVISORY, never auto-pauses.
     # Surfaces long-running directions that keep merging PRs at a healthy rate but
     # never advance their stated success_evidence (the "outcome-less scaffolding"
@@ -1037,6 +1119,27 @@ runtime_config: Dict = {
     "strategic_session_turn_timeout_seconds": int(
         os.getenv("STRATEGIC_SESSION_TURN_TIMEOUT_SECONDS", "120")
     ),
+    # Floor-tick cadence (seconds): the maximum quiet gap between autonomous
+    # resident ticks even when no world-state change is observed, so the session
+    # reviews periodically and never goes fully dark. Read by the agent's
+    # state-gated pacing (residentConfig); absent => agent floor-tick default.
+    "strategic_session_min_tick_seconds": int(
+        os.getenv("STRATEGIC_SESSION_MIN_TICK_SECONDS", "600")
+    ),
+    # Soft cap (count) on how many independent applied strategic ops the
+    # autonomous work-unit prompt should batch into a single turn. Advisory: a
+    # prompt hint only — the hard per-op server-side spawn/retire gates are
+    # unchanged. Absent => agent default.
+    "strategic_session_max_ops_per_turn": int(
+        os.getenv("STRATEGIC_SESSION_MAX_OPS_PER_TURN", "3")
+    ),
+    # Deep-turn stall budget (seconds) for an AUTONOMOUS resident turn, so a long
+    # single read/verify step is not killed mid-thought. Distinct from the
+    # interactive per-turn timeout (kept short for operator responsiveness); the
+    # 15-min absolute hard ceiling is unchanged. Absent => agent default.
+    "strategic_session_autonomous_turn_timeout_seconds": int(
+        os.getenv("STRATEGIC_SESSION_AUTONOMOUS_TURN_TIMEOUT_SECONDS", "300")
+    ),
     # Hard cap (seconds) on how long a resident strategic session may run
     # UNATTENDED before it is wound down — the outer bound on autonomous
     # operation with no operator interaction. Distinct from the continuation
@@ -1059,7 +1162,101 @@ runtime_config: Dict = {
     "resident_session_heartbeat_stale_seconds": int(
         os.getenv("RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS", "1500")
     ),
+    # Gap-scoped recently-retired direction block (direction_gap_respawn_block_mode).
+    # When a direction is proposed for a gap that already has a recently-retired
+    # direction, this mode controls whether the respawn is blocked:
+    #   observe  — record the match, never block (default).
+    #   enforce  — block same-gap re-spawns within the cooldown window.
+    # Registered here so operators can graduate from observe→enforce via
+    # PATCH /api/admin/settings without a redeploy.
+    "direction_gap_respawn_block_mode": "observe",
+    # Cooldown window (days) for the gap-respawn block. A retired direction blocks
+    # same-gap re-spawns for this many days after retirement. Default 14.
+    "direction_gap_respawn_cooldown_days": 14,
 }
+
+
+# Completion-debt seed: runtime-config knobs whose current default/observe value
+# means an obligation is standing open (a feature ships dark, or a capability is
+# measured-but-not-enforced). ``iter_dormant_knob_debts`` converts these into
+# ``dormant_knob`` completion-debt seed rows.  Kept as literal kind/source
+# strings (mirroring ``app.completion_debt``) so this module stays free of any
+# import edge onto the ledger.
+_DORMANT_KNOB_VALUES = frozenset({"off", "observe"})
+_DORMANT_MODE_KNOBS = {
+    "evergreen_fill_mode": (
+        "Evergreen auto-fill capability enabled but not enforcing (off/observe)"
+    ),
+    "strategic_retirement_challenge_gate_mode": (
+        "Adversarial retirement challenge running in observe-only watch"
+    ),
+    "structural_health_audit_mode": (
+        "Structural-health audit measuring but not enrolling findings"
+    ),
+    "metrics_integrity_sweep_mode": (
+        "Metrics-integrity sweep recomputing counters but not enrolling drift findings"
+    ),
+    "autonomous_spawn_budget_mode": (
+        "Autonomous spawn-budget mode observe-only pending dedicated rollout"
+    ),
+    "safeguard_challenge_gate_mode": (
+        "Safeguard challenge gate in observe-only shadow mode"
+    ),
+    "direction_gap_respawn_block_mode": (
+        "Direction-gap respawn block in observe-only mode"
+    ),
+    "review_fix_lane_pilot_mode": (
+        "Review-fix lane pilot mode shipping inert (default-off)"
+    ),
+    "completion_debt_weight_mode": (
+        "Completion-debt pressure signal observe-mode: recorded in sub_scores, not blended into confidence"
+    ),
+}
+# Master feature flags that ship OFF still owe an enablement decision.
+_DORMANT_OFF_FLAGS = {
+    "strategic_session_enabled": (
+        "Resident strategic session runtime shipped disabled (default-off)"
+    ),
+}
+
+
+def iter_dormant_knob_debts() -> list[dict]:
+    """Enumerate runtime-config knobs currently in a dormant/default-off/observe
+    state as completion-debt seed rows.
+
+    Each returned dict is a kwargs bundle for
+    ``app.completion_debt.record_completion_debt`` (stable ``dedupe_key``, the
+    ``dormant_knob`` kind, a human ``title``, and bounded ``detail`` capturing
+    the knob's current value). Deployment-global — no ``project_id``.
+    """
+    debts: list[dict] = []
+    for key, title in _DORMANT_MODE_KNOBS.items():
+        value = str(runtime_config.get(key, "")).lower()
+        if value in _DORMANT_KNOB_VALUES:
+            debts.append(
+                {
+                    "dedupe_key": f"dormant_knob:{key}",
+                    "kind": "dormant_knob",
+                    "title": title,
+                    "project_id": None,
+                    "source": "runtime_config_state",
+                    "detail": {"knob": key, "value": value},
+                }
+            )
+    for key, title in _DORMANT_OFF_FLAGS.items():
+        if not runtime_config.get(key, False):
+            debts.append(
+                {
+                    "dedupe_key": f"dormant_knob:{key}",
+                    "kind": "dormant_knob",
+                    "title": title,
+                    "project_id": None,
+                    "source": "runtime_config_state",
+                    "detail": {"knob": key, "value": bool(runtime_config.get(key))},
+                }
+            )
+    return debts
+
 
 # Promotion-policy key set — the rubric controls that live in runtime_config.
 # Used both by the seed below and by _apply_settings validation.
@@ -1099,6 +1296,15 @@ def _read_promotion_policy_file() -> dict | None:
             raise ValueError(
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
+        # Optional completion_debt blend factor — SEPARATE from the three-core
+        # weights that must sum to ~1.0 (mirrors release_qualifier resolution).
+        # Read + preserve it (default 0.0, clamped to [0, 0.5]) so a YAML rubric
+        # that documents a completion_debt weight seeds it into runtime_config.
+        from app.release_scoring import coerce_completion_debt_weight
+
+        _cd = coerce_completion_debt_weight(weights_raw)
+        if _cd > 0.0:
+            weights["completion_debt"] = _cd
         result: dict = {"weights": weights, "threshold": threshold}
         if "merge_grade_block_threshold" in parsed:
             try:
@@ -1350,6 +1556,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "task_type_routing",
                     "task_type_model_preferences",
                     "provider_settings_by_effort",
+                    "inline_llm",
                     "provider_selection_mode",
                     "cross_provider_fallback_enabled",
                     "agent_prompt_suffixes",
@@ -1362,6 +1569,60 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                 ):
                     if key in config_json:
                         _set(key, config_json[key])
+                if "autonomous_spawn_budget_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["autonomous_spawn_budget_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in {"off", "observe", "enforce"}:
+                        _set("autonomous_spawn_budget_mode", raw_mode)
+                if "max_global_autonomous_initiative_tasks_per_hour" in config_json:
+                    try:
+                        raw_cap = int(
+                            config_json[
+                                "max_global_autonomous_initiative_tasks_per_hour"
+                            ]
+                        )
+                    except (TypeError, ValueError):
+                        raw_cap = -1
+                    if 0 <= raw_cap <= 500:
+                        _set("max_global_autonomous_initiative_tasks_per_hour", raw_cap)
+                if "autonomous_spawn_budget_categories" in config_json:
+                    raw_categories = config_json["autonomous_spawn_budget_categories"]
+                    if isinstance(raw_categories, dict):
+                        normalized_categories: dict[str, list[str]] = {}
+                        valid_categories = all(
+                            str(key) in {"initiative", "servicing"}
+                            for key in raw_categories
+                        )
+                        for category_key, default_types in (
+                            ("initiative", AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES),
+                            ("servicing", AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES),
+                        ):
+                            if not valid_categories:
+                                break
+                            raw_types = raw_categories.get(category_key, default_types)
+                            if isinstance(raw_types, str):
+                                raw_types = raw_types.split(",")
+                            if not isinstance(raw_types, (list, tuple, set)):
+                                valid_categories = False
+                                break
+                            normalized_types = sorted(
+                                {str(t).strip() for t in raw_types if str(t).strip()}
+                            )
+                            if any(t not in ALL_TASK_TYPES for t in normalized_types):
+                                valid_categories = False
+                                break
+                            normalized_categories[category_key] = normalized_types
+                        overlap = set(
+                            normalized_categories.get("initiative", [])
+                        ) & set(normalized_categories.get("servicing", []))
+                        if valid_categories and not overlap:
+                            _set(
+                                "autonomous_spawn_budget_categories",
+                                normalized_categories,
+                            )
                 if "strategic_research_frequency" in config_json:
                     _set(
                         "strategic_research_frequency",
@@ -1461,6 +1722,48 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "evergreen_fill_deferred_memo_enrollment",
                         bool(config_json["evergreen_fill_deferred_memo_enrollment"]),
                     )
+                if "direction_gap_respawn_block_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["direction_gap_respawn_block_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("observe", "enforce"):
+                        _set("direction_gap_respawn_block_mode", raw_mode)
+                if "direction_gap_respawn_cooldown_days" in config_json:
+                    try:
+                        _cooldown = float(
+                            config_json["direction_gap_respawn_cooldown_days"]
+                        )
+                        if 1.0 <= _cooldown <= 365.0:
+                            _set("direction_gap_respawn_cooldown_days", _cooldown)
+                    except (TypeError, ValueError):
+                        pass
+                for _guardrail_int_key in (
+                    "direction_churn_window_cycles",
+                    "direction_churn_non_merge_threshold",
+                    "direction_lifetime_non_merge_threshold",
+                    "direction_review_recommendation_threshold",
+                ):
+                    if _guardrail_int_key in config_json:
+                        try:
+                            _set(
+                                _guardrail_int_key,
+                                int(config_json[_guardrail_int_key]),
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                for _guardrail_float_key in (
+                    "direction_churn_min_merge_rate",
+                    "direction_lifetime_min_merge_rate",
+                ):
+                    if _guardrail_float_key in config_json:
+                        try:
+                            _fval = float(config_json[_guardrail_float_key])
+                            if 0.0 <= _fval <= 1.0:
+                                _set(_guardrail_float_key, _fval)
+                        except (TypeError, ValueError):
+                            pass
                 if "evergreen_fill_mode" in config_json:
                     raw_mode = (
                         str(config_json["evergreen_fill_mode"] or "").strip().lower()
@@ -1473,6 +1776,12 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("structural_health_audit_mode", raw_mode)
+                if "completion_debt_weight_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["completion_debt_weight_mode"] or "").strip().lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("completion_debt_weight_mode", raw_mode)
                 if "structural_health_audit_interval_minutes" in config_json:
                     try:
                         _set(
@@ -1489,6 +1798,32 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         )
                     except (TypeError, ValueError):
                         pass
+                # Metrics-integrity sweep: mode + bounded numeric knobs. Persisted
+                # so an operator enable/tune survives a Cloud Run restart and
+                # reaches the leader across instances (mirrors the structural-health
+                # audit knobs above).
+                if "metrics_integrity_sweep_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["metrics_integrity_sweep_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("metrics_integrity_sweep_mode", raw_mode)
+                for _mi_int_key in (
+                    "metrics_integrity_sweep_interval_minutes",
+                    "metrics_integrity_sweep_max_checks",
+                    "metrics_integrity_sweep_max_projects",
+                    "metrics_integrity_sweep_sample_limit",
+                    "metrics_integrity_sweep_window_days",
+                ):
+                    if _mi_int_key in config_json:
+                        try:
+                            _mi_val = int(config_json[_mi_int_key])
+                            if _mi_val > 0:
+                                _set(_mi_int_key, _mi_val)
+                        except (TypeError, ValueError):
+                            pass
                 # Resident strategic session (dead-man's-switch safety + resident
                 # agent). Persisted so an operator enable/tune survives a Cloud Run
                 # restart and reaches the leader across instances; without these the
@@ -1505,6 +1840,9 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "strategic_local_hold_timeout_seconds",
                     "strategic_session_idle_tick_seconds",
                     "strategic_session_turn_timeout_seconds",
+                    "strategic_session_min_tick_seconds",
+                    "strategic_session_max_ops_per_turn",
+                    "strategic_session_autonomous_turn_timeout_seconds",
                     "strategic_session_max_unattended_seconds",
                     "resident_session_heartbeat_stale_seconds",
                 ):
@@ -1526,6 +1864,17 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "adversarial_spawn_gate_enabled",
                         bool(config_json["adversarial_spawn_gate_enabled"]),
                     )
+                if "adversarial_spawn_gate_infra_failure_mode" in config_json:
+                    raw_mode = (
+                        str(
+                            config_json["adversarial_spawn_gate_infra_failure_mode"]
+                            or ""
+                        )
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("observe", "enforce"):
+                        _set("adversarial_spawn_gate_infra_failure_mode", raw_mode)
                 if "warm_retarget_enabled" in config_json:
                     _set(
                         "warm_retarget_enabled",

@@ -2,6 +2,8 @@
 
 import os
 
+from fastapi import HTTPException
+
 import app.github as github
 from app.migration_chain import (
     _filename_revision_prefix,
@@ -26,6 +28,17 @@ from app.migration_reconciliation import (
 # returned by ``github.list_versions_at_ref``) back to its full repo path for a
 # per-file text fetch.
 _ALEMBIC_VERSIONS_DIR = "backend/alembic/versions"
+
+
+def _exc_detail(e: BaseException) -> str:
+    """Format an exception for use in hold-reason strings.
+
+    HTTPException.__str__ omits the detail field, producing blank diagnostics
+    like 'HTTPException: '. This helper includes the detail when present.
+    """
+    if isinstance(e, HTTPException):
+        return f"HTTPException({e.status_code}): {e.detail}"
+    return f"{type(e).__name__}: {e}"
 
 
 def _extract_rollup_migration_sources(diff: str) -> dict[str, str]:
@@ -208,7 +221,7 @@ async def _validate_rollup_migration_chain(
         return (
             "defer",
             f"could not list rollup files to check Alembic migrations: "
-            f"{type(e).__name__}: {e}",
+            f"{_exc_detail(e)}",
         )
     if not any(_touches_alembic_versions(f.get("filename", "")) for f in files):
         return ("ok", None)
@@ -221,7 +234,7 @@ async def _validate_rollup_migration_chain(
         return (
             "defer",
             f"could not fetch migration sources to validate Alembic migrations: "
-            f"{type(e).__name__}: {e}",
+            f"{_exc_detail(e)}",
         )
 
     if not target_branch:
@@ -236,7 +249,7 @@ async def _validate_rollup_migration_chain(
         return (
             "defer",
             f"could not list target branch '{target_branch}' migrations to "
-            f"validate the combined Alembic chain: {type(e).__name__}: {e}",
+            f"validate the combined Alembic chain: {_exc_detail(e)}",
         )
     reason = validate_combined_migration_chain(existing_filenames, added_sources)
     if reason is not None:
@@ -286,7 +299,7 @@ async def _validate_rollup_migration_chain(
                 "defer",
                 f"could not list promotion target '{promotion_target}' migrations "
                 f"to validate cross-branch Alembic revision identity: "
-                f"{type(e).__name__}: {e}",
+                f"{_exc_detail(e)}",
             )
 
         # Defect class 2: in-place edit of a deployed migration.
@@ -387,7 +400,7 @@ async def _validate_rollup_migration_chain(
                         "defer",
                         f"could not fetch migration '{basename}' from promotion "
                         f"target '{promotion_target}' for content-immutability "
-                        f"check: {type(e).__name__}: {e}",
+                        f"check: {_exc_detail(e)}",
                     )
                 if not text:
                     return (
@@ -539,7 +552,7 @@ async def check_qualification_migration_identity(
         return (
             "defer",
             f"could not list candidate '{candidate_ref}' Alembic migrations to "
-            f"check revision-identity safety: {type(e).__name__}: {e}",
+            f"check revision-identity safety: {_exc_detail(e)}",
         )
     try:
         target_shas = await github.list_version_shas_at_ref(
@@ -550,7 +563,7 @@ async def check_qualification_migration_identity(
             "defer",
             f"could not list promotion target '{promotion_target}' Alembic "
             f"migrations to check revision-identity safety: "
-            f"{type(e).__name__}: {e}",
+            f"{_exc_detail(e)}",
         )
     candidate_filenames = list(candidate_shas.keys())
     target_filenames = list(target_shas.keys())
@@ -636,7 +649,7 @@ async def check_qualification_migration_identity(
                     "defer",
                     f"could not fetch migration '{basename}' from promotion "
                     f"target '{promotion_target}' for body-immutability check "
-                    f"at qualification: {type(e).__name__}: {e}",
+                    f"at qualification: {_exc_detail(e)}",
                 )
             if not deployed_text:
                 return (
@@ -660,7 +673,7 @@ async def check_qualification_migration_identity(
                     "defer",
                     f"could not fetch migration '{basename}' from candidate "
                     f"'{candidate_ref}' for body-immutability check at "
-                    f"qualification: {type(e).__name__}: {e}",
+                    f"qualification: {_exc_detail(e)}",
                 )
             if not candidate_text:
                 return (
@@ -743,7 +756,7 @@ async def _validate_migration_chain_post_merge(
         return (
             "defer",
             f"could not list PR #{pr_number} files to check Alembic migrations: "
-            f"{type(e).__name__}: {e}",
+            f"{_exc_detail(e)}",
         )
     if not any(_touches_alembic_versions(f.get("filename", "")) for f in files):
         return ("ok", None)
@@ -756,7 +769,7 @@ async def _validate_migration_chain_post_merge(
         return (
             "defer",
             f"could not list target branch '{target_branch}' migrations for "
-            f"post-merge chain health check: {type(e).__name__}: {e}",
+            f"post-merge chain health check: {_exc_detail(e)}",
         )
 
     # Detect genuine third-party duplicates: any NNNN revision-id prefix that
@@ -806,7 +819,7 @@ async def _validate_migration_chain_post_merge(
             return (
                 "defer",
                 f"could not fetch migration source '{path}' at '{target_branch}' "
-                f"for post-merge chain health check: {type(e).__name__}: {e}",
+                f"for post-merge chain health check: {_exc_detail(e)}",
             )
         if not text:
             return (

@@ -1,8 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
-import { analyzeComputeJob, askComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
+import { usePersistedState } from '../hooks/usePersistedState';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
+import { ConfirmDialog } from './ConfirmDialog';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
@@ -32,6 +35,30 @@ const WINDOW_OPTIONS: { label: string; minutes: number }[] = [
   { label: '3d', minutes: 4320 },
   { label: '7d', minutes: 10080 },
 ];
+
+type AskStateValue = {
+  question: string;
+  submitting: boolean;
+  thread: Array<{ question: string; result: { answer: string | null; citations: string[]; grounding_miss: boolean; fallback_reason: string | null } }>;
+  error: string | null;
+};
+
+function sanitizeAskState(parsed: unknown): Record<string, AskStateValue> {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const obj = parsed as Record<string, unknown>;
+  const result: Record<string, AskStateValue> = {};
+  for (const [jobId, state] of Object.entries(obj)) {
+    if (!state || typeof state !== 'object' || Array.isArray(state)) continue;
+    const s = state as Record<string, unknown>;
+    result[jobId] = {
+      question: typeof s.question === 'string' ? s.question : '',
+      submitting: false,
+      thread: Array.isArray(s.thread) ? s.thread : [],
+      error: s.error === null || typeof s.error === 'string' ? s.error : null,
+    };
+  }
+  return result;
+}
 
 type MetricDirection = 'higher_better' | 'lower_better' | 'unknown';
 
@@ -575,6 +602,45 @@ function budgetBarClass(pct: number): string {
   return 'bg-sky-500';
 }
 
+function AwaitingLocalRunnerSection({
+  holds,
+  nowMs,
+}: {
+  holds: AwaitingLocalRunnerHold[];
+  nowMs: number;
+}) {
+  if (!holds || holds.length === 0) return null;
+
+  return (
+    <div className="mb-3" data-testid="awaiting-local-runner-section">
+      <div className="text-ui-sm font-semibold text-amber-300 uppercase tracking-widest mb-1.5 flex items-center gap-1.5">
+        <AlertTriangle className="w-3 h-3 shrink-0" />
+        Waiting for local runner
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {holds.map((hold) => {
+          const capLabel = hold.spend_cap_usd != null ? ` · $${Number(hold.spend_cap_usd).toFixed(2)}` : '';
+          const waitingMs = Date.parse(hold.awaiting_local_runner_since);
+          const waitingSec = isNaN(waitingMs) ? null : Math.max(0, Math.round((nowMs - waitingMs) / 1000));
+          return (
+            <div
+              key={hold.id}
+              className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2"
+              data-testid="awaiting-local-runner-row"
+            >
+              <div className="text-xs font-semibold text-amber-200 break-words">{hold.title ?? hold.id}{capLabel}</div>
+              <div className="text-ui-sm text-amber-400 font-mono mt-0.5" data-testid="awaiting-local-runner-waiting">
+                waiting for local runner
+                {waitingSec != null && <> since {fmtDuration(waitingSec)} ago</>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function HeldExperimentsSection({
   experiments,
   onApprove,
@@ -655,19 +721,57 @@ function HeldExperimentsSection({
   );
 }
 
+function buildCloneForm(job: ComputeJob): ComputeExperimentForm {
+  const lp = job.launch_params ?? {};
+  const armsRaw = lp.arms;
+  const useArmsMode = Array.isArray(armsRaw) && armsRaw.length > 0;
+  const arms = useArmsMode
+    ? (armsRaw as Array<{ name: string; command: string }>)
+    : [{ name: '', command: '' }, { name: '', command: '' }];
+  // env values are redacted server-side; env_keys carries only the key names
+  const envVars = '';
+  const sc = job.success_criterion;
+  return {
+    ...defaultComputeExperimentForm(),
+    useArmsMode,
+    arms,
+    command: lp.command ?? '',
+    declaredMetric: lp.declared_metric ?? '',
+    metric: lp.metric ?? '',
+    cwd: lp.cwd ?? '',
+    envVars,
+    accelerator: lp.accelerator ?? '',
+    machineType: lp.machine_type ?? '',
+    containerImage: lp.container_image ?? '',
+    provisioningModel: lp.provisioning_model === 'SPOT' ? 'SPOT' : 'STANDARD',
+    spendCapUsd: lp.spend_cap_usd != null ? String(lp.spend_cap_usd) : '',
+    deadlineSeconds: lp.deadline_seconds != null ? String(lp.deadline_seconds) : '',
+    requireLiveRelease: lp.require_live_release ?? false,
+    requireDurableArtifact: lp.require_durable_artifact ?? false,
+    experiment: job.experiment ?? '',
+    benchmark: job.benchmark ?? '',
+    hypothesis: job.hypothesis ?? '',
+    successMetric: sc?.metric ?? '',
+    successOperator: (sc?.operator as ComputeSuccessOperator) ?? '>=',
+    successThreshold: sc?.threshold != null ? String(sc.threshold) : '',
+  };
+}
+
 interface ComputeJobsPanelProps {
   projectId: string | null;
   onNavigateToTask?: (taskId: string) => void;
   onLaunchCompute?: () => void;
+  onCloneExperiment?: (form: ComputeExperimentForm) => void;
   onDuplicateTask?: (taskId: string) => Promise<void>;
   onApproveExperiment?: (taskId: string) => Promise<void>;
   onDismissExperiment?: (taskId: string) => Promise<void>;
   onNavigateToKnowledge?: (documentId: string) => void;
 }
 
-export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
+export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onCloneExperiment, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [heldExperiments, setHeldExperiments] = useState<HeldComputeExperiment[]>([]);
+  const [awaitingHolds, setAwaitingHolds] = useState<AwaitingLocalRunnerHold[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [summary, setSummary] = useState<ComputeJobsSummary | null>(null);
   const [lifetimeSummary, setLifetimeSummary] = useState<ComputeJobsSummary | null>(null);
@@ -676,6 +780,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [finishedWindowMinutes, setFinishedWindowMinutes] = useState(360);
   const [allTerminal, setAllTerminal] = useState(false);
   const [killingId, setKillingId] = useState<string | null>(null);
+  const [pendingKill, setPendingKill] = useState<ComputeJob | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [rerunState, setRerunState] = useState<{
     jobId: string;
@@ -686,6 +791,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     criterion: { metric: string; operator: ComputeSuccessOperator } | null;
     submitting: boolean;
     error: string | null;
+    result?: { id: string; status?: string; requires_approval?: boolean };
   } | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
@@ -693,12 +799,11 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const [askState, setAskState] = useState<Record<string, {
-    question: string;
-    submitting: boolean;
-    thread: Array<{ question: string; result: { answer: string | null; citations: string[]; grounding_miss: boolean; fallback_reason: string | null } }>;
-    error: string | null;
-  }>>({});
+  const [askState, setAskState] = usePersistedState<Record<string, AskStateValue>>(
+    `compute-ask-state:${projectId}`,
+    {},
+    sanitizeAskState,
+  );
 
   const toggleDocExpanded = useCallback((key: string) => {
     setExpandedDocIds((prev) => {
@@ -764,6 +869,22 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     { intervalMs: 30_000, enabled: !!projectId, deps: [projectId] },
   );
 
+  // Poll compute_experiment tasks held QUEUED awaiting a local runner every 30s.
+  // These have no ComputeJob row, so this endpoint is the only surface for them.
+  usePoller(
+    async (signal) => {
+      if (!projectId) return;
+      try {
+        const holds = await fetchAwaitingLocalRunnerHolds(projectId, signal);
+        setAwaitingHolds(Array.isArray(holds) ? holds : []);
+      } catch (e) {
+        if (e instanceof Error && e.name === 'AbortError') return;
+        // Non-fatal: awaiting-local-runner section is supplementary
+      }
+    },
+    { intervalMs: 30_000, enabled: !!projectId, deps: [projectId] },
+  );
+
   // Poll sweep-grouped knowledge docs every 60s — complementary to the live job
   // poll, uses durable knowledge documents so changes are infrequent.
   usePoller(
@@ -804,19 +925,26 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     }
   }, [jobs, projectId, knowledgeDocs]);
 
-  // Local 1s clock drives the live deadline countdowns between polls.
+  // Local 1s clock drives the live deadline countdowns between polls, plus the
+  // "waiting for local runner since … ago" indicator for awaiting-runner holds.
   const hasActive = jobs.some(isComputeJobActive);
+  const needsClock = hasActive || awaitingHolds.length > 0;
   useEffect(() => {
-    if (!hasActive) return;
+    if (!needsClock) return;
     const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [hasActive]);
+  }, [needsClock]);
 
   const handleKill = useCallback(
+    (job: ComputeJob) => {
+      setPendingKill(job);
+    },
+    [],
+  );
+
+  const executeKill = useCallback(
     async (job: ComputeJob) => {
-      if (!window.confirm(`Kill compute job for "${job.task_title ?? job.id}"? This stops the running VM immediately.`)) {
-        return;
-      }
+      setPendingKill(null);
       setKillingId(job.id);
       try {
         const updated = await killComputeJob(job.id);
@@ -911,8 +1039,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           threshold: parseFloat(rerunState.threshold),
         };
       }
-      await rerunComputeExperiment(rerunState.taskId, body);
-      setRerunState(null);
+      const response = await rerunComputeExperiment(rerunState.taskId, body);
+      setRerunState((prev) => prev ? { ...prev, submitting: false, result: response } : prev);
       await load();
     } catch (e) {
       setRerunState((prev) => prev ? { ...prev, submitting: false, error: e instanceof Error ? e.message : 'Re-run failed' } : prev);
@@ -943,7 +1071,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, thread: [], error: null }), submitting: false, error: e instanceof Error ? e.message : 'Ask failed' },
       }));
     }
-  }, [askState]);
+  }, [askState, setAskState]);
 
   if (!projectId) {
     return (
@@ -1077,6 +1205,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         </div>
       )}
 
+      <AwaitingLocalRunnerSection holds={awaitingHolds} nowMs={nowMs} />
+
       <HeldExperimentsSection
         experiments={heldExperiments}
         onApprove={onApproveExperiment}
@@ -1121,6 +1251,33 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     {job.external_compute_id ? ` · ${job.external_compute_id}` : ''}
                   </div>
                   {(() => {
+                    const runner = job.runner;
+                    const runnerName = runner?.hostname ?? (job.runner_target_id ? job.runner_target_id.slice(0, 8) : null);
+                    if (runnerName && job.runner_claimed_at) {
+                      const claimedMs = Date.parse(job.runner_claimed_at);
+                      const elapsedSec = isNaN(claimedMs) ? null : Math.max(0, Math.round((nowMs - claimedMs) / 1000));
+                      return (
+                        <div className="text-ui-sm text-neutral-400 font-mono mt-0.5" data-testid="compute-runner-claimed">
+                          runner: <span className="text-neutral-200">{runnerName}</span>
+                          {elapsedSec != null && (
+                            <> · claimed {fmtDuration(elapsedSec)} ago</>
+                          )}
+                        </div>
+                      );
+                    }
+                    if (job.awaiting_local_runner_since && !runner) {
+                      const waitingMs = Date.parse(job.awaiting_local_runner_since);
+                      const waitingSec = isNaN(waitingMs) ? null : Math.max(0, Math.round((nowMs - waitingMs) / 1000));
+                      return (
+                        <div className="text-ui-sm text-amber-400 font-mono mt-0.5" data-testid="compute-runner-waiting">
+                          waiting for local runner
+                          {waitingSec != null && <> since {fmtDuration(waitingSec)} ago</>}
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+                  {(() => {
                     const evidence = asLiveReleaseEvidence(job.polling_metadata?.live_release_evidence);
                     if (!evidence) return null;
                     return (
@@ -1158,6 +1315,71 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   </div>
                 </div>
               )}
+
+              {(() => {
+                const { experiment, benchmark, hypothesis } = job;
+                const hasIdentity = !!(experiment || benchmark || hypothesis);
+                if (!hasIdentity) return null;
+                return (
+                  <div className="mb-1.5 rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5">
+                    <div
+                      className="flex flex-col gap-0.5 text-ui-sm font-mono"
+                      data-testid="compute-experiment-identity"
+                    >
+                      {(experiment || benchmark) && (
+                        <div className="flex items-start gap-1.5">
+                          <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
+                          <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
+                        </div>
+                      )}
+                      {hypothesis && (
+                        <div className="flex items-start gap-1.5">
+                          <span className="text-neutral-500 shrink-0">Hypothesis</span>
+                          <span className="text-neutral-300 break-words">{hypothesis}</span>
+                        </div>
+                      )}
+                      {job.success_criterion && (
+                        <div className="flex items-start gap-1.5">
+                          <span className="text-neutral-500 shrink-0">Criterion</span>
+                          <span className="text-neutral-300 break-words">
+                            {job.success_criterion.metric} {job.success_criterion.operator} {job.success_criterion.threshold}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {(() => {
+                const prov = job.launch_params?.provenance;
+                const hasProvenance = !!(prov?.idea || prov?.draft_notes);
+                if (!hasProvenance) return null;
+                return (
+                  <div
+                    className="mb-1.5 rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5"
+                    data-testid="compute-draft-provenance"
+                  >
+                    {prov?.drafted_from_refinement && (
+                      <div className="flex items-center gap-1.5 text-ui-sm font-mono text-neutral-500 mb-0.5">
+                        <span>From AI draft</span>
+                      </div>
+                    )}
+                    {prov?.idea && (
+                      <div className="flex items-start gap-1.5 text-ui-sm font-mono">
+                        <span className="text-neutral-500 shrink-0">Idea</span>
+                        <span className="text-neutral-300 break-words">{prov.idea}</span>
+                      </div>
+                    )}
+                    {prov?.draft_notes && (
+                      <div className="flex items-start gap-1.5 text-ui-sm font-mono">
+                        <span className="text-neutral-500 shrink-0">Draft notes</span>
+                        <span className="text-neutral-400 break-words">{prov.draft_notes}</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               {(() => {
                 if (!active) return null;
@@ -1257,68 +1479,105 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <Cpu className="w-3 h-3" />
                         {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
                       </button>
+                      {onCloneExperiment && (
+                        <button
+                          onClick={() => onCloneExperiment(buildCloneForm(job))}
+                          disabled={!job.launch_params}
+                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30 text-ui-md font-semibold px-3 transition-colors disabled:opacity-50"
+                          title="Clone this experiment's configuration into the launch form"
+                          data-testid="clone-to-form"
+                        >
+                          Clone to form
+                        </button>
+                      )}
                       {rerunState?.jobId === job.id ? (
                         <div className="flex flex-col gap-2 rounded border border-sky-500/30 bg-sky-500/10 p-2 text-ui-sm" data-testid="rerun-inline-panel">
-                          <div className="font-semibold text-sky-200">Re-run with adjustments</div>
-                          <div className="flex flex-wrap gap-2">
-                            <label className="flex flex-col gap-0.5">
-                              <span className="text-neutral-400">Spend cap (USD)</span>
-                              <input
-                                type="number"
-                                min="0.01"
-                                step="0.01"
-                                value={rerunState.spendCap}
-                                onChange={(e) => setRerunState((p) => p ? { ...p, spendCap: e.target.value } : p)}
-                                className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
-                                data-testid="rerun-spend-cap"
-                              />
-                            </label>
-                            <label className="flex flex-col gap-0.5">
-                              <span className="text-neutral-400">Deadline (sec)</span>
-                              <input
-                                type="number"
-                                min="1"
-                                step="1"
-                                value={rerunState.deadlineSec}
-                                onChange={(e) => setRerunState((p) => p ? { ...p, deadlineSec: e.target.value } : p)}
-                                className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
-                                data-testid="rerun-deadline-sec"
-                              />
-                            </label>
-                            {rerunState.criterion && (
-                              <label className="flex flex-col gap-0.5">
-                                <span className="text-neutral-400">Threshold ({rerunState.criterion.metric} {rerunState.criterion.operator})</span>
-                                <input
-                                  type="number"
-                                  step="any"
-                                  value={rerunState.threshold}
-                                  onChange={(e) => setRerunState((p) => p ? { ...p, threshold: e.target.value } : p)}
-                                  className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
-                                  data-testid="rerun-threshold"
-                                />
-                              </label>
-                            )}
-                          </div>
-                          {rerunState.error && (
-                            <div className="text-red-300 text-ui-xs" data-testid="rerun-error">{rerunState.error}</div>
+                          {rerunState.result ? (
+                            <>
+                              <div className="font-semibold text-emerald-200">Re-run launched</div>
+                              <div className="flex flex-col gap-1.5">
+                                <div>
+                                  <span className="text-neutral-400">New task ID:</span>{' '}
+                                  <span className="text-emerald-300 font-mono">{rerunState.result.id}</span>
+                                </div>
+                                {rerunState.result.requires_approval && (
+                                  <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1">
+                                    <span className="text-amber-300">Held for approval</span>
+                                  </div>
+                                )}
+                              </div>
+                              <button
+                                onClick={() => setRerunState(null)}
+                                className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm w-fit"
+                                data-testid="rerun-result-close"
+                              >
+                                Close
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <div className="font-semibold text-sky-200">Re-run with adjustments</div>
+                              <div className="flex flex-wrap gap-2">
+                                <label className="flex flex-col gap-0.5">
+                                  <span className="text-neutral-400">Spend cap (USD)</span>
+                                  <input
+                                    type="number"
+                                    min="0.01"
+                                    step="0.01"
+                                    value={rerunState.spendCap}
+                                    onChange={(e) => setRerunState((p) => p ? { ...p, spendCap: e.target.value } : p)}
+                                    className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                    data-testid="rerun-spend-cap"
+                                  />
+                                </label>
+                                <label className="flex flex-col gap-0.5">
+                                  <span className="text-neutral-400">Deadline (sec)</span>
+                                  <input
+                                    type="number"
+                                    min="1"
+                                    step="1"
+                                    value={rerunState.deadlineSec}
+                                    onChange={(e) => setRerunState((p) => p ? { ...p, deadlineSec: e.target.value } : p)}
+                                    className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                    data-testid="rerun-deadline-sec"
+                                  />
+                                </label>
+                                {rerunState.criterion && (
+                                  <label className="flex flex-col gap-0.5">
+                                    <span className="text-neutral-400">Threshold ({rerunState.criterion.metric} {rerunState.criterion.operator})</span>
+                                    <input
+                                      type="number"
+                                      step="any"
+                                      value={rerunState.threshold}
+                                      onChange={(e) => setRerunState((p) => p ? { ...p, threshold: e.target.value } : p)}
+                                      className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                      data-testid="rerun-threshold"
+                                    />
+                                  </label>
+                                )}
+                              </div>
+                              {rerunState.error && (
+                                <div className="text-red-300 text-ui-xs" data-testid="rerun-error">{rerunState.error}</div>
+                              )}
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => void handleRerunSubmit()}
+                                  disabled={rerunState.submitting}
+                                  className="rounded bg-sky-500/30 text-sky-200 hover:bg-sky-500/40 px-3 py-1.5 text-ui-sm font-semibold disabled:opacity-50"
+                                  data-testid="rerun-submit"
+                                >
+                                  {rerunState.submitting ? 'Launching…' : 'Launch re-run'}
+                                </button>
+                                <button
+                                  onClick={() => setRerunState(null)}
+                                  className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm"
+                                  data-testid="rerun-cancel"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </>
                           )}
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => void handleRerunSubmit()}
-                              disabled={rerunState.submitting}
-                              className="rounded bg-sky-500/30 text-sky-200 hover:bg-sky-500/40 px-3 py-1.5 text-ui-sm font-semibold disabled:opacity-50"
-                              data-testid="rerun-submit"
-                            >
-                              {rerunState.submitting ? 'Launching…' : 'Launch re-run'}
-                            </button>
-                            <button
-                              onClick={() => setRerunState(null)}
-                              className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm"
-                              data-testid="rerun-cancel"
-                            >
-                              Cancel
-                            </button>
-                          </div>
                         </div>
                       ) : (
                         <button
@@ -1665,11 +1924,10 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               })()}
               {(() => {
                 if (active) return null;
-                const { experiment, benchmark, hypothesis } = job;
+                const { hypothesis } = job;
                 const sc = job.success_criterion;
                 const verdict = job.criterion_verdict;
-                const hasIdentity = !!(experiment || benchmark || hypothesis);
-                if (!hasIdentity && !sc) return null;
+                if (!sc) return null;
 
                 // Derive top-level verdict state when hypothesis + criterion are both present.
                 type VerdictState = 'held' | 'refuted' | 'inconclusive';
@@ -1678,45 +1936,43 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   verdictState = !verdict.measurable ? 'inconclusive' : verdict.met ? 'held' : 'refuted';
                 }
 
-                const expr = sc ? `${sc.metric} ${sc.operator} ${sc.threshold}` : null;
+                const expr = `${sc.metric} ${sc.operator} ${sc.threshold}`;
                 const margin = computeJobMargin(job);
 
                 let chip: React.ReactNode;
-                if (sc) {
-                  if (!verdict) {
-                    chip = (
-                      <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
-                        not reported
-                      </span>
-                    );
-                  } else if (verdict.met) {
-                    chip = (
-                      <span
-                        className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-emerald-300"
-                        data-testid="criterion-met"
-                      >
-                        met
-                      </span>
-                    );
-                  } else if (!verdict.measurable) {
-                    chip = (
-                      <span
-                        className="rounded border border-amber-500/40 bg-amber-500/15 px-1 py-0.5 text-amber-300"
-                        data-testid="criterion-inconclusive"
-                      >
-                        inconclusive
-                      </span>
-                    );
-                  } else {
-                    chip = (
-                      <span
-                        className="rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-red-300"
-                        data-testid="criterion-unmet"
-                      >
-                        unmet
-                      </span>
-                    );
-                  }
+                if (!verdict) {
+                  chip = (
+                    <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
+                      not reported
+                    </span>
+                  );
+                } else if (verdict.met) {
+                  chip = (
+                    <span
+                      className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-emerald-300"
+                      data-testid="criterion-met"
+                    >
+                      met
+                    </span>
+                  );
+                } else if (!verdict.measurable) {
+                  chip = (
+                    <span
+                      className="rounded border border-amber-500/40 bg-amber-500/15 px-1 py-0.5 text-amber-300"
+                      data-testid="criterion-inconclusive"
+                    >
+                      inconclusive
+                    </span>
+                  );
+                } else {
+                  chip = (
+                    <span
+                      className="rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-red-300"
+                      data-testid="criterion-unmet"
+                    >
+                      unmet
+                    </span>
+                  );
                 }
 
                 return (
@@ -1740,70 +1996,45 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         </span>
                       </div>
                     )}
-                    {(hasIdentity || sc) && (
-                      <div className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5">
-                    {hasIdentity && (
-                      <div
-                        className="flex flex-col gap-0.5 text-ui-sm font-mono"
-                        data-testid="compute-experiment-identity"
-                      >
-                        {(experiment || benchmark) && (
-                          <div className="flex items-start gap-1.5">
-                            <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
-                            <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
-                          </div>
+                    <div
+                      className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-1 text-ui-sm font-mono"
+                      data-testid="criterion-verdict-row"
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-neutral-500 shrink-0">Criterion</span>
+                        <span className="text-neutral-300 break-words">{expr}</span>
+                        {verdict && verdict.value !== null && verdict.value !== undefined && (
+                          <span className="text-neutral-500">
+                            (measured: {verdict.value})
+                          </span>
                         )}
-                        {hypothesis && (
-                          <div className="flex items-start gap-1.5">
-                            <span className="text-neutral-500 shrink-0">Hypothesis</span>
-                            <span className="text-neutral-300 break-words">{hypothesis}</span>
-                          </div>
-                        )}
+                        {chip}
                       </div>
-                    )}
-                    {sc && (
-                      <div
-                        className="flex flex-col gap-1 text-ui-sm font-mono"
-                        data-testid="criterion-verdict-row"
-                      >
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-neutral-500 shrink-0">Criterion</span>
-                          <span className="text-neutral-300 break-words">{expr}</span>
-                          {verdict && verdict.value !== null && verdict.value !== undefined && (
-                            <span className="text-neutral-500">
-                              (measured: {verdict.value})
-                            </span>
-                          )}
-                          {chip}
+                      {verdict?.binding_status && (
+                        <div className="flex items-center gap-1.5 text-neutral-500">
+                          <span className="shrink-0">Binding status</span>
+                          <span
+                            className="font-semibold text-neutral-300"
+                            data-testid="criterion-binding-status"
+                          >
+                            {verdict.binding_status}
+                          </span>
                         </div>
-                        {verdict?.binding_status && (
-                          <div className="flex items-center gap-1.5 text-neutral-500">
-                            <span className="shrink-0">Binding status</span>
-                            <span
-                              className="font-semibold text-neutral-300"
-                              data-testid="criterion-binding-status"
-                            >
-                              {verdict.binding_status}
-                            </span>
-                          </div>
-                        )}
-                        {margin !== null && (
-                          <div className="flex items-center gap-1.5 text-neutral-500">
-                            <span className="shrink-0">Margin</span>
-                            <span
-                              className={`font-semibold ${
-                                margin >= 0 ? 'text-emerald-300' : 'text-red-300'
-                              }`}
-                              data-testid="criterion-margin"
-                            >
-                              {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                      </div>
-                    )}
+                      )}
+                      {margin !== null && (
+                        <div className="flex items-center gap-1.5 text-neutral-500">
+                          <span className="shrink-0">Margin</span>
+                          <span
+                            className={`font-semibold ${
+                              margin >= 0 ? 'text-emerald-300' : 'text-red-300'
+                            }`}
+                            data-testid="criterion-margin"
+                          >
+                            {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
+                          </span>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 );
               })()}
@@ -2081,6 +2312,16 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
             Load more
           </button>
         </div>
+      )}
+
+      {pendingKill && (
+        <ConfirmDialog
+          title="Kill compute job"
+          message={`Kill compute job for "${pendingKill.task_title ?? pendingKill.id}"? This stops the running VM immediately.`}
+          confirmLabel="Kill job"
+          onConfirm={() => void executeKill(pendingKill)}
+          onCancel={() => setPendingKill(null)}
+        />
       )}
     </div>
   );

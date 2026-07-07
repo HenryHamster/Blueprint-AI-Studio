@@ -45,14 +45,20 @@ import { renderDirection } from './direction-renderer.js';
 import {
   writeFetchHelper, buildFetchGuidance, RESEARCH_FETCH_VERBS, PLAN_FETCH_VERBS,
 } from './strategic-helpers.js';
-import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
+import { fetchPriorKnowledge, buildPriorKnowledgeSection, filterKnowledgeDuplicates } from './prior-knowledge.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { resolveMigrationLayout } from './specialized.js';
+import { setPromptSizeTelemetry } from '../telemetry.js';
 
 export const PR_INELIGIBLE_TASK_TYPES = [
-  'research', 'investigate', 'audit', 'memo',
-  'web_research', 'design', 'compute_experiment',
+  'compute_experiment', 'debug', 'design', 'design_doc_update',
+  'investigate', 'memo', 'panel_review', 'perf', 'plan',
+  'release_audit', 'release_audit_challenge', 'release_merge_grade',
+  'repo_bootstrap', 'research', 'review', 'security_audit',
+  'self_audit', 'smoketest', 'strategic_review', 'verify_tests',
+  'web_research',
 ] as const;
 export {
   formatCochangeHints,
@@ -65,6 +71,8 @@ import {
   computeResearchPlanPromptFingerprint,
 } from '../prompts/thinker.js';
 export { buildThinkerPrompt, runThinkerWithGate, type ThinkerPromptParams } from '../prompts/thinker.js';
+import { ACCEPTANCE_EVIDENCE_RUBRIC, CAPABILITY_DECLARATION_DOC } from './research-plan-prompt-blocks.js';
+export { CAPABILITY_DECLARATION_DOC } from './research-plan-prompt-blocks.js';
 
 // ── Pure data transformation helpers (exported for testing) ─────────────────
 
@@ -389,6 +397,17 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
   return line1 + line2 + line3 + line4 + line5 + line6 + line7 + priorFailuresLine;
 }
 
+function buildPromptSizeTelemetry(fullPrompt: string, sections: Array<[string, string]>): Record<string, unknown> {
+  const sized = sections
+    .map(([name, text]) => ({ name, bytes: Buffer.byteLength(text, 'utf8') }))
+    .sort((a, b) => b.bytes - a.bytes);
+  return {
+    prompt_size_bytes: Buffer.byteLength(fullPrompt, 'utf8'),
+    prompt_section_count: sized.length,
+    prompt_section_sizes: sized.slice(0, 3),
+  };
+}
+
 /**
  * Renders a compact "Recently filtered (avoid)" section from the last few
  * research_history entries. Flattens entries' filtered_findings lists
@@ -492,6 +511,29 @@ export function buildUserPausedSection(
 }
 
 const QUALIFICATION_SCORE_KEYS = ['audit', 'test_erosion', 'smoketest'] as const;
+// Canonical vocabulary of all qualification states produced by the backend's
+// summarize_qualification_state. Mirrors QUALIFICATION_STATE_VOCAB in
+// release_version.py and the QualificationStateValue union in admin-ui/src/api.ts.
+// Exported so contract tests can assert it equals the shared fixture at
+// backend/testing/__fixtures__/qualification_state_vocab.json.
+export const QUALIFICATION_STATE_VOCAB: ReadonlySet<string> = new Set([
+  'audit_crashed',
+  'deferred_unsynced',
+  'dry_run',
+  'error',
+  'infra_failure',
+  'not_promoted',
+  'promoted',
+  'promoted_unconfirmed',
+  'promotion_check_wait',
+  'promotion_confirmation_timed_out',
+  'promotion_deploy_failed',
+  'promotion_failed',
+  'promotion_in_flight',
+  'protection_blocked_review',
+  'qualifying',
+  'required_check_failed',
+]);
 // Derived qualification states that mean an audit / promotion run is actively
 // in flight for the current candidate. When the effective status is any of
 // these, the agent must NOT emit `qualify_request` — a run is already going.
@@ -750,6 +792,9 @@ function formatCriterionCoverage(versionPhase: Record<string, unknown>): string[
       const criterionCoverage = typeof criterion.coverage === 'string' ? criterion.coverage.trim() : '';
       if (criterionCoverage !== 'uncovered' && criterionCoverage !== 'partial') continue;
 
+      const status = typeof criterion.status === 'string' ? criterion.status.trim() : 'active';
+      if (status !== 'active') continue;
+
       const key = typeof criterion.criterion_key === 'string' && criterion.criterion_key.trim()
         ? criterion.criterion_key.trim()
         : null;
@@ -761,7 +806,10 @@ function formatCriterionCoverage(versionPhase: Record<string, unknown>): string[
       const evidenceCount = typeof criterion.evidence_count === 'number'
         ? `, evidence=${criterion.evidence_count}`
         : '';
-      criteriaLines.push(`  - ${key}: ${criterionCoverage}${evidenceCount} — ${text}`);
+      const stuckReason = typeof criterion.stuck_reason === 'string' && criterion.stuck_reason
+        ? ` [stuck: ${criterion.stuck_reason}]`
+        : '';
+      criteriaLines.push(`  - ${key}: ${criterionCoverage}${evidenceCount}${stuckReason} — ${text}`);
     }
     if (criteriaLines.length > 0) {
       lines.push(`Acceptance criteria needing evidence:`);
@@ -779,6 +827,29 @@ function formatCriterionCoverage(versionPhase: Record<string, unknown>): string[
  */
 export function buildVersionPhaseSection(versionPhase: Record<string, unknown> | undefined): string {
   if (!versionPhase || typeof versionPhase !== 'object') return '';
+
+  // Failure marker — the backend assembly failed; surface as an explicit advisory
+  // so the strategist knows the omission is a build error, not missing lifecycle.
+  if (versionPhase.lifecycle_signal === 'unavailable' || versionPhase.build_unavailable === true) {
+    const signalStatus = typeof versionPhase.signal_status === 'string' ? versionPhase.signal_status : 'build_failed';
+    const integrationBranch = typeof versionPhase.integration_branch === 'string' ? versionPhase.integration_branch : null;
+    const promotionTarget = typeof versionPhase.promotion_target === 'string' ? versionPhase.promotion_target : null;
+    const errorSnippet = typeof versionPhase.error === 'string' ? versionPhase.error : null;
+    const branchCtx = integrationBranch && promotionTarget
+      ? ` (integration: \`${integrationBranch}\` → promotion: \`${promotionTarget}\`)`
+      : integrationBranch ? ` (integration: \`${integrationBranch}\`)` : '';
+    const lifecycleSignal = typeof versionPhase.lifecycle_signal === 'string' ? versionPhase.lifecycle_signal : 'unavailable';
+    const lines: string[] = [
+      '\n## Version Phase',
+      `**lifecycle_signal: ${lifecycleSignal} / ${signalStatus}**${branchCtx}`,
+      'The version-phase lifecycle block could not be assembled this cycle due to a backend error. ' +
+      'This is an infrastructure failure — not evidence that no release lifecycle exists. ' +
+      'Do not treat the absence of version-phase data as a signal to change phase or qualification strategy.',
+    ];
+    if (errorSnippet) lines.push(`Error: \`${errorSnippet}\``);
+    return lines.join('\n');
+  }
+
   const versionNumber = typeof versionPhase.version_number === 'number' ? versionPhase.version_number : null;
   const phase = typeof versionPhase.phase === 'string' ? versionPhase.phase : null;
   if (versionNumber === null || (phase !== 'build' && phase !== 'stabilize')) return '';
@@ -874,19 +945,45 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     }
   }
 
+  // Qualification-state disagreement — surfaced when a finalized verdict
+  // superseded a stale pending last_qualification record. Tells the strategist
+  // the displayed qualification state reflects the finalized verdict, not the
+  // stale 'pending' record that was stored on the version.
+  const disagreementRaw = versionPhase.qualification_state_disagreement;
+  if (disagreementRaw && typeof disagreementRaw === 'object' && !Array.isArray(disagreementRaw)) {
+    const disagreement = disagreementRaw as Record<string, unknown>;
+    const lqStoredStatus = typeof disagreement.last_qualification_status === 'string' ? disagreement.last_qualification_status : null;
+    const verdictFinalStatus = typeof disagreement.verdict_terminal_status === 'string' ? disagreement.verdict_terminal_status : null;
+    if (lqStoredStatus && verdictFinalStatus) {
+      parts.push(`  Note: qualification_state_disagreement — stored last_qualification.status='${lqStoredStatus}' but finalized verdict reports '${verdictFinalStatus}'. The qualification state above reflects the finalized verdict.`);
+    }
+  }
+
   // Version-phase candidate currency: is the last qualification's candidate SHA still HEAD?
   const lqCurrencyRaw = versionPhase.last_qualification_candidate_currency;
   if (lqCurrencyRaw && typeof lqCurrencyRaw === 'object' && !Array.isArray(lqCurrencyRaw)) {
     const lqc = lqCurrencyRaw as Record<string, unknown>;
-    const isCurrent = lqc.current === true;
+    const verdict = typeof lqc.verdict === 'string' ? lqc.verdict : null;
+    // Only a RESOLVED comparison can be stale: a boolean `current === false` or an
+    // explicit `verdict: 'stale'`. An api_unreachable / unknown verdict (no live
+    // comparison) must NOT be treated as stale — that would push the strategist to
+    // re-ground load-bearing findings on a transient GitHub outage alone.
+    const isResolved = typeof lqc.current === 'boolean';
+    const isCurrent = lqc.current === true || verdict === 'fresh';
+    const isStale = (isResolved && lqc.current === false) || verdict === 'stale';
     const candidateSha = typeof lqc.candidate_sha === 'string' && lqc.candidate_sha
       ? lqc.candidate_sha.slice(0, 12) : '?';
     const headSha = typeof lqc.head_sha === 'string' && lqc.head_sha
       ? lqc.head_sha.slice(0, 12) : '?';
-    if (isCurrent) {
+    if (verdict === 'api_unreachable') {
+      const reason = typeof lqc.reason === 'string' && lqc.reason ? ` (${lqc.reason})` : '';
+      parts.push(`Qualification candidate currency: API UNREACHABLE${reason} — could not reach GitHub to compare candidate \`${candidateSha}\` against integration HEAD after a bounded retry. This is a temporary reachability problem, NOT a stale-payload signal; do not re-ground findings as stale on this basis alone.`);
+    } else if (isStale) {
+      parts.push(`Qualification candidate currency: STALE — last qualification candidate \`${candidateSha}\` is behind integration HEAD \`${headSha}\`. Audit findings were scored against an older commit; consider requesting a fresh qualification.`);
+    } else if (isCurrent) {
       parts.push(`Qualification candidate currency: CURRENT — candidate \`${candidateSha}\` matches integration HEAD. Audit findings reflect live HEAD.`);
     } else {
-      parts.push(`Qualification candidate currency: STALE — last qualification candidate \`${candidateSha}\` is behind integration HEAD \`${headSha}\`. Audit findings were scored against an older commit; consider requesting a fresh qualification.`);
+      parts.push(`Qualification candidate currency: UNKNOWN — freshness could not be determined for candidate \`${candidateSha}\`. Not confirmed stale; a fresh qualification will resolve currency.`);
     }
   }
 
@@ -976,10 +1073,19 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
       const lqStatus = lqRec && typeof lqRec.status === 'string' ? lqRec.status : null;
       const lqConf = lqRec && typeof lqRec.confidence === 'number' ? lqRec.confidence : null;
       const lqBlocker = lqRec && typeof lqRec.blocker === 'string' && lqRec.blocker ? lqRec.blocker : null;
+      const rvQs = rvRec.qualification_state;
+      const rvQsRec = rvQs && typeof rvQs === 'object' && !Array.isArray(rvQs) ? rvQs as Record<string, unknown> : null;
       const lqBits: string[] = [];
       if (lqStatus) lqBits.push(`qual=${lqStatus}`);
       if (lqConf !== null) lqBits.push(`confidence=${lqConf}`);
       if (lqBlocker) lqBits.push(`blocker=${lqBlocker}`);
+      // Enriched qualification state and serving status for closed versions.
+      if (rvQsRec && typeof rvQsRec.state === 'string') {
+        lqBits.push(`qual_state=${rvQsRec.state}`);
+      }
+      const rvServingStatus = typeof rvRec.serving_status === 'string' ? rvRec.serving_status :
+        (rvQsRec && typeof rvQsRec.serving_status === 'string' ? rvQsRec.serving_status : null);
+      if (rvServingStatus) lqBits.push(`serving=${rvServingStatus}`);
       const lqSuffix = lqBits.length > 0 ? ` [${lqBits.join(', ')}]` : '';
       rvLines.push(`  - v${rvNum} (${rvStatus})${lqSuffix}`);
       if (lqRec) {
@@ -1668,14 +1774,6 @@ export function buildAvailableCapabilitiesSection(caps: unknown): string {
   ].join('\n') + '\n\n';
 }
 
-// Shared, uniform documentation of the capability-declaration framework, embedded
-// identically in the research, plan, strategic, and design prompts so EVERY task
-// type participates in the same vocabulary (not research special-casing). Frames
-// both the producer stamp and the consumer ref as drawn from AVAILABLE CAPABILITIES.
-export const CAPABILITY_DECLARATION_DOC = [
-  '**Shared capability vocabulary (applies to this and every other task type):** you may declare a `provides_capability` stamp (a capability your work ADVERTISES) and/or a `prerequisite` capability ref (a capability your work DEPENDS ON). BOTH must be drawn from the AVAILABLE CAPABILITIES list above when one fits — the registry is the shared namespace, and the resolver matches EXACTLY (no fuzzy matching), so a free-prose name a different lane will never reproduce leaves the dependency stranded. Use the SAME kebab-case convention and propose a NEW name ONLY for a genuinely new capability absent from the list. An off-registry ref is still accepted (never rejected) and flagged advisory for the strategist to fold into the registry.',
-].join('\n');
-
 // Mirrors the backend's plan-child allowlist: PLAN_SUBTASK_TYPES (the
 // PR-producing implementation subtypes) ∪ PLAN_KNOWLEDGE_SUBTASK_TYPES (the
 // knowledge-prerequisite subtypes) in backend/app/task_capabilities.py. Keep in
@@ -1780,12 +1878,11 @@ export async function handlePlan(
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
   if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
   const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
-  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   const contextPrefix = buildContextPrefix(task);
 
   const claudeMd = readClaudeMd();
-  const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const planPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const planRetryContext = buildRetryContext(task);
   const planFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
@@ -1883,7 +1980,7 @@ Rules:
 - scope: "small" for changes under ~100 lines across 1-3 files with clear, narrow scope, "medium" for changes spanning 3-8 files or 100-300 lines, or touching shared infrastructure, "large" for cross-component architectural changes, 300+ lines, or changes to auth/data models/core orchestration
 - The "type" field controls how the subtask is executed: "create" (default) for new features/additions, "refactor" for code quality improvements with no behavior change, "migrate" for database schema changes (Alembic migrations), "qa" for test-only PRs. The type field must be EXACTLY one of those values (or a knowledge-prerequisite type below). "fix" is NOT a valid subtask type — a bug-fixing subtask is type "create" even when its TITLE uses the "fix:" conventional-commit prefix (titles and types are independent; a plan child always starts from a fresh branch, which is what "create" means).
 - EMPIRICAL PREREQUISITE (optional, additive): besides the implementation subtypes above, a plan MAY emit a measurement prerequisite subtask of type="compute_experiment" when a later subtask should "measure this first, then act on the verdict". It does NOT produce a PR — it launches a budgeted, auto-torn-down compute job and persists a durable MEASURED VERDICT as knowledge. It carries a launch contract: "command" (the experiment to run), a positive "spend_cap_usd", a positive "deadline_seconds", and an OPTIONAL "success_criterion": {"metric", "operator", "threshold"}. A later implementation subtask consumes the verdict by naming this subtask's index in its depends_on_indices — it is handed the experiment's knowledge at launch. A MEASURED NEGATIVE result (success_criterion honestly missed) is still consumable evidence: the dependent still runs and acts on the verdict. Only a BROKEN run that produced no usable verdict cancels the dependent follow-on work. REQUIRED: every compute_experiment subtask must include a "smoke_sample" field proving the command was tested on this VM before writing the plan. Run: BPRF=$(mktemp); timeout 30 bash -c "BLUEPRINT_RESULT_FILE=\\"$BPRF\\" <your command>" 2>/tmp/ce_smoke_err.txt; CE_EXIT=$?; then record {"exit_code":CE_EXIT,"startup_ok":true/false,"metric_captured":true/false,"timed_out":(CE_EXIT==124),"error_excerpt":"<stderr snippet>"}. Nothing beyond the repo itself is guaranteed; your smoke is proof. If startup_ok=false, fix or drop the subtask. If genuinely un-smokable (special hardware required), set smoke_sample={"unsmokable":true,"unsmokable_reason":"<why>"} for explicit operator review.
-- acceptance_evidence (OPTIONAL, additive — omit when you have nothing substantive to declare): the concrete evidence that will prove THIS subtask's claim true, carried forward to the implementing agent and the evaluation lane. Exactly one of four kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or embed inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior that should be exercised; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes; (4) {"kind": "visual", "component": "<UI component under test>", "viewport_width": <px, 1-4096>, "assertion_type": "<optional, e.g. overflow|text_truncation>"} — for FRONTEND-TOUCHING work (admin-ui components), proven by an uploaded viewport screenshot of that component captured at that width on a successful run. Declare it only for subtasks where the success condition is concrete; never invent a placeholder/always-true declaration (those are rejected).
+- acceptance_evidence (OPTIONAL, additive — omit when you have nothing substantive to declare): the concrete evidence that will prove THIS subtask's claim true, carried forward to the implementing agent and the evaluation lane. ${ACCEPTANCE_EVIDENCE_RUBRIC} Declare it only for subtasks where the success condition is concrete; never invent a placeholder/always-true declaration (those are rejected).
 - prerequisite (OPTIONAL, default null): a FOUNDATION this subtask depends on that is built OUTSIDE this plan (another lane / an already-built capability). Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` or \`{"kind": "capability", "ref": "<capability-name>"}\`. For a capability ref, DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above so it resolves to whichever task advertises it (the matcher is EXACT). Use depends_on_indices — NOT prerequisite — to order subtasks WITHIN this plan; prerequisite is only for cross-lane/cross-plan foundations.
 - provides_capability (OPTIONAL, default null): a short kebab-case capability name THIS subtask advertises so another lane's prerequisite \`{"kind": "capability", "ref": "<name>"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability. ${CAPABILITY_DECLARATION_DOC}
 - ATOMIC SCHEMA RULE: a database schema change is ONE subtask, never split across dependent subtasks. If a subtask edits the data model (adds/changes tables, columns, or model definitions), that SAME subtask must also generate the matching migration and bump the schema revision. Do NOT emit a separate dependent type="migrate" subtask for the migration of a model change in another subtask — splitting the model edit from its migration manufactures dead serialization and ships a model PR with no migration (which reviewers reject).${atomicSchemaPathsNote} The migration agent will handle migration generation and the revision bump within that single subtask/PR. Only create a separate subtask when the other work is genuinely independent of the schema change — never to carry the migration for it.
@@ -1893,6 +1990,22 @@ Rules:
 - ALSO write /tmp/plan_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (under ~3000 chars) of your decomposition: which areas of the codebase you explored, the rationale for how you split the work, the file targets and key constraints per subtask, and any risks or open questions. This artifact is surfaced to retry agents if this task fails, so they can pick up without re-investigating.${planPromptSuffix}${planFirstTaskSection}${PLAYBOOK_GUIDANCE}
 
 ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const planPromptTelemetry = buildPromptSizeTelemetry(planPrompt, [
+    ['playbook', planPlaybookSection],
+    ['retry_context', planRetryContext],
+    ['context_prefix', contextPrefix],
+    ['cochange_hints', cochangeHintsSection],
+    ['decomposition_outcomes', decompositionOutcomesSection],
+    ['claude_md_prefix', claudeMdPrefix],
+    ['available_capabilities', planAvailableCapabilitiesSection],
+    ['greenfield', greenfieldBranch],
+  ]);
+  setPromptSizeTelemetry(
+    planPromptTelemetry.prompt_size_bytes as number,
+    planPromptTelemetry.prompt_section_count as number,
+    planPromptTelemetry.prompt_section_sizes as Array<{ name: string; bytes: number }>,
+  );
+  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   statusRef.value = `Running ${getProviderRunner().displayName} for planning...`;
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -2001,7 +2114,6 @@ export async function handleResearch(
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
   if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
   const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
-  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   let gitLogOutput = '';
   let gitDiffStatOutput = '';
@@ -2031,23 +2143,18 @@ export async function handleResearch(
   } catch (e) {
     sendLog(ws, `Warning: git hotspots failed: ${String(e)}\n`);
   }
-  const gitHistorySection = (gitLogOutput || gitDiffStatOutput) ? `## Recent Git History (last 30 commits)
-${gitLogOutput || '(unavailable)'}
-
-## Top Contributors (last 20, no merges)
-${gitShortlogOutput || '(unavailable)'}
-
-## Recent Changes Summary (last 5 commits diff stat)
-${gitDiffStatOutput || '(unavailable)'}
-
-${hotspotsSection}
-
-` : '';
+  const gitHistorySection = (gitLogOutput || gitDiffStatOutput) ? [
+    gitLogOutput ? `## Recent Git History (last 30 commits)\n${gitLogOutput}` : '',
+    gitShortlogOutput ? `## Top Contributors (last 20, no merges)\n${gitShortlogOutput}` : '',
+    gitDiffStatOutput ? `## Recent Changes Summary (last 5 commits diff stat)\n${gitDiffStatOutput}` : '',
+    hotspotsSection,
+    '',
+  ].filter(Boolean).join('\n\n') + '\n' : '';
 
   // Build codebase summary to reduce exploration overhead
 
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd())
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
   const researchPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
@@ -2091,7 +2198,16 @@ ${hotspotsSection}
   const currentDirectionText = directions.length > 0
     ? strVal((directions.find(d => d.id === currentDirectionId) ?? directions[0]).text)
     : '';
-  const priorDocs = await fetchPriorKnowledge(userPrompt || currentDirectionText);
+  const knowledgeIndexForFilter = Array.isArray(payload.knowledge_index)
+    ? (payload.knowledge_index as Array<Record<string, unknown>>)
+    : [];
+  const knownKnowledgeIds = new Set<string>(
+    knowledgeIndexForFilter.map(e => strVal(e.id)).filter(Boolean),
+  );
+  const priorDocs = filterKnowledgeDuplicates(
+    await fetchPriorKnowledge(userPrompt || currentDirectionText),
+    knownKnowledgeIds,
+  );
   if (priorDocs.length > 0) {
     sendLog(ws, `Injecting ${priorDocs.length} prior knowledge document(s) into the research prompt\n`);
   }
@@ -2165,7 +2281,7 @@ ${hotspotsSection}
     }
   }
 
-  const contextPrefix = buildContextPrefix(task);
+  const contextPrefix = buildContextPrefix(task, { suppressTaskLists: true });
 
   // ── Tactical research mode (default) ──────────────────────────────────
   const recentlyCompleted = Array.isArray(projectCtx?.recently_completed_tasks)
@@ -2227,20 +2343,21 @@ ${hotspotsSection}
     designDocHighlight = lines.join('\n') + '\n';
   }
 
-  // Design doc: only include key listing + playbook. Full sections available via ./design-doc get <key>.
+  // Design doc: only include key listing + playbook keys index. Full sections available via ./design-doc get <key>.
+  // Playbook content is already in researchPlaybookSection (task.playbook — capped, ranked selection).
+  // Rendering it again from design_doc would double the context on every agentic turn.
   let designDocSection = '';
   if (tacticalDesignDoc && Object.keys(tacticalDesignDoc).length > 0) {
     const docKeys = Array.isArray(tacticalDesignDoc._keys)
       ? tacticalDesignDoc._keys as string[]
       : Object.keys(tacticalDesignDoc).filter(k => !k.startsWith('_') && !k.startsWith('playbook/'));
-    const playbookEntries = Object.entries(tacticalDesignDoc)
-      .filter(([k]) => k.startsWith('playbook/'))
-      .map(([k, v]) => `- **${k.replace('playbook/', '')}**: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
-      .join('\n');
+    const playbookKeys = Array.isArray(tacticalDesignDoc._playbook_keys)
+      ? tacticalDesignDoc._playbook_keys as string[]
+      : [];
     designDocSection = `# ARCHITECTURE (Design Document)
 Available sections (use \`./design-doc get <key>\` to read): ${docKeys.join(', ')}
 
-${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
+${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <key>\` to read full content): ${playbookKeys.join(', ')}\n` : ''}
 `;
   }
 
@@ -2435,7 +2552,7 @@ for it. Use scope=large when the change genuinely requires cross-component coord
 
 # BEFORE YOU WRITE FINDINGS — dedup check
 
-Review the DEDUP list and Project Context above. For each finding you're about to propose,
+Review the DEDUP list above. For each finding you're about to propose,
 ask: "is this genuinely new work, or does an active/completed/queued task already cover it?"
 Different approaches to the same area ARE valid (e.g. "add rate limiting to webhooks" vs
 "add error handling to webhooks"). Only skip a finding if a prior task solves the same problem.
@@ -2562,8 +2679,6 @@ implementation findings. Add metadata alongside them when relevant.
 
 **provides_capability** (optional, default null): A short kebab-case capability name this finding's task advertises (e.g. "<feature>-core"), so a sibling finding (or another lane) declaring \`{"kind": "capability", "ref": "<feature>-core"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed. Omit unless another task needs to gate on this one by capability. ${CAPABILITY_DECLARATION_DOC}
 
-**acceptance_evidence** (optional): Declare the proof that will show this finding's claim is true. Shape: \`{"kind": "test"|"behavior"|"artifact"|"visual", "descriptor": "short human-readable proof", "selector": "optional test path/selector, artifact ref, or viewport width"}\`. kind=test = a named test/selector exercising the seam end-to-end; behavior = an observable runtime behavior; artifact = an artifact a downstream task consumes; visual = a viewport screenshot of a FRONTEND/admin-ui component (descriptor = the component name, selector = the viewport width in px as a string), proven by an uploaded screenshot of that component at that width on a successful run. Omit the whole object when you are not declaring a proof — omitting it preserves today's behavior exactly. Do NOT invent other kinds.
-
 **actionability_grade rubric** (required on every finding):
 - HIGH: problem statement is clear, desired outcome is clear, related files identified, no major unknowns blocking implementation.
 - MEDIUM: problem clear but solution path uncertain, OR small unknowns the implementer can resolve with brief exploration.
@@ -2575,7 +2690,7 @@ implementation findings. Add metadata alongside them when relevant.
 - pattern_inferred: structural inference from naming/architecture patterns, with no direct inspection. This is the default — use it (or omit the field) when uncertain.
 - deduced: derived from adjacent evidence (e.g. another finding, a log line) without directly inspecting the subject.
 
-**acceptance_evidence** (OPTIONAL, additive — default null): the FORWARD evidence that will prove this finding's claim true once implemented, carried onto the spawned task. This is the OPPOSITE direction from verification_basis: verification_basis is BACKWARD ('how well-evidenced is the claim I am making now'), acceptance_evidence is FORWARD ('what concrete observation will demonstrate the fix worked'). Exactly one of four kinds: (1) {"kind": "named_test", "test_path": "tests/test_x.py", "test_id": "test_fn"} — a test exercising the changed seam (test_path must name a real test file; test_id optional, or inline as path::test_fn); (2) {"kind": "observable_behavior", "description": "..."} — a substantive (≥10 char, non-placeholder) description of a behavior to exercise; (3) {"kind": "downstream_artifact", "artifact_id": "..."} — an artifact a later task consumes; (4) {"kind": "visual", "component": "<UI component under test>", "viewport_width": <px, 1-4096>, "assertion_type": "<optional, e.g. overflow|text_truncation>"} — for FRONTEND-TOUCHING work (admin-ui components), proven by an uploaded viewport screenshot of that component captured at that width on a successful run. Omit (or null) when you cannot name a concrete, non-trivial proof — never invent a placeholder/always-true declaration (those are rejected).
+**acceptance_evidence** (OPTIONAL, additive — default null): the FORWARD evidence that will prove this finding's claim true once implemented, carried onto the spawned task. This is the OPPOSITE direction from verification_basis: verification_basis is BACKWARD ('how well-evidenced is the claim I am making now'), acceptance_evidence is FORWARD ('what concrete observation will demonstrate the fix worked'). ${ACCEPTANCE_EVIDENCE_RUBRIC} Omit (or null) when you cannot name a concrete, non-trivial proof — never invent a placeholder/always-true declaration (those are rejected).
 
 Scope: small (<50 lines, 1 file), medium (2-5 files, 50-200 lines), large (cross-component, 200+ lines).
 Risk: low (cosmetic), medium (logic/endpoints), high (core logic, auth, data models).
@@ -2589,8 +2704,33 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
 - Optional: /tmp/research_insights_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with [{"summary": "<200 chars", "area": "path"}] for observations not worth implementing.`;
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const researchPromptFull = researchPrompt + researchPromptSuffix + researchFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your research uncovered operational knowledge (build patterns, module relationships, common failure modes), save the most reusable findings to the playbook.\n' + `\n\n${researchFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const researchPromptTelemetry = buildPromptSizeTelemetry(researchPromptFull, [
+    ['context_prefix', contextPrefix],
+    ['playbook', researchPlaybookSection],
+    ['retry_context', researchRetryContext],
+    ['codebase_instructions', codebaseSummary],
+    ['file_tree', fileTreeSection],
+    ['git_history', gitHistorySection],
+    ['design_doc_highlight', designDocHighlight],
+    ['design_doc', designDocSection],
+    ['system_verification', systemVerificationSection],
+    ['capability_verification', capabilityVerificationSection],
+    ['available_capabilities', researchAvailableCapabilitiesSection],
+    ['directions', directionsText],
+    ['cross_direction', crossDirSection],
+    ['prior_knowledge', priorKnowledgeSection],
+    ['pipeline_scope_rates', pipelineScopeRatesSection],
+    ['anomaly', anomalySection],
+  ]);
+  setPromptSizeTelemetry(
+    researchPromptTelemetry.prompt_size_bytes as number,
+    researchPromptTelemetry.prompt_section_count as number,
+    researchPromptTelemetry.prompt_section_sizes as Array<{ name: string; bytes: number }>,
+  );
+  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
   statusRef.value = 'Running codebase research...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix + researchFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your research uncovered operational knowledge (build patterns, module relationships, common failure modes), save the most reusable findings to the playbook.\n' + `\n\n${researchFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPromptFull, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   const researchFindings = readHandlerOutput(taskId, 'research_findings', ws);

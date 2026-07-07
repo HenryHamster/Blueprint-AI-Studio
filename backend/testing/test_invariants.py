@@ -1296,6 +1296,31 @@ class TestSchemaRevisionSync:
             "crash on startup with UndefinedColumnError."
         )
 
+        # Facade completeness: ``app.models`` is the canonical import surface for
+        # every table model. Domain clusters may be peeled into sibling modules
+        # (e.g. ``app.release_models``) with ``app.models`` importing and
+        # re-exporting them. If such a re-export is dropped, two things break at
+        # once: ``from app.models import X`` stops resolving, AND — because the
+        # sibling module is no longer imported — its tables silently disappear
+        # from ``SQLModel.metadata`` above, so the column-coverage check would
+        # stop protecting them while the backend still creates those tables at
+        # runtime. Assert every mapped table class is reachable through the
+        # ``app.models`` facade so a peeled-out module can never go un-imported.
+        _models_owned_modules = {"app.models", "app.release_models"}
+        facade_missing = sorted(
+            mapper.class_.__name__
+            for mapper in SQLModel._sa_registry.mappers
+            if mapper.class_.__module__ in _models_owned_modules
+            and not hasattr(models, mapper.class_.__name__)
+        )
+        assert not facade_missing, (
+            "Table model classes not re-exported from app.models (facade "
+            "incomplete — a peeled-out sibling module is not imported and "
+            "re-exported by app.models, so `from app.models import <name>` "
+            "breaks and the table vanishes from SQLModel.metadata):\n"
+            + "\n".join(f"  - {n}" for n in facade_missing)
+        )
+
     def test_migration_column_types_match_models(self):
         """Migration column types must be compatible with SQLModel definitions.
 
@@ -1442,6 +1467,12 @@ class TestSchemaRevisionSync:
             # Only consider upgrade() — drops in downgrade() must not cancel creates
             content = content.split("def downgrade", 1)[0]
 
+            # Snapshot idx_by_name before processing this file's creates so that
+            # drop processing uses the pre-create state. This correctly handles the
+            # drop-then-recreate pattern (e.g. widening an index by adding a column)
+            # where the create would otherwise overwrite the drop target in idx_by_name.
+            idx_by_name_snapshot = dict(idx_by_name)
+
             for m in create_idx_re.finditer(content):
                 name, table, cols_raw = m.group(1), m.group(2), m.group(3)
                 cols = frozenset(str_re.findall(cols_raw))
@@ -1459,7 +1490,7 @@ class TestSchemaRevisionSync:
                         effective.add((table, frozenset([col_m.group(1)])))
 
             for m in drop_idx_re.finditer(content):
-                target = idx_by_name.get(m.group(1))
+                target = idx_by_name_snapshot.get(m.group(1))
                 if target:
                     effective.discard(target)
 
@@ -1638,6 +1669,18 @@ class TestSchemaRevisionSync:
             ("0138", "ix_task_blocked_recheck"),
             ("0236", "ix_task_project_status_updated"),
             ("0237", "ix_task_project_status_updated"),
+            # 0374 created ix_direction_event_project_key with 2 columns; 0377
+            # dropped and re-created it with 3 columns (project_id, direction_key,
+            # recorded_at). Both creates are unguarded but represent a legitimate
+            # drop-and-recreate pattern — migration 0408 reasserts the 3-column
+            # form with if_not_exists=True to close the schema-coverage gap.
+            ("0374", "ix_direction_event_project_key"),
+            ("0377", "ix_direction_event_project_key"),
+            # 0381 created ix_task_vm_stopped_at without a guard; 0383 rechecked
+            # via runtime pg_indexes query instead of if_not_exists=True; 0384
+            # re-issued it with IF NOT EXISTS (guarded). Pre-date the invariant.
+            ("0381", "ix_task_vm_stopped_at"),
+            ("0383", "ix_task_vm_stopped_at"),
         }
 
         migrations_dir = os.path.join(
@@ -6963,9 +7006,12 @@ class TestBehindRecoveryUpdateBranchGuard:
             # check). The pre-merge SHA-mismatch check was removed in PR #6188
             # as part of dropping the redundant pre-merge behind path.
             "rollup_management.py",
-            # Guarded call in orchestrator.py inside orchestrator_worker for
-            # the CI polling behind path.
-            "orchestrator.py",
+            # Guarded call in orchestrator_ci_monitor.py inside
+            # _monitor_evaluating_tasks for the CI polling behind path (the
+            # EVALUATING/CI-waiting monitor sweep was extracted verbatim out
+            # of orchestrator_worker; the pr_is_not_behind_for guard moved
+            # with it).
+            "orchestrator_ci_monitor.py",
         }
         guarded_files = {rel for rel, _fn in guarded}
         missing = expected_subset - guarded_files
@@ -6976,7 +7022,8 @@ class TestBehindRecoveryUpdateBranchGuard:
         )
 
         # At least three guarded call sites must be present (1 in
-        # ci_completion + 1 in rollup_management + 1 in orchestrator).
+        # ci_completion + 1 in rollup_management + 1 in
+        # orchestrator_ci_monitor).
         assert len(guarded) >= 3, (
             f"Expected at least 3 guarded update_branch sites, "
             f"detected {len(guarded)}: {guarded}"
@@ -10134,6 +10181,69 @@ def test_pytest_filterwarnings_includes_httpx_error_guard():
     )
 
 
+def _ci_wait_true_literals_missing_pr_number(app_dir: str) -> list[str]:
+    """Return "file:line" sites where a dict LITERAL sets ``"ci_waiting": True``
+    but does NOT co-stamp a ``"pr_number"`` key.
+
+    The orchestrator's merge-critical CI-poll loop resolves a parked rollup's PR
+    via ``review_loop.pr_number`` (with a ``context.rollup_pr_number`` fallback,
+    ``ci_merge_helpers.effective_pr_number``). A ``ci_waiting=True`` armed as a
+    dict literal WITHOUT ``pr_number`` reintroduces the identity-less
+    ``{ci_waiting, iteration}`` shape that the merger SKIPS — the PR-identity
+    split-brain. Every CI-wait arm literal must therefore also carry
+    ``pr_number`` (or route through ``ci_merge_helpers.arm_ci_wait``, which
+    co-stamps it and asserts it is non-None).
+    """
+    import ast
+    import glob as globmod
+
+    offenders: list[str] = []
+    for py_file in globmod.glob(os.path.join(app_dir, "**", "*.py"), recursive=True):
+        with open(py_file, encoding="utf-8") as fh:
+            source = fh.read()
+        try:
+            tree = ast.parse(source, filename=py_file)
+        except SyntaxError:
+            continue
+        rel = os.path.relpath(py_file, app_dir).replace(os.sep, "/")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            const_keys = {
+                k.value for k in node.keys if isinstance(k, ast.Constant)
+            }
+            arms_ci_wait = any(
+                isinstance(k, ast.Constant)
+                and k.value == "ci_waiting"
+                and isinstance(v, ast.Constant)
+                and v.value is True
+                for k, v in zip(node.keys, node.values)
+            )
+            if arms_ci_wait and "pr_number" not in const_keys:
+                offenders.append(f"{rel}:{node.lineno}")
+    return offenders
+
+
+def test_ci_wait_arm_literals_costamp_pr_number():
+    """Tripwire: no dict literal may arm ``ci_waiting=True`` without ``pr_number``.
+
+    Guards the PR-identity split-brain fix: an identity-less CI-wait arm is
+    skipped by the merge-critical poll loop and only drains out-of-band. New arm
+    sites must either include ``"pr_number"`` in the same literal or route
+    through ``ci_merge_helpers.arm_ci_wait``.
+    """
+    app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+    offenders = _ci_wait_true_literals_missing_pr_number(app_dir)
+    assert not offenders, (
+        "Dict literal(s) arm ci_waiting=True without co-stamping pr_number "
+        "(identity-less shape the merge poll loop SKIPS):\n  "
+        + "\n  ".join(offenders)
+        + "\n\nInclude \"pr_number\" in the same literal, or route the arm site "
+        "through ci_merge_helpers.arm_ci_wait(review_loop, pr_number=..., "
+        "now_iso=...) which co-stamps pr_number + ci_wait_started and asserts "
+        "pr_number is non-None."
+    )
+
 # ---------------------------------------------------------------------------
 # Cache-by-default guardrail for github_refs.get_branch_sha
 # ---------------------------------------------------------------------------
@@ -10245,3 +10355,184 @@ def test_get_branch_sha_live_guard_scanner_flags_injected_site():
     )
     tree = ast.parse(src)
     assert list(_live_true_get_branch_sha_sites(tree, "fake.py")) == ["fake.py:_bad"]
+
+
+# ---------------------------------------------------------------------------
+# String patch-target resolution invariant
+# ---------------------------------------------------------------------------
+
+def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
+    """Return {filename: {target, ...}} for app.* string patch targets in test files.
+
+    Excludes patch() calls that carry ``create=True`` — those intentionally
+    name attributes that don't exist at module level.
+    """
+    result: dict[str, set[str]] = {}
+    for py_file in sorted(testing_dir.glob("*.py")):
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=py_file.name)
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+        targets: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in ("patch", "setattr"):
+                pass
+            elif isinstance(func, ast.Name) and func.id == "patch":
+                pass
+            else:
+                continue
+
+            # create=True patches intentionally reference non-existent attributes
+            if any(
+                kw.arg == "create"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            ):
+                continue
+
+            if not node.args:
+                continue
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant) or not isinstance(
+                first_arg.value, str
+            ):
+                continue
+            target = first_arg.value
+            # Require at least app.<module>.<attr> (two dots minimum)
+            if target.startswith("app.") and "." in target[4:]:
+                targets.add(target)
+
+        if targets:
+            result[py_file.name] = targets
+    return result
+
+
+def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] | None:
+    """Return the set of top-level names in a module file, or None if not found.
+
+    Scans only module-level statements (defs, class defs, assignments, imports).
+    Returns None when ``module_dotted`` does not map to a file on disk, which
+    indicates a "nested import" pattern (e.g. app.storage.storage mapping to
+    google.cloud.storage accessed via app.storage) — those are skipped rather
+    than flagged.
+    """
+    parts = module_dotted.split(".")
+    base = app_dir.parent  # backend/
+
+    candidate = base.joinpath(*parts).with_suffix(".py")
+    if not candidate.exists():
+        candidate = base.joinpath(*parts, "__init__.py")
+        if not candidate.exists():
+            return None
+
+    try:
+        source = candidate.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(candidate))
+    except (SyntaxError, UnicodeDecodeError):
+        return None
+
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                for n in ast.walk(tgt):
+                    if isinstance(n, ast.Name):
+                        names.add(n.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name)
+    return names
+
+
+def test_string_patch_targets_resolve():
+    """Every app.* string patch target in backend/testing/*.py must resolve to
+    an existing top-level name in its module.
+
+    Renaming or deleting an app.* symbol that is referenced in a string patch
+    target (mocker.patch / mock.patch / @patch / monkeypatch.setattr) silently
+    voids the mock — the real function runs instead of the mock, producing
+    false-passing tests. This invariant makes that class of breakage fail at
+    the standalone gate (scripts/test-backend.sh --standalone --no-postgres)
+    before it reaches CI, naming the offending test file and target.
+
+    Excluded: ``create=True`` patches (intentionally naming absent attributes)
+    and targets whose module path does not map to a file on disk (nested import
+    patterns such as ``app.storage.storage.Client``).
+    """
+    testing_dir = Path(__file__).resolve().parent
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+
+    targets_by_file = _collect_app_patch_targets(testing_dir)
+
+    module_cache: dict[str, set[str] | None] = {}
+    failures: list[str] = []
+
+    for test_file, targets in sorted(targets_by_file.items()):
+        for target in sorted(targets):
+            last_dot = target.rfind(".")
+            if last_dot == -1:
+                continue
+            module_dotted = target[:last_dot]
+            attr = target[last_dot + 1:]
+
+            if module_dotted not in module_cache:
+                module_cache[module_dotted] = _app_module_top_level_names(
+                    app_dir, module_dotted
+                )
+
+            top_level = module_cache[module_dotted]
+            if top_level is None:
+                continue  # nested import pattern — not checkable statically
+            if attr not in top_level:
+                failures.append(
+                    f"  {test_file}: '{target}' — '{attr}' not defined in {module_dotted}"
+                )
+
+    assert not failures, (
+        f"String patch targets that do not resolve ({len(failures)} offender(s)):\n"
+        + "\n".join(sorted(failures))
+        + "\n\nFix: rename the patch target string to match the current symbol name, "
+        "or remove the test if the functionality was deleted."
+    )
+
+
+def test_string_patch_target_scanner_self_tests():
+    """Self-tests for the patch-target scanner helpers."""
+    import textwrap
+    import tempfile
+
+    # Scanner detects a stale patch target
+    src_stale = textwrap.dedent("""
+        async def test_foo(mocker):
+            mocker.patch("app.nonexistent_module_xyz.nonexistent_func")
+    """)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        (tmpdir_path / "test_fake.py").write_text(src_stale)
+        result = _collect_app_patch_targets(tmpdir_path)
+        assert result == {
+            "test_fake.py": {"app.nonexistent_module_xyz.nonexistent_func"}
+        }
+
+    # create=True patches are excluded
+    src_create = textwrap.dedent("""
+        async def test_bar(mocker):
+            mocker.patch("app.some_module.some_func", create=True)
+    """)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        (tmpdir_path / "test_create.py").write_text(src_create)
+        assert _collect_app_patch_targets(tmpdir_path) == {}

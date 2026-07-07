@@ -21,6 +21,7 @@ const fetchKnowledgeDocument = vi.fn();
 const resolveArtifactDownloadUrl = vi.fn();
 const fetchComputeJobsAggregateSummary = vi.fn();
 const fetchHeldComputeExperiments = vi.fn();
+const fetchAwaitingLocalRunnerHolds = vi.fn();
 const fetchComputeSweepGroups = vi.fn();
 const rerunComputeExperiment = vi.fn();
 const askComputeJob = vi.fn();
@@ -39,6 +40,7 @@ vi.mock('../api', async () => {
     resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
     fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
     fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
+    fetchAwaitingLocalRunnerHolds: (...args: unknown[]) => fetchAwaitingLocalRunnerHolds(...args),
     fetchComputeSweepGroups: (...args: unknown[]) => fetchComputeSweepGroups(...args),
     rerunComputeExperiment: (...args: unknown[]) => rerunComputeExperiment(...args),
     askComputeJob: (...args: unknown[]) => askComputeJob(...args),
@@ -219,9 +221,14 @@ describe('ComputeJobsPanel render + kill', () => {
     resolveArtifactDownloadUrl.mockReset();
     fetchComputeJobsAggregateSummary.mockReset();
     fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
     fetchComputeSweepGroups.mockReset();
+    rerunComputeExperiment.mockReset();
     askComputeJob.mockReset();
     vi.restoreAllMocks();
+    // Clear persisted ask state between tests to prevent cross-test contamination
+    localStorage.removeItem('blueprint-admin:compute-ask-state:proj-1');
+    localStorage.removeItem('blueprint-admin:compute-ask-state:test-proj-persist');
   });
 
   test('renders budget bar and task title for an active job', async () => {
@@ -271,15 +278,17 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('kill button calls killComputeJob and shows killed reason', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     const active = makeJob();
     fetchComputeJobs.mockResolvedValue(wrapJobs([active]));
     killComputeJob.mockResolvedValue(
       makeJob({ status: 'CANCELLED', outcome: 'CANCELLED', terminal_reason: 'killed by operator (a@b.com)', final_cost_usd: 1.0 }),
     );
-    const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const { findByText, findByTestId, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const killBtn = await findByText('Kill');
     await act(async () => { killBtn.click(); });
+    // ConfirmDialog should appear; confirm it
+    const confirmBtn = await findByTestId('confirm-dialog-confirm');
+    await act(async () => { confirmBtn.click(); });
     await waitFor(() => expect(killComputeJob).toHaveBeenCalledWith('job-1'));
     await findByText('Killed by operator');
     expect(queryByText('Kill')).toBeNull();
@@ -576,12 +585,13 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('kill failure surfaces the backend explanation, not a generic message', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob()]));
     killComputeJob.mockRejectedValue(new Error('compute job already terminal: cannot kill'));
-    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const { findByText, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const killBtn = await findByText('Kill');
     await act(async () => { killBtn.click(); });
+    const confirmBtn = await findByTestId('confirm-dialog-confirm');
+    await act(async () => { confirmBtn.click(); });
     await waitFor(() => expect(killComputeJob).toHaveBeenCalledWith('job-1'));
     await findByText('compute job already terminal: cannot kill');
   });
@@ -764,6 +774,71 @@ describe('ComputeJobsPanel render + kill', () => {
     const subtitle = await findByText((t) => t.includes('SPOT'));
     expect(subtitle.textContent).toContain('gcp_compute_engine');
     expect(subtitle.textContent).toContain('SPOT');
+  });
+
+  test('clone-to-form button appears on terminal jobs and calls onCloneExperiment with mapped form fields', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      experiment: 'My Experiment',
+      hypothesis: 'test hypothesis',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      launch_params: {
+        command: 'python train.py',
+        declared_metric: 'accuracy',
+        metric: 'accuracy',
+        cwd: '/workspace',
+        env_keys: ['SEED'],
+        accelerator: 'T4',
+        machine_type: 'n1-standard-1',
+        container_image: 'nvcr.io/test:latest',
+        provisioning_model: 'SPOT',
+        spend_cap_usd: 5.0,
+        deadline_seconds: 3600,
+        require_live_release: true,
+        require_durable_artifact: false,
+        arms: null,
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const onCloneExperiment = vi.fn();
+    const { findByTestId } = render(
+      <ComputeJobsPanel projectId="proj-1" onCloneExperiment={onCloneExperiment} />
+    );
+    const cloneBtn = await findByTestId('clone-to-form');
+    await act(async () => { cloneBtn.click(); });
+    expect(onCloneExperiment).toHaveBeenCalledTimes(1);
+    const form = onCloneExperiment.mock.calls[0][0];
+    expect(form.command).toBe('python train.py');
+    expect(form.accelerator).toBe('T4');
+    expect(form.machineType).toBe('n1-standard-1');
+    expect(form.spendCapUsd).toBe('5');
+    expect(form.deadlineSeconds).toBe('3600');
+    expect(form.provisioningModel).toBe('SPOT');
+    expect(form.envVars).toBe('');
+    expect(form.requireLiveRelease).toBe(true);
+    expect(form.requireDurableArtifact).toBe(false);
+    expect(form.experiment).toBe('My Experiment');
+    expect(form.successMetric).toBe('accuracy');
+    expect(form.successOperator).toBe('>=');
+    expect(form.successThreshold).toBe('0.9');
+    expect(form.containerImage).toBe('nvcr.io/test:latest');
+    expect(form.useArmsMode).toBe(false);
+  });
+
+  test('clone-to-form button not rendered when onCloneExperiment is not provided', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      launch_params: { command: 'python train.py' },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Wait for jobs to load
+    await new Promise(r => setTimeout(r, 50));
+    expect(queryByTestId('clone-to-form')).toBeNull();
   });
 
   test('launch action calls onLaunchCompute from the empty compute workbench', async () => {
@@ -975,13 +1050,20 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(block.textContent).toContain('mlperf-v4');
   });
 
-  test('active job does not show experiment identity block even when fields present', async () => {
+  test('active job shows experiment identity block when fields present', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
-      makeJob({ experiment: 'sweep-v3', hypothesis: 'some hypothesis' }),
+      makeJob({
+        experiment: 'sweep-v3',
+        hypothesis: 'some hypothesis',
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      }),
     ]));
-    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const { findByText, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
-    expect(queryByTestId('compute-experiment-identity')).toBeNull();
+    const identityBlock = await findByTestId('compute-experiment-identity');
+    expect(identityBlock.textContent).toContain('sweep-v3');
+    expect(identityBlock.textContent).toContain('some hypothesis');
+    expect(identityBlock.textContent).toContain('accuracy >= 0.9');
   });
 
   test('terminal job without experiment/benchmark/hypothesis shows no identity block', async () => {
@@ -2158,6 +2240,79 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('held-experiments-section')).toBeNull();
   });
 
+  test('renders awaiting-local-runner section with title, spend cap, and waiting indicator', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    // Held ~5 minutes ago so the duration formats to a stable "5m" scale
+    // regardless of the second-or-two of test drift.
+    const since = new Date(Date.now() - 300_000).toISOString();
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([
+      {
+        id: 'task-await-1',
+        title: 'local sweep: qlora',
+        awaiting_local_runner_since: since,
+        created_at: since,
+        requires_approval: false,
+        spend_cap_usd: 8.5,
+        command: 'python train.py',
+        machine_type: null,
+        accelerator: null,
+        container_image: null,
+        provisioning_model: null,
+        deadline_seconds: null,
+      },
+    ]);
+    const { findByTestId, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const section = await findByTestId('awaiting-local-runner-section');
+    expect(section.textContent).toContain('local sweep: qlora');
+    expect(await findByText(/\$8\.50/)).toBeTruthy();
+    const waiting = await findByTestId('awaiting-local-runner-waiting');
+    expect(waiting.textContent).toContain('waiting for local runner');
+    expect(waiting.textContent).toMatch(/since .*ago/);
+    expect(waiting.textContent).toContain('5m');
+  });
+
+  test('awaiting-local-runner section is absent when no holds exist', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('No compute jobs');
+    expect(queryByTestId('awaiting-local-runner-section')).toBeNull();
+  });
+
+  test('awaiting-local-runner waiting indicator advances as the 1s clock ticks', async () => {
+    vi.useFakeTimers();
+    try {
+      const base = new Date('2026-07-04T00:00:00.000Z').getTime();
+      vi.setSystemTime(base);
+      fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+      fetchAwaitingLocalRunnerHolds.mockResolvedValue([
+        {
+          id: 'task-await-2',
+          title: 'local sweep: clock',
+          awaiting_local_runner_since: new Date(base - 10_000).toISOString(),
+          created_at: new Date(base - 10_000).toISOString(),
+          requires_approval: false,
+          spend_cap_usd: null,
+          command: null,
+          machine_type: null,
+          accelerator: null,
+          container_image: null,
+          provisioning_model: null,
+          deadline_seconds: null,
+        },
+      ]);
+      const { getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+      // Flush the leading poller promise so the hold state is applied.
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      expect(getByTestId('awaiting-local-runner-waiting').textContent).toContain('10s');
+      // The local 1s clock should advance the live duration.
+      await act(async () => { vi.advanceTimersByTime(5_000); });
+      expect(getByTestId('awaiting-local-runner-waiting').textContent).toContain('15s');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test('renders View in Library button when knowledge doc present and onNavigateToKnowledge is provided, calls it with doc id', async () => {
     const terminal = makeJob({
       status: 'SUCCEEDED',
@@ -2445,6 +2600,30 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByTestId('rerun-inline-panel');
     await act(async () => { (await findByTestId('rerun-submit')).click(); });
     expect(rerunComputeExperiment).toHaveBeenCalledWith('task-1', expect.objectContaining({ spend_cap_usd: 4.0 }));
+  });
+
+  test('surfaces compute re-run response and held approval state', async () => {
+    rerunComputeExperiment.mockResolvedValue({ id: 'new-task-xyz', status: 'QUEUED', requires_approval: true });
+    const terminal = makeJob({
+      status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, task_id: 'task-1',
+      spend_cap_usd: 4.0,
+      success_criterion: { metric: 'acc', operator: '>=' as const, threshold: 0.9 },
+    });
+    // Set default mock to return the terminal job for all subsequent load() calls after the initial render
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    // First call during render will use this override
+    fetchComputeJobs.mockResolvedValueOnce(wrapJobs([terminal]));
+    const { findByRole, findByTestId, getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { (await findByRole('button', { name: 'Re-run' })).click(); });
+    await findByTestId('rerun-inline-panel');
+    await act(async () => { (await findByTestId('rerun-submit')).click(); });
+    expect(rerunComputeExperiment).toHaveBeenCalledWith('task-1', expect.objectContaining({ spend_cap_usd: 4.0 }));
+    // Verify the new task id is displayed
+    await findByTestId('rerun-inline-panel');
+    expect(getByText('new-task-xyz')).toBeTruthy();
+    // Verify the approval requirement is displayed
+    expect(getByText('Held for approval')).toBeTruthy();
   });
 
   test('arms breakdown shows per-arm pass/fail chip and cost when per_arm_verdicts present', async () => {
@@ -3148,5 +3327,148 @@ describe('ComputeJobsPanel render + kill', () => {
     // Thread must be gone after clearing
     expect(queryByTestId('compute-ask-result')).toBeNull();
     expect(queryByTestId('compute-ask-thread')).toBeNull();
+  });
+
+  test('shows experiment identity section for active jobs with experiment, hypothesis, and criterion', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        experiment: 'model-accuracy-sweep',
+        hypothesis: 'Increasing batch size improves convergence speed without harming final accuracy',
+        success_criterion: {
+          metric: 'accuracy',
+          operator: '>=',
+          threshold: 0.92,
+        },
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+
+    // Verify experiment identity section renders for active job
+    const identitySection = await findByTestId('compute-experiment-identity');
+    expect(identitySection.textContent).toContain('model-accuracy-sweep');
+    expect(identitySection.textContent).toContain('Increasing batch size improves convergence speed');
+    expect(identitySection.textContent).toContain('accuracy >= 0.92');
+  });
+
+  test('ask-this-run threads persist across panel visits via localStorage', async () => {
+    // Clear only the key we'll use for this test
+    const testKey = 'blueprint-admin:compute-ask-state:test-proj-persist';
+    localStorage.removeItem(testKey);
+
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The run succeeded because all metrics met the criterion.',
+      citations: ['criterion_verdict:accuracy=0.95'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+
+    // Render 1: ask a question and get a response using a unique project ID
+    const { findByTestId: findByTestId1, unmount: unmount1 } = render(
+      <ComputeJobsPanel projectId="test-proj-persist" />
+    );
+    const input1 = await findByTestId1('compute-ask-input');
+    await act(async () => { fireEvent.change(input1, { target: { value: 'Why did this succeed?' } }); });
+    const submitBtn1 = await findByTestId1('compute-ask-submit');
+    await act(async () => { submitBtn1.click(); });
+
+    // Wait for the response to appear in the thread
+    await findByTestId1('compute-ask-thread');
+
+    // Verify localStorage has the question + response saved
+    const storedState1 = localStorage.getItem(testKey);
+    expect(storedState1).toBeTruthy();
+    const parsed1 = JSON.parse(storedState1!);
+    expect(parsed1['job-1']).toBeTruthy();
+    expect(parsed1['job-1'].thread).toHaveLength(1);
+    expect(parsed1['job-1'].thread[0].question).toBe('Why did this succeed?');
+    expect(parsed1['job-1'].thread[0].result.answer).toContain('metrics met');
+
+    // Unmount the component
+    unmount1();
+
+    // Reset the fetch mock for the second render
+    fetchComputeJobs.mockClear();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+
+    // Render 2: component should restore the thread from localStorage
+    const { findByTestId: findByTestId2 } = render(
+      <ComputeJobsPanel projectId="test-proj-persist" />
+    );
+
+    // Thread should be visible immediately without asking again
+    const thread = await findByTestId2('compute-ask-thread');
+    expect(thread.textContent).toContain('Why did this succeed?');
+    expect(thread.textContent).toContain('The run succeeded because all metrics met the criterion.');
+
+    // Verify localStorage still has the same state
+    const storedState2 = localStorage.getItem(testKey);
+    expect(storedState2).toBe(storedState1);
+
+    // Cleanup
+    localStorage.removeItem(testKey);
+  });
+});
+
+describe('ComputeJobsPanel — draft provenance', () => {
+  beforeEach(() => {
+    fetchComputeJobs.mockReset();
+    killComputeJob.mockReset();
+    analyzeComputeJob.mockReset();
+    rerunComputeExperiment.mockReset();
+    askComputeJob.mockReset();
+  });
+
+  test('renders provenance block when operator_idea_text is present', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        launch_params: {
+          provenance: {
+            idea: 'Fine-tune LR on ImageNet',
+            draft_notes: 'Suggested 0.01 as the optimal learning rate based on literature.',
+            drafted_from_refinement: true,
+          },
+        },
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-draft-provenance');
+    expect(block.textContent).toContain('Fine-tune LR on ImageNet');
+    expect(block.textContent).toContain('Suggested 0.01 as the optimal learning rate');
+    expect(block.textContent).toContain('From AI draft');
+  });
+
+  test('renders provenance block with only idea text when llm_draft_notes is absent', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        launch_params: {
+          provenance: {
+            idea: 'Test batch size scaling',
+            drafted_from_refinement: false,
+          },
+        },
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-draft-provenance');
+    expect(block.textContent).toContain('Test batch size scaling');
+    expect(block.textContent).not.toContain('From AI draft');
+  });
+
+  test('does not render provenance block when neither idea nor notes are present', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
+    ]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-draft-provenance')).toBeNull();
   });
 });

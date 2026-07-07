@@ -37,7 +37,11 @@ from app.acceptance_gate import (
     acceptance_was_declared,
     classify_merged_acceptance,
 )
-from app.landed_signal import LANDED_ON_INTEGRATION_KEY, is_merged_completion
+from app.landed_signal import (
+    LANDED_ON_INTEGRATION_KEY,
+    has_merge_unblock_signal,
+    is_merged_completion,
+)
 from app.models import (
     Artifact,
     ArtifactType,
@@ -46,25 +50,16 @@ from app.models import (
     TaskStatus,
     get_task_cost_by_provider_model,
 )
-from app.task_capabilities import PRODUCT_TASK_TYPES, WRITE_TASK_TYPES
+from app.task_capabilities import PRODUCT_TASK_TYPES, READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
-# Task types that never open a PR. Used as the shared source of truth for the
-# conversion-rate denominator across backend surfaces (digest_direction_progress,
-# pipeline_health) and the agent-side stats renderer.  Ineligible tasks are
-# excluded from per-scope and per-direction conversion denominators so that
+# Task types that never open a PR. Derived directly from the registry so that
+# newly-registered read_only types are automatically excluded from the
+# conversion-rate denominator without requiring a manual edit here.  Used as
+# the shared source of truth across backend surfaces (digest_direction_progress,
+# pipeline_health) and the agent-side stats renderer so that
 # knowledge/compute outputs don't deflate the merged-PR rate.
-PR_INELIGIBLE_TASK_TYPES = frozenset(
-    {
-        "research",
-        "investigate",
-        "audit",
-        "memo",
-        "web_research",
-        "design",
-        "compute_experiment",
-    }
-)
+PR_INELIGIBLE_TASK_TYPES: frozenset[str] = READ_ONLY_TASK_TYPES
 
 
 def _is_cascade_cancelled(task: Task) -> bool:
@@ -181,6 +176,33 @@ def verified_merged_count(entry: dict) -> int:
     """
     if "verified_prs_merged" in entry:
         return int(entry.get("verified_prs_merged") or 0)
+    return int(entry.get("prs_merged") or 0)
+
+
+def verified_autonomous_merged_count(entry: dict) -> int:
+    """Verification-aware AUTONOMOUS merged-PR count for a research_history entry.
+
+    The honest counterpart to the raw ``autonomous_prs_merged`` field: counts
+    only autonomous merges (no operator intervention) that ALSO landed in a
+    verified acceptance bucket — i.e. the intersection recorded as
+    ``verified_autonomous_prs_merged`` by ``_update_direction_research_outcomes``.
+    Degraded-unverified and acceptance-unsatisfied autonomous merges are excluded
+    (they count in ``autonomous_prs_merged`` but not here), and confirmed-stranded
+    merges are already absent because a full recompute drops them from the merged
+    rows entirely. By construction ``verified_autonomous_prs_merged`` is never
+    larger than either ``autonomous_prs_merged`` or ``verified_prs_merged``.
+
+    This is the honest basis for the 10-merge retirement-eligibility milestone in
+    :func:`compute_direction_autonomy_state`. A two-step legacy fallback keeps
+    historical directions whole: entries written before this field existed fall
+    back to the raw ``autonomous_prs_merged`` count, and pre-attribution entries
+    lacking even that fall back to ``prs_merged`` — degrading to the prior
+    (raw-autonomous / all-merges-autonomous) behavior rather than dropping to zero.
+    """
+    if "verified_autonomous_prs_merged" in entry:
+        return int(entry.get("verified_autonomous_prs_merged") or 0)
+    if "autonomous_prs_merged" in entry:
+        return int(entry.get("autonomous_prs_merged") or 0)
     return int(entry.get("prs_merged") or 0)
 
 
@@ -324,6 +346,27 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
             violations.append(
                 f"reachable ({reachable}) exceeds prs_merged ({prs_merged})"
             )
+    # verified_autonomous_prs_merged is the honest, verification-aware subset of
+    # autonomous_prs_merged used for the retirement milestone. It must never
+    # outrun either the raw autonomous count or the verified count. Only checked
+    # when present — legacy entries without it are skipped.
+    if "verified_autonomous_prs_merged" in entry:
+        verified_autonomous = int(entry.get("verified_autonomous_prs_merged") or 0)
+        autonomous = int(entry.get("autonomous_prs_merged") or 0)
+        if verified_autonomous < 0:
+            violations.append(
+                f"verified-autonomous ({verified_autonomous}) is negative"
+            )
+        if verified_autonomous > autonomous:
+            violations.append(
+                f"verified-autonomous ({verified_autonomous}) exceeds "
+                f"autonomous ({autonomous})"
+            )
+        if verified_autonomous > verified:
+            violations.append(
+                f"verified-autonomous ({verified_autonomous}) exceeds "
+                f"verified ({verified})"
+            )
     # stranded_prs_merged is a delta-patch applied between stranding and the next
     # full recompute; _update_direction_research_outcomes resets it to 0 once a
     # recompute runs (stranded tasks are already absent from prs_merged at that
@@ -395,9 +438,21 @@ _SPAWN_GATE_REASON_MAX_LEN = 200
 def compute_direction_autonomy_state(direction: dict) -> dict:
     """Return lifetime autonomy metrics and retirement eligibility for a direction.
 
-    Reads research_history and history_aggregate; applies a legacy fallback so
-    pre-attribution entries (no autonomous_prs_merged key) treat prs_merged as
-    autonomous — consistent with _fold_evicted_into_aggregate and admin_digest.
+    The SINGLE source of truth for the retirement-eligibility milestone —
+    strategic_spawning.py's strategist stat payload calls this rather than
+    re-deriving the rule inline, so the two surfaces can never disagree.
+
+    Retirement eligibility credits only VERIFIABLY-LANDED autonomous merges:
+    ``lifetime_autonomous_prs_merged`` sums the verification-aware
+    ``verified_autonomous_prs_merged`` field (see
+    :func:`verified_autonomous_merged_count`) across research_history plus the
+    ``total_verified_autonomous_prs_merged`` aggregate. Degraded-unverified and
+    acceptance-unsatisfied autonomous merges — merges that never verifiably
+    landed — are therefore NOT counted, mirroring how ``verified_prs_merged``
+    relates to the raw ``prs_merged``. A two-step legacy fallback keeps
+    historical directions whole: entries without the verified field fall back to
+    the raw ``autonomous_prs_merged`` count, and pre-attribution entries fall
+    back to ``prs_merged``, so no direction silently loses accumulated credit.
 
     A direction is retirement-eligible when lifetime_autonomous_prs_merged >= 10
     AND lifetime_operator_actions == 0 (zero-tolerance for operator intervention).
@@ -405,8 +460,14 @@ def compute_direction_autonomy_state(direction: dict) -> dict:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     lifetime_autonomous = sum(
-        h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history
-    ) + (agg.get("total_autonomous_prs_merged") or 0)
+        verified_autonomous_merged_count(h) for h in history
+    ) + (
+        agg.get(
+            "total_verified_autonomous_prs_merged",
+            agg.get("total_autonomous_prs_merged", 0),
+        )
+        or 0
+    )
     lifetime_op_actions = sum(h.get("operator_action_count", 0) for h in history) + (
         agg.get("total_operator_actions") or 0
     )
@@ -573,11 +634,17 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "prs_merged": {
         "consumer": "digest_direction_progress.py, direction_lifecycle.py, strategic_spawning.py, DirectionCard.tsx (+ many)"
     },
+    "merged_prs_any_base": {
+        "consumer": "strategic_completion.py (_compute_churn_metrics raw-merge-volume backstop — never pause a direction with real merges in flight)"
+    },
     "prs_rejected": {
         "consumer": "review_pipeline.py, pipeline_health.py, strategic_spawning.py"
     },
     "autonomous_prs_merged": {
         "consumer": "compute_direction_autonomy_state (this module), strategic_spawning.py, DirectionCard.tsx"
+    },
+    "verified_autonomous_prs_merged": {
+        "consumer": "compute_direction_autonomy_state (this module), strategic_spawning.py"
     },
     "assisted_prs_merged": {
         "consumer": "digest_direction_progress.py, direction_metrics.py"
@@ -834,6 +901,125 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
 }
 
 
+def _apply_evicted_generalized_and_acceptance_deltas(
+    agg: dict, snap: dict, entry: dict
+) -> None:
+    """Heal the acceptance-verified + generalized aggregate keys on a late recompute.
+
+    Companion to the primitive ``_DELTA_FIELDS`` loop in
+    :func:`_apply_direction_outcomes`: when a late recompute runs on an evicted
+    cycle, this applies deltas for the aggregate keys that
+    :func:`~app.direction_metrics._fold_evicted_into_aggregate` credits but the
+    primitive delta list omits — ``total_acceptance_verified_merged``,
+    ``total_acceptance_verified_write_merged`` (both gated on
+    ``acceptance_merged_write_total`` presence in the fresh ``entry``, mirroring
+    the fold's condition so a cycle that lost acceptance-awareness is handled
+    consistently), ``total_generalized_successes``,
+    ``total_generalized_terminal_outcomes``, and the nested
+    ``outcome_kind_breakdown``.
+
+    Reuses the same direction_metrics helpers the fold uses so the delta and the
+    fold cannot drift. LEGACY BACKFILL: snapshots persisted before these baselines
+    existed lack the new keys; each missing baseline is seeded from the SAME
+    fallback the fold used BEFORE the delta is taken (see per-field comments), so
+    no legacy cycle is double-counted or dropped to zero.
+    """
+    from app.direction_metrics import (  # noqa: PLC0415
+        _OUTCOME_KIND_STATUSES,
+        _copy_outcome_kind_breakdown,
+        _entry_generalized_successes,
+        _entry_generalized_terminal_outcomes,
+        _fallback_outcome_kind_breakdown,
+    )
+
+    _fresh_acceptance_aware = "acceptance_merged_write_total" in entry
+    # --- Acceptance-verified merged base ---
+    # Fresh contribution mirrors the fold: verified_merged_count credited only when
+    # the cycle is acceptance-aware. A legacy snapshot without the stored baseline
+    # falls back to verified_merged_count(snap) (reconstructed from the snapshot's
+    # verified_prs_merged), consistent with the value the fold credited at eviction.
+    _fresh_acc_verified = verified_merged_count(entry) if _fresh_acceptance_aware else 0
+    _snap_acc_verified = int(
+        snap.get("acceptance_verified_merged", verified_merged_count(snap)) or 0
+    )
+    _delta = _fresh_acc_verified - _snap_acc_verified
+    if _delta:
+        agg["total_acceptance_verified_merged"] = (
+            int(agg.get("total_acceptance_verified_merged") or 0) + _delta
+        )
+    # --- Verified WRITE slice ---
+    # The write-verified count cannot be reconstructed from a legacy snapshot's
+    # stored primitives, so when the baseline is absent it is seeded to the fresh
+    # value (delta 0): the folded eviction-time value is retained rather than
+    # double-counted, and the snapshot rewrite re-syncs it for future recomputes.
+    _fresh_acc_verified_write = (
+        int(entry.get("acceptance_verified_write_merged") or 0)
+        if _fresh_acceptance_aware
+        else 0
+    )
+    _snap_acc_verified_write = int(
+        snap.get("acceptance_verified_write_merged", _fresh_acc_verified_write) or 0
+    )
+    _delta = _fresh_acc_verified_write - _snap_acc_verified_write
+    if _delta:
+        agg["total_acceptance_verified_write_merged"] = (
+            int(agg.get("total_acceptance_verified_write_merged") or 0) + _delta
+        )
+    # --- Generalized successes / terminal outcomes ---
+    # The per-cycle generalized contribution is NOT reconstructable from the sparse
+    # snapshot (it includes read-only tasks, failed tasks, etc. — not just merges).
+    # For a legacy snapshot (new keys absent), seed to the FRESH value so the delta
+    # is 0: the fold already credited the rich eviction-time values into the aggregate,
+    # so we retain those rather than re-adding. This mirrors the acceptance_verified_write
+    # treatment above and avoids the double-count when terminal > prs_merged.
+    _fresh_gen_succ = _entry_generalized_successes(entry)
+    _snap_gen_succ = int(snap.get("generalized_successes", _fresh_gen_succ) or 0)
+    _delta = _fresh_gen_succ - _snap_gen_succ
+    if _delta:
+        agg["total_generalized_successes"] = (
+            int(agg.get("total_generalized_successes") or 0) + _delta
+        )
+    _fresh_gen_term = _entry_generalized_terminal_outcomes(entry)
+    _snap_gen_term = int(snap.get("generalized_terminal_outcomes", _fresh_gen_term) or 0)
+    _delta = _fresh_gen_term - _snap_gen_term
+    if _delta:
+        agg["total_generalized_terminal_outcomes"] = (
+            int(agg.get("total_generalized_terminal_outcomes") or 0) + _delta
+        )
+    # --- Nested outcome_kind_breakdown ---
+    # Delta per kind and per status; clamp each bucket status independently at 0 so
+    # a negative delta can never push one bucket negative and corrupt the others.
+    _fresh_bd = _copy_outcome_kind_breakdown(
+        entry.get("outcome_kind_breakdown") or _fallback_outcome_kind_breakdown(entry)
+    )
+    _snap_bd_raw = snap.get("outcome_kind_breakdown")
+    if isinstance(_snap_bd_raw, dict):
+        _snap_bd = _copy_outcome_kind_breakdown(_snap_bd_raw)
+    else:
+        # Legacy snapshot without the breakdown: seed to the fresh value so the
+        # delta is 0 per bucket (retain the already-folded eviction-time credit).
+        _snap_bd = _copy_outcome_kind_breakdown(_fresh_bd)
+    _agg_bd = agg.get("outcome_kind_breakdown")
+    if not isinstance(_agg_bd, dict):
+        _agg_bd = {}
+    for _kind in set(_fresh_bd) | set(_snap_bd):
+        _fresh_counts = _fresh_bd.get(_kind) or {}
+        _snap_counts = _snap_bd.get(_kind) or {}
+        _bucket = _agg_bd.get(_kind)
+        if not isinstance(_bucket, dict):
+            _bucket = {"success": 0, "neutral": 0, "failure": 0}
+            _agg_bd[_kind] = _bucket
+        for _status in _OUTCOME_KIND_STATUSES:
+            _status_delta = int(_fresh_counts.get(_status, 0) or 0) - int(
+                _snap_counts.get(_status, 0) or 0
+            )
+            if _status_delta:
+                _bucket[_status] = max(
+                    0, int(_bucket.get(_status, 0) or 0) + _status_delta
+                )
+    agg["outcome_kind_breakdown"] = _agg_bd
+
+
 async def _update_direction_research_outcomes(
     project_id: uuid.UUID,
     direction_id: str,
@@ -866,8 +1052,17 @@ async def _update_direction_research_outcomes(
         ),
         None,
     )
+    _evicted_snap: dict | None = None
     if entry_snap is None:
-        return
+        # Check whether this cycle was evicted into history_aggregate vs. genuinely absent.
+        _evicted_snap = (
+            (d.get("history_aggregate") or {}).get("_evicted_cycle_snapshots") or {}
+        ).get(research_task_id)
+        if _evicted_snap is None:
+            return
+        # Entry was evicted — continue computation so delta logic can apply
+        # incremental merge-count updates to history_aggregate via _apply_direction_outcomes.
+        entry_snap = {"task_id": research_task_id}
     # Work on a mutable copy; all stat writes accumulate here and are then
     # applied to the freshly-locked directions row inside with_directions_locked.
     entry = dict(entry_snap)
@@ -1089,7 +1284,10 @@ async def _update_direction_research_outcomes(
     # smearing sibling merges, costs, and counts across unrelated directions. Legacy
     # single-direction cycles (no child has direction_id set) keep all children so
     # existing history entries are unaffected.
-    if any((ct.context or {}).get("direction_id") for ct in child_tasks_rows):
+    has_tagged_children = any(
+        (ct.context or {}).get("direction_id") for ct in child_tasks_rows
+    )
+    if has_tagged_children:
         child_tasks_rows = [
             ct
             for ct in child_tasks_rows
@@ -1100,6 +1298,8 @@ async def _update_direction_research_outcomes(
         if project is not None:
             session.expire(project, ["directions"])
 
+            _zero_child_evicted: list[bool] = [False]
+
             def _apply_zero_child_spawn_gate(dirs: list) -> None:
                 for fresh_d in dirs:
                     if fresh_d.get("id") != direction_id:
@@ -1108,13 +1308,29 @@ async def _update_direction_research_outcomes(
                     for idx, history_entry in enumerate(history):
                         if history_entry.get("task_id") == research_task_id:
                             history[idx] = entry
-                            break
+                            fresh_d["research_history"] = history
+                            return
+                    # Entry not found in live history — check if it was evicted.
+                    _agg = fresh_d.get("history_aggregate") or {}
+                    if (
+                        _agg.get("_evicted_cycle_snapshots") or {}
+                    ).get(research_task_id):
+                        _zero_child_evicted[0] = True
                     fresh_d["research_history"] = history
                     break
 
             await with_directions_locked(
                 session, project_id, _apply_zero_child_spawn_gate
             )
+            if _zero_child_evicted[0]:
+                import logging as _log_zero
+                _log_zero.getLogger(__name__).warning(
+                    "[DIRECTION] zero-child spawn-gate patch skipped for evicted cycle "
+                    "(research_task_id=%s, direction_id=%s): "
+                    "spawn-gate fields have no aggregate equivalent",
+                    research_task_id,
+                    direction_id,
+                )
             await session.commit()
         return
     # Set of child task IDs that ever opened a PR. The PULL_REQUEST Artifact is
@@ -1141,9 +1357,20 @@ async def _update_direction_research_outcomes(
     )
 
     def _opened_pr(ct: Task) -> bool:
-        """True when *ct* opened a PR (via any reliable signal)."""
+        """True when *ct* opened a PR (via any reliable signal).
+
+        PULL_REQUEST artifact is the authoritative signal.  The pr_number
+        fallbacks below are intentionally skipped for 'review', 'fix', and
+        'panel_review' task types: ReviewPayload/PanelReviewPayload.pr_number
+        is the PR under review (not one opened by the task), and fix tasks
+        iterate an existing PR rather than opening a new one (see
+        _PR_OPENING_COMPLETION_TYPES in task_lifecycle.py).
+        """
         if ct.id in _pr_artifact_task_ids:
             return True
+        ct_type = (ct.first_payload or {}).get("type", "")
+        if ct_type in ("review", "fix", "panel_review"):
+            return False
         ctx_ = ct.context or {}
         if ctx_.get("pr_number") or ctx_.get("rollup_pr_number"):
             return True
@@ -1193,6 +1420,23 @@ async def _update_direction_research_outcomes(
     # to return them to QUEUED.
     # tasks_blocked retired 2026-06-05 — see RESEARCH_HISTORY_METRIC_MANIFEST.
     entry["prs_merged"] = sum(1 for ct in child_tasks_rows if is_merged_completion(ct))
+    # merged_prs_any_base: children that COMPLETED, opened a real PR, and got that
+    # PR MERGED — onto the integration branch OR a rollup staging branch. It is the
+    # raw merge-*volume* signal: unlike prs_merged (integration-landed only, gated
+    # on is_merged_completion), a child whose PR merged to a staging branch still
+    # carries has_merge_unblock_signal=True (pr_merged) even before its rollup lands
+    # and re-stamps landed_on_integration. No-op / no-PR success closes are excluded
+    # via _opened_pr, so this never counts "no changes needed" completions as merges.
+    # Consumed by the churn guardrail as a defense-in-depth backstop: a direction
+    # with real merges in flight is never paused as "0 real merges" even if a rollup
+    # landing's credit propagation has not yet recomputed prs_merged.
+    entry["merged_prs_any_base"] = sum(
+        1
+        for ct in child_tasks_rows
+        if ct.status == TaskStatus.COMPLETED
+        and has_merge_unblock_signal(ct)
+        and _opened_pr(ct)
+    )
     entry["prs_rejected"] = sum(
         1
         for ct in child_tasks_rows
@@ -1244,6 +1488,23 @@ async def _update_direction_research_outcomes(
         aggregate_buckets["proven"]
         + aggregate_buckets["satisfied_unproven"]
         + aggregate_buckets["undeclared"]
+    )
+    # verified_autonomous_prs_merged: the honest basis for the retirement-
+    # eligibility milestone (compute_direction_autonomy_state). A merge counts
+    # here only when it is BOTH autonomous (no operator intervention) AND lands
+    # in one of the same verified acceptance buckets as verified_prs_merged
+    # (proven + satisfied_unproven + undeclared). Degraded-unverified and
+    # acceptance-unsatisfied autonomous merges are excluded, so by construction
+    # verified_autonomous_prs_merged <= autonomous_prs_merged and
+    # <= verified_prs_merged. Confirmed-stranded merges are already absent from
+    # _merged_rows (is_merged_completion returns False when landed_on_integration
+    # is explicitly False), so they never inflate this count on a full recompute.
+    _VERIFIED_ACCEPTANCE_BUCKETS = ("proven", "satisfied_unproven", "undeclared")
+    entry["verified_autonomous_prs_merged"] = sum(
+        1
+        for ct in _merged_rows
+        if is_autonomous_merge(ct)
+        and classify_merged_acceptance(ct) in _VERIFIED_ACCEPTANCE_BUCKETS
     )
     # A full recompute already excludes confirmed-stranded tasks from prs_merged
     # and verified_prs_merged (is_merged_completion returns False when
@@ -1348,18 +1609,34 @@ async def _update_direction_research_outcomes(
     entry["preventive_context_tasks_failed"] = sum(
         1 for ct in _prev_rows if _counts_as_failure(ct)
     )
-    challenged_children = [
-        ct
-        for ct in child_tasks_rows
-        if (ct.context or {}).get("research_spawn_gate_challenged") is True
-        and (ct.context or {}).get("direction_id") == direction_id
-    ]
-    unchallenged_children = [
-        ct
-        for ct in child_tasks_rows
-        if not (ct.context or {}).get("research_spawn_gate_challenged")
-        and (ct.context or {}).get("direction_id") == direction_id
-    ]
+    # Spawn-gate metrics: filter by direction_id only if children are tagged
+    # (new multi-direction mode). In legacy mode (untagged children), all
+    # children in child_tasks_rows already match this direction, so skip the
+    # redundant filter that would exclude all untagged children.
+    if has_tagged_children:
+        challenged_children = [
+            ct
+            for ct in child_tasks_rows
+            if (ct.context or {}).get("research_spawn_gate_challenged") is True
+            and (ct.context or {}).get("direction_id") == direction_id
+        ]
+        unchallenged_children = [
+            ct
+            for ct in child_tasks_rows
+            if not (ct.context or {}).get("research_spawn_gate_challenged")
+            and (ct.context or {}).get("direction_id") == direction_id
+        ]
+    else:
+        challenged_children = [
+            ct
+            for ct in child_tasks_rows
+            if (ct.context or {}).get("research_spawn_gate_challenged") is True
+        ]
+        unchallenged_children = [
+            ct
+            for ct in child_tasks_rows
+            if not (ct.context or {}).get("research_spawn_gate_challenged")
+        ]
     challenged_spawned = len(challenged_children)
     unchallenged_spawned = len(unchallenged_children)
     challenged_merged = sum(1 for ct in challenged_children if is_merged_completion(ct))
@@ -2109,6 +2386,23 @@ async def _update_direction_research_outcomes(
     # each other's research_history entries via stale whole-array overwrites.
     session.expire(project, ["directions"])
 
+    # Aggregate-delta fields: (entry_key, aggregate_key) pairs that
+    # _fold_evicted_into_aggregate accumulates. Used by _apply_direction_outcomes
+    # to apply incremental deltas when the live entry was evicted.
+    _DELTA_FIELDS = (
+        ("prs_merged", "total_prs_merged"),
+        ("verified_prs_merged", "total_verified_prs_merged"),
+        ("autonomous_prs_merged", "total_autonomous_prs_merged"),
+        ("verified_autonomous_prs_merged", "total_verified_autonomous_prs_merged"),
+        ("assisted_prs_merged", "total_assisted_prs_merged"),
+        ("reachable_prs_merged", "total_reachable_prs_merged"),
+        ("stranded_prs_merged", "total_stranded_prs_merged"),
+        ("acceptance_proven_merged", "total_acceptance_proven_merged"),
+        ("acceptance_consumed_merged", "total_acceptance_consumed_merged"),
+        ("acceptance_declared_merged", "total_acceptance_declared_merged"),
+        ("acceptance_merged_write_total", "total_acceptance_merged_write_total"),
+    )
+
     def _apply_direction_outcomes(dirs: list) -> None:
         target_d = next((x for x in dirs if x.get("id") == direction_id), None)
         if target_d is None:
@@ -2122,6 +2416,39 @@ async def _update_direction_research_outcomes(
             None,
         )
         if target_entry is None:
+            if _evicted_snap is None:
+                return
+            # Cycle was evicted — apply incremental merge-count deltas to history_aggregate
+            # so late merges and stranded corrections are not permanently lost.
+            _agg = target_d.get("history_aggregate") or {}
+            _snaps = _agg.get("_evicted_cycle_snapshots") or {}
+            _snap = _snaps.get(research_task_id)
+            if _snap is None:
+                return
+            for _entry_key, _agg_key in _DELTA_FIELDS:
+                _new_val = int(entry.get(_entry_key) or 0)
+                _snap_val = int(_snap.get(_entry_key) or 0)
+                _delta = _new_val - _snap_val
+                if _delta != 0:
+                    _agg[_agg_key] = int(_agg.get(_agg_key) or 0) + _delta
+            # ALSO heal the acceptance-verified + generalized aggregate keys that the
+            # fold credits but the primitive _DELTA_FIELDS list omits — otherwise a
+            # late merge on an evicted cycle leaves total_acceptance_verified_merged,
+            # total_acceptance_verified_write_merged, total_generalized_successes,
+            # total_generalized_terminal_outcomes, and outcome_kind_breakdown frozen
+            # at their eviction-time values, silently diverging the proof-weighted
+            # scoring / digest / strategist surfaces from ground truth.
+            _apply_evicted_generalized_and_acceptance_deltas(_agg, _snap, entry)
+            # Update snapshot to the new baseline (all keys, via the shared builder so
+            # it stays byte-identical to the two snapshot-writing sites) for
+            # idempotency on future recomputes.
+            from app.direction_metrics import (  # noqa: PLC0415
+                build_evicted_cycle_snapshot,
+            )
+
+            _snaps[research_task_id] = build_evicted_cycle_snapshot(entry)
+            _agg["_evicted_cycle_snapshots"] = _snaps
+            target_d["history_aggregate"] = _agg
             return
         target_entry.update(entry)
         if new_context is not None:
@@ -2186,6 +2513,13 @@ async def refresh_direction_outcomes_after_merge(
     ctx = task.context or {}
     direction_id = ctx.get("direction_id")
     research_task_id = ctx.get("research_task_id")
+    # Snapshot the task id for the best-effort failure logs below. Both blocks
+    # call session.rollback() on failure (expiring `task` regardless of
+    # expire_on_commit); a later getattr(task, "id") in the except handlers would
+    # fire a sync lazy-load -> MissingGreenlet (getattr's default does NOT swallow
+    # it — a lazy-load raises MissingGreenlet, not AttributeError), which would
+    # propagate out of merge finalization.
+    _task_id_str = str(task.id)
     # Direction outcome recompute requires both IDs; skip if either is absent.
     if direction_id and research_task_id:
         try:
@@ -2195,11 +2529,16 @@ async def refresh_direction_outcomes_after_merge(
         except Exception as exc:  # noqa: BLE001 — best-effort; must not break merge finalize
             logging.getLogger(__name__).warning(
                 "[DIRECTION] post-merge outcome refresh failed for task %s: %r",
-                getattr(task, "id", None),
+                _task_id_str,
                 exc,
             )
             with contextlib.suppress(Exception):
                 await session.rollback()
+                # rollback expired `task`; re-materialise it so the criterion
+                # evidence block below (which passes the live ORM task to
+                # record_task_merge_evidence) runs on a live instance instead of
+                # firing a sync lazy-load -> MissingGreenlet.
+                await session.refresh(task)
     # Criterion evidence is independent of the direction recompute — record for
     # any task that carries criterion_ids and a proven verdict.
     # Best-effort: a failure here must never break merge finalization.
@@ -2210,7 +2549,7 @@ async def refresh_direction_outcomes_after_merge(
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
             "[DIRECTION] criterion evidence recording failed for task %s: %r",
-            getattr(task, "id", None),
+            _task_id_str,
             exc,
         )
         with contextlib.suppress(Exception):
@@ -2267,24 +2606,47 @@ async def discount_stranded_pr_from_direction_credit(
         # Idempotency guard: discount already applied on a prior cycle; skip.
         return
     try:
+        _discount_was_applied: list[bool] = [False]
 
         def _apply_stranded_discount(dirs: list) -> None:
             for d in dirs:
                 if d.get("id") != str(direction_id):
                     continue
                 history = list(d.get("research_history", []))
+                _found = False
                 for idx, h in enumerate(history):
                     if h.get("task_id") == str(research_task_id):
                         current = int(h.get("stranded_prs_merged") or 0)
                         history[idx] = {**h, "stranded_prs_merged": current + 1}
+                        _found = True
                         break
                 d["research_history"] = history
+                if not _found:
+                    # Cycle entry was evicted — route discount to history_aggregate directly
+                    # so the credit-gate correction is not silently lost.
+                    _agg = d.get("history_aggregate") or {}
+                    _agg.setdefault("total_stranded_prs_merged", 0)
+                    _agg["total_stranded_prs_merged"] += 1
+                    # Update the eviction snapshot so a future post-merge recompute
+                    # computes the correct delta (stranded→0 undoes this increment).
+                    _snaps = _agg.get("_evicted_cycle_snapshots") or {}
+                    _rid = str(research_task_id)
+                    if _rid in _snaps:
+                        _snap = _snaps[_rid]
+                        _snap["stranded_prs_merged"] = (
+                            int(_snap.get("stranded_prs_merged") or 0) + 1
+                        )
+                    d["history_aggregate"] = _agg
+                _discount_was_applied[0] = True
                 break
 
         await with_directions_locked(session, task.project_id, _apply_stranded_discount)
-        # Stamp the idempotency flag so repeated rollup-management cycles are no-ops.
-        task.context = {**ctx, "stranded_discount_applied": True}
-        await session.commit()
+        if _discount_was_applied[0]:
+            # Stamp the idempotency flag so repeated rollup-management cycles are no-ops.
+            # Only written when the discount was actually applied (live entry or evicted aggregate),
+            # not when the direction itself was not found.
+            task.context = {**ctx, "stranded_discount_applied": True}
+            await session.commit()
     except Exception as exc:  # noqa: BLE001 — best-effort; must not undo stranding
         logging.getLogger(__name__).warning(
             "[DIRECTION] stranded-PR credit discount failed for task %s: %r",

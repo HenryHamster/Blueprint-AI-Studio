@@ -108,6 +108,7 @@ export interface DirectionCardProps {
   dismissDirectionUpdate: (id: string) => Promise<void>;
   triggerResearch: (id: string, bypass?: boolean) => Promise<void>;
   reorderDirections: (newOrder: Direction[]) => Promise<void>;
+  decideChurnRetirement?: (id: string, decision: 'KEEP' | 'RETIRE', rationale?: string) => Promise<void>;
   // State
   taskCounts: Record<string, number>;
   activeTasks?: Record<string, Array<{ id: string; status: string; title: string; latest_status_message?: string }>>;
@@ -136,13 +137,15 @@ function DirectionCardImpl({
   startEdit,
   updateDirection, approveProposal, rejectProposal, reviveProposal,
   reactivateDirection, activateStagedDirection, retargetStagedDirection, cancelStagedDirection, unholdDirection, markDirectionComplete, quickToggleStatus, deleteDirection,
-  applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections,
+  applyDirectionUpdate, dismissDirectionUpdate, triggerResearch, reorderDirections, decideChurnRetirement,
   taskCounts, activeTasks, researchingIds, researchSuccessIds,
   forceConfirmId, setForceConfirmId,
   stageTargetVersion,
   onViewFindings, onViewKnowledge, onNavigateToTask,
 }: DirectionCardProps) {
   const forceConfirmRef = useRef<HTMLDivElement | null>(null);
+  const retireConfirmRef = useRef<HTMLDivElement | null>(null);
+  const [retireConfirmOpen, setRetireConfirmOpen] = useState(false);
   const [expandedNotes, setExpandedNotes] = useState<Set<number>>(new Set());
   const [notesOpen, setNotesOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -268,6 +271,18 @@ function DirectionCardImpl({
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
   }, [forceConfirmId, d.id, setForceConfirmId]);
+
+  // Close retire-confirm popover on outside click
+  useEffect(() => {
+    if (!retireConfirmOpen) return;
+    function handleClick(e: MouseEvent) {
+      if (retireConfirmRef.current && !retireConfirmRef.current.contains(e.target as Node)) {
+        setRetireConfirmOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [retireConfirmOpen]);
 
   return (
     <div className={`border rounded-lg p-2 ${d.status === 'proposed' ? 'bg-purple-950/20 border-purple-900/40' : d.status === 'expired' ? 'bg-neutral-900/30 border-neutral-800/40 opacity-70' : d.status === 'staged' ? 'bg-sky-950/20 border-sky-900/40' : 'bg-neutral-900/50 border-neutral-800/50'}`}>
@@ -768,6 +783,71 @@ function DirectionCardImpl({
               >
                 unhold
               </button>
+            </div>
+          )}
+          {/* Churn-retirement recommendation banner — operator must explicitly
+              decide Keep or Retire; the direction is held PAUSED until decided. */}
+          {d.churn_retirement_recommended && (
+            <div className="mt-1.5 flex items-start gap-1.5 p-1.5 bg-amber-950/30 border border-amber-900/50 rounded">
+              <AlertTriangle className="w-3 h-3 text-amber-400 shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <p className="text-ui-md text-amber-300 font-medium leading-tight">Retirement recommended</p>
+                {d.churn_retirement_recommended_reason && (
+                  <p className="text-ui-sm text-amber-400/80 leading-relaxed mt-0.5">
+                    {d.churn_retirement_recommended_reason}
+                  </p>
+                )}
+                {d.churn_retirement_recommended_at && (
+                  <p className="text-ui-sm text-neutral-600 mt-0.5">
+                    flagged {formatRelativeTime(d.churn_retirement_recommended_at)}
+                  </p>
+                )}
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
+                <button
+                  data-viewport-allow-small-target
+                  onClick={() => decideChurnRetirement?.(d.id, 'KEEP')}
+                  title="Keep — clear the retirement recommendation and keep this direction active"
+                  className="text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
+                >
+                  Keep
+                </button>
+                <div className="relative">
+                  {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
+                  <button
+                    data-viewport-allow-small-target
+                    onClick={() => setRetireConfirmOpen(v => !v)}
+                    title="Retire — permanently retire this direction"
+                    className="text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors bg-red-950/60 border-red-900/50 text-red-400 hover:bg-red-900/50"
+                  >
+                    Retire
+                  </button>
+                  {retireConfirmOpen && (
+                    <div
+                      ref={retireConfirmRef}
+                      className="absolute right-0 top-6 z-10 w-52 bg-neutral-900 border border-red-900/60 rounded-lg p-3 shadow-xl"
+                    >
+                      <p className="text-ui-md text-red-300 font-medium mb-1">Retire this direction?</p>
+                      <p className="text-ui-sm text-neutral-400 mb-2 leading-relaxed">This will permanently retire the direction. This action cannot be undone.</p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => { setRetireConfirmOpen(false); decideChurnRetirement?.(d.id, 'RETIRE'); }}
+                          className="flex-1 text-ui-sm px-2 py-1 min-h-[44px] rounded border bg-red-950/60 border-red-900/50 text-red-300 hover:bg-red-900/50 font-medium transition-colors"
+                        >
+                          Retire
+                        </button>
+                        <button
+                          onClick={() => setRetireConfirmOpen(false)}
+                          className="flex-1 text-ui-sm px-2 py-1 min-h-[44px] rounded border bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           )}
           {/* Positive completion suggestion */}

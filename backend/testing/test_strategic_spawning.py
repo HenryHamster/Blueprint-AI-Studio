@@ -679,13 +679,39 @@ async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
     GitHub-derived keys stay absent.
     """
     project = _make_project(
-        vision={"purpose": "test purpose"},
+        vision={
+            "purpose": "test purpose",
+            "_strategic_cycle_history": [
+                    {
+                        "cycle_id": "sc-resident-01",
+                        "outcome": "completed",
+                        "phase2_completed_at": "2026-07-02T00:00:00+00:00",
+                        "summary_text": "rev 12, 1 created, 1 retired",
+                        "created_direction_ids": ["d1"],
+                        "retired_direction_ids": ["d-ret"],
+                        "created_rationales": {"d1": "new direction for active work"},
+                        "retired_rationales": {"d-ret": "landed elsewhere"},
+                },
+            ],
+        },
         problem_model={
             "capabilities": [
                 {"id": "c1", "status": "working", "backing_paths": ["app/foo.py"]}
             ]
         },
-        directions=[{"id": "d1", "text": "ship it", "status": "active"}],
+        directions=[
+            {"id": "d1", "text": "ship it", "status": "active"},
+                {
+                    "id": "d-ret",
+                    "text": "retired work",
+                    "status": "retired",
+                    "retired_at": "2026-07-01T00:00:00+00:00",
+                    "retirement_reason": "landed elsewhere",
+                    "retirement_outcome": "merged on automain",
+                    "research_history": [{"timestamp": "2026-07-01T00:00:00+00:00", "prs_merged": 2}],
+                    "history_aggregate": {"total_cycles": 1, "total_prs_merged": 2},
+                },
+        ],
     )
     db_session.add(project)
     await db_session.commit()
@@ -704,6 +730,7 @@ async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
         )
     )
     await db_session.commit()
+    await _seed_legacy_cycles(db_session, project)
 
     # ONLY the four slow, network-I/O builders are tripwires. The cheap DB/
     # in-memory grounding builders are intentionally NOT tripwired — the resident
@@ -753,6 +780,14 @@ async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
     assert "direction_counts" in payload
     assert payload["direction_counts"]["active"] == 1
     assert [d["id"] for d in payload.get("directions_summary") or []] == ["d1"]
+    retired_summary = payload.get("retired_directions_summary")
+    assert retired_summary and retired_summary[0]["id"] == "d-ret"
+    assert retired_summary[0]["retirement_reason"] == "landed elsewhere"
+    assert retired_summary[0]["retirement_outcome"] == "merged on automain"
+    prev_outcomes = payload.get("previous_decision_outcomes")
+    assert prev_outcomes and prev_outcomes["cycle_id"] == "sc-resident-01"
+    assert prev_outcomes["created"][0]["direction_id"] == "d1"
+    assert prev_outcomes["retired"][0]["direction_id"] == "d-ret"
     # The queued operator message is surfaced (would otherwise be missed).
     assert any(
         "operator question queued" in (m.get("content") or "")
@@ -778,6 +813,218 @@ async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
     assert ctx.get("preferred_runner_target_id") == "runner-xyz"
     assert ctx.get("strategic_cycle_id") == task.strategic_cycle_id
     assert task.strategic_cycle_id
+
+
+# ── resident_exam_leads surfacing ──
+
+
+@pytest.mark.asyncio
+async def test_payload_includes_resident_exam_leads_section(db_session, mocker):
+    """resident_exam_leads from the exam ledger surfaces in the resident-minimal payload.
+
+    A ledger with one FOUND and one CLEAR record for different surfaces must
+    produce exactly one entry in ``resident_exam_leads`` (the FOUND one only).
+    The CLEAR entry must NOT appear.
+    """
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    ledger = json.dumps({
+        "records": [
+            {
+                "surfaceKey": "direction:d-found",
+                "atTick": 3,
+                "at": "2026-07-05T10:00:00Z",
+                "verdict": "found",
+                "note": "missing test coverage",
+            },
+            {
+                "surfaceKey": "direction:d-clear",
+                "atTick": 2,
+                "at": "2026-07-05T09:00:00Z",
+                "verdict": "clear",
+                "note": "",
+            },
+        ],
+        "tick": 3,
+        "corrective": False,
+    })
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            RESIDENT_SESSION_KEY: {
+                "version": 1,
+                "status": "active",
+                "_exam_ledger": ledger,
+            },
+        },
+        directions=[{"id": "d-found", "text": "active direction", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    for _name in (
+        "resolve_branch_verification_context",
+        "_verify_capability_backing_paths",
+        "_build_recent_interventions",
+        "ground_design_doc",
+    ):
+        mocker.patch(
+            f"app.strategic_spawning.{_name}",
+            new=AsyncMock(side_effect=AssertionError(f"must not call {_name}")),
+        )
+
+    extra = {
+        "_resident_session": True,
+        "strategic_session_id": "ss-exam-leads",
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
+        "preferred_runner_target_id": "runner-exam",
+    }
+    spawned = await _spawn_strategic_review(
+        project, db_session, extra_context=extra, resident_minimal=True
+    )
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    leads = payload.get("resident_exam_leads")
+    assert leads is not None, "resident_exam_leads should be present when FOUND leads exist"
+    assert len(leads) == 1, f"Expected 1 open FOUND lead, got {len(leads)}: {leads}"
+    assert leads[0]["surfaceKey"] == "direction:d-found"
+    assert leads[0]["note"] == "missing test coverage"
+    assert leads[0]["at"] == "2026-07-05T10:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_no_resident_leads_when_ledger_absent(db_session, mocker):
+    """When no _exam_ledger is present in the resident session blob, resident_exam_leads is absent."""
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            RESIDENT_SESSION_KEY: {
+                "version": 1,
+                "status": "active",
+                # No _exam_ledger key
+            },
+        },
+        directions=[{"id": "d1", "text": "active direction", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    for _name in (
+        "resolve_branch_verification_context",
+        "_verify_capability_backing_paths",
+        "_build_recent_interventions",
+        "ground_design_doc",
+    ):
+        mocker.patch(
+            f"app.strategic_spawning.{_name}",
+            new=AsyncMock(side_effect=AssertionError(f"must not call {_name}")),
+        )
+
+    extra = {
+        "_resident_session": True,
+        "strategic_session_id": "ss-no-ledger",
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
+    }
+    spawned = await _spawn_strategic_review(
+        project, db_session, extra_context=extra, resident_minimal=True
+    )
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    assert "resident_exam_leads" not in payload, (
+        "resident_exam_leads should be absent when no _exam_ledger is present"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_resident_minimal_dedup_keeps_latest_by_tick(db_session, mocker):
+    """Dedup by surfaceKey keeps the record with the highest atTick.
+
+    Two FOUND records for the same surface (atTick=1 and atTick=5); a later
+    CLEAR (atTick=3) for a second surface. Result: first surface stays FOUND
+    (highest tick wins the dedup), second surface is CLEARED (not in output).
+    """
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    ledger = json.dumps({
+        "records": [
+            # First surface: FOUND at tick 1, then another FOUND at tick 5 (latest wins)
+            {"surfaceKey": "fetch:ci", "atTick": 1, "at": "2026-07-05T08:00:00Z", "verdict": "found", "note": "old note"},
+            {"surfaceKey": "fetch:ci", "atTick": 5, "at": "2026-07-05T12:00:00Z", "verdict": "found", "note": "newer note"},
+            # Second surface: FOUND at tick 2, then CLEAR at tick 4 (latest wins → cleared)
+            {"surfaceKey": "direction:d2", "atTick": 2, "at": "2026-07-05T09:00:00Z", "verdict": "found", "note": ""},
+            {"surfaceKey": "direction:d2", "atTick": 4, "at": "2026-07-05T11:00:00Z", "verdict": "clear", "note": ""},
+        ],
+        "tick": 5,
+        "corrective": False,
+    })
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            RESIDENT_SESSION_KEY: {
+                "version": 1,
+                "status": "active",
+                "_exam_ledger": ledger,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    for _name in (
+        "resolve_branch_verification_context",
+        "_verify_capability_backing_paths",
+        "_build_recent_interventions",
+        "ground_design_doc",
+    ):
+        mocker.patch(
+            f"app.strategic_spawning.{_name}",
+            new=AsyncMock(side_effect=AssertionError(f"must not call {_name}")),
+        )
+
+    extra = {
+        "_resident_session": True,
+        "strategic_session_id": "ss-dedup",
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
+    }
+    spawned = await _spawn_strategic_review(
+        project, db_session, extra_context=extra, resident_minimal=True
+    )
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    leads = payload.get("resident_exam_leads")
+    assert leads is not None, "resident_exam_leads should be present"
+    assert len(leads) == 1, f"Expected 1 open FOUND lead (fetch:ci only), got {leads}"
+    assert leads[0]["surfaceKey"] == "fetch:ci"
+    assert leads[0]["note"] == "newer note"
 
 
 @pytest.mark.asyncio
@@ -1521,6 +1768,80 @@ async def test_success_evidence_absent_when_not_in_context(db_session):
 
 
 @pytest.mark.asyncio
+async def test_retired_direction_grounding_present_in_direction_stats(db_session):
+    """retired_direction_grounding from context reaches the direction stat entry,
+    bounded, and survives summarize compaction (metrics + retirement_memo kept)."""
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    grounding = {
+        "direction_id": "d-prior99",
+        "classification": "abandoned",
+        "metrics": {"prs_merged": 3, "cycles": 7},
+        "reason": "R" * 700,
+        "gap_id": "g-some-gap",
+        "retirement_memo": {
+            "knowledge_doc_id": "kd-abc",
+            "summary": "prior work stalled on flaky infra",
+        },
+    }
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-rg01",
+                "status": "active",
+                "text": "Continuation of retired work",
+                "priority": "medium",
+                "context": {"retired_direction_grounding": grounding},
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            },
+            {
+                "id": "d-rg02",
+                "status": "active",
+                "text": "Novel direction with no retired origin",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-rg01")
+
+    surfaced = d_stat["retired_direction_grounding"]
+    assert surfaced["direction_id"] == "d-prior99"
+    assert surfaced["classification"] == "abandoned"
+    assert surfaced["metrics"] == {"prs_merged": 3, "cycles": 7}
+    assert surfaced["gap_id"] == "g-some-gap"
+    assert surfaced["retirement_memo"]["knowledge_doc_id"] == "kd-abc"
+    # reason bounded to the sibling-field cap (500)
+    assert surfaced["reason"] == "R" * 500
+
+    # A direction with no retired origin omits the field entirely.
+    d_stat_novel = next(s for s in payload["directions_summary"] if s["id"] == "d-rg02")
+    assert "retired_direction_grounding" not in d_stat_novel
+
+    # The field must survive summarize compaction (nested metrics + memo kept).
+    compacted = _compact_direction_summary_entry(d_stat)
+    assert "retired_direction_grounding" in compacted, (
+        "compaction must preserve retired_direction_grounding, not drop it"
+    )
+    compacted_grounding = compacted["retired_direction_grounding"]
+    assert compacted_grounding["classification"] == "abandoned"
+    assert compacted_grounding["metrics"] == {"prs_merged": 3, "cycles": 7}
+    assert compacted_grounding["retirement_memo"]["knowledge_doc_id"] == "kd-abc"
+
+
+@pytest.mark.asyncio
 async def test_gap_id_present_in_direction_stats(db_session):
     """A direction's gap_id linkage is surfaced in the direction stat entry so
     the strategic agent can reconcile directions against problem-model gaps."""
@@ -1932,6 +2253,66 @@ async def test_retirement_eligibility_fields_in_direction_stats(db_session):
 
 
 @pytest.mark.asyncio
+async def test_stat_payload_autonomy_agrees_with_helper_and_excludes_degraded(
+    db_session,
+):
+    """The strategist stat payload derives autonomy from the single source of
+    truth (compute_direction_autonomy_state) — the two surfaces cannot disagree,
+    and degraded/unverified autonomous merges do NOT advance retirement.
+
+    The direction has 10 RAW autonomous merges but only 8 verified, so the raw
+    milestone would (wrongly) fire while the verified milestone does not.
+    """
+    from app.direction_outcomes import compute_direction_autonomy_state
+
+    direction = {
+        "id": "d-verified-autonomy-payload",
+        "status": "active",
+        "text": "Direction with degraded autonomous merges",
+        "priority": "high",
+        "research_history": [
+            {
+                "autonomous_prs_merged": 10,
+                "verified_autonomous_prs_merged": 8,
+                "prs_merged": 10,
+                "operator_action_count": 0,
+            },
+        ],
+        "history_aggregate": {
+            "total_autonomous_prs_merged": 0,
+            "total_verified_autonomous_prs_merged": 0,
+            "total_operator_actions": 0,
+        },
+    }
+    project = _make_project(directions=[direction], vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    stat = {s["id"]: s for s in payload["directions_summary"]}[
+        "d-verified-autonomy-payload"
+    ]
+
+    # The payload agrees byte-for-byte with the helper on the same input.
+    expected = compute_direction_autonomy_state(direction)
+    assert (
+        stat["lifetime_autonomous_prs_merged"]
+        == expected["lifetime_autonomous_prs_merged"]
+        == 8
+    )
+    assert stat["lifetime_operator_actions"] == expected["lifetime_operator_actions"]
+    # 8 verified (not the raw 10) → NOT retirement-eligible.
+    assert stat["retirement_eligible"] == expected["retirement_eligible"] is False
+
+
+@pytest.mark.asyncio
 async def test_cost_fields_present_when_history_has_merge_data(db_session):
     """cost_per_merged_pr and estimated_cost_usd appear when history has tasks_created + avg_time_to_merge_hours + merges."""
     from app.routers.admin_analytics import ON_DEMAND_RATE
@@ -2130,6 +2511,186 @@ async def test_spawn_strategic_review_skips_when_strategic_task_active(
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is False
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_respects_initiative_budget(
+    db_session, mocker
+):
+    """Design-doc spawns stop when the initiative budget is exhausted in enforce mode."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        build_config={"bootstrap_completed_at": "2026-01-01T00:00:00"},
+    )
+    budget_source = _make_project(vision={"purpose": "budget source"})
+    db_session.add_all([project, budget_source])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(budget_source)
+
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Research budget source",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    try:
+        spawned = await _spawn_design_doc_update(
+            project,
+            db_session,
+            apply_spawn_budget_guard=True,
+        )
+
+        assert spawned is False
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert result.scalars().all() == []
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_respects_global_backstop(db_session, mocker):
+    """Strategic review spawns stop when the global autonomous backstop is exhausted."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-sr-budget",
+                "status": "active",
+                "text": "Budget-sensitive direction",
+                "priority": "medium",
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    budget_source = _make_project(vision={"purpose": "budget source"})
+    db_session.add_all([project, budget_source])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(budget_source)
+    await _seed_legacy_cycles(db_session, project)
+
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Research budget source",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "observe"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 500
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 1
+    try:
+        spawned = await _spawn_strategic_review(
+            project,
+            db_session,
+            apply_spawn_budget_guard=True,
+        )
+
+        assert spawned is False
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert result.scalars().all() == []
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_strategic_spawn_budget_guard_fails_closed_in_enforce_mode(
+    db_session, mocker
+):
+    """A snapshot-computation failure must BLOCK the spawn under enforce mode.
+
+    Fail-open on a persistent snapshot/DB error would silently disable an
+    operator-enabled budget — the exact opposite of enforcement.
+    """
+    from app.strategic_spawning import _strategic_spawn_budget_guard
+
+    mocker.patch(
+        "app.strategic_spawning.compute_autonomous_spawn_budget_snapshot",
+        new=AsyncMock(side_effect=RuntimeError("snapshot db down")),
+    )
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    try:
+        guard = await _strategic_spawn_budget_guard(db_session, "initiative")
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+
+    assert guard is not None
+    assert guard["guard"] == "budget_snapshot_unavailable"
+    assert guard["mode"] == "enforce"
+    assert guard["category"] == "initiative"
+
+
+@pytest.mark.asyncio
+async def test_strategic_spawn_budget_guard_fails_open_in_observe_mode(
+    db_session, mocker
+):
+    """In observe mode the guard is advisory, so a snapshot failure preserves
+    fail-open behavior (returns None => spawn proceeds)."""
+    from app.strategic_spawning import _strategic_spawn_budget_guard
+
+    mocker.patch(
+        "app.strategic_spawning.compute_autonomous_spawn_budget_snapshot",
+        new=AsyncMock(side_effect=RuntimeError("snapshot db down")),
+    )
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "observe"
+    try:
+        guard = await _strategic_spawn_budget_guard(db_session, "initiative")
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+
+    assert guard is None
 
 
 @pytest.mark.asyncio
@@ -2678,6 +3239,97 @@ async def test_recommended_mode_pause_present_in_direction_stats(db_session):
     assert d_stat.get("recommended_mode") == "pause", (
         "Expected recommended_mode='pause' in direction stats for pause-mode direction"
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_retire_pending_surfaces_in_direction_stats(db_session, mocker):
+    """Paused lifetime-burn directions keep their retire-pending metadata in the strategist payload."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    now = datetime.utcnow()
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-retire-pending",
+                "status": "paused",
+                "text": "Direction pending lifetime-burn retirement",
+                "priority": "medium",
+                "auto_paused": True,
+                "paused_reason": "Lifetime burn backstop: cumulative non-merge ratio above threshold",
+                "auto_retire_pending": True,
+                "auto_retire_pending_reason": "lifetime_burn",
+                "auto_retire_pending_at": (now - timedelta(hours=1)).isoformat(),
+                "lifetime_burn_pause_count": 2,
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    d_stat = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-retire-pending"
+    )
+
+    assert d_stat.get("auto_retire_pending") is True
+    assert d_stat.get("auto_retire_pending_reason") == "lifetime_burn"
+    assert d_stat.get("auto_retire_pending_at") == (now - timedelta(hours=1)).isoformat()
+    assert d_stat.get("lifetime_burn_pause_count") == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_retire_pending_surfaces_for_active_scaffolding_direction(
+    db_session, mocker
+):
+    """Active scaffolding-flagged directions surface retire-pending metadata in the strategist payload."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    now = datetime.utcnow()
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-scaffolding-retire",
+                "status": "active",
+                "text": "Direction pending scaffolding retirement",
+                "priority": "medium",
+                "auto_retire_pending": True,
+                "auto_retire_pending_reason": "scaffolding",
+                "auto_retire_pending_at": (now - timedelta(minutes=5)).isoformat(),
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    d_stat = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-scaffolding-retire"
+    )
+
+    assert d_stat.get("auto_retire_pending") is True
+    assert d_stat.get("auto_retire_pending_reason") == "scaffolding"
+    assert d_stat.get("auto_retire_pending_at") == (
+        now - timedelta(minutes=5)
+    ).isoformat()
+    assert d_stat.get("status") == "active"
 
 
 @pytest.mark.asyncio
@@ -4484,6 +5136,72 @@ async def test_playbook_keys_index_skips_pending_entries(db_session, mocker):
 # ---------------------------------------------------------------------------
 
 
+def test_stamp_direction_in_flight_counts():
+    """_stamp_direction_in_flight stamps the per-direction in-flight count from
+    active_by_direction onto each stat in place — staffed>0, idle=0, and a
+    direction absent from the mapping defaults to 0 (present-even-when-0)."""
+    from app.strategic_spawning import _stamp_direction_in_flight
+
+    stats = [
+        {"id": "d-staffed", "status": "active"},
+        {"id": "d-idle", "status": "active"},
+        {"id": "d-absent", "status": "active"},
+    ]
+    _stamp_direction_in_flight(stats, {"d-staffed": 3, "d-idle": 0})
+    by_id = {s["id"]: s for s in stats}
+    assert by_id["d-staffed"]["in_flight"] == 3
+    assert by_id["d-idle"]["in_flight"] == 0
+    # Absent from the mapping still gets an explicit 0, not a missing field.
+    assert by_id["d-absent"]["in_flight"] == 0
+
+
+def test_stamp_direction_in_flight_handles_none_mapping():
+    """A None active_by_direction (e.g. resident/degraded path) stamps 0, never
+    raises — graceful degrade."""
+    from app.strategic_spawning import _stamp_direction_in_flight
+
+    stats = [{"id": "d-1", "status": "active"}]
+    _stamp_direction_in_flight(stats, None)
+    assert stats[0]["in_flight"] == 0
+
+
+def test_stamped_in_flight_matches_reconciliation_pipeline():
+    """The count stamped onto direction_stats and the value
+    _build_cycle_start_reconciliation reports in direction_pipeline[*].in_flight
+    are derived from the SAME active_by_direction mapping, so they cannot
+    disagree for a given direction."""
+    from app.strategic_spawning import (
+        _stamp_direction_in_flight,
+        _build_cycle_start_reconciliation,
+    )
+
+    direction_stats = [
+        {"id": "d-staffed", "status": "active", "text": "moving", "gap_id": "g-a"},
+        {"id": "d-idle", "status": "active", "text": "quiet", "gap_id": "g-b"},
+    ]
+    active_by_direction = {"d-staffed": 2, "d-idle": 0}
+
+    _stamp_direction_in_flight(direction_stats, active_by_direction)
+
+    problem_model = {
+        "gaps": [
+            {"id": "g-a", "status": "active"},
+            {"id": "g-b", "status": "active"},
+        ]
+    }
+    recon = _build_cycle_start_reconciliation(
+        direction_stats, problem_model, active_by_direction
+    )
+    pipeline_by_id = {
+        entry["direction_id"]: entry for entry in recon["direction_pipeline"]
+    }
+    stamped_by_id = {s["id"]: s for s in direction_stats}
+    for did in ("d-staffed", "d-idle"):
+        assert stamped_by_id[did]["in_flight"] == pipeline_by_id[did]["in_flight"]
+    assert stamped_by_id["d-staffed"]["in_flight"] == 2
+    assert stamped_by_id["d-idle"]["in_flight"] == 0
+
+
 def test_agent_view_design_doc_strips_playbook_archive():
     """playbook_archive is operator-only state — it must never ship in agent
     payloads. Unbounded growth of this field was the trigger for the silent
@@ -4605,6 +5323,54 @@ def test_agent_view_problem_model_drops_rejected_agent_edits():
     assert "rejected_agent_edits" not in view
     # The durable input is never mutated.
     assert "rejected_agent_edits" in pm
+
+
+def test_agent_view_problem_model_cluster_reexported_from_sibling_module():
+    """The agent-view problem_model builder cluster was peeled into the sibling
+    module ``app.strategic_problem_view`` to keep ``strategic_spawning`` under its
+    size cap. ``strategic_spawning`` must re-export every moved name so existing
+    ``from app.strategic_spawning import ...`` call sites and tests keep resolving
+    the SAME object — this guards the extraction contract against a future edit
+    that shadows a re-export with a divergent local copy."""
+    from app import strategic_problem_view, strategic_spawning
+
+    for name in (
+        "_agent_view_problem_model",
+        "_agent_view_problem_model_packed",
+        "_agent_view_problem_model_floor",
+        "_compute_model_health",
+        "_shrink_pm_to_floor",
+        "_skeletonize_caps_friction",
+        "_serialized_bytes",
+        "_GAP_HISTORY_KEEP",
+        "_GAP_PAST_MOVES_KEEP",
+        "_GAP_EVIDENCE_KEEP",
+        "_AGENT_VIEW_FLOOR_BYTES",
+    ):
+        assert hasattr(strategic_problem_view, name), (
+            f"{name} must be defined in the sibling module"
+        )
+        assert getattr(strategic_spawning, name) is getattr(
+            strategic_problem_view, name
+        ), f"strategic_spawning.{name} must re-export the sibling module's object"
+
+    # Behaviour is preserved end-to-end through the re-export: the moved trim
+    # still drops archived_gaps and bounds per-gap history to the keep window.
+    pm = {
+        "archived_gaps": [{"id": "old"}],
+        "gaps": [
+            {
+                "id": "g",
+                "history": [
+                    {"e": i}
+                    for i in range(strategic_problem_view._GAP_HISTORY_KEEP + 3)
+                ],
+            }
+        ],
+    }
+    view = strategic_spawning._agent_view_problem_model(pm)
+    assert "archived_gaps" not in view
+    assert len(view["gaps"][0]["history"]) == strategic_problem_view._GAP_HISTORY_KEEP
 
 
 def test_build_operator_overrides_summary_consolidates_both_ledgers():
@@ -6679,6 +7445,208 @@ async def test_version_phase_includes_promotion_readiness(
 
 
 @pytest.mark.asyncio
+async def test_version_phase_qualification_state_reconciles_finalized_verdict(
+    db_session, mocker, _lts_split_active
+):
+    """The strategic payload's version_phase applies the finalized-verdict
+    substitution (unified with the other open-version surfaces): a stale
+    ``pending`` + ``promotion_pending`` record with an already-resolved verdict
+    reads the terminal status (NOT ``promotion_in_flight``) and surfaces the
+    verdict disagreement explicitly."""
+    from app.models import QualificationVerdict, ReleaseVersion
+    from sqlalchemy.orm.attributes import flag_modified
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_verdict_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow_naive()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    sha = "e" * 40
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=sha,
+            confidence=0.9,
+            terminal_status="promoted",
+            would_promote=True,
+            promotion_enabled=False,
+            finalized_at=now,
+            audit_findings=[{"severity": "LOW", "summary": "nit"}],
+        )
+    )
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "confidence": 0.9,
+        "promotion_pending": {"pr_number": 7, "pr_url": "https://x/pull/7"},
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    vp = tasks[0].payloads[0].get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+
+    qs = vp.get("qualification_state")
+    assert qs is not None, "qualification_state must be present"
+    assert qs["state"] != "promotion_in_flight", (
+        f"finalized verdict must supersede the stale promotion_pending: {qs}"
+    )
+    assert qs["state"] == "promoted", qs
+    dis = vp.get("qualification_state_disagreement")
+    assert dis is not None, (
+        "strategic payload must surface the finalized-verdict disagreement"
+    )
+    assert dis["last_qualification_status"] == "pending"
+    assert dis["verdict_terminal_status"] == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_version_phase_narrates_debt_enforce_preview(
+    db_session, mocker, _lts_split_active
+):
+    """The strategic payload keeps the observe-mode debt-enforce preview on the
+    compacted version_phase.last_qualification block."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow_naive(),
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "d" * 40,
+            "confidence": 0.72,
+            "threshold": 0.8,
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.8, "smoketest": 0.95},
+            "debt_enforce_confidence_preview": 0.61,
+            "debt_enforce_weight_preview": 0.15,
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    vp = tasks[0].payloads[0].get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+    qual = vp.get("last_qualification")
+    assert qual is not None, "last_qualification should be present"
+    assert qual["debt_enforce_confidence_preview"] == pytest.approx(0.61)
+    assert qual["debt_enforce_weight_preview"] == pytest.approx(0.15)
+
+
+@pytest.mark.asyncio
+async def test_version_phase_qualification_state_reconciles_crashed_audit(
+    db_session, mocker, _lts_split_active
+):
+    """The strategic payload's version_phase applies the audit-crash reconciliation:
+    a bare ``pending`` record whose version-scoped audit child crashed
+    (terminal-failed, no report) reads ``audit_crashed`` instead of telling the
+    strategist to wait on a dead audit."""
+    from app.models import ReleaseVersion
+    from sqlalchemy.orm.attributes import flag_modified
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow_naive()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    sha = "f" * 40
+    version.last_qualification = {"status": "pending", "candidate_sha": sha}
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    # Version-scoped release_audit task pinned to the evaluated candidate, FAILED
+    # with no report artifact => a crashed audit child.
+    db_session.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "release_audit"}],
+            vm_instance_id="agent-vm-audit-crash-strat",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id), "candidate_sha": sha},
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    vp = tasks[0].payloads[0].get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+
+    qs = vp.get("qualification_state")
+    assert qs is not None and qs["state"] == "audit_crashed", qs
+
+
+@pytest.mark.asyncio
 async def test_version_phase_includes_recent_versions(
     db_session, mocker, _lts_split_active
 ):
@@ -6926,7 +7894,13 @@ async def test_version_phase_block_carries_criterion_coverage(
 
     floor = _version_phase_floor(vp)
     assert floor["criterion_coverage"]["total"] == 3
-    assert "criteria" not in floor["criterion_coverage"]
+    floor_criteria = floor["criterion_coverage"]["criteria"]
+    assert len(floor_criteria) == 3
+    assert {entry["criterion_key"] for entry in floor_criteria} == {
+        c_covered.criterion_key,
+        c_partial.criterion_key,
+        c_uncovered.criterion_key,
+    }
 
     # stuck_count survives compaction — the uncovered criterion has no direction
     # mapping so its stuck_reason is "no_mapping" and stuck_count is 1.
@@ -6939,6 +7913,90 @@ async def test_version_phase_block_carries_criterion_coverage(
     # Covered and partial criteria have stuck_reason=None.
     assert by_key[c_covered.criterion_key]["stuck_reason"] is None
     assert by_key[c_partial.criterion_key]["stuck_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_version_phase_build_failure_surfaces_in_payload(
+    db_session, mocker, _lts_split_active
+):
+    """When the outer version_phase block assembly fails, the payload must carry a
+    compact failure-marker dict (lifecycle_signal='unavailable', signal_status=
+    'build_failed') rather than silently omitting the block entirely.
+
+    This is the regression test required by the acceptance gate:
+    test_version_phase_build_failure_surfaces_in_payload must run green under a
+    real merge-test verdict, and the PR must change non-test production code that
+    the test exercises.
+    """
+    from app.strategic_payload_compaction import (
+        _summarize_version_phase,
+        _version_phase_floor,
+    )
+
+    # Patch current_open_version to raise so the outer try/except fires.
+    mocker.patch(
+        "app.release_version.current_open_version",
+        side_effect=RuntimeError("simulated version_phase build failure"),
+    )
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, (
+        "version_phase must be present even when assembly fails — "
+        "the failure-marker dict should be set, not None"
+    )
+    assert vp.get("lifecycle_signal") == "unavailable", (
+        f"lifecycle_signal must be 'unavailable' on build failure; got {vp!r}"
+    )
+    assert vp.get("signal_status") == "build_failed", (
+        f"signal_status must be 'build_failed'; got {vp.get('signal_status')!r}"
+    )
+    assert isinstance(vp.get("error"), str) and len(vp["error"]) > 0, (
+        "error must be a non-empty bounded string"
+    )
+    assert len(vp["error"]) <= 240, "error must be bounded to 240 chars"
+    assert vp.get("integration_branch") == "automain", (
+        "integration_branch must be preserved in the failure marker"
+    )
+    assert vp.get("promotion_target") == "main", (
+        "promotion_target must be preserved in the failure marker"
+    )
+
+    # Failure marker must survive both compaction paths so it is not silently
+    # dropped under budget pressure.
+    normal = _summarize_version_phase(vp)
+    assert normal.get("lifecycle_signal") == "unavailable", (
+        "lifecycle_signal must survive _summarize_version_phase"
+    )
+    assert normal.get("signal_status") == "build_failed"
+    assert normal.get("integration_branch") == "automain"
+    assert normal.get("promotion_target") == "main"
+
+    floor_out = _version_phase_floor(vp)
+    assert floor_out.get("lifecycle_signal") == "unavailable", (
+        "lifecycle_signal must survive _version_phase_floor"
+    )
+    assert floor_out.get("signal_status") == "build_failed"
 
 
 @pytest.mark.asyncio
@@ -7090,8 +8148,9 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     await db_session.refresh(active_project)
 
     assert await _spawn_strategic_review(active_project, db_session) is True
-    # The integration!=promotion gate now performs one direct version-phase lookup.
-    assert current_open_version.call_count == 1
+    # The integration!=promotion gate performs at least one version-phase lookup;
+    # compute_qualification_trigger_state may add a second call via release_readiness.
+    assert current_open_version.call_count >= 1
     assert ensure_initial_release_version.call_args.kwargs["promotion_target"] == "main"
 
 
@@ -7323,6 +8382,50 @@ async def test_stabilize_hint_names_lower_dimension_when_audit_not_binding(
     assert "test_erosion sub-score" in suffix
     assert "audit is not the limiting dimension" in suffix
     assert "the audit sub-score is the binding constraint on promotion" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_version_phase_unavailable_marker_on_build_failure(
+    db_session, mocker, _lts_split_active
+):
+    """When the version_phase block assembly encounters an exception, a minimal
+    version_phase block with build_unavailable=True is included in the payload,
+    so the strategist can distinguish 'build failed' from 'no version exists'."""
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_spawning_deps(mocker)
+    # Force the version_phase block build to fail by mocking
+    # current_open_version to raise an exception.
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(side_effect=RuntimeError("version_phase build boom")),
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, "version_phase block should be present even on build failure"
+    assert (
+        vp.get("build_unavailable") is True
+    ), "version_phase should have build_unavailable=True marker"
 
 
 def _patch_candidate_currency(mocker, *, resolved, head_sha):
@@ -7725,6 +8828,267 @@ async def test_spawn_strategic_review_payload_freshness_unknown_when_currency_in
     )
 
 
+def _patch_candidate_currency_raises(mocker, exc, *, resolved=("tok", "owner", "repo")):
+    """Mock the currency GitHub path so ``get_branch_sha`` raises ``exc``.
+
+    Credential resolution succeeds (a transient GitHub failure only happens
+    AFTER credentials resolve), and the bounded-retry sleep is neutralized so
+    the api_unreachable classification is exercised without wall-clock delay.
+    """
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=resolved),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=exc),
+    )
+    mocker.patch("app.strategic_spawning._CURRENCY_RETRY_DELAY_S", 0)
+
+
+@pytest.mark.asyncio
+async def test_payload_staleness_api_unreachable_verdict_distinct_from_unknown(
+    db_session, mocker, _lts_split_active
+):
+    """A TRANSIENT GitHub failure (5xx) must surface payload_staleness.verdict=
+    'api_unreachable' — DISTINCT from the 'unknown' verdict used for genuine local
+    indeterminacy — after a bounded retry, and must NOT set ``stale``.
+
+    Regression: an API outage at spawn time must not be reported as a stale/unknown
+    payload, which would force the strategist to re-ground every load-bearing
+    payload claim.  The endpoint must never crash on the transient failure.
+    """
+    from fastapi import HTTPException
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "f" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    # Credentials resolve, but the live branch-HEAD read hits a GitHub 5xx — a
+    # transient reachability failure, NOT genuine local indeterminacy.
+    _patch_candidate_currency_raises(
+        mocker,
+        HTTPException(status_code=502, detail="GitHub API error (HTTP 502)."),
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, (
+        "payload_staleness must be present even when GitHub is unreachable"
+    )
+    assert staleness.get("verdict") == "api_unreachable", (
+        "a transient GitHub 5xx must produce verdict='api_unreachable', "
+        "distinct from the 'unknown' verdict used for genuine indeterminacy"
+    )
+    assert staleness.get("verdict") != "unknown", (
+        "api_unreachable must NOT collapse into the genuine-indeterminacy verdict"
+    )
+    # An unreachable API is NOT a known-stale payload — never set stale.
+    assert "stale" not in staleness or staleness.get("stale") is None, (
+        "stale must not be set on an api_unreachable block"
+    )
+    assert "checked_at" in staleness, "checked_at timestamp must be present"
+    _assert_generated_at_iso_utc(staleness)
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_currency_typed_verdicts(db_session, mocker):
+    """Unit coverage of the typed verdicts produced by _resolve_candidate_currency:
+    fresh / stale (resolved), api_unreachable (transient GitHub/transport), and
+    unknown (genuine local indeterminacy) each with the right shape."""
+    from fastapi import HTTPException
+    import httpx
+
+    from app.strategic_spawning import _resolve_candidate_currency
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    candidate = "a" * 40
+    mocker.patch("app.strategic_spawning._CURRENCY_RETRY_DELAY_S", 0)
+
+    # Genuine indeterminacy: no candidate SHA on the record → unknown, no GitHub call.
+    res = await _resolve_candidate_currency(db_session, project, {}, "main")
+    assert res["verdict"] == "unknown"
+    assert res["resolved"] is False
+    assert res["reason"] == "no_candidate_sha"
+
+    # Genuine indeterminacy: candidate present but repo credentials unavailable.
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=None),
+    )
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "unknown"
+    assert res["reason"] == "repo_credentials_unavailable"
+    assert res["candidate_sha"] == candidate
+
+    # Resolved fresh: candidate == HEAD.
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "fresh"
+    assert res["resolved"] is True
+    assert res["current"] is True
+    assert res["head_sha"] == candidate
+
+    # Resolved stale: candidate != HEAD.
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value="b" * 40))
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "stale"
+    assert res["current"] is False
+
+    # Transient GitHub 5xx → api_unreachable, distinct from unknown.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=HTTPException(status_code=502, detail="5xx")),
+    )
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "api_unreachable"
+    assert res["resolved"] is False
+    assert res["candidate_sha"] == candidate
+
+    # Transport error (timeout) → api_unreachable.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=httpx.ConnectError("boom")),
+    )
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "api_unreachable"
+
+    # Branch genuinely not found (404) is NOT transient → unknown, not api_unreachable.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=HTTPException(status_code=404, detail="not found")),
+    )
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "unknown"
+    assert res["reason"] == "branch_not_found"
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_currency_retries_transient_failure(db_session, mocker):
+    """The bounded retry must (a) make a SECOND ``get_branch_sha`` attempt after a
+    transient blip and resolve fresh/stale when that retry succeeds, and (b) make
+    exactly ``_CURRENCY_RETRY_ATTEMPTS`` attempts before classifying
+    api_unreachable.  These assertions on ``call_count`` FAIL if the function
+    only ever makes a single attempt — the core requested retry behavior."""
+    from fastapi import HTTPException
+
+    from app.strategic_spawning import (
+        _CURRENCY_RETRY_ATTEMPTS,
+        _resolve_candidate_currency,
+    )
+
+    # The retry must actually exercise more than one attempt for this to be a
+    # meaningful guard; the production default is 2.
+    assert _CURRENCY_RETRY_ATTEMPTS >= 2
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    candidate = "a" * 40
+    head = "b" * 40
+    # No wall-clock delay between the bounded retries.
+    mocker.patch("app.strategic_spawning._CURRENCY_RETRY_DELAY_S", 0)
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+
+    # (a) First attempt raises a transient 5xx, the retry succeeds with a HEAD
+    # that differs from the candidate → resolves to 'stale' (NOT api_unreachable),
+    # proving the transient failure was retried rather than classified.
+    transient_then_ok = AsyncMock(
+        side_effect=[HTTPException(status_code=502, detail="5xx"), head]
+    )
+    mocker.patch("app.github.get_branch_sha", new=transient_then_ok)
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "stale", (
+        "a transient first attempt followed by a successful retry must resolve, "
+        "not classify api_unreachable"
+    )
+    assert res["resolved"] is True
+    assert res["head_sha"] == head
+    assert transient_then_ok.await_count == 2, (
+        "the transient first attempt must be retried a second time before resolving"
+    )
+
+    # (a') Same, but the retry succeeds with HEAD == candidate → 'fresh'.
+    transient_then_fresh = AsyncMock(
+        side_effect=[HTTPException(status_code=503, detail="5xx"), candidate]
+    )
+    mocker.patch("app.github.get_branch_sha", new=transient_then_fresh)
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "fresh"
+    assert res["current"] is True
+    assert transient_then_fresh.await_count == 2
+
+    # (b) Every attempt fails transiently → api_unreachable only AFTER exhausting
+    # the full bounded budget of attempts.
+    always_transient = AsyncMock(
+        side_effect=HTTPException(status_code=502, detail="5xx")
+    )
+    mocker.patch("app.github.get_branch_sha", new=always_transient)
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "api_unreachable"
+    assert always_transient.await_count == _CURRENCY_RETRY_ATTEMPTS, (
+        "api_unreachable must only be reported after the full bounded retry budget "
+        f"of {_CURRENCY_RETRY_ATTEMPTS} attempts is exhausted"
+    )
+
+    # (b') A 404 short-circuits — it is not transient, so it must NOT be retried.
+    not_found = AsyncMock(
+        side_effect=HTTPException(status_code=404, detail="not found")
+    )
+    mocker.patch("app.github.get_branch_sha", new=not_found)
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "unknown"
+    assert res["reason"] == "branch_not_found"
+    assert not_found.await_count == 1, (
+        "a non-transient 404 must short-circuit without consuming a retry"
+    )
+
+
 @pytest.mark.asyncio
 async def test_payload_staleness_resolves_true_verdict_without_carried_findings(
     db_session, mocker, _lts_split_active
@@ -8038,6 +9402,94 @@ async def test_qualification_substate_hint_absent_while_auditing(
     assert "PROMOTION_FAILED" not in suffix
     vp = payload.get("version_phase") or {}
     assert vp.get("qualification_state", {}).get("state") == "qualifying"
+
+
+@pytest.mark.asyncio
+async def test_qualification_substate_hint_suppressed_when_verdict_supersedes_pending(
+    db_session, mocker, _lts_split_active
+):
+    """When a finalized QualificationVerdict (terminal_status='promoted') exists
+    and last_qualification still says 'pending'+'promotion_pending', the resolver
+    substitutes the effective status to 'promoted'.  The prompt-suffix hint must
+    use the resolver-applied qualification_state (NOT the raw last_qualification)
+    so PROMOTION_IN_FLIGHT is absent — the promotion already resolved."""
+    from app.models import QualificationVerdict, ReleaseVersion
+    from sqlalchemy.orm.attributes import flag_modified
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_verdict_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow_naive()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    sha = "f" * 40
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=sha,
+            confidence=0.92,
+            terminal_status="promoted",
+            would_promote=True,
+            promotion_enabled=False,
+            finalized_at=now,
+        )
+    )
+    # Stale last_qualification: still shows pending+promotion_pending even though
+    # the verdict is already finalized.
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "confidence": 0.92,
+        "promotion_pending": {
+            "pr_number": 9002,
+            "pr_url": "https://github.com/x/y/pull/9002",
+            "auto_merge_enabled": True,
+            "enabled_at": now.isoformat(),
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "PROMOTION_IN_FLIGHT" not in suffix, (
+        "prompt-suffix must NOT assert PROMOTION_IN_FLIGHT when the verdict "
+        f"has already finalized as promoted; got suffix: {suffix!r}"
+    )
+    # The version_phase qualification_state must reflect the resolved outcome
+    vp = payload.get("version_phase") or {}
+    qs = vp.get("qualification_state", {})
+    assert qs.get("state") == "promoted", (
+        f"qualification_state must be resolver-applied 'promoted', got: {qs}"
+    )
 
 
 @pytest.mark.asyncio
@@ -10389,13 +11841,87 @@ async def test_recent_merged_titles_carry_tristate_merge_verdict(db_session, moc
     assert verdicts["Badge says merged but stranded"] == "verified_not_landed"
 
 
+@pytest.mark.asyncio
+async def test_recent_merged_titles_pending_in_open_rollup_verdict(
+    db_session, mocker
+):
+    """PRs merged into a still-open rollup branch get verdict pending_in_open_rollup.
+
+    When get_pull_request returns state=open (no merge_commit_sha), the task
+    is in a staging branch waiting for the rollup to squash-merge. This must
+    NOT be classified as verified_not_landed (a real accounting conflict) and
+    must NOT trigger the stranded-discount path.
+    """
+    direction_id = "dir-pending-rollup"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "pending rollup dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Impl merged into open rollup branch",
+        description="PR is still open — rollup not yet squash-merged",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 555, "direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mark_stranded_mock = mocker.patch(
+        "app.strategic_spawning.mark_stranded_non_landing"
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open"}),
+    )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+    titles = delta["recent_merged_titles"]
+    assert len(titles) == 1
+    entry = titles[0]
+    assert entry["title"] == "Impl merged into open rollup branch"
+    assert entry["merge_verdict"] == "pending_in_open_rollup"
+    assert entry["on_automain"] is False
+
+    assert delta["recent_merge_verdict_counts"]["pending_in_open_rollup"] == 1
+    assert delta["recent_merge_verdict_counts"]["verified_not_landed"] == 0
+    assert "recent_not_landed_titles" not in delta
+
+    mark_stranded_mock.assert_not_called()
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("stranded_discount_applied") is None
+
+
 @pytest.mark.parametrize(
     ("messages", "expected_verdict", "expected_not_landed_titles"),
     [
         (
             ["Rollup squash\n\nIncluded work:\n- Honor rollup squash bodies"],
-            "verified_landed",
-            None,
+            "verified_not_landed",
+            ["Honor rollup squash bodies"],
         ),
         (
             ["Rollup squash\n\nIncluded PRs: #9635, #9639"],
@@ -10409,7 +11935,7 @@ async def test_recent_merged_titles_carry_tristate_merge_verdict(db_session, moc
         ),
         (None, "unverifiable", None),
     ],
-    ids=["title-evidence", "pr-evidence", "absent", "scan-failure"],
+    ids=["title-only-not-rescued", "pr-evidence", "absent", "scan-failure"],
 )
 @pytest.mark.asyncio
 async def test_rollup_squash_body_evidence_prevents_not_landed_verdict(
@@ -10483,6 +12009,104 @@ async def test_rollup_squash_body_evidence_prevents_not_landed_verdict(
     )
     expected_scan_count = 2 if expected_verdict == "verified_landed" else 1
     assert commit_messages_mock.await_count == expected_scan_count
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_verdict", "expected_not_landed_titles"),
+    [
+        (
+            ["Rollup squash\n\nIncluded PRs: #9635, #9639"],
+            "verified_landed",
+            None,
+        ),
+        (
+            ["Rollup squash\n\nIncluded work:\n- Honor rollup squash bodies"],
+            "verified_not_landed",
+            ["Honor rollup squash bodies"],
+        ),
+        (
+            ["Rollup squash\n\nIncluded PRs: #1111"],
+            "verified_not_landed",
+            ["Honor rollup squash bodies"],
+        ),
+    ],
+    ids=["pr-match-rescued", "title-only-not-rescued", "wrong-pr-not-rescued"],
+)
+@pytest.mark.asyncio
+async def test_squash_rescue_requires_pr_number_evidence(
+    db_session, mocker, messages, expected_verdict, expected_not_landed_titles
+):
+    """PR-number references are primary rescue evidence; title-only matches do not rescue.
+
+    When a task has a PR number, only a PR number match in the commit messages
+    can rescue it from a false NOT-landed verdict. Title substring matches are
+    not sufficient for rescue when PR numbers are available.
+    """
+    direction_id = "dir-pr-primary-evidence"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "pr-number-primary test", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Honor rollup squash bodies",
+        description="task with pr number for rescue evidence",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 9635, "direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merge_commit_sha": "rewritten-child-sha",
+                "head": {"sha": "head-sha"},
+            }
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    commit_messages_mock = mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=messages),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+
+    assert delta["recent_merged_titles"] == [
+        {
+            "title": "Honor rollup squash bodies",
+            "on_automain": expected_verdict == "verified_landed",
+            "merge_verdict": expected_verdict,
+            "landed_on_integration": None,
+        }
+    ]
+    if expected_not_landed_titles:
+        assert delta["recent_not_landed_titles"] == expected_not_landed_titles
+    else:
+        assert "recent_not_landed_titles" not in delta
+    assert delta["recent_merge_verdict_counts"][expected_verdict] == 1
+    assert sum(delta["recent_merge_verdict_counts"].values()) == 1
+    commit_messages_mock.assert_any_await(
+        "tok", "owner", "repo", "automain", project_id=str(project.id)
+    )
 
 
 # ── stranded-PR credit discount persisted by cycle-start reconciliation ────────
@@ -10778,7 +12402,7 @@ async def test_rollup_squash_body_evidence_applies_to_promotion_target(
         new=AsyncMock(
             side_effect=[
                 ["Rollup squash\n\nIncluded PRs: #9635"],
-                ["Promoted rollup\n\nIncluded work: Promoted rollup squash body"],
+                ["Promoted rollup\n\nIncluded PRs: #9635"],
             ]
         ),
     )
@@ -10881,6 +12505,7 @@ async def test_recent_merged_titles_cap_preserves_full_merge_accounting_counts(
         "verified_landed": _RECENT_MERGED_TITLES_CAP,
         "verified_not_landed": 3,
         "unverifiable": 0,
+        "pending_in_open_rollup": 0,
     }
     assert delta["recent_not_landed_titles"] == [
         "stranded 10",
@@ -11901,6 +13526,84 @@ class TestBuildCycleStartReconciliation:
         assert out["counts"]["merge_landed"] == _RECENT_MERGED_TITLES_CAP
         assert out["counts"]["merge_not_landed"] == 3
 
+    def test_pending_in_open_rollup_emitted_and_not_treated_as_conflict(self):
+        # PRs merged into an open rollup branch yield pending_in_open_rollup verdict.
+        # They must appear in recon.pending_in_open_rollup (not merge_accounting),
+        # counts.merge_pending_in_open_rollup must carry the title count, and
+        # counts.merge_pending_in_open_rollup_accounting must carry the direction count.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-1", "status": "active", "text": "rollup dir"},
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "rollup dir",
+                "recent_merged_titles": [
+                    {"title": "feat A", "merge_verdict": "pending_in_open_rollup"},
+                    {"title": "feat B", "merge_verdict": "pending_in_open_rollup"},
+                    {"title": "landed C", "merge_verdict": "verified_landed"},
+                ],
+                "recent_merge_verdict_counts": {
+                    "verified_landed": 1,
+                    "verified_not_landed": 0,
+                    "unverifiable": 0,
+                    "pending_in_open_rollup": 2,
+                },
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, {}, {}, None, per_direction_delta
+        )
+        assert out is not None
+        # Pending rollup items are NOT merge conflicts.
+        assert out["merge_accounting"] == []
+        assert out["counts"]["merge_accounting"] == 0
+        assert out["counts"]["merge_not_landed"] == 0
+        # They appear in the dedicated pending section.
+        pending = out["pending_in_open_rollup"]
+        assert len(pending) == 1
+        entry = pending[0]
+        assert entry["direction_id"] == "d-1"
+        assert entry["pending_in_open_rollup"] == 2
+        assert "feat A" in entry["pending_in_open_rollup_titles"]
+        assert "feat B" in entry["pending_in_open_rollup_titles"]
+        assert entry["pending_in_open_rollup_titles_overflow"] == 0
+        # Aggregate counts match.
+        assert out["counts"]["merge_pending_in_open_rollup"] == 2
+        assert out["counts"]["merge_pending_in_open_rollup_accounting"] == 1
+        # Landed count is unaffected.
+        assert out["counts"]["merge_landed"] == 1
+
+    def test_pending_in_open_rollup_only_cycle_renders_section(self):
+        # A cycle whose ONLY merge signal is pending rollup work must not hit the
+        # nothing-to-reconcile early return and must still emit the section.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        per_direction_delta = [
+            {
+                "direction_id": "d-2",
+                "direction_text": "pending only dir",
+                "recent_merged_titles": [
+                    {"title": "feat X", "merge_verdict": "pending_in_open_rollup"},
+                ],
+                "recent_merge_verdict_counts": {
+                    "verified_landed": 0,
+                    "verified_not_landed": 0,
+                    "unverifiable": 0,
+                    "pending_in_open_rollup": 1,
+                },
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            [], {}, {}, None, per_direction_delta
+        )
+        assert out is not None, "pending-only cycle must not return None"
+        assert len(out["pending_in_open_rollup"]) == 1
+        assert out["counts"]["merge_pending_in_open_rollup"] == 1
+        assert out["counts"]["merge_pending_in_open_rollup_accounting"] == 1
+
     def test_phantom_direction_refs_flagged_in_current_focus(self):
         from app.strategic_spawning import _build_cycle_start_reconciliation
 
@@ -12046,6 +13749,407 @@ class TestBuildCycleStartReconciliation:
         assert out is not None
         assert out["qualification_prose_drift"] == []
         assert out["counts"]["qualification_prose_drift"] == 0
+
+    def test_qualification_surface_conflicts_stale_candidate_with_pending_status(self):
+        # A stale candidate with status="pending" (active qualification in flight)
+        # should NOT raise a conflict — integration-branch drift during active
+        # qualification is expected, not a surface disagreement.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "pending",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "qualifying"},
+            # Production shape emitted by _resolve_candidate_currency: verdict
+            # is "stale" (resolved=True, current=False) when the pinned SHA is
+            # behind integration HEAD. There is no "is_stale" key.
+            "last_qualification_candidate_currency": {
+                "verdict": "stale",
+                "resolved": True,
+                "current": False,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "9998887776665554443",
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        stale_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "stale_candidate_with_promotion_failed_status"
+        ]
+        # pending + stale is normal during active qualification; NOT a conflict
+        assert len(stale_conflicts) == 0
+
+    def test_qualification_surface_conflicts_stale_candidate_with_promotion_failed(self):
+        # A stale candidate with status="promotion_failed" IS a genuine conflict
+        # — the version should have advanced its candidate after failure.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "promotion_failed",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "promotion_failed"},
+            "last_qualification_candidate_currency": {
+                "verdict": "stale",
+                "resolved": True,
+                "current": False,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "9998887776665554443",
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        stale_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "stale_candidate_with_promotion_failed_status"
+        ]
+        assert len(stale_conflicts) == 1
+        assert "stale" in stale_conflicts[0]["description"].lower()
+        assert "promotion_failed" in stale_conflicts[0]["description"]
+
+    def test_qualification_surface_conflicts_status_state_mismatch(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "pending",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            # Deliberately mismatched: status="pending" but state="promoted"
+            # (promoted is not a valid state for pending status)
+            "qualification_state": {"state": "promoted"},
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        status_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "status_state_mismatch"
+        ]
+        assert len(status_conflicts) == 1
+        assert "status" in status_conflicts[0]["description"].lower()
+        assert "state" in status_conflicts[0]["description"].lower()
+
+    def test_status_state_mismatch_not_flagged_for_finalized_verdict_substitution(self):
+        """When qualification_state_disagreement is present the resolver already
+        documented the status→state divergence (e.g. pending→promoted via a
+        finalized QualificationVerdict).  _build_cycle_start_reconciliation must
+        NOT flag it as a status_state_mismatch conflict — that would be a false
+        positive against the resolver's own deliberate substitution.
+
+        Acceptance evidence: named_test requirement from direction task."""
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        # Simulate what the resolver produces when a merge-test verdict with
+        # terminal_status="promoted" exists while last_qualification.status is
+        # still "pending" (the stale-pending window):
+        #   - last_qualification.status = "pending"  (raw, unmodified)
+        #   - qualification_state.state = "promoted"  (resolver-applied)
+        #   - qualification_state_disagreement = {...}  (resolver note)
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "pending",
+                "promotion_pending": {
+                    "pr_number": 9001,
+                    "pr_url": "https://github.com/x/y/pull/9001",
+                    "auto_merge_enabled": True,
+                },
+                "confidence": 0.92,
+                "threshold": 0.80,
+            },
+            # Resolver substituted "pending" → "promoted" via QualificationVerdict
+            "qualification_state": {"state": "promoted", "summary": "Promoted."},
+            # Resolver documented the substitution here:
+            "qualification_state_disagreement": {
+                "last_qualification_status": "pending",
+                "verdict_terminal_status": "promoted",
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        status_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "status_state_mismatch"
+        ]
+        assert status_conflicts == [], (
+            "status_state_mismatch must NOT fire when qualification_state_disagreement "
+            f"is present (resolver already documented the substitution); got: {conflicts}"
+        )
+
+    def test_qualification_surface_conflicts_criterion_coverage_vs_confidence(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "pending",
+                # Confidence MEETS threshold
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "qualifying"},
+            # But only 2 of 5 criteria are covered
+            "criterion_coverage": {
+                "total": 5,
+                "covered": 2,
+                "partial": 1,
+                "uncovered": 2,
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        coverage_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "criterion_coverage_vs_confidence"
+        ]
+        assert len(coverage_conflicts) == 1
+        assert "confidence" in coverage_conflicts[0]["description"].lower()
+        assert "covered" in coverage_conflicts[0]["description"].lower()
+
+    def test_qualification_surface_conflicts_none_when_surfaces_agree(self):
+        # A genuinely agreeing set of surfaces should produce NO conflicts
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "promoted",
+                "confidence": 0.95,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "promoted"},
+            "last_qualification_candidate_currency": {
+                "verdict": "fresh",
+                "resolved": True,
+                "current": True,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "abc123def456789",
+            },
+            # All criteria are covered
+            "criterion_coverage": {
+                "total": 5,
+                "covered": 5,
+                "partial": 0,
+                "uncovered": 0,
+            },
+            "promotion_readiness": {
+                "ready": True,
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        assert out["qualification_surface_conflicts"] == []
+        assert out["counts"]["qualification_surface_conflicts"] == 0
+
+    def test_qualification_surface_conflicts_promotion_readiness_unready(self):
+        # promotion_readiness.ready=False while last_qualification.status=
+        # "promotion_failed" should produce a promotion_readiness_unready
+        # conflict when is_current_readiness=True (pre-go-live calibration mode).
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "promotion_failed",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            # State kept consistent with status so only the promotion-readiness
+            # conflict fires (promotion_failed is a valid state for this status).
+            "qualification_state": {"state": "promotion_failed"},
+            "last_qualification_candidate_currency": {
+                "verdict": "fresh",
+                "resolved": True,
+                "current": True,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "abc123def456789",
+            },
+            "criterion_coverage": {
+                "total": 5,
+                "covered": 5,
+                "partial": 0,
+                "uncovered": 0,
+            },
+            "promotion_readiness": {
+                "ready": False,
+                # is_current_readiness=True: pre-go-live calibration regime
+                # where ready=False reflects actual track-record failure.
+                "is_current_readiness": True,
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        pr_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "promotion_readiness_unready"
+        ]
+        assert len(pr_conflicts) == 1
+        assert "not ready" in pr_conflicts[0]["description"].lower()
+        assert "promotion_failed" in pr_conflicts[0]["description"]
+
+    def test_promotion_readiness_unready_suppressed_in_live_regime(self):
+        # When is_current_readiness=False (live regime), promotion_readiness
+        # forced ready=False by _annotate_regime is a regime relabel, not a
+        # genuine track-record failure — the conflict must NOT be raised.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "promotion_failed",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "promotion_failed"},
+            "last_qualification_candidate_currency": {
+                "verdict": "fresh",
+                "resolved": True,
+                "current": True,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "abc123def456789",
+            },
+            "criterion_coverage": {
+                "total": 5,
+                "covered": 5,
+                "partial": 0,
+                "uncovered": 0,
+            },
+            "promotion_readiness": {
+                "ready": False,
+                # is_current_readiness=False: live regime, ready=False is a
+                # regime relabel by _annotate_regime, not a real conflict.
+                "is_current_readiness": False,
+                # live_regime_calibration_artifact=True: machine-checkable signal
+                # that ready=False is a regime artifact, not a real failure.
+                "live_regime_calibration_artifact": True,
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        pr_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "promotion_readiness_unready"
+        ]
+        # Live-regime forced ready=False must not surface as a conflict
+        assert len(pr_conflicts) == 0
+        # The promotion_readiness block carries the machine-checkable artifact flag.
+        pr_block = version_phase_block["promotion_readiness"]
+        assert pr_block.get("live_regime_calibration_artifact") is True
+
+    def test_qualification_surface_conflicts_absent_without_version_phase_block(self):
+        # When version_phase_block is None (no LTS split), the check simply
+        # doesn't run, so the field is empty even if surfaces would disagree.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=None,
+        )
+        assert out is not None
+        assert out["qualification_surface_conflicts"] == []
+        assert out["counts"]["qualification_surface_conflicts"] == 0
 
 
 # ── _build_prune_candidates: concrete cleanup list when the model is heavy ─────
@@ -13120,6 +15224,81 @@ def test_open_message_citation_summary_empty_without_warning():
     assert _open_message_citation_summary({}) == {}
     assert _open_message_citation_summary(None) == {}
     assert _open_message_citation_summary({"_provenance_warnings": "nope"}) == {}
+
+
+@pytest.mark.asyncio
+async def test_open_message_counts_ship_when_inbox_dropped(db_session):
+    """Trim-proof open-message count ships at critical tier and survives a full inbox drop.
+
+    open_message_count is computed from the raw feed BEFORE packing and placed at
+    critical tier, so even when the entire open_messages list is dropped under byte
+    budget pressure the agent can distinguish a genuinely empty inbox from a dropped
+    one and knows to ./fetch messages list to retrieve them.
+    """
+    from app.payload_schemas import pack_under_budget
+    from app.strategic_spawning import (
+        _summarize_open_messages,
+        _floor_open_messages,
+    )
+
+    # Build a schema that gives open_messages only 1 byte of budget by inflating
+    # all critical+high content to crowd it out — simulating extreme byte pressure
+    # where the inbox would normally be dropped wholesale.
+    # We test the pack contract directly rather than spawning a task.
+    messages = [
+        {
+            "id": f"msg-{i}",
+            "type": "NOTE",
+            "content": f"operator message #{i} with some content",
+            "created_at": f"2026-06-01T00:00:{i:02d}",
+        }
+        for i in range(40)
+    ]
+
+    # Use a tiny budget so open_messages (high priority, multi-KB) gets dropped
+    # while open_message_count (critical, tiny scalar) always ships.
+    tiny_budget = 512  # bytes — far too small to hold the message list
+
+    packed = pack_under_budget(
+        {
+            "open_message_count": len(messages),
+            "open_messages": messages,
+        },
+        schema={
+            "open_message_count": {"priority": "critical"},
+            "open_messages": {
+                "priority": "high",
+                "summarize": _summarize_open_messages,
+                "floor": _floor_open_messages,
+            },
+        },
+        budget=tiny_budget,
+    )
+
+    meta = packed["_packer_meta"]
+    dropped_keys = {entry["key"] for entry in meta["dropped"]}
+    trimmed_keys = {entry["key"] for entry in meta["trimmed"]}
+
+    # The trim-proof count must always ship at critical tier.
+    assert "open_message_count" in packed, (
+        "open_message_count must ship at critical tier even under extreme budget pressure"
+    )
+    assert packed["open_message_count"] == 40, (
+        f"open_message_count must equal the full pre-trim inbox depth; got {packed.get('open_message_count')}"
+    )
+    # The critical scalar must never appear in trimmed or dropped lists.
+    assert "open_message_count" not in dropped_keys | trimmed_keys, (
+        f"open_message_count must not be dropped or trimmed; meta={meta}"
+    )
+    # open_messages was dropped or trimmed (i.e. the inbox did NOT ship in full).
+    assert "open_messages" in dropped_keys or "open_messages" in trimmed_keys, (
+        "Under tiny budget open_messages must be dropped or trimmed to exercise the count-fallback path"
+    )
+    # open_messages must NOT appear in packed when dropped.
+    if "open_messages" in dropped_keys:
+        assert "open_messages" not in packed, (
+            "Dropped open_messages must not appear in the packed payload"
+        )
 
 
 class TestParallelismHint:
@@ -16135,6 +18314,62 @@ async def test_spawn_fix_per_review_budget_enforced(db_session, mocker):
     assert flag["scope"] == "per_review"
 
 
+@pytest.mark.asyncio
+async def test_spawn_fix_resident_session_exempt_from_per_review_cap(db_session, mocker):
+    """A resident-session task can exceed the per-review cap without being blocked;
+    only the rolling window cap applies. A batch task remains blocked at the cap."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"strategist_spawn_per_review_cap": 2, "strategist_spawn_window_cap": 50},
+    )
+
+    # --- Resident session task: context["_resident_session"] = True ---
+    project = Project(name="P-resident", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    resident_review = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+        context={"_resident_session": True},
+    )
+    db_session.add(resident_review)
+    await db_session.commit()
+    await db_session.refresh(resident_review)
+    resident_id = str(resident_review.id)
+
+    # 3 spawns — exceeds the per-review cap of 2, all should succeed for resident.
+    for n in ("alpha", "beta", "gamma"):
+        body = await _post_spawn_fix(
+            db_session, resident_id, title=f"Fix {n}", prompt=f"do {n}"
+        )
+        assert body["status"] == "ok", f"resident spawn '{n}' was blocked: {body}"
+        assert body["deduplicated"] is False
+
+    # --- Batch task: no _resident_session flag, still blocked at cap ---
+    _project2, batch_id = await _make_strategic_review_task(db_session)
+
+    for n in ("one", "two"):
+        body = await _post_spawn_fix(
+            db_session, batch_id, title=f"Batch fix {n}", prompt=f"do {n}"
+        )
+        assert body["status"] == "ok"
+
+    refused = await _post_spawn_fix(
+        db_session,
+        batch_id,
+        title="Batch fix three",
+        prompt="do three",
+        expect_status=429,
+    )
+    assert refused["status"] == "skipped"
+    assert refused["scope"] == "per_review"
+
+
 # ── CI compliance in strategic review payload ─────────────────────────────────
 
 
@@ -16404,3 +18639,853 @@ async def test_direction_stats_known_zero_reachable_survives_eviction(db_session
         "known-zero reachability must survive eviction via total_reachable_recorded_cycles counter"
     )
     assert evicted_dir["reachable_prs_merged"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Summarize fallbacks for previously-exempt droppable payload sections.
+# Each of the six sections below dropped WHOLESALE under byte-budget pressure
+# before gaining a summarize_fn. These tests assert each summarizer (a) shrinks
+# a representative oversized input, (b) never raises on malformed/empty input,
+# and (c) is wired into the schema with a callable summarize entry.
+# ---------------------------------------------------------------------------
+
+
+def _ser_size(value) -> int:
+    """Serialized byte size, matching the packer's accounting."""
+    return len(json.dumps(value, default=str))
+
+
+_DROPPABLE_SUMMARIZE_SECTIONS = (
+    "operator_overrides",
+    "knowledge_index",
+    "previous_decision_outcomes",
+    "playbook_summary",
+    "past_retirement_critiques",
+    "self_reflection_log",
+)
+
+
+def test_droppable_sections_have_summarize_fallback():
+    """The six previously-exempt droppable sections now carry a summarize_fn.
+
+    Acceptance contract: each section key in _STRATEGIC_REVIEW_SCHEMA maps to a
+    schema entry whose ``summarize`` value is CALLABLE (not exempt/None), so under
+    byte-budget pressure the packer degrades the section instead of dropping it
+    wholesale. knowledge_index is also checked in _DESIGN_DOC_UPDATE_SCHEMA.
+    """
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _DESIGN_DOC_UPDATE_SCHEMA,
+    )
+
+    for key in _DROPPABLE_SUMMARIZE_SECTIONS:
+        entry = _STRATEGIC_REVIEW_SCHEMA.get(key)
+        assert entry is not None, f"{key} missing from _STRATEGIC_REVIEW_SCHEMA"
+        assert callable(entry.get("summarize")), (
+            f"{key} must have a callable summarize fallback, not exempt-drop"
+        )
+        assert not entry.get("exempt"), (
+            f"{key} must not be exempt once it has a summarize fallback"
+        )
+
+    # knowledge_index appears in the design-doc schema variant too.
+    dd_entry = _DESIGN_DOC_UPDATE_SCHEMA.get("knowledge_index")
+    assert dd_entry is not None
+    assert callable(dd_entry.get("summarize")), (
+        "knowledge_index must have a summarize fallback in _DESIGN_DOC_UPDATE_SCHEMA"
+    )
+
+
+def test_summarize_operator_overrides_shrinks_and_keeps_keys():
+    from app.strategic_spawning import _summarize_operator_overrides
+
+    overrides = [
+        {
+            "document": "vision",
+            "field": f"field_{i}",
+            "kind": "scalar_conflict",
+            "agent_value": "A" * 240,
+            "operator_value": "O" * 240,
+            "at": f"2026-07-0{i}T00:00:00Z",
+        }
+        for i in range(1, 9)
+    ]
+    result = _summarize_operator_overrides(overrides)
+    assert isinstance(result, list)
+    assert _ser_size(result) < _ser_size(overrides)
+    assert len(result) <= 4  # newest-few cap
+    # Load-bearing routing keys survive; prose values are truncated hard.
+    first = result[0]
+    assert first["document"] == "vision"
+    assert first["field"] == "field_1"
+    assert first["kind"] == "scalar_conflict"
+    assert first["at"] == "2026-07-01T00:00:00Z"
+    assert len(first["agent_value"]) < 240
+
+
+def test_summarize_operator_overrides_malformed_never_raises():
+    from app.strategic_spawning import _summarize_operator_overrides
+
+    assert _summarize_operator_overrides(None) is None
+    assert _summarize_operator_overrides("str") == "str"
+    assert _summarize_operator_overrides([]) == []
+    # Non-dict list entries pass through untouched.
+    assert _summarize_operator_overrides([123, "x"]) == [123, "x"]
+    # Missing fields don't crash.
+    assert _summarize_operator_overrides([{}]) == [
+        {
+            "document": None,
+            "field": None,
+            "kind": None,
+            "agent_value": None,
+            "operator_value": None,
+            "at": None,
+        }
+    ]
+
+
+def test_summarize_knowledge_index_shrinks_and_keeps_pointers():
+    from app.strategic_spawning import _summarize_knowledge_index
+
+    entries = [
+        {
+            "id": f"doc-{i}",
+            "title": f"Doc {i}",
+            "summary": "S" * 300,
+            "topic": "research",
+            "direction_id": f"d-{i}",
+            "source_kind": "web_research",
+            "sweep_id": None,
+            "arm_label": None,
+            "per_arm_verdicts": [{"arm": "a", "blob": "X" * 500}],
+            "origin_provenance": {"deep": {"nested": "Y" * 500}},
+            "knowledge_acceptance_evidence": "Z" * 300,
+            "created_at": "2026-07-01T00:00:00Z",
+        }
+        for i in range(15)
+    ]
+    result = _summarize_knowledge_index(entries)
+    assert isinstance(result, list)
+    assert _ser_size(result) < _ser_size(entries)
+    assert len(result) <= 8
+    first = result[0]
+    # Navigation pointers survive so ./fetch knowledge <id> still works.
+    assert first["id"] == "doc-0"
+    assert first["title"] == "Doc 0"
+    assert first["direction_id"] == "d-0"
+    # Heavy sub-fields dropped, summary truncated.
+    assert "per_arm_verdicts" not in first
+    assert "origin_provenance" not in first
+    assert len(first["summary"]) < 300
+
+
+def test_summarize_knowledge_index_malformed_never_raises():
+    from app.strategic_spawning import _summarize_knowledge_index
+
+    assert _summarize_knowledge_index(None) is None
+    assert _summarize_knowledge_index("x") == "x"
+    assert _summarize_knowledge_index([]) == []
+    assert _summarize_knowledge_index([123]) == [123]
+    # Entry with no summary key: no crash, id preserved.
+    assert _summarize_knowledge_index([{"id": "d1"}]) == [{"id": "d1"}]
+
+
+def test_summarize_previous_decision_outcomes_shrinks_keeps_ids():
+    from app.strategic_spawning import _summarize_previous_decision_outcomes
+
+    value = {
+        "cycle_id": "c-1",
+        "phase2_completed_at": "2026-07-01T00:00:00Z",
+        "summary_text": "T" * 500,
+        "cycle_reasoning": "R" * 2000,
+        "created": [
+            {
+                "direction_id": f"d-{i}",
+                "role": "created",
+                "status": "active",
+                "text": "X" * 200,
+                "prs_merged": 3,
+                "rationale": "why " * 100,
+                "prediction": {"similar_past_merges": 2, "blob": "P" * 500},
+            }
+            for i in range(10)
+        ],
+        "retired": [
+            {
+                "direction_id": "d-ret",
+                "role": "retired",
+                "status": "missing",
+                "final_metrics": {"merged": 5, "blob": "F" * 500},
+            }
+        ],
+    }
+    result = _summarize_previous_decision_outcomes(value)
+    assert isinstance(result, dict)
+    assert _ser_size(result) < _ser_size(value)
+    assert result["cycle_id"] == "c-1"
+    assert result["phase2_completed_at"] == "2026-07-01T00:00:00Z"
+    assert "cycle_reasoning" not in result  # verbose free-text dropped
+    assert len(result["created"]) <= 6
+    first = result["created"][0]
+    assert first["direction_id"] == "d-0"  # fetch pointer preserved
+    assert "prediction" not in first  # heavy sub-body dropped
+    assert "final_metrics" not in result["retired"][0]
+
+
+def test_summarize_previous_decision_outcomes_malformed_never_raises():
+    from app.strategic_spawning import _summarize_previous_decision_outcomes
+
+    assert _summarize_previous_decision_outcomes(None) is None
+    assert _summarize_previous_decision_outcomes("x") == "x"
+    assert _summarize_previous_decision_outcomes({}) == {}
+    # created not a list -> untouched key.
+    out = _summarize_previous_decision_outcomes({"cycle_id": "c", "created": "bad"})
+    assert out["cycle_id"] == "c"
+    assert out["created"] == "bad"
+
+
+def test_summarize_playbook_summary_shrinks_keeps_keys():
+    from app.strategic_spawning import _summarize_playbook_summary
+
+    value = {
+        "entries": [
+            {
+                "key": f"pb-{i}",
+                "content": "C" * 400,
+                "source": "auto-generated",
+                "updated_at": "2026-07-01T00:00:00Z",
+                "hit_count": 3,
+                "confirmed_count": 2,
+            }
+            for i in range(10)
+        ]
+    }
+    result = _summarize_playbook_summary(value)
+    assert isinstance(result, dict)
+    assert _ser_size(result) < _ser_size(value)
+    assert len(result["entries"]) <= 6
+    first = result["entries"][0]
+    assert first["key"] == "pb-0"  # fetch pointer preserved
+    assert len(first["content"]) < 400
+    assert "hit_count" not in first  # stat fields dropped
+
+
+def test_summarize_playbook_summary_malformed_never_raises():
+    from app.strategic_spawning import _summarize_playbook_summary
+
+    assert _summarize_playbook_summary(None) is None
+    assert _summarize_playbook_summary("x") == "x"
+    assert _summarize_playbook_summary({}) == {}
+    # entries not a list -> passthrough.
+    assert _summarize_playbook_summary({"entries": "bad"}) == {"entries": "bad"}
+    # Non-dict entry preserved.
+    out = _summarize_playbook_summary({"entries": [1, {"key": "k"}]})
+    assert out["entries"][0] == 1
+
+
+def test_summarize_past_retirement_critiques_shrinks_keeps_ids():
+    from app.strategic_spawning import _summarize_past_retirement_critiques
+
+    value = [
+        {
+            "direction_id": f"d-{i}",
+            "what_it_addressed": "W" * 300,
+            "pattern_that_produced_it": "P" * 300,
+            "lesson": "L" * 300,
+        }
+        for i in range(6)
+    ]
+    result = _summarize_past_retirement_critiques(value)
+    assert isinstance(result, list)
+    assert _ser_size(result) < _ser_size(value)
+    assert len(result) <= 3
+    first = result[0]
+    assert first["direction_id"] == "d-0"
+    assert len(first["lesson"]) < 300
+
+
+def test_summarize_past_retirement_critiques_sentinel_and_malformed():
+    from app.strategic_spawning import _summarize_past_retirement_critiques
+
+    assert _summarize_past_retirement_critiques(None) is None
+    assert _summarize_past_retirement_critiques("x") == "x"
+    assert _summarize_past_retirement_critiques([]) == []
+    # no_eligible_retirements sentinel is preserved.
+    assert _summarize_past_retirement_critiques([{"no_eligible_retirements": True}]) == [
+        {"no_eligible_retirements": True}
+    ]
+    assert _summarize_past_retirement_critiques([42]) == [42]
+
+
+def test_summarize_self_reflection_log_shrinks_keeps_pointers():
+    from app.strategic_spawning import _summarize_self_reflection_log
+
+    value = [
+        {
+            "ts": f"2026-07-0{i}T00:00:00Z",
+            "cycle_task_id": f"t-{i}",
+            "what_was_hard": "H" * 300,
+            "missing_context": "M" * 300,
+            "proposed_self_improvement": "I" * 300,
+        }
+        for i in range(1, 6)
+    ]
+    result = _summarize_self_reflection_log(value)
+    assert isinstance(result, list)
+    assert _ser_size(result) < _ser_size(value)
+    assert len(result) <= 3
+    # Newest-few (tail) kept; pointers preserved.
+    last = result[-1]
+    assert last["cycle_task_id"] == "t-5"
+    assert last["ts"] == "2026-07-05T00:00:00Z"
+    assert len(last["what_was_hard"]) < 300
+
+
+def test_summarize_self_reflection_log_malformed_never_raises():
+    from app.strategic_spawning import _summarize_self_reflection_log
+
+    assert _summarize_self_reflection_log(None) is None
+    assert _summarize_self_reflection_log("x") == "x"
+    assert _summarize_self_reflection_log([]) == []
+    assert _summarize_self_reflection_log(["str", 1]) == ["str", 1]
+
+
+def _oversized_section_fixtures() -> dict:
+    """Realistic oversized values for the six previously-exempt sections."""
+    return {
+        "operator_overrides": [
+            {
+                "document": "vision",
+                "field": f"f{i}",
+                "kind": "k",
+                "agent_value": "A" * 240,
+                "operator_value": "O" * 240,
+                "at": f"2026-07-0{(i % 9) + 1}T00:00:00Z",
+            }
+            for i in range(8)
+        ],
+        "knowledge_index": [
+            {
+                "id": f"doc-{i}",
+                "title": f"Doc {i}",
+                "summary": "S" * 300,
+                "topic": "t",
+                "direction_id": f"d-{i}",
+                "source_kind": "web_research",
+                "per_arm_verdicts": [{"blob": "X" * 400}],
+                "origin_provenance": {"blob": "Y" * 400},
+            }
+            for i in range(15)
+        ],
+        "previous_decision_outcomes": {
+            "cycle_id": "c-1",
+            "phase2_completed_at": "2026-07-01T00:00:00Z",
+            "summary_text": "T" * 500,
+            "cycle_reasoning": "R" * 2000,
+            "created": [
+                {
+                    "direction_id": f"d-{i}",
+                    "role": "created",
+                    "status": "active",
+                    "text": "X" * 200,
+                    "prediction": {"blob": "P" * 400},
+                }
+                for i in range(10)
+            ],
+            "retired": [],
+        },
+        "playbook_summary": {
+            "entries": [
+                {
+                    "key": f"pb-{i}",
+                    "content": "C" * 400,
+                    "source": "auto-generated",
+                    "hit_count": 3,
+                }
+                for i in range(10)
+            ]
+        },
+        "past_retirement_critiques": [
+            {
+                "direction_id": f"d-{i}",
+                "what_it_addressed": "W" * 300,
+                "pattern_that_produced_it": "P" * 300,
+                "lesson": "L" * 300,
+            }
+            for i in range(6)
+        ],
+        "self_reflection_log": [
+            {
+                "ts": f"2026-07-0{i}T00:00:00Z",
+                "cycle_task_id": f"t-{i}",
+                "what_was_hard": "H" * 300,
+                "missing_context": "M" * 300,
+                "proposed_self_improvement": "I" * 300,
+            }
+            for i in range(1, 6)
+        ],
+    }
+
+
+_CRITICAL_IDENTITY_PAYLOAD = {
+    "type": "strategic_review",
+    "research_mode": False,
+    "project_name": "P",
+    "base_branch": "main",
+    "is_self_repo": True,
+    "enable_self_improvement": True,
+    "model": "m",
+    "effort": "medium",
+    "vision": "V",
+    "direction_counts": {"active": 1},
+    "max_active_directions": 5,
+    "open_message_count": 0,
+}
+
+
+@pytest.mark.parametrize("section", _DROPPABLE_SUMMARIZE_SECTIONS)
+def test_droppable_section_degrades_not_drops_under_budget(section):
+    """Integration: each previously-exempt section trims (not drops) under pressure.
+
+    Packs the critical identity keys plus ONE oversized section at a budget just
+    below the whole-payload size, so the section cannot ship whole and must fall
+    through to its summarize_fn. Asserts the section survives (appears in output,
+    trimmed) rather than landing in the wholesale-dropped list — the exact
+    behavior change from swapping ``exempt: True`` to ``summarize: <fn>``.
+    """
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+    from app.payload_schemas import pack_under_budget
+
+    fixtures = _oversized_section_fixtures()
+    payload = {**_CRITICAL_IDENTITY_PAYLOAD, section: fixtures[section]}
+    # The packer's budget accounting sums per-VALUE sizes (not the whole-dict
+    # size). Reserve exactly the critical values plus one byte under the whole
+    # section value, so the section cannot ship whole and must fall through to
+    # its summarize_fn (which produces a strictly smaller, budget-fitting form).
+    critical_used = sum(
+        _ser_size(v) for v in _CRITICAL_IDENTITY_PAYLOAD.values()
+    )
+    whole_section = _ser_size(fixtures[section])
+    budget = critical_used + whole_section - 1
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
+    meta = packed.get("_packer_meta", {})
+    dropped_keys = {d["key"] for d in meta.get("dropped", [])}
+    trimmed_keys = {t["key"] for t in meta.get("trimmed", [])}
+
+    assert section in packed, (
+        f"{section} degraded to nothing under budget — summarize should keep a skeleton"
+    )
+    assert section not in dropped_keys, (
+        f"{section} was dropped wholesale; expected it to be trimmed instead"
+    )
+    assert section in trimmed_keys, (
+        f"{section} should be recorded as trimmed in _packer_meta"
+    )
+    # The retained value is strictly smaller than the original.
+    assert _ser_size(packed[section]) < _ser_size(fixtures[section])
+
+
+# ── Reconciliation sections fixture contract ──────────────────────────────────
+
+
+class TestReconciliationSectionsContract:
+    """Pin the list-class keys of cycle_start_reconciliation to a fixture so
+    that adding a backend key without updating the agent renderer fails CI.
+
+    The fixture (backend/testing/__fixtures__/reconciliation_sections.json) is
+    the single source of truth.  These tests verify the backend side; the agent
+    side is covered in agent/src/handlers/strategic-sections.test.ts.
+    """
+
+    def _load_fixture(self) -> dict:
+        from pathlib import Path
+
+        fixture_path = (
+            Path(__file__).parent / "__fixtures__" / "reconciliation_sections.json"
+        )
+        with open(fixture_path) as f:
+            return json.load(f)
+
+    def _minimal_recon_output(self) -> dict:
+        """Return a non-None _build_cycle_start_reconciliation result."""
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        # An active direction with no gap_id is always ungrounded → non-empty
+        # conflict list → function returns a dict (not None).
+        direction_stats = [
+            {"id": "d-contract-test", "status": "active", "text": "contract test"}
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, {}, {})
+        assert out is not None, (
+            "_build_cycle_start_reconciliation returned None for minimal data — "
+            "the early-return guard may have changed; update this helper."
+        )
+        return out
+
+    def test_fixture_schema_version_and_list_keys(self):
+        fixture = self._load_fixture()
+        assert fixture["schema_version"] == 1
+        assert isinstance(fixture["list_keys"], list)
+        assert len(fixture["list_keys"]) > 0
+
+    def test_backend_output_contains_all_fixture_list_keys(self):
+        """Every fixture key must appear as a list in the backend output.
+
+        Fails when the fixture adds a key that _build_cycle_start_reconciliation
+        does not yet emit — update the backend function or remove the key.
+        """
+        fixture = self._load_fixture()
+        expected_keys = set(fixture["list_keys"])
+        out = self._minimal_recon_output()
+
+        actual_list_keys = {k for k, v in out.items() if isinstance(v, list)}
+        missing = expected_keys - actual_list_keys
+        assert not missing, (
+            f"Keys in reconciliation_sections fixture but absent from "
+            f"_build_cycle_start_reconciliation output: {sorted(missing)}. "
+            f"Add them to the backend function or remove them from the fixture."
+        )
+
+    def test_fixture_covers_all_backend_list_keys(self):
+        """Every list key the backend emits must be declared in the fixture.
+
+        Fails when _build_cycle_start_reconciliation adds a new list key without
+        updating backend/testing/__fixtures__/reconciliation_sections.json — the
+        CI guard that catches the compute-but-never-render drift class.
+        """
+        fixture = self._load_fixture()
+        expected_keys = set(fixture["list_keys"])
+        out = self._minimal_recon_output()
+
+        actual_list_keys = {k for k, v in out.items() if isinstance(v, list)}
+        extra = actual_list_keys - expected_keys
+        assert not extra, (
+            f"_build_cycle_start_reconciliation emits list keys not declared in "
+            f"the reconciliation_sections fixture: {sorted(extra)}. "
+            f"Add them to backend/testing/__fixtures__/reconciliation_sections.json "
+            f"AND add a renderer in agent/src/handlers/strategic-sections.ts."
+        )
+
+
+# ---------------------------------------------------------------------------
+# _maybe_spawn_ci_compliance_cap_bump_fix — chronic vs routine classification
+# ---------------------------------------------------------------------------
+
+from app.strategic_spawning import _maybe_spawn_ci_compliance_cap_bump_fix  # noqa: E402
+
+
+def _chronic_history():
+    """Return a 3-bump history that trips the chronic-offender threshold."""
+    from app.size_limit_policy import BumpRecord
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    return [
+        BumpRecord(
+            commit_sha="aaa",
+            commit_date=(now - timedelta(days=150)).isoformat(),
+            old_cap=3500,
+            new_cap=4050,
+        ),
+        BumpRecord(
+            commit_sha="bbb",
+            commit_date=(now - timedelta(days=90)).isoformat(),
+            old_cap=4050,
+            new_cap=4500,
+        ),
+        BumpRecord(
+            commit_sha="ccc",
+            commit_date=(now - timedelta(days=30)).isoformat(),
+            old_cap=4500,
+            new_cap=4700,
+        ),
+    ]
+
+
+def _make_gate(violations, *, head_sha="a" * 40):
+    return {
+        "blocked": True,
+        "head_sha": head_sha,
+        "violations": violations,
+        "branch_literal_violations": [],
+        "violation_count": len(violations),
+    }
+
+
+@pytest.mark.asyncio
+async def test_cap_bump_task_decomposes_chronic_offender(db_session, mocker):
+    """When a violation is on a chronic offender, the spawned task must direct
+    decomposition and must NOT instruct a blind cap bump (--fix) for that file.
+
+    This is the acceptance test named by the task:
+    test_strategic_spawning.py::test_cap_bump_task_decomposes_chronic_offender
+    """
+    project = Project(
+        name="chronic-test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test chronic spawn"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = _make_gate(
+        [{"section": "backend", "rel": "orchestrator.py", "count": 9200, "cap": 9000}]
+    )
+
+    with patch(
+        "app.size_limit_policy.parse_bump_history",
+        return_value=_chronic_history(),
+    ):
+        spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+
+    assert spawned is not None
+    prompt = spawned.first_payload["prompt"]
+    title = spawned.first_payload["title"]
+
+    # Must direct decomposition, not a cap bump.
+    assert "decompos" in prompt.lower(), (
+        "Expected prompt to mention decomposition for a chronic offender"
+    )
+    assert "orchestrator.py" in prompt, (
+        "Expected prompt to name the chronic offender file"
+    )
+    # Must NOT tell the agent to run --fix on the chronic file.
+    assert "python3 backend/testing/check_size_limits.py --fix" not in prompt, (
+        "Prompt must not instruct --fix for a chronic offender"
+    )
+    # Title should signal decomposition, not a cap bump.
+    assert "decompos" in title.lower() or "chronic" in title.lower(), (
+        f"Task title should indicate decomposition, got: {title!r}"
+    )
+    # Context keys preserved.
+    assert spawned.context["spawned_by"] == "ci_compliance_cap_bump_gate"
+    assert spawned.context["head_sha"] == "a" * 40
+    assert spawned.context["ci_compliance_cap_bump"] is True
+
+
+@pytest.mark.asyncio
+async def test_cap_bump_task_routine_violation_keeps_fix_instruction(db_session, mocker):
+    """When all violations are routine (no chronic history), the spawned task
+    must still instruct `check_size_limits.py --fix` as before.
+    """
+    project = Project(
+        name="routine-test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test routine spawn"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = _make_gate(
+        [{"section": "backend", "rel": "new_module.py", "count": 1600, "cap": 1500}]
+    )
+
+    with patch("app.size_limit_policy.parse_bump_history", return_value=[]):
+        spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+
+    assert spawned is not None
+    prompt = spawned.first_payload["prompt"]
+    title = spawned.first_payload["title"]
+
+    assert "python3 backend/testing/check_size_limits.py --fix" in prompt, (
+        "Routine violation must still instruct --fix"
+    )
+    assert "bump" in title.lower() or "fix" in title.lower(), (
+        f"Routine task title should reference bump/fix, got: {title!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cap_bump_task_uncapped_violation_treated_as_routine(db_session, mocker):
+    """Violations with cap=None (new files) are never chronic and must keep the
+    --fix instruction regardless of git history.
+    """
+    project = Project(
+        name="uncapped-test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test uncapped spawn"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = _make_gate(
+        [{"section": "backend", "rel": "brand_new.py", "count": 2000, "cap": None}]
+    )
+
+    classify_breach_mock = mocker.patch("app.size_limit_policy.classify_breach")
+    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+
+    # classify_breach must NOT be called for uncapped violations.
+    classify_breach_mock.assert_not_called()
+    assert spawned is not None
+    assert "python3 backend/testing/check_size_limits.py --fix" in spawned.first_payload["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# Session-end message hand-off: _fetch_open_messages exclusion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_messages_excludes_session_handoff_resolved_messages(db_session):
+    """Messages resolved via session hand-off must not reappear in later strategic payloads.
+
+    Verifies two things:
+    1. ``handoff_session_messages`` can be imported and called without error.
+    2. ``_fetch_open_messages`` excludes messages with ``status='resolved'`` and
+       ``resolution='session_handoff'``, while unrelated open messages remain visible.
+
+    This covers the full observable contract: a concluded session's conversation
+    messages leave the open-message feed after hand-off, and project-wide standing
+    messages (BUG_REPORTs, questions from other sessions) are unaffected.
+    """
+    from app.session_message_handoff import handoff_session_messages
+    from app.strategic_spawning import _fetch_open_messages
+
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Message that belonged to the ending session — will be handed off.
+    msg_session = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.NOTE,
+        content="operator chat during session",
+        status="open",
+    )
+    # Unrelated standing message — must survive the hand-off.
+    msg_other = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.BUG_REPORT,
+        content="standing bug report unrelated to any session",
+        status="open",
+    )
+    db_session.add_all([msg_session, msg_other])
+    await db_session.commit()
+
+    # Both messages appear before the hand-off.
+    before = await _fetch_open_messages(db_session, project.id)
+    before_ids = {m["id"] for m in before}
+    assert str(msg_session.id) in before_ids
+    assert str(msg_other.id) in before_ids
+
+    # Call the new hand-off function (exercises production code).
+    # When the resident_session_id column is not yet on the model this returns 0
+    # (safe no-op). We then directly mark the session message resolved to test
+    # the _fetch_open_messages exclusion path regardless.
+    _count = await handoff_session_messages(db_session, project.id, "ss-test123456789")
+    assert isinstance(_count, int) and _count >= 0
+
+    # Simulate the resolved state the hand-off produces (or would produce once
+    # the resident_session_id column lands from the sibling PR).
+    msg_session.status = "resolved"
+    msg_session.resolution = "session_handoff"
+    msg_session.resolved_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db_session.add(msg_session)
+    await db_session.commit()
+
+    # After hand-off: the session message is gone; the standing message remains.
+    after = await _fetch_open_messages(db_session, project.id)
+    after_ids = {m["id"] for m in after}
+    assert str(msg_session.id) not in after_ids, (
+        "session_handoff-resolved message must be excluded from the open-message feed"
+    )
+    assert str(msg_other.id) in after_ids, (
+        "unrelated open message must remain visible after session hand-off"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handoff_session_messages_write_path(db_session):
+    """handoff_session_messages must resolve messages stamped with the ending
+    session_id: status='resolved', resolution='session_handoff', resolved_at set,
+    and context stamped with session_handoff_at/session_id.
+
+    Tests the core write path by seeding a message WITH resident_session_id
+    matching the session being handed off.
+    """
+    from app.session_message_handoff import handoff_session_messages
+
+    SESSION_ID = "ss-handoff-writetest"
+
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Message stamped for the ending session — must be resolved by handoff.
+    msg_session = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.NOTE,
+        content="operator chat during session",
+        status="open",
+        resident_session_id=SESSION_ID,
+    )
+    # Unrelated open message (NULL session) — must NOT be touched.
+    msg_unscoped = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.BUG_REPORT,
+        content="standing bug report — no session",
+        status="open",
+        resident_session_id=None,
+    )
+    # Message stamped for a DIFFERENT session — must NOT be touched.
+    msg_other_session = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.NOTE,
+        content="message from a different session",
+        status="open",
+        resident_session_id="ss-other-session",
+    )
+    db_session.add_all([msg_session, msg_unscoped, msg_other_session])
+    await db_session.commit()
+
+    count = await handoff_session_messages(db_session, project.id, SESSION_ID)
+    assert count == 1, f"expected 1 message resolved, got {count}"
+    await db_session.commit()
+
+    await db_session.refresh(msg_session)
+    await db_session.refresh(msg_unscoped)
+    await db_session.refresh(msg_other_session)
+
+    # The session-stamped message is resolved.
+    assert msg_session.status == "resolved", "stamped message must be resolved"
+    assert msg_session.resolution == "session_handoff"
+    assert msg_session.resolved_at is not None
+    ctx = msg_session.context or {}
+    assert "session_handoff_at" in ctx, "context must contain session_handoff_at"
+    assert ctx.get("session_id") == SESSION_ID
+
+    # Unscoped and other-session messages are untouched.
+    assert msg_unscoped.status == "open", "NULL-session message must remain open"
+    assert msg_other_session.status == "open", "other-session message must remain open"

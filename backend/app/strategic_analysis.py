@@ -155,6 +155,9 @@ def _build_retired_directions_summary(
             entry["prs_rejected"] = total_rejected
         if d.get("retirement_reason"):
             entry["retirement_reason"] = str(d["retirement_reason"])[:200]
+        retirement_outcome = d.get("retirement_outcome") or d.get("auto_completed_reason")
+        if retirement_outcome:
+            entry["retirement_outcome"] = str(retirement_outcome)[:200]
         if d.get("auto_completed_reason"):
             entry["auto_completed_reason"] = str(d["auto_completed_reason"])[:200]
         if cost_per_merge is not None:
@@ -181,9 +184,11 @@ def _build_retired_directions_summary(
     # the live list. The lifecycle pass removes terminal directions from
     # project.directions, so directions retired a cycle ago are invisible to the
     # loop above. vision['_recently_retired_directions'] survives pruning and
-    # stores compact entries (id, text_tokens, retired_at, reason, gap_id).
-    # Adding them here ensures the agent sees cross-cycle retirements and can
-    # avoid re-proposing work for the same gaps.
+    # stores compact entries (id, text_tokens, retired_at, reason, gap_id,
+    # cycles, prs_merged). Adding them here ensures the agent sees cross-cycle
+    # retirements and can avoid re-proposing work for the same gaps. The outcome
+    # metrics (cycles, prs_merged) surface the actual result so re-proposals of
+    # landed or known-dead work can be detected.
     vision = project.vision or {}
     recently_retired_memory = vision.get("_recently_retired_directions") or []
     if recently_retired_memory and len(results) < max_count:
@@ -202,11 +207,43 @@ def _build_retired_directions_summary(
                 "id": entry_id,
                 "text": text[:200],
                 "status": "retired",
-                "cycles": 0,
-                "prs_merged": 0,
+                "cycles": mem_entry.get("cycles", 0),
+                "prs_merged": mem_entry.get("prs_merged", 0),
             }
             if mem_entry.get("reason"):
                 mem_result["retirement_reason"] = str(mem_entry["reason"])[:200]
+            # Surface the compact retirement outcome ("why it was retired / what
+            # landed" — rationale or a superseded-by successor pointer) so the
+            # agent sees what a retired direction actually shipped, not just its
+            # coarse reason category.
+            if mem_entry.get("outcome"):
+                mem_result["retirement_outcome"] = str(mem_entry["outcome"])[:200]
+            else:
+                # The freetext ``outcome`` is optional and the lifecycle retire
+                # path never writes it, but every memory entry carries a
+                # structured ``retired_outcome`` ({classification, metrics}). Fall
+                # back to it so the strategist always sees how a retired direction
+                # ended (classification + outcome metrics), not just its coarse
+                # reason category. Keep the same per-entry char cap.
+                retired_outcome = mem_entry.get("retired_outcome")
+                if isinstance(retired_outcome, dict):
+                    classification = str(
+                        retired_outcome.get("classification") or ""
+                    ).strip()
+                    if classification:
+                        outcome_text = classification
+                        metrics = retired_outcome.get("metrics")
+                        if isinstance(metrics, dict):
+                            metric_bits = [
+                                f"{k}={v}"
+                                for k, v in metrics.items()
+                                if isinstance(v, (int, float, bool))
+                            ]
+                            if metric_bits:
+                                outcome_text = (
+                                    f"{classification} ({', '.join(metric_bits)})"
+                                )
+                        mem_result["retirement_outcome"] = outcome_text[:200]
             results.append(mem_result)
             existing_ids.add(entry_id)
 

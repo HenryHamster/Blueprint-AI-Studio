@@ -18,6 +18,20 @@ _REPO_ROOT = "/tmp/workspace"
 _DESIGN_DOC_PATH_RE = re.compile(
     r"\b((?:backend|agent|admin-ui)/(?:[\w.-]+/)*[\w.-]+\.\w+)\b"
 )
+# Matches a non-numeric symbol suffix on a module pointer, e.g. "models.py:Alert".
+# Line-number refs like "file.py:42" are excluded because digits don't match [A-Za-z_].
+_MODULE_PTR_SYMBOL_RE = re.compile(r":[A-Za-z_]\w*$")
+
+
+def _normalize_module_ptr(ref: str) -> str:
+    """Strip a path:Symbol suffix to recover the bare file path.
+
+    Converts 'backend/app/models.py:Alert' → 'backend/app/models.py'.
+    Line-number refs like 'file.py:42' are unchanged (digit after colon).
+    """
+    return _MODULE_PTR_SYMBOL_RE.sub("", ref)
+
+
 _PRESENT_SYSTEM_STATUSES = {"mature", "functional", "partial"}
 _PRESENT_CAPABILITY_STATUSES = {"working", "partial"}
 
@@ -94,7 +108,14 @@ async def _path_exists_at_head(path: str, repo_root: str = _REPO_ROOT) -> bool |
     False means the path is definitely absent in HEAD. None means git/root
     validation failed, so callers should degrade conservatively and leave the
     original value untouched.
+
+    Normalizes path:Symbol suffixes before the git check so module pointers like
+    'backend/app/models.py:Alert' resolve to the underlying file. For directory
+    pointers (trailing '/'), any non-empty output from git ls-files confirms
+    presence — the directory name itself never appears in the listing.
     """
+    path = _normalize_module_ptr(path)
+    is_dir = path.endswith("/")
     if not _looks_like_file_path(path):
         # Not a recognizable file path — indeterminate, leave callers to degrade.
         return None
@@ -121,8 +142,11 @@ async def _path_exists_at_head(path: str, repo_root: str = _REPO_ROOT) -> bool |
             return None
         if proc.returncode != 0:
             return None
-        # git ls-files returns 0 and outputs the path if it exists, empty otherwise
-        return path in stdout.decode(errors="replace").splitlines()
+        output = stdout.decode(errors="replace")
+        if is_dir:
+            # Directory pointer: presence is confirmed by any listed file beneath it.
+            return bool(output.strip())
+        return path in output.splitlines()
     except Exception as e:  # noqa: BLE001 — grounding must degrade to indeterminate, never raise
         logger.warning(
             f"[SOURCE_REF_VALIDATION] Failed to check if file exists: {path}: {e}"
@@ -156,6 +180,7 @@ async def _file_exists_in_repo_branch(
     """
     if not isinstance(path, str):
         return None
+    path = _normalize_module_ptr(path)
     if not path or path != path.strip() or " " in path:
         return None
     from app.github_repo_snapshot import glob_exists_on_branch, path_exists_on_branch
@@ -163,6 +188,17 @@ async def _file_exists_in_repo_branch(
     if any(ch in path for ch in "*?[]{}"):
         return await glob_exists_on_branch(
             path,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+
+    if path.endswith("/"):
+        # Directory pointer: use a glob to check whether any file exists beneath it.
+        return await glob_exists_on_branch(
+            path + "*",
             token=token,
             owner=owner,
             repo=repo,
@@ -213,6 +249,7 @@ async def _file_content_in_repo_branch(
     design-doc entries, and retried passes cost one API call per content
     change instead of one per read.
     """
+    path = _normalize_module_ptr(path)
     if not _looks_like_file_path(path):
         return None, None
     from app.github_repo_snapshot import file_text_on_branch
@@ -296,6 +333,8 @@ async def _classify_each_path(
     for p in paths:
         exists: bool | None
         if isinstance(p, str):
+            # Both callees normalize path:Symbol refs and directory pointers
+            # internally — no caller-level normalization needed here.
             if use_repo_branch:
                 exists = await _file_exists_in_repo_branch(
                     p,

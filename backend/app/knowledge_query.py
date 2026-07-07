@@ -16,7 +16,7 @@ omits the (potentially large) markdown body; only get-by-id returns it.
 import uuid
 from typing import Any, NamedTuple
 
-from sqlalchemy import String, cast, func, or_
+from sqlalchemy import String, cast, func, or_, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -577,6 +577,10 @@ async def build_knowledge_index(
     ``limit`` — so the decision-maker sees the most relevant knowledge first
     without losing visibility of the broader store. The total never exceeds
     ``limit`` and per-entry summaries are truncated to ``summary_chars``.
+
+    Documents are ranked by source-kind tier (durable kinds first, stubs last),
+    then by creation date descending, so design/web_research/compute_experiment
+    docs outrank newer research_audit stubs.
     """
     seen: set[str] = set()
     entries: list[dict] = []
@@ -584,9 +588,29 @@ async def build_knowledge_index(
     async def _collect(direction: str | None) -> None:
         if len(entries) >= limit:
             return
+        stmt = build_knowledge_documents_stmt(project_id, direction=direction)
+        # Tier 0: durable kinds (design, web_research, compute_experiment).
+        # Tier 1: stub/metadata kinds (research_audit, repo_domain, direction_retirement).
+        # Tier 2: unknown/legacy.
+        durable = {
+            SourceKind.DESIGN.value,
+            SourceKind.WEB_RESEARCH.value,
+            SourceKind.COMPUTE_EXPERIMENT.value,
+        }
+        stub = {
+            SourceKind.RESEARCH_AUDIT.value,
+            SourceKind.REPO_DOMAIN.value,
+            SourceKind.DIRECTION_RETIREMENT.value,
+        }
         stmt = (
-            build_knowledge_documents_stmt(project_id, direction=direction)
-            .order_by(KnowledgeDocument.created_at.desc())
+            stmt.order_by(
+                case(
+                    (KnowledgeDocument.source_kind.in_(durable), 0),
+                    (KnowledgeDocument.source_kind.in_(stub), 1),
+                    else_=2,
+                ),
+                KnowledgeDocument.created_at.desc(),
+            )
             .limit(limit)
         )
         rows = (await session.execute(stmt)).scalars().all()
@@ -644,6 +668,40 @@ async def fetch_direction_knowledge_index(
         by_dir.setdefault(did, []).append(_knowledge_index_entry(doc, summary_chars))
         counts[did] = n + 1
     return by_dir
+
+
+async def fetch_retirement_memo(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+    *,
+    summary_chars: int = _KNOWLEDGE_INDEX_SUMMARY_CHARS,
+) -> dict[str, str] | None:
+    """Return the latest retirement memo knowledge row for a direction.
+
+    Retirement memos are best-effort: dedup windows and sparse retire context
+    mean a matching row may not exist, so callers should treat ``None`` as a
+    normal absence rather than a grounding failure.
+    """
+    if not direction_id:
+        return None
+    stmt = (
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.project_id == project_id,
+            KnowledgeDocument.direction_id == direction_id,
+            KnowledgeDocument.source_kind == SourceKind.DIRECTION_RETIREMENT.value,
+        )
+        .order_by(KnowledgeDocument.created_at.desc())
+        .limit(1)
+    )
+    doc = (await session.execute(stmt)).scalars().first()
+    if doc is None:
+        return None
+    return {
+        "id": str(doc.id),
+        "summary": (doc.summary or "")[:summary_chars],
+    }
 
 
 async def get_knowledge_document(

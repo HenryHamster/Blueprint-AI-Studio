@@ -8,6 +8,7 @@ from httpx import AsyncClient
 from sqlalchemy import func
 from sqlmodel import select
 
+from app import acceptance_criteria as ac
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.models import (
     ReleaseVersion,
@@ -15,6 +16,7 @@ from app.models import (
     AlertSeverity,
     Artifact,
     ArtifactType,
+    CompletionDebtEntry,
     ComputeJob,
     ComputeJobStatus,
     Direction,
@@ -31,6 +33,7 @@ from app.models import (
     TaskWakeRegistration,
     TaskStatus,
     SourceKind,
+    VersionAcceptanceCriterion,
     WakeAction,
     WakeDeliveryState,
     _utcnow,
@@ -329,6 +332,7 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         status=TaskStatus.IN_PROGRESS,
         strategic_cycle_id="sc-active",
         vm_runtime_cost_banked_db=1.25,
+        estimated_cost_usd=1.25,
     )
     queued_task = Task(
         project_id=project.id,
@@ -336,6 +340,7 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
         vm_runtime_cost_banked_db=0.75,
+        estimated_cost_usd=0.75,
     )
     db_session.add(phase2_task)
     db_session.add(queued_task)
@@ -770,40 +775,112 @@ async def test_strategic_state_surfaces_resident_session_availability_flag(
 
 
 @pytest.mark.asyncio
-async def test_strategic_state_cost_uses_vm_cost_source_of_truth(
+async def test_strategic_state_cost_uses_estimated_cost_usd(
     client: AsyncClient, db_session
 ):
+    """estimated_cost_usd is the source of truth for cumulative cost.
+
+    Single-attempt completed tasks never bank their cost into
+    vm_runtime_cost_banked_db (banking only runs on retry/requeue paths).
+    The terminal-success path sets estimated_cost_usd to the full VM cost
+    (banked + current-attempt), so summing that column captures all tasks.
+    """
     project = await _make_project(db_session)
-    stale_estimate_only = Task(
+    # Single-attempt completed task: cost only in estimated_cost_usd (never banked).
+    single_attempt_completed = Task(
         project_id=project.id,
-        title="Legacy estimate only",
+        title="Single-attempt completed",
         payloads=[{"type": "create"}],
         status=TaskStatus.COMPLETED,
-        estimated_cost_usd=999.0,
+        estimated_cost_usd=1.5,
     )
-    banked_cost = Task(
+    # Multi-attempt failed task: estimated_cost_usd holds the full cost;
+    # vm_runtime_cost_banked_db holds only the banked portion from prior retries.
+    multi_attempt_failed = Task(
         project_id=project.id,
-        title="Banked retry cost",
+        title="Multi-attempt failed",
         payloads=[{"type": "create"}],
         status=TaskStatus.FAILED,
-        estimated_cost_usd=999.0,
-        vm_runtime_cost_banked_db=1.25,
+        estimated_cost_usd=0.75,
+        vm_runtime_cost_banked_db=0.5,
     )
+    # Archived task must be excluded regardless of its cost.
     archived_cost = Task(
         project_id=project.id,
-        title="Archived retry cost",
+        title="Archived task",
         payloads=[{"type": "create"}],
         status=TaskStatus.FAILED,
         archived=True,
+        estimated_cost_usd=10.0,
         vm_runtime_cost_banked_db=10.0,
     )
-    db_session.add_all([stale_estimate_only, banked_cost, archived_cost])
+    # Active task with no prior attempts has estimated_cost_usd=NULL → contributes 0.
+    no_cost_yet = Task(
+        project_id=project.id,
+        title="Active first attempt",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add_all(
+        [single_attempt_completed, multi_attempt_failed, archived_cost, no_cost_yet]
+    )
     await db_session.commit()
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
 
     assert resp.status_code == 200
-    assert resp.json()["tasks"]["cumulative_estimated_cost_usd"] == pytest.approx(1.25)
+    # 1.5 (single-attempt) + 0.75 (multi-attempt full cost) = 2.25; archived excluded.
+    assert resp.json()["tasks"]["cumulative_estimated_cost_usd"] == pytest.approx(2.25)
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_cost_uses_sql_aggregate_and_current_attempt(
+    client: AsyncClient, db_session
+):
+    """Cost total uses SQL SUM(estimated_cost_usd) for non-archived tasks."""
+    project = await _make_project(db_session)
+    # Task 1: completed with estimated_cost_usd — covered by SQL aggregate
+    completed = Task(
+        project_id=project.id,
+        title="Completed task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        estimated_cost_usd=2.00,
+    )
+    # Task 2: failed with estimated_cost_usd — also covered by SQL aggregate
+    failed = Task(
+        project_id=project.id,
+        title="Failed task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        estimated_cost_usd=1.50,
+    )
+    # Task 3: archived — excluded from SQL aggregate
+    archived = Task(
+        project_id=project.id,
+        title="Archived cost",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        archived=True,
+        estimated_cost_usd=99.0,
+    )
+    # Task 4: active with no estimated_cost_usd — contributes 0
+    active = Task(
+        project_id=project.id,
+        title="Active task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+        estimated_cost_usd=None,
+    )
+    db_session.add_all([completed, failed, archived, active])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    cost = data["tasks"]["cumulative_estimated_cost_usd"]
+    # SQL aggregate picks up 2.00 + 1.50; archived and active(NULL) excluded.
+    assert cost == pytest.approx(3.50)
 
 
 @pytest.mark.asyncio
@@ -854,6 +931,13 @@ async def test_strategic_state_task_focus_uses_full_project_scope(
         created_at=base_time + timedelta(days=1),
         completed_at=base_time + timedelta(days=1, hours=1),
     )
+    listener_completed_task = Task(
+        project_id=project.id,
+        title="Listener-stamped completed task",
+        payloads=[{"type": "create", "direction_id": "d-done"}],
+        status=TaskStatus.COMPLETED,
+        created_at=base_time + timedelta(days=3),
+    )
     newer_routine_tasks = [
         Task(
             project_id=project.id,
@@ -870,9 +954,11 @@ async def test_strategic_state_task_focus_uses_full_project_scope(
         old_queued_task,
         recently_completed_task,
         older_completed_task,
+        listener_completed_task,
         *newer_routine_tasks,
     ])
     await db_session.commit()
+    await db_session.refresh(listener_completed_task)
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
 
@@ -912,9 +998,11 @@ async def test_strategic_state_task_focus_uses_full_project_scope(
     assert all(row["id"] != str(approval_task.id) for row in queued["items"])
 
     completed = focus["buckets"]["recent_completed"]
-    assert completed["total"] == 2
-    assert completed["items"][0]["id"] == str(recently_completed_task.id)
-    assert completed["items"][0]["completed_at"] == recently_completed_task.completed_at.isoformat()
+    assert completed["total"] == 3
+    assert completed["items"][0]["id"] == str(listener_completed_task.id)
+    assert completed["items"][0]["completed_at"] == listener_completed_task.completed_at.isoformat()
+    assert completed["items"][1]["id"] == str(recently_completed_task.id)
+    assert completed["items"][2]["id"] == str(older_completed_task.id)
     assert completed["items"][0]["direction_id"] == "d-done"
 
 
@@ -2457,6 +2545,96 @@ async def test_strategic_session_conversation_resolves_message_selected_refs(
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_endpoint_returns_conversation_envelope(
+    client: AsyncClient, db_session
+):
+    """GET /strategic-conversation wraps the transcript in {conversation: ...}."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(minutes=10)
+    messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user" if i % 2 == 0 else "strategic",
+            content=f"conv row {i:02d}",
+            created_at=base_time + timedelta(minutes=i),
+        )
+        for i in range(3)
+    ]
+    db_session.add_all(messages)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "conversation" in body
+    conversation = body["conversation"]
+    assert "items" in conversation
+    contents = [item["content"] for item in conversation["items"]]
+    assert contents == ["conv row 00", "conv row 01", "conv row 02"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_endpoint_enforces_member_access(
+    client: AsyncClient, db_session
+):
+    """GET /strategic-conversation returns 404 when the caller is not a project member."""
+    # Create a project owned by a different user so TEST_USER_ID has no membership
+    other_project = Project(
+        name="Other Project",
+        user_id="other-user-999",
+    )
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(other_project)
+
+    resp = await client.get(
+        f"/api/admin/projects/{other_project.id}/strategic-conversation"
+    )
+
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_endpoint_passes_include_message_id(
+    client: AsyncClient, db_session
+):
+    """include_message_id= on the lightweight endpoint surfaces an older message."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(hours=2)
+    older = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="older targeted message",
+        created_at=base_time,
+    )
+    newer_messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user" if i % 2 == 0 else "strategic",
+            content=f"newer row {i:02d}",
+            created_at=base_time + timedelta(minutes=i + 1),
+        )
+        for i in range(5)
+    ]
+    db_session.add_all([older, *newer_messages])
+    await db_session.commit()
+    await db_session.refresh(older)
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+        f"?include_message_id={older.id}"
+    )
+
+    assert resp.status_code == 200, resp.text
+    ids = [item["id"] for item in resp.json()["conversation"]["items"]]
+    assert ids[0] == str(older.id)
 
 
 @pytest.mark.asyncio
@@ -4214,7 +4392,7 @@ async def test_strategic_state_counts_changes_since_last_check_in(
     assert since_state["messages"]["needs_operator"] == 1
     assert since_state["tasks"]["created"] == 1
     assert since_state["tasks"]["updated"] == 3
-    assert since_state["tasks"]["completed"] == 1
+    assert since_state["tasks"]["completed"] == 2
     assert since_state["tasks"]["failed"] == 1
     assert since_state["tasks"]["blocked"] == 1
     assert since_state["alerts"]["raised"] == 1
@@ -5136,6 +5314,7 @@ async def test_strategic_state_includes_operator_attention(
         "stale_task_preview": 4,
         "alert_error_preview": 4,
         "alert_warning_preview": 4,
+        "stuck_acceptance_criteria_preview": 4,
     }
     assert len(attention["items"]) <= 8
 
@@ -5237,6 +5416,75 @@ async def test_strategic_state_includes_operator_attention(
         "alert_id": str(active_alert.id),
         "action": "dismiss_alert",
     }
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_stuck_acceptance_criteria(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    c_no_map = await ac.create_criterion(
+        db_session, project.id, version.id, "Unmapped criterion"
+    )
+    c_retired = await ac.create_criterion(
+        db_session, project.id, version.id, "Retired criterion"
+    )
+    c_active = await ac.create_criterion(
+        db_session, project.id, version.id, "Active criterion"
+    )
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key="d-retired",
+            text="Retired mapping",
+            status="retired",
+            criterion_keys=[c_retired.criterion_key],
+        )
+    )
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key="d-active",
+            text="Active mapping",
+            status="active",
+            criterion_keys=[c_active.criterion_key],
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/operator-attention?project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["stuck_acceptance_criteria"] == 2
+    assert attention["counts"]["needs_operator"] == 3
+    item_ids = {item["id"] for item in attention["items"]}
+    no_map_id = f"version:{version.id}:acceptance_criterion:{c_no_map.criterion_key}"
+    retired_id = f"version:{version.id}:acceptance_criterion:{c_retired.criterion_key}"
+    active_id = f"version:{version.id}:acceptance_criterion:{c_active.criterion_key}"
+    assert no_map_id in item_ids
+    assert retired_id in item_ids
+    assert active_id not in item_ids
+    no_map_item = next(item for item in attention["items"] if item["id"] == no_map_id)
+    retired_item = next(
+        item for item in attention["items"] if item["id"] == retired_id
+    )
+    assert no_map_item["reason"] == "stuck_acceptance_criterion"
+    assert no_map_item["stuck_reason"] == "no_mapping"
+    assert no_map_item["label"] == "Acceptance criterion is unmapped"
+    assert retired_item["stuck_reason"] == "direction_retired"
+    assert (
+        retired_item["label"]
+        == "Acceptance criterion points to a retired direction"
+    )
 
 
 @pytest.mark.asyncio
@@ -5647,6 +5895,98 @@ async def test_operator_attention_approval_precedence_over_blocked(
 
 
 @pytest.mark.asyncio
+async def test_operator_attention_surfaces_preserved_handmerge_failed_task_as_needs_operator_and_clears_when_archived(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    preserved = Task(
+        project_id=project.id,
+        title="Preserved hand-merge PR",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        latest_status_message="Review-fix cap reached (4 iterations, per-chain) - PR #123 LEFT OPEN with mergeable work; manual hand-merge required (not auto-closed)",
+        context={
+            "failure_detail": "review_cap_preserved_for_handmerge",
+            "pr_preserved_for_handmerge": True,
+        },
+    )
+    db_session.add(preserved)
+    await db_session.commit()
+    await db_session.refresh(preserved)
+
+    newer_failed_tasks = []
+    for idx in range(4):
+        task = Task(
+            project_id=project.id,
+            title=f"New failure {idx + 1}",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.FAILED,
+            latest_status_message=f"Newer failure #{idx + 1}",
+        )
+        newer_failed_tasks.append(task)
+    db_session.add_all(newer_failed_tasks)
+    await db_session.commit()
+    for task in newer_failed_tasks:
+        await db_session.refresh(task)
+
+    resp = await client.get(
+        f"/api/admin/operator-attention?project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["needs_operator"] == 1
+    assert attention["counts"]["watch"] == 4
+    assert attention["counts"]["failed_tasks"] == 4
+    assert attention["counts"]["handmerge_preserved_tasks"] == 1
+
+    item_ids = {item["id"] for item in attention["items"]}
+    preserved_id = f"task:{preserved.id}:hand_merge_required"
+    assert preserved_id in item_ids
+    assert f"task:{preserved.id}:failed_task" not in item_ids
+    visible_failed_task_ids = {
+        item["id"] for item in attention["items"] if item["reason"] == "failed_task"
+    }
+    assert len(visible_failed_task_ids) == 3
+    assert visible_failed_task_ids.issubset(
+        {f"task:{task.id}:failed_task" for task in newer_failed_tasks}
+    )
+
+    preserved_item = next(
+        item for item in attention["items"] if item["id"] == preserved_id
+    )
+    assert preserved_item["severity"] == "needs_operator"
+    assert preserved_item["reason"] == "hand_merge_required"
+    assert preserved_item["label"] == "Hand-merge required"
+    assert preserved_item["lifecycle"] == {
+        "mode": "task_lifecycle",
+        "clears_when": "task_archived_or_pr_merged_or_closed",
+        "operator_action": "hand_merge_or_archive_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    }
+
+    preserved.archived = True
+    db_session.add(preserved)
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/operator-attention?project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "watch"
+    assert attention["counts"]["needs_operator"] == 0
+    assert attention["counts"]["watch"] == 4
+    assert attention["counts"]["failed_tasks"] == 4
+    assert attention["counts"]["handmerge_preserved_tasks"] == 0
+    assert preserved_id not in {item["id"] for item in attention["items"]}
+
+
+@pytest.mark.asyncio
 async def test_operator_attention_pure_blocked_not_requiring_approval_stays_in_watch(
     client: AsyncClient, db_session
 ):
@@ -5934,7 +6274,12 @@ async def test_strategic_state_exposes_sha_freshness_verdict_when_candidate_behi
 
     This is the acceptance-criteria test: non-trivial mock + real merge-test
     verdict path (candidate != head_sha → current=False → verdict=stale).
+    Pre-populates _CURRENCY_CACHE so the warm-cache path returns the stale verdict
+    without awaiting GitHub (non-blocking design).
     """
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE_TTL_S
+
     project = await _make_project(db_session)
     candidate_sha = "abc1234" * 5
     head_sha = "def5678" * 5
@@ -5949,18 +6294,15 @@ async def test_strategic_state_exposes_sha_freshness_verdict_when_candidate_behi
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(
-            return_value={
-                "current": False,
-                "candidate_sha": candidate_sha,
-                "head_sha": head_sha,
-            }
-        ),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="main",
+    )
+    cache_key = (str(project.id), "main", candidate_sha)
+    currency = {"current": False, "candidate_sha": candidate_sha, "head_sha": head_sha}
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {cache_key: (currency, time.monotonic() + _CURRENCY_CACHE_TTL_S)},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -5976,7 +6318,14 @@ async def test_strategic_state_exposes_sha_freshness_verdict_when_candidate_behi
 async def test_strategic_state_sha_freshness_fresh_when_candidate_matches_head(
     client: AsyncClient, db_session, mocker
 ):
-    """Open version where candidate == integration HEAD → verdict fresh."""
+    """Open version where candidate == integration HEAD → verdict fresh.
+
+    Pre-populates _CURRENCY_CACHE so the warm-cache path returns the fresh verdict
+    without awaiting GitHub (non-blocking design).
+    """
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE_TTL_S
+
     project = await _make_project(db_session)
     sha = "aabbccdd" * 5
     version = ReleaseVersion(
@@ -5990,18 +6339,15 @@ async def test_strategic_state_sha_freshness_fresh_when_candidate_matches_head(
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(
-            return_value={
-                "current": True,
-                "candidate_sha": sha,
-                "head_sha": sha,
-            }
-        ),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="main",
+    )
+    cache_key = (str(project.id), "main", sha)
+    currency = {"current": True, "candidate_sha": sha, "head_sha": sha}
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {cache_key: (currency, time.monotonic() + _CURRENCY_CACHE_TTL_S)},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -6017,7 +6363,7 @@ async def test_strategic_state_sha_freshness_fresh_when_candidate_matches_head(
 async def test_strategic_state_sha_freshness_unknown_when_resolve_fails(
     client: AsyncClient, db_session, mocker
 ):
-    """When _resolve_candidate_currency raises, sha_freshness.verdict is unknown.
+    """On cold cache, sha_freshness.verdict is unknown (resolve runs off-path).
     Endpoint must still return 200 (GitHub failure must not break the read model)."""
     project = await _make_project(db_session)
     version = ReleaseVersion(
@@ -6031,12 +6377,14 @@ async def test_strategic_state_sha_freshness_unknown_when_resolve_fails(
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(side_effect=RuntimeError("GitHub API timeout")),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="main",
+    )
+    # Cold cache → endpoint returns unknown immediately without awaiting GitHub.
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -6049,7 +6397,14 @@ async def test_strategic_state_sha_freshness_unknown_when_resolve_fails(
 async def test_strategic_state_sha_freshness_includes_checked_at(
     client: AsyncClient, db_session, mocker
 ):
-    """Freshness block for a fresh verdict carries a checked_at ISO timestamp."""
+    """Freshness block for a fresh verdict carries a checked_at ISO timestamp.
+
+    Pre-populates _CURRENCY_CACHE so the warm-cache path returns the fresh
+    verdict without awaiting GitHub (non-blocking design).
+    """
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE_TTL_S
+
     project = await _make_project(db_session)
     sha = "ccddee11" * 5
     version = ReleaseVersion(
@@ -6063,18 +6418,15 @@ async def test_strategic_state_sha_freshness_includes_checked_at(
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(
-            return_value={
-                "current": True,
-                "candidate_sha": sha,
-                "head_sha": sha,
-            }
-        ),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="main",
+    )
+    cache_key = (str(project.id), "main", sha)
+    currency = {"current": True, "candidate_sha": sha, "head_sha": sha}
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {cache_key: (currency, time.monotonic() + _CURRENCY_CACHE_TTL_S)},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -6091,7 +6443,14 @@ async def test_strategic_state_sha_freshness_includes_checked_at(
 async def test_strategic_state_sha_freshness_includes_integration_branch(
     client: AsyncClient, db_session, mocker
 ):
-    """Stale freshness block carries the integration_branch name used for comparison."""
+    """Stale freshness block carries the integration_branch name used for comparison.
+
+    Pre-populates _CURRENCY_CACHE so the warm-cache path returns the stale
+    verdict without awaiting GitHub (non-blocking design).
+    """
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE_TTL_S
+
     project = await _make_project(db_session)
     candidate_sha = "aabb1122" * 5
     head_sha = "ccdd3344" * 5
@@ -6106,18 +6465,15 @@ async def test_strategic_state_sha_freshness_includes_integration_branch(
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(
-            return_value={
-                "current": False,
-                "candidate_sha": candidate_sha,
-                "head_sha": head_sha,
-            }
-        ),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="automain",
+    )
+    cache_key = (str(project.id), "automain", candidate_sha)
+    currency = {"current": False, "candidate_sha": candidate_sha, "head_sha": head_sha}
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {cache_key: (currency, time.monotonic() + _CURRENCY_CACHE_TTL_S)},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -6141,3 +6497,1108 @@ async def test_strategic_state_sha_freshness_unknown_includes_checked_at(
     assert "checked_at" in freshness
     assert freshness["checked_at"] is not None
     assert "T" in freshness["checked_at"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_sha_freshness_api_unreachable_distinct_from_unknown(
+    client: AsyncClient, db_session, mocker
+):
+    """api_unreachable background results are NOT written to _CURRENCY_CACHE.
+
+    With the non-blocking design, currency is resolved off the request path.
+    A transient GitHub failure (api_unreachable) must not be cached — the next
+    request should still trigger a fresh background resolution attempt rather
+    than serving a pinned api_unreachable verdict for the full TTL.
+    """
+    from app.routers.admin_project_strategic_session import (
+        _CURRENCY_CACHE,
+        _currency_resolve_and_cache,
+    )
+
+    project = await _make_project(db_session)
+    candidate = "abc1234" * 5
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": candidate, "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=AsyncMock(
+            return_value={
+                "verdict": "api_unreachable",
+                "resolved": False,
+                "reason": "github_http_502",
+                "candidate_sha": candidate,
+            }
+        ),
+    )
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="main",
+    )
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {},
+        clear=True,
+    )
+
+    # Cold cache → endpoint returns unknown immediately (GitHub not awaited).
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    assert freshness["verdict"] == "unknown"
+
+    # Run the background coroutine directly to verify api_unreachable is not cached.
+    cache_key = (str(project.id), "main", candidate)
+    last_qual = {"candidate_sha": candidate, "status": "not_promoted"}
+    await _currency_resolve_and_cache(project.id, last_qual, "main", cache_key)
+
+    # api_unreachable must NOT be written to the cache.
+    assert cache_key not in _CURRENCY_CACHE, (
+        "api_unreachable verdict must not be cached; found in _CURRENCY_CACHE"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_currency_is_non_blocking(
+    client: AsyncClient, db_session, mocker
+):
+    """GET /strategic-state must return promptly on a cold currency cache.
+
+    Acceptance test: with _resolve_candidate_currency patched to sleep 2 s the
+    endpoint must return 'unknown' (or a previously-cached verdict) immediately
+    instead of blocking.  After the background task runs, _CURRENCY_CACHE is
+    populated for subsequent callers.
+    """
+    import asyncio
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE
+
+    project = await _make_project(db_session)
+    sha = "deadbeef" * 5
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": sha, "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="main",
+    )
+
+    resolved_event = asyncio.Event()
+
+    async def _slow_resolve(*args, **kwargs):
+        await asyncio.sleep(2)
+        resolved_event.set()
+        return {"current": True, "candidate_sha": sha, "head_sha": sha}
+
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=_slow_resolve,
+    )
+    # Ensure cold cache for this project/branch/sha combination.
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {},
+        clear=True,
+    )
+
+    # Capture background tasks so we can await them after the response.
+    bg_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+
+    def _capture_create_task(coro, **kw):
+        t = original_create_task(coro, **kw)
+        bg_tasks.append(t)
+        return t
+
+    mocker.patch("asyncio.create_task", side_effect=_capture_create_task)
+
+    # --- BEFORE measurement ---
+    t0 = time.monotonic()
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    elapsed = time.monotonic() - t0
+
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    # Cold cache → endpoint returns unknown without waiting on GitHub.
+    assert freshness["verdict"] == "unknown", (
+        f"Expected 'unknown' on cold cache, got {freshness['verdict']!r}"
+    )
+    # Must return well under the 2 s mock sleep — proves it is non-blocking.
+    assert elapsed < 1.0, (
+        f"Endpoint took {elapsed:.2f}s; expected non-blocking return under 1s"
+    )
+    # A background task must have been scheduled.
+    assert bg_tasks, "asyncio.create_task was not called — background resolution not scheduled"
+
+    # --- AFTER: wait for background task, then verify cache is populated ---
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
+    cache_key = (str(project.id), "main", sha)
+    assert cache_key in _CURRENCY_CACHE, (
+        "Background resolution did not populate _CURRENCY_CACHE"
+    )
+    cached_currency, _ = _CURRENCY_CACHE[cache_key]
+    assert cached_currency.get("current") is True
+
+
+@pytest.mark.asyncio
+async def test_strategic_runtime_compute_job_preview_includes_experiment_outcome(
+    client: AsyncClient, db_session
+):
+    """_compute_job_preview populates experiment_outcome from task.plan_output.compute_result."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    task = Task(
+        project_id=project.id,
+        title="Throughput regression check",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": True,
+                    "measurable": True,
+                    "summary": "Throughput exceeded 100 req/s",
+                },
+                "hypothesis": {"held": True},
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        machine_type="gpu-small",
+        status=ComputeJobStatus.SUCCEEDED,
+        final_cost_usd=3.5,
+        completed_at=now - timedelta(minutes=15),
+        updated_at=now - timedelta(minutes=15),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    items = data["runtime"]["work"]["compute_jobs"]["items"]
+    matched = [item for item in items if item.get("task_id") == str(task.id)]
+    assert matched, "compute job preview item not found for task"
+    outcome = matched[0].get("experiment_outcome")
+    assert outcome is not None, "experiment_outcome missing from compute job preview item"
+    assert outcome["outcome_label"] == "met"
+    assert outcome["criterion_met"] is True
+    assert outcome["hypothesis_held"] is True
+    assert "Throughput exceeded 100 req/s" in (outcome.get("criterion_summary") or "")
+
+
+@pytest.mark.asyncio
+async def test_strategic_runtime_compute_job_preview_inconclusive_when_not_measurable(
+    client: AsyncClient, db_session
+):
+    """met=false, measurable=false → outcome_label inconclusive, not unmet."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    task = Task(
+        project_id=project.id,
+        title="Non-measurable metric check",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": False,
+                    "measurable": False,
+                    "summary": "Metric not found in output",
+                },
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        final_cost_usd=1.0,
+        completed_at=now - timedelta(minutes=5),
+        updated_at=now - timedelta(minutes=5),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    items = data["runtime"]["work"]["compute_jobs"]["items"]
+    matched = [item for item in items if item.get("task_id") == str(task.id)]
+    assert matched, "compute job preview item not found"
+    outcome = matched[0].get("experiment_outcome")
+    assert outcome is not None
+    assert outcome["outcome_label"] == "inconclusive"
+    assert outcome["criterion_met"] is False
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_unmet_experiment_outcome(
+    client: AsyncClient, db_session
+):
+    """A recently-completed compute_experiment with criterion.met=False appears in attention."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    unmet_task = Task(
+        project_id=project.id,
+        title="Latency regression check",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": False,
+                    "measurable": True,
+                    "summary": "P99 latency was 380ms, threshold 200ms",
+                }
+            }
+        },
+    )
+    # met=True → should NOT appear
+    met_task = Task(
+        project_id=project.id,
+        title="Throughput benchmark met",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        completed_at=now - timedelta(hours=2),
+        plan_output={
+            "compute_result": {
+                "criterion": {"met": True, "measurable": True, "summary": "All good"}
+            }
+        },
+    )
+    # older than 6 hours → should NOT appear
+    old_task = Task(
+        project_id=project.id,
+        title="Old benchmark",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        completed_at=now - timedelta(hours=8),
+        plan_output={
+            "compute_result": {
+                "criterion": {"met": False, "measurable": True, "summary": "Old failure"}
+            }
+        },
+    )
+    # archived=True → should NOT appear
+    archived_task = Task(
+        project_id=project.id,
+        title="Archived benchmark",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=True,
+        completed_at=now - timedelta(hours=1),
+        plan_output={
+            "compute_result": {
+                "criterion": {"met": False, "measurable": True, "summary": "Archived"}
+            }
+        },
+    )
+    db_session.add_all([unmet_task, met_task, old_task, archived_task])
+    await db_session.commit()
+    await db_session.refresh(unmet_task)
+    assert unmet_task.completed_at is not None
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["experiment_outcomes"] == 1
+    assert attention["counts"]["watch"] >= 1
+    item_ids = {item["id"] for item in attention["items"]}
+    expected_id = f"task:{unmet_task.id}:experiment_outcome"
+    assert expected_id in item_ids
+    exp_item = next(item for item in attention["items"] if item["id"] == expected_id)
+    assert exp_item["reason"] == "experiment_outcome"
+    assert exp_item["severity"] == "watch"
+    assert "unmet" in exp_item["label"].lower()
+    assert exp_item["lifecycle"]["mode"] == "task_lifecycle"
+    assert "P99 latency" in (exp_item.get("detail") or "")
+
+    # met / old / archived tasks must not appear
+    assert f"task:{met_task.id}:experiment_outcome" not in item_ids
+    assert f"task:{old_task.id}:experiment_outcome" not in item_ids
+    assert f"task:{archived_task.id}:experiment_outcome" not in item_ids
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_inconclusive_experiment_outcome_label(
+    client: AsyncClient, db_session
+):
+    """met=False, measurable=False → outcome_label inconclusive, not unmet."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    inconclusive_task = Task(
+        project_id=project.id,
+        title="Non-measurable criterion experiment",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        completed_at=now - timedelta(hours=1),
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": False,
+                    "measurable": False,
+                    "summary": "Metric absent from run output",
+                }
+            }
+        },
+    )
+    db_session.add(inconclusive_task)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["experiment_outcomes"] == 1
+    item_ids = {item["id"] for item in attention["items"]}
+    expected_id = f"task:{inconclusive_task.id}:experiment_outcome"
+    assert expected_id in item_ids
+    exp_item = next(item for item in attention["items"] if item["id"] == expected_id)
+    assert "inconclusive" in exp_item["label"].lower()
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_unmet_experiment_not_masked_by_newer_successes(
+    client: AsyncClient, db_session
+):
+    """An unmet outcome must be counted even when many successful experiments
+    complete after it within the window (no fixed-size scan cap)."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    unmet_task = Task(
+        project_id=project.id,
+        title="Buried unmet experiment",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        completed_at=now - timedelta(hours=5),
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": False,
+                    "measurable": True,
+                    "summary": "Throughput below threshold",
+                }
+            }
+        },
+    )
+    met_tasks = [
+        Task(
+            project_id=project.id,
+            title=f"Successful experiment {i}",
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.COMPLETED,
+            archived=False,
+            completed_at=now - timedelta(minutes=i),
+            plan_output={
+                "compute_result": {
+                    "criterion": {"met": True, "measurable": True, "summary": "ok"}
+                }
+            },
+        )
+        for i in range(25)
+    ]
+    db_session.add_all([unmet_task, *met_tasks])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["experiment_outcomes"] == 1
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"task:{unmet_task.id}:experiment_outcome" in item_ids
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_stuck_criteria_no_mapping(
+    client: AsyncClient, db_session
+):
+    """Uncovered criterion with no direction mapping surfaces as needs_operator stuck_criteria."""
+    project = await _make_project(db_session)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-aabbccdd",
+        text="All tests pass",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    attention = resp.json()["attention"]
+
+    assert attention["counts"]["stuck_criteria"] >= 1
+    assert attention["counts"]["needs_operator"] >= 1
+    assert attention["level"] == "needs_operator"
+
+    stuck_items = [item for item in attention["items"] if item["reason"] == "stuck_criteria"]
+    assert len(stuck_items) == 1
+    item = stuck_items[0]
+    assert item["severity"] == "needs_operator"
+    assert "no direction mapping" in item["detail"]
+    assert item["lifecycle"]["operator_action"] == "remap_or_attest_criterion"
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_stuck_criteria_direction_retired(
+    client: AsyncClient, db_session
+):
+    """Uncovered criterion whose only mapped direction is retired surfaces as stuck_criteria."""
+    project = await _make_project(db_session)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion_key = "c-11223344"
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion_key,
+        text="Performance within budget",
+        status="active",
+    )
+    retired_direction = Direction(
+        project_id=project.id,
+        direction_key="d-retired-dir",
+        status="retired",
+        criterion_keys=[criterion_key],
+    )
+    db_session.add_all([criterion, retired_direction])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    attention = resp.json()["attention"]
+
+    assert attention["counts"]["stuck_criteria"] >= 1
+    assert attention["counts"]["needs_operator"] >= 1
+    assert attention["level"] == "needs_operator"
+
+    stuck_items = [item for item in attention["items"] if item["reason"] == "stuck_criteria"]
+    assert len(stuck_items) == 1
+    item = stuck_items[0]
+    assert item["severity"] == "needs_operator"
+    assert "retired" in item["detail"]
+    assert item["lifecycle"]["operator_action"] == "remap_or_attest_criterion"
+
+
+# ── sweep_closed_handmerge_prs tests ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sweep_closed_handmerge_prs_resolves_merged_pr(db_session, mocker):
+    """When a preserved-for-handmerge task's PR has been merged, the sweep clears
+    pr_preserved_for_handmerge from context and resolves the ProjectMessage."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Rollup for hand-merge",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "handmerge_pr_number": 999,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        from_task_id=None,
+        content="PR #999 preserved for hand-merge",
+        context={"event_type": "handmerge_pr_preserved", "pr_number": 999},
+        idempotency_key=None,  # set after task.id is known
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Now fix the idempotency_key (task.id available after commit).
+    msg.idempotency_key = f"handmerge:{task.id}"
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged_at": "2026-07-05T10:00:00Z"},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+
+    assert resolved == 1
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert "pr_preserved_for_handmerge" not in ctx, "Flag must be cleared after merge"
+    assert ctx.get("handmerge_pr_resolved") is True
+    assert ctx.get("handmerge_pr_resolution") == "merged"
+
+    await db_session.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "PR #999 merged"
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_closed_handmerge_prs_resolves_closed_unmerged_pr(db_session, mocker):
+    """When a preserved PR is closed without merging, the sweep clears the flag
+    and resolves the message with resolution='closed'."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Rollup closed without merge",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "handmerge_pr_number": 888,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="PR #888 preserved for hand-merge",
+        context={"event_type": "handmerge_pr_preserved", "pr_number": 888},
+        idempotency_key=f"handmerge:{task.id}",
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged_at": None},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+
+    assert resolved == 1
+    await db_session.refresh(task)
+    assert "pr_preserved_for_handmerge" not in (task.context or {})
+    assert (task.context or {}).get("handmerge_pr_resolution") == "closed"
+
+    await db_session.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "PR #888 closed"
+
+
+@pytest.mark.asyncio
+async def test_sweep_closed_handmerge_prs_skips_open_pr(db_session, mocker):
+    """When the PR is still open, the sweep must not clear the flag or resolve
+    the message."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Rollup still open",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "handmerge_pr_number": 777,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="PR #777 preserved for hand-merge",
+        context={"event_type": "handmerge_pr_preserved", "pr_number": 777},
+        idempotency_key=f"handmerge:{task.id}",
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "open", "merged_at": None},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+
+    assert resolved == 0
+    await db_session.refresh(task)
+    assert (task.context or {}).get("pr_preserved_for_handmerge") is True, (
+        "Flag must NOT be cleared while PR is still open"
+    )
+    await db_session.refresh(msg)
+    assert msg.status == "open", "Message must remain open while PR is open"
+    # Fairness: last-checked timestamp must be stamped so updated_at advances,
+    # rotating this task to the back of the ordered batch in future cycles.
+    assert (task.context or {}).get("handmerge_last_checked_at") is not None, (
+        "handmerge_last_checked_at must be set after an open-PR check"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sweep_closed_handmerge_prs_legacy_fallback_artifact(db_session, mocker):
+    """When a preserved task has no handmerge_pr_number in context (legacy path),
+    the sweep falls back to the PULL_REQUEST artifact's pr_url to find the PR number,
+    and still clears the flag and resolves the ProjectMessage when the PR is closed."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    # Task does NOT have handmerge_pr_number in context — simulates tasks
+    # preserved before handmerge_pr_number was stored in context.
+    task = Task(
+        project_id=project.id,
+        title="Legacy hand-merge no PR number in context",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # PULL_REQUEST artifact provides the PR URL (legacy path).
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/owner/repo/pull/404",
+    )
+    db_session.add(artifact)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="PR preserved for hand-merge",
+        context={"event_type": "handmerge_pr_preserved", "pr_number": 404},
+        idempotency_key=f"handmerge:{task.id}",
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged_at": "2026-07-05T11:00:00Z"},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+
+    assert resolved == 1
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert "pr_preserved_for_handmerge" not in ctx, (
+        "Flag must be cleared even when PR number came from artifact fallback"
+    )
+    assert ctx.get("handmerge_pr_resolved") is True
+    assert ctx.get("handmerge_pr_resolution") == "merged"
+
+    await db_session.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "PR #404 merged"
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_clears_after_sweep_resolves_handmerge_pr(
+    client: AsyncClient, db_session, mocker
+):
+    """End-to-end: after sweep_closed_handmerge_prs clears pr_preserved_for_handmerge,
+    the operator_attention endpoint no longer shows a hand_merge_required item."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Preserved hand-merge PR — sweep integration",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "handmerge_pr_number": 555,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Before sweep: attention shows the hand_merge_required item.
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention_before = resp.json()
+    assert attention_before["counts"]["handmerge_preserved_tasks"] == 1
+    assert attention_before["counts"]["needs_operator"] == 1
+    assert any(
+        item["reason"] == "hand_merge_required"
+        for item in attention_before["items"]
+    )
+
+    # Simulate PR being merged by having GitHub return state=closed.
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged_at": "2026-07-05T10:00:00Z"},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+    assert resolved == 1
+
+    # After sweep: attention no longer shows the hand_merge_required item.
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention_after = resp.json()
+    assert attention_after["counts"]["handmerge_preserved_tasks"] == 0
+    assert attention_after["counts"]["needs_operator"] == 0
+    assert not any(
+        item["reason"] == "hand_merge_required"
+        for item in attention_after["items"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_coverage_blocked_version_without_stuck_criteria_raises_attention(
+    client: AsyncClient, db_session
+):
+    """Uncovered criterion mapped to an active direction raises coverage_blocked attention."""
+    project = await _make_project(db_session)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion_key = "c-cov-blocked-01"
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion_key,
+        text="Feature X fully shipped",
+        status="active",
+    )
+    # Map the criterion to an active direction (stuck_reason will be None).
+    active_direction = Direction(
+        project_id=project.id,
+        direction_key="d-active-for-cov",
+        status="active",
+        criterion_keys=[criterion_key],
+    )
+    db_session.add_all([criterion, active_direction])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    attention = resp.json()["attention"]
+
+    # coverage_blocked should be counted and surfaced as needs_operator
+    assert attention["counts"]["coverage_blocked"] >= 1
+    assert attention["counts"]["needs_operator"] >= 1
+    assert attention["level"] == "needs_operator"
+
+    # stuck_criteria must NOT fire for this criterion (it has an active mapping)
+    assert attention["counts"]["stuck_criteria"] == 0
+
+    coverage_blocked_items = [
+        item for item in attention["items"] if item["reason"] == "coverage_blocked"
+    ]
+    assert len(coverage_blocked_items) == 1
+    cb_item = coverage_blocked_items[0]
+    assert cb_item["severity"] == "needs_operator"
+    assert "active" in cb_item["detail"]
+    assert cb_item["lifecycle"]["operator_action"] == "monitor_active_direction_progress"
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_stale_completion_debt(
+    client: AsyncClient, db_session
+):
+    """Open debt older than the threshold with no linked tasks → needs_operator item."""
+    project = await _make_project(db_session)
+    old_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Old unworked knob obligation",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=48),
+    )
+    db_session.add(old_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 1
+    assert attention["counts"]["needs_operator"] >= 1
+    assert attention["level"] == "needs_operator"
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 1
+    item = stale_items[0]
+    assert item["severity"] == "needs_operator"
+    assert item["count"] == 1
+    assert item["lifecycle"]["operator_action"] == "link_task_or_resolve_debt"
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_does_not_surface_young_completion_debt(
+    client: AsyncClient, db_session
+):
+    """Open debt within the staleness threshold is NOT surfaced."""
+    project = await _make_project(db_session)
+    young_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Recently created knob obligation",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=1),
+    )
+    db_session.add(young_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 0
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_does_not_surface_debt_with_linked_tasks(
+    client: AsyncClient, db_session
+):
+    """Old debt linked to a genuinely active Task is NOT surfaced (work is in progress)."""
+    project = await _make_project(db_session)
+    # Create a real Task in an active status so the linked-task resolver finds it.
+    active_task = Task(
+        project_id=project.id,
+        title="In-flight work addressing the debt",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(active_task)
+    await db_session.flush()
+    linked_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Old knob obligation with work in flight",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=48),
+        detail={"linked_tasks": [{"task_id": str(active_task.id)}]},
+    )
+    db_session.add(linked_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 0
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_debt_with_only_failed_linked_task(
+    client: AsyncClient, db_session
+):
+    """Old debt whose only linked task is FAILED resurfaces as stale-unworked.
+
+    A FAILED linked task does NOT count as work-in-progress; the debt should
+    surface so the operator/strategist can spawn a new follow-up or dispose it.
+    """
+    project = await _make_project(db_session)
+    failed_task = Task(
+        project_id=project.id,
+        title="Failed follow-up for the debt",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(failed_task)
+    await db_session.flush()
+    linked_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Knob obligation whose only follow-up failed",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=48),
+        detail={"linked_tasks": [{"task_id": str(failed_task.id)}]},
+    )
+    db_session.add(linked_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    # The debt should resurface because the only linked task failed.
+    assert attention["counts"]["stale_completion_debts"] >= 1
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) >= 1
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_does_not_surface_resolved_or_dismissed_debt(
+    client: AsyncClient, db_session
+):
+    """Resolved or dismissed debts are not surfaced regardless of age."""
+    project = await _make_project(db_session)
+    resolved_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Resolved old knob",
+        status="resolved",
+        created_at=_utcnow() - timedelta(hours=48),
+    )
+    dismissed_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Dismissed old knob",
+        status="dismissed",
+        created_at=_utcnow() - timedelta(hours=48),
+    )
+    db_session.add(resolved_entry)
+    db_session.add(dismissed_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 0
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_stale_debt_count_in_counts_block(
+    client: AsyncClient, db_session
+):
+    """counts.stale_completion_debts reflects both project-scoped and global (project_id=NULL) rows."""
+    project = await _make_project(db_session)
+    project_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Project-scoped old debt",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=48),
+    )
+    global_entry = CompletionDebtEntry(
+        project_id=None,
+        kind="seed_inventory",
+        title="Global deployment-level old debt",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=72),
+    )
+    db_session.add(project_entry)
+    db_session.add(global_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 2
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 1
+    assert stale_items[0]["count"] == 2

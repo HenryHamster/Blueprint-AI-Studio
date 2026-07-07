@@ -4,9 +4,108 @@ Extracted from ``app.github``; all symbols are re-exported from there so
 existing imports keep working.
 """
 
+import time
+from dataclasses import dataclass
+
 from fastapi import HTTPException, status
 
 from app.github import logger
+
+
+# Default backoff (seconds) advertised to the agent when we must refuse a create
+# because the pre-create idempotency lookup could not be confirmed but GitHub
+# gave us no usable reset hint. Small enough to retry promptly once a transient
+# blip clears; large enough not to hot-loop.
+_CREATE_PR_DEFAULT_RETRY_AFTER_S = 30
+
+# Upper bound on the Retry-After we advertise. A drained 5000/hr install-token
+# bucket can be up to ~1h from reset; telling the agent to sleep that long inside
+# a synchronous ``./pr`` step would starve the reaper heartbeat budget on the VM
+# and get it false-reaped. Cap it and let the agent re-poll after the window.
+_CREATE_PR_MAX_RETRY_AFTER_S = 120
+
+
+@dataclass
+class _OpenPRLookup:
+    """Outcome of the pre-create idempotency lookup for a (head, base) pair.
+
+    ``outcome`` is the load-bearing field — the three cases demand different
+    handling in :func:`create_pull_request`:
+
+    * ``"found"``     — an open PR already exists; ``pr`` holds it. Dedup:
+                        resume it instead of creating a duplicate.
+    * ``"none"``      — GitHub returned HTTP 200 with an empty list. A
+                        *confirmed* "no open PR", so creation is safe.
+    * ``"uncertain"`` — the lookup could not be confirmed: the GitHub GET was
+                        rate-limited, short-circuited by the local limiter,
+                        returned a non-200, or raised. We do NOT know whether an
+                        open PR exists, so POSTing now risks creating a duplicate
+                        once the quota window resets (incident #7350/#7351 class).
+                        The caller must refuse and surface a retryable signal.
+                        ``retry_after`` carries the best-known backoff (seconds)
+                        when derivable from the response.
+    """
+
+    outcome: str
+    pr: dict | None = None
+    retry_after: int | None = None
+
+
+def _retry_after_seconds_from_response(resp) -> int | None:
+    """Best-effort backoff (seconds) from a rate-limited GitHub response.
+
+    Prefers an explicit ``Retry-After`` header (integer seconds — what GitHub
+    sends for secondary limits, and what the local short-circuit synthesises from
+    ``X-RateLimit-Reset``). Falls back to ``X-RateLimit-Reset`` (epoch seconds)
+    minus now. Returns ``None`` when neither yields a positive value.
+    """
+    headers = getattr(resp, "headers", None) or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            secs = int(str(retry_after).strip())
+            if secs > 0:
+                return secs
+        except (TypeError, ValueError):
+            pass
+    reset = headers.get("X-RateLimit-Reset")
+    if reset is not None:
+        try:
+            delta = int(str(reset).strip()) - int(time.time())
+            if delta > 0:
+                return delta
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _raise_create_pr_retryable(
+    head: str, base: str, retry_after: int | None
+) -> None:
+    """Refuse a PR create with a retryable signal instead of failing open.
+
+    Raises HTTP 503 with a ``Retry-After`` header so the agent backs off and
+    retries later — replacing the old fail-open behavior that POSTed anyway when
+    the idempotency lookup was inconclusive and created a duplicate PR once the
+    drained GitHub quota reset. 503 (not 500) is what keeps the agent's backoff
+    loop engaged rather than treating the outcome as a hard failure.
+    """
+    delay = retry_after or _CREATE_PR_DEFAULT_RETRY_AFTER_S
+    delay = max(1, min(delay, _CREATE_PR_MAX_RETRY_AFTER_S))
+    logger.warning(
+        f"[PR] Refusing to create PR for {head} -> {base}: could not confirm "
+        f"whether an open PR already exists (GitHub rate-limited/unavailable). "
+        f"Returning 503 retry-after={delay}s to avoid a duplicate PR."
+    )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=(
+            "Cannot verify whether an open pull request already exists for "
+            f"{head} -> {base} because the GitHub API is rate-limited; refusing "
+            "to create to avoid a duplicate PR. Retry after the window resets."
+        ),
+        headers={"Retry-After": str(delay)},
+    )
 
 
 def _github_request(*args, **kwargs):
@@ -148,16 +247,22 @@ async def _find_open_pull_request(
     head: str,
     base: str,
     project_id: str | None = None,
-) -> dict | None:
-    """Return the open PR for ``head`` -> ``base`` if one exists, else None.
+) -> _OpenPRLookup:
+    """Look up the open PR for ``head`` -> ``base`` for create-time idempotency.
 
     GitHub allows at most one open PR per (head, base) pair but enforces it only
     best-effort — two concurrent ``POST /pulls`` can both succeed (201) and leave
     a duplicate (rollup PR incident #7350/#7351). This lookup lets
     ``create_pull_request`` collapse the "already created" case into resuming the
-    existing PR. Best-effort by design: any non-200 response or error returns
-    None so a flaky lookup never blocks creation — the POST and its 422 handler
-    still cover the race.
+    existing PR.
+
+    Returns an :class:`_OpenPRLookup` whose ``outcome`` distinguishes the three
+    cases the caller must treat differently — crucially, a *confirmed* "no PR"
+    (HTTP 200 with an empty list) from an *unconfirmed* lookup (rate-limited /
+    short-circuited / non-200 / error). This is a FAIL-CLOSED contract: an
+    unconfirmed lookup must NOT be read as "no PR exists", because POSTing then
+    can create a duplicate PR once the drained GitHub quota resets (the old
+    fail-open behavior returned ``None`` here and POSTed anyway).
     """
     try:
         list_resp = await _github_request(
@@ -167,17 +272,34 @@ async def _find_open_pull_request(
             headers,
             project_id=project_id,
         )
-    except Exception as exc:  # noqa: BLE001 — any lookup failure (network, auth, HTTP) must fall through to the POST so a flaky pre-check never blocks creation.
+    except Exception as exc:  # noqa: BLE001 — any lookup failure (network, auth, HTTP) is UNCERTAIN, not "no PR". Fail closed so we never POST a duplicate on a flaky pre-check.
         logger.warning(f"[PR] Pre-create lookup for {head} -> {base} failed: {exc}")
-        return None
-    if getattr(list_resp, "status_code", None) == 200:
+        return _OpenPRLookup("uncertain")
+
+    status_code = getattr(list_resp, "status_code", None)
+    if status_code == 200:
         try:
             items = list_resp.json()
-        except Exception:  # noqa: BLE001 — a malformed body is treated as "no existing PR" so creation proceeds.
-            return None
+        except Exception:  # noqa: BLE001 — a malformed 200 body cannot confirm "no PR"; treat as uncertain rather than fail open.
+            logger.warning(
+                f"[PR] Pre-create lookup for {head} -> {base} returned an "
+                f"unparseable 200 body — treating as uncertain"
+            )
+            return _OpenPRLookup("uncertain")
         if items:
-            return items[0]
-    return None
+            return _OpenPRLookup("found", pr=items[0])
+        return _OpenPRLookup("none")
+
+    # Non-200: rate-limited (real GitHub 403/429 or the local short-circuit's
+    # synthetic 403) or otherwise unavailable. We cannot confirm the absence of
+    # an open PR, so the caller must NOT proceed to POST.
+    retry_after = _retry_after_seconds_from_response(list_resp)
+    logger.warning(
+        f"[PR] Pre-create lookup for {head} -> {base} returned HTTP "
+        f"{status_code} (rate-limited/unavailable) — treating as uncertain"
+        + (f"; retry-after {retry_after}s" if retry_after else "")
+    )
+    return _OpenPRLookup("uncertain", retry_after=retry_after)
 
 
 async def create_pull_request(
@@ -202,15 +324,21 @@ async def create_pull_request(
     # Idempotency pre-check: GitHub enforces one open PR per (head, base) only
     # best-effort, so two concurrent creates can both 201 → duplicate PRs
     # (incident #7350/#7351). Resume an already-open PR instead of POSTing again.
-    existing = await _find_open_pull_request(
-        headers, owner, repo, head, base, project_id
-    )
-    if existing is not None:
+    #
+    # FAIL-CLOSED: if the lookup could not be *confirmed* (rate-limited /
+    # short-circuited / non-200 / error) we must NOT POST — doing so would create
+    # a duplicate PR once the drained GitHub quota resets. Surface a retryable
+    # 503 + Retry-After so the agent backs off and re-checks later instead.
+    lookup = await _find_open_pull_request(headers, owner, repo, head, base, project_id)
+    if lookup.outcome == "found" and lookup.pr is not None:
         logger.info(
-            f"[PR] Open PR #{existing.get('number')} already exists for "
+            f"[PR] Open PR #{lookup.pr.get('number')} already exists for "
             f"{head} -> {base} — returning it instead of creating a duplicate"
         )
-        return existing
+        return lookup.pr
+    if lookup.outcome == "uncertain":
+        _raise_create_pr_retryable(head, base, lookup.retry_after)
+    # lookup.outcome == "none": GitHub confirmed no open PR — safe to create.
 
     payload = {"title": title[:256], "head": head, "base": base, "body": body[:65536]}
 
@@ -236,11 +364,17 @@ async def create_pull_request(
                 logger.info(
                     f"PR already exists for {head} -> {base}, fetching existing PR"
                 )
-                existing = await _find_open_pull_request(
+                lookup = await _find_open_pull_request(
                     headers, owner, repo, head, base, project_id
                 )
-                if existing is not None:
-                    return existing
+                if lookup.pr is not None:
+                    return lookup.pr
+                # GitHub says a PR exists but we could not fetch it (the lookup
+                # was itself rate-limited). Surface retryable rather than a 422
+                # the agent would treat as permanent — the existing PR resolves
+                # on retry once quota returns.
+                if lookup.outcome == "uncertain":
+                    _raise_create_pr_retryable(head, base, lookup.retry_after)
             if "no commits between" in msg:
                 # Empty diff — branches are identical. Return a synthetic "merged" result
                 # so the caller can mark the task as completed instead of failed.
@@ -271,6 +405,26 @@ async def create_pull_request(
             status_code=401,
             detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked",
         )
+
+    # Rate-limited POST (real GitHub 403/429 or the local short-circuit's
+    # synthetic 403): the create did NOT happen. Surface as a retryable 503 so
+    # the agent backs off — instead of a 500 it would treat as a hard failure and
+    # hot-retry, re-draining the quota and re-tripping the limiter.
+    if response.status_code == 429 or (
+        response.status_code == 403
+        and (
+            response.headers.get("X-RateLimit-Remaining") == "0"
+            or response.headers.get("Retry-After") is not None
+        )
+    ):
+        logger.warning(
+            f"[PR] create POST for {head} -> {base} rate-limited "
+            f"({response.status_code}) — returning retryable 503"
+        )
+        _raise_create_pr_retryable(
+            head, base, _retry_after_seconds_from_response(response)
+        )
+
     logger.error(
         f"Failed to create pull request ({response.status_code}): {response.text}"
     )

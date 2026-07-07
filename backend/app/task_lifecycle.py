@@ -386,7 +386,7 @@ async def _mark_dependents_warm_claimable(landed_task: Task) -> None:
     import (orchestrator is a heavy module that is already loaded by call time).
     """
     try:
-        from app.orchestrator import _mark_unblocked_dependents
+        from app.dep_lifecycle import _mark_unblocked_dependents
         from app.rollup_management import _verify_pr_merged
 
         unblocked = await _mark_unblocked_dependents(landed_task, _verify_pr_merged)
@@ -1199,7 +1199,13 @@ async def _resolve_review_second_opinion(
         status=TaskStatus.COMPLETED,
         verdict_json=json.dumps(
             {
-                "verdict": record["reconciled_verdict"],
+                # ``record`` may be a stored record loaded on the pending-application
+                # REPLAY path; a fail-closed escalation can persist one without a
+                # ``reconciled_verdict`` key. Fall back to the (in-scope) primary
+                # verdict — the fail-closed value that preserves current behavior on
+                # every reachable path (reconcile_review_second_opinion always sets
+                # the key, so the default is only used by a keyless replay record).
+                "verdict": record.get("reconciled_verdict", primary_verdict),
                 "issues": record.get("surviving_issues", []),
                 "feedback": parked.get("feedback", ""),
                 "investigated_files": parked.get("investigated_files", []),
@@ -1212,7 +1218,7 @@ async def _resolve_review_second_opinion(
         review.id,
         record["state"],
         primary_verdict,
-        record["reconciled_verdict"],
+        record.get("reconciled_verdict", primary_verdict),
     )
     # Release the review row's FOR UPDATE lock (acquired above) BEFORE
     # _process_post_commit: it opens a SEPARATE session and re-acquires FOR UPDATE
@@ -1484,26 +1490,35 @@ async def _process_post_commit(
 
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:
-        # Round 3 C3 + C4: strategic tasks (design_doc_update, strategic_review)
-        # have a downstream completion chain that needs both the Project and
-        # the Task locked. The canonical order is **Project before Task,
-        # always** (docs/concurrency.md). Locking Task first then Project
-        # second reintroduces the cross-table deadlock vector C5 originally
-        # closed, so we peek at the task type via a non-locking read and use
-        # the canonical pair-locker for strategic types. Non-strategic types
-        # use the existing task-only lock pattern.
+        # WI-6 (deadlock remediation) + Round 3 C3/C4: the post-commit unit
+        # can lock BOTH the Project and the Task row — strategic tasks in their
+        # completion chain, and every other type via the downstream project-row
+        # writers reached from the completion handlers / rollup / spawn
+        # (with_vision_locked, with_design_doc_locked, with_directions_locked,
+        # project_lock, ...). The canonical order is **Project before Task,
+        # always** (docs/concurrency.md). Previously only strategic types used
+        # the canonical pair-locker; every other type locked the Task first
+        # (task-only FOR UPDATE) and reached the Project lock downstream — so
+        # two concurrent non-strategic post-commits in the same project took
+        # Task→Project while a strategic / dispatch / reaper path took
+        # Project→Task, and the opposite orders deadlocked (Postgres 40P01
+        # DeadlockDetected, ~6/hr on bursty concurrent agent-status callbacks).
+        # Acquire Project→Task up front for ALL types via the canonical
+        # pair-locker. The invariant this establishes is ORDER, not duration: the
+        # Project row is always acquired FIRST (before the Task), by every path.
+        # (The up-front locks are RELEASED at the Phase-B3 lock-release commit —
+        # "release the lock before slow GitHub calls" — so a downstream project
+        # lock taken after that commit is a fresh same-connection acquisition, not
+        # a held-through re-entrant no-op. A downstream lock taken while the up-front
+        # lock is still held IS re-entrant / non-blocking, but the deadlock freedom
+        # comes purely from Project-before-Task being universal, not from holding
+        # the row across the whole unit.)
         _peek_row = (
-            await session.execute(
-                select(Task.payloads, Task.project_id).where(Task.id == task_id)
-            )
+            await session.execute(select(Task.project_id).where(Task.id == task_id))
         ).first()
         if _peek_row is None:
             return {"status": "accepted"}
-        _peek_payload_list = _peek_row[0] or []
-        _peek_first = _peek_payload_list[0] if _peek_payload_list else {}
-        _peek_type = _peek_first.get("type") if isinstance(_peek_first, dict) else None
-        _peek_project_id = _peek_row[1]
-        _is_strategic_type = _peek_type in STRATEGIC_TASK_TYPES
+        _peek_project_id = _peek_row[0]
 
         # skip_locked + bounded retry: the row is typically only held briefly
         # (by the agent_status early-commit path that just released it, or by a
@@ -1511,19 +1526,20 @@ async def _process_post_commit(
         # queue behind GitHub API calls (15-120s) and hit the Postgres
         # lock_timeout as LockNotAvailableError, which tears down the session.
         task = None
-        # Round 3 C3 + C4: ``locked_project`` is set ONLY when the post-commit
-        # is processing a strategic task and the canonical pair-lock succeeded.
-        # The strategic-completion chain handlers below receive this via
-        # ``project=`` so they skip their own (legacy) re-acquisition.
+        # ``locked_project`` holds the canonically pre-locked Project (acquired
+        # BEFORE the task). The strategic-completion chain handlers
+        # (``completion_needs_locked_project``) receive it via ``project=`` so
+        # they skip their own (legacy) re-acquisition; non-strategic handlers
+        # ignore it and re-lock the same row re-entrantly under the held lock.
         locked_project: Project | None = None
-        for _attempt in range(3):
-            if _is_strategic_type and _peek_project_id is not None:
-                # Canonical Project → Task ordering for strategic tasks. The
-                # helper acquires Project first; if the task row is held it
-                # yields ``(project, None)`` and we retry. If the project is
-                # held it yields ``(None, None)`` and we retry as well.
-                from app.task_locking import lock_project_then_task
+        from app.task_locking import lock_project_then_task
 
+        for _attempt in range(3):
+            if _peek_project_id is not None:
+                # Canonical Project → Task ordering. The helper acquires
+                # Project first; if the task row is held it yields
+                # ``(project, None)`` and we retry; if the project is held it
+                # yields ``(None, None)`` and we retry as well.
                 async with lock_project_then_task(
                     session,
                     _peek_project_id,
@@ -1547,6 +1563,8 @@ async def _process_post_commit(
                     if _p is not None:
                         await session.rollback()
             else:
+                # Defensive fallback only: Task.project_id is NOT NULL, so this
+                # fires solely if the peek raced a hard delete. Task-only lock.
                 task = (
                     (
                         await session.execute(
@@ -3422,9 +3440,13 @@ async def _process_post_commit(
                                 _pre_rollup_mig_guard: (
                                     tuple[bool, str | None] | None
                                 ) = None
+                                _pre_rollup_size_cap: (
+                                    tuple[str, str | None] | None
+                                ) = None
                                 if _orig_peek_loop.get("ci_passed"):
                                     _peek_pr_num = _orig_peek_loop.get("pr_number")
                                     _peek_base = _orig_peek_loop.get("base_branch", "")
+                                    _peek_branch = _orig_peek_loop.get("branch", "")
                                     try:
                                         (
                                             _pre_rollup_gh,
@@ -3455,6 +3477,31 @@ async def _process_post_commit(
                                                     else None
                                                 ),
                                             )
+                                        # Hoist size-cap preflight before the lock for
+                                        # direct (non-rollup) task PRs, mirroring the
+                                        # migration guard pattern above.  Rollup parents
+                                        # have rollup_pr_number in context — skip there.
+                                        if (
+                                            _peek_pr_num
+                                            and _peek_branch
+                                            and not (_orig_peek or {}).get(
+                                                "rollup_pr_number"
+                                            )
+                                        ):
+                                            from app.rollup_size_preflight import (
+                                                preflight_rollup_size_caps as _sc_pre,
+                                            )
+
+                                            _pre_rollup_size_cap = await _sc_pre(
+                                                _pre_rollup_gh,
+                                                _pre_rollup_own,
+                                                _pre_rollup_rep,
+                                                _peek_pr_num,
+                                                _peek_branch,
+                                                project_id=str(task.project_id)
+                                                if task.project_id
+                                                else None,
+                                            )
                                     except Exception as _pre_exc:
                                         logger.debug(
                                             "[REVIEW PIPELINE] Pre-lock token/guard "
@@ -3465,6 +3512,7 @@ async def _process_post_commit(
                                         )
                                         _pre_rollup_gh = None
                                         _pre_rollup_mig_guard = None
+                                        _pre_rollup_size_cap = None
 
                                 # Phase A1: skip_locked + bounded retry. If the parent
                                 # task row is held by a peer, defer the handoff —
@@ -3551,6 +3599,7 @@ async def _process_post_commit(
                                                 session,
                                                 source="review_approval",
                                                 precomputed_migration_guard=_pre_rollup_mig_guard,
+                                                precomputed_size_cap=_pre_rollup_size_cap,
                                             )
                                         except Exception as _gate_e:
                                             logger.error(
@@ -6018,9 +6067,13 @@ async def _process_post_commit(
         # after children spawn, never in QUEUED. Production incident: task
         # 582a0210 force-failed at 19:47:30 while waiting on a warm-handoff
         # from sibling 609b380c on agent-vm-540ee.
-        all_tasks_stmt = select(Task).where(Task.project_id == task.project_id)
-        all_tasks = (await session.execute(all_tasks_stmt)).scalars().all()
-        executable_statuses = [t.status for t in all_tasks if t.vm_instance_id]
+        # Column-selective scan — avoids loading large JSONB context blobs for
+        # every task on every completion event.
+        all_tasks_stmt = select(
+            Task.id, Task.status, Task.vm_instance_id
+        ).where(Task.project_id == task.project_id)
+        all_task_rows = (await session.execute(all_tasks_stmt)).all()
+        executable_statuses = [r.status for r in all_task_rows if r.vm_instance_id]
         # A PARKED task is live work waiting on an external wake; park_task
         # clears vm_instance_id=None on park, so it is already invisible to
         # ``executable_statuses``. This guard provides defence-in-depth: without
@@ -6030,12 +6083,12 @@ async def _process_post_commit(
         # converge COMPLETED/FAILED while a parked child is still waiting to be
         # woken — an early-converge. Treat any live PARKED child as in-flight so
         # the all-terminal guard below cannot trip while one exists.
-        has_parked_task = any(t.status == TaskStatus.PARKED for t in all_tasks)
-        parent_tasks = [
-            t
-            for t in all_tasks
-            if not t.vm_instance_id
-            and t.status
+        has_parked_task = any(r.status == TaskStatus.PARKED for r in all_task_rows)
+        _parent_task_ids = [
+            r.id
+            for r in all_task_rows
+            if not r.vm_instance_id
+            and r.status
             not in [
                 TaskStatus.QUEUED,  # leaf awaiting claim/warm-handoff, not a parent
                 # PARKED leaf is live work awaiting an external wake, not a
@@ -6046,6 +6099,18 @@ async def _process_post_commit(
                 TaskStatus.CANCELLED,
             ]
         ]
+        # Fetch full ORM objects only for parent tasks — needed for mutation.
+        parent_tasks = (
+            (
+                await session.execute(
+                    select(Task).where(Task.id.in_(_parent_task_ids))
+                )
+            )
+            .scalars()
+            .all()
+            if _parent_task_ids
+            else []
+        )
 
         project_stmt = select(Project).where(Project.id == task.project_id)
         project = (await session.execute(project_stmt)).scalars().first()

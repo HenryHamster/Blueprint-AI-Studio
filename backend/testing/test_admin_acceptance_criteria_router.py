@@ -11,11 +11,23 @@ Role-enforcement, happy path, 400/404/409 branches.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from httpx import AsyncClient
+from sqlmodel import select
 
 from app import acceptance_criteria as ac
-from app.models import Direction, Project, ProjectMember, ReleaseVersion
+from app.models import (
+    CriterionEvidence,
+    Direction,
+    Project,
+    ProjectMember,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+    VersionAcceptanceCriterion,
+)
 
 TEST_USER_ID = "test-user-123"
 
@@ -227,6 +239,59 @@ async def test_create_criterion_per_version_cap(client: AsyncClient, db_session)
     assert resp.status_code == 409, f"expected 409 cap enforcement, got {resp.status_code}: {resp.text}"
 
 
+@pytest.mark.asyncio
+async def test_cap_counts_only_active_criteria(client: AsyncClient, db_session):
+    """Retracted criteria do not count toward the cap; a version at cap with some
+    retracted rows can still accept new active criteria via the operator endpoint."""
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+
+    # Fill to (cap - 1) with active criteria, plus 1 extra that we then retract.
+    # Total rows = cap, but active rows = cap - 1, so there is still one slot.
+    for i in range(ac.MAX_CRITERIA_PER_VERSION - 1):
+        await ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text=f"Active {i}",
+        )
+    to_retract = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Will be retracted",
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=to_retract.criterion_key,
+        reason="superseded by new work",
+        retracted_by="test",
+    )
+
+    # Total rows = MAX_CRITERIA_PER_VERSION; active rows = MAX_CRITERIA_PER_VERSION - 1.
+    # The endpoint should allow one more active criterion.
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria",
+        json={"text": "Replacement criterion"},
+    )
+    assert resp.status_code == 200, (
+        f"expected 200 (retracted rows should not block cap), got {resp.status_code}: {resp.text}"
+    )
+    data = resp.json()
+    assert data["criterion_key"].startswith("c-")
+
+    # Now we are exactly at the active cap — a further create should be rejected.
+    resp2 = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria",
+        json={"text": "One too many"},
+    )
+    assert resp2.status_code == 409, (
+        f"expected 409 after active cap reached, got {resp2.status_code}: {resp2.text}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /api/admin/projects/{project_id}/acceptance-criteria/link-direction
 # ---------------------------------------------------------------------------
@@ -310,6 +375,44 @@ async def test_link_direction_400_unknown_criterion_key(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
+async def test_link_direction_400_dangling_key_returns_structured_error(
+    client: AsyncClient, db_session
+):
+    """A dangling criterion key returns a structured 400 with active_criterion_keys.
+
+    check_criterion_key_write normalises both dangling and inactive failures
+    into the same structured error shape so callers can inspect
+    error='criterion_key_invalid', classification, keys, and active_criterion_keys.
+    """
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+    direction = await _make_direction(db_session, project)
+
+    # Create one active criterion so the active_criterion_keys list is non-empty.
+    active = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Active criterion",
+    )
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/link-direction",
+        json={
+            "direction_key": direction.direction_key,
+            "criterion_keys": ["c-does-not-exist"],
+        },
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    detail = body.get("error", {}).get("message", body)
+    assert detail.get("error") == "criterion_key_invalid"
+    assert detail.get("classification") == "dangling"
+    assert "c-does-not-exist" in detail.get("keys", [])
+    assert active.criterion_key in detail.get("active_criterion_keys", [])
+
+
+@pytest.mark.asyncio
 async def test_link_direction_404_unknown_direction(client: AsyncClient, db_session):
     """Returns 404 when direction_key does not exist in the project."""
     project = await _make_project_member(db_session)
@@ -381,3 +484,506 @@ async def test_link_direction_400_rejects_closed_version_criterion_key(
         "criterion key from a closed version must be rejected with 400; "
         f"got {resp.status_code}: {resp.text}"
     )
+
+
+@pytest.mark.asyncio
+async def test_link_direction_400_rejects_inactive_criterion_key(
+    client: AsyncClient, db_session
+):
+    """A retracted criterion key in the open version is rejected with structured 400.
+
+    Even when the key exists in the open version, an inactive (retracted or
+    superseded) criterion must not be linked to a direction — the guard returns
+    a structured error with error='criterion_key_invalid' and
+    classification='inactive' so callers can distinguish inactive from unknown.
+    """
+    from app.models import VersionAcceptanceCriterion
+    from sqlmodel import select as _select
+
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+    direction = await _make_direction(db_session, project)
+
+    # Create a criterion and retract it in the open version.
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Criterion to retract",
+    )
+    row = (
+        await db_session.execute(
+            _select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.id == criterion.id
+            )
+        )
+    ).scalar_one()
+    row.status = "retracted"
+    db_session.add(row)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/link-direction",
+        json={
+            "direction_key": direction.direction_key,
+            "criterion_keys": [criterion.criterion_key],
+        },
+    )
+    assert resp.status_code == 400, (
+        "retracted criterion key must be rejected with 400; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    # FastAPI wraps dict details under {"error": {"code": ..., "message": {...}}}.
+    body = resp.json()
+    detail = body.get("error", {}).get("message", body)
+    assert detail.get("error") == "criterion_key_invalid"
+    assert detail.get("classification") == "inactive"
+    assert criterion.criterion_key in detail.get("keys", [])
+
+
+# ---------------------------------------------------------------------------
+# Supersession-target validation via the strategic agent op
+# ---------------------------------------------------------------------------
+
+
+async def _make_strategic_task_and_token(session, project):
+    """Create a strategic_review Task and return (task, agent_token)."""
+    from app.auth import create_agent_token
+    from app.models import Task
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id=f"agent-vm-{project.id}",
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    token = create_agent_token(
+        str(task.id),
+        f"agent-vm-{project.id}",
+        task_type="strategic_review",
+    )
+    return task, token
+
+
+@pytest.mark.asyncio
+async def test_supersession_target_unknown_key_rejected(client: AsyncClient, db_session):
+    """set_acceptance_criteria returns 400 when superseded_by_key does not exist on the open version."""
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Criterion to retract",
+    )
+    task, token = await _make_strategic_task_and_token(db_session, project)
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "reason": "Replacing with something",
+                        "superseded_by_key": "c-does-not-exist",
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 400, (
+        f"Expected 400 for unknown superseded_by_key, got {resp.status_code}: {resp.text}"
+    )
+    assert "does not refer to an active criterion" in resp.json()["error"]["message"]
+
+    # Source criterion must remain active — the validation rejected the op before retraction.
+    await db_session.refresh(criterion)
+    assert criterion.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_supersession_target_valid_active_key_accepted(client: AsyncClient, db_session):
+    """set_acceptance_criteria returns 200 when superseded_by_key references a real active criterion."""
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    source = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Old criterion",
+    )
+    successor = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="New replacement criterion",
+    )
+    task, token = await _make_strategic_task_and_token(db_session, project)
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": source.criterion_key,
+                        "reason": "Superseded by new criterion",
+                        "superseded_by_key": successor.criterion_key,
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, (
+        f"Expected 200 for valid active superseded_by_key, got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["retracted"][0]["status"] == "superseded"
+    assert body["retracted"][0]["found"] is True
+
+    await db_session.refresh(source)
+    assert source.status == "superseded"
+    assert source.superseded_by_key == successor.criterion_key
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/projects/{project_id}/acceptance-criteria/{key}/reinstate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reinstate_criterion_happy_path(client: AsyncClient, db_session):
+    """Reinstating a retracted criterion flips it back to active and clears retraction fields."""
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Criterion to retract then reinstate",
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion.criterion_key,
+        reason="loop retracted this",
+        retracted_by="strategist",
+    )
+    await db_session.refresh(criterion)
+    assert criterion.status == "retracted"
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/reinstate"
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["criterion_key"] == criterion.criterion_key
+
+    await db_session.refresh(criterion)
+    assert criterion.status == "active"
+    assert criterion.retraction_reason is None
+    assert criterion.retracted_at is None
+    assert criterion.retracted_by is None
+    assert criterion.superseded_by_key is None
+
+
+@pytest.mark.asyncio
+async def test_reinstate_already_active_idempotent(client: AsyncClient, db_session):
+    """Reinstating an already-active criterion is a no-op returning 200."""
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Active criterion",
+    )
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/reinstate"
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+
+    await db_session.refresh(criterion)
+    assert criterion.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_reinstate_not_found_404(client: AsyncClient, db_session):
+    """Returns 404 when the criterion key does not exist in the open version."""
+    project = await _make_project_member(db_session, role="member")
+    await _make_version(db_session, project)
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/c-doesnotexist/reinstate"
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reinstate_409_no_open_version(client: AsyncClient, db_session):
+    """Returns 409 when there is no open release version."""
+    project = await _make_project_member(db_session, role="member")
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/c-any/reinstate"
+    )
+    assert resp.status_code == 409, f"expected 409 (no open version), got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_reinstate_409_cap_exceeded(client: AsyncClient, db_session):
+    """Returns 409 when reinstating would exceed the active-criteria cap."""
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+
+    # Create a criterion, retract it, then fill the cap with other criteria.
+    to_reinstate = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Will be retracted",
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=to_reinstate.criterion_key,
+        reason="test retraction",
+        retracted_by="test",
+    )
+
+    # Fill up active slots to the cap.
+    for i in range(ac.MAX_CRITERIA_PER_VERSION):
+        await ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text=f"Filler {i}",
+        )
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{to_reinstate.criterion_key}/reinstate"
+    )
+    assert resp.status_code == 409, f"expected 409 (cap exceeded), got {resp.status_code}: {resp.text}"
+    assert "cap" in resp.json().get("error", {}).get("message", resp.text).lower()
+
+
+@pytest.mark.asyncio
+async def test_reinstate_requires_member_role(client: AsyncClient, db_session):
+    """Project non-member receives 403/404 on the reinstate endpoint."""
+    other_project = Project(name="OtherReinstate", user_id="other-user")
+    db_session.add(other_project)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"{_BASE}/projects/{other_project.id}/acceptance-criteria/c-any/reinstate"
+    )
+    assert resp.status_code in (403, 404)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/projects/{project_id}/acceptance-criteria/reconcile-backfill
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_single_direction(client: AsyncClient, db_session):
+    """Single-direction branch: returns ok with per-direction summary (0 rows when no tasks)."""
+    project = await _make_project_member(db_session, role="member")
+    direction = await _make_direction(db_session, project, key="d-backfill1")
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/reconcile-backfill",
+        json={"direction_key": direction.direction_key},
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert isinstance(data["results"], list)
+    assert len(data["results"]) == 1
+    assert data["results"][0]["direction_key"] == direction.direction_key
+    assert data["results"][0]["evidence_recorded"] == 0
+    assert data["total_evidence_recorded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_all_directions(client: AsyncClient, db_session):
+    """All-directions branch: iterates every Direction row for the project and returns aggregate."""
+    project = await _make_project_member(db_session, role="member")
+    dir_a = await _make_direction(db_session, project, key="d-all-a")
+    dir_b = await _make_direction(db_session, project, key="d-all-b")
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/reconcile-backfill",
+        json={},
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    # Results list omits directions with 0 new rows, but total is the sum.
+    assert data["total_evidence_recorded"] == 0
+    assert isinstance(data["results"], list)
+    # Verify that both directions were scanned (they produced 0 rows, so results list is empty).
+    assert data["results"] == []
+    _ = dir_a, dir_b  # referenced above; silence linter
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_requires_member_role(client: AsyncClient, db_session):
+    """Project non-member receives 403/404 on the reconcile-backfill endpoint."""
+    other_project = Project(name="OtherBackfill", user_id="other-user")
+    db_session.add(other_project)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"{_BASE}/projects/{other_project.id}/acceptance-criteria/reconcile-backfill",
+        json={"direction_key": "d-any"},
+    )
+    assert resp.status_code in (403, 404)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_single_direction_with_merged_task(
+    client: AsyncClient, db_session
+):
+    """Single-direction backfill records evidence for a pre-existing proven merged task.
+
+    Exercises the non-zero path: a task that merged before the criterion-direction
+    mapping was created should have evidence recorded on backfill.  Asserts both
+    the per-direction result and that CriterionEvidence rows are actually persisted.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project, status="open")
+    direction = await _make_direction(db_session, project, key="d-backfill-merged")
+
+    # Create a criterion and link it to the direction so record_task_merge_evidence
+    # can find it via direction.criterion_keys.
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-backfill-test",
+        text="Backfill test criterion",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+    await db_session.refresh(criterion)
+
+    # Link criterion to direction via criterion_keys.
+    direction.criterion_keys = ["c-backfill-test"]
+    db_session.add(direction)
+    await db_session.commit()
+
+    # Create a task that already merged (proven) in the current version window.
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+        context={
+            "direction_id": direction.direction_key,
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True},
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/reconcile-backfill",
+        json={"direction_key": direction.direction_key},
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["results"][0]["direction_key"] == direction.direction_key
+    # Two evidence rows per criterion: task_merge + reachability.
+    assert data["results"][0]["evidence_recorded"] == 2
+    assert data["total_evidence_recorded"] == 2
+
+    # Verify CriterionEvidence rows are actually persisted.
+    ev_rows = (
+        await db_session.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion.id
+            )
+        )
+    ).scalars().all()
+    source_kinds = {e.source_kind for e in ev_rows}
+    assert "task_merge" in source_kinds
+    assert "reachability" in source_kinds
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_all_directions_with_merged_task(
+    client: AsyncClient, db_session
+):
+    """All-directions backfill aggregates evidence across directions with proven merged tasks."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project, status="open")
+    dir_a = await _make_direction(db_session, project, key="d-all-proven-a")
+    dir_b = await _make_direction(db_session, project, key="d-all-proven-b")
+
+    for direction, ckey in [
+        (dir_a, "c-all-proven-a"),
+        (dir_b, "c-all-proven-b"),
+    ]:
+        criterion = VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key=ckey,
+            text=f"Criterion for {direction.direction_key}",
+            status="active",
+        )
+        db_session.add(criterion)
+        await db_session.commit()
+        direction.criterion_keys = [ckey]
+        db_session.add(direction)
+        await db_session.commit()
+
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            completed_at=version.opened_at + timedelta(seconds=1),
+            context={
+                "direction_id": direction.direction_key,
+                "pr_merged": True,
+                CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True},
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/reconcile-backfill",
+        json={},
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    # 2 evidence rows per direction (task_merge + reachability) × 2 directions = 4
+    assert data["total_evidence_recorded"] == 4
+    direction_keys_in_results = {r["direction_key"] for r in data["results"]}
+    assert dir_a.direction_key in direction_keys_in_results
+    assert dir_b.direction_key in direction_keys_in_results

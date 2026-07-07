@@ -20,6 +20,7 @@ from app.models import (
     ComputeJobOutcome,
     ComputeJobStatus,
     KnowledgeDocument,
+    LocalRunner,
     Project,
     ProjectMember,
     SourceKind,
@@ -2132,3 +2133,458 @@ async def test_ask_compute_job_history_not_citable(
     # Prior answer text is not durable evidence — must be rejected by the grounding gate
     assert body["grounding_miss"] is True
     assert body["citations"] == []
+
+
+# ---------------------------------------------------------------------------
+# Runner identity and wait-state surfacing tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_runner(session, project, *, hostname="worker-01", status="active"):
+    """Seed a LocalRunner for the given project."""
+    import hashlib
+    token = "test-token-" + hostname
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=token_hash,
+        hostname=hostname,
+        status=status,
+    )
+    session.add(runner)
+    await session.commit()
+    await session.refresh(runner)
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_surfaces_runner_claim(client: AsyncClient, db_session):
+    """A job pinned to a registered runner must surface runner_target_id,
+    runner_claimed_at, and a runner descriptor (id/hostname/status) in the response."""
+    project = await _make_project(db_session, name="Runner Claim Project")
+    await _add_member(db_session, project.id, "viewer")
+    runner = await _make_runner(db_session, project, hostname="worker-01")
+
+    claimed_at = "2026-07-04T10:00:00Z"
+    _task, job, _artifact = await _make_job(
+        db_session,
+        project,
+        polling_metadata={
+            "runner_target_id": str(runner.id),
+            "runner_claimed_at": claimed_at,
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    j = resp.json()["compute_jobs"][0]
+
+    assert j["runner_target_id"] == str(runner.id)
+    assert j["runner_claimed_at"] == claimed_at
+    assert j["runner"] is not None
+    assert j["runner"]["id"] == str(runner.id)
+    assert j["runner"]["hostname"] == "worker-01"
+    assert j["runner"]["status"] == "active"
+    # token_hash must NOT be present in the descriptor.
+    assert "token_hash" not in j["runner"]
+    assert "token" not in j["runner"]
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_awaiting_local_runner_since(
+    client: AsyncClient, db_session
+):
+    """A queued job whose task carries awaiting_local_runner_since must surface that
+    field; when no runner has claimed it the runner descriptor must be null."""
+    project = await _make_project(db_session, name="Awaiting Runner Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    waiting_since = "2026-07-04T09:30:00Z"
+    task = Task(
+        project_id=project.id,
+        title="queued compute task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_local_runner_since": waiting_since},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.QUEUED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    j = resp.json()["compute_jobs"][0]
+
+    assert j["awaiting_local_runner_since"] == waiting_since
+    assert j["runner"] is None
+    assert j["runner_target_id"] is None
+    assert j["runner_claimed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_no_runner_fields_null(client: AsyncClient, db_session):
+    """A job with no runner pin must have all three runner fields null (backward-compat)."""
+    project = await _make_project(db_session, name="No Runner Project")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job, _artifact = await _make_job(db_session, project)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    j = resp.json()["compute_jobs"][0]
+
+    assert j["runner_target_id"] is None
+    assert j["runner_claimed_at"] is None
+    assert j["awaiting_local_runner_since"] is None
+    assert j["runner"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_surfaces_runner_claim(
+    client: AsyncClient, db_session
+):
+    """The single-job detail endpoint must also surface runner fields."""
+    project = await _make_project(db_session, name="Runner Detail Project")
+    await _add_member(db_session, project.id, "viewer")
+    runner = await _make_runner(db_session, project, hostname="detail-host")
+
+    claimed_at = "2026-07-04T11:00:00Z"
+    _task, job, _artifact = await _make_job(
+        db_session,
+        project,
+        polling_metadata={
+            "runner_target_id": str(runner.id),
+            "runner_claimed_at": claimed_at,
+        },
+    )
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 200
+    j = resp.json()["compute_job"]
+
+    assert j["runner_target_id"] == str(runner.id)
+    assert j["runner_claimed_at"] == claimed_at
+    assert j["runner"]["hostname"] == "detail-host"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_payload_exposes_launch_params(
+    client: AsyncClient, db_session
+):
+    """launch_params must be projected from the task's first_payload fields so
+    the operator UI can pre-fill the launch form from a finished job."""
+    project = await _make_project(db_session, name="Launch Params Project")
+    await _add_member(db_session, project.id, "viewer")
+    task = Task(
+        project_id=project.id,
+        title="clone-me experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "declared_metric": "accuracy",
+                "metric": "accuracy",
+                "provenance": {
+                    "idea": "Measure how the draft was shaped by the original operator idea",
+                    "draft_notes": "The contract was refined from the draft before launch.",
+                    "drafted_from_refinement": True,
+                },
+                "cwd": "/workspace",
+                "env": {"SEED": "42", "LR": "0.01"},
+                "accelerator": "T4",
+                "machine_type": "n1-standard-1",
+                "container_image": "nvcr.io/nvidia/pytorch:24.01",
+                "provisioning_model": "SPOT",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 3600,
+                "require_live_release": True,
+                "require_durable_artifact": True,
+                "success_criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": 0.9,
+                },
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=2.0,
+        result_reference=None,
+        polling_metadata={},
+        completed_at=_utcnow(),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    j = resp.json()["compute_jobs"][0]
+    lp = j["launch_params"]
+
+    assert lp is not None
+    assert lp["command"] == "python train.py"
+    assert lp["declared_metric"] == "accuracy"
+    assert lp["metric"] == "accuracy"
+    assert lp["cwd"] == "/workspace"
+    # Env values are operator-supplied secrets: only the sorted key names are
+    # projected; the raw mapping must never reach this viewer-readable payload.
+    assert lp["env_keys"] == ["LR", "SEED"]
+    assert "env" not in lp
+    assert "42" not in str(lp) and "0.01" not in str(lp)
+    assert lp["provenance"] == {
+        "idea": "Measure how the draft was shaped by the original operator idea",
+        "draft_notes": "The contract was refined from the draft before launch.",
+        "drafted_from_refinement": True,
+    }
+    assert lp["accelerator"] == "T4"
+    assert lp["machine_type"] == "n1-standard-1"
+    assert lp["container_image"] == "nvcr.io/nvidia/pytorch:24.01"
+    assert lp["provisioning_model"] == "SPOT"
+    assert lp["spend_cap_usd"] == 5.0
+    assert lp["deadline_seconds"] == 3600
+    assert lp["require_live_release"] is True
+    assert lp["require_durable_artifact"] is True
+
+
+@pytest.mark.asyncio
+async def test_compute_job_payload_launch_params_arms_mode(
+    client: AsyncClient, db_session
+):
+    """Arms-mode experiments must expose arms + declared_metric in launch_params."""
+    project = await _make_project(db_session, name="Arms Launch Params Project")
+    await _add_member(db_session, project.id, "viewer")
+    arms = [
+        {"name": "control", "command": "python run.py --lr 0.01"},
+        {"name": "treatment", "command": "python run.py --lr 0.001"},
+    ]
+    task = Task(
+        project_id=project.id,
+        title="arms experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "arms": arms,
+                "declared_metric": "loss",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        accrued_cost_usd=0.5,
+        result_reference=None,
+        polling_metadata={},
+        completed_at=_utcnow(),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    lp = resp.json()["compute_jobs"][0]["launch_params"]
+
+    assert lp["arms"] == arms
+    assert lp["declared_metric"] == "loss"
+    assert lp["command"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_job_launch_params_null_without_task(
+    client: AsyncClient, db_session
+):
+    """A job with no linked task must expose launch_params as null."""
+    project = await _make_project(db_session, name="No Task Project")
+    await _add_member(db_session, project.id, "viewer")
+    job = ComputeJob(
+        task_id=None,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        accrued_cost_usd=0.1,
+        result_reference=None,
+        polling_metadata={},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    assert resp.json()["compute_jobs"][0]["launch_params"] is None
+
+
+async def _make_awaiting_local_runner_task(
+    session,
+    project,
+    *,
+    title="held compute task",
+    awaiting_since="2026-07-04T10:00:00+00:00",
+    created_at=None,
+    payload=None,
+    status=TaskStatus.QUEUED,
+    requires_approval=False,
+    archived=False,
+    task_type="compute_experiment",
+):
+    """Seed a compute_experiment Task held awaiting a local runner (no ComputeJob)."""
+    base_payload = {"type": task_type}
+    if payload:
+        base_payload.update(payload)
+    task = Task(
+        project_id=project.id,
+        title=title,
+        status=status,
+        payloads=[base_payload],
+        context={"awaiting_local_runner_since": awaiting_since}
+        if awaiting_since is not None
+        else {},
+        requires_approval=requires_approval,
+        archived=archived,
+    )
+    if created_at is not None:
+        task.created_at = created_at
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_list_awaiting_local_runner_holds(client: AsyncClient, db_session):
+    """Held compute_experiment tasks appear newest-first with stamp + launch fields;
+    control tasks (approval-held, non-compute, unstamped, archived) are excluded."""
+    project = await _make_project(db_session, name="Local Runner Hold Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    older = await _make_awaiting_local_runner_task(
+        db_session,
+        project,
+        title="older held experiment",
+        awaiting_since="2026-07-04T09:00:00+00:00",
+        created_at=datetime(2026, 7, 4, 9, 0, 0, tzinfo=timezone.utc),
+        payload={
+            "spend_cap_usd": 3.5,
+            "command": "python run_older.py",
+            "machine_type": "a2-highgpu-1g",
+            "accelerator": "nvidia-tesla-a100",
+            "container_image": "img:older",
+            "provisioning_model": "SPOT",
+            "deadline_seconds": 1200,
+        },
+    )
+    newer = await _make_awaiting_local_runner_task(
+        db_session,
+        project,
+        title="newer held experiment",
+        awaiting_since="2026-07-04T10:30:00+00:00",
+        created_at=datetime(2026, 7, 4, 10, 30, 0, tzinfo=timezone.utc),
+        payload={"spend_cap_usd": 5.0, "command": "python run_newer.py"},
+    )
+
+    # Controls that MUST be excluded.
+    await _make_awaiting_local_runner_task(
+        db_session,
+        project,
+        title="approval-held experiment",
+        requires_approval=True,
+    )
+    await _make_awaiting_local_runner_task(
+        db_session,
+        project,
+        title="non-compute task",
+        task_type="research",
+    )
+    await _make_awaiting_local_runner_task(
+        db_session,
+        project,
+        title="unstamped experiment",
+        awaiting_since=None,
+    )
+    await _make_awaiting_local_runner_task(
+        db_session,
+        project,
+        title="archived experiment",
+        archived=True,
+    )
+    # A running experiment (has a ComputeJob, status IN_PROGRESS) must be excluded.
+    await _make_job(db_session, project, status=ComputeJobStatus.RUNNING)
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs/awaiting-local-runner"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, list)
+    assert [entry["id"] for entry in body] == [str(newer.id), str(older.id)]
+
+    newer_entry = body[0]
+    assert newer_entry["title"] == "newer held experiment"
+    assert newer_entry["awaiting_local_runner_since"] == "2026-07-04T10:30:00+00:00"
+    assert newer_entry["created_at"] is not None
+    assert newer_entry["requires_approval"] is False
+    assert newer_entry["spend_cap_usd"] == 5.0
+    assert newer_entry["command"] == "python run_newer.py"
+
+    older_entry = body[1]
+    assert older_entry["awaiting_local_runner_since"] == "2026-07-04T09:00:00+00:00"
+    assert older_entry["spend_cap_usd"] == 3.5
+    assert older_entry["command"] == "python run_older.py"
+    assert older_entry["machine_type"] == "a2-highgpu-1g"
+    assert older_entry["accelerator"] == "nvidia-tesla-a100"
+    assert older_entry["container_image"] == "img:older"
+    assert older_entry["provisioning_model"] == "SPOT"
+    assert older_entry["deadline_seconds"] == 1200
+
+
+@pytest.mark.asyncio
+async def test_awaiting_local_runner_viewer_ok_non_member_404(
+    client: AsyncClient, db_session
+):
+    """Viewer membership returns 200; no membership returns 404."""
+    project = await _make_project(db_session, name="Hold Access Project")
+    await _make_awaiting_local_runner_task(db_session, project)
+
+    # No membership row -> 404.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs/awaiting-local-runner"
+    )
+    assert resp.status_code == 404
+
+    await _add_member(db_session, project.id, "viewer")
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/compute-jobs/awaiting-local-runner"
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()) == 1

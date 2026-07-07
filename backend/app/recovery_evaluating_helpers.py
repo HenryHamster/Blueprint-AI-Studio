@@ -620,51 +620,87 @@ async def _attempt_ci_backstop_recovery(
 
 
 async def _verify_ci_before_backstop(
-    parent: Task, review_loop: dict, head_sha: str, session
+    parent: Task, review_loop: dict, head_sha: str | None, session
 ) -> bool:
-    """Read the PR's LIVE check-run conclusion before the backstop fails a parent.
+    """Read the PR's LIVE CI verdict before the backstop fails a parent.
 
     The CI-wait backstop fires on a wall-clock that can outlast a CI conclusion
     that actually landed before the wait window even started — e.g. when
     ``review_loop.ci_wait_started`` is re-armed after CI already concluded
-    (incident 2026-06-07). This reads the real check-run state and routes on the
-    truth instead of timing out blindly:
+    (incident 2026-06-07). It also fired on rollups targeting ``automain`` that
+    carry ZERO CI checks and sit ``mergeable=CLEAN``: the old gate required a
+    cached ``head_sha`` AND ``review_loop.pr_number``, so a row parked with its
+    identity only at ``context.rollup_pr_number`` (or with no cached head) was
+    never verified and got hard-killed at the deadline.
 
-      - concluded FAILURE → delegate to ``handle_ci_completion`` so the existing
-        CI-failure handling (fix-spawn path, ci_passed=False) runs;
-      - concluded SUCCESS → record the pass and reset/clear the CI-wait clock so
-        the parent stops counting toward the backstop;
-      - still pending / GitHub error → return False (fail OPEN: fall through to
-        the existing timeout behaviour — never kill on an outage, never block).
+    This routes through the SAME strict resolver + no-checks policy the
+    orchestrator poll loop uses (``ci_resolution.resolve_pr_ci_status`` +
+    ``resolve_no_checks_escalation``), so the verdict here can never disagree
+    with what the merger would do:
+
+      - GREEN / RED → delegate to ``handle_ci_completion`` (merge / fix-spawn),
+        which re-locks the row and re-enforces the ``_review_approved`` gate;
+      - NO_CHECKS resolving to ``merge_unverified`` (staging base / declared
+        no-CI / test-less repo) → treat as green so the same handler runs the
+        mergeability-gated merge — this is what fast-resolves the 0-check/CLEAN
+        rollup the backstop used to kill;
+      - NO_CHECKS resolving to ``verify_tests`` / ``keep_polling``, a still
+        PENDING build, or ANY GitHub error → return False (fail OPEN: fall
+        through to the existing timeout path — never a wrong kill, never block on
+        an outage, never merge on absence of signal for a CI-gated repo).
+
+    The PR number is resolved via :func:`effective_pr_number`
+    (``review_loop.pr_number`` OR ``context.rollup_pr_number``); ``head_sha`` is
+    looked up from the live PR when the parked loop never cached one.
 
     ALL GitHub I/O is performed here, strictly OUTSIDE the caller's FOR-UPDATE
     re-validate window. ``handle_ci_completion`` re-locks the row itself.
 
-    Returns True iff CI had genuinely concluded and was handled (the caller must
+    Returns True iff a terminal verdict was reached and handled (the caller must
     then skip the kill); False to fall through to the existing timeout path.
     """
-    from app import services
-    from app.routers.agent import get_github_token_for_task
-    from app.github_checks import get_check_runs_cached
+    from app import ci_resolution, services
     from app.ci_completion import handle_ci_completion
+    from app.ci_merge_helpers import effective_pr_number
+    from app.github import get_pull_request
+    from app.models import Project
+    from app.routers.agent import get_github_token_for_task
+    from app.shared_state import runtime_config as _rt_cfg
 
-    pr_number = review_loop.get("pr_number")
+    pr_number = effective_pr_number(parent)
+    if not pr_number:
+        # No PR to poll — the backstop's wall-clock is the only signal.
+        return False
+
+    _pr_data = None
     try:
         _gh, _owner, _repo = await services._bounded(
             get_github_token_for_task(parent.id, session),
             services._GH_CALL_TIMEOUT_S,
             what=f"ci-backstop token {str(parent.id)[:8]}",
         )
-        ci_result = await services._bounded(
-            get_check_runs_cached(
-                _gh,
-                _owner,
-                _repo,
-                head_sha,
+        # Resolve head_sha live when the parked loop never cached one — the old
+        # hard precondition on a cached head_sha is exactly what starved the
+        # identity-incomplete rows of a verify before the kill.
+        _head_sha = head_sha or ""
+        if not _head_sha:
+            _pr_data = await services._bounded(
+                get_pull_request(_gh, _owner, _repo, pr_number),
+                services._GH_CALL_TIMEOUT_S,
+                what=f"ci-backstop PR #{pr_number}",
+            )
+            _head_sha = (_pr_data.get("head") or {}).get("sha") or ""
+        _resolved = await services._bounded(
+            ci_resolution.resolve_pr_ci_status(
+                pr_number=pr_number,
+                branch_sha=_head_sha,
+                token=_gh,
+                owner=_owner,
+                repo=_repo,
                 project_id=str(parent.project_id) if parent.project_id else None,
             ),
             services._GH_CALL_TIMEOUT_S,
-            what=f"ci-backstop check-runs PR #{pr_number}",
+            what=f"ci-backstop resolve PR #{pr_number}",
         )
     except Exception as e:
         # Fail OPEN: a GitHub error / timeout must never block the backstop —
@@ -675,27 +711,74 @@ async def _verify_ci_before_backstop(
         )
         return False
 
-    # API-error results are tagged so the caller doesn't cache a fake-pending —
-    # treat them as 'no signal' and fail open.
-    if ci_result.get("_from_api_error"):
-        logger.info(
-            f"[EVAL TIMEOUT] CI re-verify for task {str(parent.id)[:8]} (PR "
-            f"#{pr_number}) hit a GitHub API error — falling through to timeout"
+    _state = _resolved.get("state")
+    ci_result: dict | None = None
+    if _state == "green":
+        ci_result = {
+            "status": "completed",
+            "conclusion": "success",
+            "details": _resolved.get("details", []),
+            "failed_logs": "",
+        }
+    elif _state == "red":
+        ci_result = {
+            "status": "completed",
+            "conclusion": "failure",
+            "details": _resolved.get("details", []),
+            "failed_logs": _resolved.get("failed_logs", "")
+            or "CI checks failed (see workflow run)",
+        }
+    elif _state == "no_checks":
+        # Definitive 0-check state: apply the SAME no-checks policy the poll loop
+        # uses. Only a merge_unverified verdict resolves here; verify_tests /
+        # keep_polling fall open so the poll loop's own no-checks escalation
+        # owns the verify-gate / alert-and-wait path (never merge on absence of
+        # signal for a CI-gated repo).
+        _base_ref = ""
+        if _pr_data is None:
+            with contextlib.suppress(Exception):
+                _pr_data = await services._bounded(
+                    get_pull_request(_gh, _owner, _repo, pr_number),
+                    services._GH_CALL_TIMEOUT_S,
+                    what=f"ci-backstop PR #{pr_number} base",
+                )
+        if _pr_data:
+            _base_ref = (_pr_data.get("base") or {}).get("ref", "") or ""
+        _base_ref = _base_ref or review_loop.get("base_branch", "")
+        _proj = (
+            await session.get(Project, parent.project_id)
+            if parent.project_id
+            else None
         )
+        _gate_on = _rt_cfg.get("no_ci_test_gate_enabled", True)
+        _action = (
+            ci_resolution.resolve_no_checks_escalation(
+                _proj, _base_ref, gate_enabled=_gate_on
+            )
+            if _proj is not None
+            else "keep_polling"
+        )
+        if _action == "merge_unverified":
+            ci_result = {
+                "status": "completed",
+                "conclusion": "success",
+                "details": [],
+                "failed_logs": "",
+            }
+        else:
+            return False
+    else:
+        # pending / unresolved — the backstop's wall-clock is the only signal.
         return False
 
-    if ci_result.get("status") != "completed":
-        # CI genuinely still pending — the backstop's wall-clock is the only
-        # signal left; fall through.
-        return False
-
-    # CI has actually concluded. Delegate to the shared completion handler, which
-    # re-locks the row, records the gate signal, and runs the fix-spawn (failure)
-    # or merge/approval (success) path exactly as the orchestrator poll loop does.
+    # A terminal verdict was reached. Delegate to the shared completion handler,
+    # which re-locks the row, records the gate signal, RE-ENFORCES the
+    # _review_approved gate, and runs the fix-spawn (failure) or merge (success)
+    # path exactly as the orchestrator poll loop does.
     logger.warning(
         f"[EVAL TIMEOUT] Task {str(parent.id)[:8]} CI re-verify: PR #{pr_number} "
-        f"actually concluded ({ci_result.get('conclusion')}) before backstop — "
-        f"routing to CI-completion handler instead of failing the parent"
+        f"resolved to '{_state}' before backstop — routing to CI-completion "
+        f"handler instead of failing the parent"
     )
     try:
         await handle_ci_completion(
@@ -813,7 +896,11 @@ async def _apply_rollup_merge_classification(
     Returns (record_merged, terminal, landed_branch).
     """
     from app.branch_resolution import classify_rollup_merge_outcome
-    from app.landed_signal import apply_merged_landed_signal, mark_landed_on_integration
+    from app.landed_signal import (
+        apply_merged_landed_signal,
+        has_landed_signal,
+        mark_landed_on_integration,
+    )
 
     record_merged, terminal, landed = await classify_rollup_merge_outcome(
         task,
@@ -844,6 +931,31 @@ async def _apply_rollup_merge_classification(
                 hotfix_lane=hotfix_lane,
                 non_merge_reason=non_merge_reason,
             )
+        # Membership-based merge-credit propagation. The signal writes above only
+        # stamp the rollup ITSELF; when it landed on the integration branch, every
+        # child whose PR merged onto the rollup's staging branch reached the trunk
+        # too — but squash-merge makes each child's own merge commit an ancestor of
+        # nothing on integration, so per-task ancestry reconciliation can never
+        # re-credit it. Propagate by lineage subtree instead. This is a bare
+        # ``session.add`` on descendant rows (no commit); every recovery caller
+        # (reaper orphan sweep, EVALUATING pr-check, lost-marker recovery) commits
+        # ``task`` afterwards, so the child stamps ride that commit. Best-effort: a
+        # propagation error must never undo the recovered rollup landing.
+        if has_landed_signal(task):
+            try:
+                from app.rollup_management import (
+                    _propagate_landed_to_staging_merged_descendants,
+                )
+
+                await _propagate_landed_to_staging_merged_descendants(task.id, session)
+            except Exception:  # noqa: BLE001 — credit propagation never blocks recovery
+                logger.warning(
+                    "[ROLLUP] landed-signal propagation failed for recovered "
+                    "rollup %s (%s)",
+                    getattr(task, "id", None),
+                    source,
+                    exc_info=True,
+                )
     return record_merged, terminal, landed
 
 

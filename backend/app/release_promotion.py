@@ -376,6 +376,21 @@ async def _record_qualification_verdict(
         if "smoketest_enabled" in base_record:
             sub_scores = dict(sub_scores)
             sub_scores["smoketest_enabled"] = base_record["smoketest_enabled"]
+        # Embed completion-debt snapshot so the immutable verdict row carries the
+        # open-debt state observed at finalization time.
+        if "completion_debt" in base_record:
+            sub_scores = dict(sub_scores)
+            sub_scores["completion_debt"] = base_record["completion_debt"]
+        # Carry the observe-mode debt-enforce preview into the immutable verdict
+        # row so verdict history can show what enforce would have done at this
+        # attempt without re-deriving it from mutable last_qualification state.
+        for preview_key in (
+            "debt_enforce_confidence_preview",
+            "debt_enforce_weight_preview",
+        ):
+            if preview_key in base_record:
+                sub_scores = dict(sub_scores)
+                sub_scores[preview_key] = base_record[preview_key]
 
         confidence = base_record.get("confidence")
         threshold = base_record.get("threshold")
@@ -919,13 +934,18 @@ async def promote(
     #
     # The dedicated session has ONLY qualifier state dirty (concern 1), so this
     # commit can never prematurely commit a caller's unrelated transaction.
+    # Snapshot version_number before the pre-I/O commit: a commit failure below
+    # rolls back (expiring `version` regardless of expire_on_commit), and both the
+    # rollback-failure log and the failure-record re-lock would then read version
+    # state on an expired instance -> sync lazy-load -> MissingGreenlet.
+    _version_number = version.version_number
     try:
         await session.commit()
     except Exception as exc:  # noqa: BLE001 — a commit failure here is recoverable
         logger.warning(
             "[RELEASE_QUALIFIER] promote: failed to commit before releasing "
             "the row lock for v%d (%s) — recording failure",
-            version.version_number,
+            _version_number,
             exc,
         )
         try:
@@ -934,9 +954,21 @@ async def promote(
             logger.exception(
                 "[RELEASE_QUALIFIER] promote: rollback after pre-I/O commit "
                 "failure also failed for v%d",
-                version.version_number,
+                _version_number,
             )
         # The rollback released the lock — the failure record must re-lock.
+        # The rollback also expired `version`; re-materialise it so
+        # _record_promotion_failure -> _relock_version_for_promotion_write can
+        # read version.id (~687) without a sync lazy-load -> MissingGreenlet,
+        # which would defeat failure recording and stick the version at "pending".
+        try:
+            await session.refresh(version)
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] promote: refresh after rollback failed for "
+                "v%d — failure recording may re-raise",
+                _version_number,
+            )
         return await _record_promotion_failure(
             session,
             version,

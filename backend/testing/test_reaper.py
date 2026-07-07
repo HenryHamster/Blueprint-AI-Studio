@@ -5230,7 +5230,7 @@ async def test_get_reaper_stats_reports_recent_age_after_cycle(
 
 @pytest.mark.asyncio
 async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_kill(
-    reaper_db, stop_after_one_cycle, reaper_side_effects
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
     """A ReleaseVersion stuck at last_qualification.status=='pending' whose
     audit + smoketest children are BOTH FAILED is finalized by the reaper's
@@ -5249,6 +5249,12 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
     broken pipeline, not a quality verdict — yielding status 'infra_failure')
     and phase is back to 'stabilize'.
     """
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from app import shared_state
 
     _original_promotion = shared_state.runtime_config.get("promotion_enabled")
@@ -5341,7 +5347,7 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
 
 @pytest.mark.asyncio
 async def test_step9_sweep_skips_qualification_with_running_child(
-    reaper_db, stop_after_one_cycle, reaper_side_effects
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
     """Step 9 must NOT finalize a 'pending' version while a qualifier child is
     still non-terminal — the normal completion path owns that case.
@@ -5360,6 +5366,12 @@ async def test_step9_sweep_skips_qualification_with_running_child(
     the test fails on either fault: a broken finalize path fails the positive
     control; a premature sweep wrongly finalizes the running-child version.
     """
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from app import shared_state
     from app.time_utils import _utcnow as _now_for_seed
 
@@ -5502,7 +5514,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
 
 @pytest.mark.asyncio
 async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
-    reaper_db, stop_after_one_cycle, reaper_side_effects
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
     """Audit R4-H5: the reaper's Step 9 sweep must STILL force-finalize a
     qualification that is past the timeout when its started_at is corrupt /
@@ -5514,6 +5526,12 @@ async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
     clock exceeds the qualification timeout.  After one reaper cycle the
     version is force-finalized as a qualification_timeout.
     """
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app import release_qualifier as _rq
@@ -15551,3 +15569,117 @@ async def test_converge_guard_skips_ordering_only_dep(reaper_db):
     assert cancelled == 0
     await reaper_db.refresh(child)
     assert child.status == TaskStatus.QUEUED
+
+
+# ── Metrics-integrity sweep (standing self-audit of self-reported counters) ──
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_sweep_flags_counter_drift_without_mutating_sources(
+    reaper_db, mocker
+):
+    """The standing metrics-integrity sweep must FLAG a seeded self-reported
+    counter drift, leave the audited source counter byte-identical, and respect
+    both the mode gate (off => no run) and the cadence gate (second immediate
+    call inside the interval => no run).
+
+    Ground truth exercised: a playbook entry cannot be confirmed more times than
+    it was ever referenced/shown. We seed confirmed_count=7 > reference_count=2
+    (the exact over-credit class the shown-key gate closed) and assert the sweep
+    reports the drift as an independent recompute while NEVER writing back to
+    ``confirmed_count``.
+    """
+    import app.metrics_integrity_sweep as mis
+    from app.shared_state import runtime_config as _rc
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(reaper_db)
+    # A drifted playbook entry (confirmed > reference) plus a clean one.
+    project.design_doc = {
+        "playbook/drifted-key": {
+            "value": "seeded drift",
+            "confirmed_count": 7,
+            "reference_count": 2,
+            "followed_count": 3,
+        },
+        "playbook/clean-key": {
+            "value": "consistent",
+            "confirmed_count": 1,
+            "reference_count": 4,
+            "followed_count": 4,
+        },
+    }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "design_doc")
+    reaper_db.add(project)
+    await reaper_db.commit()
+
+    # --- Mode gate: off => sweep does not run and flags nothing. --------------
+    _saved = {
+        k: _rc.get(k)
+        for k in (
+            "metrics_integrity_sweep_mode",
+            "metrics_integrity_sweep_interval_minutes",
+        )
+    }
+    try:
+        _rc["metrics_integrity_sweep_mode"] = "off"
+        gated = await mis.run_metrics_integrity_sweep(reaper_db, now=_utcnow())
+        assert gated is None
+        assert mis.get_metrics_integrity_observability()["ticks"] == 0
+
+        # --- Observe mode: sweep runs and flags the drift. -------------------
+        _rc["metrics_integrity_sweep_mode"] = "observe"
+        _rc["metrics_integrity_sweep_interval_minutes"] = 60
+        now = _utcnow()
+        tick = await mis.run_metrics_integrity_sweep(reaper_db, now=now)
+        assert tick is not None
+        assert tick["mode"] == "observe"
+
+        pid = str(project.id)
+        playbook_flags = [
+            f
+            for f in tick["flags"]
+            if f["check"] == "playbook_confirmation_integrity" and f["subject"] == pid
+        ]
+        assert len(playbook_flags) == 1, tick["flags"]
+        flag = playbook_flags[0]
+        assert flag["status"] == "flagged"
+        # self_reported = sum of confirmed_count (7 + 1), ground truth = sum of
+        # reference_count (2 + 4); delta = number of bad entries (1 over-credit).
+        assert flag["self_reported"] == 8
+        assert flag["ground_truth"] == 6
+        assert flag["delta"] == 1
+        assert "drifted-key" in flag["detail"]
+
+        # --- Non-mutation: the audited source counter is byte-identical. -----
+        await reaper_db.refresh(project)
+        entries = project.design_doc
+        assert entries["playbook/drifted-key"]["confirmed_count"] == 7
+        assert entries["playbook/drifted-key"]["reference_count"] == 2
+        assert entries["playbook/clean-key"]["confirmed_count"] == 1
+
+        # --- Observability snapshot carries the flag. ------------------------
+        snap = mis.get_metrics_integrity_observability()
+        assert snap["ticks"] == 1
+        assert snap["flags_total"] >= 1
+        assert any(
+            f["check"] == "playbook_confirmation_integrity"
+            for f in snap["recent_flags"]
+        )
+
+        # --- Cadence gate: a second call inside the interval does NOT run. ----
+        again = await mis.run_metrics_integrity_sweep(
+            reaper_db, now=now + timedelta(minutes=1)
+        )
+        assert again is None
+        assert mis.get_metrics_integrity_observability()["ticks"] == 1
+    finally:
+        for k, v in _saved.items():
+            if v is None:
+                _rc.pop(k, None)
+            else:
+                _rc[k] = v
+        mis._reset_observability_for_tests()

@@ -7,7 +7,9 @@ from app.payload_schemas import (
     PayloadTooLargeError,
     TaskType,
     _MAX_PAYLOAD_BYTES,
+    normalize_acceptance_evidence,
     parse_acceptance_evidence,
+    read_acceptance_evidence,
     validate_internal_payload,
     validate_task_payload,
 )
@@ -57,6 +59,143 @@ def test_parse_acceptance_evidence_strips_descriptor():
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_agent.py",
+                "test_id": "test_agent_completes",
+            },
+            {
+                "kind": "test",
+                "descriptor": "test_agent_completes",
+                "selector": "backend/testing/test_agent.py",
+            },
+        ),
+        (
+            {
+                "kind": "observable_behavior",
+                "description": "the endpoint returns scoped audit rows",
+            },
+            {
+                "kind": "behavior",
+                "descriptor": "the endpoint returns scoped audit rows",
+            },
+        ),
+        (
+            {"kind": "downstream_artifact", "artifact_id": "COMPUTE_RESULT:accuracy"},
+            {"kind": "artifact", "descriptor": "COMPUTE_RESULT:accuracy"},
+        ),
+        (
+            {"kind": "visual", "component": "MetricsDashboard", "viewport_width": 1280},
+            {"kind": "visual", "descriptor": "MetricsDashboard", "selector": "1280"},
+        ),
+    ],
+)
+def test_parse_acceptance_evidence_accepts_payload_vocabulary(raw, expected):
+    assert parse_acceptance_evidence(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_payload", "expected_context"),
+    [
+        (
+            {
+                "kind": "behavior",
+                "descriptor": "the endpoint returns scoped audit rows",
+            },
+            {
+                "kind": "observable_behavior",
+                "description": "the endpoint returns scoped audit rows",
+            },
+            {
+                "kind": "behavior",
+                "descriptor": "the endpoint returns scoped audit rows",
+            },
+        ),
+        (
+            {"kind": "artifact", "descriptor": "COMPUTE_RESULT:accuracy"},
+            {"kind": "downstream_artifact", "artifact_id": "COMPUTE_RESULT:accuracy"},
+            {"kind": "artifact", "descriptor": "COMPUTE_RESULT:accuracy"},
+        ),
+        (
+            {
+                "kind": "visual",
+                "descriptor": "MetricsDashboard",
+                "selector": "1280",
+            },
+            {"kind": "visual", "component": "MetricsDashboard", "viewport_width": 1280},
+            {
+                "kind": "visual",
+                "descriptor": "MetricsDashboard",
+                "selector": "1280",
+            },
+        ),
+        (
+            {
+                "kind": "test",
+                "descriptor": "seam test exercises new path",
+                "selector": "backend/testing/test_agent.py::test_agent_completes",
+            },
+            {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_agent.py",
+                "test_id": "test_agent_completes",
+            },
+            {
+                "kind": "test",
+                "descriptor": "seam test exercises new path",
+                "selector": "backend/testing/test_agent.py::test_agent_completes",
+            },
+        ),
+    ],
+)
+def test_normalize_acceptance_evidence_bridges_context_to_payload(
+    raw, expected_payload, expected_context
+):
+    assert normalize_acceptance_evidence(raw) == (expected_payload, expected_context)
+    parsed = read_acceptance_evidence({"acceptance_evidence": raw})
+    assert parsed is not None
+    assert parsed.model_dump(exclude_none=True) == expected_payload
+
+    result = validate_task_payload(
+        {"type": "create", "prompt": "do the thing", "acceptance_evidence": raw}
+    )
+    assert result["acceptance_evidence"] == expected_payload
+
+
+def test_normalize_acceptance_evidence_context_test_without_test_file_is_context_only():
+    raw = {"kind": "test", "descriptor": "manual smoke exercise of the new path"}
+
+    assert normalize_acceptance_evidence(raw) == (None, raw)
+    assert parse_acceptance_evidence(raw) == raw
+    assert read_acceptance_evidence({"acceptance_evidence": raw}) is None
+
+
+def test_normalize_acceptance_evidence_visual_bad_width_is_context_only():
+    raw = {"kind": "visual", "descriptor": "MetricsDashboard", "selector": "wide"}
+
+    assert normalize_acceptance_evidence(raw) == (None, raw)
+    assert parse_acceptance_evidence(raw) == raw
+    assert read_acceptance_evidence({"acceptance_evidence": raw}) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        "not-a-dict",
+        {"kind": "screenshot", "descriptor": "nope"},
+        {"kind": "behavior", "descriptor": "ok", "extra": "forbidden"},
+        {"kind": "visual", "descriptor": "", "selector": "1280"},
+    ],
+)
+def test_normalize_acceptance_evidence_malformed_is_fail_soft(raw):
+    assert normalize_acceptance_evidence(raw) == (None, None)
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         None,
@@ -74,6 +213,88 @@ def test_parse_acceptance_evidence_strips_descriptor():
 def test_parse_acceptance_evidence_malformed_returns_none(raw):
     """Any absent/malformed value yields None and never raises."""
     assert parse_acceptance_evidence(raw) is None
+
+
+# --- normalization: the payload vocab (named_test/…) is accepted too ----------
+# Findings and plan subtasks declare acceptance_evidence in the payload vocab
+# (the shape the merge gate consumes). Historically that shape was silently
+# dropped from the context channel by parse_acceptance_evidence (the two
+# vocabularies were disjoint on ``kind``). It is now normalized into the lighter
+# context form so a single declaration populates BOTH channels.
+
+
+def test_parse_acceptance_evidence_normalizes_named_test():
+    out = parse_acceptance_evidence(
+        {"kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar"}
+    )
+    assert out == {
+        "kind": "test",
+        "descriptor": "test_bar",
+        "selector": "testing/test_foo.py",
+    }
+
+
+def test_parse_acceptance_evidence_normalizes_named_test_inline_node():
+    """A ``path::node`` test_path with no test_id still yields a descriptor."""
+    out = parse_acceptance_evidence(
+        {"kind": "named_test", "test_path": "testing/test_foo.py::test_bar"}
+    )
+    assert out == {
+        "kind": "test",
+        "descriptor": "test_bar",
+        "selector": "testing/test_foo.py::test_bar",
+    }
+
+
+def test_parse_acceptance_evidence_normalizes_observable_behavior():
+    out = parse_acceptance_evidence(
+        {"kind": "observable_behavior", "description": "endpoint returns scoped audit"}
+    )
+    assert out == {"kind": "behavior", "descriptor": "endpoint returns scoped audit"}
+
+
+def test_parse_acceptance_evidence_normalizes_downstream_artifact():
+    out = parse_acceptance_evidence(
+        {"kind": "downstream_artifact", "artifact_id": "design-doc-42"}
+    )
+    assert out == {"kind": "artifact", "descriptor": "design-doc-42"}
+
+
+def test_parse_acceptance_evidence_normalizes_visual():
+    out = parse_acceptance_evidence(
+        {"kind": "visual", "component": "FleetRunnersPanel", "viewport_width": 375}
+    )
+    assert out == {
+        "kind": "visual",
+        "descriptor": "FleetRunnersPanel",
+        "selector": "375",
+    }
+
+
+def test_parse_acceptance_evidence_rejects_malformed_payload_vocab():
+    """A payload-vocab kind that fails its own validation still yields None."""
+    # named_test whose test_path does not look like a real test file.
+    assert parse_acceptance_evidence(
+        {"kind": "named_test", "test_path": "app/main.py"}
+    ) is None
+    # observable_behavior with a trivially-short description.
+    assert parse_acceptance_evidence(
+        {"kind": "observable_behavior", "description": "ok"}
+    ) is None
+    # An unknown extra key is forbidden by the payload schema too.
+    assert parse_acceptance_evidence(
+        {"kind": "downstream_artifact", "artifact_id": "x", "extra": "no"}
+    ) is None
+
+
+def test_parse_acceptance_evidence_context_vocab_unchanged_by_normalization():
+    """Regression guard: the lighter context vocab still round-trips byte-for-byte."""
+    raw = {
+        "kind": "test",
+        "descriptor": "end-to-end seam test passes",
+        "selector": "testing/test_foo.py::test_bar",
+    }
+    assert parse_acceptance_evidence(raw) == raw
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +432,26 @@ def test_compute_experiment_payload_carries_launch_and_benchmark_fields():
     assert result["spend_cap_usd"] == 2.5
     assert result["deadline_seconds"] == 1800
     assert result["experiment"] == "perf-sweep-v3"
+
+
+def test_compute_experiment_payload_carries_provenance_roundtrip():
+    raw = {
+        "type": "compute_experiment",
+        "command": "python bench.py --suite full",
+        "spend_cap_usd": 2.5,
+        "deadline_seconds": 1800,
+        "provenance": {
+            "idea": "Tune throughput on the target GPU",
+            "draft_notes": "Draft preferred a short benchmark and a tight deadline.",
+            "drafted_from_refinement": True,
+        },
+    }
+    result = _valid(raw)
+    assert result["provenance"] == {
+        "idea": "Tune throughput on the target GPU",
+        "draft_notes": "Draft preferred a short benchmark and a tight deadline.",
+        "drafted_from_refinement": True,
+    }
 
 
 def test_compute_experiment_payload_tolerates_extra_benchmark_fields():

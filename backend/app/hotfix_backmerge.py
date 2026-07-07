@@ -54,6 +54,7 @@ The caller commits the session.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -248,6 +249,16 @@ async def _check_module_size_violations(
     return violations
 
 
+def _fetch_chronic_info(rel: str, section: str) -> tuple[list, bool]:
+    """Sync helper: run parse_bump_history + chronic check in a thread.
+
+    Isolated so asyncio.to_thread can wrap a single callable without
+    calling parse_bump_history twice.
+    """
+    history = parse_bump_history(rel, section)
+    return history, _is_chronic_offender(history)
+
+
 async def _emit_size_violation_alerts(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -331,8 +342,9 @@ async def _emit_size_violation_alerts(
             continue
 
         # Advisory bump-history lookup — never blocks the alert path.
+        # parse_bump_history calls subprocess.run (blocking); offload to a thread.
         try:
-            history = parse_bump_history(rel, section)
+            history = await asyncio.to_thread(parse_bump_history, rel, section)
             chronic = _is_chronic_offender(history)
         except Exception:  # noqa: BLE001
             history = []

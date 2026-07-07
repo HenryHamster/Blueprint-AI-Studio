@@ -1,4 +1,4 @@
-import type { ComponentProps, MutableRefObject, ReactNode } from 'react';
+import { useState, type ComponentProps, type MutableRefObject, type ReactNode } from 'react';
 import {
   RotateCw,
   Users,
@@ -8,12 +8,18 @@ import { DirectionsPanel } from './DirectionsPanel';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { DashboardHome } from './DashboardHome';
 import { ConsoleHome } from './ConsoleHome';
+import { CompletionDebtPanel } from './CompletionDebtPanel';
 import { FleetRunnersPanel } from './FleetRunnersPanel';
 import { RuntimeAccountsPanel } from './RuntimeAccountsPanel';
 import { SettingsSectionRouter, type SettingsSectionRouterProps } from './SettingsSectionRouter';
 import type { Task } from './TaskCard';
 import { WarmVmPanel } from './WarmVmPanel';
+import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import { WorkbenchPanel, WorkbenchSurface } from './WorkbenchLayout';
+import type { FailingTaskTypeEntry } from '../types/diagnostics';
+import { fetchAgentServingShas, type AgentServingShasResponse, type VersionLifecycleResponse } from '../api';
+import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
+import { hasVersionLifecycleData } from '../hooks/useVersionLifecycle';
 import {
   PROJECT_MANAGE_SECTIONS,
   RUNTIME_SECTIONS,
@@ -28,6 +34,7 @@ import {
   type SectionNavItem,
 } from './OperatorWorkspaceSections';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
+import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import type { Project } from '../types/project';
 
 export type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './OperatorWorkspaceSections';
@@ -448,14 +455,23 @@ interface RuntimeWorkspaceProps {
   onOpenFleet: () => void;
   onCreateTask: () => void;
   onLaunchCompute: () => void;
+  onCloneExperiment?: (form: ComputeExperimentForm) => void;
   onDirectionClick: (directionId: string) => void;
   onConfigureTargets: () => void;
   onSpawnOrphanFix: DashboardHomeProps['onSpawnOrphanFix'];
   onPanelReviewPr: DashboardHomeProps['onPanelReviewPr'];
+  gatedTaskTypes?: FailingTaskTypeEntry[];
   onApproveExperiment: (taskId: string) => Promise<void>;
   onDismissExperiment: (taskId: string) => Promise<void>;
   onNavigateToKnowledge: (documentId: string) => void;
   onRestartOrchestrator: () => Promise<void>;
+  fleetRunnersRefreshSignal?: number;
+  addToast: (message: string, type: 'success' | 'error' | 'info') => void;
+  versionLifecycle: VersionLifecycleResponse | null;
+  versionLifecycleError: string | null;
+  versionLifecycleLastSuccessAt: string | null;
+  versionLifecycleRefreshing: boolean;
+  refreshVersionLifecycle: () => Promise<void>;
 }
 
 export function RuntimeWorkspace({
@@ -480,18 +496,41 @@ export function RuntimeWorkspace({
   onOpenFleet,
   onCreateTask,
   onLaunchCompute,
+  onCloneExperiment,
   onDirectionClick,
   onConfigureTargets,
   onSpawnOrphanFix,
   onPanelReviewPr,
+  gatedTaskTypes,
   onApproveExperiment,
   onDismissExperiment,
   onNavigateToKnowledge,
   onRestartOrchestrator,
+  fleetRunnersRefreshSignal,
+  addToast,
+  versionLifecycle,
+  versionLifecycleError,
+  versionLifecycleLastSuccessAt,
+  versionLifecycleRefreshing,
+  refreshVersionLifecycle,
 }: RuntimeWorkspaceProps) {
   const runtimeSettingsSections = visibleRuntimeSettingsSections(userRole);
   const activeRuntimeItem = resolveRuntimeItem(runtimeSection);
   const activeRuntimeSettingsItem = resolveRuntimeSettingsItem(runtimeConfigSection, userRole);
+  const hasVersionData = hasVersionLifecycleData(versionLifecycle);
+  const [agentServingShas, setAgentServingShas] = useState<AgentServingShasResponse | null>(null);
+  usePoller(async (signal) => {
+    if (!selectedProjectId) { setAgentServingShas(null); return; }
+    try {
+      const data = await fetchAgentServingShas(selectedProjectId);
+      if (!signal.aborted) setAgentServingShas(data);
+    } catch {
+      if (!signal.aborted) setAgentServingShas(null);
+    }
+  }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId] });
+  const visibleRuntimeSections = RUNTIME_SECTIONS.filter(
+    s => s.id !== 'version-lifecycle' || hasVersionData,
+  );
   const actionButtonClass = 'inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-0 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 sm:min-w-0 sm:px-3';
   const runtimeAccounts = settingsRouterProps.maxPlanAccounts ?? [];
   const accountTotal = runtimeAccounts.length;
@@ -532,7 +571,7 @@ export function RuntimeWorkspace({
     <WorkbenchSurface
       title="Runtime"
       subtitle="Overview, devices, compute, accounts, settings"
-      tabs={RUNTIME_SECTIONS.map(({ id, label }) => ({ id, label }))}
+      tabs={visibleRuntimeSections.map(({ id, label }) => ({ id, label }))}
       activeTab={runtimeSection}
       onTabChange={onRuntimeSectionChange}
       actions={runtimeSurfaceActions}
@@ -571,6 +610,12 @@ export function RuntimeWorkspace({
             onOpenFleet={onOpenFleet}
             onCreateTask={onCreateTask}
           />
+          {selectedProjectId && (
+            <CompletionDebtPanel
+              projectId={selectedProjectId}
+              addToast={addToast}
+            />
+          )}
         </div>
       ) : runtimeSection === 'devices' ? (
         <div className="mx-auto flex max-w-7xl flex-col gap-3">
@@ -599,6 +644,8 @@ export function RuntimeWorkspace({
                 <FleetRunnersPanel
                   projectId={selectedProjectId}
                   requireLocalRunner={settingsRouterProps.resourceEnvelopeData?.require_local_runner ?? false}
+                  refreshSignal={fleetRunnersRefreshSignal}
+                  live={wsConnected}
                 />
               ) : (
                 <div className="py-10 text-center text-xs text-neutral-500">
@@ -629,6 +676,7 @@ export function RuntimeWorkspace({
             projectId={selectedProjectId}
             onNavigateToTask={onViewTaskById}
             onLaunchCompute={onLaunchCompute}
+            onCloneExperiment={onCloneExperiment}
             onApproveExperiment={onApproveExperiment}
             onDismissExperiment={onDismissExperiment}
             onNavigateToKnowledge={onNavigateToKnowledge}
@@ -648,8 +696,29 @@ export function RuntimeWorkspace({
           onConfigureTargets={onConfigureTargets}
           onSpawnOrphanFix={onSpawnOrphanFix}
           onPanelReviewPr={onPanelReviewPr}
+          gatedTaskTypes={gatedTaskTypes}
           userRole={userRole}
         />
+      ) : runtimeSection === 'version-lifecycle' ? (
+        <div className="mx-auto max-w-6xl space-y-4">
+          {selectedProjectId ? (
+            <VersionLifecyclePanel
+              data={versionLifecycle}
+              loading={false}
+              projectId={selectedProjectId}
+              onRefresh={refreshVersionLifecycle}
+              userRole={userRole}
+              refreshError={versionLifecycleError}
+              lastSuccessfulRefreshAt={versionLifecycleLastSuccessAt}
+              refreshing={versionLifecycleRefreshing}
+              agentServingShas={agentServingShas}
+            />
+          ) : (
+            <div className="py-10 text-center text-xs text-neutral-500">
+              Select a project to view version lifecycle.
+            </div>
+          )}
+        </div>
       ) : runtimeSection === 'accounts' ? (
         <div className="mx-auto flex max-w-6xl flex-col gap-3">
           <RuntimeSectionIntro

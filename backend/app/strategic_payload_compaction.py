@@ -15,6 +15,7 @@ _VERSION_PHASE_RECENT_VERSIONS_FLOOR_CAP = 2
 _VERSION_PHASE_TEXT_CAP = 500
 _VERSION_PHASE_TEXT_FLOOR_CAP = 240
 _VERSION_PHASE_CRITERIA_CAP = 20
+_VERSION_PHASE_CRITERIA_FLOOR_CAP = 10
 _DIRECTION_SUMMARY_TEXT_CAP = 260
 _DIRECTION_SUMMARY_LONG_TEXT_CAP = 420
 _DIRECTION_SUMMARY_LIST_CAP = 3
@@ -217,6 +218,9 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
         "first_deferred_at",
         "deferred_at",
         "prior_superseded",
+        "qualify_request_blocked_at",
+        "debt_enforce_confidence_preview",
+        "debt_enforce_weight_preview",
     ):
         _put_present(out, value, key)
     for key in (
@@ -251,6 +255,9 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
     acceptance = value.get("acceptance_aggregate")
     if isinstance(acceptance, dict):
         out["acceptance_aggregate"] = acceptance
+    qrb = _compact_scalar_mapping(value.get("qualify_request_blocked"), text_cap=text_cap)
+    if qrb:
+        out["qualify_request_blocked"] = qrb
     promo = _compact_promotion_pending(value.get("promotion_pending"), text_cap=text_cap)
     if promo:
         out["promotion_pending"] = promo
@@ -375,6 +382,12 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     out: dict[str, Any] = {}
     text_cap = _VERSION_PHASE_TEXT_FLOOR_CAP if floor else _VERSION_PHASE_TEXT_CAP
     for key in (
+        "lifecycle_signal",
+        "signal_status",
+        "build_unavailable",
+        "error",
+        "integration_branch",
+        "promotion_target",
         "version_number",
         "phase",
         "goal",
@@ -403,6 +416,15 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     qs = _compact_qualification_state(block.get("qualification_state"), floor=floor)
     if qs:
         out["qualification_state"] = qs
+    # Small scalar dict {last_qualification_status, verdict_terminal_status}
+    # emitted when a finalized verdict superseded a stale pending record. Kept so
+    # the finalized-verdict disagreement survives packing and stays consistent
+    # with the agent fetch verb's ``qualification_state_disagreement`` field.
+    disagreement = _compact_scalar_mapping(
+        block.get("qualification_state_disagreement"), text_cap=text_cap
+    )
+    if disagreement:
+        out["qualification_state_disagreement"] = disagreement
     artifacts = _compact_release_artifacts(block.get("artifacts"))
     if artifacts:
         out["artifacts"] = artifacts
@@ -418,11 +440,44 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
         for key in ("total", "covered", "partial", "uncovered", "stuck_count"):
             if key in coverage:
                 compact_coverage[key] = coverage[key]
-        if not floor:
-            # Normal path: include per-criterion list capped to bounded length.
-            criteria = coverage.get("criteria")
-            if isinstance(criteria, list):
+        criteria = coverage.get("criteria")
+        if isinstance(criteria, list):
+            if not floor:
+                # Normal path: include per-criterion list capped to bounded length.
                 compact_coverage["criteria"] = criteria[:_VERSION_PHASE_CRITERIA_CAP]
+            else:
+                # Floor path: include a tightly capped, priority-sorted subset so
+                # the strategist knows WHICH criteria need attention without a fetch.
+                # Priority order: stuck first, then uncovered, then partial.
+                # Keep only load-bearing identity/state fields.
+                def _criterion_sort_key(c: dict) -> int:
+                    if not isinstance(c, dict):
+                        return 3
+                    if c.get("stuck_reason") is not None:
+                        return 0
+                    cov = c.get("coverage")
+                    if cov == "uncovered":
+                        return 1
+                    if cov == "partial":
+                        return 2
+                    return 3
+
+                sorted_criteria = sorted(criteria, key=_criterion_sort_key)
+                floor_criteria = []
+                for c in sorted_criteria[:_VERSION_PHASE_CRITERIA_FLOOR_CAP]:
+                    if not isinstance(c, dict):
+                        continue
+                    entry: dict[str, Any] = {}
+                    for fkey in ("criterion_key", "coverage", "stuck_reason"):
+                        if fkey in c:
+                            entry[fkey] = c[fkey]
+                    text = _bounded_text(c.get("text"), _VERSION_PHASE_TEXT_FLOOR_CAP)
+                    if text:
+                        entry["text"] = text
+                    if entry:
+                        floor_criteria.append(entry)
+                if floor_criteria:
+                    compact_coverage["criteria"] = floor_criteria
         if compact_coverage:
             out["criterion_coverage"] = compact_coverage
     for key in (
@@ -546,6 +601,15 @@ _DIRECTIONS_SUMMARY_KEEP = 12
 _OUTCOME_DIRECTION_OUTCOMES_KEEP = 10
 _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED = 8
 
+# Core-floor caps for directions_summary. The floor is the guaranteed-minimum
+# active-direction core the strategist ALWAYS receives even under extreme byte
+# pressure — tighter than the summarize path (_DIRECTIONS_SUMMARY_KEEP) and
+# stripped to the load-bearing identity/status scalars plus a short headline.
+# Fuller per-direction detail (and dropped directions) stay fetchable via
+# ``./fetch direction <id>``.
+_DIRECTIONS_FLOOR_KEEP = 5
+_DIRECTION_FLOOR_TEXT_CAP = 120
+
 
 def _direction_activity_score(stat: dict) -> int:
     """Sort key for choosing which direction stats stay in the strategic payload.
@@ -588,6 +652,42 @@ def _summarize_directions(stats: list) -> list:
     return [
         _compact_direction_summary_entry(stat)
         for stat in sorted_stats[:_DIRECTIONS_SUMMARY_KEEP]
+        if isinstance(stat, dict)
+    ]
+
+
+def _floor_direction_entry(stat: dict) -> dict:
+    """Ultra-compact per-direction skeleton for the core floor.
+
+    Keeps only the load-bearing identity/status scalars plus a short text
+    headline — enough for the strategist to know which active directions exist
+    and their state. Everything else is fetchable via ``./fetch direction <id>``.
+    """
+    out: dict[str, Any] = {}
+    for key in ("id", "priority", "status", "gap_id", "system_id", "in_flight"):
+        _put_present(out, stat, key)
+    headline = _bounded_text(stat.get("text"), _DIRECTION_FLOOR_TEXT_CAP)
+    if headline:
+        out["text"] = headline
+    return out
+
+
+def _directions_summary_floor(stats: list) -> list:
+    """Guaranteed-minimum core floor for ``directions_summary``.
+
+    Keeps the top :data:`_DIRECTIONS_FLOOR_KEEP` highest-activity directions as
+    compact id/priority/status/headline skeletons so the active-direction core
+    NEVER disappears entirely under budget pressure. This is the floor callback
+    registered in the strategic pack schema; the packer reserves its bytes off
+    the top of the budget so recoverable siblings degrade first. Fuller detail
+    and dropped directions remain fetchable via ``./fetch direction <id>``.
+    """
+    if not isinstance(stats, list):
+        return stats
+    sorted_stats = sorted(stats, key=_direction_activity_score, reverse=True)
+    return [
+        _floor_direction_entry(stat)
+        for stat in sorted_stats[:_DIRECTIONS_FLOOR_KEEP]
         if isinstance(stat, dict)
     ]
 
@@ -687,12 +787,38 @@ def _compact_spawn_gate_metrics(value: Any) -> dict | None:
     return out or None
 
 
+def _compact_retired_grounding(value: Any) -> dict | None:
+    """Preserve a direction's ``retired_direction_grounding`` through compaction.
+
+    Routing this through ``_compact_scalar_mapping`` would drop the nested
+    ``metrics`` and ``retirement_memo`` bodies, so keep those explicitly while
+    still bounding every string field.
+    """
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in ("direction_id", "classification", "reason", "gap_id"):
+        _put_present(out, value, key, text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
+    metrics = _compact_scalar_mapping(value.get("metrics"), text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
+    if metrics:
+        out["metrics"] = metrics
+    memo = value.get("retirement_memo")
+    if isinstance(memo, dict):
+        compact_memo: dict[str, Any] = {}
+        for key in ("knowledge_doc_id", "summary"):
+            _put_present(compact_memo, memo, key, text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
+        if compact_memo:
+            out["retirement_memo"] = compact_memo
+    return out or None
+
+
 def _compact_direction_summary_entry(stat: dict) -> dict:
     out: dict[str, Any] = {}
     for key in (
         "id",
         "priority",
         "status",
+        "in_flight",
         "total_cycles",
         "prs_merged",
         "verified_prs_merged",
@@ -721,6 +847,7 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "confirmed_finding_count",
         "confirmed_finding_trend",
         "outcome_scaffolding_flagged",
+        "churn_retirement_recommended",
     ):
         _put_present(out, stat, key)
     for key in (
@@ -741,6 +868,7 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "recent_findings_grade_distribution",
         "recent_findings_verification_basis",
         "recent_findings_challenge_summary",
+        "churn_retirement_evidence",
     ):
         compact = _compact_scalar_mapping(stat.get(key), text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
         if compact:
@@ -778,5 +906,7 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
     spawn_gate = _compact_spawn_gate_metrics(stat.get("spawn_gate_metrics"))
     if spawn_gate:
         out["spawn_gate_metrics"] = spawn_gate
+    grounding = _compact_retired_grounding(stat.get("retired_direction_grounding"))
+    if grounding:
+        out["retired_direction_grounding"] = grounding
     return out
-

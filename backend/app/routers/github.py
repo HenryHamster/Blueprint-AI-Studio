@@ -407,8 +407,13 @@ async def github_webhook(
                             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                             Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
                         )
+                        .limit(50)
                     )
                     pr_artifacts = art_result.scalars().all()
+                    if len(pr_artifacts) == 50:
+                        logger.warning(
+                            f"[WEBHOOK] PR {pr_url_suffix} artifact lookup hit limit=50; some artifacts may be missed"
+                        )
                     if not pr_artifacts:
                         logger.info(
                             f"[WEBHOOK] PR {pr_url_suffix} merged but no matching artifacts found — agent may not have reported yet"
@@ -597,8 +602,13 @@ async def github_webhook(
                             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                             Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
                         )
+                        .limit(50)
                     )
                     pr_artifacts = art_result.scalars().all()
+                    if len(pr_artifacts) == 50:
+                        logger.warning(
+                            f"[WEBHOOK] PR {pr_url_suffix} close artifact lookup hit limit=50; some artifacts may be missed"
+                        )
                     if pr_artifacts:
                         pr_body = data.get("pull_request", {}).get("body") or ""
                         rejection_note = pr_body[:500] if pr_body else None
@@ -860,8 +870,13 @@ async def github_webhook(
                 Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                 Artifact.pr_url.ilike(f"%{pr_url_suffix}"),
             )
+            .limit(50)
         )
         pr_artifacts = art_result.scalars().all()
+        if len(pr_artifacts) == 50:
+            logger.warning(
+                f"[WEBHOOK] pull_request_review PR {pr_url_suffix} artifact lookup hit limit=50; some artifacts may be missed"
+            )
         if not pr_artifacts:
             logger.info(
                 f"[WEBHOOK] pull_request_review for PR {pr_url_suffix}: no matching artifact"

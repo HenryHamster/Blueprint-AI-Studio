@@ -5,6 +5,8 @@ from datetime import timedelta
 import pytest
 from httpx import AsyncClient
 
+from sqlalchemy import text
+
 from app.models import (
     Project,
     ProjectMember,
@@ -160,6 +162,19 @@ async def test_terminal_task_without_completed_at_uses_updated_at_not_status_log
     )
     task.updated_at = updated_at
     db_session.add(task)
+    await db_session.commit()
+
+    # The before_insert event listener (_stamp_task_completed_at_on_insert) stamps
+    # completed_at from the status_log tail (old_terminal_at = 10 days ago), which
+    # would push the task outside the 7-day activity window. Use a raw SQL UPDATE
+    # to simulate a legacy row that predates the durable-column stamping, bypassing
+    # all ORM events (onupdate, before_flush) so updated_at stays at the fixture value.
+    await db_session.execute(
+        text(
+            "UPDATE task SET completed_at = NULL, updated_at = :ua WHERE id = :id"
+        ),
+        {"ua": updated_at, "id": task.id},
+    )
     await db_session.commit()
 
     resp = await client.get("/api/admin/activity")

@@ -13,7 +13,7 @@ from typing import Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -592,6 +592,43 @@ async def agent_task_capabilities(
     return {"task_capabilities": task_capability_contract()}
 
 
+async def _load_active_agent_task(session: AsyncSession, token: dict) -> Task:
+    """Load the task named by the agent JWT and assert it is still the live,
+    same-VM active task before minting fresh credentials for it.
+
+    Shared authorization for the credential-minting agent endpoints
+    (``/refresh-token`` and ``/git-read-token``). ``verify_agent_token`` already
+    rejects a JWT whose task reached an ``_AGENT_INACTIVE_TASK_STATUSES``
+    terminal state or was reassigned to a *different* VM, but that leaves two
+    liveness gaps a fresh credential must not slip through:
+
+    * a task in a non-terminal-but-non-active status (e.g. ``EVALUATING``) that
+      is no longer executing agent work, and
+    * a requeued task whose ``vm_instance_id`` was cleared (the
+      ``verify_agent_token`` mismatch guard short-circuits when either side is
+      falsy).
+
+    Enforcing the same ``vm_instance_id`` match + active-status allowlist the
+    refresh endpoint has used since the 2026-04-25 W3/E1/E2 audit closes both,
+    so a stale-but-unexpired JWT for a requeued/completed task cannot keep
+    minting credentials.
+    """
+    task_id = token["sub"]
+    vm_id = token["vm_instance_id"]
+    task = await session.get(Task, uuid.UUID(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if task.vm_instance_id != vm_id:
+        raise HTTPException(status_code=409, detail="vm_instance_mismatch")
+    if task.status not in (
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.QUEUED,
+    ):
+        raise HTTPException(status_code=409, detail=f"task_not_active:{task.status}")
+    return task
+
+
 @router.post("/refresh-token")
 @limiter.limit("120/minute")
 async def agent_refresh_token(
@@ -610,17 +647,7 @@ async def agent_refresh_token(
     """
     task_id = token["sub"]
     vm_id = token["vm_instance_id"]
-    task = await session.get(Task, uuid.UUID(task_id))
-    if task is None:
-        raise HTTPException(status_code=404, detail="task_not_found")
-    if task.vm_instance_id != vm_id:
-        raise HTTPException(status_code=409, detail="vm_instance_mismatch")
-    if task.status not in (
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.QUEUED,
-    ):
-        raise HTTPException(status_code=409, detail=f"task_not_active:{task.status}")
+    task = await _load_active_agent_task(session, token)
     # A successful refresh PROVES the agent is refresh-capable. Stamping
     # last_token_refresh_at marks this task — and, via the VM-level lookup in
     # _vm_is_refresh_capable, every subsequent warm handoff on this VM — as
@@ -641,6 +668,42 @@ async def agent_refresh_token(
     )
     expires_at = datetime.now(timezone.utc) + timedelta(hours=AGENT_TOKEN_TTL_HOURS)
     return {"token": new_token, "token_expires_at": expires_at.isoformat()}
+
+
+@router.get("/git-read-token")
+@limiter.limit("120/minute")
+async def agent_git_read_token(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a fresh GitHub App installation read token for the task's repo.
+
+    Called periodically by the strategic resident VM to keep its local
+    git remote credential fresh (resident needs `git fetch origin` for
+    automain verification; it never pushes — push credentials are per-task).
+
+    Uses `get_repo_installation_token` (cached 50 min per repo) so a warm
+    cache costs zero GitHub API calls.
+
+    Authorization is at parity with `/refresh-token`: both mint a fresh
+    credential, so both require the JWT's task to still be the same-VM active
+    task via `_load_active_agent_task`. Without it a stale-but-unexpired JWT for
+    a requeued/completed task could keep minting read tokens until JWT expiry.
+    """
+    task = await _load_active_agent_task(session, token)
+    project = await session.get(Project, task.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    owner = project.github_owner
+    repo = project.github_repo
+    if not owner or not repo:
+        raise HTTPException(status_code=422, detail="project_has_no_github_repo")
+    from app.github_auth import get_repo_installation_token
+    gh_token = await get_repo_installation_token(owner, repo)
+    if not gh_token:
+        raise HTTPException(status_code=502, detail="github_token_unavailable")
+    return {"token": gh_token, "owner": owner, "repo": repo}
 
 
 async def _stamp_reviewer_recovery_count(
@@ -1033,16 +1096,35 @@ async def claim_task(
         (_claimed_context.get("review_loop") or {}).get("original_task_id")
     )
 
-    _cursor = task
     _MAX_ANCESTOR_DEPTH = 5
-    for _ in range(_MAX_ANCESTOR_DEPTH):
-        if _cursor.parent_task_id is None:
-            break
-        _cursor = await session.get(Task, _cursor.parent_task_id)
-        if _cursor is None:
-            break
-        if _cursor.id not in _ancestor_ids:
-            _ancestor_ids.append(_cursor.id)
+    if task.parent_task_id is not None:
+        _ancestor_result = await session.execute(
+            text(
+                """
+                WITH RECURSIVE ancestor_chain(id, parent_task_id, depth) AS (
+                    SELECT id, parent_task_id, 0
+                    FROM task
+                    WHERE id = :start_id
+                    UNION ALL
+                    SELECT t.id, t.parent_task_id, a.depth + 1
+                    FROM task t
+                    JOIN ancestor_chain a ON t.id = a.parent_task_id
+                    WHERE a.parent_task_id IS NOT NULL AND a.depth < :max_depth
+                )
+                SELECT id FROM ancestor_chain
+                WHERE id != :self_id
+                """
+            ),
+            {
+                "start_id": str(task.parent_task_id),
+                "max_depth": _MAX_ANCESTOR_DEPTH,
+                "self_id": str(task.id),
+            },
+        )
+        for _row in _ancestor_result:
+            _row_id = uuid.UUID(str(_row[0]))
+            if _row_id not in _ancestor_ids:
+                _ancestor_ids.append(_row_id)
 
     _migration_reservation = await get_migration_reservation_for_task_chain(
         session, task_ids=_ancestor_ids
@@ -2212,6 +2294,29 @@ async def claim_task(
         _default_caps = {"fix": 8, "qa": 8, "review": 8, "create": 12, "refactor": 12}
         _cap = int(_playbook_caps.get(task_type, _default_caps.get(task_type, 10)))
         _capped_candidates = _playbook_candidates[: max(_cap, 0)]
+        # Apply a total-byte cap on top of the entry-count cap. Candidates are
+        # already sorted highest-relevance-first, so we drop from the tail
+        # (lowest-relevance) until the cumulative content bytes fit within the
+        # limit. Index 9 in the tuple holds the content string.
+        _PLAYBOOK_BYTE_CAP = 12_000
+        _byte_total = sum(len(_c[9]) for _c in _capped_candidates)
+        if _byte_total > _PLAYBOOK_BYTE_CAP:
+            _trimmed: list = []
+            _running = 0
+            for _c in _capped_candidates:
+                _entry_bytes = len(_c[9])
+                if _running + _entry_bytes <= _PLAYBOOK_BYTE_CAP:
+                    _trimmed.append(_c)
+                    _running += _entry_bytes
+            logger.warning(
+                "Playbook byte-capped to %d/%d entries (%d→%d bytes) for task %s",
+                len(_trimmed),
+                len(_capped_candidates),
+                _byte_total,
+                _running,
+                _claimed_task_id,
+            )
+            _capped_candidates = _trimmed
         # Derive landed-vs-not-landed for the SMALL capped set with a single
         # batched query (diverged is not a sort key, so doing this after the cap
         # is safe and keeps it off the per-entry hot loop). An entry is diverged
@@ -2922,6 +3027,16 @@ async def claim_task(
                     response["direction_context"]["review_quality_feedback"] = (
                         review_quality_feedback
                     )
+
+                # recent_findings_evidence: structured claims+sources for the most
+                # recent merged/proposed findings under this direction. Populated here
+                # so the context-prefix renderer (task.direction_context.recent_findings_evidence)
+                # receives it via the claim response rather than via the bulkier
+                # research-payload path (autonomous_research.py) where no renderer
+                # consumed it.
+                _rfe = direction.get("recent_findings_evidence")
+                if _rfe and isinstance(_rfe, list):
+                    response["direction_context"]["recent_findings_evidence"] = _rfe
 
             # Surface saturation / deadlock signals to research agents so they can
             # pivot to direction_update/direction_note findings on stuck directions.
@@ -4755,14 +4870,20 @@ async def agent_heartbeat(
     # downstream aggregations always see the freshest snapshot.
     if (
         req.llm_call_count is not None
+        or req.num_turns is not None
         or req.total_input_tokens is not None
         or req.total_output_tokens is not None
         or req.total_cache_creation_input_tokens is not None
         or req.total_cache_read_input_tokens is not None
         or req.viewport_screenshot_forwarded_count is not None
+        or req.total_tool_result_bytes is not None
+        or req.prompt_size_bytes is not None
+        or req.prompt_section_count is not None
+        or req.prompt_section_sizes is not None
     ):
         summary = {
             "llm_call_count": int(req.llm_call_count or 0),
+            "num_turns": int(req.num_turns or 0),
             "total_input_tokens": int(req.total_input_tokens or 0),
             "total_output_tokens": int(req.total_output_tokens or 0),
             "viewport_screenshot_forwarded_count": int(
@@ -4770,6 +4891,8 @@ async def agent_heartbeat(
             ),
             "last_updated_at": _utcnow().isoformat(),
         }
+        if req.num_turns is not None:
+            summary["num_turns"] = int(req.num_turns)
         # Persist the cache-class sub-counts only when the agent actually sent
         # them, so an older agent's heartbeat writes a byte-for-byte unchanged
         # summary. total_input_tokens stays the INCLUSIVE input total; these are
@@ -4782,6 +4905,20 @@ async def agent_heartbeat(
             summary["total_cache_read_input_tokens"] = int(
                 req.total_cache_read_input_tokens
             )
+        # Persist total_tool_result_bytes only when the agent sent it so older
+        # agents leave the key absent (unknown ≠ zero) in downstream aggregations.
+        if req.total_tool_result_bytes is not None:
+            summary["total_tool_result_bytes"] = int(req.total_tool_result_bytes)
+        # Persist prompt-size telemetry only when sent — backwards-compatible
+        # with older agents that don't emit these fields.
+        if req.prompt_size_bytes is not None:
+            summary["prompt_size_bytes"] = int(req.prompt_size_bytes)
+        if req.prompt_section_count is not None:
+            summary["prompt_section_count"] = int(req.prompt_section_count)
+        if req.prompt_section_sizes is not None:
+            summary["prompt_section_sizes"] = [
+                s.model_dump() for s in req.prompt_section_sizes
+            ]
         task.api_call_summary = summary
 
     # Per-task structured-output format-compliance telemetry (equipping

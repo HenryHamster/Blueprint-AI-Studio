@@ -2,6 +2,7 @@ import fs from 'fs';
 import { WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { SHELL_CMD_RE } from '../shell-safety.js';
+import { agentTokenShellFn } from '../token-file.js';
 import {
   buildScopedLintOneliner,
   detectLinterKind,
@@ -152,7 +153,7 @@ function buildViewportUploadBlock(taskId: string): string {
       # ── viewport screenshot upload (PR-only regression evidence) ──────────
       # Non-fatal: missing JSON / PNG / tools / token → WARN and skip.
       if command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \\
-          && [ -n "\${AGENT_API_TOKEN:-}" ] && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
+          && _load_agent_token 2>/dev/null && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
         VP_JSON="admin-ui/test-results/viewport-failures.json"
         if [ -f "$VP_JSON" ]; then
           _vp_slugify() {
@@ -204,7 +205,7 @@ function buildViewportUploadBlock(taskId: string): string {
             fi
             # POST for a signed upload URL.
             _vp_resp=$(curl -sf -X POST \\
-              -H "Authorization: Bearer \${AGENT_API_TOKEN}" \\
+              -H "Authorization: Bearer $TOKEN" \\
               -H "Content-Type: application/json" \\
               -d "{\\"task_id\\":\\"${taskId}\\",\\"component\\":\\"$_vp_comp\\",\\"width\\":$_vp_width}" \\
               "\${ORCHESTRATOR_URL}/api/agent/viewport/failure-screenshot-upload-url") || {
@@ -280,7 +281,7 @@ function buildVisualCaptureBlock(taskId: string, component: string, width: numbe
 # the acceptance gate resolves against).
 if [ \${#FAILED[@]} -eq 0 ] && admin_ui_runtime_touched \\
     && command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \\
-    && [ -n "\${AGENT_API_TOKEN:-}" ] && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
+    && _load_agent_token 2>/dev/null && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
   _VA_COMPONENT='${component}'
   _VA_WIDTH=${width}
   _VA_SHOT_DIR="/tmp/check_visual_shots_${taskId}"
@@ -299,7 +300,7 @@ if [ \${#FAILED[@]} -eq 0 ] && admin_ui_runtime_touched \\
   else
     # POST for a signed upload URL bound to the canonical (component, width) object.
     _VA_RESP=$(curl -sf -X POST \\
-      -H "Authorization: Bearer \${AGENT_API_TOKEN}" \\
+      -H "Authorization: Bearer $TOKEN" \\
       -H "Content-Type: application/json" \\
       -d "{\\"task_id\\":\\"${taskId}\\",\\"component\\":\\"$_VA_COMPONENT\\",\\"width\\":$_VA_WIDTH}" \\
       "\${ORCHESTRATOR_URL}/api/agent/viewport/failure-screenshot-upload-url") || _VA_RESP=""
@@ -355,6 +356,7 @@ echo "[check] visual acceptance declared but ${reason} — skipping capture"
 export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   const ciFailureSelectors = sanitizeCiFailureSelectors(cfg.ciFailureSelectors);
+  const agentTokenFn = agentTokenShellFn();
   // Auto-detects which stacks were touched (admin-ui / agent / backend) by
   // inspecting `git diff --name-only` against the base branch + uncommitted.
   // Runs the corresponding lint/build commands plus the admin-ui browser-mode
@@ -378,6 +380,7 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
 # so you can act on it. Re-run after edits.
 
 set -uo pipefail
+${agentTokenFn}
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 

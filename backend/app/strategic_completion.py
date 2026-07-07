@@ -24,6 +24,11 @@ from app.direction_metrics import (
     proof_weighted_merged,
 )
 from app.direction_outcomes import credit_gate_merged_count, verified_merged_count
+from app.direction_referential_guard import (
+    build_retired_direction_grounding,
+    classify_retired_direction_outcome,
+)
+from app.direction_grounding import validate_create_direction_grounding
 
 # Stopword set reused so the spawn-title redundancy check matches the project's
 # established word-overlap semantics (same tokens ignored: articles,
@@ -474,6 +479,7 @@ _PORTFOLIO_OP_ALIASES = {
     "stage": "stage_direction",
     "approve": "approve_direction",
     "reject": "reject_direction",
+    "activate": "activate_direction",
 }
 _VALID_PORTFOLIO_OPS = frozenset(
     {
@@ -483,6 +489,7 @@ _VALID_PORTFOLIO_OPS = frozenset(
         "stage_direction",
         "approve_direction",
         "reject_direction",
+        "activate_direction",
     }
 )
 _VALID_PORTFOLIO_VERDICTS = frozenset({"approved", "rejected", "warned", "uncertain"})
@@ -496,6 +503,7 @@ _HARD_BLOCK_PORTFOLIO_OPS = frozenset(
         "stage_direction",
         "approve_direction",
         "reject_direction",
+        "activate_direction",
     }
 )
 STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY = (
@@ -1228,7 +1236,8 @@ async def _apply_new_acceptance_criteria(
             return
         existing = await _ac.get_criteria_for_version(session, _open_ver.id)
         existing_texts = {c.text for c in existing}
-        headroom = _ac.MAX_CRITERIA_PER_VERSION - len(existing)
+        active_count = sum(1 for c in existing if c.status == "active")
+        headroom = _ac.MAX_CRITERIA_PER_VERSION - active_count
         created_count = 0
         skipped_over_cap = 0
         for text in criteria_texts:
@@ -1402,6 +1411,9 @@ async def _apply_qualify_request(
         return
     reason_raw = request.get("reason")
     reason = reason_raw.strip() or None if isinstance(reason_raw, str) else None
+    # Initialised outside the try so the except clause can record a durable
+    # failure on the version row even if run_qualification throws.
+    open_ver = None
     try:
         from app import release_qualifier as _rq
         from app import release_version as _rv
@@ -1456,6 +1468,37 @@ async def _apply_qualify_request(
                         getattr(spawned, "id", None),
                         reason,
                     )
+                    # Record the CI-compliance block durably on the version row
+                    # so the resident strategist can see WHY a requested
+                    # qualification never started. This path only spawns a
+                    # cap-bump task + logs today, leaving last_qualification null —
+                    # indistinguishable from "never requested" without log access.
+                    # Merged under a dedicated key (like the qualify_request_error
+                    # trace on the failure path below) so it never overwrites a
+                    # prior verdict's "status" and cannot perturb
+                    # run_qualification's cached-verdict guard.
+                    try:
+                        open_ver.last_qualification = {
+                            **(open_ver.last_qualification or {}),
+                            "qualify_request_blocked": {
+                                "blocker": "ci_compliance",
+                                "violation_count": gate.get("violation_count", 0),
+                                "head_sha": gate.get("head_sha"),
+                                "cap_bump_task": (
+                                    str(spawned.id) if spawned is not None else None
+                                ),
+                            },
+                            "qualify_request_blocked_at": _utcnow().isoformat(),
+                        }
+                        flag_modified(open_ver, "last_qualification")
+                        session.add(open_ver)
+                    except Exception:  # noqa: BLE001 — recording must never block the gate
+                        logger.exception(
+                            "[STRATEGIC] Task %s (%s path): failed to record "
+                            "qualify_request CI-compliance block on ReleaseVersion",
+                            task.id,
+                            path,
+                        )
                     return
             else:
                 logger.info(
@@ -1487,12 +1530,35 @@ async def _apply_qualify_request(
             reason,
         )
     except Exception:
+        import traceback as _tb
+
         logger.exception(
             "[STRATEGIC] Task %s (%s path): failed to apply qualify_request "
             "(non-fatal)",
             task.id,
             path,
         )
+        # Record the failure durably on the ReleaseVersion row so it is
+        # queryable via the strategic payload / admin version-phase fetch.
+        # A log line alone is not fetchable by the agent or operator without
+        # direct log access.  Merges under a separate key so a partial write
+        # by run_qualification (e.g. "status": "error") is preserved.
+        if open_ver is not None:
+            try:
+                open_ver.last_qualification = {
+                    **(open_ver.last_qualification or {}),
+                    "qualify_request_error": _tb.format_exc(limit=5)[:500],
+                    "qualify_request_error_at": _utcnow().isoformat(),
+                }
+                flag_modified(open_ver, "last_qualification")
+                session.add(open_ver)
+            except Exception:  # noqa: BLE001 — recording must never re-raise
+                logger.exception(
+                    "[STRATEGIC] Task %s (%s path): also failed to record "
+                    "qualify_request error on ReleaseVersion — failure lost",
+                    task.id,
+                    path,
+                )
 
 
 def _extract_rationale_from_notes(direction: dict | None, prefix: str) -> str | None:
@@ -1755,6 +1821,22 @@ async def _spawn_retirement_memos(
     by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
     spawned = 0
     for did in retired_ids:
+        # A retirement that was previously DEFERRED by the challenge gate left an
+        # open ``retirement_residual:{project}:{direction}:deferred`` debt row.
+        # The retire has now succeeded, so resolve that residual. Runs BEFORE the
+        # memo-dedup ``continue`` so a duplicate-memo direction still gets its
+        # deferred debt cleared. Best-effort/non-fatal; does not touch the
+        # separate memo handoff debt written below.
+        try:
+            from app.completion_debt import aresolve_deferred_retirement_debt
+
+            await aresolve_deferred_retirement_debt(session, project.id, did)
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] deferred-retirement debt resolve failed for "
+                "direction %s (non-fatal)",
+                did,
+            )
         if did in already_memed:
             logger.debug(
                 "[STRATEGIC] Skipping duplicate retirement memo for direction %s", did
@@ -1940,6 +2022,34 @@ async def _spawn_retirement_memos(
             memo_task.status = TaskStatus.FAILED
             raise
         spawned += 1
+        # Completion-debt ledger: a retirement leaves a residual handoff (the
+        # memo captures rationale, but downstream follow-through is owed).
+        # Best-effort, deduped per (project, direction) so the row is unique.
+        try:
+            from app.completion_debt import (
+                arecord_completion_debt,
+                KIND_RETIREMENT_RESIDUAL,
+            )
+
+            await arecord_completion_debt(
+                session,
+                dedupe_key=f"retirement_residual:{project.id}:{did}",
+                kind=KIND_RETIREMENT_RESIDUAL,
+                title=f"Retirement residual handoff for direction {did}: {topic[:120]}",
+                project_id=project.id,
+                source="strategic_completion",
+                detail={
+                    "direction_id": str(did),
+                    "memo_task_id": str(memo_task.id),
+                    "kind": "retired",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[STRATEGIC] completion-debt record failed for retired "
+                "direction %s (non-fatal)",
+                did,
+            )
         logger.info(
             "[STRATEGIC] Spawned retirement memo task %s for direction %s (synthesized=%s)",
             memo_task.id,
@@ -2070,11 +2180,21 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     )
     total_finished = merged + non_merge_finished
     merge_rate = proof_merged / total_finished if total_finished > 0 else 0.0
+    # Raw merge volume: children whose PR actually MERGED — onto the integration
+    # branch OR a rollup staging branch — over the window. Unlike ``merged``
+    # (credit-gate, integration-landed only), this stays non-zero the moment work
+    # lands on a staging branch, before the rollup lands and re-stamps
+    # landed_on_integration. It is a defense-in-depth backstop for the pause gate:
+    # a direction whose work is demonstrably landing must never be paused as
+    # "0 real merges" merely because rollup-landing credit propagation has not yet
+    # recomputed prs_merged. Legacy entries lacking the field contribute 0.
+    real_merges = sum(int(e.get("merged_prs_any_base") or 0) for e in window)
     return {
         "window_cycles": len(window),
         "merged": merged,
         "non_merge_finished": non_merge_finished,
         "merge_rate": round(merge_rate, 3),
+        "real_merges": real_merges,
     }
 
 
@@ -2261,73 +2381,202 @@ def _already_built_signature(direction: dict) -> dict | None:
     return None
 
 
-def _check_direction_health(direction: dict) -> str | None:
-    """Return a pause reason if this direction should be auto-paused, else None."""
+def _direction_non_merge_pause(direction: dict) -> str | None:
+    """Single consolidated non-merge-rate pause proxy — the mechanical trigger.
+
+    Churn-guardrail redesign: the three former independent merge-rate rules
+    (zero-merge, churn guardrail, lifetime burn backstop) are collapsed here into
+    ONE proxy driven by a single signal — finished tasks that did not merge, versus
+    the proof-weighted merge rate — evaluated at two horizons that share that same
+    signal shape:
+
+      1. Rolling window (via ``_compute_churn_metrics``) — the primary, responsive
+         trigger. Two folded-in cases of the one signal:
+           * FOLDED zero-merge: ``0`` proof-weighted merges landed over >=5 settled
+             cycles with real (non-no-op, non-infra) unmerged work — the degenerate
+             rate==0 tail of the proxy. Reason kept as ``Unproductive:`` for the
+             downstream zombie-ladder / already-built classification.
+           * FOLDED churn: unmerged volume is absolutely high AND the proof-weighted
+             merge rate is very low. Reason ``Churn guardrail:``.
+      2. Lifetime (via ``_compute_lifetime_burn_metrics``) — a slow-burn backstop for
+         directions that stay under the window volume every window yet accumulate.
+         Reason ``Lifetime burn backstop:``.
+
+    Every branch reads the same non-merge definition (completed-minus-no-op plus
+    non-infra code failures, minus proof-weighted merges) so infra-failure exclusion
+    and already-built no-op suppression are preserved. Reason prefixes are unchanged
+    so the lifecycle's evidence capture, zombie/lifetime ladders and already-built
+    routing keep working. No terminal retirement happens here — only a reversible
+    pause reason is returned. Callers gate this on ``not in_grace and not
+    still_productive`` (grace + productivity/proof shields).
+    """
     history = direction.get("research_history") or []
 
-    # Grace period: a just-recovered direction skips history-based rules (1, 2, 5, 6)
-    # until at least one new research cycle is appended after recovery. This prevents
-    # the frozen research_history that originally triggered the pause from immediately
-    # re-triggering it on the very next lifecycle tick. Code-failure rules (3, 4) are
-    # always evaluated so auto-retirement is never weakened by the grace period.
+    # --- Folded zero-merge tail (was Rule 2): proof-weighted merge rate == 0 ---
+    # 5+ cycles, no verified merges anywhere, most recent cycle settled (no tasks
+    # in flight), and real unmerged work finished. This is the low-volume end of the
+    # same non-merge proxy: a direction shipping literally nothing over five cycles.
+    if len(history) >= 5:
+        total_merged = sum(verified_merged_count(entry) for entry in history)
+        # Raw merge volume across the direction's whole life (integration + staging
+        # merges). A direction that merged real PRs — even ones whose rollup-landing
+        # credit has not yet propagated back into verified_prs_merged — is NOT
+        # "shipping literally nothing"; this zero-merge pause must not fire on the
+        # merge-credit-propagation lag. Legacy entries lacking the field contribute 0,
+        # preserving the pause for genuinely unproductive directions.
+        real_merges_any = sum(
+            int(entry.get("merged_prs_any_base") or 0) for entry in history
+        )
+        if total_merged == 0 and real_merges_any == 0:
+            non_merge_real = sum(
+                max(0, entry.get("tasks_completed", 0))
+                - entry.get("tasks_completed_no_pr", 0)
+                + max(
+                    0,
+                    entry.get("tasks_failed", 0) - entry.get("tasks_failed_infra", 0),
+                )
+                for entry in history
+            )
+            last = history[-1]
+            created = last.get("tasks_created", 0)
+            finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
+            if (created == 0 or finished >= created) and non_merge_real > 0:
+                total_created = sum(entry.get("tasks_created", 0) for entry in history)
+                return (
+                    f"Unproductive: 0 PRs merged from {len(history)} research cycles "
+                    f"({total_created} tasks created)"
+                )
+
+    # --- Rolling-window churn (was Rule 5): high unmerged volume at a low rate ---
+    churn_threshold = int(
+        _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
+    )
+    churn_min_merge_rate_config = _runtime_config.get(
+        "direction_churn_min_merge_rate", 0.10
+    )
+    churn_min_merge_rate = float(
+        0.10 if churn_min_merge_rate_config is None else churn_min_merge_rate_config
+    )
+    if churn_threshold > 0:
+        metrics = _compute_churn_metrics(direction)
+        if (
+            metrics
+            and metrics["non_merge_finished"] >= churn_threshold
+            and metrics["merge_rate"] < churn_min_merge_rate
+            # Defense-in-depth: never pause a direction whose work is demonstrably
+            # landing. ``real_merges`` counts PRs that actually merged (integration
+            # OR staging) over the window; it stays non-zero even when a rollup
+            # landing's merge-credit has not yet propagated into the credit-gate
+            # ``merge_rate``. Genuine churn (nothing merged anywhere) keeps
+            # ``real_merges == 0`` and still trips the guardrail.
+            and metrics.get("real_merges", 0) == 0
+        ):
+            return (
+                f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
+                f"without merging, {metrics['merged']} merged in last "
+                f"{metrics['window_cycles']} cycles "
+                f"(merge rate {metrics['merge_rate']:.0%})"
+            )
+
+    # --- Lifetime cumulative burn backstop (was Rule 6): same signal, whole life ---
+    lifetime_threshold = int(
+        _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
+    )
+    lifetime_min_merge_rate_config = _runtime_config.get(
+        "direction_lifetime_min_merge_rate", 0.10
+    )
+    lifetime_min_merge_rate = float(
+        0.10
+        if lifetime_min_merge_rate_config is None
+        else lifetime_min_merge_rate_config
+    )
+    if lifetime_threshold > 0:
+        lm = _compute_lifetime_burn_metrics(direction)
+        if (
+            lm
+            and lm["lifetime_non_merge_finished"] >= lifetime_threshold
+            and lm["lifetime_merge_rate"] < lifetime_min_merge_rate
+        ):
+            return (
+                f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
+                f"finished without merging lifetime, {lm['lifetime_merged']} merged "
+                f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
+            )
+
+    return None
+
+
+def _check_direction_health(direction: dict) -> str | None:
+    """Return a pause reason if this direction should be auto-paused, else None.
+
+    Consolidation (churn-guardrail redesign). The former six independent
+    history-based pause rules are reduced to ONE mechanical non-merge-rate proxy
+    (:func:`_direction_non_merge_pause`) plus two guards that the code shows are a
+    genuinely different — and safer to keep separate — kind of signal:
+
+      * FOLDED into the single proxy: zero-merge (Rule 2), churn (Rule 5) and
+        lifetime burn (Rule 6). All three are one signal — unmerged finished work
+        versus the proof-weighted merge rate — at the rate==0 tail, the rolling
+        window, and the lifetime horizon respectively.
+      * RETAINED as a separate mechanical guard — code-failure (Rules 3 & 4). This
+        is a CRASH signal, not a merge-RATE one: it must stay classifiable
+        (``_is_code_failure_pause_reason`` routes it to an investigate task and its
+        own retire ladder) and it is deliberately UNGATED — a crashing direction
+        pauses no matter how productive its last cycle looked and even inside the
+        grace period.
+      * DROPPED as a standalone rule but preserved in spirit — saturation (Rule 1).
+        A saturated direction produces no actionable work at all (it may finish
+        nothing), so a non-merge-RATE proxy that needs finished work cannot see it;
+        it is kept as a small research-productivity guard rather than force-fitted
+        into the proxy.
+
+    Preserved semantics: grace period (the proxy + saturation skip until a new
+    post-recovery cycle appends; code-failure always evaluated), the still-productive
+    shield with proof-aware forfeit (:func:`_direction_still_productive` /
+    :func:`_recent_merges_mostly_unproven`), and infra-failure exclusion. No terminal
+    retirement happens here.
+    """
+    history = direction.get("research_history") or []
+
+    # Grace period: a just-recovered direction skips the history-based non-merge
+    # proxy and the saturation guard until at least one new research cycle is
+    # appended after recovery, so the frozen research_history that triggered the
+    # original pause cannot immediately re-trigger it. The code-failure guard below
+    # is always evaluated so auto-retirement is never weakened by the grace period.
     recovered_at = direction.get("auto_recovered_at")
     in_grace = recovered_at is not None and not any(
         (e.get("timestamp") or "") > recovered_at for e in history
     )
 
-    # Fix #1 gate for the cumulative merge-rate family (Rules 2, 5, 6 only): a
-    # direction that is still demonstrably productive must not be pause-retired by a
-    # zero-merge / churn / lifetime-burn signal. Code-failure rules (3, 4) below are
-    # deliberately left UNGATED — a crashing direction pauses no matter how productive
-    # its last cycle looked. The shield is also FORFEIT when the direction's recent
-    # merges are essentially all undeclared/unproven (_recent_merges_mostly_unproven):
-    # "productive" must mean proven work, not a pile of merely-delivered merges, so
-    # such a direction no longer out-protects one shipping proven work.
+    # Productivity/proof shield for the non-merge proxy only: a direction that is
+    # still demonstrably productive must not be pause-retired by a merge-rate signal.
+    # The code-failure guard is deliberately left UNGATED. The shield is FORFEIT when
+    # the direction's recent merges are essentially all undeclared/unproven
+    # (_recent_merges_mostly_unproven): "productive" must mean proven work.
     still_productive = _direction_still_productive(
         direction
     ) and not _recent_merges_mostly_unproven(direction)
 
-    if not in_grace:
-        # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task
-        if direction.get("possibly_saturated") and len(history) >= 5:
-            recent5 = history[-5:]
-            if all(entry.get("tasks_created", 0) <= 1 for entry in recent5):
-                return (
-                    "Saturated: last 5 research cycles produced no actionable findings"
-                )
+    # Saturation guard (retained): research produced no actionable findings.
+    if not in_grace and direction.get("possibly_saturated") and len(history) >= 5:
+        recent5 = history[-5:]
+        if all(entry.get("tasks_created", 0) <= 1 for entry in recent5):
+            return "Saturated: last 5 research cycles produced no actionable findings"
 
-        # Rule 2: Zero merge rate — 5+ cycles with 0 PRs merged total, and the most
-        # recent cycle has no tasks still in-flight (tasks_created == tasks_completed + tasks_failed).
-        # Skipped when the direction is still productive (Fix #1). Also skipped when the
-        # only thing that "finished" was correct no-op "already-built" completions
-        # (Fix #2 inline math): subtract tasks_completed_no_pr (and infra failures) from
-        # the lifetime non-merge volume — if nothing real finished unmerged, 0 PRs merged
-        # is "nothing to merge", not unproductiveness.
-        if len(history) >= 5 and not still_productive:
-            total_merged = sum(verified_merged_count(entry) for entry in history)
-            if total_merged == 0:
-                non_merge_real = sum(
-                    max(0, entry.get("tasks_completed", 0))
-                    - entry.get("tasks_completed_no_pr", 0)
-                    + max(
-                        0,
-                        entry.get("tasks_failed", 0)
-                        - entry.get("tasks_failed_infra", 0),
-                    )
-                    for entry in history
-                )
-                last = history[-1]
-                created = last.get("tasks_created", 0)
-                finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
-                if (created == 0 or finished >= created) and non_merge_real > 0:
-                    total_created = sum(
-                        entry.get("tasks_created", 0) for entry in history
-                    )
-                    return f"Unproductive: 0 PRs merged from {len(history)} research cycles ({total_created} tasks created)"
+    # Single consolidated non-merge-rate proxy (folds zero-merge + churn + lifetime).
+    # Evaluated BEFORE the code-failure guards so that a zero-merge, non-productive
+    # direction is always classified as 'Unproductive:' (reversible, non-terminal)
+    # rather than 'Recent stall:' (code_failure_pause_count, terminal at 3 strikes).
+    # The code-failure guards below then only fire on directions that passed the
+    # non-merge proxy (in_grace, still_productive, or no non-merge trigger).
+    if not in_grace and not still_productive:
+        proxy_reason = _direction_non_merge_pause(direction)
+        if proxy_reason:
+            return proxy_reason
 
-    # Rule 3: High CODE failure rate — last 3 cycles have >70% tasks failed
-    # for direction-attributable reasons (not infra failures like rate limits,
-    # provision failures, or timeouts which are uncorrelated with direction quality).
+    # Code-failure guard (retained, UNGATED): a crash signal that routes to an
+    # investigate task. Rule 3 — >70% of spawned tasks failed for CODE reasons over
+    # the last 3 cycles (infra failures excluded, uncorrelated with direction quality).
     if len(history) >= 3:
         recent3 = history[-3:]
         total_created_3 = sum(entry.get("tasks_created", 0) for entry in recent3)
@@ -2337,11 +2586,9 @@ def _check_direction_health(direction: dict) -> str | None:
         if total_created_3 > 0 and code_failed_3 / total_created_3 > 0.7:
             return f"High code failure rate: >70% of spawned tasks failed for code reasons in last 3 cycles ({code_failed_3}/{total_created_3}, {infra_failed_3} infra failures excluded)"
 
-    # Rule 4: Recent cycle stall — last 3 cycles all either failed as research
-    # tasks (crash/timeout/provision) or produced children with ≥1 CODE failed
-    # and zero merges. Pauses faster than Rule 2's 5-cycle threshold. Infra
-    # failures are excluded from the child-failed check for the same reason
-    # as Rule 3: they're uncorrelated with direction quality.
+    # Rule 4 — recent stall: last 3 cycles all either failed as research tasks
+    # (crash/timeout/provision) or produced children with >=1 CODE failure and zero
+    # merges. Infra failures are excluded for the same reason as Rule 3.
     if len(history) >= 3:
         recent3 = history[-3:]
 
@@ -2357,58 +2604,6 @@ def _check_direction_health(direction: dict) -> str | None:
             return (
                 "Recent stall: last 3 research cycles all failed or produced no merges"
             )
-
-    if not in_grace and not still_productive:
-        # Rules 5 & 6 are gated on the same Fix #1 productivity check as Rule 2: a
-        # still-productive direction is never churn/burn-paused.
-        #
-        # Rule 5: High non-merge churn — rolling window of finished tasks that did not merge.
-        # Only fires when non-merging volume is both absolutely high AND merge rate is very low,
-        # to avoid pausing productive high-throughput directions that simply have many tasks.
-        # research/investigate children are excluded conservatively by the default threshold.
-        churn_threshold = int(
-            _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
-        )
-        churn_min_merge_rate = float(
-            _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
-        )
-        if churn_threshold > 0:
-            metrics = _compute_churn_metrics(direction)
-            if (
-                metrics
-                and metrics["non_merge_finished"] >= churn_threshold
-                and metrics["merge_rate"] < churn_min_merge_rate
-            ):
-                return (
-                    f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
-                    f"without merging, {metrics['merged']} merged in last "
-                    f"{metrics['window_cycles']} cycles "
-                    f"(merge rate {metrics['merge_rate']:.0%})"
-                )
-
-        # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
-        # just under the rolling-window threshold every window but accumulate hundreds of
-        # non-merging tasks over their lifetime. High threshold prevents pausing productive
-        # high-throughput directions. This pause requires manual operator intervention (retire
-        # vs. reset) because the lifetime metric will not drop on its own after auto-recovery.
-        lifetime_threshold = int(
-            _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
-        )
-        lifetime_min_merge_rate = float(
-            _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
-        )
-        if lifetime_threshold > 0:
-            lm = _compute_lifetime_burn_metrics(direction)
-            if (
-                lm
-                and lm["lifetime_non_merge_finished"] >= lifetime_threshold
-                and lm["lifetime_merge_rate"] < lifetime_min_merge_rate
-            ):
-                return (
-                    f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
-                    f"finished without merging lifetime, {lm['lifetime_merged']} merged "
-                    f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
-                )
 
     return None
 
@@ -3103,6 +3298,20 @@ def _find_matching_direction(
 
 _RETIRED_MEMORY_CAP = 30
 _RETIRED_TEXT_TOKEN_CAP = 20
+# Bounded char cap for the optional per-entry outcome blurb ("why it was
+# retired / what landed"). The list is shipped in the strategist payload, so
+# the outcome must stay compact — same spirit as the token cap above.
+_RETIRED_OUTCOME_CHAR_CAP = 200
+
+
+def _retired_direction_outcome_metrics(direction: dict) -> dict[str, int]:
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    total_cycles = len(history) + int(agg.get("total_cycles") or 0)
+    total_merged = sum(int(h.get("prs_merged", 0) or 0) for h in history) + int(
+        agg.get("total_prs_merged") or 0
+    )
+    return {"cycles": total_cycles, "prs_merged": total_merged}
 
 
 def record_retired_direction_memory(
@@ -3110,26 +3319,52 @@ def record_retired_direction_memory(
     direction: dict,
     *,
     reason: str,
+    outcome: str | None = None,
 ) -> None:
     """Add a compact entry to vision['_recently_retired_directions'].
 
     Called at every terminal-status write so the create_direction dedup check
     can block same-gap or text-overlap re-spawns even after direction pruning.
     Mutates vision in place; caller is responsible for flag_modified + session.add.
+
+    ``outcome`` is an OPTIONAL compact blurb capturing *why* the direction was
+    retired / *what* it shipped (e.g. the retirement rationale, or a
+    ``superseded by <id>`` successor pointer). It is bounded to
+    ``_RETIRED_OUTCOME_CHAR_CAP`` chars and only stored when non-empty, so
+    existing callers that omit it keep the previous entry shape unchanged.
     """
     text = direction.get("text") or ""
     tokens = list(
         set(text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
     )[:_RETIRED_TEXT_TOKEN_CAP]
+
+    metrics = _retired_direction_outcome_metrics(direction)
+    classification = classify_retired_direction_outcome(
+        reason,
+        prs_merged=metrics["prs_merged"],
+    )
+
     entry: dict = {
         "id": direction.get("id", ""),
         "text_tokens": tokens,
         "retired_at": _utcnow().isoformat(),
         "reason": reason,
+        # Preserve legacy top-level metrics for older readers while placing the
+        # classified outcome in one compact object for new grounding consumers.
+        "cycles": metrics["cycles"],
+        "prs_merged": metrics["prs_merged"],
+        "retired_outcome": {
+            "classification": classification,
+            "metrics": metrics,
+        },
     }
     gap_id = direction.get("gap_id")
     if gap_id:
         entry["gap_id"] = str(gap_id)
+    if outcome:
+        _bounded = str(outcome).strip()[:_RETIRED_OUTCOME_CHAR_CAP]
+        if _bounded:
+            entry["outcome"] = _bounded
     existing = list(vision.get("_recently_retired_directions") or [])
     existing.append(entry)
     vision["_recently_retired_directions"] = existing[-_RETIRED_MEMORY_CAP:]
@@ -3147,23 +3382,95 @@ def _check_gap_respawn_block(
     Gate 2: text-token overlap >=4 (same threshold as _is_direction_duplicate).
     Returns None when no block applies.
     """
+    match = find_gap_respawn_match(
+        text,
+        new_gap_id,
+        retired_memory,
+        cooldown_days,
+    )
+    if match is None:
+        return None
+    mem_entry, match_kind = match
+    annotation = build_retired_direction_grounding(mem_entry)
+    return _format_retired_grounding_reason(
+        mem_entry,
+        match_kind=match_kind,
+        new_gap_id=new_gap_id,
+        grounding=annotation,
+    )
+
+
+def find_gap_respawn_match(
+    text: str,
+    new_gap_id: str | None,
+    retired_memory: list,
+    cooldown_days: float,
+) -> tuple[dict, str] | None:
     cooldown_cutoff = (_utcnow() - timedelta(days=cooldown_days)).isoformat()
     new_text_tokens = set(text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
     for mem_entry in retired_memory:
+        if not isinstance(mem_entry, dict):
+            continue
         if mem_entry.get("retired_at", "") < cooldown_cutoff:
             continue
         if new_gap_id and mem_entry.get("gap_id") == new_gap_id:
-            return (
-                f"gap {new_gap_id} was recently staffed by retired direction "
-                f"{mem_entry.get('id')} ({mem_entry.get('reason')})"
-            )
+            return mem_entry, "gap"
         mem_tokens = set(mem_entry.get("text_tokens") or [])
         if len(new_text_tokens & mem_tokens) >= 4:
-            return (
-                f"text overlaps recently-retired direction "
-                f"{mem_entry.get('id')} ({mem_entry.get('reason')})"
-            )
+            return mem_entry, "text"
     return None
+
+
+def _format_retired_grounding_reason(
+    mem_entry: dict,
+    *,
+    match_kind: str,
+    new_gap_id: str | None,
+    grounding: dict | None,
+) -> str:
+    direction_id = mem_entry.get("id")
+    reason = mem_entry.get("reason")
+    if match_kind == "gap":
+        prefix = (
+            f"gap {new_gap_id} was recently staffed by retired direction "
+            f"{direction_id}"
+        )
+    else:
+        prefix = f"text overlaps recently-retired direction {direction_id}"
+
+    classification = (grounding or {}).get("classification")
+    metrics = (grounding or {}).get("metrics") or {}
+    if classification in {"landed", "success_evidence_met"}:
+        outcome_label = (
+            "landed work"
+            if classification == "landed"
+            else "met success evidence"
+        )
+        return (
+            f"{prefix} whose prior outcome was {outcome_label} "
+            f"(prs_merged={metrics.get('prs_merged', 0)}, "
+            f"cycles={metrics.get('cycles', 0)}; {reason})"
+        )
+    return f"{prefix} ({reason})"
+
+
+def _retired_grounding_note(grounding: dict, block_reason: str) -> str:
+    classification = grounding.get("classification") or "unknown"
+    metrics = grounding.get("metrics") or {}
+    direction_id = grounding.get("direction_id") or "unknown"
+    note = (
+        "Grounding: matches retired direction "
+        f"{direction_id}; prior_outcome={classification}; "
+        f"prs_merged={metrics.get('prs_merged', 0)}, "
+        f"cycles={metrics.get('cycles', 0)}. {block_reason}"
+    )
+    memo = grounding.get("retirement_memo")
+    if isinstance(memo, dict) and memo.get("knowledge_doc_id"):
+        note += (
+            f" Retirement memo {memo.get('knowledge_doc_id')}: "
+            f"{str(memo.get('summary') or '')[:160]}"
+        )
+    return note
 
 
 async def _check_direction_starvation(
@@ -3479,6 +3786,7 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
 
     dropped: list = packer_meta.get("dropped") or []
     trimmed: list = packer_meta.get("trimmed") or []
+    shipped: list = packer_meta.get("shipped") or []
 
     directions_dropped_count: int = sum(
         1
@@ -3489,6 +3797,22 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         isinstance(e, dict) and "problem_model" in str(e.get("key", "")).lower()
         for e in (dropped + trimmed)
     )
+    open_messages_dropped: bool = any(
+        isinstance(e, dict) and str(e.get("key", "")) == "open_messages"
+        for e in dropped
+    )
+    version_phase_dropped: bool = any(
+        isinstance(e, dict) and str(e.get("key", "")) == "version_phase"
+        for e in dropped
+    )
+    # High/critical-tier sections that dropped wholesale under budget pressure —
+    # the packer stamps each drop entry with its schema tier. A non-empty list
+    # means the strategist ran on a degraded payload; empty means clean.
+    high_tier_dropped: list[str] = [
+        str(e.get("key"))
+        for e in dropped
+        if isinstance(e, dict) and e.get("priority") in ("high", "critical")
+    ]
 
     gap_memory_trimmed: list = packer_meta.get("gap_memory_trimmed") or []
     gap_memory_trimmed_count: int = sum(
@@ -3514,6 +3838,31 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
                 if isinstance(total, int) and isinstance(shown, int):
                     gap_memory_hidden_entries += max(0, total - shown)
 
+    budget_total: int = packer_meta.get("budget_total") or 0
+    budget_used: int = packer_meta.get("budget_used") or 0
+    budget_utilization_pct: float | None = (
+        round(budget_used / budget_total * 100, 1) if budget_total > 0 else None
+    )
+
+    # Merge byte sizes from all three accounting paths: shipped (full-size),
+    # trimmed (bytes_trimmed = shipped size), dropped (bytes = original size).
+    section_bytes: dict[str, int] = {}
+    for entry in shipped:
+        if isinstance(entry, dict) and entry.get("key"):
+            section_bytes[str(entry["key"])] = int(entry.get("bytes") or 0)
+    for entry in trimmed:
+        if isinstance(entry, dict) and entry.get("key"):
+            section_bytes[str(entry["key"])] = int(entry.get("bytes_trimmed") or 0)
+    for entry in dropped:
+        if isinstance(entry, dict) and entry.get("key"):
+            # dropped sections contributed 0 bytes to the packed payload
+            section_bytes.setdefault(str(entry["key"]), 0)
+    top_budget_consumers: list[dict] = sorted(
+        [{"key": k, "bytes": v} for k, v in section_bytes.items()],
+        key=lambda x: x["bytes"],
+        reverse=True,
+    )[:5]
+
     return {
         "model_bytes": model_bytes,
         "capability_count": capability_count,
@@ -3521,9 +3870,148 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         "model_size_status": model_size_status,
         "directions_dropped_count": directions_dropped_count,
         "problem_model_truncated": problem_model_truncated,
+        "open_messages_dropped": open_messages_dropped,
+        "version_phase_dropped": version_phase_dropped,
+        "high_tier_dropped": high_tier_dropped,
         "gap_memory_trimmed_count": gap_memory_trimmed_count,
         "gap_memory_hidden_entries": gap_memory_hidden_entries,
+        "budget_utilization_pct": budget_utilization_pct,
+        "top_budget_consumers": top_budget_consumers,
     }
+
+
+async def _apply_qualify_request_post_commit(
+    request: object,
+    *,
+    task_id: "uuid.UUID",
+    project_id: "uuid.UUID",
+    path: str,
+    session_factory=None,
+) -> None:
+    """Post-commit: run the best-effort ``qualify_request`` side-effect on a fresh session.
+
+    STRUCTURAL INVARIANT (docs/concurrency.md; ``_process_post_commit`` — "release
+    the lock before slow GitHub calls"): the ``qualify_request`` handler does
+    minutes of external GitHub I/O — the CI-compliance scan in
+    ``ci_compliance.ensure_current_ci_compliance`` (which reads the capped module
+    set at the integration-branch HEAD) plus the candidate-SHA resolution in
+    ``release_qualifier.run_qualification``. That MUST NOT run while the strategic
+    completion holds the Project ``FOR UPDATE`` row lock (acquired up front by
+    ``_process_post_commit`` via ``lock_project_then_task``) and its DB connection.
+
+    Running it under the lock idled the completion's connection across the
+    multi-minute scan until Cloud SQL closed it mid-flush (``UPDATE project SET
+    ci_compliance`` → asyncpg ``InterfaceError: connection is closed``), poisoning
+    the completion session so its commit raised ``PendingRollbackError``. The
+    completion handler classified that as a transient error and requeued the WHOLE
+    agent job — re-running a 5–24 min architecture review up to ``max_retries``
+    times before giving up as FAILED, even though the agent's design-doc write had
+    already landed each time.
+
+    ``run_qualification`` is self-defending — it takes its own ``ReleaseVersion``
+    ``FOR UPDATE`` lock and resolves its GitHub I/O outside that lock — so it
+    needs no lock held by this caller. So the qualify side-effect runs here, AFTER
+    the completion has durably committed and released its Project lock, on a
+    dedicated fresh session. It is best-effort: any failure (connection death,
+    GitHub error) is logged and swallowed — the durable completion already
+    committed, so a failure here can never requeue the task or discard the
+    agent's work.
+    """
+    if not request or not isinstance(request, dict):
+        return
+    from app.database import AsyncSessionLocal
+
+    factory = session_factory or AsyncSessionLocal
+    try:
+        async with factory() as fresh:
+            project = await fresh.get(Project, project_id)
+            task = await fresh.get(Task, task_id)
+            if project is None or task is None:
+                return
+            await _apply_qualify_request(request, task, project, fresh, path=path)
+            await fresh.commit()
+    except Exception:
+        logger.warning(
+            "[STRATEGIC_COMPLETION] _apply_qualify_request_post_commit: qualify_request "
+            "side-effect failed for task %s project %s (%s path) — non-fatal; the "
+            "strategic completion already committed durably, task NOT requeued",
+            task_id,
+            project_id,
+            path,
+            exc_info=True,
+        )
+
+
+async def _maybe_retry_workday_auto_start(
+    project_id: "uuid.UUID",
+    *,
+    session_factory=None,
+) -> None:
+    """Post-commit: retry Workday auto-start when a blocking strategic cycle finishes.
+
+    When the project is in Workday (continuous) mode, has no live resident session,
+    and its last recorded blocked reason is ``cycle_in_flight`` — meaning a batch
+    strategic cycle was in flight when the operator entered Workday — re-run the
+    Workday auto-start now that the blocking cycle has completed. Runs on a
+    dedicated fresh session; any failure is logged and swallowed so strategic
+    completion is never broken.
+    """
+    import app.strategic_resident_session as _srs
+    from app.database import AsyncSessionLocal
+    from app.workbench_state import get_strategic_workbench_state
+
+    factory = session_factory or AsyncSessionLocal
+    # Read current project state on a fresh session.
+    try:
+        async with factory() as fresh:
+            project = await fresh.get(Project, project_id)
+            if project is None:
+                return
+            # Only retry when no live resident session is running.
+            if _srs.resident_session_is_active(
+                _srs.read_resident_session(project.vision)
+            ):
+                return
+            # Only retry when the blocked reason is specifically cycle_in_flight.
+            raw_reason = (project.vision or {}).get(
+                _srs.RESIDENT_SESSION_REASON_KEY
+            ) or {}
+            if raw_reason.get("reason") != _srs.RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:
+                return
+            op_user_id = raw_reason.get("operator_user_id") or "system"
+            # Only retry when Workday mode is still active — read from the
+            # per-user prefs store (MessagesNoisePrefs) where workbench state
+            # is actually persisted, NOT from project.vision.
+            workbench = await get_strategic_workbench_state(fresh, op_user_id, project_id)
+            if workbench.get("interaction_mode") != "continuous":
+                return
+    except Exception:
+        logger.warning(
+            "[STRATEGIC_COMPLETION] _maybe_retry_workday_auto_start: state read failed "
+            "for project %s",
+            project_id,
+            exc_info=True,
+        )
+        return
+    # Conditions met — re-run the auto-start on a separate fresh session.
+    try:
+        await _srs._auto_start_on_workday_entry(
+            project_id,
+            operator_user_id=op_user_id,
+            session_factory=factory,
+        )
+        logger.info(
+            "[STRATEGIC_COMPLETION] Workday auto-start retry triggered for project %s "
+            "(cycle_in_flight unblocked by strategic completion)",
+            project_id,
+        )
+    except Exception:
+        logger.warning(
+            "[STRATEGIC_COMPLETION] _maybe_retry_workday_auto_start: auto-start retry "
+            "failed for project %s",
+            project_id,
+            exc_info=True,
+        )
 
 
 async def _handle_strategic_completion(
@@ -3639,6 +4127,34 @@ async def _handle_strategic_completion(
                 _extra["model_gc_telemetry"] = _compute_model_gc_telemetry(
                     project, task
                 )
+                # A high/critical-tier section dropping wholesale means the
+                # strategist ran on a degraded payload — raise a loud, dedup'd
+                # operator alert. Medium/low drops are expected degradation and
+                # do NOT alert.
+                _high_tier_dropped = _extra["model_gc_telemetry"].get(
+                    "high_tier_dropped"
+                ) or []
+                if _high_tier_dropped:
+                    logger.error(
+                        "[STRATEGIC] Task %s: strategist ran on degraded payload — "
+                        "high-tier sections dropped under budget: %s",
+                        task.id,
+                        _high_tier_dropped,
+                    )
+                    try:
+                        await _create_strategic_alert(
+                            project.id,
+                            session,
+                            "Strategist ran on a degraded payload: high-tier "
+                            "section(s) dropped under the byte budget — "
+                            f"{', '.join(_high_tier_dropped)}. Context was "
+                            "truncated; verify the cycle's decisions.",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            f"[STRATEGIC] Task {task.id}: failed to raise high-tier-drop alert (non-fatal)",
+                            exc_info=True,
+                        )
             except Exception:  # noqa: BLE001
                 logger.warning(
                     f"[STRATEGIC] Task {task.id}: failed to compute model_gc_telemetry (non-fatal)",
@@ -3857,8 +4373,16 @@ async def _handle_strategic_completion(
         # sanitized {reason} dict under ``QUALIFY_REQUEST_CONTEXT_KEY``. When the
         # open ReleaseVersion is in ``stabilize`` this kicks off the release
         # qualifier.
+        # qualify_request is a best-effort side-effect that does minutes of GitHub
+        # I/O (CI-compliance scan + run_qualification). Per the "release the lock
+        # before slow GitHub calls" invariant it must NOT run under the Project
+        # FOR UPDATE lock _process_post_commit holds — doing so idled this
+        # session's connection across the scan until Cloud SQL closed it,
+        # poisoning the commit below (PendingRollbackError) and requeuing the
+        # whole agent job. Captured here; applied post-commit on a fresh session.
         _qr_ctx = (task.context or {}).get(QUALIFY_REQUEST_CONTEXT_KEY)
-        await _apply_qualify_request(_qr_ctx, task, project, session, path="api")
+        _qr_task_id = task.id
+        _qr_project_id = project.id
         # Apply new_version_goal if the agent supplied one via the API. Same
         # transport as qualify_request: the ``set_problem_model`` endpoint lifts
         # the field out of the problem_model JSON (ProblemModel extra="forbid")
@@ -3877,10 +4401,26 @@ async def _handle_strategic_completion(
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
         # each cycle. Replaces the previous one-message-per-cycle noise.
-        await _spawn_retirement_memos(
-            session, project, task, retired_ids, retired_rationales
-        )
+        try:
+            await _spawn_retirement_memos(
+                session, project, task, retired_ids, retired_rationales
+            )
+        except Exception:
+            logger.error(
+                "[STRATEGIC] Task %s: _spawn_retirement_memos failed; retirement memos not created "
+                "for direction IDs %s — commit will still proceed",
+                task.id,
+                retired_ids,
+                exc_info=True,
+            )
         await session.commit()
+        # qualify_request runs AFTER the lock-release commit, on its own fresh
+        # session, so its slow GitHub I/O never holds this completion's Project
+        # lock / connection and a failure here can never requeue the durably-
+        # completed task (see _apply_qualify_request_post_commit).
+        await _apply_qualify_request_post_commit(
+            _qr_ctx, task_id=_qr_task_id, project_id=_qr_project_id, path="api"
+        )
         # Post-commit: the live strategic ops already emitted per-write
         # `strategic_updated` events during execution; here we close the cycle.
         from app.strategic_events import emit_strategic_cycle_completed
@@ -3901,6 +4441,7 @@ async def _handle_strategic_completion(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
             f"{_adoption_suffix_msg}{_spawn_suffix_msg}"
         )
+        await _maybe_retry_workday_auto_start(task.project_id)
         return
 
     # Fallback: try log-based parsing for backward compatibility
@@ -3910,18 +4451,27 @@ async def _handle_strategic_completion(
         parsed = None
 
     if not parsed or not isinstance(parsed, dict):
-        # No API calls and no parseable output — record failure
-        project = await session.get(Project, task.project_id)
-        if project:
-            current_vision = project.vision or {}
-            failures = current_vision.get("_strategic_failures", 0) + 1
-            current_vision["_strategic_failures"] = failures
-            current_vision["_strategic_failures_at"] = _utcnow().isoformat()
-            project.vision = current_vision
-            flag_modified(project, "vision")
-            cycle_id = task.strategic_cycle_id or (task.context or {}).get(
-                "strategic_cycle_id"
-            )
+        # No API calls and no parseable output — record failure under a row lock.
+        # skip_locked=False: wait for the lock rather than silently drop a count.
+        from app.task_locking import with_vision_locked
+
+        cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
+        _now_iso = _utcnow().isoformat()
+        _failure_num: list[int] = []
+
+        def _bump_failures(vision: dict) -> None:
+            failures = vision.get("_strategic_failures", 0) + 1
+            vision["_strategic_failures"] = failures
+            vision["_strategic_failures_at"] = _now_iso
+            _failure_num.append(failures)
+
+        project_found = await with_vision_locked(
+            session, task.project_id, _bump_failures
+        )
+        if project_found:
+            project = await session.get(Project, task.project_id)
             if cycle_id:
                 # Audit W2: failure recorded on the StrategicCycle row.
                 failed_cycle = await strategic_cycle.mark_failure(
@@ -3932,8 +4482,8 @@ async def _handle_strategic_completion(
                 )
             else:
                 failed_cycle = None
-            session.add(project)
         else:
+            project = None
             failed_cycle = None
         task.latest_status_message = "Strategic output could not be parsed"
         session.add(task)
@@ -3955,7 +4505,7 @@ async def _handle_strategic_completion(
                 failure_reason="strategic_review unparseable output",
             ),
         )
-        failure_num = current_vision.get("_strategic_failures", "?") if project else "?"
+        failure_num = _failure_num[0] if _failure_num else "?"
         logger.warning(
             f"[STRATEGIC] Task {task.id}: unparseable output (failure #{failure_num})"
         )
@@ -3965,6 +4515,7 @@ async def _handle_strategic_completion(
                 session,
                 f"Strategic review could not parse agent output (failure #{failure_num}, task {str(task.id)[:8]})",
             )
+        await _maybe_retry_workday_auto_start(task.project_id)
         return
 
     new_vision = parsed.get("vision")
@@ -4102,7 +4653,11 @@ async def _handle_strategic_completion(
         try:
             from pydantic import ValidationError as _PmValidationError
 
-            from app.problem_model import apply_agent_update
+            from app.problem_model import (
+                active_direction_gap_ids as _active_direction_gap_ids,
+                apply_agent_update,
+                normalize_active_moves_writeback as _normalize_active_moves_writeback,
+            )
 
             # Resolve the cycle's baseline problem model (snapshot at spawn) for
             # the 3-way operator-wins merge, mirroring the vision baseline
@@ -4128,12 +4683,14 @@ async def _handle_strategic_completion(
                         if snap:
                             pm_baseline = snap
 
+            _protected_gap_ids = _active_direction_gap_ids(project.directions)
             try:
                 new_pm_raw, pm_diff = apply_agent_update(
                     current_raw=project.problem_model,
                     proposed_raw=new_problem_model,
                     now_iso=_utcnow().isoformat(),
                     baseline_raw=pm_baseline,
+                    protected_gap_ids=_protected_gap_ids,
                 )
             except _PmValidationError as pm_err:
                 logger.warning(
@@ -4143,6 +4700,29 @@ async def _handle_strategic_completion(
             else:
                 project.problem_model = new_pm_raw
                 flag_modified(project, "problem_model")
+                # Surface blocked gap deletions (active direction still references).
+                _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
+                if _blocked_dels:
+                    logger.warning(
+                        f"[STRATEGIC] Task {task.id}: gap deletion(s) blocked — "
+                        f"still referenced by active direction(s): {_blocked_dels}"
+                    )
+                # Normalize stale active_moves via shared helper so both write
+                # paths (op-endpoint + log-parse fallback) stay converged.
+                _active_dir_ids = {
+                    str(d.get("id"))
+                    for d in (project.directions or [])
+                    if d.get("status") == "active"
+                }
+                new_pm_raw, _norm = _normalize_active_moves_writeback(
+                    new_pm_raw, _active_dir_ids, _utcnow().isoformat()
+                )
+                if _norm:
+                    logger.info(
+                        f"[STRATEGIC] Task {task.id}: auto-normalized active_moves: {_norm}"
+                    )
+                    project.problem_model = new_pm_raw
+                    flag_modified(project, "problem_model")
                 logger.info(
                     f"[STRATEGIC] Updated problem_model for project {project.id} "
                     f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
@@ -4280,7 +4860,10 @@ async def _handle_strategic_completion(
             logger.exception("[STRATEGIC] Failed to append self_reflection (non-fatal)")
 
     if not new_vision or not isinstance(new_vision, dict):
-        # No vision produced — increment failure counter to prevent infinite strategic loops
+        # No vision produced — increment failure counter to prevent infinite strategic loops.
+        # `project` is already locked by lock_project_for_strategic_transition (or held by
+        # the caller via caller_holds_lock), so the RMW below is safe without re-acquiring
+        # with_vision_locked — a double-acquire would deadlock.
         current_vision = dict(project.vision or {})
         failures = current_vision.get("_strategic_failures", 0) + 1
         current_vision["_strategic_failures"] = failures
@@ -4305,6 +4888,7 @@ async def _handle_strategic_completion(
     created_ids_fb: list = []
     retired_ids_fb: list = []
     created_rationales_fb: Dict[str, str] = {}
+    created_retired_grounding_fb: dict[str, dict] = {}
     _pending_retire_memory: list = []
     # Rejected-proposal tombstones to persist into vision["rejected_proposals"]
     # after the op loop, via with_vision_locked() — same deferred-batch +
@@ -4313,10 +4897,19 @@ async def _handle_strategic_completion(
     _pending_rejected_proposals: list = []
     retired_rationales_fb: Dict[str, str] = {}
     # Gap-staffing reconciliations to apply to project.problem_model after the
-    # op loop. Each entry is ``(direction_id, new_gap_id, prior_gap_id)`` — the
-    # fallback mirror of the HTTP create/update_direction reconciliation. Applied
-    # once after the loop, in the same locked transaction as the directions write.
+    # op loop. Each entry is
+    # ``(direction_id, new_gap_id, prior_gap_id, new_status, prior_status)``.
+    # Applied once after the loop, in the same locked transaction as the
+    # directions write.
     _pending_gap_reconciles: list = []
+    # Delta tracking for the post-loop directions write.  Each op mutates the
+    # in-memory ``directions`` snapshot; capturing those mutations here lets the
+    # locked write apply only what changed against the FRESH DB list, so a
+    # direction added concurrently between snapshot and write is preserved rather
+    # than silently overwritten.
+    _delta_mutated: dict = {}   # str(id) -> final dict for any modified existing dir
+    _delta_removed: set = set() # str(ids) removed with no tombstone (reject, no text)
+    _delta_created: list = []   # new direction dicts appended this batch
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
             logger.warning(
@@ -4403,12 +4996,46 @@ async def _handle_strategic_completion(
                 _retired_memory = list(
                     (project.vision or {}).get("_recently_retired_directions") or []
                 )
-                _gap_block_reason = _check_gap_respawn_block(
+                _retired_grounding: dict | None = None
+                _gap_block_reason = None
+                _gap_match = find_gap_respawn_match(
                     text,
                     op_entry.get("gap_id"),
                     _retired_memory,
                     _gap_respawn_cooldown_days,
                 )
+                if _gap_match is not None:
+                    _matched_retired_entry, _gap_match_kind = _gap_match
+                    _retirement_memo = None
+                    _retired_direction_id = str(
+                        _matched_retired_entry.get("id") or ""
+                    )
+                    if _retired_direction_id:
+                        try:
+                            from app.knowledge_query import fetch_retirement_memo
+
+                            _retirement_memo = await fetch_retirement_memo(
+                                session,
+                                project.id,
+                                _retired_direction_id,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "[STRATEGIC] Task %s: failed to fetch retirement memo for %s",
+                                task.id,
+                                _retired_direction_id,
+                                exc_info=True,
+                            )
+                    _retired_grounding = build_retired_direction_grounding(
+                        _matched_retired_entry,
+                        _retirement_memo,
+                    )
+                    _gap_block_reason = _format_retired_grounding_reason(
+                        _matched_retired_entry,
+                        match_kind=_gap_match_kind,
+                        new_gap_id=op_entry.get("gap_id"),
+                        grounding=_retired_grounding,
+                    )
                 if _gap_block_reason:
                     logger.warning(
                         "[STRATEGIC] Task %s: create_direction '%s' blocked by recently-retired "
@@ -4466,6 +5093,19 @@ async def _handle_strategic_completion(
                         ]
                         if matched
                         else []
+                    )
+                    + (
+                        [
+                            {
+                                "text": _retired_grounding_note(
+                                    _retired_grounding,
+                                    _gap_block_reason or "",
+                                ),
+                                "added_at": _utcnow().isoformat(),
+                            }
+                        ]
+                        if _retired_grounding
+                        else []
                     ),
                     "research_history": [],
                     "context": {
@@ -4473,6 +5113,10 @@ async def _handle_strategic_completion(
                         "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
                     },
                 }
+                if _retired_grounding:
+                    new_dir["context"]["retired_direction_grounding"] = (
+                        _retired_grounding
+                    )
                 impl_constraints = str(
                     op_entry.get("implementation_constraints", "")
                 ).strip()
@@ -4492,13 +5136,28 @@ async def _handle_strategic_completion(
                         dr["distinction"] = distinction[:_DIR_FIELD_MAX]
                     if dr:
                         new_dir["context"]["dedup_reasoning"] = dr
+                        new_dir["context"]["grounding_verdict"] = validate_create_direction_grounding(
+                            dr,
+                            directions,
+                            _retired_memory,
+                        )
                 if op_entry.get("source"):
                     new_dir["source"] = str(op_entry["source"])[:64]
                 # Persist the direction→gap linkage (mirrors the API write path
                 # in admin_agent_ops.create_direction) so reconciliation can map
-                # an active direction back to its problem-model gap.
+                # an active direction back to its problem-model gap. Skip and warn
+                # when the gap_id resolves to a closed/nonexistent gap.
                 if op_entry.get("gap_id"):
-                    new_dir["gap_id"] = str(op_entry["gap_id"])
+                    _gid_fb = str(op_entry["gap_id"])
+                    from app.problem_model import check_gap_id_write
+                    _gap_err_fb, _ = check_gap_id_write(_gid_fb, project.problem_model)
+                    if _gap_err_fb:
+                        logger.warning(
+                            "[STRATEGIC] Task %s: skipping gap_id link for %s: gap %s is %s",
+                            task.id, new_dir["id"], _gid_fb, _gap_err_fb,
+                        )
+                    else:
+                        new_dir["gap_id"] = _gid_fb
                 if op_entry.get("paths"):
                     new_dir["paths"] = op_entry["paths"]
                 raw_category = op_entry.get("category")
@@ -4550,13 +5209,14 @@ async def _handle_strategic_completion(
                     )
                     new_dir["paused_at"] = _utcnow().isoformat()
                 directions.append(new_dir)
+                _delta_created.append(new_dir)
                 # Stage the gap this fresh active direction staffs (active_moves
                 # + clear deferral). Mirror the HTTP create_direction path: only a
                 # live active direction staffs a gap (a pause-translated direction
                 # is not yet working it). Applied to problem_model after the loop.
                 if new_dir.get("gap_id") and new_dir.get("status") == "active":
                     _pending_gap_reconciles.append(
-                        (new_dir["id"], new_dir["gap_id"], None)
+                        (new_dir["id"], new_dir["gap_id"], None, "active", None)
                     )
                 ops_applied += 1
                 creates_count += 1
@@ -4565,6 +5225,8 @@ async def _handle_strategic_completion(
                     created_rationales_fb[new_dir["id"]] = rationale[
                         :_RATIONALE_PERSIST_MAX
                     ]
+                if _retired_grounding:
+                    created_retired_grounding_fb[new_dir["id"]] = _retired_grounding
                 logger.info(
                     f"[STRATEGIC] Created direction '{text[:60]}' for project {project.id}"
                 )
@@ -4572,6 +5234,7 @@ async def _handle_strategic_completion(
             elif op == "update_direction":
                 dir_id = op_entry.get("direction_id")
                 changes = op_entry.get("changes", {})
+                raw_dedup_reasoning = op_entry.get("dedup_reasoning")
                 if not dir_id or not changes:
                     continue
                 blocked, why = challenge_rejects_portfolio_op(
@@ -4598,6 +5261,12 @@ async def _handle_strategic_completion(
                         # Prior gap_id captured before the change, for re-ground
                         # reconciliation (prune old gap, stage the new one).
                         _pre_gap_id_fb = d.get("gap_id")
+                        # Prior status, so a flip INTO a terminal state
+                        # (expired/superseded) records retired-direction memory
+                        # exactly once (and not on updates that were already
+                        # terminal).
+                        _pre_status_fb = d.get("status")
+                        _gap_changed_fb = False
                         if "text" in changes:
                             new_text = str(changes["text"])
                             if len(new_text) > STRATEGIC_DIRECTION_TEXT_MAX:
@@ -4614,16 +5283,25 @@ async def _handle_strategic_completion(
                         if "paths" in changes:
                             d["paths"] = changes["paths"]
                         # Update (or clear) the direction→gap linkage (mirrors the
-                        # API update_direction path in admin_agent_ops).
+                        # API update_direction path in admin_agent_ops). Skip and
+                        # warn when the new gap_id resolves to a closed/nonexistent gap.
                         if "gap_id" in changes:
                             gid = changes["gap_id"]
                             if gid:
-                                d["gap_id"] = str(gid)
+                                _gid_fb = str(gid)
+                                from app.problem_model import check_gap_id_write
+                                _gap_err_fb, _ = check_gap_id_write(_gid_fb, project.problem_model)
+                                if _gap_err_fb:
+                                    logger.warning(
+                                        "[STRATEGIC] Task %s: skipping gap_id link for %s: gap %s is %s",
+                                        task.id, dir_id, _gid_fb, _gap_err_fb,
+                                    )
+                                else:
+                                    d["gap_id"] = _gid_fb
+                                    _gap_changed_fb = True
                             else:
                                 d.pop("gap_id", None)
-                            _pending_gap_reconciles.append(
-                                (str(dir_id), d.get("gap_id"), _pre_gap_id_fb)
-                            )
+                                _gap_changed_fb = True
                         if "system_id" in changes:
                             if changes["system_id"]:
                                 sid_new = str(changes["system_id"])
@@ -4634,23 +5312,37 @@ async def _handle_strategic_completion(
                                 d["system_id"] = sid_new[:STRATEGIC_SYSTEM_ID_MAX]
                             else:
                                 d["system_id"] = None
+                        retired_memory = list(
+                            (project.vision or {}).get("_recently_retired_directions") or []
+                        )
                         if "status" in changes and changes["status"] in (
                             "active",
                             "paused",
                             "expired",
                             "superseded",
                         ):
-                            # Block reactivating a direction the user manually paused
-                            if (
-                                changes["status"] == "active"
-                                and d.get("status") == "paused"
-                                and not d.get("auto_paused")
-                            ):
-                                logger.warning(
-                                    f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}"
+                            # Reactivation goes through the shared seam so it clears
+                            # pause residue AND stamps the auto_recovered_at grace
+                            # marker when resuming from paused — preventing frozen
+                            # research_history from immediately re-pausing or
+                            # zombie-retiring the direction. The strategist may NOT
+                            # resume a user-paused direction (allow_user_paused=False):
+                            # the helper returns False and we keep the existing
+                            # blocked-reactivation warning, mutating nothing.
+                            if changes["status"] == "active":
+                                from app.direction_lifecycle import (
+                                    reactivate_paused_direction,
                                 )
+
+                                if not reactivate_paused_direction(
+                                    d, allow_user_paused=False
+                                ):
+                                    logger.warning(
+                                        f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}"
+                                    )
                             else:
                                 d["status"] = changes["status"]
+                                superseded_by = None
                                 if changes["status"] == "superseded":
                                     d["completed_at"] = _utcnow().isoformat()
                                     superseded_by = changes.get("superseded_by")
@@ -4668,6 +5360,61 @@ async def _handle_strategic_completion(
                                             }
                                     if superseded_by:
                                         d["superseded_by"] = superseded_by
+                            # Record retired-direction memory when this update
+                            # flips the direction INTO a terminal state. Queue
+                            # into the deferred batch (flushed under the single
+                            # post-loop with_vision_locked pass) - do NOT write
+                            # vision inside the op loop. Guard on the prior
+                            # status so an update that was already terminal, or
+                            # that sets a non-terminal status, records nothing.
+                            if (
+                                changes["status"] in ("expired", "superseded")
+                                and _pre_status_fb
+                                not in ("expired", "superseded")
+                            ):
+                                if changes["status"] == "superseded":
+                                    _fb_term_reason = "strategic_superseded"
+                                    _fb_sb = d.get("superseded_by")
+                                    _fb_succ = (
+                                        _fb_sb.get("direction_id")
+                                        if isinstance(_fb_sb, dict)
+                                        else None
+                                    )
+                                    _fb_term_outcome = (
+                                        f"superseded by {_fb_succ}"
+                                        if _fb_succ
+                                        else None
+                                    )
+                                else:
+                                    _fb_term_reason = "strategic_expired"
+                                    _fb_term_outcome = rationale or None
+                                _pending_retire_memory.append(
+                                    {
+                                        "snapshot": dict(d),
+                                        "reason": _fb_term_reason,
+                                        "outcome": _fb_term_outcome,
+                                    }
+                                )
+                        _DIR_FIELD_MAX = 500
+                        if isinstance(raw_dedup_reasoning, dict):
+                            dr: dict = {}
+                            closest = raw_dedup_reasoning.get("closest_directions")
+                            if isinstance(closest, list):
+                                dr["closest_directions"] = closest[:3]
+                            distinction = str(
+                                raw_dedup_reasoning.get("distinction") or ""
+                            ).strip()
+                            if distinction:
+                                dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+                            if dr:
+                                ctx = dict(d.get("context") or {})
+                                ctx["dedup_reasoning"] = dr
+                                ctx["grounding_verdict"] = validate_create_direction_grounding(
+                                    dr,
+                                    directions,
+                                    retired_memory,
+                                )
+                                d["context"] = ctx
                         if "category" in changes:
                             if changes["category"] in (
                                 "product",
@@ -4779,6 +5526,17 @@ async def _handle_strategic_completion(
                                     f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
                                 )
                             d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                        if _gap_changed_fb or d.get("status") != _pre_status_fb:
+                            _pending_gap_reconciles.append(
+                                (
+                                    str(dir_id),
+                                    d.get("gap_id"),
+                                    _pre_gap_id_fb,
+                                    d.get("status"),
+                                    _pre_status_fb,
+                                )
+                            )
+                        _delta_mutated[str(dir_id)] = d
                         ops_applied += 1
                         logger.info(
                             f"[STRATEGIC] Updated direction {dir_id} for project {project.id}: {list(changes.keys())}"
@@ -4806,7 +5564,13 @@ async def _handle_strategic_completion(
                     if d.get("id") == dir_id:
                         d["status"] = "retired"
                         d["retired_at"] = _utcnow().isoformat()
-                        _pending_retire_memory.append(dict(d))
+                        _pending_retire_memory.append(
+                            {
+                                "snapshot": dict(d),
+                                "reason": "strategic_retire",
+                                "outcome": rationale or None,
+                            }
+                        )
                         if rationale:
                             notes = d.get("notes", [])
                             notes.append(
@@ -4820,6 +5584,7 @@ async def _handle_strategic_completion(
                                     f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
                                 )
                             d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                        _delta_mutated[str(dir_id)] = d
                         ops_applied += 1
                         retires_applied += 1
                         retired_ids_fb.append(dir_id)
@@ -4862,6 +5627,8 @@ async def _handle_strategic_completion(
                 for d in directions:
                     if d.get("id") == dir_id:
                         staged_for_version = open_version.version_number
+                        _pre_status_fb = d.get("status")
+                        _gap_id_fb = d.get("gap_id")
                         d["status"] = "staged"
                         d["staged_for_version"] = staged_for_version
                         d["staged_at"] = _utcnow().isoformat()
@@ -4890,6 +5657,17 @@ async def _handle_strategic_completion(
                         }
                         flag_modified(task, "context")
                         session.add(task)
+                        if _gap_id_fb:
+                            _pending_gap_reconciles.append(
+                                (
+                                    str(dir_id),
+                                    _gap_id_fb,
+                                    _gap_id_fb,
+                                    "staged",
+                                    _pre_status_fb,
+                                )
+                            )
+                        _delta_mutated[str(dir_id)] = d
                         ops_applied += 1
                         logger.info(
                             f"[STRATEGIC] Staged direction {dir_id} for project {project.id}"
@@ -4937,6 +5715,16 @@ async def _handle_strategic_completion(
                     continue
                 target["status"] = "active"
                 target["activated_at"] = _utcnow().isoformat()
+                if target.get("gap_id"):
+                    _pending_gap_reconciles.append(
+                        (
+                            str(dir_id),
+                            target.get("gap_id"),
+                            target.get("gap_id"),
+                            "active",
+                            "proposed",
+                        )
+                    )
                 notes = target.get("notes", [])
                 notes.append(
                     {
@@ -4965,6 +5753,7 @@ async def _handle_strategic_completion(
                 }
                 flag_modified(task, "context")
                 session.add(task)
+                _delta_mutated[str(dir_id)] = target
                 ops_applied += 1
                 logger.info(
                     f"[STRATEGIC] Approved direction {dir_id} for project {project.id}"
@@ -5043,12 +5832,10 @@ async def _handle_strategic_completion(
                     if t.vm_instance_id:
                         vm_ids_to_delete.append(t.vm_instance_id)
                 directions = remaining
-                _d = directions
-                from app.task_locking import (
-                    with_directions_locked as _with_directions_locked,
-                )
-
-                await _with_directions_locked(session, task.project_id, lambda _: _d)
+                if rejected_text:
+                    _delta_mutated[str(dir_id)] = tombstone
+                else:
+                    _delta_removed.add(str(dir_id))
                 ctx = task.context or {}
                 task.context = {
                     **ctx,
@@ -5076,11 +5863,131 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Rejected direction {dir_id} for project {project.id}"
                 )
 
+            elif op == "activate_direction":
+                dir_id = op_entry.get("direction_id")
+                if not dir_id:
+                    continue
+                target = next((d for d in directions if d.get("id") == dir_id), None)
+                if not target:
+                    continue
+                cur_status = target.get("status")
+                _TERMINAL_STATUSES_FB = frozenset(
+                    {"retired", "expired", "superseded", "completed", "rejected"}
+                )
+                if cur_status == "active":
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback activate_direction skipped for %s because already active",
+                        task.id,
+                        dir_id,
+                    )
+                    continue
+                if cur_status in _TERMINAL_STATUSES_FB:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback activate_direction skipped for %s because terminal status=%s",
+                        task.id,
+                        dir_id,
+                        cur_status,
+                    )
+                    continue
+                blocked, why = challenge_rejects_portfolio_op(
+                    fallback_challenge_record,
+                    op,
+                    direction_id=str(dir_id),
+                )
+                if blocked:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback portfolio challenge blocked activate_direction for %s: %s",
+                        task.id,
+                        dir_id,
+                        why or "challenge rejected this activate_direction",
+                    )
+                    continue
+                active_count = sum(1 for d in directions if d.get("status") == "active")
+                max_active = _runtime_config.get("max_active_directions", 5)
+                if active_count >= max_active:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback activate_direction skipped for %s because active count %s/%s reached cap",
+                        task.id,
+                        dir_id,
+                        active_count,
+                        max_active,
+                    )
+                    continue
+                from app.direction_lifecycle import reactivate_paused_direction as _reactivate_fb
+                _reactivate_fb(target, allow_user_paused=True)
+                target.pop("staged_at", None)
+                if rationale:
+                    notes = target.get("notes", [])
+                    notes.append(
+                        {
+                            "text": f"Reactivated by strategic op: {rationale}",
+                            "added_at": _utcnow().isoformat(),
+                        }
+                    )
+                    target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                _gap_id_activate_fb = target.get("gap_id")
+                if _gap_id_activate_fb:
+                    _pending_gap_reconciles.append(
+                        (
+                            str(dir_id),
+                            _gap_id_activate_fb,
+                            _gap_id_activate_fb,
+                            "active",
+                            cur_status,
+                        )
+                    )
+                _delta_mutated[str(dir_id)] = target
+                ctx = task.context or {}
+                task.context = {
+                    **ctx,
+                    "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
+                    "_strategic_updated_ids": list(
+                        ctx.get("_strategic_updated_ids", [])
+                    ) + [dir_id],
+                }
+                flag_modified(task, "context")
+                session.add(task)
+                ops_applied += 1
+                logger.info(
+                    f"[STRATEGIC] Reactivated direction {dir_id} for project {project.id}"
+                )
+
         if ops_applied > 0:
             from app.task_locking import with_directions_locked
 
-            _dirs = list(directions)
-            await with_directions_locked(session, task.project_id, lambda _: _dirs)
+            _fb_mutated = dict(_delta_mutated)
+            _fb_removed = set(_delta_removed)
+            _fb_created = list(_delta_created)
+
+            def _apply_fb_delta(fresh: list) -> list:
+                result = []
+                for d in fresh:
+                    did = str(d.get("id") or "")
+                    if did in _fb_removed:
+                        continue
+                    if did in _fb_mutated:
+                        result.append(_fb_mutated[did])
+                    else:
+                        result.append(d)
+                fresh_ids = {str(d.get("id") or "") for d in fresh}
+                for new_dir in _fb_created:
+                    if str(new_dir.get("id") or "") not in fresh_ids:
+                        result.append(new_dir)
+                # Enforce the 20-tombstone cap on "rejected" entries so the
+                # fallback path stays consistent with the HTTP reject path
+                # (admin_agent_ops.py) and rejected entries never accumulate
+                # unboundedly via repeated fallback writes.
+                rejected_entries = [
+                    d for d in result if d.get("status") == "rejected"
+                ]
+                if len(rejected_entries) > 20:
+                    non_rejected = [
+                        d for d in result if d.get("status") != "rejected"
+                    ]
+                    result = non_rejected + rejected_entries[-20:]
+                return result
+
+            await with_directions_locked(session, task.project_id, _apply_fb_delta)
 
         # Reconcile problem-model gaps for any create/re-ground that carried a
         # gap_id, in the same locked transaction as the directions write (the
@@ -5090,7 +5997,7 @@ async def _handle_strategic_completion(
         if _pending_gap_reconciles:
             from app.problem_model import (
                 parse_problem_model,
-                reconcile_gap_staffing,
+                reconcile_gap_staffing_for_status,
             )
             from pydantic import ValidationError as _PMValidationError
 
@@ -5100,9 +6007,32 @@ async def _handle_strategic_completion(
                 _pm_model = None
             if _pm_model is not None:
                 _pm_changed = False
-                for _did, _new_g, _prior_g in _pending_gap_reconciles:
-                    if reconcile_gap_staffing(_pm_model, _did, _new_g, _prior_g):
+                for _entry in _pending_gap_reconciles:
+                    if len(_entry) == 3:
+                        _did, _new_g, _prior_g = _entry
+                        _new_status = "active"
+                        _prior_status = None
+                    else:
+                        _did, _new_g, _prior_g, _new_status, _prior_status = _entry
+                    _result = reconcile_gap_staffing_for_status(
+                        _pm_model,
+                        _did,
+                        _new_g,
+                        _prior_g,
+                        new_status=_new_status,
+                        prior_status=_prior_status,
+                        now_iso=_utcnow().isoformat(),
+                    )
+                    if _result.changed:
                         _pm_changed = True
+                    if _result.unresolved_gap_ids:
+                        logger.warning(
+                            "[STRATEGIC] Task %s: fallback gap staffing "
+                            "reconciliation unresolved for %s: %s",
+                            task.id,
+                            _did,
+                            _result.model_dump(),
+                        )
                 if _pm_changed:
                     project.problem_model = _pm_model.model_dump()
                     flag_modified(project, "problem_model")
@@ -5114,7 +6044,12 @@ async def _handle_strategic_completion(
 
             def _apply_retire_memory(vision: dict) -> None:
                 for _rd in _retire_batch:
-                    record_retired_direction_memory(vision, _rd, reason="strategic_retire")
+                    record_retired_direction_memory(
+                        vision,
+                        _rd["snapshot"],
+                        reason=_rd["reason"],
+                        outcome=_rd.get("outcome"),
+                    )
 
             await with_vision_locked(session, task.project_id, _apply_retire_memory)
 
@@ -5166,8 +6101,12 @@ async def _handle_strategic_completion(
     await _apply_version_phase_decision(
         _vpd_parsed, task, project, session, path="fallback"
     )
+    # See _apply_qualify_request_post_commit: the qualify_request side-effect does
+    # slow GitHub I/O and must run AFTER this path's lock-release commit, on a
+    # fresh session — never under the completion's Project lock. Captured here.
     _qr_parsed = parsed.get("qualify_request")
-    await _apply_qualify_request(_qr_parsed, task, project, session, path="fallback")
+    _qr_task_id_fb = task.id
+    _qr_project_id_fb = task.project_id
 
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.
@@ -5197,6 +6136,10 @@ async def _handle_strategic_completion(
                     project, retired_ids_fb
                 ),
             }
+            if created_retired_grounding_fb:
+                _fb_extra["created_retired_grounding"] = dict(
+                    created_retired_grounding_fb
+                )
             _fb_critiques = parsed.get("retired_direction_critiques")
             if _fb_critiques is not None:
                 _fb_extra["retirement_critiques"] = _fb_critiques
@@ -5390,13 +6333,24 @@ async def _handle_strategic_completion(
                             from app.notification_dispatch import (
                                 post_question_answer,
                             )
+                            from app.strategic_resident_session import (
+                                read_resident_session,
+                                resident_session_is_active,
+                            )
 
+                            _resident_blob = read_resident_session(project.vision)
                             await post_question_answer(
                                 session,
                                 project.id,
                                 msg.id,
                                 msg.resolution or "Addressed by strategic review",
                                 task.id,
+                                resident_session_id=(
+                                    _resident_blob.get("session_id")
+                                    if isinstance(_resident_blob, dict)
+                                    and resident_session_is_active(_resident_blob)
+                                    else None
+                                ),
                             )
                         except Exception as _e:  # noqa: BLE001
                             logger.warning(
@@ -5452,12 +6406,27 @@ async def _handle_strategic_completion(
     # cycle; the user acknowledges to stamp a read-marker.
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
     session.add(task)
-    await _spawn_retirement_memos(
-        session, project, task, retired_ids_fb, retired_rationales_fb
-    )
+    try:
+        await _spawn_retirement_memos(
+            session, project, task, retired_ids_fb, retired_rationales_fb
+        )
+    except Exception:
+        logger.error(
+            "[STRATEGIC] Task %s: _spawn_retirement_memos failed (fallback path); retirement memos "
+            "not created for direction IDs %s — commit will still proceed",
+            task.id,
+            retired_ids_fb,
+            exc_info=True,
+        )
     await (
         session.commit()
     )  # Single commit: vision + directions + messages + task status
+    # qualify_request runs post-commit on its own fresh session (see
+    # _apply_qualify_request_post_commit) so its slow GitHub I/O never holds this
+    # completion's Project lock / connection.
+    await _apply_qualify_request_post_commit(
+        _qr_parsed, task_id=_qr_task_id_fb, project_id=_qr_project_id_fb, path="fallback"
+    )
     # Post-commit: notify the admin UI of every strategist output this
     # legacy-parse path wrote, then close the cycle. Tiny refetch signals.
     from app.strategic_events import (
@@ -5524,3 +6493,4 @@ async def _handle_strategic_completion(
     logger.info(
         f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved"
     )
+    await _maybe_retry_workday_auto_start(task.project_id)

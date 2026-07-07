@@ -38,11 +38,12 @@ vi.mock('../api', async () => {
     API_BASE_URL: 'https://blueprint-orchestrator-xyz.a.run.app',
     listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
     registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret-xyz' })),
+    rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated-xyz' })),
     revokeFleetRunner: vi.fn(async () => {}),
   });
 });
 
-import { listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api';
+import { listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken } from '../api';
 
 describe('FleetRunnersPanel — behavioral', () => {
   let root: Root | null = null;
@@ -327,10 +328,92 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(statusAfter?.textContent).toContain('operator-laptop');
   });
 
+  // ── Rotate runner token ──────────────────────────────────────────────────────
+
+  test('rotating a runner shows ConfirmDialog, calls rotateFleetRunnerToken on confirm, and shows restart-focused token dialog', async () => {
+    const clipboardWrite = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWrite },
+    });
+    const el = await mount();
+
+    const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+    expect(rotateBtn).not.toBeNull();
+
+    await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // ConfirmDialog should be visible with rotate-specific text
+    expect(el.textContent).toContain('current token will stop working immediately');
+    expect(rotateFleetRunnerToken).not.toHaveBeenCalled();
+
+    // Confirm the dialog
+    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+    expect(confirmBtn).not.toBeNull();
+    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(rotateFleetRunnerToken).toHaveBeenCalledWith('proj-test', SAMPLE_RUNNERS[0].id);
+    expect(el.textContent).toContain('Runner token rotated');
+    expect(el.textContent).toContain('tok-rotated-xyz');
+    expect(el.textContent).toContain('Restart the existing runner process');
+    expect(el.textContent).toContain('Restart required');
+    expect(el.textContent).not.toContain('Connected on this project');
+    expect(el.textContent).toContain('Windows PowerShell');
+    expect(el.textContent).toContain('macOS/Linux');
+    expect(el.textContent).toContain('py -3 scripts/blueprint_runner.py start');
+    expect(el.textContent).toContain('bash blueprint-runner start');
+
+    const tokenCopyBtn = el.querySelector('button[title="Copy token"]');
+    const shellCopyBtn = el.querySelector('button[title="Copy macOS/Linux setup snippet"]');
+    expect(tokenCopyBtn).not.toBeNull();
+    expect(shellCopyBtn).not.toBeNull();
+
+    await act(async () => { (tokenCopyBtn as HTMLButtonElement).click(); });
+    expect(clipboardWrite).toHaveBeenLastCalledWith('tok-rotated-xyz');
+    await act(async () => { (shellCopyBtn as HTMLButtonElement).click(); });
+    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining("bash blueprint-runner start --token 'tok-rotated-xyz'"));
+  });
+
+  test('cancelling the rotate confirm does not call rotateFleetRunnerToken', async () => {
+    const el = await mount();
+
+    const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+    await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // ConfirmDialog should be visible
+    expect(el.querySelector('[data-testid="confirm-dialog-confirm"]')).not.toBeNull();
+
+    // Cancel the dialog
+    const cancelBtn = Array.from(el.querySelectorAll('button')).find(b => b.textContent === 'Cancel');
+    await act(async () => { (cancelBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(rotateFleetRunnerToken).not.toHaveBeenCalled();
+    expect(el.textContent).not.toContain('Runner token rotated');
+  });
+
+  test('rotate error is displayed in the panel', async () => {
+    vi.mocked(rotateFleetRunnerToken).mockRejectedValueOnce(new Error('Rotate failed'));
+    const el = await mount();
+
+    const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+    await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(el.textContent).toContain('Rotate failed');
+    expect(el.textContent).not.toContain('Runner token rotated');
+  });
+
   // ── Revoke runner ────────────────────────────────────────────────────────────
 
-  test('revoking a runner prompts window.confirm before calling revokeFleetRunner', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  test('revoking a runner shows ConfirmDialog before calling revokeFleetRunner', async () => {
     const el = await mount();
 
     const revokeBtn = el.querySelector('button[title="Revoke runner"]');
@@ -339,28 +422,35 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => { (revokeBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(revokeFleetRunner).toHaveBeenCalledWith('proj-test', SAMPLE_RUNNERS[0].id);
+    // ConfirmDialog should be visible
+    expect(el.querySelector('[data-testid="confirm-dialog-confirm"]')).not.toBeNull();
+    expect(revokeFleetRunner).not.toHaveBeenCalled();
 
-    confirmSpy.mockRestore();
+    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(revokeFleetRunner).toHaveBeenCalledWith('proj-test', SAMPLE_RUNNERS[0].id);
   });
 
   test('cancelling the revoke confirm does not call revokeFleetRunner', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     const el = await mount();
 
     const revokeBtn = el.querySelector('button[title="Revoke runner"]');
     await act(async () => { (revokeBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(revokeFleetRunner).not.toHaveBeenCalled();
+    // ConfirmDialog should be visible
+    expect(el.querySelector('[data-testid="confirm-dialog-confirm"]')).not.toBeNull();
 
-    confirmSpy.mockRestore();
+    const cancelBtn = Array.from(el.querySelectorAll('button')).find(b => b.textContent === 'Cancel');
+    await act(async () => { (cancelBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(revokeFleetRunner).not.toHaveBeenCalled();
   });
 
   test('revoke error is displayed in the panel', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.mocked(revokeFleetRunner).mockRejectedValueOnce(new Error('Network error'));
     const el = await mount();
 
@@ -368,8 +458,11 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => { (revokeBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
+    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
     expect(el.textContent).toContain('Network error');
-    vi.restoreAllMocks();
   });
 
   // ── capsSummary ──────────────────────────────────────────────────────────────
@@ -921,5 +1014,116 @@ describe('FleetRunnersPanel — behavioral', () => {
     vi.mocked(listFleetRunners).mockRejectedValueOnce(new Error('Unauthorized'));
     const el = await mount();
     expect(el.textContent).toContain('Unauthorized');
+  });
+
+  // ── live prop / 30s poll gating ──────────────────────────────────────────────
+
+  test('test_live_stream_suppresses_blind_30s_poll: when live=true, setInterval is not called with 30000', async () => {
+    const intervals: number[] = [];
+    const origSetInterval = globalThis.setInterval;
+    const spy = vi.spyOn(globalThis, 'setInterval').mockImplementation((fn, delay, ...args) => {
+      if (typeof delay === 'number') intervals.push(delay);
+      return origSetInterval(fn, delay, ...args);
+    });
+    try {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<FleetRunnersPanel projectId="proj-live" live={true} />);
+      });
+      await act(async () => {});
+
+      // The 30s blind-poll interval must not be registered when live=true
+      expect(intervals).not.toContain(30000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('when live=false, setInterval is called with 30000 (poll runs)', async () => {
+    const intervals: number[] = [];
+    const origSetInterval = globalThis.setInterval;
+    const spy = vi.spyOn(globalThis, 'setInterval').mockImplementation((fn, delay, ...args) => {
+      if (typeof delay === 'number') intervals.push(delay);
+      return origSetInterval(fn, delay, ...args);
+    });
+    try {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<FleetRunnersPanel projectId="proj-poll" live={false} />);
+      });
+      await act(async () => {});
+
+      expect(intervals).toContain(30000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('when live is absent (default), setInterval fires with 30000 (backward-compat)', async () => {
+    const intervals: number[] = [];
+    const origSetInterval = globalThis.setInterval;
+    const spy = vi.spyOn(globalThis, 'setInterval').mockImplementation((fn, delay, ...args) => {
+      if (typeof delay === 'number') intervals.push(delay);
+      return origSetInterval(fn, delay, ...args);
+    });
+    try {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<FleetRunnersPanel projectId="proj-default" />);
+      });
+      await act(async () => {});
+
+      expect(intervals).toContain(30000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('enrollment fast-poll (3s) still fires when live=true and enroll dialog is open', async () => {
+    // Reset mock so runner-new is NOT in the list (a prior test's mockResolvedValue
+    // would otherwise include it as 'connected', making enrolledConnected=true which
+    // short-circuits the fast-poll useEffect).
+    vi.mocked(listFleetRunners).mockResolvedValue(SAMPLE_RUNNERS);
+
+    // Use fake timers only for setInterval/clearInterval so React's scheduler
+    // (which uses MessageChannel/setTimeout) keeps working normally.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<FleetRunnersPanel projectId="proj-enroll-live" live={true} />);
+      });
+      await act(async () => {});
+
+      const enrollBtn = [...(host as HTMLDivElement).querySelectorAll('button')].find(b => b.textContent?.includes('Enroll runner'));
+      await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+
+      // Verify the dialog opened and the runner has not yet connected
+      expect((host as HTMLDivElement).textContent).toContain('Waiting for your runner to connect');
+
+      const callsBeforeAdvance = vi.mocked(listFleetRunners).mock.calls.length;
+
+      // Advance 3s: the enrollment fast-poll (gated on pendingToken, NOT on live)
+      // must still fire when live=true — assert an extra load() call occurs.
+      await act(async () => { vi.advanceTimersByTime(3000); });
+      await act(async () => {});
+
+      expect(vi.mocked(listFleetRunners).mock.calls.length).toBeGreaterThan(callsBeforeAdvance);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

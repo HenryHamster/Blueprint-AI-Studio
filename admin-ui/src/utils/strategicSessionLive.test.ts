@@ -77,6 +77,27 @@ describe('computeStrategicSessionActivity', () => {
     expect(activity.items.map(i => i.text)).toEqual(['$ ls', 'edited a.ts']);
   });
 
+  it('recognises working lifecycle for an autonomous turn', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
+      delta({ id: 2, seq: 2, kind: 'command', text: '$ git log' }),
+    ];
+    const activity = computeStrategicSessionActivity(transcript, []);
+    expect(activity.latestLifecycle).toBe('working');
+    expect(activity.items.map(i => i.text)).toEqual(['$ git log']);
+  });
+
+  it('done after working clears the strip and sets latestLifecycle to done', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
+      delta({ id: 2, seq: 2, kind: 'command', text: '$ old cmd' }),
+      delta({ id: 3, seq: 3, kind: 'status', text: 'done', status: 'done' }),
+    ];
+    const activity = computeStrategicSessionActivity(transcript, []);
+    expect(activity.latestLifecycle).toBe('done');
+    expect(activity.items).toHaveLength(0);
+  });
+
   it('drops activity up to and including the last done frame (completed turn)', () => {
     const transcript = [
       delta({ id: 1, seq: 1, kind: 'command', text: '$ old' }),

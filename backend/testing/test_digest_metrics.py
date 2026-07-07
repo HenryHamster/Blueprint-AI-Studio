@@ -7,6 +7,7 @@ import pytest
 
 from app.models import (
     TaskStatus,
+    QualificationVerdict,
     ReleaseVersion,
 )
 from app.digest_metrics import (
@@ -26,6 +27,7 @@ from app.digest_metrics import (
     compute_migration_slot_contention_summary,
     _MIGRATION_SLOT_HOLD_ALERT_SECONDS,
     compute_narrative_summary,
+    compute_outer_loop_convergence,
     compute_dependency_health_signals,
     compute_recurring_error_clusters,
     compute_release_qualifier_infra_metrics,
@@ -2380,6 +2382,73 @@ def test_compute_non_code_outcomes_empty_when_no_qualifying_tasks():
     assert _compute_non_code_outcomes([inflight], window_start) == {}
 
 
+def test_compute_non_code_outcomes_includes_window_straddling_terminal_task():
+    """Task created before window but completed within window is included.
+
+    A task created before window_start but whose terminal status transition
+    (completion/failure/cancellation) occurs within the window should be counted
+    in non-code outcomes. This ensures we measure the actual delivery of outcomes
+    within a time period, not the spawn time.
+    """
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    # Created well before the window
+    created_before_window = window_start - timedelta(hours=12)
+    # But completed within the window
+    completed_in_window = window_start + timedelta(hours=1)
+
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        plan_output=[{"title": "Investigate", "actionability_grade": "HIGH"}],
+        created_at=created_before_window,
+        status_log=[{"s": "COMPLETED", "t": completed_in_window.isoformat()}],
+    )
+
+    result = _compute_non_code_outcomes([task], window_start)
+    # Task should be included because it completed within the window.
+    assert result["total"] == 1
+    assert result["successes"] == 1
+    assert result["neutrals"] == 0
+    assert result["failures"] == 0
+
+
+def test_outer_loop_convergence_non_code_outcomes_includes_straddling_task():
+    """compute_outer_loop_convergence counts non-code tasks that straddle the window.
+
+    A task created before window_start but completing within the window must appear
+    in non_code_outcomes. This validates that the DB query layer must supply tasks
+    with a wider lookback (created_at < window_start) so _compute_non_code_outcomes
+    (which correctly windows on completion time) can count them.
+    """
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    # Created well before the window but completed within it
+    created_before_window = window_start - timedelta(hours=12)
+    completed_in_window = window_start + timedelta(hours=2)
+
+    straddling_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        plan_output=[{"title": "Finding", "actionability_grade": "HIGH"}],
+        created_at=created_before_window,
+        status_log=[{"s": "COMPLETED", "t": completed_in_window.isoformat()}],
+    )
+
+    result = compute_outer_loop_convergence(
+        all_tasks=[straddling_task],
+        escalation_alerts=[],
+        window_start=window_start,
+    )
+
+    non_code = result.get("non_code_outcomes", {})
+    assert non_code.get("total") == 1, (
+        "Straddling non-code task (created before window, completed within) must "
+        "appear in non_code_outcomes; DB layer must use a wider lookback_cutoff"
+    )
+    assert non_code.get("successes") == 1
+
+
 class TestComputeRetryAnalytics:
     """Unit tests for the extracted compute_retry_analytics helper."""
 
@@ -2519,6 +2588,41 @@ class TestComputeRetryAnalytics:
         assert result["retry_success_count"] == 2
         assert result["retry_wasted_rate"] == round(1 / 3, 4)
 
+    def test_avg_retries_before_failure_correct(self):
+        """avg_retries_before_failure counts actual retries (attempt_number - 1), not attempt ordinal.
+
+        _attempt_number is 1-indexed: 1=first attempt, 2=second attempt (1 retry), 3=third (2 retries).
+        The average should reflect the number of retries, not the attempt number.
+        """
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        failed = [
+            # _attempt_number=2 → 1 retry (second attempt)
+            make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 2},
+            ),
+            # _attempt_number=3 → 2 retries (third attempt)
+            make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 3},
+            ),
+            # _attempt_number=2 → 1 retry
+            make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 2},
+            ),
+        ]
+        result = compute_retry_analytics(
+            failed_tasks=failed,
+            completed_tasks=[],
+            dir_id_to_text={},
+            window_start=window_start,
+        )
+        # 3 retried failed tasks: (1 + 2 + 1) retries / 3 tasks = 4 / 3 ≈ 1.33
+        assert result["retry_task_count"] == 3
+        assert result["avg_retries_before_failure"] == round(4 / 3, 2)
+
 
 @pytest.mark.asyncio
 async def test_release_qualifier_infra_metrics_no_versions(db_session):
@@ -2541,15 +2645,20 @@ async def test_release_qualifier_infra_metrics_no_versions(db_session):
 
 @pytest.mark.asyncio
 async def test_release_qualifier_infra_metrics_counts_by_error_category(db_session):
-    """Rows with distinct infra_failure error codes increment the correct buckets."""
+    """Verdict rows with distinct infra_failure error codes increment correct buckets."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="stabilize")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
     now = _utcnow()
     window_start = now - timedelta(hours=24)
-    finalized_at = (now - timedelta(hours=1)).isoformat()
+    finalized_at = now - timedelta(hours=1)
 
     error_cases = [
         "audit_report_missing",
@@ -2557,19 +2666,16 @@ async def test_release_qualifier_infra_metrics_counts_by_error_category(db_sessi
         "smoketest_report_missing",
         "audit_task_failed_other",  # unknown bucket — counts in total only
     ]
-    for i, error in enumerate(error_cases):
-        v = ReleaseVersion(
-            project_id=project.id,
-            version_number=i + 1,
-            phase="stabilize",
-            last_qualification={
-                "status": "infra_failure",
-                "error": error,
-                "consecutive_infra_errors": 1,
-                "finalized_at": finalized_at,
-            },
+    for error in error_cases:
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                terminal_status="infra_failure",
+                finalized_at=finalized_at,
+                sub_scores={"infra_failure": {"error": error, "consecutive_infra_errors": 1}},
+            )
         )
-        db_session.add(v)
     await db_session.commit()
 
     result = await compute_release_qualifier_infra_metrics(
@@ -2592,35 +2698,26 @@ async def test_release_qualifier_infra_metrics_counts_repeat_signatures(db_sessi
     await db_session.commit()
     await db_session.refresh(project)
 
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="stabilize")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
     now = _utcnow()
-    finalized_at = (now - timedelta(hours=1)).isoformat()
-    rows = [
-        {
-            "same_error_as_prior": True,
-            "same_error_different_candidate": True,
-        },
-        {
-            "same_infra_failure_as_previous": True,
-            "same_infra_failure_different_candidate": False,
-        },
-        {
-            "same_error_as_prior": False,
-            "same_error_different_candidate": False,
-        },
+    finalized_at = now - timedelta(hours=1)
+    infra_evidences = [
+        {"error": "audit_infra_respawn_cap_exceeded", "consecutive_infra_errors": 1, "same_error_as_prior": True, "same_error_different_candidate": True},
+        {"error": "audit_infra_respawn_cap_exceeded", "consecutive_infra_errors": 2, "same_error_as_prior": True, "same_error_different_candidate": False},
+        {"error": "audit_infra_respawn_cap_exceeded", "consecutive_infra_errors": 3, "same_error_as_prior": False, "same_error_different_candidate": False},
     ]
-    for i, evidence in enumerate(rows):
+    for evidence in infra_evidences:
         db_session.add(
-            ReleaseVersion(
+            QualificationVerdict(
                 project_id=project.id,
-                version_number=i + 1,
-                phase="stabilize",
-                last_qualification={
-                    "status": "infra_failure",
-                    "error": "audit_infra_respawn_cap_exceeded",
-                    "consecutive_infra_errors": i + 1,
-                    "finalized_at": finalized_at,
-                    **evidence,
-                },
+                release_version_id=version.id,
+                terminal_status="infra_failure",
+                finalized_at=finalized_at,
+                sub_scores={"infra_failure": evidence},
             )
         )
     await db_session.commit()
@@ -2643,22 +2740,24 @@ async def test_release_qualifier_infra_metrics_streak_max(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = _utcnow()
-    finalized_at = (now - timedelta(hours=1)).isoformat()
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="stabilize")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
-    for i, streak in enumerate([2, 4, 1]):
-        v = ReleaseVersion(
-            project_id=project.id,
-            version_number=i + 1,
-            phase="stabilize",
-            last_qualification={
-                "status": "infra_failure",
-                "error": "audit_report_missing",
-                "consecutive_infra_errors": streak,
-                "finalized_at": finalized_at,
-            },
+    now = _utcnow()
+    finalized_at = now - timedelta(hours=1)
+
+    for streak in [2, 4, 1]:
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                terminal_status="infra_failure",
+                finalized_at=finalized_at,
+                sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": streak}},
+            )
         )
-        db_session.add(v)
     await db_session.commit()
 
     result = await compute_release_qualifier_infra_metrics(
@@ -2671,40 +2770,39 @@ async def test_release_qualifier_infra_metrics_streak_max(db_session):
 
 @pytest.mark.asyncio
 async def test_release_qualifier_infra_metrics_excludes_outside_window(db_session):
-    """Rows finalized before window_start are not counted."""
+    """Verdict rows finalized before window_start are not counted."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = _utcnow()
-    old_finalized_at = (now - timedelta(hours=48)).isoformat()
-    recent_finalized_at = (now - timedelta(hours=1)).isoformat()
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="stabilize")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
-    old_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=1,
-        phase="stabilize",
-        last_qualification={
-            "status": "infra_failure",
-            "error": "audit_report_missing",
-            "consecutive_infra_errors": 3,
-            "finalized_at": old_finalized_at,
-        },
+    now = _utcnow()
+    old_finalized_at = now - timedelta(hours=48)
+    recent_finalized_at = now - timedelta(hours=1)
+
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=old_finalized_at,
+            sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": 3}},
+        )
     )
-    recent_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=2,
-        phase="stabilize",
-        last_qualification={
-            "status": "infra_failure",
-            "error": "smoketest_report_missing",
-            "consecutive_infra_errors": 1,
-            "finalized_at": recent_finalized_at,
-        },
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=recent_finalized_at,
+            sub_scores={"infra_failure": {"error": "smoketest_report_missing", "consecutive_infra_errors": 1}},
+        )
     )
-    db_session.add(old_version)
-    db_session.add(recent_version)
     await db_session.commit()
 
     result = await compute_release_qualifier_infra_metrics(
@@ -2720,46 +2818,40 @@ async def test_release_qualifier_infra_metrics_excludes_outside_window(db_sessio
 
 @pytest.mark.asyncio
 async def test_release_qualifier_infra_metrics_qualifier_runs_total(db_session):
-    """qualifier_runs_total counts all finalized quals, not just infra_failure ones."""
+    """qualifier_runs_total counts all finalized verdict rows, not just infra_failure ones."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = _utcnow()
-    finalized_at = (now - timedelta(hours=1)).isoformat()
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="promote")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
-    # One infra_failure and one successful promotion
-    infra_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=1,
-        phase="stabilize",
-        last_qualification={
-            "status": "infra_failure",
-            "error": "audit_report_missing",
-            "consecutive_infra_errors": 1,
-            "finalized_at": finalized_at,
-        },
+    now = _utcnow()
+    finalized_at = now - timedelta(hours=1)
+
+    # One infra_failure verdict
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=finalized_at,
+            sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": 1}},
+        )
     )
-    promoted_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=2,
-        phase="promote",
-        last_qualification={
-            "status": "promoted",
-            "finalized_at": finalized_at,
-        },
+    # One promoted verdict — counts in total but not infra
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="promoted",
+            finalized_at=finalized_at,
+            sub_scores=None,
+        )
     )
-    # Version with no qualification at all — should not count
-    unqual_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=3,
-        phase="build",
-        last_qualification=None,
-    )
-    db_session.add(infra_version)
-    db_session.add(promoted_version)
-    db_session.add(unqual_version)
     await db_session.commit()
 
     result = await compute_release_qualifier_infra_metrics(
@@ -2769,6 +2861,89 @@ async def test_release_qualifier_infra_metrics_qualifier_runs_total(db_session):
     )
     assert result["qualifier_runs_total"] == 2
     assert result["release_infra_failure_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_release_qualifier_infra_metrics_count_historical_verdict_rows_after_requalification(
+    db_session,
+):
+    """Infra attempts preserved as verdict rows are counted even after a later
+    successful requalification overwrites last_qualification.
+
+    This is the core regression test for the bug: ReleaseVersion.last_qualification
+    is mutable and holds only the latest verdict. QualificationVerdict rows are
+    immutable; each run appends one. After a successful re-qualification the infra
+    rows must still be visible to the infra-metrics counter.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    finalized_at = now - timedelta(hours=2)
+
+    # Single version that had two infra failures and then a successful promotion.
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="promote",
+        # last_qualification reflects only the final promoted state —
+        # the two prior infra failures are gone from here.
+        last_qualification={
+            "status": "promoted",
+            "finalized_at": (now - timedelta(hours=1)).isoformat(),
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Infra attempt 1 — audit_report_missing
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=finalized_at,
+            sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": 1, "same_error_as_prior": False, "same_error_different_candidate": False}},
+        )
+    )
+    # Infra attempt 2 — same error, same candidate
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=finalized_at,
+            sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": 2, "same_error_as_prior": True, "same_error_different_candidate": False}},
+        )
+    )
+    # Successful promotion verdict — overwrites last_qualification in production
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="promoted",
+            finalized_at=now - timedelta(hours=1),
+            sub_scores=None,
+        )
+    )
+    await db_session.commit()
+
+    result = await compute_release_qualifier_infra_metrics(
+        db_session,
+        project_id=project.id,
+        window_start=now - timedelta(hours=24),
+    )
+    # All 3 verdict rows (2 infra + 1 promoted) count toward total runs.
+    assert result["qualifier_runs_total"] == 3
+    # Both infra verdicts are counted even though last_qualification only shows promoted.
+    assert result["release_infra_failure_total"] == 2
+    assert result["audit_report_missing_count"] == 2
+    # The second infra attempt had same_error_as_prior=True.
+    assert result["release_infra_failure_repeat_signature_total"] == 1
+    assert result["release_infra_failure_streak_max"] == 2
 
 
 class TestDigestMetricsModuleSeams:
@@ -7195,3 +7370,62 @@ def test_digest_payload_keys_have_named_consumer():
         "admin-ui component reads it (not just a pending/retired annotation): "
         f"{consumerless}"
     )
+
+def test_multi_attempt_task_counts_once_in_cost_breakdown():
+    """A multi-attempt task contributes task_count=1, priced_task_count=1,
+    and merge_rate=1.0 even when it has two banked attempt-rows, not two."""
+    from app.llm_cost_attribution import compute_llm_cost_breakdown
+    from app.models import TaskStatus, bank_task_current_attempt
+
+    now = _utcnow()
+
+    # Build a task with one banked attempt and one live attempt (both on the
+    # same anthropic/claude-sonnet-4-6 model — a priced combo).
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+        },
+        vm_provisioned_at=now,
+        vm_spot=True,
+    )
+    # Bank the first attempt into attempt_history so the task has two rows.
+    bank_task_current_attempt(task, stopped_at=now)
+
+    # Set up a second live attempt.
+    task.api_call_summary = {
+        "llm_call_count": 2,
+        "total_input_tokens": 250,
+        "total_output_tokens": 150,
+    }
+    task.vm_provisioned_at = now
+
+    breakdown = compute_llm_cost_breakdown([task])
+    totals = breakdown["totals"]
+
+    # One task → task_count=1 (not 2 attempt-rows).
+    assert totals["task_count"] == 1, (
+        f"task_count should be 1 (one task), got {totals['task_count']}"
+    )
+    # One priced task → priced_task_count=1 (not 2 attempt-rows).
+    assert totals["priced_task_count"] == 1, (
+        f"priced_task_count should be 1 (one task), got {totals['priced_task_count']}"
+    )
+    assert totals["unpriced_task_count"] == 0
+
+    # One merged task → merge_rate=1.0 (not 0.5 as if task_count were 2).
+    assert totals["merged_count"] == 1
+    assert totals["merge_rate"] == 1.0, (
+        f"merge_rate should be 1.0 (1 merged / 1 task), got {totals['merge_rate']}"
+    )
+
+    # Model bucket should also count the task once.
+    by_model = {(r["provider"], r["model"]): r for r in breakdown["by_model"]}
+    row = by_model[("anthropic", "claude-sonnet-4-6")]
+    assert row["task_count"] == 1
+    assert row["merge_rate"] == 1.0

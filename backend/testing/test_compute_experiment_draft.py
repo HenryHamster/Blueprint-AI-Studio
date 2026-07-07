@@ -185,6 +185,51 @@ class TestComputeExperimentDraftDoesNotPersist:
         assert len(jobs) == 0, "Draft endpoint must not create ComputeJob rows"
 
 
+class TestDraftRefinementRevisesPriorDraft:
+    """Multi-turn refinement: a second call with prior_draft revises the existing contract."""
+
+    @pytest.mark.asyncio
+    async def test_draft_refinement_revises_prior_draft(self, client: AsyncClient):
+        """Passing prior_draft alongside a refinement idea returns a revised contract."""
+        prior_draft_dict = json.loads(_GOOD_LLM_RESPONSE)
+
+        revised_response = json.dumps({
+            **prior_draft_dict,
+            "title": "PyTorch vs JAX (3 Arms)",
+            "command": None,
+            "arms": [
+                {"name": "pytorch", "command": "python3 bench/matmul_bench.py --backend pytorch"},
+                {"name": "jax", "command": "python3 bench/matmul_bench.py --backend jax"},
+                {"name": "jax-jit", "command": "python3 bench/matmul_bench.py --backend jax --jit"},
+            ],
+            "declared_metric": "throughput_gflops",
+            "spend_cap_usd": 5.0,
+        })
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key"}):
+            with patch("app.admin._call_draft_llm", new=AsyncMock(return_value=json.loads(revised_response))) as mock_llm:
+                resp = await client.post(
+                    "/api/admin/tasks/compute-experiment/draft",
+                    json={
+                        "idea": "make it 3 arms, cap at $5",
+                        "prior_draft": prior_draft_dict,
+                    },
+                )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["draft_available"] is True
+
+        # Verify the LLM was called with the prior_draft so refinement is context-aware.
+        mock_llm.assert_called_once()
+        call_kwargs = mock_llm.call_args
+        assert call_kwargs.args[4] == prior_draft_dict or call_kwargs.kwargs.get("prior_draft") == prior_draft_dict
+
+        # Revised draft should reflect the refinement (3 arms, higher spend cap).
+        assert data["arms"] is not None and len(data["arms"]) == 3
+        assert data["spend_cap_usd"] == 5.0
+
+
 class TestCoerceDraftUnit:
     """Unit tests for the _coerce_draft helper (no HTTP, no DB, no LLM)."""
 

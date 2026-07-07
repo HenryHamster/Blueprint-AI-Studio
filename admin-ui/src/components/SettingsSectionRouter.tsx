@@ -24,6 +24,7 @@ import type {
   AutoReviewConfig,
   ProjectResourceEnvelopeResponse,
   ResourceEnvelopeConfig,
+  OnboardingProof,
 } from '../types/project';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
@@ -137,6 +138,19 @@ export interface SettingsSectionRouterProps {
   anyAutonomousEnabled: boolean;
   onPauseAllAutonomous: () => Promise<void>;
   onRestartOrchestrator: () => Promise<void>;
+  // Direction guardrail knobs
+  directionChurnWindowCycles: number;
+  onUpdateDirectionChurnWindowCycles: (value: number) => void;
+  directionChurnNonMergeThreshold: number;
+  onUpdateDirectionChurnNonMergeThreshold: (value: number) => void;
+  directionChurnMinMergeRate: number;
+  onUpdateDirectionChurnMinMergeRate: (value: number) => void;
+  directionLifetimeNonMergeThreshold: number;
+  onUpdateDirectionLifetimeNonMergeThreshold: (value: number) => void;
+  directionLifetimeMinMergeRate: number;
+  onUpdateDirectionLifetimeMinMergeRate: (value: number) => void;
+  directionReviewRecommendationThreshold: number;
+  onUpdateDirectionReviewRecommendationThreshold: (value: number) => void;
 
   // Accounts
   githubAccount: string | null;
@@ -222,6 +236,7 @@ export interface SettingsSectionRouterProps {
   selectedProjectRepo: string | null;
   selectedProjectIsSelfRepo?: boolean;
   selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
+  selectedProjectOnboardingProof?: OnboardingProof | null;
   buildConfig: BuildConfig | null;
   onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
   onDetectBuildConfig: () => Promise<void>;
@@ -284,6 +299,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           notifyOnHighSignalMessage={props.notifyOnHighSignalMessage}
           onUpdateNotifyOnHighSignalMessage={props.onUpdateNotifyOnHighSignalMessage}
           onNavigateToNotifications={() => props.onNavigateToSection('notifications')}
+          selectedProjectOnboardingProof={props.selectedProjectOnboardingProof}
         />
       );
     case 'provider-routing':
@@ -354,6 +370,18 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           onPauseAllAutonomous={props.onPauseAllAutonomous}
           onRestartOrchestrator={props.onRestartOrchestrator}
           selectedProjectId={props.selectedProjectId}
+          directionChurnWindowCycles={props.directionChurnWindowCycles}
+          onUpdateDirectionChurnWindowCycles={props.onUpdateDirectionChurnWindowCycles}
+          directionChurnNonMergeThreshold={props.directionChurnNonMergeThreshold}
+          onUpdateDirectionChurnNonMergeThreshold={props.onUpdateDirectionChurnNonMergeThreshold}
+          directionChurnMinMergeRate={props.directionChurnMinMergeRate}
+          onUpdateDirectionChurnMinMergeRate={props.onUpdateDirectionChurnMinMergeRate}
+          directionLifetimeNonMergeThreshold={props.directionLifetimeNonMergeThreshold}
+          onUpdateDirectionLifetimeNonMergeThreshold={props.onUpdateDirectionLifetimeNonMergeThreshold}
+          directionLifetimeMinMergeRate={props.directionLifetimeMinMergeRate}
+          onUpdateDirectionLifetimeMinMergeRate={props.onUpdateDirectionLifetimeMinMergeRate}
+          directionReviewRecommendationThreshold={props.directionReviewRecommendationThreshold}
+          onUpdateDirectionReviewRecommendationThreshold={props.onUpdateDirectionReviewRecommendationThreshold}
         />
       );
     case 'deploy':
@@ -459,6 +487,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           dailyCostCeilingUsd={props.dailyCostCeilingUsd}
           onUpdateDailyCostCeiling={props.onUpdateDailyCostCeiling}
           isAdmin={props.isAdmin}
+          selectedProjectId={props.selectedProjectId}
         />
       );
     case 'build-config':

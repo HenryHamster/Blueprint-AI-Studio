@@ -70,11 +70,31 @@ _DEFAULT_PRECOMPUTE_HOURS: int = 24
 # on a request-serving connection. Overridable via runtime_config.
 PRECOMPUTE_INTERVAL_SECONDS: int = 45
 
-# Per-key compute budget for one precompute tick. The compute path already
-# sets a 30s LOCAL statement_timeout; this wraps the whole coroutine so a
-# wedged tick (e.g. waiting on a stuck connection checkout) cannot pin the
-# worker. Bounded < interval so ticks never overlap-stack.
+# Cooperative wall-time budget for one precompute tick. ``run_precompute_tick``
+# reads elapsed time BETWEEN units of work (never mid-query) and returns a
+# partial refresh once this is exceeded; the next tick resumes where this one
+# left off (the round-robin offset only advances past projects actually primed).
+# This REPLACES the old query-cancelling ``asyncio.timeout`` wrapper, which fired
+# mid-``session.execute``, made asyncpg raise ``CancelledError`` and ejected an
+# otherwise-healthy pool connection every overrun (~44/hr "[DB] Invalidated pool
+# connection after CancelledError", 1:1 timestamp-identical with this tick's
+# overrun). Bounded < interval so a normal tick never overlap-stacks. Each unit
+# is independently bounded (5s statement_timeout on digest, 30s on health), so
+# the tick stays bounded without ever cancelling a query.
 PRECOMPUTE_TICK_BUDGET_SECONDS: int = 35
+
+# Last-resort HARD timeout for the whole tick, kept only so a single pathological
+# unit that ignores its own statement_timeout (e.g. a wedged connection checkout,
+# before any query even runs) can never pin the worker task forever — which would
+# make the ``_tick_in_progress`` guard skip every future tick. Individual queries
+# are each capped by their own statement_timeout (5s digest / 30s health), but a
+# unit issues SEVERAL of them, so 180s is a generous — not a provable — upper
+# bound: in the common case the cooperative check returns early at
+# ``PRECOMPUTE_TICK_BUDGET_SECONDS`` between units, nowhere near this. A genuine
+# multi-query DB wedge (N_queries x statement_timeout) can still trip it — accepted:
+# rare, not the chronic every-tick overrun the cooperative budget eliminates. If it
+# does fire it cancels a query (the old failure mode), but only in that real wedge.
+PRECOMPUTE_TICK_HARD_TIMEOUT_SECONDS: int = 180
 
 # How long a precomputed entry is considered fresh enough to serve directly.
 # Beyond this the endpoint treats the cache as stale and falls back to a
@@ -490,24 +510,70 @@ async def _precompute_health_one(
     )
 
 
-async def run_precompute_tick(session_factory) -> int:
-    """Run one full precompute tick over the hot key set.
+@dataclass(frozen=True)
+class TickResult:
+    """Outcome of one precompute tick.
 
-    Returns the number of keys successfully refreshed. Each key computes on a
-    fresh session so one slow/failing key cannot poison the others' session.
-    Pure orchestration over ``_precompute_one`` / ``_precompute_health_one`` —
-    directly unit-testable with a session-factory stub.
+    ``refreshed`` is the number of hot keys successfully refreshed this tick —
+    the same meaning the old bare ``int`` return carried, so callers that only
+    care about the count read ``result.refreshed``.
 
-    Priming order is budget-aware: global views go first (most-hit keys), then
-    a round-robin SLICE of per-project digest keys, then the matching slice of
-    health keys. Only ``_PROJECTS_PER_TICK_SLICE`` projects are primed per tick;
-    the global ``_project_tick_offset`` advances each tick so every active project
-    is refreshed across multiple ticks rather than all 25 being hit every 45s.
-    Whatever the budget truncates degrades to the bounded on-demand path (the
-    prior behavior), never an error.
+    ``partial`` is True when the tick returned early because it reached the
+    cooperative wall-time budget BETWEEN units of work: the remaining keys are
+    deferred to the next tick, which resumes where this one left off (the
+    round-robin offset only advances past projects actually primed). A partial
+    tick is a normal, expected outcome under load — NOT an error — and, unlike
+    the old query-cancelling ``asyncio.timeout``, it never cancels an in-flight
+    query or invalidates a pool connection.
+    """
+
+    refreshed: int
+    partial: bool = False
+
+
+async def run_precompute_tick(
+    session_factory,
+    *,
+    budget_seconds: float | None = None,
+) -> TickResult:
+    """Run one precompute tick over the hot key set, cooperatively time-boxed.
+
+    Returns a :class:`TickResult`: ``refreshed`` counts the hot keys primed this
+    tick; ``partial`` is True if the tick stopped early on the cooperative budget.
+    Each key computes on a fresh session so one slow/failing key cannot poison the
+    others' session. Pure orchestration over ``_precompute_one`` /
+    ``_precompute_health_one`` — directly unit-testable with a session-factory stub.
+
+    Budget model (WI-2). The tick reads elapsed wall time BETWEEN whole units of
+    work (never mid-query) and returns a partial refresh once ``budget_seconds``
+    (default ``PRECOMPUTE_TICK_BUDGET_SECONDS``) is exceeded, handing the remaining
+    per-project keys to the next tick. The round-robin ``_project_tick_offset`` only
+    advances past projects actually primed, so the next tick resumes where this one
+    left off rather than skipping the unprimed tail of the slice. Each unit is
+    independently bounded — the digest compute under a 5s LOCAL statement_timeout
+    and the health compute under 30s — so a single unit cannot overrun by more than
+    that, and the tick never needs a query-cancelling hard timeout to stay bounded.
+    This replaces the old ``asyncio.timeout(PRECOMPUTE_TICK_BUDGET_SECONDS)`` wrapper
+    that fired mid-``session.execute``, made asyncpg raise ``CancelledError``, and
+    ejected an otherwise-healthy pool connection on every overrun (the ~44/hr
+    "[DB] Invalidated pool connection after CancelledError" bleed).
+
+    Priming order: the GLOBAL views (both kinds — the most-hit keys) are ALWAYS
+    primed first; only the per-project round-robin slice and the L2 prune are
+    subject to the cooperative cutoff. Whatever the budget truncates degrades to
+    the bounded on-demand path (the prior behavior), never an error.
     """
     global _project_tick_offset
+
+    if budget_seconds is None:
+        budget_seconds = float(PRECOMPUTE_TICK_BUDGET_SECONDS)
+    started_monotonic = time.monotonic()
+
+    def _budget_exceeded() -> bool:
+        return (time.monotonic() - started_monotonic) >= budget_seconds
+
     refreshed = 0
+    partial = False
 
     async def _prime(label: str, coro_factory) -> None:
         nonlocal refreshed
@@ -529,8 +595,9 @@ async def run_precompute_tick(session_factory) -> int:
 
     # --- GLOBAL views first (both kinds). The no-project DashboardHome /
     #     CatchUpPanel polls are the most-hit keys and the dominant source of the
-    #     health-overview timeouts, so they are primed before any per-project work
-    #     that the tick budget might truncate under load. ---
+    #     health-overview timeouts, so they are ALWAYS primed — the cooperative
+    #     cutoff applies only to the per-project round-robin below, so truncation
+    #     is spent on lower-priority per-project keys, never the globals. ---
     await _prime(
         "global digest",
         lambda s: _precompute_one(s, hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=None),
@@ -551,63 +618,90 @@ async def run_precompute_tick(session_factory) -> int:
         offset = _project_tick_offset % n
         rotated = project_ids[offset:] + project_ids[:offset]
         tick_slice = rotated[:_PROJECTS_PER_TICK_SLICE]
-        _project_tick_offset = (offset + _PROJECTS_PER_TICK_SLICE) % n
     else:
+        n = 0
+        offset = 0
         tick_slice = []
 
+    # Prime each project's digest + health together so the round-robin offset can
+    # advance by whole projects fully primed. The cooperative budget is checked
+    # BETWEEN projects (never mid-query): once exceeded, we stop and mark the tick
+    # partial, leaving the unprimed projects for the next tick.
+    projects_done = 0
     for project_id in tick_slice:
+        if _budget_exceeded():
+            partial = True
+            break
         await _prime(
             f"project={project_id} digest",
             lambda s, pid=project_id: _precompute_one(
                 s, hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=pid
             ),
         )
-    for project_id in tick_slice:
         await _prime(
             f"project={project_id} health",
             lambda s, pid=project_id: _precompute_health_one(
                 s, lookback_hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=pid
             ),
         )
+        projects_done += 1
+
+    # Advance the offset only past projects actually primed this tick, so a
+    # budget-truncated tick resumes at the first project it did not reach on the
+    # next tick (rather than skipping the unprimed tail of the slice).
+    if n:
+        _project_tick_offset = (offset + projects_done) % n
 
     # --- Prune L2 rows for keys that are no longer hot (cheap bounded DELETE).
     #     Cutoff = 2x the freshness window so a briefly-restarting worker never
-    #     prunes rows a reader might still legitimately serve. ---
-    try:
-        async with session_factory() as session:
-            deleted = await cleanup_stale_shared(
-                session, older_than_seconds=PRECOMPUTE_STALE_FALLBACK_SECONDS * 2
-            )
-        if deleted:
-            logger.debug(
-                "[DIGEST_PRECOMPUTE] pruned %d stale shared-cache row(s)", deleted
-            )
-    except Exception as exc:
-        logger.debug("[DIGEST_PRECOMPUTE] shared-cache prune failed: %s", exc)
+    #     prunes rows a reader might still legitimately serve. Skipped when the
+    #     tick already hit its budget — deferring an occasional sweep one tick is
+    #     harmless, and skipping it keeps the cooperative bound honest. ---
+    if not (partial or _budget_exceeded()):
+        try:
+            async with session_factory() as session:
+                deleted = await cleanup_stale_shared(
+                    session, older_than_seconds=PRECOMPUTE_STALE_FALLBACK_SECONDS * 2
+                )
+            if deleted:
+                logger.debug(
+                    "[DIGEST_PRECOMPUTE] pruned %d stale shared-cache row(s)", deleted
+                )
+        except Exception as exc:
+            logger.debug("[DIGEST_PRECOMPUTE] shared-cache prune failed: %s", exc)
 
-    return refreshed
+    return TickResult(refreshed=refreshed, partial=partial)
 
 
 async def digest_precompute_service() -> None:
     """Leader-only background loop that primes the digest precompute cache.
 
-    Sleeps ``_resolve_interval()`` seconds between ticks. Each tick is bounded
-    by ``PRECOMPUTE_TICK_BUDGET_SECONDS`` so a wedged tick can never pin the
-    task; the lifecycle monitor restarts it on crash/timeout. Cancellation
-    (shutdown) propagates cleanly.
+    Sleeps ``_resolve_interval()`` seconds between ticks. Each tick self-limits
+    to ``PRECOMPUTE_TICK_BUDGET_SECONDS`` via a COOPERATIVE wall-time budget
+    checked between units of work (see ``run_precompute_tick``): an over-budget
+    tick returns a partial refresh — it never cancels an in-flight query — and
+    the next tick resumes where it left off. A generous
+    ``PRECOMPUTE_TICK_HARD_TIMEOUT_SECONDS`` (>= 3x the cooperative budget) wraps
+    the tick purely as a last-resort guard against a wedged unit that ignores its
+    own statement_timeout. Because a unit issues several queries (each capped by
+    its own statement_timeout), 180s is a generous — not a provable — upper bound:
+    the common every-tick path never approaches it, though a genuine multi-query DB
+    wedge can still trip it (accepted: rare). The lifecycle monitor restarts the
+    loop on crash. Cancellation (shutdown) propagates cleanly.
 
     The ``_tick_in_progress`` flag prevents tick overlap: if a previous tick
-    hasn't finished when the next interval fires (e.g. a DB hiccup held the
-    asyncio.timeout beyond its deadline), the new interval is skipped rather
-    than stacking a second concurrent tick.
+    hasn't finished when the next interval fires (e.g. a hard-timeout wedge held
+    a tick past its deadline), the new interval is skipped rather than stacking a
+    second concurrent tick.
     """
     global _tick_in_progress
     from app.database import AsyncSessionLocal
 
     logger.info(
-        "[DIGEST_PRECOMPUTE] service started (interval=%ds, budget=%ds)",
+        "[DIGEST_PRECOMPUTE] service started (interval=%ds, budget=%ds, hard_timeout=%ds)",
         _resolve_interval(),
         PRECOMPUTE_TICK_BUDGET_SECONDS,
+        PRECOMPUTE_TICK_HARD_TIMEOUT_SECONDS,
     )
     while True:
         await asyncio.sleep(_resolve_interval())
@@ -618,21 +712,37 @@ async def digest_precompute_service() -> None:
             continue
         _tick_in_progress = True
         try:
-            async with asyncio.timeout(PRECOMPUTE_TICK_BUDGET_SECONDS):
-                refreshed = await run_precompute_tick(AsyncSessionLocal)
-            logger.debug(
-                "[DIGEST_PRECOMPUTE] tick refreshed %d digest key(s)", refreshed
-            )
+            async with asyncio.timeout(PRECOMPUTE_TICK_HARD_TIMEOUT_SECONDS):
+                result = await run_precompute_tick(AsyncSessionLocal)
+            if result.partial:
+                # Normal under load: the cooperative budget stopped the tick
+                # between units (no query cancelled); the next tick resumes.
+                logger.info(
+                    "[DIGEST_PRECOMPUTE] tick hit the %ds cooperative budget — "
+                    "refreshed %d key(s), returned partial; next tick resumes "
+                    "where this one left off",
+                    PRECOMPUTE_TICK_BUDGET_SECONDS,
+                    result.refreshed,
+                )
+            else:
+                logger.debug(
+                    "[DIGEST_PRECOMPUTE] tick refreshed %d digest key(s)",
+                    result.refreshed,
+                )
         except asyncio.CancelledError:
             raise
         except TimeoutError:
-            # Expected, recoverable: a single slow tick is abandoned and the
-            # next tick retries. The compute path is row-capped + has its own
-            # statement_timeout, so a slow tick is bounded, not fatal.
+            # LAST-RESORT safety only: the cooperative budget returns partial
+            # between units long before this generous hard cap, so this fires
+            # only if a single unit wedged past its own statement_timeout (e.g. a
+            # stuck connection checkout). Abandoning the tick here CAN cancel a
+            # query (the old failure mode), but only in a genuine wedge — not the
+            # chronic every-tick overrun the cooperative budget eliminated. The
+            # next tick retries.
             logger.warning(
-                "[DIGEST_PRECOMPUTE] tick exceeded %ds budget — abandoning this "
-                "tick; next tick retries",
-                PRECOMPUTE_TICK_BUDGET_SECONDS,
+                "[DIGEST_PRECOMPUTE] tick exceeded the %ds hard-timeout safety — "
+                "abandoning this tick; next tick retries",
+                PRECOMPUTE_TICK_HARD_TIMEOUT_SECONDS,
             )
         except Exception as tick_exc:
             logger.error("[DIGEST_PRECOMPUTE] tick error: %s", tick_exc, exc_info=True)

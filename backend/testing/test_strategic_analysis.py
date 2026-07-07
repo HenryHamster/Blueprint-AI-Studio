@@ -3393,6 +3393,103 @@ def test_retired_directions_summary_includes_durable_memory_entries():
     assert "auth" in entry["text"]
 
 
+def test_retired_directions_summary_surfaces_outcome():
+    """The compact outcome ('why retired / what landed') is surfaced to the agent."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-sup",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "strategic_superseded",
+                    "outcome": "superseded by d-successor",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["retirement_reason"] == "strategic_superseded"
+    assert entry["retirement_outcome"] == "superseded by d-successor"
+
+
+def test_retired_directions_summary_falls_back_to_structured_outcome():
+    """When freetext ``outcome`` is absent, the renderer surfaces the always-present
+    structured ``retired_outcome`` (classification + metrics) as retirement_outcome."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-struct",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                    # No freetext "outcome" — the lifecycle retire path never writes
+                    # it — but the structured retired_outcome is always present.
+                    "retired_outcome": {
+                        "classification": "abandoned",
+                        "metrics": {"prs_merged": 0, "cycles": 4},
+                    },
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    outcome = result[0]["retirement_outcome"]
+    assert outcome.startswith("abandoned")
+    assert "prs_merged=0" in outcome
+    assert "cycles=4" in outcome
+
+
+def test_retired_directions_summary_prefers_freetext_over_structured_outcome():
+    """A freetext ``outcome`` still wins over the structured fallback."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-both-outcomes",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "strategic_superseded",
+                    "outcome": "superseded by d-successor",
+                    "retired_outcome": {
+                        "classification": "landed",
+                        "metrics": {"prs_merged": 3},
+                    },
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert result[0]["retirement_outcome"] == "superseded by d-successor"
+
+
+def test_retired_directions_summary_omits_outcome_when_absent():
+    """Entries without an outcome do not emit a retirement_outcome key."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-old",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    assert "retirement_outcome" not in result[0]
+
+
 def test_retired_directions_summary_deduplicates_live_and_memory():
     """A direction present in both the live list and durable memory is not duplicated."""
     project = _make_project(
@@ -3438,3 +3535,29 @@ def test_retired_directions_summary_memory_respects_window():
     )
     result = _build_retired_directions_summary(project)
     assert result == []
+
+
+def test_retired_directions_summary_memory_surfaces_outcome():
+    """Memory-augmented entries surface cycles and prs_merged outcome metrics."""
+    project = _make_project(
+        directions=[],  # direction pruned from live list
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-pruned-with-merges",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                    "cycles": 5,
+                    "prs_merged": 3,
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["id"] == "d-pruned-with-merges"
+    assert entry["cycles"] == 5
+    assert entry["prs_merged"] == 3
+    assert entry["status"] == "retired"

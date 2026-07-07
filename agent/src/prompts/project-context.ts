@@ -68,7 +68,7 @@ function parseResearchSummary(raw: string): string {
 }
 
 // ── Shared: Format project_context into a markdown section ────────────────
-export function formatProjectContext(ctx: Record<string, unknown>, taskType = '', taskScope = '', currentDirectionId = '', relatedFilesCount = 0): string {
+export function formatProjectContext(ctx: Record<string, unknown>, taskType = '', taskScope = '', currentDirectionId = '', relatedFilesCount = 0, opts?: { suppressTaskLists?: boolean }): string {
   const CONTEXT_BUDGET = 8000;
 
   const header = [
@@ -77,10 +77,10 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     '',
   ];
 
-  // Build active tasks section (always included in full)
+  // Build active tasks section (always included in full, unless suppressTaskLists)
   const activeLines: string[] = [];
   const activeTasks = ctx.active_tasks as Array<Record<string, unknown>> | undefined;
-  if (activeTasks && activeTasks.length > 0) {
+  if (!opts?.suppressTaskLists && activeTasks && activeTasks.length > 0) {
     activeLines.push('### Active Tasks');
     const hasBlocked = activeTasks.some((t) => strVal(t.status) === 'BLOCKED');
     if (hasBlocked) {
@@ -168,8 +168,20 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
           return aMatch - bMatch;
         })
       : lessonsData;
+    // Collapse near-duplicate lessons: same normalized last_feedback or same task_title + failure_class
+    const seenFeedback = new Set<string>();
+    const seenTitleClass = new Set<string>();
+    const dedupedLessons = sortedLessons.filter((l) => {
+      const feedbackKey = strVal(l.last_feedback).trim().toLowerCase();
+      const titleClassKey = `${strVal(l.task_title)}|${strVal(l.failure_class)}`;
+      if (feedbackKey && seenFeedback.has(feedbackKey)) return false;
+      if (titleClassKey !== '|' && seenTitleClass.has(titleClassKey)) return false;
+      if (feedbackKey) seenFeedback.add(feedbackKey);
+      if (titleClassKey !== '|') seenTitleClass.add(titleClassKey);
+      return true;
+    });
     const candidateLines: string[] = ['### Lessons from Past Reviews'];
-    for (const l of sortedLessons) {
+    for (const l of dedupedLessons) {
       const fcSuffix = l.failure_class ? ` [${strVal(l.failure_class)}]` : '';
       const dirSuffix = currentDirectionId && strVal(l.direction_id) === currentDirectionId ? ' [same direction]' : '';
       candidateLines.push(`- **${strVal(l.task_title)}** (${String(l.iterations)} cycles)${fcSuffix}${dirSuffix}: ${strVal(l.last_feedback)}`);
@@ -185,7 +197,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   // Build queued tasks section — one-liners only to preserve budget for higher-priority content
   const queuedTasks = ctx.queued_tasks as Array<Record<string, unknown>> | undefined;
   let queuedLines: string[] = [];
-  if (queuedTasks && queuedTasks.length > 0) {
+  if (!opts?.suppressTaskLists && queuedTasks && queuedTasks.length > 0) {
     const shortLines: string[] = ['### Queued Tasks'];
     for (const t of queuedTasks) {
       shortLines.push(`- [${strVal(t.task_type)}] **${strVal(t.title)}**`);
@@ -235,7 +247,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   // Build direction-filtered recent tasks section — prioritized, shown before general recent
   const directionRecentTasks = ctx.direction_recent_tasks as Array<Record<string, unknown>> | undefined;
   let directionRecentLines: string[] = [];
-  if (directionRecentTasks && directionRecentTasks.length > 0) {
+  if (!opts?.suppressTaskLists && directionRecentTasks && directionRecentTasks.length > 0) {
     const headerLine = '### Recent Tasks in This Direction';
     const entries = directionRecentTasks.map(renderCompletedTaskLine);
     const candidate = [headerLine, ...entries, ''].join('\n');
@@ -249,7 +261,7 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
   const recentTasks = ctx.recently_completed_tasks as Array<Record<string, unknown>> | undefined;
   let recentLines: string[] = [];
   let recentDropped = 0;
-  if (recentTasks && recentTasks.length > 0) {
+  if (!opts?.suppressTaskLists && recentTasks && recentTasks.length > 0) {
     const allEntries: string[] = recentTasks.map(renderCompletedTaskLine);
 
     // Keep most recent entries that fit within budget

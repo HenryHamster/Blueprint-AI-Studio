@@ -175,6 +175,27 @@ describe('OrchestratorHealthBar cost pill', () => {
     expect(stalePill).toHaveTextContent('as of 1m ago');
     expect(stalePill.className).toContain('opacity-75');
   });
+
+  it('renders a gated-task summary chip when per-type gates are active', async () => {
+    await act(async () => {
+      render(
+        <OrchestratorHealthBar
+          {...baseProps}
+          gatedTaskTypes={[
+            { task_type: 'create', failure_rate: 0.83, sample_size: 12, threshold: 0.6 },
+            { task_type: 'fix', failure_rate: 0.67, sample_size: 5, threshold: 0.6 },
+          ]}
+        />,
+      );
+    });
+
+    const chip = screen.getByTitle(/Per-type dispatch gates active:/);
+    expect(chip).toHaveTextContent('Gated:');
+    expect(chip).toHaveTextContent('create');
+    expect(chip).toHaveTextContent('fix');
+    expect(chip.getAttribute('title')).toContain('83% failure rate, n=12');
+    expect(chip.getAttribute('title')).toContain('67% failure rate, n=5');
+  });
 });
 
 describe('OrchestratorHealthBar cycle liveness verdict', () => {

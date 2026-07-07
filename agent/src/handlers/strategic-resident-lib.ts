@@ -7,6 +7,8 @@
  * surface.
  */
 
+import { promptOps } from './strategic-ops-registry.js';
+
 export interface ResidentInboundMessage {
   id?: string;
   created_at?: string;
@@ -27,6 +29,22 @@ export interface SessionHeartbeatResponse {
   leased_until?: string;
   stop_requested?: boolean;
   status?: string;
+  /** Monotonic marker over strategist-relevant change sources (task transitions,
+   *  operator messages, direction/cycle mutations). State-gated pacing fires an
+   *  autonomous turn when this differs from the rev recorded at the last turn.
+   *  ABSENT (older backend that does not populate it) degrades to floor-tick
+   *  pacing — the same forward-compat pattern `authority_held` uses. */
+  work_state_rev?: string;
+  /** Optional compact counts feeding the tick context (in-flight tasks, terminal
+   *  transitions since last look, new operator messages). Advisory only. */
+  work_state_summary?: Record<string, unknown>;
+  /** Serialized exam-ledger echoed from the heartbeat note, or null. Agents
+   *  ignore this field; it is only used for roundtrip integrity checks. */
+  exam_ledger?: string | null;
+  /** Live direction keys (direction_key strings) in the project that are not
+   *  yet retired. Used to refresh the surface catalog between restarts so
+   *  new/retired directions enter/leave the rotation mid-session. */
+  active_direction_ids?: string[];
 }
 
 /**
@@ -70,6 +88,15 @@ export interface ResidentConfig {
   turnTimeoutMs: number;
   /** false disables the autonomous self-prompt path (e.g. a read-only monitor mode) */
   autonomousEnabled: boolean;
+  /** Floor-tick interval for autonomous turns (ms): fire even with no state change so
+   *  the session never goes fully dark. Default: AUTONOMOUS_FLOOR_TICK_MS (600s). */
+  minTickMs: number;
+  /** Per-turn stall budget for AUTONOMOUS turns (ms). Deeper than the operator default
+   *  so a long read/verify/investigate step isn't clipped mid-thought. Default: 300s. */
+  autonomousTurnTimeoutMs: number;
+  /** Max ops to batch in one autonomous turn — surfaced in the self-prompt as a hint.
+   *  Default: 3. */
+  maxOpsPerTurn: number;
 }
 
 function num(v: unknown, fallback: number): number {
@@ -80,16 +107,124 @@ function str(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
 }
 
+function fmtScalar(v: unknown, fallback = '?'): string {
+  if (v === undefined || v === null) return fallback;
+  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return JSON.stringify(v);
+}
+
+export function buildRetiredContextText(
+  retiredDirections: Array<Record<string, unknown>> | undefined,
+): string {
+  if (!retiredDirections || retiredDirections.length === 0) return '';
+  const lines: string[] = [
+    'These directions were recently retired, completed, or superseded. Use them to avoid reviving landed or intentionally retired work.',
+  ];
+  for (const d of retiredDirections) {
+    const text = str(d.text, '?').slice(0, 200);
+    const did = str(d.id, '?');
+    const status = str(d.status, 'unknown');
+    const cycles = fmtScalar(d.cycles, '?');
+    const prsMerged = fmtScalar(d.prs_merged, '?');
+    const extras: string[] = [];
+    const retirementReason = str(d.retirement_reason).trim();
+    const retirementOutcome = str(d.retirement_outcome).trim();
+    if (retirementReason) extras.push(`reason=${retirementReason.slice(0, 160)}`);
+    if (retirementOutcome) extras.push(`outcome=${retirementOutcome.slice(0, 160)}`);
+    const tail = extras.length > 0 ? ` | ${extras.join(' | ')}` : '';
+    lines.push(`- [${status}] ${text} (id: ${did}) | cycles=${cycles} | prs_merged=${prsMerged}${tail}`);
+  }
+  return lines.join('\n');
+}
+
+export function buildPriorDecisionsText(
+  previousDecisionOutcomes: Record<string, unknown> | undefined,
+): string {
+  if (!previousDecisionOutcomes || typeof previousDecisionOutcomes !== 'object') return '';
+  const created = Array.isArray(previousDecisionOutcomes.created)
+    ? previousDecisionOutcomes.created as Array<Record<string, unknown>>
+    : [];
+  const retired = Array.isArray(previousDecisionOutcomes.retired)
+    ? previousDecisionOutcomes.retired as Array<Record<string, unknown>>
+    : [];
+  if (created.length === 0 && retired.length === 0) return '';
+
+  const lines: string[] = [];
+  const cycleId = str(previousDecisionOutcomes.cycle_id);
+  const summaryText = str(previousDecisionOutcomes.summary_text).trim();
+  const reasoningText = str(previousDecisionOutcomes.cycle_reasoning).trim();
+  const cycleBits: string[] = [];
+  if (cycleId) cycleBits.push(`cycle=${cycleId}`);
+  if (summaryText) cycleBits.push(summaryText.slice(0, 240));
+  if (reasoningText) cycleBits.push(`reasoning=${reasoningText.slice(0, 240)}`);
+  if (cycleBits.length > 0) {
+    lines.push(cycleBits.join(' | '));
+  }
+
+  const renderEntry = (label: string, entry: Record<string, unknown>): string => {
+    const did = str(entry.direction_id, '?');
+    const status = str(entry.status, 'unknown');
+    const prsMerged = fmtScalar(entry.prs_merged, '?');
+    const rationale = str(entry.rationale).trim();
+    const calibrationDelta = entry.calibration_delta;
+    const parts = [`${label} ${did}`, `status=${status}`, `prs_merged=${prsMerged}`];
+    if (rationale) parts.push(`rationale=${rationale.slice(0, 160)}`);
+    if (typeof calibrationDelta === 'number' || typeof calibrationDelta === 'string') {
+      parts.push(`calibration_delta=${fmtScalar(calibrationDelta, '?')}`);
+    }
+    return `- ${parts.join(' | ')}`;
+  };
+
+  if (created.length > 0) {
+    lines.push('Created directions:');
+    for (const entry of created) {
+      lines.push(renderEntry('created', entry));
+    }
+  }
+  if (retired.length > 0) {
+    lines.push('Retired directions:');
+    for (const entry of retired) {
+      lines.push(renderEntry('retired', entry));
+    }
+  }
+  return lines.join('\n');
+}
+
+export function buildStagedDirectionsText(
+  stagedDirections: Array<Record<string, unknown>> | undefined,
+): string {
+  if (!stagedDirections || stagedDirections.length === 0) return '';
+  const lines: string[] = [
+    'These directions are already staged for a next version. Use them as queued work, not as fresh proposals.',
+  ];
+  for (const d of stagedDirections) {
+    const did = str(d.id, '?');
+    const text = str(d.text, '?').slice(0, 200);
+    const priority = str(d.priority, 'unknown');
+    const stagedForVersion = fmtScalar(d.staged_for_version, '?');
+    const stagedAt = str(d.staged_at).trim();
+    const stagedAgeDays = fmtScalar(d.staged_age_days, '?');
+    const extras: string[] = [];
+    if (stagedAt) extras.push(`staged_at=${stagedAt.slice(0, 64)}`);
+    extras.push(`staged_age_days=${stagedAgeDays}`);
+    lines.push(`- ${text} (id: ${did}) | priority=${priority} | staged_for_version=${stagedForVersion} | ${extras.join(' | ')}`);
+  }
+  return lines.join('\n');
+}
+
 /**
  * Resolve the resident loop's timing knobs from the strategic payload the
  * backend ships (runtime settings surfaced onto the payload). Defaults: 5s idle
  * (heartbeat) tick, 1.5s inbound-message poll (fast operator pickup), 120s
- * per-turn timeout.
+ * per-turn timeout, 600s floor tick, 300s autonomous stall budget, 3 ops/turn.
  */
 export function residentConfig(payload: Record<string, unknown>): ResidentConfig {
   const idleTickSec = num(payload.strategic_session_idle_tick_seconds, 5);
   const messagePollSec = num(payload.strategic_session_message_poll_seconds, 1.5);
   const turnTimeoutSec = num(payload.strategic_session_turn_timeout_seconds, 120);
+  const minTickSec = num(payload.strategic_session_min_tick_seconds, 600);
+  const autonomousTurnTimeoutSec = num(payload.strategic_session_autonomous_turn_timeout_seconds, 300);
+  const maxOpsPerTurn = Math.max(1, Math.round(num(payload.strategic_session_max_ops_per_turn, 3)));
   // interaction_mode === 'monitor' (or an explicit flag) makes the session
   // read-only: it still chats + heartbeats but does not autonomously advance.
   const mode = str(payload.interaction_mode).toLowerCase();
@@ -104,6 +239,10 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     messagePollMs: Math.min(idleTickMs, Math.max(750, Math.round(messagePollSec * 1000))),
     turnTimeoutMs: Math.max(15_000, Math.round(turnTimeoutSec * 1000)),
     autonomousEnabled,
+    // Never poll slower than the idle tick (60s floor keeps the session lively).
+    minTickMs: Math.max(idleTickMs, Math.round(minTickSec * 1000)),
+    autonomousTurnTimeoutMs: Math.max(15_000, Math.round(autonomousTurnTimeoutSec * 1000)),
+    maxOpsPerTurn,
   };
 }
 
@@ -241,9 +380,13 @@ export interface BootstrapContext {
   problemModelJson: string;
   runningUpdate: string;
   directionsText: string;
+  stagedDirectionsText?: string;
+  retiredDirectionsText: string;
+  previousDecisionOutcomesText: string;
   visionJson: string;
   openMessagesText: string;
   sessionId: string;
+  fetchGuidanceText?: string;
 }
 
 /**
@@ -266,30 +409,35 @@ conversation with the operator in memory. You operate at two speeds:
 - **Interactive (operator chat):** when the operator sends a message, answer it
   directly and conversationally, take a quick action if they ask, and keep it
   tight. First priority is always a live operator message. You MUST post your
-  conversational answer to the operator with \`./messages send '<answer>'\` — the
-  live stream is a transcript, but the durable chat reply the operator reads is
-  the message you send. Every reply to an operator message REQUIRES a
-  \`./messages send\`; do not answer only in the stream.
+  conversational answer to the operator with \`./messages send '<answer>'\` or,
+  for apostrophe-heavy or multiline replies, \`./messages send --stdin\` with a
+  heredoc or pipe. The live stream is a transcript, but the durable chat reply
+  the operator reads is the message you send. Every reply to an operator
+  message REQUIRES a \`./messages send\`; do not answer only in the stream.
 - **Autonomous (between messages):** when no operator input is pending you are
-  handed a short "advance the project" turn. Take ONE bounded step — refine the
-  problem model, open/refine/retire a direction, spawn needed work, or refine the
-  running update — then stop so the loop can check for operator input again. Your
-  autonomous turn can be interrupted the moment the operator speaks.
+  handed a turn to advance the project. Complete ONE meaningful unit of progress —
+  refine the problem model, open/refine/retire a direction, spawn needed work,
+  refine the running update, OR examine one project surface for work worth doing.
+  An examination that ends CLEAR (the one surface you looked at holds nothing
+  actionable right now) is a fully successful turn — looking is real progress.
+  Busy-work means unneeded MUTATION; examination is never busy-work. Then stop so
+  the loop can check for operator input again. Your autonomous turn can be
+  interrupted the moment the operator speaks.
 
 Never wait on the operator to proceed. Never claim the session is "done" — it
 ends only when the operator stops it.
 
 ## Your tools (bash helpers already provisioned in this workspace)
-- \`./strategic <op> <json|file>\` — apply strategic operations (set-problem-model,
-  set-running-update, create-direction, update-direction, retire-direction,
-  stage-direction, approve-direction, reject-direction, spawn-task, reflect,
-  set-evidence-progress, set-retirement-critiques, pending-confirm, …). These are
-  your MUTATING actions on the cloud source of truth.
-- \`./fetch <kind> <id>\` — pull full detail (problem-model, direction, gap,
-  section, playbook, message, version-phase) when context was trimmed.
+- \`./strategic <op> <json|file>\` — apply strategic operations (${promptOps().map(e => e.alias).join(', ')}).
+  These are your MUTATING actions on the cloud source of truth.
+- \`./fetch <kind> <id>\` — pull full detail when context was trimmed. The
+  canonical verb list and per-verb guidance are below.
 - \`./design-doc <get|list|set|delete> <key>\` — read/update design-doc sections.
-- \`./messages send '<text>'\` / \`./messages resolve <ref> '<how>'\` — talk to the
-  operator and close addressed messages.
+- \`./messages send '<text>'\` / \`./messages send --stdin\` / \`./messages resolve <ref> '<how>'\` — talk to the
+  operator and close addressed messages. Use \`--stdin\` for apostrophe-heavy or
+  multiline replies.
+
+${ctx.fetchGuidanceText?.trim() ? `${ctx.fetchGuidanceText.trim()}\n\n` : ''}
 
 All strategic state you write describes the MANAGED project (see CLAUDE.md) —
 never this execution environment, this prompt, or the helper commands.`);
@@ -304,6 +452,15 @@ never this execution environment, this prompt, or the helper commands.`);
   }
   if (ctx.directionsText.trim()) {
     sections.push(`## Active directions\n${ctx.directionsText.trim()}`);
+  }
+  if (ctx.stagedDirectionsText?.trim()) {
+    sections.push(`## Already-staged (next-version) directions\n${ctx.stagedDirectionsText.trim()}`);
+  }
+  if (ctx.retiredDirectionsText.trim()) {
+    sections.push(`## Recently retired / completed directions\n${ctx.retiredDirectionsText.trim()}`);
+  }
+  if (ctx.previousDecisionOutcomesText.trim()) {
+    sections.push(`## Prior-cycle decision outcomes\n${ctx.previousDecisionOutcomesText.trim()}`);
   }
   if (ctx.visionJson.trim()) {
     sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
@@ -354,9 +511,10 @@ export type StreamFrameKind =
   | 'reasoning' | 'action' | 'tool' | 'status' | 'message'
   | 'command' | 'file' | 'read' | 'subagent' | 'tool_result';
 
-/** Optional lifecycle status on a frame: `responding` opens an operator turn
- *  (drives the working indicator), `done` closes it (clears the activity strip). */
-export type StreamFrameStatus = 'responding' | 'done';
+/** Optional lifecycle status on a frame: `responding` opens an OPERATOR turn
+ *  (drives the working indicator), `working` opens an AUTONOMOUS turn (advancing/
+ *  watching indicator), `done` closes any turn (clears the activity strip). */
+export type StreamFrameStatus = 'responding' | 'working' | 'done';
 
 interface CoalescedItem { kind: StreamFrameKind; text: string; open: boolean; status?: StreamFrameStatus; }
 
@@ -425,20 +583,517 @@ export class FrameCoalescer {
   }
 }
 
+// ── Evidence-gated autonomous tick: examination ledger + rotating focus ───────
+//
+// Replaces the old constant "take ONE small step, or say nothing needs doing"
+// self-prompt. The loop cannot conclude idle without naming ONE project surface
+// it actually examined this tick (the TICK-VERDICT contract), and a code-owned
+// ledger rotates a focus hint across an enumerable catalog of surfaces so each
+// tick's look lands somewhere new. There are NO quotas: a project may be CLEAR
+// on every surface forever — the only demand is that the claim is earned
+// per-surface, per-tick. See design docs 24fd9f78 (evidence-gated idle) and
+// 9f769438 (state-gated work units).
+
+export type ExamSurfaceKind =
+  | 'direction' | 'code' | 'fetch' | 'messages' | 'knowledge' | 'design-doc' | 'problem-model';
+
+/** One examinable project surface. `key` is the stable ledger identity
+ *  (`direction:d-21efb120` | `code:backend` | `qualification` | …); `hint` is a
+ *  default way to examine it, surfaced in the prompt — a suggestion, not a cage. */
+export interface ExamSurface {
+  key: string;
+  kind: ExamSurfaceKind;
+  label: string;
+  hint: string;
+}
+
+/** One recorded look at a surface. `verdict` is the parsed tick outcome, or
+ *  `unevidenced` when a CLEAR was claimed on a turn that examined nothing (no
+ *  tool use) or the marker was missing/garbled — both corrected next tick.
+ *  `interrupted` is set when the turn was cut short before completing (operator
+ *  preemption, authority suspend, stall watchdog) — not a violation, no
+ *  corrective instruction. */
+export interface ExamRecord {
+  surfaceKey: string;
+  atTick: number;
+  at: string;
+  verdict: 'clear' | 'found' | 'advanced' | 'unevidenced' | 'interrupted';
+  note: string;
+}
+
+/** Cap on retained exam records (bounds a multi-hour session's memory). */
+export const EXAM_RECORDS_CAP = 200;
+/** Default number of focus surfaces surfaced in the prompt each tick. */
+export const FOCUS_LIST_SIZE = 3;
+/** Default floor-tick interval (ms): even with no state change, review at least
+ *  this often. Deliberately under the continuation-lease TTL so a session never
+ *  goes fully dark, and matches design doc 9f769438's 600s floor. */
+export const AUTONOMOUS_FLOOR_TICK_MS = 600_000;
+export const EXAM_NOTE_CAP = 240;
 /**
- * The bounded autonomous self-prompt. Deliberately short so the turn returns
- * quickly and the loop can re-poll for operator input. One step per turn.
+ * Byte budget for the serialized exam ledger. Must stay below the backend's
+ * _EXAM_LEDGER_MAX_BYTES (20_000) so the stored value is always valid JSON.
+ * Set to 16_000 to leave headroom for the surrounding heartbeat note envelope.
  */
-export function buildAutonomousPrompt(): string {
-  return `No operator message is pending right now. Take ONE small, bounded step to
-advance the project, then STOP so I can check for operator input:
+export const EXAM_LEDGER_MAX_BYTES = 16_000;
 
-- If the problem model or running update is stale, refine it (one focused edit).
-- If a direction is clearly dead, retire it; if there is an obvious gap, open a
-  direction for it; if a direction needs decomposition or investigation, spawn a
-  research/plan/design/web_research/compute_experiment task.
-- If nothing genuinely needs doing this tick, say so in one line and take no
-  action (do not invent busy-work).
+// The diagnostic read verbs (a subset of STRATEGIC_FETCH_VERBS in
+// strategic-helpers.ts) that make good STANDING examination surfaces. Kept as a
+// local literal so this lib stays dependency-free (importing strategic-helpers
+// would pull in the heavy index surface and defeat the pure-helper testability).
+const EXAM_FETCH_SURFACES: ReadonlyArray<{ key: string; hint: string }> = [
+  { key: 'qualification', hint: './fetch qualification — read the open version findings/sub-scores; is any finding actionable now?' },
+  { key: 'version-phase', hint: './fetch version-phase — confirm the phase and any blockers to the next promotion' },
+  { key: 'ci-compliance', hint: './fetch ci-compliance — scan for a recurring failure class worth a direction' },
+  { key: 'efficiency-snapshot', hint: './fetch efficiency-snapshot — look for an input-token / cost regression' },
+  { key: 'vm-cost', hint: './fetch vm-cost — check the spend trend for anything anomalous' },
+  { key: 'compute-sweeps', hint: './fetch compute-sweeps — review sweep outcomes for a lead' },
+  { key: 'capability-trials', hint: './fetch capability-trials — review trial verdicts for a follow-up' },
+];
 
-Apply any decision through the ./strategic helper. Keep this turn short.`;
+/**
+ * Enumerate the project's examinable surfaces from what the resident already
+ * reaches: active directions (from the payload's `directions_summary` ids), the
+ * diagnostic read verbs, the standing messages/knowledge/problem-model/design-doc
+ * surfaces, and one `code:<dir>` per top-level directory of the full-clone
+ * workspace (project-shape-agnostic — no hardcoded project types). Pure: rebuild
+ * it whenever the payload changes and new directions enter as never-examined,
+ * retired ones drop out (nextFocus ignores records whose surface is gone).
+ */
+export function buildSurfaceCatalog(
+  payload: Record<string, unknown>,
+  workspaceTopDirs: string[],
+): ExamSurface[] {
+  const out: ExamSurface[] = [];
+  const seenKeys = new Set<string>();
+  const push = (s: ExamSurface): void => {
+    if (seenKeys.has(s.key)) return;
+    seenKeys.add(s.key);
+    out.push(s);
+  };
+
+  const dirs = Array.isArray(payload.directions_summary)
+    ? payload.directions_summary as Array<Record<string, unknown>> : [];
+  for (const d of dirs) {
+    const id = str(d.id);
+    if (!id) continue;
+    const text = str(d.text).trim().slice(0, 80);
+    push({
+      key: `direction:${id}`,
+      kind: 'direction',
+      label: text ? `direction ${id} — ${text}` : `direction ${id}`,
+      hint: `./fetch direction ${id} — judge its recent outcomes/churn; is it still productive or done?`,
+    });
+  }
+
+  for (const f of EXAM_FETCH_SURFACES) {
+    push({ key: f.key, kind: 'fetch', label: f.key, hint: f.hint });
+  }
+
+  push({ key: 'messages:recent', kind: 'messages', label: 'recent operator messages', hint: './fetch message open — re-read open + recently resolved operator messages for anything unaddressed' });
+  push({ key: 'knowledge:recent', kind: 'knowledge', label: 'recent knowledge / design outputs', hint: './fetch knowledge — scan unadopted design / web_research outputs for something to act on' });
+  push({ key: 'problem-model', kind: 'problem-model', label: 'problem model', hint: './fetch problem-model — compare its claims against the code/directions for drift' });
+  push({ key: 'design-doc', kind: 'design-doc', label: 'design-doc sections', hint: './design-doc list then read a section — check drift vs the code it describes' });
+
+  for (const dir of Array.isArray(workspaceTopDirs) ? workspaceTopDirs : []) {
+    const name = str(dir).trim();
+    if (!name) continue;
+    push({
+      key: `code:${name}`,
+      kind: 'code',
+      label: `code/${name}`,
+      hint: `read a module under ${name}/ with fresh eyes for correctness / config-drift / UX bugs`,
+    });
+  }
+
+  return out;
+}
+
+/**
+ * The next focus surfaces for this tick: never-examined surfaces first (in
+ * catalog order, so freshly-added directions are auto-prioritized), then
+ * least-recently-examined (LRU by the max tick a record touched the surface).
+ * Records whose surface is no longer in the catalog are ignored (pruned).
+ * Returns at most `n` surfaces.
+ */
+export function nextFocus(
+  catalog: ExamSurface[],
+  records: ExamRecord[],
+  n: number = FOCUS_LIST_SIZE,
+): ExamSurface[] {
+  const lastTick = new Map<string, number>();
+  for (const r of records) {
+    const prev = lastTick.get(r.surfaceKey);
+    if (prev === undefined || r.atTick > prev) lastTick.set(r.surfaceKey, r.atTick);
+  }
+  const never: ExamSurface[] = [];
+  const examined: ExamSurface[] = [];
+  for (const s of catalog) {
+    if (lastTick.has(s.key)) examined.push(s);
+    else never.push(s);
+  }
+  examined.sort((a, b) => (lastTick.get(a.key) ?? 0) - (lastTick.get(b.key) ?? 0));
+  return [...never, ...examined].slice(0, Math.max(0, n));
+}
+
+/**
+ * Parse the trailing TICK-VERDICT marker line from a turn's result text. Scans
+ * from the LAST line so a mid-turn mention cannot be mistaken for the verdict.
+ * ADVANCED carries no surface (it is about applied ops); FOUND/CLEAR name the ONE
+ * surface examined. Returns null when no valid marker is present (missing/garbled
+ * → treated as a contract violation by classifyTickOutcome).
+ */
+export function parseTickVerdict(
+  resultText: string,
+): { verdict: 'advanced' | 'found' | 'clear'; surfaceKey: string; note: string } | null {
+  if (typeof resultText !== 'string') return null;
+  const lines = resultText.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = /^\s*TICK-VERDICT:\s*(ADVANCED|FOUND|CLEAR)\b\s*(.*)$/i.exec(lines[i]);
+    if (!m) continue;
+    const verdict = m[1].toLowerCase() as 'advanced' | 'found' | 'clear';
+    const rest = m[2].trim();
+    if (verdict === 'advanced') {
+      return { verdict, surfaceKey: '', note: rest.replace(/^[—–-]\s*/, '').trim() };
+    }
+    // FOUND / CLEAR: "<surface-key> — <note>" (dash surrounded by spaces so a
+    // hyphenated key like d-21efb120 is never split), or "<surface-key> <note>".
+    let surfaceKey = '';
+    let note = '';
+    const dashIdx = rest.search(/\s[—–-]\s/);
+    if (dashIdx >= 0) {
+      surfaceKey = rest.slice(0, dashIdx).trim();
+      note = rest.slice(dashIdx).replace(/^\s*[—–-]\s*/, '').trim();
+    } else {
+      const sp = rest.indexOf(' ');
+      if (sp >= 0) { surfaceKey = rest.slice(0, sp).trim(); note = rest.slice(sp + 1).trim(); }
+      else surfaceKey = rest;
+    }
+    return { verdict, surfaceKey, note };
+  }
+  return null;
+}
+
+/** Whether a turn declared more actionable work remains (a literal AGENDA-CONTINUE
+ *  line), gating an immediate re-tick in shouldRunAutonomousTurn. */
+export function parseAgendaContinue(resultText: string): boolean {
+  return /^\s*AGENDA-CONTINUE\b/im.test(typeof resultText === 'string' ? resultText : '');
+}
+
+/** The FOUND leads still open — the latest record per surface that is a FOUND
+ *  (a later clear/advanced/unevidenced on the same surface closes it). Restated
+ *  in the next tick's prompt until acted on or cleared. */
+export function openFoundLeads(records: ExamRecord[]): ExamRecord[] {
+  const latest = new Map<string, ExamRecord>();
+  for (const r of records) latest.set(r.surfaceKey, r);
+  return [...latest.values()].filter(r => r.verdict === 'found');
+}
+
+export interface TickLedgerUpdate {
+  /** the record to append to the ledger */
+  record: ExamRecord;
+  /** open the next tick with a corrective examine-before-CLEAR instruction */
+  corrective: boolean;
+  /** the turn declared more actionable work (AGENDA-CONTINUE) */
+  agendaContinue: boolean;
+  /** a status stream line to surface a contract violation (undefined = none) */
+  statusNote?: string;
+}
+
+/**
+ * Classify a completed (or interrupted) autonomous turn into a ledger update. A
+ * CLEAR on a turn that used no tool (`sawToolUse === false`) is physically
+ * unevidenced; a missing/garbled marker is a contract violation. Both are recorded
+ * `unevidenced` and set the corrective flag so the next tick opens with "examine
+ * <stalest> before concluding CLEAR" — never failing the session. ADVANCED/FOUND
+ * and an evidenced CLEAR record their verdict against the named surface (falling
+ * back to the stalest focus surface when the marker omitted a key, e.g. ADVANCED).
+ *
+ * When `interrupted` is true the turn was cut short before it could produce a
+ * TICK-VERDICT marker (operator preemption, authority suspend, stall watchdog).
+ * This is NOT a contract violation: it is recorded as `interrupted` with
+ * `corrective: false` and `agendaContinue: false` so the ledger and rotation are
+ * unaffected and no false corrective frame is raised.
+ */
+export function classifyTickOutcome(params: {
+  resultText: string;
+  sawToolUse: boolean;
+  focus: ExamSurface[];
+  atTick: number;
+  at: string;
+  /** True when the turn was cut short before completion (preemption / suspend / stall). */
+  interrupted?: boolean;
+}): TickLedgerUpdate {
+  const stalest = params.focus[0]?.key ?? '';
+  const base = { atTick: params.atTick, at: params.at };
+
+  if (params.interrupted) {
+    return {
+      record: { surfaceKey: stalest, ...base, verdict: 'interrupted', note: 'turn interrupted before completion' },
+      corrective: false,
+      agendaContinue: false,
+    };
+  }
+
+  const verdict = parseTickVerdict(params.resultText);
+  const agendaContinue = parseAgendaContinue(params.resultText);
+
+  if (!verdict) {
+    return {
+      record: { surfaceKey: stalest, ...base, verdict: 'unevidenced', note: 'no valid TICK-VERDICT marker line' },
+      corrective: true,
+      agendaContinue,
+      statusNote: 'tick ended without a valid TICK-VERDICT marker — will examine a surface before concluding CLEAR next tick',
+    };
+  }
+
+  const surfaceKey = verdict.surfaceKey || stalest;
+  const note = verdict.note.slice(0, EXAM_NOTE_CAP);
+
+  if (verdict.verdict === 'clear' && !params.sawToolUse) {
+    return {
+      record: { surfaceKey, ...base, verdict: 'unevidenced', note: note || 'CLEAR claimed with no tool use' },
+      corrective: true,
+      agendaContinue,
+      statusNote: `CLEAR on ${surfaceKey || 'a surface'} examined nothing this turn (no tool use) — recorded unevidenced`,
+    };
+  }
+
+  return {
+    record: { surfaceKey, ...base, verdict: verdict.verdict, note },
+    corrective: false,
+    agendaContinue,
+  };
+}
+
+export interface AutonomousTurnGateState {
+  /** work_state_rev from the latest heartbeat (undefined/null = backend does not
+   *  populate it → this signal is skipped and pacing degrades to the floor tick). */
+  currentWorkStateRev?: string | null;
+  /** the rev recorded at the last autonomous turn */
+  lastTurnWorkStateRev?: string | null;
+  /** the previous autonomous turn ended AGENDA-CONTINUE */
+  previousTurnAgendaContinue: boolean;
+  /** an operator turn just completed (act on fresh conversation) */
+  operatorTurnJustCompleted: boolean;
+  /** ms since the last autonomous turn (Infinity before the first) */
+  msSinceLastAutonomousTurn: number;
+  /** floor-tick interval; default AUTONOMOUS_FLOOR_TICK_MS */
+  floorTickMs?: number;
+}
+
+/**
+ * Pure pacing predicate: run an autonomous turn when ANY of — the world moved
+ * (heartbeat work_state_rev differs from the rev at the last turn), the agent
+ * declared more work (AGENDA-CONTINUE), an operator turn just completed, or the
+ * floor tick elapsed. ABSENT work_state_rev degrades to floor-tick pacing.
+ */
+export function shouldRunAutonomousTurn(state: AutonomousTurnGateState): boolean {
+  if (state.operatorTurnJustCompleted) return true;
+  if (state.previousTurnAgendaContinue) return true;
+  const rev = state.currentWorkStateRev;
+  if (rev !== undefined && rev !== null && rev !== state.lastTurnWorkStateRev) return true;
+  const floor = state.floorTickMs ?? AUTONOMOUS_FLOOR_TICK_MS;
+  return state.msSinceLastAutonomousTurn >= floor;
+}
+
+/**
+ * Build the DYNAMIC autonomous self-prompt for one tick. Parameterized by the
+ * rotating focus surfaces, recent ledger records (so the turn goes somewhere new
+ * or deeper rather than re-polling), open FOUND leads (restated until acted on),
+ * and a corrective flag (set after an unevidenced idle claim). Contract: complete
+ * ONE meaningful unit of progress (may chain investigate→decide→act→verify and
+ * batch a few ops), keep a standing agenda, and END with exactly one TICK-VERDICT
+ * marker line. CLEAR is scoped to the ONE surface examined this turn — there is
+ * no global "nothing to do", and cheap delta signals can never justify it.
+ */
+export function buildAutonomousPrompt(
+  focus: ExamSurface[],
+  recentRecords: ExamRecord[],
+  openFound: ExamRecord[],
+  corrective: boolean,
+  maxOpsPerTurn = 3,
+): string {
+  const lines: string[] = [];
+
+  if (corrective && focus.length > 0) {
+    lines.push(
+      `CORRECTION: your last idle conclusion examined nothing (no fetch/read ran, or the verdict marker was missing). Examine ${focus[0].key} now — ${focus[0].hint} — and cite what you actually read BEFORE you may conclude CLEAR.`,
+      '',
+    );
+  }
+
+  lines.push(
+    'No operator message is pending. Complete ONE meaningful unit of progress this',
+    `turn. A unit may chain investigate → decide → act → verify, and may batch up to`,
+    `${maxOpsPerTurn} applied ./strategic ops when they form one coherent unit. Depth is`,
+    'welcome: read code, task outcomes, a direction, or the qualification findings',
+    'before deciding — do not stop at revision numbers or counts.',
+    '',
+    'Rotating examination focus (prefer the first; pick another ONLY with a concrete',
+    'lead — your verdict MUST name the surface you actually examined):',
+  );
+  for (const s of focus) lines.push(`- ${s.key} — ${s.hint}`);
+
+  if (recentRecords.length > 0) {
+    lines.push('', 'Recently examined (go somewhere new or deeper — do not just re-poll these):');
+    for (const r of recentRecords) {
+      lines.push(`- ${r.surfaceKey} [${r.verdict}] ${r.note}`.slice(0, 200));
+    }
+  }
+
+  if (openFound.length > 0) {
+    lines.push('', 'Open leads (FOUND but not yet acted on — act on one or explicitly clear it):');
+    for (const r of openFound) {
+      lines.push(`- ${r.surfaceKey}: ${r.note}`.slice(0, 200));
+    }
+  }
+
+  lines.push(
+    '',
+    'Maintain a standing agenda in your session memory; act on the highest-leverage',
+    'item actionable NOW. If more actionable items remain after this turn, end with a',
+    'literal line: AGENDA-CONTINUE',
+    '',
+    'Operator visibility: do NOT send unsolicited durable messages. Use `./messages',
+    "send` ONLY to reply to the operator or to surface something operator-actionable",
+    '(a question, blocker, or real finding). Operator-facing status goes to',
+    '`set-running-update`. Idle is stated here in the stream, never in the inbox.',
+    '',
+    'Cheap delta signals — revision numbers, attempt counts, `git fetch`, unchanged',
+    'payload fields — may be checked but can NEVER justify a CLEAR: "no change since',
+    'the last tick" is the expected steady state, not evidence a surface is clear.',
+    '',
+    'End this turn with EXACTLY ONE trailing marker line, one of:',
+    '  TICK-VERDICT: ADVANCED — <what op(s) you applied and why>',
+    '  TICK-VERDICT: FOUND <surface-key> — <the lead worth acting on next>',
+    '  TICK-VERDICT: CLEAR <surface-key> — <what you actually opened/read, and why nothing there is actionable>',
+    'CLEAR is scoped to the ONE surface you examined this turn — there is no global',
+    '"nothing to do". An examination that ends CLEAR is a fully successful turn.',
+  );
+
+  return lines.join('\n');
+}
+
+// ── Durable exam-ledger helpers ───────────────────────────────────────────────
+// The ledger lives only in process memory; these helpers serialize it as a
+// bounded JSON string for the heartbeat ``note`` field and restore it from
+// ``task.context._exam_ledger`` on startup, so a routine restart (deploy,
+// runner restart) does not wipe open FOUND leads or reset tick rotation.
+
+/**
+ * Serialize the exam ledger for the heartbeat note. Caps note fields at
+ * EXAM_NOTE_CAP, then drops oldest records until the JSON serialization fits
+ * within EXAM_LEDGER_MAX_BYTES so the backend never receives a truncated blob
+ * that would cause JSON.parse to throw on restart.
+ */
+export function serializeLedger(
+  records: ExamRecord[],
+  tick: number,
+  corrective: boolean,
+): string {
+  const truncated = records.slice(-EXAM_RECORDS_CAP).map(r => ({
+    ...r,
+    note: r.note.slice(0, EXAM_NOTE_CAP),
+  }));
+  // Drop oldest records until the serialized byte length fits the budget.
+  let start = 0;
+  while (start < truncated.length) {
+    const candidate = JSON.stringify({ records: truncated.slice(start), tick, corrective });
+    if (Buffer.byteLength(candidate, 'utf8') <= EXAM_LEDGER_MAX_BYTES) {
+      return candidate;
+    }
+    start++;
+  }
+  return JSON.stringify({ records: [], tick, corrective });
+}
+
+/**
+ * Restore the exam ledger from a persisted string (``task.context._exam_ledger``
+ * or the echoed ``exam_ledger`` heartbeat field). Returns null on any parse
+ * error so the caller falls back to a clean slate.
+ */
+export function restoreLedger(
+  value: string | undefined | null,
+): { records: ExamRecord[]; tick: number; corrective: boolean } | null {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const p = parsed as Record<string, unknown>;
+    const rawRecords = Array.isArray(p.records) ? p.records : [];
+    const records: ExamRecord[] = rawRecords
+      .filter((r): r is Record<string, unknown> => r !== null && typeof r === 'object' && !Array.isArray(r))
+      .filter(r => typeof r.surfaceKey === 'string')
+      .slice(0, EXAM_RECORDS_CAP)
+      .map(r => ({
+        surfaceKey: String(r.surfaceKey),
+        atTick: typeof r.atTick === 'number' ? r.atTick : 0,
+        at: typeof r.at === 'string' ? r.at : '',
+        verdict: (['clear', 'found', 'advanced', 'unevidenced', 'interrupted'].includes(String(r.verdict))
+          ? r.verdict : 'unevidenced') as ExamRecord['verdict'],
+        note: typeof r.note === 'string' ? r.note.slice(0, EXAM_NOTE_CAP) : '',
+      }));
+    const tick = typeof p.tick === 'number' && Number.isFinite(p.tick) ? p.tick : 0;
+    const corrective = typeof p.corrective === 'boolean' ? p.corrective : false;
+    return { records, tick, corrective };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refresh the surface catalog from a heartbeat's ``active_direction_ids``:
+ * add direction surfaces for newly active directions, prune surfaces for
+ * retired ones, and leave all non-direction surfaces (fetch verbs, code dirs,
+ * etc.) untouched. Preserves catalog ordering (directions first, then fetch,
+ * then code/knowledge/etc.).
+ */
+export function refreshSurfaceCatalog(
+  catalog: ExamSurface[],
+  activeDirectionIds: string[],
+  payload: Record<string, unknown>,
+): ExamSurface[] {
+  const activeSet = new Set(activeDirectionIds);
+
+  // Prune direction surfaces for retired/absent directions.
+  const pruned = catalog.filter(
+    s => s.kind !== 'direction' || activeSet.has(s.key.slice('direction:'.length)),
+  );
+
+  // Build label map from payload's directions_summary (best-effort enrichment).
+  const payloadDirs = Array.isArray(payload.directions_summary)
+    ? payload.directions_summary as Array<Record<string, unknown>> : [];
+  const payloadDirText = new Map<string, string>();
+  for (const d of payloadDirs) {
+    const id = typeof d.id === 'string' ? d.id : '';
+    const text = typeof d.text === 'string' ? d.text.trim().slice(0, 80) : '';
+    if (id) payloadDirText.set(id, text);
+  }
+
+  // Determine which direction keys are already in the (pruned) catalog.
+  const existingKeys = new Set(pruned.map(s => s.key));
+
+  // Build new direction surfaces in the order activeDirectionIds provides.
+  const newDirs: ExamSurface[] = [];
+  for (const id of activeDirectionIds) {
+    const key = `direction:${id}`;
+    if (!existingKeys.has(key)) {
+      const text = payloadDirText.get(id) ?? '';
+      newDirs.push({
+        key,
+        kind: 'direction',
+        label: text ? `direction ${id} — ${text}` : `direction ${id}`,
+        hint: `./fetch direction ${id} — judge its recent outcomes/churn; is it still productive or done?`,
+      });
+    }
+  }
+
+  if (newDirs.length === 0) return pruned;
+
+  // Insert new directions before the first non-direction surface to maintain
+  // the ordering buildSurfaceCatalog establishes (directions always first).
+  const firstNonDir = pruned.findIndex(s => s.kind !== 'direction');
+  if (firstNonDir === -1) return [...pruned, ...newDirs];
+  return [...pruned.slice(0, firstNonDir), ...newDirs, ...pruned.slice(firstNonDir)];
 }

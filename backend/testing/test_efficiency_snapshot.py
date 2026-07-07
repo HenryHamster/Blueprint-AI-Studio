@@ -1577,6 +1577,89 @@ async def test_banked_attempt_carries_cache_breakdown_for_per_attempt_pricing(
 
 
 @pytest.mark.asyncio
+async def test_banked_attempt_carries_prompt_size_fields(db_session):
+    """bank_task_current_attempt carries prompt_size_bytes, prompt_section_count,
+    and prompt_section_sizes from api_call_summary into attempt_history when present."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"pr_merged": False},
+        vm_provisioned_at=_utcnow() - timedelta(minutes=5),
+        vm_stopped_at=_utcnow(),
+        api_call_summary={
+            "llm_call_count": 2,
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "prompt_size_bytes": 80000,
+            "prompt_section_count": 4,
+            "prompt_section_sizes": [
+                {"name": "task", "bytes": 30000},
+                {"name": "guidance", "bytes": 50000},
+            ],
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    bank_task_current_attempt(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert task.attempt_history[0]["prompt_size_bytes"] == 80000
+    assert task.attempt_history[0]["prompt_section_count"] == 4
+    assert task.attempt_history[0]["prompt_section_sizes"] == [
+        {"name": "task", "bytes": 30000},
+        {"name": "guidance", "bytes": 50000},
+    ]
+    assert task.api_call_summary is None
+
+
+@pytest.mark.asyncio
+async def test_banked_attempt_omits_prompt_size_fields_when_absent(db_session):
+    """bank_task_current_attempt omits prompt-size keys when api_call_summary
+    does not carry them — backward compat with older agents."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"pr_merged": False},
+        vm_provisioned_at=_utcnow() - timedelta(minutes=5),
+        vm_stopped_at=_utcnow(),
+        api_call_summary={
+            "llm_call_count": 1,
+            "total_input_tokens": 200,
+            "total_output_tokens": 50,
+            # no prompt_size_bytes / prompt_section_count / prompt_section_sizes
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    bank_task_current_attempt(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert "prompt_size_bytes" not in task.attempt_history[0]
+    assert "prompt_section_count" not in task.attempt_history[0]
+    assert "prompt_section_sizes" not in task.attempt_history[0]
+
+
+@pytest.mark.asyncio
 async def test_retry_banked_vm_and_llm_costs_count_across_attempts(db_session):
     project = make_project()
     db_session.add(project)
@@ -1717,9 +1800,9 @@ async def test_compute_llm_cost_breakdown_credits_each_attempt_model(db_session)
     assert openai_row["cost_per_merge"] == round(openai_row["total_cost_usd"] / 1, 6)
 
     totals = breakdown["totals"]
-    assert totals["task_count"] == 2  # two attempt-rows
+    assert totals["task_count"] == 1  # one task (not two attempt-rows)
     assert totals["merged_count"] == 1  # one merged TASK, not double-credited
-    assert totals["merge_rate"] == round(1 / 2, 4)
+    assert totals["merge_rate"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -1774,17 +1857,17 @@ async def test_compute_llm_cost_breakdown_merge_counts_multi_attempt_task_once(
     row = {(e["provider"], e["model"]): e for e in breakdown["by_model"]}[
         ("anthropic", "claude-sonnet-4-6")
     ]
-    # Two attempt-rows in one bucket, but a single merged task.
-    assert row["task_count"] == 2
+    # Two attempt-rows in one bucket, but a single task and a single merged task.
+    assert row["task_count"] == 1
     assert row["merged_count"] == 1
-    assert row["merge_rate"] == round(1 / 2, 4)
+    assert row["merge_rate"] == 1.0
     # cost_per_merge divides total bucket cost by the merge COUNT (1), not the
     # attempt count (2): the per-attempt accumulation would halve this figure.
     assert row["cost_per_merge"] == round(row["total_cost_usd"] / 1, 6)
 
     totals = breakdown["totals"]
     assert totals["merged_count"] == 1
-    assert totals["merge_rate"] == round(1 / 2, 4)
+    assert totals["merge_rate"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -4656,6 +4739,523 @@ def test_compact_llm_cost_attribution():
     assert create_row["mean_input_tokens_per_call"] == 500  # 3000 / 6
     assert create_row["cost_usd"] > 0
 
+
+def test_per_turn_metrics_present_when_num_turns_reported():
+    """mean_turns_per_call, mean_input_tokens_per_turn, mean_uncached_input_tokens_per_call,
+    and cache_read_share are computed correctly when tasks report num_turns."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # 4000 input tokens (1000 cache_read), 10 calls, 5 turns across 2 tasks
+    task1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 600,
+            "llm_call_count": 6,
+            "total_cache_read_input_tokens": 600,
+            "total_cache_creation_input_tokens": 0,
+            "num_turns": 3,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    task2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 4,
+            "total_cache_read_input_tokens": 400,
+            "total_cache_creation_input_tokens": 0,
+            "num_turns": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task1, task2])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["research"]
+
+    # total_input=4000, cache_read=1000, llm_call_count=10, num_turns=5
+    assert row["llm_call_count"] == 10
+    assert row["total_input_tokens"] == 4000
+    assert row["total_cache_read_input_tokens"] == 1000
+    # mean_turns_per_call = 5 / 10 = 0.5
+    assert row["mean_turns_per_call"] == 0.5
+    # mean_input_tokens_per_turn = 4000 / 5 = 800
+    assert row["mean_input_tokens_per_turn"] == 800
+    # uncached = 4000 - 0 - 1000 = 3000; per call = 3000 / 10 = 300
+    assert row["mean_uncached_input_tokens_per_call"] == 300
+    # cache_read_share = 1000 / 4000 = 0.25
+    assert row["cache_read_share"] == 0.25
+
+
+def test_per_turn_metrics_absent_when_num_turns_not_reported():
+    """mean_turns_per_call and mean_input_tokens_per_turn are None when no task
+    in the bucket reports num_turns (absent-counter tolerance)."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 5,
+            # num_turns deliberately absent (older agent)
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["create"]
+
+    # num_turns absent → turn-dependent metrics are None
+    assert row["mean_turns_per_call"] is None
+    assert row["mean_input_tokens_per_turn"] is None
+    # uncached and cache_read_share don't depend on num_turns
+    assert row["mean_uncached_input_tokens_per_call"] == 400  # 2000 / 5
+    # cache_read absent → 0 / 2000 = 0.0 (not None, input exists)
+    assert row["cache_read_share"] == 0.0
+    assert row["total_cache_read_input_tokens"] == 0
+
+
+def test_per_turn_metrics_from_attempt_history():
+    """num_turns is accumulated from attempt_history (banked attempts) as well
+    as the live api_call_summary."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        # current attempt has num_turns=2
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 3,
+            "num_turns": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # attempt_history set after creation (property setter pattern used by other tests)
+    task.attempt_history = [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "llm_input_tokens": 1500,
+            "llm_output_tokens": 300,
+            "llm_call_count": 4,
+            "num_turns": 3,
+        }
+    ]
+
+    rows = compute_llm_cost_by_task_type([task])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["fix"]
+
+    # total turns = 3 (history) + 2 (current) = 5
+    # llm_call_count = 4 (history) + 3 (current) = 7
+    assert row["mean_turns_per_call"] == round(5 / 7, 2)
+    # total_input = 1500 (history) + 1000 (current) = 2500
+    assert row["mean_input_tokens_per_turn"] == round(2500 / 5)
+
+
+def test_tool_result_bytes_aggregated_in_by_task_type():
+    """total_tool_result_bytes and mean_tool_result_bytes_per_task are correct
+    when tasks report the field via attempt_history and api_call_summary."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # task1: 5000 bytes in attempt_history, 3000 bytes in live api_call_summary
+    task1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 5,
+            "total_tool_result_bytes": 3000,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    task1.attempt_history = [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "llm_input_tokens": 1500,
+            "llm_output_tokens": 300,
+            "llm_call_count": 3,
+            "total_tool_result_bytes": 5000,
+        }
+    ]
+
+    # task2: only api_call_summary carries the field
+    task2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 2,
+            "total_tool_result_bytes": 2000,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task1, task2])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["research"]
+
+    # task1: 5000 (history) + 3000 (live) = 8000; task2: 2000; total = 10000
+    assert row["total_tool_result_bytes"] == 10000
+    # mean = 10000 / 2 tasks = 5000
+    assert row["mean_tool_result_bytes_per_task"] == 5000
+
+
+def test_mean_tool_result_bytes_denominator_uses_task_count_not_reporting_count():
+    """mean_tool_result_bytes_per_task divides by task_count (all tasks in the bucket),
+    not prompt_size_reporting_count — a non-reporting task dilutes the tool-result mean.
+    This contrasts with mean_prompt_size_bytes which uses prompt_size_reporting_count."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # task1: reports tool_result_bytes
+    task1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 2,
+            "total_tool_result_bytes": 6000,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    # task2: older agent, does NOT report tool_result_bytes
+    task2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "llm_call_count": 1,
+            # total_tool_result_bytes deliberately absent
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task1, task2])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["research"]
+
+    # total accumulates only from the reporting task
+    assert row["total_tool_result_bytes"] == 6000
+    # mean divides by task_count (2), NOT by reporting count (1)
+    # so non-reporting task dilutes the per-task average
+    assert row["mean_tool_result_bytes_per_task"] == 3000
+
+
+def test_tool_result_bytes_absent_when_not_reported():
+    """total_tool_result_bytes and mean_tool_result_bytes_per_task are None
+    when no task in the bucket reported the field (absent-counter tolerance)."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 5,
+            # total_tool_result_bytes deliberately absent (older agent)
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["create"]
+
+    assert row["total_tool_result_bytes"] is None
+    assert row["mean_tool_result_bytes_per_task"] is None
+
+
+def test_compute_llm_cost_breakdown_totals_includes_tool_result_bytes():
+    """totals block from compute_llm_cost_breakdown includes total_tool_result_bytes."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task_with = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 3,
+            "total_tool_result_bytes": 4000,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    task_without = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review"}],
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "llm_call_count": 2,
+            # no total_tool_result_bytes
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    # Present when at least one task reported
+    breakdown = compute_llm_cost_breakdown([task_with, task_without])
+    assert breakdown["totals"]["total_tool_result_bytes"] == 4000
+
+    # None when no task reported
+    breakdown_none = compute_llm_cost_breakdown([task_without])
+    assert breakdown_none["totals"]["total_tool_result_bytes"] is None
+
+
+def test_compact_llm_cost_attribution_carries_tool_result_bytes():
+    """_compact_llm_cost_attribution threads total_tool_result_bytes into the
+    top-level compact block and into each by_task_type row."""
+    import uuid
+
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 600,
+            "llm_call_count": 6,
+            "total_tool_result_bytes": 12000,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = _compact_llm_cost_attribution([task])
+
+    # Top-level aggregate
+    assert result["total_tool_result_bytes"] == 12000
+
+    # Per-task-type row
+    by_type = {r["task_type"]: r for r in result["by_task_type"]}
+    assert "create" in by_type
+    assert by_type["create"]["total_tool_result_bytes"] == 12000
+
+
+def test_prompt_size_bytes_accumulated_from_api_call_summary():
+    """task with api_call_summary.prompt_size_bytes yields non-None total and mean."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 4,
+            "prompt_size_bytes": 150000,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["research"]
+
+    assert row["total_prompt_size_bytes"] == 150000
+    assert row["mean_prompt_size_bytes"] == 150000  # one reporting task
+
+
+def test_prompt_size_bytes_absent_yields_none():
+    """task without prompt_size_bytes in api_call_summary yields None for both fields."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["fix"]
+
+    assert row["total_prompt_size_bytes"] is None
+    assert row["mean_prompt_size_bytes"] is None
+
+
+def test_prompt_size_bytes_accumulated_from_attempt_history():
+    """prompt_size_bytes is accumulated from attempt_history rows as well."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "plan"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 3,
+            "prompt_size_bytes": 80000,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    task.attempt_history = [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "llm_input_tokens": 1500,
+            "llm_output_tokens": 300,
+            "llm_call_count": 4,
+            "prompt_size_bytes": 120000,
+        }
+    ]
+
+    rows = compute_llm_cost_by_task_type([task])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["plan"]
+
+    # Both attempt_history and api_call_summary contribute
+    assert row["total_prompt_size_bytes"] == 120000 + 80000
+    assert row["mean_prompt_size_bytes"] == 120000 + 80000  # one reporting task (summed)
+
+
+def test_prompt_size_bytes_mean_denominator_is_reporting_task_count():
+    """mean_prompt_size_bytes divides by reporting tasks, not total tasks."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task_with = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 5,
+            "prompt_size_bytes": 90000,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    task_without = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review"}],
+        api_call_summary={
+            "total_input_tokens": 1500,
+            "total_output_tokens": 300,
+            "llm_call_count": 3,
+            # no prompt_size_bytes — older task
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task_with, task_without])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["review"]
+
+    # total from 1 reporting task; mean denominator = 1, not 2
+    assert row["total_prompt_size_bytes"] == 90000
+    assert row["mean_prompt_size_bytes"] == 90000
+
+
+def test_compact_attribution_passes_through_prompt_size_bytes():
+    """_compact_llm_cost_attribution includes total/mean prompt_size_bytes in by_task_type."""
+    import uuid
+
+    from app.efficiency_snapshot import _compact_llm_cost_attribution
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 600,
+            "llm_call_count": 6,
+            "prompt_size_bytes": 200000,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = _compact_llm_cost_attribution([task])
+    by_type = {r["task_type"]: r for r in result["by_task_type"]}
+
+    assert "create" in by_type
+    create_row = by_type["create"]
+    assert create_row["total_prompt_size_bytes"] == 200000
+    assert create_row["mean_prompt_size_bytes"] == 200000
 
 
 @pytest.mark.asyncio

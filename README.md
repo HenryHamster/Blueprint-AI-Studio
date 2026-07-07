@@ -253,7 +253,7 @@ Key test invariants:
 - Schema revision (`EXPECTED_SCHEMA_REVISION` in `backend/app/main.py`) — must match the latest Alembic migration
 - Database migrations are immutable — new migrations must chain from the latest `down_revision`
 - Use `./check` for the fast repo gate; use `./check test` for the lightweight backend smoke pass
-- Use `./blueprint status` (or `./blueprint --help`) to query the operator CLI; `./blueprint` is a thin bash wrapper that forwards to `python3 scripts/blueprint.py`. On Windows / PowerShell (where the bash wrapper does not run), call the script directly: `python scripts/blueprint.py status`
+- Use `./blueprint status` (or `./blueprint --help`) to query the operator CLI; `./blueprint` is a thin bash wrapper that forwards to `python3 scripts/blueprint.py`. Run `bash scripts/install-cli.sh` once after cloning to symlink `blueprint` and `blueprint-runner` into `~/.local/bin` so they work as bare commands from any directory. On Windows / PowerShell (where the bash wrapper does not run), call the script directly: `python scripts/blueprint.py status`
 
 ### Adding Features
 

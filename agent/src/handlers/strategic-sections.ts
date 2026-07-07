@@ -1,5 +1,6 @@
 import { strVal } from '../index.js';
 import { calcMessageAge, parseResearchContext } from './research-plan.js';
+import { formatRetiredDirectionGrounding } from './research-direction-context.js';
 
 export function fmtScalar(v: unknown, fallback = '?'): string {
   if (v === undefined || v === null) return fallback;
@@ -250,6 +251,25 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     }
   }
 
+  // Active directions whose criterion_keys map to inactive or unknown
+  // (dangling / wrong-version) acceptance criteria for the open version.
+  const criterionLinkConflicts = Array.isArray(recon.criterion_link_conflicts)
+    ? recon.criterion_link_conflicts as Array<Record<string, unknown>> : [];
+  if (criterionLinkConflicts.length > 0) {
+    lines.push(`\n### Broken criterion links — direction maps to a non-active criterion (${fmtScalar(counts.criterion_link_conflicts, String(criterionLinkConflicts.length))})`);
+    lines.push('These directions carry criterion_keys that are retracted/superseded (inactive) or absent from the open version (dangling). Remap each to an active criterion or clear the stale key.');
+    for (const c of criterionLinkConflicts) {
+      const text = strVal(c.direction_text ?? c.text, '?');
+      const did = strVal(c.direction_id, '?');
+      const key = strVal(c.criterion_key, '?');
+      const cls = strVal(c.classification) === 'inactive'
+        ? 'retracted or superseded'
+        : 'not in the open version';
+      const hint = c.recovery_hint ? ` — ${strVal(c.recovery_hint)}` : '';
+      lines.push(`- ${text} (id: ${did}) → criterion ${key} is ${cls}${hint}`);
+    }
+  }
+
   if (phantomRefs.length > 0) {
     lines.push(`\n### Phantom direction refs — prose cites missing directions (${fmtScalar(counts.phantom_direction_refs, String(phantomRefs.length))})`);
     lines.push('These prose references do not resolve to any known direction. Rewrite the stale narrative or link it to a real direction.');
@@ -265,6 +285,21 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     lines.push(`Active candidate: \`${strVal(qualProseDrift[0]?.active_candidate_sha, '?')}\`. The prose fields below reference a different SHA. Rewrite the stale narrative to reflect the current candidate or remove the specific SHA reference.`);
     for (const q of qualProseDrift) {
       lines.push(`- \`${strVal(q.stale_sha, '?')}\` cited in ${strVal(q.cited_in, '?')} (active: \`${strVal(q.active_candidate_sha, '?')}\`)`);
+    }
+  }
+
+  const qualSurfaceConflicts = Array.isArray(recon.qualification_surface_conflicts)
+    ? recon.qualification_surface_conflicts as Array<Record<string, unknown>> : [];
+  if (qualSurfaceConflicts.length > 0) {
+    const qualConflictsTotal = countOr(counts.qualification_surface_conflicts, qualSurfaceConflicts.length);
+    lines.push(`\n### Qualification surface conflicts — coherence disagreements (${qualConflictsTotal})`);
+    lines.push('The backend detected disagreements between qualification surfaces (candidate currency, qualification state, criterion coverage, promotion readiness). Each entry names a specific cross-surface contradiction. Resolve the conflict before advancing the qualification.');
+    for (const c of qualSurfaceConflicts) {
+      lines.push(`- [${strVal(c.conflict_type, '?')}] ${strVal(c.description, '?')}`);
+    }
+    const overflow = qualConflictsTotal - qualSurfaceConflicts.length;
+    if (overflow > 0) {
+      lines.push(`- +${overflow} more not shown`);
     }
   }
 
@@ -349,6 +384,7 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     ? recon.merge_accounting as Array<Record<string, unknown>> : [];
   const mergeNotLandedTotal = countOr(counts.merge_not_landed, 0);
   const mergeUnverifiableTotal = countOr(counts.merge_unverifiable, 0);
+  const mergePendingInOpenRollupTotal = countOr(counts.merge_pending_in_open_rollup, 0);
   const mergeDirTotal = countOr(counts.merge_accounting, mergeAccounting.length);
   if (mergeAccounting.length > 0 || mergeNotLandedTotal > 0) {
     lines.push(`\n### Merge-accounting drift — badge says shipped, ancestry says NOT landed (${mergeDirTotal} direction(s), ${mergeNotLandedTotal} title(s); ${mergeUnverifiableTotal} unverifiable)`);
@@ -371,6 +407,33 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     }
     if (mergeDirTotal > mergeAccounting.length) {
       lines.push(`- +${mergeDirTotal - mergeAccounting.length} more direction(s) with drift not shown`);
+    }
+  }
+
+  // Pending rollup merges: PRs merged into staging branches awaiting rollup squash-merge
+  // into the integration branch. These are normal work-in-progress, not accounting conflicts.
+  const pendingRollupAccounting = Array.isArray(recon.pending_in_open_rollup)
+    ? recon.pending_in_open_rollup as Array<Record<string, unknown>> : [];
+  if (pendingRollupAccounting.length > 0 || mergePendingInOpenRollupTotal > 0) {
+    const rollupDirTotal = countOr(counts.merge_pending_in_open_rollup_accounting, pendingRollupAccounting.length);
+    lines.push(`\n### Pending rollup merges — work awaiting squash-merge to integration branch (${rollupDirTotal} direction(s), ${mergePendingInOpenRollupTotal} title(s))`);
+    lines.push('These PRs are merged into staging branches and awaiting the rollup to squash-merge into the integration branch. This is normal in-progress work, not a lost-work alarm.');
+    for (const m of pendingRollupAccounting) {
+      const text = strVal(m.direction_text, '?');
+      const did = strVal(m.direction_id, '?');
+      const pending = countOr(m.pending_in_open_rollup, 0);
+      const titles = Array.isArray(m.pending_in_open_rollup_titles) ? m.pending_in_open_rollup_titles as string[] : [];
+      const titlesOverflow = countOr(m.pending_in_open_rollup_titles_overflow, 0);
+      lines.push(`- ${text} (id: ${did}) — ${pending} pending rollup merge`);
+      for (const t of titles) {
+        lines.push(`  - ⧗ ${strVal(t, '?')}`);
+      }
+      if (titlesOverflow > 0) {
+        lines.push(`  - +${titlesOverflow} more pending title(s) not shown`);
+      }
+    }
+    if (rollupDirTotal > pendingRollupAccounting.length) {
+      lines.push(`- +${rollupDirTotal - pendingRollupAccounting.length} more direction(s) not shown`);
     }
   }
 
@@ -1164,8 +1227,21 @@ export function buildDirSummaryText(
     }
 
     const scaffoldingNote = d.outcome_scaffolding_flagged === true ? ' [SCAFFOLDING]' : '';
+    const churnRetireNote = d.churn_retirement_recommended === true ? ' [CHURN-RETIRE-RECOMMENDED]' : '';
 
-    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}${scaffoldingNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}`;
+    let churnRetireSection = '';
+    if (d.churn_retirement_recommended === true) {
+      const ev = d.churn_retirement_evidence as Record<string, unknown> | undefined;
+      const detail = ev && typeof ev === 'object'
+        ? ` (${fmtScalar(ev.churn_family_pause_count)}x churn/unproductive/saturated paused, merge_rate=${fmtScalar(ev.merge_rate, 'n/a')})`
+        : '';
+      churnRetireSection = `\n   ⚠ CHURN-RETIREMENT-RECOMMENDED${detail}: this direction has repeatedly churn-paused with no escape and now stays PAUSED pending your explicit decision. It will NOT auto-retire — either retire it via the retirement path or give it a concrete new approach.`;
+    }
+
+    const groundingText = formatRetiredDirectionGrounding(d.retired_direction_grounding);
+    const groundingSection = groundingText ? `\n   ${groundingText}` : '';
+
+    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}${scaffoldingNote}${churnRetireNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}${churnRetireSection}${groundingSection}`;
   }).join('\n\n');
   // When the shipped detail list is shorter than the authoritative active count,
   // render an honest "showing M of N" header instead of letting the reader infer
@@ -1225,6 +1301,62 @@ export function buildCiComplianceSection(ciCompliance: unknown): string {
   return lines.join('\n');
 }
 
+// Statuses that indicate a linked task has successfully completed its work.
+const _DEBT_COMPLETED_STATUSES = new Set(['COMPLETED']);
+
+export function buildCompletionDebtSection(debt: unknown): string {
+  // Accept the new dict shape {items: [...], total_open: N} or the legacy array shape.
+  let entries: Array<Record<string, unknown>>;
+  let totalOpen: number;
+  if (debt && typeof debt === 'object' && !Array.isArray(debt)) {
+    const d = debt as Record<string, unknown>;
+    entries = Array.isArray(d.items) ? d.items as Array<Record<string, unknown>> : [];
+    totalOpen = typeof d.total_open === 'number' ? d.total_open : entries.length;
+  } else if (Array.isArray(debt)) {
+    entries = debt as Array<Record<string, unknown>>;
+    totalOpen = entries.length;
+  } else {
+    return '';
+  }
+  if (totalOpen === 0 && entries.length === 0) return '';
+  const lines: string[] = ['\n## Open Completion Debt'];
+  const hiddenCount = Math.max(0, totalOpen - entries.length);
+  const tailNote = hiddenCount > 0 ? ` (+${hiddenCount} more not shown)` : '';
+  lines.push(`${totalOpen} open obligation(s)${tailNote} — unfinished work from merged features, knob activations, or retired directions:`);
+  for (const e of entries) {
+    const kind = strVal(e.kind, 'unknown');
+    const title = strVal(e.title, '');
+    const desc = strVal(e.description, '');
+    // Always lead with the human title. Append description only when it adds
+    // information beyond the title (e.g. no_ci_gate detail text). For
+    // dormant_knob rows the backend sets description == title so nothing extra
+    // is appended, avoiding the bare "off"/"observe" knob state showing up.
+    const label = title || desc || '(no description)';
+    const extraDesc = desc && desc !== label ? ` — ${desc}` : '';
+    const ageDays = typeof e.age_days === 'number' ? ` (${e.age_days}d old)` : '';
+    const id = strVal(e.id);
+    const idTag = id ? ` \`${id}\`` : '';
+    lines.push(`  - [${kind}]${idTag} ${label}${extraDesc}${ageDays}`);
+    // Render linked task statuses so the strategist knows if follow-up work
+    // is in flight, already completed (dispose-ready), or failed.
+    const linkedTasks = Array.isArray(e.linked_tasks) ? e.linked_tasks as Array<Record<string, unknown>> : [];
+    if (linkedTasks.length > 0) {
+      const hasCompleted = linkedTasks.some(lt => _DEBT_COMPLETED_STATUSES.has(strVal(lt.status, '').toUpperCase()));
+      const taskSummaries = linkedTasks.map(lt => {
+        const tid = strVal(lt.task_id, '?');
+        const shortId = tid.length > 8 ? tid.slice(0, 8) : tid;
+        const status = strVal(lt.status, 'unknown');
+        return `${shortId}: ${status}`;
+      }).join(', ');
+      const disposeNudge = hasCompleted ? ' ← work landed; consider dispose-completion-debt' : '';
+      lines.push(`    Linked task(s): ${taskSummaries}${disposeNudge}`);
+    }
+  }
+  lines.push('\n_Dispose an obligation once its work lands: `./strategic dispose-completion-debt \'{"debt_id":"<id>","disposition":"resolved","evidence":"<what proved it done>"}\'` (use `"dismissed"` with a reason if it no longer applies). When spawning follow-up work, pass `"debt_id":"<id>"` in the spawn-task/spawn-fix DATA to link the task to its obligation._');
+  lines.push('_Address open completion debt before adding new obligations in the same area._');
+  return lines.join('\n');
+}
+
 export function buildDirHealthSummary(
   directionsSummary: Array<Record<string, unknown>>,
   maxActiveDirections: number,
@@ -1277,10 +1409,23 @@ export function buildPayloadStalenessSection(staleness: Record<string, unknown> 
 
   const lines: string[] = ['\n## Payload Currency (cycle-start check)'];
 
+  // Transient GitHub/API failure — the freshness check could not reach GitHub
+  // (5xx / rate-limit / transport / timeout) after a bounded retry. This is a
+  // TEMPORARY reachability problem, NOT evidence the payload is stale, so it must
+  // render distinctly from an indeterminate ('unknown') check and must NOT push
+  // the strategist to re-ground every load-bearing payload claim as stale.
+  if (staleness.verdict === 'api_unreachable') {
+    const checkedAt = typeof staleness.checked_at === 'string' ? staleness.checked_at : '';
+    const reason = typeof staleness.reason === 'string' && staleness.reason ? ` (${staleness.reason})` : '';
+    lines.push(`⚠ API UNREACHABLE — the freshness check could not reach GitHub at spawn time${reason} after a bounded retry.${checkedAt ? ` Checked at: ${checkedAt}.` : ''}`);
+    lines.push('This is a TEMPORARY API-reachability problem, NOT evidence that this payload is stale. Do NOT re-ground every load-bearing payload claim as stale/unknown on this basis — treat the prior payload SHAs as last-known-good and re-check currency once GitHub is reachable.');
+    return lines.join('\n');
+  }
+
   // Unknown/indeterminate verdict — currency check could not be completed
   if (staleness.verdict === 'unknown') {
     const checkedAt = typeof staleness.checked_at === 'string' ? staleness.checked_at : '';
-    lines.push(`⚠ UNKNOWN — freshness check could not be completed at spawn time (GitHub API unreachable or candidate SHA unavailable).${checkedAt ? ` Checked at: ${checkedAt}.` : ''}`);
+    lines.push(`⚠ UNKNOWN — freshness check could not be completed at spawn time (no candidate SHA, unavailable repo credentials, or the integration branch was not found).${checkedAt ? ` Checked at: ${checkedAt}.` : ''}`);
     lines.push('Treat this payload as potentially stale. Do NOT assume audit findings are scored against current HEAD until a fresh qualification confirms currency.');
     return lines.join('\n');
   }
@@ -1320,6 +1465,32 @@ export function buildPayloadStalenessSection(staleness: Record<string, unknown> 
     if (generatedAt) {
       lines.push(`_Checked at ${generatedAt}_`);
     }
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Render open FOUND leads from the resident session's exam ledger. These are
+ * surfaces the resident session examined and found actionable work on, but the
+ * session ended before acting. The batch strategist should prioritise these
+ * before re-deriving from scratch.
+ *
+ * Returns '' when the leads array is empty.
+ */
+export function buildResidentExamLeadsSection(leads: Array<Record<string, unknown>>): string {
+  if (leads.length === 0) return '';
+  const lines: string[] = ['\n## Resident exam open leads'];
+  lines.push(
+    'The resident session examined these surfaces and recorded open FOUND leads before ending. ' +
+    'Prioritise investigating or acting on them before re-deriving from scratch.',
+  );
+  for (const lead of leads) {
+    const surface = strVal(lead.surfaceKey, '?');
+    const note = strVal(lead.note, '');
+    const at = strVal(lead.at, '');
+    const notePart = note ? ` — ${note}` : '';
+    const atPart = at ? ` (examined at ${at})` : '';
+    lines.push(`- **${surface}**${notePart}${atPart}`);
   }
   return lines.join('\n');
 }

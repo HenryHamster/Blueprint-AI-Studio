@@ -24,6 +24,7 @@ from sqlalchemy import Index, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, select
 
+from app.landed_signal import has_landed_signal
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -189,21 +190,27 @@ async def _maybe_create_drift_alerts(
                 f"Direction {direction_id} has {claimed} claimed changes but 0 PRs merged in 7d",
             )
         )
-    for title, message in candidates:
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.title == title,
-                        Alert.dismissed_at.is_(None),
-                    )
+    if not candidates:
+        return
+    # Batch the undismissed-alert existence check into one query (was one query
+    # per candidate title) and test membership in-memory; create-only-if-absent
+    # semantics are preserved exactly.
+    existing_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.in_([t for t, _ in candidates]),
                 )
             )
-            .scalars()
-            .first()
         )
-        if not existing:
+        .scalars()
+        .all()
+    )
+    existing_titles = {a.title for a in existing_alerts}
+    for title, message in candidates:
+        if title not in existing_titles:
             session.add(
                 Alert(
                     project_id=project_id,
@@ -302,11 +309,9 @@ async def compute_direction_drift(
         per_direction_claims[dir_id] = per_direction_claims.get(
             dir_id, 0
         ) + _direction_claimed_changes(t)
-        # Merged PR: must have a PULL_REQUEST artifact AND context.pr_merged
-        # truthy. The latter is set by the rollup verification step, so it's
-        # the authoritative "shipped" signal — pure artifact existence
-        # would over-count rejected PRs.
-        if t.id in pr_artifact_task_ids and ctx.get("pr_merged"):
+        # Merged PRs must have a PR artifact and the canonical integration
+        # landing signal; merge-equivalent unblock markers are not shipped.
+        if t.id in pr_artifact_task_ids and has_landed_signal(t):
             per_direction_merged[dir_id] = per_direction_merged.get(dir_id, 0) + 1
 
     for d in directions:

@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WORKSPACE } from '../index.js';
+import { agentTokenShellFn, githubTokenShellFn } from '../token-file.js';
 import { validateCfgShellSafety, type CodeChangeHelperConfig } from './code-change-helpers.js';
 
 // Load the canonical sr-pr-section.js renderer from disk and base64-encode
@@ -53,6 +54,8 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   // pick up the URL without re-querying GitHub.
   const _SR_SECTION_SCRIPT_B64 = loadSrSectionScriptB64();
   const _SCREENSHOTS_SECTION_SCRIPT_B64 = loadScreenshotsSectionScriptB64();
+  const agentTokenFn = agentTokenShellFn();
+  const githubTokenFn = githubTokenShellFn();
   const script = `#!/bin/bash
 # ./pr open --title "..." --body "..."  — ship the diff via PR
 #
@@ -64,6 +67,8 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
 # Non-zero on any failure — error tail printed; fix and retry.
 
 set -uo pipefail
+${agentTokenFn}
+${githubTokenFn}
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
@@ -99,7 +104,7 @@ if [ "$OP" = "close" ]; then
   fi
 
   API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-  TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+  _load_agent_token
   TASK="${cfg.taskId}"
 
   # Refresh GitHub token
@@ -332,24 +337,22 @@ if [ "$COMMITS_AHEAD" = "0" ]; then
 fi
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+_load_agent_token
 TASK="${cfg.taskId}"
+# _load_github_token's backend fallback reads $TASK_ID (the standard VM env var,
+# baked into /etc/agent.env by the orchestrator startup script). Set it from the
+# build-time task id so the fallback works even when the ambient shell env does
+# not carry TASK_ID — the script already knows its own task id, so it must not
+# depend on an external env var to fetch the push token.
+TASK_ID="${cfg.taskId}"
 
-# 3. Refresh GitHub token + remote URL right before push. The clone-time token
-#    is per-task ephemeral and may be near expiry by the time Claude ships.
-TOKEN_RESP=$(curl -f -sS --max-time 30 \\
-  -H "X-Agent-Token: $TOKEN" \\
-  "$API/api/agent/github/token?task_id=$TASK") || {
-  echo "[pr] Failed to fetch fresh GitHub token from orchestrator" >&2
-  exit 1
-}
-GH_PUSH_TOKEN=$(printf '%s' "$TOKEN_RESP" | jq -r '.data.token // empty')
-if [ -z "$GH_PUSH_TOKEN" ]; then
-  echo "[pr] orchestrator returned no token: $TOKEN_RESP" >&2
-  exit 1
-fi
-git remote set-url origin "https://x-access-token:$GH_PUSH_TOKEN@github.com/${cfg.owner}/${cfg.repo}.git"
-unset GH_PUSH_TOKEN  # only needed for the remote URL above
+# 3. Refresh GitHub token + remote URL right before push. _load_github_token
+#    prefers the live token file (kept fresh by the Node agent at ~45min
+#    intervals) and falls back to the backend API. _set_github_remote rewrites
+#    the origin URL so git push uses the rotated token instead of the stale
+#    clone-time one.
+_load_github_token || { echo "[pr] Failed to load GitHub token" >&2; exit 1; }
+_set_github_remote "${cfg.owner}" "${cfg.repo}"
 
 # 4. Push (with retry — concurrent-push handling)
 PUSH_OK=0
@@ -431,27 +434,54 @@ PR_PAYLOAD=$(jq -n --arg tid "$TASK" --arg owner "${cfg.owner}" --arg repo "${cf
   '{task_id: $tid, owner: $owner, repo: $repo, title: $title, head: $head, base: $base, body: $body}')
 PR_RESP=""
 PR_OK=0
+PR_HDR_FILE=/tmp/pr_create_hdrs_${cfg.taskId}
 for attempt in 1 2 3 4 5; do
-  PR_HTTP=$(printf '%s' "$PR_PAYLOAD" | curl -sS -o /tmp/pr_create_resp_${cfg.taskId} -w '%{http_code}' --max-time 90 \\
+  : > "$PR_HDR_FILE"
+  PR_HTTP=$(printf '%s' "$PR_PAYLOAD" | curl -sS -o /tmp/pr_create_resp_${cfg.taskId} -D "$PR_HDR_FILE" -w '%{http_code}' --max-time 90 \\
     -X POST "$API/api/agent/github/pull-requests" \\
     -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || PR_HTTP="000"
   if [ "$PR_HTTP" = "200" ] || [ "$PR_HTTP" = "201" ] || [ "$PR_HTTP" = "202" ]; then
     PR_RESP=$(cat /tmp/pr_create_resp_${cfg.taskId})
     PR_OK=1; break
   fi
-  if [ "$PR_HTTP" = "429" ] || [ "\${PR_HTTP:0:1}" = "5" ] || [ "$PR_HTTP" = "000" ]; then
-    BACKOFF=$((attempt * 3))
-    echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP — retrying in \${BACKOFF}s..." >&2
-    sleep "$BACKOFF"; continue
+  # Classify the status. RETRYABLE: 401/403 (maybe a stale agent token), 429
+  # (rate limited), 5xx (incl. 503 = the backend refusing to create because it
+  # could not confirm no-duplicate while the GitHub quota is drained), and 000
+  # (curl transport/timeout). Anything else (400/404/409/422 ...) is permanent.
+  case "$PR_HTTP" in
+    401|403|429|000|5[0-9][0-9]) : ;;
+    *)
+      echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP (permanent failure):" >&2
+      cat /tmp/pr_create_resp_${cfg.taskId} >&2
+      rm -f /tmp/pr_create_resp_${cfg.taskId} "$PR_HDR_FILE"
+      exit 1 ;;
+  esac
+  # A 401/403 can be a stale agent token — re-read it before backing off.
+  case "$PR_HTTP" in
+    401|403) _load_agent_token 2>/dev/null || true ;;
+  esac
+  if [ "$attempt" -ge 5 ]; then
+    echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP — no attempts left" >&2
+    cat /tmp/pr_create_resp_${cfg.taskId} >&2
+    break
   fi
-  echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP (permanent failure):" >&2
-  cat /tmp/pr_create_resp_${cfg.taskId} >&2
-  rm -f /tmp/pr_create_resp_${cfg.taskId}
-  exit 1
+  # Backoff: honor a server-sent Retry-After (seconds) when present — the backend
+  # returns 503 + Retry-After while the GitHub quota is drained. Cap it so a long
+  # reset window (up to ~1h) never blocks the VM past its reaper heartbeat budget.
+  # Otherwise exponential backoff (5,10,20,40s) — never the old tight ~3-9s loop.
+  RETRY_AFTER=$(grep -i '^Retry-After:' "$PR_HDR_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
+  if [ -n "$RETRY_AFTER" ] && [ "$RETRY_AFTER" -gt 0 ] 2>/dev/null; then
+    BACKOFF="$RETRY_AFTER"
+  else
+    BACKOFF=$((5 * (1 << (attempt - 1))))
+  fi
+  [ "$BACKOFF" -gt 120 ] && BACKOFF=120
+  echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP — retrying in \${BACKOFF}s..." >&2
+  sleep "$BACKOFF"
 done
-rm -f /tmp/pr_create_resp_${cfg.taskId}
+rm -f /tmp/pr_create_resp_${cfg.taskId} "$PR_HDR_FILE"
 if [ "$PR_OK" = "0" ]; then
-  echo "[pr] PR creation failed after 5 retries — orchestrator unreachable" >&2
+  echo "[pr] PR creation failed after 5 retries — orchestrator/GitHub quota unavailable" >&2
   exit 1
 fi
 PR_URL=$(printf '%s' "$PR_RESP" | jq -r '.data.html_url // empty')

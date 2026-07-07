@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func as _func
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 from typing import List, Literal
 import uuid
@@ -171,7 +172,9 @@ async def trigger_self_audit(
     active_tasks = (
         (
             await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(load_only(Task.id, Task.status, Task.payloads, raiseload=True))
+                .where(
                     Task.project_id == project.id,
                     Task.status.in_(active_statuses),
                 )
@@ -208,6 +211,11 @@ async def trigger_self_audit(
         idempotency_key=idempotency_key,
     )
     session.add(new_task)
+    # Snapshot project.id before commit: the IntegrityError rollback below
+    # expires `project` (rollback expires regardless of expire_on_commit), so
+    # reading project.id in the coalesce log/return would fire a sync lazy-load
+    # -> MissingGreenlet, 500-ing instead of coalescing onto the in-flight audit.
+    _project_id = project.id
     try:
         await session.commit()
     except IntegrityError:
@@ -233,12 +241,12 @@ async def trigger_self_audit(
                 detail="Self-audit is already in progress for this project.",
             )
         logger.info(
-            f"[ADMIN] Concurrent self-audit trigger for project {project.id} "
+            f"[ADMIN] Concurrent self-audit trigger for project {_project_id} "
             f"coalesced onto existing audit {existing.id}"
         )
         return {
             "task_id": str(existing.id),
-            "project_id": str(project.id),
+            "project_id": str(_project_id),
             "status": existing.status,
         }
     await session.refresh(new_task)
@@ -648,9 +656,25 @@ async def trigger_rollup(
 
     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
 
-    # Count children
+    # Count children — only load the fields needed by _build_rollup_pr_body.
     children = (
-        (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.parent_task_id == task.id)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.payloads,
+                        Task.vm_provisioned_at,
+                        Task.vm_stopped_at,
+                        Task.vm_machine_type,
+                        Task.vm_spot,
+                        raiseload=True,
+                    )
+                )
+            )
+        )
         .scalars()
         .all()
     )

@@ -257,6 +257,37 @@ describe('PipelineView side-car rendering', () => {
   });
 });
 
+describe('PipelineView loading state', () => {
+  it('shows_loading_instead_of_empty_before_initial_tasks_load', () => {
+    render(<PipelineView tasks={[]} loading={true} onViewLogs={vi.fn()} />);
+
+    expect(screen.getByText('Loading tasks...')).toBeInTheDocument();
+    expect(screen.queryByText('No tasks yet')).not.toBeInTheDocument();
+  });
+
+  it('shows empty state after loading completes with no tasks', () => {
+    render(<PipelineView tasks={[]} loading={false} onViewLogs={vi.fn()} />);
+
+    expect(screen.queryByText('Loading tasks...')).not.toBeInTheDocument();
+    expect(screen.getByText('No tasks yet')).toBeInTheDocument();
+  });
+
+  it('shows empty state with active filters when loading is false', () => {
+    render(<PipelineView tasks={[]} loading={false} hasActiveFilters={true} onViewLogs={vi.fn()} />);
+
+    expect(screen.queryByText('Loading tasks...')).not.toBeInTheDocument();
+    expect(screen.getByText('No tasks match the active filters — try clearing filters to see all tasks')).toBeInTheDocument();
+  });
+
+  it('shows tasks instead of loading when tasks are present even if loading is true', () => {
+    const tasks = [makeTask({ id: 'task-1', title: 'Test Task' })];
+    render(<PipelineView tasks={tasks} loading={true} onViewLogs={vi.fn()} />);
+
+    expect(screen.getByText('Test Task')).toBeInTheDocument();
+    expect(screen.queryByText('Loading tasks...')).not.toBeInTheDocument();
+  });
+});
+
 describe('PipelineView group summary counts parked tasks separately', () => {
   it('displays parked count in group header badge and does not inflate queued segment', async () => {
     const user = userEvent.setup();

@@ -70,6 +70,34 @@ def test_check_wrapper_shell_syntax():
     assert result.returncode == 0, f"bash -n failed on ./check: {result.stderr}"
 
 
+def test_install_cli_shell_syntax():
+    """scripts/install-cli.sh passes bash -n (no syntax errors)."""
+    script = os.path.join(REPO_ROOT, "scripts", "install-cli.sh")
+    result = subprocess.run(["bash", "-n", script], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed on scripts/install-cli.sh: {result.stderr}"
+
+
+def test_blueprint_wrapper_resolves_via_symlink(tmp_path):
+    """./blueprint works when invoked via a symlink from an unrelated directory.
+
+    This test would FAIL under the old `dirname "$0"` form and only passes with
+    `readlink -f` — making the assertion load-bearing for the symlink fix.
+    """
+    wrapper = os.path.join(REPO_ROOT, "blueprint")
+    link = tmp_path / "blueprint"
+    link.symlink_to(wrapper)
+    result = subprocess.run(
+        [str(link), "--help"],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+    )
+    assert result.returncode == 0, (
+        f"blueprint --help via symlink exited {result.returncode}: {result.stderr}"
+    )
+    assert len(result.stdout) > 0, "blueprint --help via symlink produced no output"
+
+
 # ── --help for every (sub)command parses and exits 0 ─────────────────────────
 
 HELP_INVOCATIONS = [

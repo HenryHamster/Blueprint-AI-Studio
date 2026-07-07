@@ -211,6 +211,10 @@ PROMOTION_READINESS_METRIC_MANIFEST: dict[str, dict] = {
         "ground_truth": "not promotion_enabled (False once promotion is live, since the dry-run window is then stale pre-go-live history)",
         "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
     },
+    "live_regime_calibration_artifact": {
+        "ground_truth": "promotion_enabled == True — True iff ready=False was forced by _annotate_regime because promotion went live (not a real track-record failure); False in the dry-run window where ready reflects actual qualification history",
+        "consumer": "strategic_spawning._build_cycle_start_reconciliation (cycle-start reconciliation, distinguishes forced-not-ready regime relabel from genuine not-ready verdict without requiring cross-referencing is_current_readiness)",
+    },
 }
 
 
@@ -299,10 +303,18 @@ def _annotate_regime(out: dict[str, Any], promotion_enabled: bool) -> dict[str, 
     frozen on stale dry-runs, so we relabel it as a pre-go-live calibration window
     and force ``ready`` False — a stale dry-run streak must never read as a live
     'ready' signal.
+
+    ``live_regime_calibration_artifact`` is True exactly when ``ready=False`` was
+    forced by this function because promotion went live (a regime relabel), NOT
+    because the qualification track record is genuinely not ready.  Any consumer
+    that receives ``ready=False`` can check this flag without cross-referencing
+    ``is_current_readiness`` to know whether the not-ready verdict is a regime
+    artifact or a real track-record failure.
     """
     out["promotion_enabled"] = promotion_enabled
     out["regime"] = "live" if promotion_enabled else "pre_go_live_calibration"
     out["is_current_readiness"] = not promotion_enabled
+    out["live_regime_calibration_artifact"] = promotion_enabled
     if promotion_enabled:
         out["ready"] = False
         out["reason"] = _READINESS_LIVE_REGIME_NOTE
@@ -370,6 +382,13 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "merge_grade_coverage": qual.get("merge_grade_coverage"),
         "merge_grade_biggest_gap": qual.get("merge_grade_biggest_gap"),
         "merge_grade": qual.get("merge_grade"),
+        # Open completion-debt snapshot at qualification time (additive; None when
+        # the ledger was unavailable or no debt was open).
+        "completion_debt": qual.get("completion_debt"),
+        # Enforce-mode confidence preview (observe/off mode only; None when the mode
+        # is already enforce, a hard blocker fired, or debt pressure was unavailable).
+        "debt_enforce_confidence_preview": qual.get("debt_enforce_confidence_preview"),
+        "debt_enforce_weight_preview": qual.get("debt_enforce_weight_preview"),
     }
 
 
@@ -400,9 +419,27 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
     )
     sub_scores = verdict.sub_scores
     if isinstance(sub_scores, dict):
+        debt_enforce_confidence_preview = sub_scores.get(
+            "debt_enforce_confidence_preview"
+        )
+        debt_enforce_weight_preview = sub_scores.get("debt_enforce_weight_preview")
         sub_scores = {
-            k: v for k, v in sub_scores.items() if k != "acceptance_aggregate"
+            k: v
+            for k, v in sub_scores.items()
+            if k
+            not in {
+                "acceptance_aggregate",
+                "debt_enforce_confidence_preview",
+                "debt_enforce_weight_preview",
+            }
         }
+    else:
+        debt_enforce_confidence_preview = getattr(
+            verdict, "debt_enforce_confidence_preview", None
+        )
+        debt_enforce_weight_preview = getattr(
+            verdict, "debt_enforce_weight_preview", None
+        )
     return {
         "id": str(verdict.id),
         "release_version_id": str(verdict.release_version_id),
@@ -467,6 +504,12 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "goal_alignment": verdict.goal_alignment,
         # Blind merge-grade cert (additive; None on legacy rows predating migration 0327).
         "blind_merge_grade": verdict.blind_merge_grade,
+        # Open completion-debt snapshot embedded in sub_scores at verdict-recording time.
+        # None on legacy rows or when the ledger was unavailable at finalization.
+        "completion_debt": _sub(verdict, "completion_debt"),
+        # Observe-mode preview of the enforce-path confidence / weight.
+        "debt_enforce_confidence_preview": debt_enforce_confidence_preview,
+        "debt_enforce_weight_preview": debt_enforce_weight_preview,
     }
 
 
@@ -520,6 +563,7 @@ def _empty_readiness(
         "promotion_enabled": False,
         "regime": "pre_go_live_calibration",
         "is_current_readiness": True,
+        "live_regime_calibration_artifact": False,
     }
 
 
@@ -894,6 +938,92 @@ async def _has_active_promotion_ci_remediation(
     return False
 
 
+def _compute_requalification_decision(
+    carried: list[dict[str, Any]],
+    truncated: bool,
+    ledger_states: dict[str, str],
+    open_version_id: str,
+) -> dict[str, Any]:
+    """Pure re-qualification readiness decision (no I/O; testable without a DB).
+
+    ``ledger_states`` maps finding_key → resolution state string (e.g. "resolved",
+    "stale"). Any key absent from the map is treated as "unresolved".
+
+    Truncation-safe: when ``truncated`` is True, the carried list was clipped at
+    the cap and hidden findings may exist. If ALL visible gating findings are
+    resolved we still allow re-qualification — a fresh run re-scores the full set.
+    Blocking forever on a truncated-but-fully-resolved list permanently wedges the
+    auto-redrive (see compute_requalification_readiness for context).
+    """
+    gating: list[dict[str, Any]] = []
+    for f in carried:
+        if not isinstance(f, dict):
+            continue
+        severity = str(f.get("severity") or "").lower()
+        if severity not in _REQUALIFICATION_GATING_SEVERITIES:
+            continue
+        key = f.get("key") or _KEYLESS_FINDING_SENTINEL
+        state_val = ledger_states.get(key)
+        state = state_val if state_val in _RESOLVED_LEDGER_STATES else "unresolved"
+        gating.append(
+            {
+                "key": key,
+                "severity": severity,
+                "summary": f.get("summary"),
+                "state": state,
+            }
+        )
+
+    gating_total = len(gating)
+    gating_resolved = sum(1 for g in gating if g["state"] in _RESOLVED_LEDGER_STATES)
+    all_resolved = gating_resolved == gating_total
+
+    if truncated and all_resolved:
+        # All visible gating findings resolved. Even though the carried list was
+        # clipped at the cap, allow re-qualification — the next run re-scores the
+        # full finding set. Blocking forever on truncated-but-resolved findings
+        # permanently wedges the auto-redrive.
+        ready = True
+        reason = (
+            f"all {gating_total} visible high/medium finding(s) resolved or "
+            "code-verified stale; note: carried list was truncated at the cap — "
+            "re-qualification will re-score the full finding set"
+        )
+    elif truncated:
+        # Truncated with unresolved visible gating findings.
+        ready = False
+        reason = (
+            "carried audit findings were truncated at the cap — readiness cannot "
+            f"be asserted on a partial list ({gating_resolved}/{gating_total} "
+            "visible gating findings resolved)"
+        )
+    elif gating_total == 0:
+        ready = True
+        reason = "no carried high/medium audit findings — ready to re-qualify"
+    elif all_resolved:
+        ready = True
+        reason = (
+            f"all {gating_total} carried high/medium audit finding(s) resolved or "
+            "code-verified stale — ready to re-qualify"
+        )
+    else:
+        ready = False
+        reason = (
+            f"{gating_total - gating_resolved} of {gating_total} carried "
+            "high/medium audit finding(s) still unresolved"
+        )
+
+    return {
+        "requalification_ready": ready,
+        "open_version_id": open_version_id,
+        "audit_findings_truncated": truncated,
+        "gating_total": gating_total,
+        "gating_resolved": gating_resolved,
+        "reason": reason,
+        "findings": gating,
+    }
+
+
 async def compute_requalification_readiness(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -911,9 +1041,14 @@ async def compute_requalification_readiness(
     zero-gating-findings case: ready=True (nothing carried blocks re-qualification).
 
     Truncation-safe: if the carried list was clipped at the cap
-    (``audit_findings_truncated``), readiness is NOT claimed on the partial list —
-    ``requalification_ready`` is forced False and ``audit_findings_truncated`` is
-    surfaced so consumers can treat readiness conservatively.
+    (``audit_findings_truncated``) and any VISIBLE gating finding is unresolved,
+    readiness is NOT claimed on the partial list.  If every visible gating
+    finding is resolved, readiness IS claimed despite truncation (with a
+    re-score caveat in the reason) — the next qualification run re-scores the
+    full finding set, and blocking forever on a truncated-but-fully-resolved
+    list would permanently wedge the auto-redrive.
+    ``audit_findings_truncated`` is always surfaced so consumers can treat
+    readiness conservatively.
 
     Returns a dict shaped:
         {
@@ -976,77 +1111,303 @@ async def compute_requalification_readiness(
         .scalars()
         .all()
     )
-    ledger_by_key: dict[str, AuditFindingResolution] = {
-        row.finding_key: row for row in ledger_rows
+    ledger_states: dict[str, str] = {row.finding_key: row.state for row in ledger_rows}
+
+    return _compute_requalification_decision(
+        carried, truncated, ledger_states, str(version.id)
+    )
+
+
+# Gate-state vocabulary emitted by ``compute_promotion_ci_green_gate``.  Only
+# ``green`` clears the promotion_failed re-driver; every other state defers.
+_PROMOTION_CI_GATE_STATES = frozenset(
+    {"green", "pending", "red", "dispatched", "no_signal", "unavailable"}
+)
+
+
+def _promotion_ci_gate_verdict(
+    gate_state: str,
+    *,
+    head_sha: str | None = None,
+    run_id: Any = None,
+    html_url: str | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Small, stable verdict dict for :func:`compute_promotion_ci_green_gate`."""
+    return {
+        "gate_state": gate_state,
+        "head_sha": head_sha,
+        "run_id": run_id,
+        "html_url": html_url,
+        "reason": reason,
     }
 
-    gating: list[dict[str, Any]] = []
-    for f in carried:
-        if not isinstance(f, dict):
-            continue
-        severity = str(f.get("severity") or "").lower()
-        if severity not in _REQUALIFICATION_GATING_SEVERITIES:
-            continue
-        key = f.get("key")
-        if not key:
-            # No content key (e.g. challenger-independent blocker persisted
-            # without a hash key).  Expose the sentinel so callers can pass
-            # it directly to the resolution endpoint without reading internals.
-            key = _KEYLESS_FINDING_SENTINEL
-            ledger = ledger_by_key.get(_KEYLESS_FINDING_SENTINEL)
-        else:
-            ledger = ledger_by_key.get(key)
-        state = (
-            ledger.state
-            if ledger is not None and ledger.state in _RESOLVED_LEDGER_STATES
-            else "unresolved"
+
+async def compute_promotion_ci_green_gate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    dispatch: bool = True,
+) -> dict[str, Any]:
+    """Resolve whether the integration-branch HEAD has a green full-suite CI run.
+
+    This is the promotion_failed-specific full-matrix green gate.  It resolves the
+    project's GitHub creds, the integration branch, and the current integration
+    HEAD sha, then looks up the latest ``ci.yml`` Actions run for that HEAD sha via
+    :func:`app.github.get_workflow_run_for_sha` (which filters by ``head_sha``, so a
+    returned run is always FOR the current HEAD).
+
+    Returns a small verdict dict ``{gate_state, head_sha, run_id, html_url, reason}``
+    where ``gate_state`` is one of:
+
+      * ``green``      — a COMPLETED ``ci.yml`` run for the current HEAD concluded success
+      * ``pending``    — a run for HEAD is queued / in_progress (not yet concluded)
+      * ``red``        — a run for HEAD concluded non-success
+      * ``dispatched`` — no run existed for HEAD, so one was just dispatched
+      * ``no_signal``  — ``dispatch=False`` and no run exists for HEAD, or a
+                         cancelled run exists with ``dispatch=False``
+      * ``unavailable``— GitHub creds / HEAD / API unavailable (or an error occurred)
+
+    When ``dispatch=True`` and there is no run for the current HEAD, dispatches a
+    fresh ``ci.yml`` run on the integration branch (the full 8-shard backend +
+    frontend + agent matrix, since ci.yml's ``detect`` job forces all-true on a
+    ``workflow_dispatch``) and returns ``dispatched``.
+
+    IMPORTANT: this performs a GitHub round-trip and is DELIBERATELY separate from
+    :func:`compute_requalification_readiness`, which stays DB-only and
+    side-effect-free.  Never raises — any failure degrades to ``unavailable``.
+    """
+    from app import github  # noqa: PLC0415 — avoid import cycle
+    from app.github_checks import CI_WORKFLOW_FILE  # noqa: PLC0415
+    from app.models import Project  # noqa: PLC0415
+    from app.release_promotion import (  # noqa: PLC0415
+        _lts_branch_names,
+        _resolve_github_with_session,
+    )
+
+    try:
+        project = await session.get(Project, project_id)
+        if project is None:
+            return _promotion_ci_gate_verdict(
+                "unavailable", reason="project not found"
+            )
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return _promotion_ci_gate_verdict(
+                "unavailable", reason="GitHub credentials unavailable"
+            )
+        token, owner, repo = resolved
+        integration_branch, _promotion_target = _lts_branch_names(project)
+        head_sha = await github.get_branch_sha(token, owner, repo, integration_branch)
+        if not head_sha:
+            return _promotion_ci_gate_verdict(
+                "unavailable",
+                reason=f"could not resolve {integration_branch} HEAD sha",
+            )
+
+        run = await github.get_workflow_run_for_sha(
+            token,
+            owner,
+            repo,
+            head_sha,
+            workflow_file=CI_WORKFLOW_FILE,
+            project_id=str(project_id),
         )
-        gating.append(
-            {
-                "key": key,
-                "severity": severity,
-                "summary": f.get("summary"),
-                "state": state,
-            }
+        if run is not None:
+            run_id = run.get("run_id")
+            html_url = run.get("html_url") or ""
+            status_ = run.get("status")
+            conclusion = run.get("conclusion")
+            if status_ == "completed":
+                if conclusion == "success":
+                    return _promotion_ci_gate_verdict(
+                        "green",
+                        head_sha=head_sha,
+                        run_id=run_id,
+                        html_url=html_url,
+                        reason="ci.yml run for integration HEAD concluded success",
+                    )
+                if conclusion == "cancelled":
+                    if not dispatch:
+                        return _promotion_ci_gate_verdict(
+                            "no_signal",
+                            head_sha=head_sha,
+                            run_id=run_id,
+                            html_url=html_url,
+                            reason=(
+                                "ci.yml run for integration HEAD was cancelled "
+                                "(read-only gate, no run dispatched)"
+                            ),
+                        )
+                    # dispatch=True: treat the cancelled run as absent and
+                    # fall through to the dispatch block below.
+                else:
+                    return _promotion_ci_gate_verdict(
+                        "red",
+                        head_sha=head_sha,
+                        run_id=run_id,
+                        html_url=html_url,
+                        reason=(
+                            "ci.yml run for integration HEAD concluded "
+                            f"{conclusion or 'non-success'}"
+                        ),
+                    )
+            else:
+                # queued / in_progress / waiting / requested — a run is in flight.
+                return _promotion_ci_gate_verdict(
+                    "pending",
+                    head_sha=head_sha,
+                    run_id=run_id,
+                    html_url=html_url,
+                    reason=f"ci.yml run for integration HEAD is {status_ or 'in flight'}",
+                )
+
+        # No run exists for the current HEAD.
+        if not dispatch:
+            return _promotion_ci_gate_verdict(
+                "no_signal",
+                head_sha=head_sha,
+                reason=(
+                    "no ci.yml run for integration HEAD "
+                    "(read-only gate, no run dispatched)"
+                ),
+            )
+        dispatched = await github.dispatch_workflow_run(
+            token,
+            owner,
+            repo,
+            CI_WORKFLOW_FILE,
+            integration_branch,
+            project_id=str(project_id),
+        )
+        if dispatched:
+            return _promotion_ci_gate_verdict(
+                "dispatched",
+                head_sha=head_sha,
+                reason=(
+                    "no ci.yml run for integration HEAD — dispatched a fresh "
+                    f"full-matrix run on {integration_branch}"
+                ),
+            )
+        return _promotion_ci_gate_verdict(
+            "unavailable",
+            head_sha=head_sha,
+            reason="failed to dispatch ci.yml run for integration HEAD",
+        )
+    except Exception:
+        logger.exception(
+            "[PROMOTION_CI_GATE] compute failed for project %s", project_id
+        )
+        return _promotion_ci_gate_verdict(
+            "unavailable", reason="error computing promotion CI green gate"
         )
 
-    gating_total = len(gating)
-    gating_resolved = sum(1 for g in gating if g["state"] in _RESOLVED_LEDGER_STATES)
-    all_resolved = gating_resolved == gating_total
 
-    if truncated:
-        # The carried list was clipped at the cap: we cannot see every gating
-        # finding, so readiness must not be claimed on a partial list.
-        ready = False
-        reason = (
-            "carried audit findings were truncated at the cap — readiness cannot "
-            f"be asserted on a partial list ({gating_resolved}/{gating_total} "
-            "visible gating findings resolved)"
-        )
-    elif gating_total == 0:
-        ready = True
-        reason = "no carried high/medium audit findings — ready to re-qualify"
-    elif all_resolved:
-        ready = True
-        reason = (
-            f"all {gating_total} carried high/medium audit finding(s) resolved or "
-            "code-verified stale — ready to re-qualify"
-        )
-    else:
-        ready = False
-        reason = (
-            f"{gating_total - gating_resolved} of {gating_total} carried "
-            "high/medium audit finding(s) still unresolved"
-        )
+async def compute_qualification_trigger_state(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Classify whether the open version's INITIAL qualification trigger is armed.
+
+    This is a cheap, DB-only predicate (no GitHub round-trips) that answers
+    'why hasn't the initial qualification fired / would it fire now'.  It is
+    the single source of truth for the initial-trigger decision so the sweep
+    function and any future read-surface cannot drift apart.
+
+    Returns a dict shaped::
+
+        {
+          "trigger_state": "armed" | "blocked",
+          "open_version_id": str | None,
+          "reason": str,   # machine-readable code
+          "summary": str,  # human-readable explanation
+          "coverage_total": int,
+          "coverage_covered": int,
+        }
+
+    ``trigger_state`` is ``"armed"`` exactly when:
+      - an open release version exists for the project, AND
+      - the version is in the "stabilize" phase, AND
+      - no prior qualification attempt exists (``last_qualification is None``
+        AND ``qualification_attempts == 0``), AND
+      - criterion coverage is complete: NOT (total > 0 and covered < total).
+
+    ``reason`` codes when ``trigger_state == "blocked"``:
+      - ``"no_open_version"``       — no open release version
+      - ``"wrong_phase"``           — version exists but is not in stabilize phase
+      - ``"prior_attempt_exists"``  — last_qualification is set OR qualification_attempts > 0
+      - ``"coverage_incomplete"``   — coverage gate would fire (total > 0 and covered < total)
+    """
+    from app.acceptance_criteria import get_version_coverage_summary  # noqa: PLC0415
+
+    version = await release_version.current_open_version(session, project_id)
+    if version is None:
+        return {
+            "trigger_state": "blocked",
+            "open_version_id": None,
+            "reason": "no_open_version",
+            "summary": "no open release version — nothing to qualify",
+            "coverage_total": 0,
+            "coverage_covered": 0,
+        }
+
+    if version.phase != "stabilize":
+        return {
+            "trigger_state": "blocked",
+            "open_version_id": str(version.id),
+            "reason": "wrong_phase",
+            "summary": (
+                f"version v{version.version_number} is in phase "
+                f"'{version.phase}', not 'stabilize'"
+            ),
+            "coverage_total": 0,
+            "coverage_covered": 0,
+        }
+
+    has_prior_attempt = (
+        version.last_qualification is not None
+        or (version.qualification_attempts or 0) > 0
+    )
+    if has_prior_attempt:
+        return {
+            "trigger_state": "blocked",
+            "open_version_id": str(version.id),
+            "reason": "prior_attempt_exists",
+            "summary": (
+                f"version v{version.version_number} already has a qualification "
+                "attempt recorded — initial trigger does not re-fire"
+            ),
+            "coverage_total": 0,
+            "coverage_covered": 0,
+        }
+
+    coverage = await get_version_coverage_summary(session, version.id)
+    total = int(coverage.get("total") or 0)
+    covered = int(coverage.get("covered") or 0)
+
+    if total > 0 and covered < total:
+        return {
+            "trigger_state": "blocked",
+            "open_version_id": str(version.id),
+            "reason": "coverage_incomplete",
+            "summary": (
+                f"criterion coverage incomplete for v{version.version_number}: "
+                f"{covered}/{total} active criteria covered"
+            ),
+            "coverage_total": total,
+            "coverage_covered": covered,
+        }
 
     return {
-        "requalification_ready": ready,
+        "trigger_state": "armed",
         "open_version_id": str(version.id),
-        "audit_findings_truncated": truncated,
-        "gating_total": gating_total,
-        "gating_resolved": gating_resolved,
-        "reason": reason,
-        "findings": gating,
+        "reason": "armed",
+        "summary": (
+            f"v{version.version_number} is stabilize-phase with no prior attempt "
+            f"and complete criterion coverage ({covered}/{total if total else 'none'})"
+        ),
+        "coverage_total": total,
+        "coverage_covered": covered,
     }
 
 

@@ -8,6 +8,7 @@ import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './worksp
 import { handlers, resolveHandler } from './handlers/index.js';
 import {
   loadTaskCapabilityContract,
+  isReadOnlyTaskType,
   type TaskCapabilityContract,
 } from './taskCapabilities.js';
 import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
@@ -36,9 +37,15 @@ import {
 import {
   initTokenModule, tryRefreshToken,
   scheduleProactiveTokenRefresh, stopProactiveTokenRefresh,
+  scheduleGithubTokenRefresh, stopGithubTokenRefresh,
   computeRefreshDelayMs, isBootstrapToken,
 } from './utils/agent-token.js';
-import { ensureAgentTokenFileEnv, writeAgentTokenFile } from './token-file.js';
+import { ensureAgentTokenFileEnv, writeAgentTokenFile, ensureGithubTokenFileEnv, writeGithubTokenFile } from './token-file.js';
+import {
+  writeGitTokenFile,
+  setupGitCredentialHelper,
+  ensureGitCredentialHelperScript,
+} from './git-credential.js';
 import { sanitize, sanitizeError } from './utils/sanitize.js';
 import {
   type StaleResultEnvelope,
@@ -395,10 +402,10 @@ export function resolveBaseBranch(
   task: Record<string, unknown>,
   fallback = 'main',
 ): string {
-  const fromPayload = strVal(payload.base_branch);
+  const fromPayload = strVal(payload.base_branch).trim();
   if (fromPayload) return fromPayload;
   const meta = task.project_metadata as Record<string, unknown> | undefined;
-  const fromMeta = strVal(meta?.integration_branch);
+  const fromMeta = strVal(meta?.integration_branch).trim();
   if (fromMeta) return fromMeta;
   return fallback;
 }
@@ -892,6 +899,33 @@ export async function apiRequest(
         const retryAfterSec = parseInt(res.headers.get('Retry-After') || '5', 10);
         const delayMs = Math.max(1000, Math.min(retryAfterSec * 1000, API_RETRY_BACKOFF_MAX_MS));
         log(`${method} ${path} got 429 (rate-limited/locked), retrying in ${delayMs}ms`);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      // 503 (or a 403 carrying a Retry-After): temporary upstream unavailability
+      // — e.g. the create-PR endpoint refusing with 503 + Retry-After while the
+      // shared GitHub install-token quota is drained (it cannot confirm no
+      // duplicate PR). Back off honoring Retry-After when present, else
+      // exponential, capped like the 429 path. A 403 is retried here ONLY when
+      // it carries a Retry-After, so genuine auth/permission 403s (no such
+      // header) still fail fast via the 4xx bail-out below.
+      //
+      // Note: this path clamps Retry-After to API_RETRY_BACKOFF_MAX_MS (30s),
+      // intentionally TIGHTER than the backend's advertised ceiling (up to 120s)
+      // and the ./pr shell loop's 120s honor cap. This is a Node fetch retry with
+      // a bounded per-request budget (not the synchronous ./pr step), so a short
+      // cap keeps it responsive and simply re-polls sooner; the backend still
+      // won't create until the quota returns, so an earlier retry is harmless.
+      const retryAfterHeader = res.headers.get('Retry-After') ?? null;
+      if (res.status === 503 || (res.status === 403 && retryAfterHeader !== null)) {
+        if (attempt === retries - 1) {
+          throw new Error(`${method} ${path} failed (${res.status}): ${text}`);
+        }
+        const retryAfterSec = retryAfterHeader !== null ? parseInt(retryAfterHeader, 10) : NaN;
+        const delayMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+          ? Math.max(1000, Math.min(retryAfterSec * 1000, API_RETRY_BACKOFF_MAX_MS))
+          : Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, API_RETRY_BACKOFF_MAX_MS);
+        log(`${method} ${path} got ${res.status} (temporary/upstream-unavailable), retrying in ${delayMs}ms`);
         await new Promise(r => setTimeout(r, delayMs));
         continue;
       }
@@ -2324,6 +2358,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
 function stopHeartbeat() {
   if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
   stopProactiveTokenRefresh();
+  stopGithubTokenRefresh();
   // Reset mutex so warm-VM continuity (one agent process, multiple sequential
   // tasks) starts the next task with a clean in-flight state. Without this,
   // a stuck heartbeat at role-end would leave the flag true and the new
@@ -2826,23 +2861,30 @@ export function gitAsync(args: string[], cwd = WORKSPACE, timeoutMs = 300_000): 
 const GIT_CLONE_AUTH_ERROR = /Invalid username or token|Password authentication is not supported|Authentication failed|remote: (?:Invalid|Repository not found)|returned error:\s*40[13]\b|HTTP\s*40[13]\b/i;
 
 /** Re-mint a fresh GitHub installation token (force_refresh busts the backend's
- *  ~50min cache) and rewrite the `x-access-token:<tok>@github.com` segment of
- *  the matching clone-arg in place. Returns true if a URL arg was rewritten. */
+ *  ~50min cache), write it to the credential-helper token file, and also rewrite
+ *  any `x-access-token:<tok>@github.com` segment in-place for legacy callers
+ *  that still embed the token in the URL. Returns true if a fresh token was
+ *  obtained (regardless of whether a URL was rewritten). */
 async function refreshCloneToken(args: string[], taskId: string): Promise<boolean> {
   if (!taskId) return false;
-  const urlIdx = args.findIndex(a => /https:\/\/x-access-token:[^@]+@github\.com\//.test(a));
-  if (urlIdx === -1) return false;
   const freshRes = await apiGet(
     `/api/agent/github/token?task_id=${taskId}&force_refresh=true`,
     API_MAX_RETRIES, 180_000,
   ) as { data?: { token?: string } };
   const freshToken = freshRes.data?.token;
   if (!freshToken) return false;
-  // Replace only the token segment; keep host/path untouched.
-  args[urlIdx] = args[urlIdx].replace(
-    /(https:\/\/x-access-token:)[^@]+(@github\.com\/)/,
-    `$1${freshToken}$2`,
-  );
+  // Persist the fresh token so the credential helper reads it on the retry.
+  writeGitTokenFile(freshToken);
+  // Also rewrite any legacy token-embedded URL in the args array so old-style
+  // callers that still build `x-access-token:<tok>@github.com` URLs also get
+  // the fresh token on their retry attempt.
+  const urlIdx = args.findIndex(a => /https:\/\/x-access-token:[^@]+@github\.com\//.test(a));
+  if (urlIdx !== -1) {
+    args[urlIdx] = args[urlIdx].replace(
+      /(https:\/\/x-access-token:)[^@]+(@github\.com\/)/,
+      `$1${freshToken}$2`,
+    );
+  }
   return true;
 }
 
@@ -2919,8 +2961,15 @@ export async function setupWorkspace(
   sendLog(ws, `Cloning ${owner}/${repo}...\n`);
   sendHeartbeatSync(taskId, `Cloning ${owner}/${repo}...`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
-  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  const cloneArgs = ['clone', '--depth', '100', '--branch', baseBranch];
+  // Write the token to the credential-helper file and ensure the helper script
+  // exists before the clone so git can authenticate without an embedded token.
+  writeGitTokenFile(ghToken);
+  const helperPath = ensureGitCredentialHelperScript();
+  const cleanCloneUrl = `https://github.com/${owner}/${repo}.git`;
+  const cloneArgs = [
+    '-c', `credential.https://github.com.helper=${helperPath}`,
+    'clone', '--depth', '100', '--branch', baseBranch,
+  ];
   // Reuse the pre-baked git object cache when the image seeded a mirror for
   // this repo. `--reference-if-able` borrows objects from the local mirror and
   // silently falls back to a normal fetch if the path is missing or invalid,
@@ -2930,7 +2979,7 @@ export async function setupWorkspace(
     cloneArgs.push('--reference-if-able', referenceRepo);
     sendLog(ws, `Using pre-baked git object cache at ${referenceRepo}\n`);
   }
-  cloneArgs.push(cloneUrl, WORKSPACE);
+  cloneArgs.push(cleanCloneUrl, WORKSPACE);
   try {
     await cloneWithRetry(cloneArgs);
   } catch (e) {
@@ -2938,6 +2987,9 @@ export async function setupWorkspace(
     (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'clone_failed';
     throw err;
   }
+  // Configure the credential helper and clean remote URL in the workspace git
+  // config so all subsequent operations authenticate via the helper.
+  setupGitCredentialHelper(owner, repo, WORKSPACE);
   sendHeartbeatSync(taskId, `Clone complete, configuring workspace...`);
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
@@ -3021,8 +3073,12 @@ export async function pushAndCreatePR(
   // keeps firing during the push, preventing the reaper from killing us mid-push.
   sendHeartbeatSync(taskId, `Pushing ${workBranch}...`);
   const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
-  const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
+  // Refresh the token file and ensure the remote URL is clean (no embedded secret).
+  // The credential helper configured in .git/config at clone time will supply the
+  // fresh token to git push without it appearing in the URL or .git/config.
+  writeGitTokenFile(freshGhRes.data.token);
+  const cleanPushUrl = `https://github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', cleanPushUrl], { encoding: 'utf-8' });
   await gitAsync(['push', 'origin', workBranch]);
   sendLog(ws, `Pushed to branch: ${workBranch}\n`);
 
@@ -3061,6 +3117,8 @@ import {
   getCurrentPromptFingerprint,
   recordLlmCallStart,
   recordLlmTokens,
+  recordNumTurns,
+  recordToolResultBytes,
   getLlmTelemetry,
   resetLlmTelemetry,
   recordFormatMiss,
@@ -3077,6 +3135,8 @@ export {
   getCurrentPromptFingerprint,
   recordLlmCallStart,
   recordLlmTokens,
+  recordNumTurns,
+  recordToolResultBytes,
   getLlmTelemetry,
   resetLlmTelemetry,
   recordFormatMiss,
@@ -3785,6 +3845,14 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // permissions to a read-only task.
     statusRef.value = 'Loading task-capability contract...';
     await ensureTaskCapabilityContractLoaded();
+
+    // Seed the GitHub token file immediately so bash helpers can use it from
+    // the first invocation. Then schedule proactive refreshes every 45 min
+    // (the GitHub installation token TTL is 60 min; the backend cache is 50 min,
+    // so force_refresh=false hits the cache at zero GitHub API cost).
+    ensureGithubTokenFileEnv();
+    writeGithubTokenFile(ghToken);
+    scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
 
     // Dispatch to handler — contract-driven (registry-driven task types).
     //

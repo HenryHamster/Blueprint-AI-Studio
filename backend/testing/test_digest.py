@@ -1836,6 +1836,78 @@ async def test_digest_time_window_filtering(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_digest_windowing_uses_durable_completed_at_not_status_log_tail(
+    client: AsyncClient, db_session
+):
+    """A post-terminal status_log write (e.g. a latest_status_message append) must
+    NOT pull a task whose durable completed_at is OUTSIDE the window back into the
+    digest. Deriving from the status_log tail would wrongly include it."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    completed_at = now - timedelta(hours=30)  # OUTSIDE the 24h window
+    post_terminal_msg_at = now - timedelta(hours=1)  # INSIDE the window
+    task = make_task(
+        project_id=project.id,
+        title="Completed Long Ago Then Messaged",
+        status=TaskStatus.COMPLETED,
+        created_at=completed_at,
+        completed_at=completed_at,
+        status_log=[
+            {"s": "COMPLETED", "t": completed_at.isoformat()},
+            # Mirrors latest_status_message appending a row post-terminal.
+            {"t": post_terminal_msg_at.isoformat(), "msg": "operator note"},
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest?hours=24")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["completed_count"] == 0
+    titles = [c["title"] for c in data["recent_completions"]]
+    assert "Completed Long Ago Then Messaged" not in titles
+
+
+@pytest.mark.asyncio
+async def test_digest_legacy_null_completed_at_windows_by_status_log_tail(
+    client: AsyncClient, db_session
+):
+    """Legacy rows whose durable completed_at was never stamped still window by the
+    status_log tail (unchanged fallback), NOT created_at."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    terminal_at = now - timedelta(hours=2)  # INSIDE the 24h window
+    task = make_task(
+        project_id=project.id,
+        title="Legacy In Window",
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=40),  # OUTSIDE the window
+        status_log=[{"s": "COMPLETED", "t": terminal_at.isoformat()}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    # Simulate a legacy row whose durable column was never populated.
+    task.completed_at = None
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest?hours=24")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["completed_count"] == 1
+    titles = [c["title"] for c in data["recent_completions"]]
+    assert "Legacy In Window" in titles
+
+
+@pytest.mark.asyncio
 async def test_digest_project_filter(client: AsyncClient, db_session):
     """project_id query param filters tasks to only the specified project."""
     project_a = make_project(name="Project A")
@@ -4599,8 +4671,8 @@ async def test_digest_retry_overhead_cost_computation(client: AsyncClient, db_se
     body = response.json()
 
     assert body["retry_task_count"] == 3  # attempts 2, 3, 4 (attempt 1 excluded)
-    # avg = (2 + 3 + 4) / 3 = 3.0
-    assert body["avg_retries_before_failure"] == pytest.approx(3.0)
+    # avg retries = (1 + 2 + 3) / 3 = 2.0 (attempt_number - 1 for each)
+    assert body["avg_retries_before_failure"] == pytest.approx(2.0)
 
     expected_cost = ON_DEMAND_RATE * 3600 + SPOT_RATE * 1800
     assert body["retry_overhead_cost_usd"] == pytest.approx(round(expected_cost, 4))
@@ -5814,6 +5886,17 @@ async def test_stash_projected_task_fields_works_for_orm_loaded_tasks(db_session
     )
 
     assert loaded.first_payload == {"type": "research"}
+
+    # The durable Task.completed_at column is preferred over the SQL-projected
+    # status_log tail: with completed_at stamped (by the terminal insert), the
+    # projection is ignored so a post-terminal status_log write cannot move the
+    # derived time.
+    assert loaded.completed_at is not None
+    assert _derive_completed_at(loaded) == loaded.completed_at
+
+    # Legacy rows (completed_at never stamped) fall back to the projection —
+    # the transient stash still drives the derived time on that path.
+    loaded.completed_at = None
     assert _derive_completed_at(loaded) == datetime.fromisoformat(
         projected_completed_at
     )

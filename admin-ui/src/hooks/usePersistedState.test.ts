@@ -52,4 +52,36 @@ describe('usePersistedState', () => {
     );
     expect(result.current[0]).toBe(11);
   });
+
+  it('re-reads the new key value when the key changes while mounted', () => {
+    localStorage.setItem('blueprint-admin:proj-a', JSON.stringify('a-val'));
+    localStorage.setItem('blueprint-admin:proj-b', JSON.stringify('b-val'));
+    const { result, rerender } = renderHook(
+      ({ k }) => usePersistedState<string>(k, 'def'),
+      { initialProps: { k: 'proj-a' } },
+    );
+    expect(result.current[0]).toBe('a-val');
+    rerender({ k: 'proj-b' });
+    // Without the key-change re-sync, this would still read 'a-val'.
+    expect(result.current[0]).toBe('b-val');
+  });
+
+  it('does not clobber the new key value with the previous key state', () => {
+    localStorage.setItem('blueprint-admin:proj-a', JSON.stringify('a-val'));
+    localStorage.setItem('blueprint-admin:proj-b', JSON.stringify('b-val'));
+    const { rerender } = renderHook(
+      ({ k }) => usePersistedState<string>(k, 'def'),
+      { initialProps: { k: 'proj-a' } },
+    );
+    rerender({ k: 'proj-b' });
+    // The switch must not overwrite proj-b's persisted value with proj-a's
+    // stale state (the lost-update the write effect used to cause).
+    expect(localStorage.getItem('blueprint-admin:proj-b')).toBe(
+      JSON.stringify('b-val'),
+    );
+    // proj-a's own value is left intact (no cross-project corruption).
+    expect(localStorage.getItem('blueprint-admin:proj-a')).toBe(
+      JSON.stringify('a-val'),
+    );
+  });
 });

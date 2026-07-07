@@ -108,6 +108,11 @@ _ROLLUP_PR_CREATE_CLAIM_TTL_S = 300
 # fix path rather than loop on a non-mechanical block.
 _ALEMBIC_AUTORECONCILE_CAP = 2
 
+# Bounded auto-bump attempts per rollup PR for assembled-tree module size
+# breaches. Two bumps covers the rare case where CI re-runs before the bump
+# commit propagates; beyond that we require manual approval rather than loop.
+_SIZE_CAP_AUTOBUMP_CAP = 2
+
 
 async def _attempt_alembic_autoreconcile(
     parent: Task,
@@ -388,6 +393,27 @@ def _promotion_target_rollup_allowed(parent: Task, target_branch: str) -> bool:
     return bool(payload.get("hotfix") or ctx.get("hotfix"))
 
 
+def _task_owns_staging_branch(task: Task, staging_branch: str | None) -> bool:
+    """Whether ``task`` may roll ``staging_branch`` up to the base.
+
+    Research/plan staging branches are minted ``{prefix}{task.id[:8]}``, so the
+    branch's trailing path segment is the OWNER's 8-hex id-prefix. Returns
+    ``False`` only on positive proof of foreign ownership — the trailing segment
+    is a valid id-prefix that is not this task's — i.e. the branch was inherited
+    from an ancestor. Any other name (no id-suffix / legacy) is treated as owned,
+    so we defer on evidence, never on ambiguity.
+    """
+    if not staging_branch:
+        return False
+    tail = staging_branch.rsplit("/", 1)[-1]
+    looks_like_id_prefix = len(tail) == 8 and all(
+        c in "0123456789abcdef" for c in tail
+    )
+    if not looks_like_id_prefix:
+        return True
+    return tail == str(task.id).replace("-", "")[:8]
+
+
 _FORCE_DROP_REASONS = frozenset(
     {"rollup_no_pr_artifact", "malformed_pr_url", "review_respawn_cap"}
 )
@@ -428,7 +454,7 @@ def _propagate_landed_to_rollup_children(
 
 async def _propagate_landed_to_staging_merged_descendants(
     parent_task_id, session: AsyncSession
-) -> None:
+) -> list[Task]:
     """Recursively stamp landed_on_integration on all staging-merged descendants.
 
     ``_propagate_landed_to_rollup_children`` only touches the direct children
@@ -445,6 +471,14 @@ async def _propagate_landed_to_staging_merged_descendants(
     ``has_landed_signal``, skipping force-dropped children exactly as the sync
     helper does.  Idempotent: descendants that already carry the landed signal
     are skipped.
+
+    Returns the descendant tasks newly stamped by THIS call (empty when every
+    descendant was already landed / force-dropped / never merged). Callers that
+    must also re-credit the affected directions — the churn / merge-rate
+    counters are recomputed per-cycle from ``research_history`` and only pick a
+    child up once ``is_merged_completion`` is True — use the returned tasks to
+    drive one ``refresh_direction_outcomes_after_merge`` per distinct direction.
+    Existing callers that ignore the return value are unaffected.
     """
     from app.landed_signal import (
         NON_MERGE_UNBLOCK_REASON_KEY,
@@ -455,6 +489,7 @@ async def _propagate_landed_to_staging_merged_descendants(
 
     visited: set = {parent_task_id}
     queue: list = [parent_task_id]
+    stamped: list[Task] = []
 
     while queue:
         rows = (
@@ -481,10 +516,13 @@ async def _propagate_landed_to_staging_merged_descendants(
             ):
                 mark_landed_on_integration(row)
                 session.add(row)
+                stamped.append(row)
 
             next_queue.append(row.id)
 
         queue = next_queue
+
+    return stamped
 
 
 async def _hold_rollup_for_branch_safety(
@@ -1544,25 +1582,25 @@ async def _check_and_trigger_rollup(
             respawned = 0
             # Phase A: decide under lock; collect respawn candidates.
             respawn_candidates: list[dict] = []
+            # Batch-fetch PR artifacts for all unmerged children in one query.
+            _unmerged_ids = [c.id for c in unmerged]
+            _pr_arts_result = await session.execute(
+                select(Artifact)
+                .where(
+                    Artifact.task_id.in_(_unmerged_ids),
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+            _pr_art_by_task: dict = {}
+            for _art in _pr_arts_result.scalars().all():
+                if _art.task_id not in _pr_art_by_task:
+                    _pr_art_by_task[_art.task_id] = _art
             for c in unmerged:
                 age = (now - c.updated_at).total_seconds() if c.updated_at else 0
                 if age < stale_threshold.total_seconds():
                     continue  # Too recent — normal pipeline may still be working
                 # Look up PR artifact to get pr_number and branch
-                pr_art = (
-                    (
-                        await session.execute(
-                            select(Artifact)
-                            .where(
-                                Artifact.task_id == c.id,
-                                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                            )
-                            .limit(1)
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
+                pr_art = _pr_art_by_task.get(c.id)
                 if not pr_art or not pr_art.pr_url:
                     # No PR artifact — _verify_pr_merged should have handled this.
                     # Force-set pr_merged so next cycle picks it up.
@@ -2023,6 +2061,43 @@ async def _check_and_trigger_rollup(
             logger.error(
                 f"[ROLLUP] Parent {parent.id} — all {failed_count} non-cancelled "
                 f"children failed after PR verification, marking parent FAILED"
+            )
+            return
+
+        # ── Structural invariant: only a staging branch's OWNER rolls it up ──
+        # A descendant that merely INHERITED an ancestor's research/plan branch
+        # (research_completion stamps it into every child; the derivation above
+        # reads that inherited value) must not open a SECOND rollup for it — its
+        # children's PRs already merged into that shared branch and the owner
+        # carries them to base exactly once. The per-task rollup_pr_number guard
+        # further down can't see the peer's PR. Ownership is proven off the
+        # branch name (mints are {prefix}{id[:8]}); owns_rollup_branch is a
+        # DURABLE flag for requeue-clones / mid-recreate tasks whose volatile
+        # rollup_pr_number marker was cleared. (Incident: dup rollups
+        # #13026/#13035 on research/bdb302f7 — the second wedged and FAILED.)
+        if (
+            staging_branch
+            and not _task_owns_staging_branch(parent, staging_branch)
+            and not parent_ctx.get("owns_rollup_branch")
+            and not parent_ctx.get("rollup_pr_number")
+        ):
+            parent.status = TaskStatus.COMPLETED
+            parent.context = _clear_rollup_transient_state(parent.context)
+            parent.latest_status_message = (
+                f"✓ {completed_count} subtask(s) merged into {staging_branch} "
+                f"— rollup deferred to that branch's owner (not this task's branch)"
+            )
+            session.add(parent)
+            await session.commit()
+            await broadcast_to_project(
+                str(parent.project_id),
+                "task_updated",
+                {"task_id": str(parent.id), "status": TaskStatus.COMPLETED},
+            )
+            logger.info(
+                f"[ROLLUP] Parent {parent.id} completed WITHOUT rollup — staging "
+                f"branch '{staging_branch}' is owned by an ancestor; its owner "
+                f"carries the {completed_count} merged subtask(s) to base"
             )
             return
 
@@ -2549,6 +2624,15 @@ async def _check_and_trigger_rollup(
                                     for k, v in parent_ctx.items()
                                     if k not in ("rollup_pr_number", "rollup_pr_url")
                                 }
+                                # Durable ownership survives the volatile marker
+                                # clear: a requeue-clone on a foreign-named branch
+                                # whose rollup_pr_number is being dropped here to
+                                # retry with a fresh PR must still be recognized as
+                                # the branch owner next cycle — otherwise the
+                                # OWNER-gate above would see (foreign branch + no
+                                # marker) and silently strand reviewed work
+                                # (invariant #2).
+                                parent.context["owns_rollup_branch"] = True
                                 parent_ctx = parent.context
                                 existing_pr = None
                                 session.add(parent)
@@ -2976,6 +3060,35 @@ async def _check_and_trigger_rollup(
                         promotion_target=promotion_target,
                     )
 
+                    # Check assembled-tree module size caps before auto-merge.
+                    # Two child PRs can each add lines to a capped file and pass
+                    # CI in isolation; the combined rollup may breach the cap.
+                    # Auto-bumps and commits the updated JSON so the next CI run
+                    # passes. Runs in this unlocked window (GitHub I/O).
+                    #
+                    # Pre-check the auto-bump budget BEFORE calling preflight so
+                    # that we never commit a cap bump when the budget is already
+                    # exhausted. preflight_rollup_size_caps returns "hold" when
+                    # commit_bump=False and a breach is detected, avoiding the
+                    # spurious commit that would otherwise happen before the
+                    # budget check in the "bumped" branch below.
+                    from app.rollup_size_preflight import preflight_rollup_size_caps
+                    _sb_pr_pre = parent_ctx.get("_size_cap_autobump_pr")
+                    _sb_count_pre = (
+                        int(parent_ctx.get("_size_cap_autobump_count", 0))
+                        if _sb_pr_pre == rollup_pr_number
+                        else 0
+                    )
+                    size_cap_status, size_cap_reason = await preflight_rollup_size_caps(
+                        gh_token,
+                        owner,
+                        repo,
+                        rollup_pr_number,
+                        staging_branch,
+                        project_id=str(project_id_local) if project_id_local else None,
+                        commit_bump=_sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP,
+                    )
+
                     # Re-acquire to apply mutations / dispatch alerts.
                     parent = await _relock_parent(
                         session,
@@ -3234,6 +3347,72 @@ async def _check_and_trigger_rollup(
                         logger.warning(
                             f"[ROLLUP] PR #{rollup_pr_number} blocked — invalid Alembic "
                             f"chain ({alembic_reason}) — held for approval, spawned re-chain fix"
+                        )
+                        return
+
+                    # Module size-cap preflight guard (parent is locked here).
+                    if size_cap_status == "defer":
+                        logger.info(
+                            f"[ROLLUP] Deferring auto-merge for PR #{rollup_pr_number} — "
+                            f"could not validate module size caps: {size_cap_reason}"
+                        )
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} — size-cap check failed, "
+                            f"retrying next cycle"
+                        )[:500]
+                        session.add(parent)
+                        await session.commit()
+                        return
+                    if size_cap_status == "hold":
+                        _gates_on = _runtime_config.get("require_approval_gates", True)
+                        if _gates_on:
+                            parent.requires_approval = True
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} held — size-cap: "
+                            f"{size_cap_reason}"
+                        )[:500]
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                        }
+                        session.add(parent)
+                        await _dispatch_rollup_approval_alert(
+                            parent,
+                            session,
+                            f"Rollup PR #{rollup_pr_number} held — module size-cap: "
+                            f"{size_cap_reason}",
+                            pr_number=rollup_pr_number,
+                        )
+                        await session.commit()
+                        logger.warning(
+                            f"[ROLLUP] PR #{rollup_pr_number} held — size-cap "
+                            f"({size_cap_reason})"
+                        )
+                        return
+                    if size_cap_status == "bumped":
+                        # Cap was auto-bumped and committed to the staging branch.
+                        # Defer one sweep so CI re-runs with the updated JSON.
+                        # Budget was already pre-checked before calling preflight
+                        # (commit_bump=False when exhausted → "hold" instead of
+                        # "bumped"), so _sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP here.
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                            "_size_cap_autobump_pr": rollup_pr_number,
+                            "_size_cap_autobump_count": _sb_count_pre + 1,
+                        }
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} — auto-bumped module size "
+                            f"caps: {size_cap_reason}; re-validating next cycle"
+                        )[:500]
+                        session.add(parent)
+                        await session.commit()
+                        logger.info(
+                            f"[ROLLUP] PR #{rollup_pr_number} size-cap auto-bump "
+                            f"committed (attempt {_sb_count_pre + 1}/{_SIZE_CAP_AUTOBUMP_CAP}): "
+                            f"{size_cap_reason}"
                         )
                         return
 

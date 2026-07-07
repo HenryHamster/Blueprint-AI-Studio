@@ -9,11 +9,13 @@ interface FleetDetailDrawerProps {
   onViewTask: (taskId: string) => void;
   projects: Project[];
   selectedProjectId?: string | null;
+  fleetRunnersRefreshSignal?: number;
+  live?: boolean;
 }
 
 type Tab = 'vm-fleet' | 'runners';
 
-export function FleetDetailDrawer({ onClose, onViewTask, projects, selectedProjectId }: FleetDetailDrawerProps) {
+export function FleetDetailDrawer({ onClose, onViewTask, projects, selectedProjectId, fleetRunnersRefreshSignal, live }: FleetDetailDrawerProps) {
   const [tab, setTab] = useState<Tab>('vm-fleet');
 
   return (
@@ -53,7 +55,7 @@ export function FleetDetailDrawer({ onClose, onViewTask, projects, selectedProje
           )}
           {tab === 'runners' && (
             selectedProjectId ? (
-              <FleetRunnersPanel projectId={selectedProjectId} />
+              <FleetRunnersPanel projectId={selectedProjectId} refreshSignal={fleetRunnersRefreshSignal} live={live} />
             ) : (
               <div className="p-6 text-xs text-neutral-500 text-center">
                 Select a project to manage self-hosted runners.

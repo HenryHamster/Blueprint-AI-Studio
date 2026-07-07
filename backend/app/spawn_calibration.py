@@ -203,6 +203,13 @@ def _poor_decomp_history(direction: dict, label: str = "") -> bool:
             if isinstance(r, (int, float)):
                 w = dq.get("subtask_count") or 1
                 ws, total = ws + float(r) * w, total + w
+    # Incorporate folded aggregate decomposition quality so evicted cycles contribute.
+    agg_dq = (direction.get("history_aggregate") or {}).get("decomposition_quality") or {}
+    agg_ws = agg_dq.get("subtask_merge_rate_weighted_sum") or 0.0
+    agg_cnt = agg_dq.get("subtask_count_sum") or 0
+    if isinstance(agg_ws, (int, float)) and isinstance(agg_cnt, int) and agg_cnt > 0:
+        ws += float(agg_ws)
+        total += agg_cnt
     if total < 3 or ws / total >= 0.3:
         return False
     logger.info(
@@ -212,6 +219,32 @@ def _poor_decomp_history(direction: dict, label: str = "") -> bool:
         total,
     )
     return True
+
+
+def _merge_agg_scope_breakdown(target: dict[str, dict], agg_scope: dict) -> None:
+    """Merge folded history_aggregate scope_breakdown counters into a live scope_agg.
+
+    The aggregate stores a subset of the counters that _aggregate_scope_breakdown
+    produces (created, merged, failed, failed_infra, failed_scope_overflow).
+    Only those keys are merged; keys absent from the aggregate (merged_cross_module,
+    failed_analysis_overflow, failure_stages) are left at their live-data values.
+    """
+    for scope, stats in agg_scope.items():
+        bucket = target.setdefault(
+            scope,
+            {
+                "created": 0,
+                "merged": 0,
+                "merged_cross_module": 0,
+                "failed": 0,
+                "failed_infra": 0,
+                "failed_scope_overflow": 0,
+                "failed_analysis_overflow": 0,
+                "failure_stages": {},
+            },
+        )
+        for key in ("created", "merged", "failed", "failed_infra", "failed_scope_overflow"):
+            bucket[key] = bucket.get(key, 0) + stats.get(key, 0)
 
 
 def _aggregate_scope_breakdown(history_entries: list[dict]) -> dict[str, dict]:
@@ -389,9 +422,16 @@ def _calibrate_scope(
     except ValueError:
         return proposed_scope, None
 
-    # Aggregate direction-specific scope_breakdown across last 3 history entries
+    # Aggregate direction-specific scope_breakdown across last 3 history entries,
+    # then merge folded aggregate so evicted cycles contribute when live data is sparse.
     aggregated = _aggregate_scope_breakdown(direction.get("research_history", [])[-3:])
     direction_data_points = sum(v["created"] for v in aggregated.values())
+    if direction_data_points < 3:
+        _merge_agg_scope_breakdown(
+            aggregated,
+            (direction.get("history_aggregate") or {}).get("scope_breakdown") or {},
+        )
+        direction_data_points = sum(v["created"] for v in aggregated.values())
 
     if direction_data_points >= 3:
         agg = aggregated
@@ -583,8 +623,13 @@ def predict_spawn_success(
     # Signal 1: direction scope-specific merge rate (same aggregation as _calibrate_scope).
     # SCOPE_OVERFLOW stays in the effective denominator — it signals the scope
     # assessment was wrong, which is what this signal should reflect.
+    # Merge folded aggregate scope_breakdown unconditionally so evicted cycles contribute.
     history3 = direction.get("research_history", [])[-3:]
     scope_agg = _aggregate_scope_breakdown(history3)
+    _merge_agg_scope_breakdown(
+        scope_agg,
+        (direction.get("history_aggregate") or {}).get("scope_breakdown") or {},
+    )
     scope_stats = scope_agg.get(scope)
     if scope_stats:
         effective = _effective_scope_denominator(scope_stats)
@@ -640,15 +685,24 @@ def predict_spawn_success(
     # historical merge rate of those subtasks is a direct indicator of whether
     # plan decomposition works for this direction. Omitted entirely when no
     # decomposition data exists so brand-new directions aren't penalized.
+    # Incorporates folded aggregate decomposition quality so evicted cycles contribute.
     if scope == "large":
-        decomp_rates: list[float] = []
+        decomp_ws, decomp_total = 0.0, 0
         for entry in history3:
             for dq in entry.get("decomposition_quality") or []:
                 rate = dq.get("subtask_merge_rate")
                 if isinstance(rate, (int, float)):
-                    decomp_rates.append(float(rate))
-        if decomp_rates:
-            signals.append(sum(decomp_rates) / len(decomp_rates))
+                    w = dq.get("subtask_count") or 1
+                    decomp_ws += float(rate) * w
+                    decomp_total += w
+        agg_dq = (direction.get("history_aggregate") or {}).get("decomposition_quality") or {}
+        agg_ws = agg_dq.get("subtask_merge_rate_weighted_sum") or 0.0
+        agg_cnt = agg_dq.get("subtask_count_sum") or 0
+        if isinstance(agg_ws, (int, float)) and isinstance(agg_cnt, int) and agg_cnt > 0:
+            decomp_ws += float(agg_ws)
+            decomp_total += agg_cnt
+        if decomp_total > 0:
+            signals.append(decomp_ws / decomp_total)
             weights.append(1.5)
 
     # Signal 4: pipeline-wide scope merge rate fallback. Weighted lowest so it

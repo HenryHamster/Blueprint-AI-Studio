@@ -19,6 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.direct_llm_client import get_anthropic_api_key
+from app.inline_llm import call_inline_llm_json, resolve_inline_llm_settings
 from app.models import Project, Task, _utcnow
 from app.playbook_capacity import maybe_archive_for_capacity, _mark_stale_review_entries
 from app.time_utils import _to_naive_utc
@@ -196,9 +198,6 @@ _REVIEW_CATEGORIES: dict[str, list[str]] = {
 }
 
 _VALID_CATEGORIES = set(_REVIEW_CATEGORIES.keys()) | {"other"}
-_LLM_CATEGORIZE_MODEL = "claude-haiku-4-5-20251001"
-_LLM_CATEGORIZE_TIMEOUT = 10.0
-
 _MODULE_FEEDBACK_KEY = "module_feedback"
 _MODULE_FEEDBACK_MAX_ENTRIES = 50
 _MODULE_FEEDBACK_DECAY_AGE_DAYS = 14
@@ -273,7 +272,10 @@ def _categorize_review_issues(
 
 async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dict]]:
     """LLM-backed categorizer with keyword fallback."""
-    if os.environ.get("DISABLE_LLM_REVIEW_CATEGORIZATION", "").strip() == "1":
+    if (
+        os.environ.get("DISABLE_LLM_REVIEW_CATEGORIZATION", "").strip() == "1"
+        or resolve_inline_llm_settings("review_categorize").disabled
+    ):
         return _categorize_review_issues_keyword(
             [
                 {
@@ -289,7 +291,7 @@ async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dic
             ]
         )
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = get_anthropic_api_key()
     if not api_key:
         logger.info(
             "categorize_review_issues_llm: no ANTHROPIC_API_KEY, using keyword fallback"
@@ -308,61 +310,40 @@ async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dic
             for i, item in enumerate(issues)
         )
     )
-
-    for attempt in range(2):
-        try:
-            import anthropic as _anthropic  # noqa: PLC0415
-
-            client = _anthropic.AsyncAnthropic(api_key=api_key)
-            resp = await client.messages.create(
-                model=_LLM_CATEGORIZE_MODEL,
-                max_tokens=512,
-                timeout=_LLM_CATEGORIZE_TIMEOUT,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = resp.content[0].text.strip()
-            data = json.loads(raw)
-            classifications = data["classifications"]
-            for classification in classifications:
-                if classification["category"] not in _VALID_CATEGORIES:
-                    raise ValueError(
-                        f"unknown category: {classification['category']!r}"
-                    )
-            buckets: dict[str, list[dict]] = {}
-            for classification in classifications:
-                idx = classification["index"]
-                if idx < 0 or idx >= len(issues):
-                    continue
-                item = issues[idx]
-                severity = (item.get("severity") or "").upper()
-                if severity not in ("CRITICAL", "MAJOR", "MINOR"):
-                    continue
-                buckets.setdefault(classification["category"], []).append(
-                    {
-                        "desc": (item.get("description") or "").strip(),
-                        "severity": severity,
-                        "iteration": item.get("iteration", 0),
-                    }
-                )
-            return buckets
-        except (json.JSONDecodeError, KeyError, ValueError) as exc:
-            if attempt == 0:
-                logger.info(
-                    "categorize_review_issues_llm: parse error %s, retrying once", exc
-                )
+    data = await call_inline_llm_json(
+        "review_categorize",
+        prompt,
+        required_keys=("classifications",),
+    )
+    if data is None:
+        return _keyword_from_flat(issues)
+    try:
+        classifications = data["classifications"]
+        buckets: dict[str, list[dict]] = {}
+        for classification in classifications:
+            category = classification["category"]
+            if category not in _VALID_CATEGORIES:
+                raise ValueError(f"unknown category: {category!r}")
+            idx = classification["index"]
+            if not isinstance(idx, int) or isinstance(idx, bool):
+                raise ValueError(f"invalid index: {idx!r}")
+            if idx < 0 or idx >= len(issues):
                 continue
-            logger.info(
-                "categorize_review_issues_llm: parse error on retry, using keyword fallback"
+            item = issues[idx]
+            severity = (item.get("severity") or "").upper()
+            if severity not in ("CRITICAL", "MAJOR", "MINOR"):
+                continue
+            buckets.setdefault(category, []).append(
+                {
+                    "desc": (item.get("description") or "").strip(),
+                    "severity": severity,
+                    "iteration": item.get("iteration", 0),
+                }
             )
-            break
-        except Exception as exc:
-            logger.info(
-                "categorize_review_issues_llm: exception %s, using keyword fallback",
-                exc,
-            )
-            break
-
-    return _keyword_from_flat(issues)
+        return buckets
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.info("categorize_review_issues_llm: malformed LLM output (%s), using keyword fallback", exc)
+        return _keyword_from_flat(issues)
 
 
 def _keyword_from_flat(issues: list[dict]) -> dict[str, list[dict]]:
@@ -389,7 +370,7 @@ async def cache_first_attempt_classification(
     """Run LLM categoriser (keyword fallback inside) and cache result in task_context."""
     if (
         os.environ.get("DISABLE_LLM_REVIEW_CATEGORIZATION", "").strip() == "1"
-        or not os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        or not get_anthropic_api_key()
     ):
         method = "keyword"
         buckets = _keyword_from_flat(issues)

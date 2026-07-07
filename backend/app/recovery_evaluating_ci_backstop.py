@@ -159,11 +159,20 @@ async def _handle_ci_waiting_backstop(
     #       (fail-OPEN: never kill, but never block on an outage).
     # ALL GitHub I/O is strictly OUTSIDE the FOR-UPDATE window
     # below — handle_ci_completion re-locks the row itself.
-    _ci_head_sha = rl.get("head_sha")
-    if _ci_head_sha and rl.get("pr_number"):
-        _ci_resolved = await _verify_ci_before_backstop(task, rl, _ci_head_sha, session)
+    # Resolve the PR via the canonical accessor (review_loop.pr_number OR
+    # context.rollup_pr_number) — a rollup parked with its identity only at
+    # context.rollup_pr_number is now verified before any kill. head_sha is
+    # resolved live inside _verify_ci_before_backstop when the loop never cached
+    # one (the old hard head_sha precondition is what starved those rows of a
+    # verify before the deadline).
+    from app.ci_merge_helpers import effective_pr_number
+
+    if effective_pr_number(task):
+        _ci_resolved = await _verify_ci_before_backstop(
+            task, rl, rl.get("head_sha"), session
+        )
         if _ci_resolved:
-            # CI had actually concluded — handled (fix-spawn /
+            # CI reached a terminal verdict — handled (merge / fix-spawn /
             # pass recorded / wait cleared). Skip the kill.
             return True
 

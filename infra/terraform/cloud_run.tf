@@ -14,14 +14,17 @@ resource "google_cloud_run_v2_service" "orchestrator" {
     # backend/app/lifecycle.py spawns 9 background services (reaper,
     # orchestrator_worker, gcp_cleanup, gcp_image_cleanup, secret_reconciliation,
     # stale_branch_cleanup, auto_archive, config_sync, availability_refresh).
-    # None of them have leader election — per-row safety holds via
-    # task_lock(skip_locked=True) and FOR UPDATE, but side effects are not
-    # per-row: GitHub/GCP API poll rates would multiply Nx, _provision_coroutines
-    # is a per-instance dict racing against _get_actual_gcp_vm_count, stale-branch
-    # cleanup and image pruner would issue N redundant deletes.
-    # Until pg_advisory_lock leader election lands in lifecycle.py
-    # (see TODO there), max MUST stay at 1 — DO NOT bump without first
-    # implementing leader election.
+    # Leader election IS implemented via pg_try_advisory_lock(_BACKGROUND_LOCK_ID)
+    # in lifecycle.py (_leader_lock_keepalive_tick maintains the lock; the
+    # _reap_stale_leader_lock_holder watchdog evicts crashed leaders). N>1
+    # instances is architecturally safe for correctness — per-row safety still
+    # holds via task_lock(skip_locked=True) and the advisory lock ensures only
+    # one instance runs the background loops. However, bumping max above 1
+    # STILL requires a memory-sizing review: the 2026-05-29 incident showed that
+    # OOM at 2Gi triggers a leader-respawn loop (OOM drops the DB connection →
+    # releases the advisory lock → watchdog hard-exits the prior leader and
+    # respawns), and the 4Gi/2vCPU revert was sized for a singleton. Validate
+    # per-instance memory headroom before enabling multi-instance scaling.
     scaling {
       min_instance_count = 1
       max_instance_count = 1

@@ -591,6 +591,107 @@ class TestAdminRunnerEndpoints:
         assert offline_health["stale_reason"] == "inactive"
 
     @pytest.mark.asyncio
+    async def test_rotate_runner_token_replaces_hash_and_invalidates_old_token(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, old_token = await _make_runner(db_session, project.id)
+        old_hash = runner.token_hash
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/rotate-token"
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["runner_id"] == str(runner.id)
+        new_token = body["token"]
+        assert new_token
+        assert new_token != old_token
+
+        await db_session.refresh(runner)
+        assert runner.token_hash == auth_mod.hash_runner_token(new_token)
+        assert runner.token_hash != old_hash
+        assert runner.token_hash != new_token
+        assert runner.token_hash != old_token
+
+        assert await auth_mod.verify_runner_token(old_token, db_session) is None
+        resolved = await auth_mod.verify_runner_token(new_token, db_session)
+        assert resolved is not None
+        assert resolved.id == runner.id
+
+        old_heartbeat = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {old_token}"},
+        )
+        assert old_heartbeat.status_code == 401
+        new_heartbeat = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": ["after-rotation"]},
+            headers={"Authorization": f"Bearer {new_token}"},
+        )
+        assert new_heartbeat.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.capabilities["active_task_ids"] == ["after-rotation"]
+
+    @pytest.mark.asyncio
+    async def test_rotate_runner_token_rejects_missing_deleted_cross_project_and_non_owner(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, old_token = await _make_runner(db_session, project.id)
+        deleted_runner, deleted_token = await _make_runner(
+            db_session, project.id, status="deleted"
+        )
+        other_project = await _make_project(db_session, name="Other Runner Project")
+        non_owner_project = await _make_project(
+            db_session,
+            owner_id="other-owner",
+            name="Member Only Runner Project",
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=non_owner_project.id,
+                user_id=TEST_USER_ID,
+                role="member",
+            )
+        )
+        non_owner_runner, non_owner_token = await _make_runner(
+            db_session, non_owner_project.id
+        )
+        await db_session.commit()
+
+        missing = await client.post(
+            f"/api/admin/projects/{project.id}/runners/{uuid.uuid4()}/rotate-token"
+        )
+        assert missing.status_code == 404
+
+        deleted = await client.post(
+            f"/api/admin/projects/{project.id}/runners/{deleted_runner.id}/rotate-token"
+        )
+        assert deleted.status_code == 404
+
+        cross_project = await client.post(
+            f"/api/admin/projects/{other_project.id}/runners/{runner.id}/rotate-token"
+        )
+        assert cross_project.status_code == 404
+
+        non_owner = await client.post(
+            f"/api/admin/projects/{non_owner_project.id}/runners/{non_owner_runner.id}/rotate-token"
+        )
+        assert non_owner.status_code == 403
+
+        await db_session.refresh(runner)
+        await db_session.refresh(deleted_runner)
+        await db_session.refresh(non_owner_runner)
+        assert runner.token_hash == auth_mod.hash_runner_token(old_token)
+        assert deleted_runner.token_hash == auth_mod.hash_runner_token(deleted_token)
+        assert non_owner_runner.token_hash == auth_mod.hash_runner_token(
+            non_owner_token
+        )
+
+    @pytest.mark.asyncio
     async def test_delete_marks_deleted(self, client: AsyncClient, db_session):
         project = await _make_project(db_session)
         runner, _ = await _make_runner(db_session, project.id)
@@ -2660,7 +2761,7 @@ class TestOrchestratorRunnerRouting:
         await db_session.commit()
 
         with patch(
-            "app.orchestrator.emit_workbench_refetch",
+            "app.orchestrator_runner_dispatch.emit_workbench_refetch",
             new=AsyncMock(),
         ) as emit:
             await orch._deactivate_stale_runners(db_session)

@@ -94,6 +94,7 @@ export function ProjectBuildConfigSection({
   const [stagingPrefixes, setStagingPrefixes] = useState<string[]>([]);
   const [stagingPrefixesIsDefault, setStagingPrefixesIsDefault] = useState(true);
   const [stagingPrefixesSaving, setStagingPrefixesSaving] = useState(false);
+  const [stagingPrefixesError, setStagingPrefixesError] = useState('');
   const [blockDegradedEnabled, setBlockDegradedEnabled] = useState(false);
   const [blockDegradedSaving, setBlockDegradedSaving] = useState(false);
   const [blockNoTestEnabled, setBlockNoTestEnabled] = useState(false);
@@ -217,14 +218,18 @@ export function ProjectBuildConfigSection({
     if (!projectId) return;
     const trimmed = stagingPrefixes.map(p => p.trim()).filter(Boolean);
     setStagingPrefixesSaving(true);
+    setStagingPrefixesError('');
     try {
       const resp = await apiFetch(`/api/admin/projects/${projectId}/staging-branch-prefixes`, {
         method: 'PATCH',
         body: JSON.stringify({ staging_branch_prefixes: trimmed }),
       });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       setStagingPrefixes(data.staging_branch_prefixes);
       setStagingPrefixesIsDefault(data.is_default);
+    } catch {
+      setStagingPrefixesError('Failed to save staging prefixes — changes were not applied.');
     } finally {
       setStagingPrefixesSaving(false);
     }
@@ -233,14 +238,18 @@ export function ProjectBuildConfigSection({
   const handleRevertStagingPrefixes = async () => {
     if (!projectId) return;
     setStagingPrefixesSaving(true);
+    setStagingPrefixesError('');
     try {
       const resp = await apiFetch(`/api/admin/projects/${projectId}/staging-branch-prefixes`, {
         method: 'PATCH',
         body: JSON.stringify({ staging_branch_prefixes: null }),
       });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       setStagingPrefixes(data.staging_branch_prefixes);
       setStagingPrefixesIsDefault(data.is_default);
+    } catch {
+      setStagingPrefixesError('Failed to revert staging prefixes — changes were not applied.');
     } finally {
       setStagingPrefixesSaving(false);
     }
@@ -788,6 +797,9 @@ export function ProjectBuildConfigSection({
               {stagingPrefixesSaving ? 'Saving...' : 'Save Staging Prefixes'}
             </button>
           </div>
+          {stagingPrefixesError && (
+            <p className="text-ui-sm text-red-400 mt-2" data-testid="staging-prefixes-error">{stagingPrefixesError}</p>
+          )}
         </div>
       )}
 

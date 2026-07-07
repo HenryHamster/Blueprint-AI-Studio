@@ -36,6 +36,7 @@ from app.shared_state import runtime_config
 import app.strategic_resident_session as srs
 from app.strategic_resident_session import (
     RESIDENT_SESSION_KEY,
+    RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
     RESIDENT_SESSION_REASON_KEY,
     RESIDENT_SESSION_REASON_NO_RUNNER,
     RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
@@ -52,7 +53,7 @@ from app.strategic_resident_session import (
     stop_resident_session,
     sync_resident_session_for_interaction_mode,
 )
-from app.strategic_state_read_model import _resident_session_availability
+from app.strategic_state_read_model import _resident_session_availability, compute_model_integrity_conflicts
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
     strategic_local_continuation_status_from_vision,
@@ -770,15 +771,20 @@ async def test_heartbeat_endpoint_agent_token(
     )
     assert res.status_code == 200, res.text
     body = res.json()
-    assert set(body.keys()) == {
-        "authority_held",
-        "leased_until",
-        "stop_requested",
-        "status",
-    }
+    # Core lease-view keys are always present; additive read-only signals (older
+    # agents ignore unknown fields).
+    assert {"authority_held", "leased_until", "stop_requested", "status",
+            "work_state_rev", "work_state_summary",
+            "exam_ledger", "active_direction_ids"} <= set(body.keys())
     assert body["authority_held"] is True
     assert body["stop_requested"] is False
     assert body["status"] == "active"
+    # work_state_summary is always a dict with the three advisory count keys.
+    assert set(body["work_state_summary"].keys()) == {
+        "in_flight",
+        "terminal_since",
+        "new_operator_messages",
+    }
 
 
 @pytest.mark.asyncio
@@ -834,6 +840,7 @@ async def test_stop_helper_drives_task_terminal_and_releases_lease(db_session):
     # Resident task driven terminal.
     refreshed = await db_session.get(Task, task.id)
     assert refreshed.status == TaskStatus.CANCELLED
+    assert refreshed.context.get("failure_category") == "ADMIN_CANCEL"
 
     # Continuation lease marker released.
     fresh_project = await db_session.get(Project, project.id)
@@ -862,6 +869,189 @@ async def test_stop_endpoint(client: AsyncClient, db_session, enable_strategic_s
     assert task.status == TaskStatus.CANCELLED
     blob = (project.vision or {}).get(RESIDENT_SESSION_KEY)
     assert blob is not None and blob.get("status") == "ended"
+
+
+@pytest.mark.asyncio
+async def test_operator_stop_runs_strategic_completion_processing_exactly_once(
+    db_session, monkeypatch
+):
+    """Operator stop triggers _handle_strategic_completion exactly once on the
+    cancelled task via _run_resident_completion_on_stop, and the stop itself
+    still succeeds and returns the ended snapshot."""
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+    project = await db_session.get(Project, project.id)
+
+    calls = []
+
+    async def fake_completion_on_stop(task_id, *, session_factory=None):
+        calls.append(task_id)
+
+    monkeypatch.setattr(
+        srs, "_run_resident_completion_on_stop", fake_completion_on_stop
+    )
+
+    snapshot = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Stop returned the ended snapshot.
+    assert snapshot["status"] == "ended"
+    assert snapshot["stop_requested"] is True
+
+    # Completion processing was triggered exactly once with the right task id.
+    assert len(calls) == 1
+    assert calls[0] == task.id
+
+
+@pytest.mark.asyncio
+async def test_stop_completion_failure_does_not_mask_stop(db_session, monkeypatch):
+    """An exception inside _run_resident_completion_on_stop must not propagate —
+    stop_resident_session still returns the ended snapshot normally."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+    project = await db_session.get(Project, project.id)
+
+    async def failing_completion_on_stop(task_id, *, session_factory=None):
+        raise RuntimeError("simulated completion failure")
+
+    monkeypatch.setattr(
+        srs, "_run_resident_completion_on_stop", failing_completion_on_stop
+    )
+
+    snapshot = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # The stop must still succeed despite the completion handler raising.
+    assert snapshot["status"] == "ended"
+    assert snapshot["stop_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_resident_completion_on_stop_skips_when_no_strategic_activity(
+    db_session, monkeypatch
+):
+    """_run_resident_completion_on_stop must NOT invoke _handle_strategic_completion
+    and must NOT increment _strategic_failures when the task has no stashed
+    strategic work and no API-activity markers — the false-failure case."""
+    from app.strategic_resident_session import _run_resident_completion_on_stop
+
+    from app.strategic_completion import (
+        QUALIFY_REQUEST_CONTEXT_KEY,
+        VERSION_PHASE_DECISION_CONTEXT_KEY,
+        NEW_VERSION_GOAL_CONTEXT_KEY,
+        NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+    )
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    # No stashed strategic work keys or API-activity markers — only infra keys like
+    # provides_capability may be present, which are not checked by _run_resident_completion_on_stop.
+    ctx = task.context or {}
+    _stash_keys = (
+        QUALIFY_REQUEST_CONTEXT_KEY,
+        VERSION_PHASE_DECISION_CONTEXT_KEY,
+        NEW_VERSION_GOAL_CONTEXT_KEY,
+        NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+    )
+    _api_markers = (
+        "_strategic_vision_set",
+        "_strategic_dirs_created",
+        "_strategic_dirs_retired",
+        "_strategic_dirs_staged",
+        "_strategic_dirs_updated",
+        "_strategic_proposals_approved",
+        "_strategic_proposals_rejected",
+        "_strategic_tasks_spawned",
+        "_strategic_api_called",
+    )
+    assert not any(ctx.get(k) for k in _stash_keys), f"Unexpected stash key in task context: {ctx}"
+    assert not any(ctx.get(k) for k in _api_markers), f"Unexpected API marker in task context: {ctx}"
+
+    completion_calls = []
+
+    async def fake_handle_completion(t, logs, session, *, project=None):
+        completion_calls.append({"task_id": t.id, "project": project})
+
+    monkeypatch.setattr(
+        "app.strategic_completion._handle_strategic_completion",
+        fake_handle_completion,
+    )
+
+    factory = _dedicated_session_factory(db_session)
+    await _run_resident_completion_on_stop(task.id, session_factory=factory)
+
+    # Handler must NOT have been called for a task with no strategic work.
+    assert completion_calls == [], (
+        "_handle_strategic_completion was called despite no strategic activity"
+    )
+
+    # _strategic_failures must not have been written.
+    fresh = await db_session.get(Project, project.id)
+    assert "_strategic_failures" not in (fresh.vision or {}), (
+        "_strategic_failures was incremented for an operator stop with no API activity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_resident_completion_on_stop_applies_stashed_work(
+    db_session, monkeypatch
+):
+    """_run_resident_completion_on_stop must call _handle_strategic_completion with
+    a non-None locked project when the task carries stashed strategic work — e.g.
+    a qualify_request written by set_problem_model — and must re-fetch the task
+    via the injected session_factory."""
+    from app.strategic_resident_session import _run_resident_completion_on_stop
+    from app.strategic_completion import QUALIFY_REQUEST_CONTEXT_KEY
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+
+    # Stash a qualify_request in the task context (set by set_problem_model API).
+    ctx = dict(task.context or {})
+    ctx[QUALIFY_REQUEST_CONTEXT_KEY] = {"reason": "ready for qualification"}
+    task.context = ctx
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    completion_calls = []
+
+    async def fake_handle_completion(t, logs, session, *, project=None):
+        completion_calls.append({"task_id": t.id, "project": project})
+
+    monkeypatch.setattr(
+        "app.strategic_completion._handle_strategic_completion",
+        fake_handle_completion,
+    )
+
+    # Bypass the FOR UPDATE lock (Postgres-only) while preserving the project
+    # re-fetch so the test is runnable on SQLite.
+    async def fake_lock_project(session, project_id, *, max_retries=3):
+        return await session.get(Project, project_id)
+
+    monkeypatch.setattr(
+        "app.task_locking.lock_project_for_strategic_transition",
+        fake_lock_project,
+    )
+
+    factory = _dedicated_session_factory(db_session)
+    await _run_resident_completion_on_stop(task.id, session_factory=factory)
+
+    # Handler must have been called exactly once with a non-None project.
+    assert len(completion_calls) == 1, (
+        f"Expected exactly one _handle_strategic_completion call, got {len(completion_calls)}"
+    )
+    assert completion_calls[0]["task_id"] == task.id
+    assert completion_calls[0]["project"] is not None, (
+        "_handle_strategic_completion was called with project=None (missing project lock)"
+    )
 
 
 @pytest.mark.asyncio
@@ -1059,24 +1249,51 @@ async def test_start_spawn_path_is_minimal_and_lands_task_id(db_session, monkeyp
         )
     )
     await db_session.commit()
+    budget_source = Project(name="resident budget source", user_id=TEST_USER_ID)
+    db_session.add(budget_source)
+    await db_session.commit()
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Budget source task",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=_utcnow() - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+    original_mode = runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = runtime_config["max_global_autonomous_tasks_per_hour"]
+    runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    runtime_config["max_global_autonomous_tasks_per_hour"] = 500
     # Deliberately NO adoptable strategic_review task exists → the start SPAWNS.
 
-    import app.strategic_spawning as _sps
+    try:
+        import app.strategic_spawning as _sps
 
-    for _name in (
-        "resolve_branch_verification_context",
-        "_verify_capability_backing_paths",
-        "_build_recent_interventions",
-        "ground_design_doc",
-    ):
-        async def _boom(*args, _n=_name, **kwargs):
-            raise AssertionError(f"resident spawn must not call {_n}")
+        for _name in (
+            "resolve_branch_verification_context",
+            "_verify_capability_backing_paths",
+            "_build_recent_interventions",
+            "ground_design_doc",
+        ):
+            async def _boom(*args, _n=_name, **kwargs):
+                raise AssertionError(f"resident spawn must not call {_n}")
 
-        monkeypatch.setattr(_sps, _name, _boom)
+            monkeypatch.setattr(_sps, _name, _boom)
 
-    snapshot = await start_resident_session(
-        db_session, project, operator_user_id=TEST_USER_ID
-    )
+        snapshot = await start_resident_session(
+            db_session, project, operator_user_id=TEST_USER_ID
+        )
+    finally:
+        runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = original_initiative
+        runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
 
     # A real task_id landed and the session is active (the bug produced no task_id).
     assert snapshot["status"] == "active"
@@ -1195,7 +1412,7 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
 
     created: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
         # Mimic the canonical spawn: create + commit a strategic_review task.
         t = Task(
             project_id=proj.id,
@@ -1236,6 +1453,82 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
     assert read_resident_session(vision) is None
 
 
+@pytest.mark.asyncio
+async def test_start_compensation_receives_plain_snapshotted_project_id(
+    db_session, monkeypatch
+):
+    """WI-7: start-failure compensation must receive a PLAIN id value snapshotted
+    before ``session.rollback()`` — it must never re-read the (post-rollback)
+    ``project.id`` ORM attribute.
+
+    The ``except`` block's ``session.rollback()`` expires ``project``'s ORM
+    attributes; under asyncpg a subsequent ``project.id`` read emits a sync
+    lazy-load in an async context → ``MissingGreenlet`` (the ~1-2/hr prod wedge).
+    A full fault repro is impractical on the SQLite harness (it retains the PK
+    through the rollback and services any re-load on the single shared connection
+    instead of raising), so this test locks the observable contract the fix
+    guarantees: compensation (``_release_start_claim``) is handed the correct,
+    concrete ``uuid.UUID`` and runs to completion (claim cleared). The sibling
+    ``test_sync_resident_snapshots_project_id_before_rollback`` is the true
+    fault-injecting guard for the same snapshot-before-rollback discipline.
+    """
+    project = await _make_project_with_member(db_session)  # no live strategic task
+    await _make_live_local_runner(db_session, project)
+    # Snapshot the expected id while ``project`` is still loaded (before the run).
+    expected_id = project.id
+
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
+        t = Task(
+            project_id=proj.id,
+            title="spawned resident",
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id="agent-vm-spawned",
+            created_by="ORCHESTRATOR",
+        )
+        session.add(t)
+        await session.commit()
+        await session.refresh(t)
+        return t
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("finalize boom")
+
+    monkeypatch.setattr(srs, "_spawn_resident_strategic_task", fake_spawn)
+    monkeypatch.setattr(srs, "persist_strategic_workbench_update", boom)
+
+    captured: dict = {}
+    real_release = srs._release_start_claim
+
+    async def spy_release(
+        project_id, session_id, spawned_task_id, *, session_factory=None
+    ):
+        captured["project_id"] = project_id
+        return await real_release(
+            project_id, session_id, spawned_task_id, session_factory=session_factory
+        )
+
+    monkeypatch.setattr(srs, "_release_start_claim", spy_release)
+
+    factory = _dedicated_session_factory(db_session)
+    with pytest.raises(RuntimeError):
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            session_factory=factory,
+        )
+
+    # Compensation ran and received the pre-rollback SNAPSHOT of the id: correct
+    # value, concrete uuid.UUID (same plain type — not a coroutine/deferred).
+    assert captured, "compensation (_release_start_claim) was never invoked"
+    assert captured["project_id"] == expected_id
+    assert type(captured["project_id"]) is type(expected_id)
+    # Claim actually cleared → compensation completed (not aborted mid-way).
+    vision = await _fresh_vision(factory, project.id)
+    assert read_resident_session(vision) is None
+
+
 # ---------------------------------------------------------------------------
 # Workday is the on-switch: auto start/stop the resident session on an
 # interaction_mode change (sync_resident_session_for_interaction_mode).
@@ -1271,6 +1564,91 @@ async def test_sync_auto_starts_on_enter_continuous(
     assert resident_session_is_active(read_resident_session(vision))
     # No blocked-reason recorded when the auto-start succeeds.
     assert read_resident_session_blocked_reason(vision) is None
+
+
+@pytest.mark.asyncio
+async def test_sync_resident_snapshots_project_id_before_rollback(
+    db_session, enable_strategic_session_flag, monkeypatch
+):
+    """WI-7 regression (true fault-injecting guard): the interaction-mode sync
+    snapshots ``project.id`` BEFORE its up-front ``session.rollback()`` and never
+    re-reads the (post-rollback) ORM attribute.
+
+    ``sync_resident_session_for_interaction_mode`` only ever reads ``project.id``
+    (it never ``refresh``-es or ``add``-s the instance), so this passes a proxy
+    whose ``.id`` starts delegating to the real id and, once the rollback fires,
+    raises ``MissingGreenlet`` — exactly what asyncpg does when the code lazy-reads
+    an expired attribute after a rollback in an async context. This faithfully
+    reproduces the prod fault the SQLite harness cannot (it retains the PK and
+    services re-loads silently).
+
+    With the fix (id snapshotted before the rollback) the sync passes the plain
+    snapshot to ``_auto_start_on_workday_entry`` and succeeds → active snapshot.
+    On the PRE-FIX code the post-rollback ``project.id`` read raises inside the
+    ``try`` and the whole sync is swallowed to ``None`` (a silently wedged auto-
+    start) — so this assertion fails, catching the regression.
+    """
+    from sqlalchemy.exc import MissingGreenlet
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+
+    class _ProjectIdPoisonAfterRollback:
+        """Delegates ``.id`` to the real project until the caller rolls back;
+        after that a ``.id`` read raises ``MissingGreenlet`` (mimics asyncpg's
+        post-rollback expired-attribute lazy-load in an async context)."""
+
+        def __init__(self, real_id):
+            self._real_id = real_id
+            self._rolled_back = False
+
+        @property
+        def id(self):
+            if self._rolled_back:
+                raise MissingGreenlet(
+                    "simulated post-rollback lazy-load of an expired attribute"
+                )
+            return self._real_id
+
+    proxy = _ProjectIdPoisonAfterRollback(project.id)
+
+    real_rollback = db_session.rollback
+
+    async def rollback_then_poison(*args, **kwargs):
+        await real_rollback(*args, **kwargs)
+        proxy._rolled_back = True
+
+    monkeypatch.setattr(db_session, "rollback", rollback_then_poison)
+
+    captured: dict = {}
+    real_auto_start = srs._auto_start_on_workday_entry
+
+    async def spy_auto_start(project_id, *, operator_user_id, session_factory):
+        captured["project_id"] = project_id
+        return await real_auto_start(
+            project_id,
+            operator_user_id=operator_user_id,
+            session_factory=session_factory,
+        )
+
+    monkeypatch.setattr(srs, "_auto_start_on_workday_entry", spy_auto_start)
+
+    factory = _dedicated_session_factory(db_session)
+    snapshot = await sync_resident_session_for_interaction_mode(
+        db_session,
+        proxy,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="chat",
+        new_mode="continuous",
+        session_factory=factory,
+    )
+
+    # Fix present: the pre-rollback snapshot let the auto-start run to success.
+    assert snapshot is not None and snapshot["status"] == "active"
+    assert captured, "auto-start hand-off was never reached (post-rollback read?)"
+    assert captured["project_id"] == proxy._real_id
+    assert type(captured["project_id"]) is type(proxy._real_id)
 
 
 @pytest.mark.asyncio
@@ -1870,6 +2248,233 @@ async def test_heartbeat_liveness_only_does_not_extend_lease(db_session):
 
 
 # ---------------------------------------------------------------------------
+# Resident pacing substrate — the heartbeat carries an additive, READ-ONLY
+# work-state signal (``work_state_rev`` + ``work_state_summary``) for the
+# agent's state-gated pacing. It must be present, monotonic over strategist-
+# relevant change sources, and must NOT extend the lease.
+# ---------------------------------------------------------------------------
+
+
+async def _make_operator_message(
+    db_session, project, *, content="hi", created_at=None, resident_session_id=None
+):
+    """Insert an operator-authored (from_type='user') open ProjectMessage.
+
+    ``resident_session_id`` stamps the row with the session it was sent into
+    (``None`` = legacy/cadence, always treated as unscoped/visible).
+    """
+    msg = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        content=content,
+        status="open",
+        resident_session_id=resident_session_id,
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+    if created_at is not None:
+        msg.created_at = created_at
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+    return msg
+
+
+async def _make_strategic_agent_task(
+    db_session, project, *, status=TaskStatus.IN_PROGRESS, updated_at=None
+):
+    """Insert a STRATEGIC_AGENT-created (strategist-spawned) task."""
+    task = Task(
+        project_id=project.id,
+        title="spawned by strategist",
+        payloads=[{"type": "research"}],
+        status=status,
+        created_by="STRATEGIC_AGENT",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    if updated_at is not None:
+        task.updated_at = updated_at
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_reports_work_state_fields(db_session):
+    """The heartbeat response carries ``work_state_rev`` (max ISO stamp over
+    strategist-relevant sources) and a ``work_state_summary`` dict with the three
+    advisory count keys the agent's tick context consumes."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Establish concrete strategist-relevant world state: one in-flight spawned
+    # task and one open operator message.
+    await _make_strategic_agent_task(db_session, project, status=TaskStatus.IN_PROGRESS)
+    await _make_operator_message(db_session, project)
+
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+
+    # rev present and ISO-8601-ish (has a date/time separator).
+    assert result["work_state_rev"] is not None
+    assert "T" in result["work_state_rev"]
+
+    summary = result["work_state_summary"]
+    assert set(summary.keys()) == {"in_flight", "terminal_since", "new_operator_messages"}
+    assert summary["in_flight"] == 1  # our one IN_PROGRESS STRATEGIC_AGENT task
+    assert summary["new_operator_messages"] == 1  # our one open operator message
+    assert summary["terminal_since"] == 0  # no terminal strategist tasks yet
+    assert all(isinstance(v, int) for v in summary.values())
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_work_state_rev_is_monotonic(db_session):
+    """A newer strategist-relevant change (a later operator message) advances
+    ``work_state_rev``; the marker never moves backward."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    base = _utcnow()
+    await _make_operator_message(
+        db_session, project, created_at=base - timedelta(minutes=5)
+    )
+    project = await db_session.get(Project, project.id)
+    r1 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    rev1 = r1["work_state_rev"]
+    assert rev1 is not None
+
+    # A newer operator message must strictly advance the rev.
+    await _make_operator_message(
+        db_session, project, created_at=base + timedelta(minutes=5)
+    )
+    project = await db_session.get(Project, project.id)
+    r2 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    rev2 = r2["work_state_rev"]
+    assert rev2 is not None
+    assert rev2 > rev1  # ISO-8601 same-format strings compare monotonically
+    assert r2["work_state_summary"]["new_operator_messages"] == 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_work_state_does_not_extend_lease(db_session):
+    """Surfacing the work-state signal is read-only: a liveness-only (progress=
+    False) heartbeat that computes a non-null work_state_rev still PRESERVES the
+    existing lease — the dead-man's switch is never extended by the new fields."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    # Strategist-relevant activity so work_state_rev is genuinely populated.
+    await _make_strategic_agent_task(db_session, project, status=TaskStatus.IN_PROGRESS)
+    await _make_operator_message(db_session, project)
+
+    project = await db_session.get(Project, project.id)
+    r1 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+    lease1 = r1["leased_until"]
+    assert lease1 is not None
+    assert r1["work_state_rev"] is not None
+
+    # Liveness-only heartbeat: work-state computed + returned, but lease unmoved.
+    project = await db_session.get(Project, project.id)
+    r2 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    assert r2["authority_held"] is True
+    assert r2["leased_until"] == lease1  # NOT extended by the work-state read
+    assert r2["work_state_rev"] is not None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_work_state_notices_descendant_task_transitions(db_session):
+    """The work-state signal must advance when descendant tasks (children of
+    strategist-spawned tasks) transition, not just direct STRATEGIC_AGENT tasks.
+    When a plan child or follow-up fix blocks/completes, the wake signal advances
+    so the resident reacts promptly, not waiting for the root task."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Create a root task spawned by the strategist
+    root = await _make_strategic_agent_task(
+        db_session, project, status=TaskStatus.IN_PROGRESS
+    )
+
+    # Create a descendant (child) task with a different created_by
+    child = Task(
+        project_id=project.id,
+        parent_task_id=root.id,
+        title="child of strategist spawn",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    # First heartbeat: capture the initial work_state_rev
+    project = await db_session.get(Project, project.id)
+    r1 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    rev1 = r1["work_state_rev"]
+    # Root is in-flight, child is in-flight → 2 in-flight descendant-aware tasks
+    assert r1["work_state_summary"]["in_flight"] >= 1
+
+    # Transition the child task (not a STRATEGIC_AGENT task, but a descendant)
+    child.status = TaskStatus.COMPLETED
+    db_session.add(child)
+    await db_session.commit()
+
+    # Second heartbeat: work_state_rev must advance because child transitioned
+    project = await db_session.get(Project, project.id)
+    r2 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    rev2 = r2["work_state_rev"]
+
+    # The rev must have advanced (descendant transition detected).
+    assert rev2 is not None
+    assert rev2 > rev1, (
+        f"work_state_rev should advance when descendant transitions: {rev1} → {rev2}"
+    )
+    # Child no longer in-flight; summary should reflect it (fewer in-flight).
+    assert r2["work_state_summary"]["terminal_since"] >= 1
+
+
+# ---------------------------------------------------------------------------
 # Finding 1 (this review) — lease lapse / unattended cap END the session so the
 # resident task goes terminal and the legacy cadence reclaims (no indefinite
 # stall). A fresh / actively-working session is NEVER stop-requested.
@@ -1977,6 +2582,131 @@ async def test_heartbeat_operator_return_before_cap_keeps_session_alive(
     assert (
         _utcnow() - srs._parse_iso_naive(reblob["last_operator_interaction_at"])
     ).total_seconds() < 60
+
+
+# ---------------------------------------------------------------------------
+# Session-scope isolation (design b182b46e / migration 0396): a message stamped
+# for a DIFFERENT resident session must not re-arm THIS session's unattended cap
+# or pollute its pacing signal, while legacy/cadence NULL-session rows stay
+# visible so no pre-migration backlog is silently dropped.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unattended_cap_ignores_other_session_message(db_session, monkeypatch):
+    """A FRESH operator message stamped for a DIFFERENT resident session must NOT
+    re-arm this session's unattended cap. Without session scoping the cross-session
+    message would keep the clock hot (the bleed this feature eliminates); with it,
+    the message is invisible here so the aged clock still fires and the session
+    ends."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["last_operator_interaction_at"] = (
+        _utcnow() - timedelta(hours=2)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Fresh message addressed to ANOTHER session — must not re-arm our clock.
+    await _make_operator_message(
+        db_session, project, content="for session A", resident_session_id="ss-other"
+    )
+
+    project = await db_session.get(Project, project.id)
+    capped = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+    assert capped["stop_requested"] is True
+    assert capped["status"] == "ended"
+
+
+@pytest.mark.asyncio
+async def test_unattended_cap_rearmed_by_null_session_message(db_session, monkeypatch):
+    """A FRESH legacy/cadence NULL-session operator message REMAINS visible and
+    re-arms this session's unattended cap (backward compat: NULL is never hidden),
+    so the session keeps its authority instead of ending."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["last_operator_interaction_at"] = (
+        _utcnow() - timedelta(hours=2)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Fresh NULL-session (legacy/cadence) message — visible, re-arms the clock.
+    await _make_operator_message(
+        db_session, project, content="unstamped", resident_session_id=None
+    )
+
+    project = await db_session.get(Project, project.id)
+    reengaged = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+    assert reengaged["authority_held"] is True
+    assert reengaged["stop_requested"] is False
+    assert reengaged["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_work_state_pacing_scoped_to_session(db_session):
+    """``new_operator_messages`` counts only messages addressed to THIS session
+    (its own stamp) plus unstamped NULL rows — a message stamped for another
+    session is excluded so it cannot drive this session's pacing / work_state."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    this_session = snap["session_id"]
+
+    # One for us, one NULL (legacy/cadence), one for another session.
+    await _make_operator_message(
+        db_session, project, resident_session_id=this_session
+    )
+    await _make_operator_message(db_session, project, resident_session_id=None)
+    await _make_operator_message(
+        db_session, project, resident_session_id="ss-other"
+    )
+
+    _, summary = await srs._compute_resident_work_state(
+        db_session, project.id, resident_session_id=this_session
+    )
+    # Our stamp + the NULL row are counted; the other-session row is not.
+    assert summary["new_operator_messages"] == 2
+
+    # A None scope (older caller / cadence path) still counts every message
+    # project-wide — the backward-compatible behaviour is unchanged.
+    _, summary_all = await srs._compute_resident_work_state(
+        db_session, project.id
+    )
+    assert summary_all["new_operator_messages"] == 3
 
 
 @pytest.mark.asyncio
@@ -2110,7 +2840,7 @@ async def test_start_revalidates_adopt_candidate_and_spawns_fresh(
     # cadence spawn path in a standalone test).
     fresh_holder: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
         # The real spawn wrapper BIRTHS the task with the resident context flags
         # (via extra_context); mirror that here so the fresh task carries them in
         # its first committed state, exactly as start now relies on (no post-spawn
@@ -2245,3 +2975,792 @@ async def test_born_context_unpinned_when_no_runner():
     assert ctx["strategic_session_id"] == "ss-nopin"
     assert "preferred_runner_target_id" not in ctx
     assert srs.STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in ctx
+
+
+# ---------------------------------------------------------------------------
+# compute_model_integrity_conflicts unit tests
+# ---------------------------------------------------------------------------
+
+def _make_gap(id: str, name: str, status: str = "active", active_moves: list | None = None, deferral: dict | None = None) -> dict:
+    g: dict = {"id": id, "name": name, "status": status}
+    if active_moves is not None:
+        g["active_moves"] = active_moves
+    if deferral is not None:
+        g["deferral"] = deferral
+    return g
+
+
+def _make_dir(id: str, text: str, gap_id: str | None = None, status: str = "active") -> dict:
+    d: dict = {"id": id, "text": text, "status": status}
+    if gap_id is not None:
+        d["gap_id"] = gap_id
+    return d
+
+
+def test_compute_model_integrity_conflicts_clean_model_returns_none():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-1"])]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id="g-1")]
+    assert compute_model_integrity_conflicts(pm, dirs) is None
+
+
+def test_compute_model_integrity_conflicts_empty_model_returns_none():
+    assert compute_model_integrity_conflicts({}, []) is None
+    assert compute_model_integrity_conflicts(None, None) is None
+
+
+def test_compute_model_integrity_conflicts_orphaned_gap():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1")]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id=None)]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    assert len(result["orphaned_gaps"]) == 1
+    assert result["orphaned_gaps"][0]["id"] == "g-1"
+    assert result["counts"]["orphaned_gaps"] == 1
+    assert result["counts"]["total"] >= 1
+
+
+def test_compute_model_integrity_conflicts_deferred_gap_not_orphaned():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", deferral={"reason": "parked"})]}
+    dirs = []
+    assert compute_model_integrity_conflicts(pm, dirs) is None
+
+
+def test_compute_model_integrity_conflicts_ungrounded_direction_no_gap():
+    pm = {"gaps": []}
+    dirs = [_make_dir("d-1", "Active direction with no gap")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    ud = result["ungrounded_directions"]
+    assert len(ud) == 1
+    assert ud[0]["id"] == "d-1"
+    assert ud[0]["reason"] == "no_gap_id"
+    assert ud[0]["gap_id"] is None
+
+
+def test_compute_model_integrity_conflicts_ungrounded_direction_closed_gap():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", status="closed")]}
+    dirs = [_make_dir("d-1", "Direction", gap_id="g-1")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    ud = result["ungrounded_directions"]
+    assert len(ud) == 1
+    assert ud[0]["reason"] == "gap_not_active"
+    assert ud[0]["gap_id"] == "g-1"
+
+
+def test_compute_model_integrity_conflicts_stale_active_moves():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-old", "d-1"])]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id="g-1")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    sam = result["stale_active_moves"]
+    assert len(sam) == 1
+    assert sam[0]["gap_id"] == "g-1"
+    assert "d-old" in sam[0]["stale_direction_ids"]
+    assert "d-1" not in sam[0]["stale_direction_ids"]
+
+
+def test_compute_model_integrity_conflicts_paused_direction_not_active():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-paused"])]}
+    dirs = [_make_dir("d-paused", "Paused dir", gap_id="g-1", status="paused")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    # d-paused is paused, so it is not in active_dir_ids → stale_active_moves
+    assert len(result["stale_active_moves"]) == 1
+    # g-1 is not referenced by any active direction → orphaned
+    assert len(result["orphaned_gaps"]) == 1
+    assert result["counts"]["total"] >= 2
+
+
+def test_compute_model_integrity_conflicts_gap_conflicts_carry_recovery_hints():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-old"])]}
+    dirs = [_make_dir("d-1", "Ungrounded dir")]  # no gap → ungrounded + orphan
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    # Every gap-integrity entry surfaces an actionable, operator-facing hint.
+    assert result["orphaned_gaps"][0]["recovery_hint"] == (
+        "Assign an active direction to this gap or record a deferral."
+    )
+    assert result["ungrounded_directions"][0]["recovery_hint"] == (
+        "Link this direction to an open gap or retire it."
+    )
+    assert result["stale_active_moves"][0]["recovery_hint"] == (
+        "Reconcile the gap's active_moves — the listed directions are no longer active."
+    )
+
+
+def test_compute_model_integrity_conflicts_ungrounded_closed_gap_hint():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", status="closed")]}
+    dirs = [_make_dir("d-1", "Direction", gap_id="g-1")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    ud = result["ungrounded_directions"][0]
+    assert ud["reason"] == "gap_not_active"
+    assert ud["recovery_hint"] == (
+        "Reground this direction to an active gap — its current gap is closed."
+    )
+
+
+def test_compute_model_integrity_conflicts_criterion_links_absent_by_default():
+    # A gap-clean model with no criterion inputs stays clean (backward compatible).
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-1"])]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id="g-1")]
+    assert compute_model_integrity_conflicts(pm, dirs) is None
+
+
+def test_compute_model_integrity_conflicts_criterion_link_inactive_and_dangling():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-1"])]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id="g-1")]
+    criterion_links = [
+        {
+            "id": "d-1",
+            "text": "Direction 1",
+            "status": "active",
+            "criterion_keys": ["c-ok", "c-retracted", "c-unknown"],
+        }
+    ]
+    result = compute_model_integrity_conflicts(
+        pm,
+        dirs,
+        criterion_links=criterion_links,
+        active_criterion_keys=frozenset({"c-ok"}),
+        inactive_criterion_keys=frozenset({"c-retracted"}),
+    )
+    assert result is not None
+    clc = result["criterion_link_conflicts"]
+    assert len(clc) == 2
+    by_key = {c["criterion_key"]: c for c in clc}
+    assert by_key["c-retracted"]["classification"] == "inactive"
+    assert by_key["c-retracted"]["recovery_hint"] == (
+        "Remap to an active criterion — this key is retracted or superseded."
+    )
+    assert by_key["c-unknown"]["classification"] == "dangling"
+    assert by_key["c-unknown"]["recovery_hint"] == (
+        "Remap to a criterion in the open version — this key is unknown there."
+    )
+    assert by_key["c-retracted"]["direction_id"] == "d-1"
+    assert result["counts"]["criterion_link_conflicts"] == 2
+    assert result["counts"]["total"] == 2
+
+
+def test_compute_model_integrity_conflicts_criterion_links_ignore_inactive_directions():
+    # A retired/paused direction's stale criterion keys are not operator-actionable.
+    pm = {"gaps": []}
+    dirs: list = []
+    criterion_links = [
+        {
+            "id": "d-old",
+            "text": "Retired direction",
+            "status": "retired",
+            "criterion_keys": ["c-unknown"],
+        }
+    ]
+    result = compute_model_integrity_conflicts(
+        pm,
+        dirs,
+        criterion_links=criterion_links,
+        active_criterion_keys=frozenset(),
+        inactive_criterion_keys=frozenset(),
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Exam-ledger persistence: heartbeat note round-trips into the session blob
+# and is echoed back in the response; the lease is NOT extended (liveness-only
+# heartbeat). Satisfies the acceptance-criteria gate named test.
+# ---------------------------------------------------------------------------
+
+
+_SAMPLE_LEDGER = {
+    "records": [
+        {
+            "surfaceKey": "direction:d-abc123",
+            "atTick": 1,
+            "at": "2026-01-01T00:01:00",
+            "verdict": "clear",
+            "note": "checked the direction; nothing to do",
+        },
+        {
+            "surfaceKey": "qualification",
+            "atTick": 2,
+            "at": "2026-01-01T00:02:00",
+            "verdict": "found",
+            "note": "audit finding needs a follow-up direction",
+        },
+    ],
+    "tick": 2,
+    "corrective": False,
+}
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_note_ledger_summary_persists_without_extending_lease(db_session):
+    """The heartbeat ``note`` field carries the agent's serialized exam ledger.
+    The backend parses it (JSON), stores it as ``_exam_ledger`` in the session
+    blob, and echoes ``exam_ledger`` in the response. A liveness-only (progress=
+    False) heartbeat that carries a note PERSISTS the ledger AND still does NOT
+    extend the continuation lease — both the persistence contract (write path)
+    and the lease-immutability contract (read path) hold simultaneously.
+    """
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Establish a baseline lease by sending a progress heartbeat first.
+    project = await db_session.get(Project, project.id)
+    r0 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+    baseline_lease = r0["leased_until"]
+    assert baseline_lease is not None
+
+    # Liveness-only heartbeat WITH a note: carries the exam ledger.
+    note = _json.dumps(_SAMPLE_LEDGER)
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False, note=note,
+    )
+
+    # --- lease-immutability contract (pinned by existing test) ---------------
+    assert result["authority_held"] is True  # still fresh (preserved, not bumped)
+    assert result["leased_until"] == baseline_lease  # NOT extended by liveness
+
+    # --- persistence contract (new) -----------------------------------------
+    # The echoed exam_ledger field is the stored JSON string.
+    assert result.get("exam_ledger") == note
+
+    # The blob carries ``_exam_ledger`` (written inside the locked _renew closure).
+    fresh_project = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh_project.vision)
+    assert blob is not None
+    assert "_exam_ledger" in blob
+    stored = _json.loads(blob["_exam_ledger"])
+    assert stored["tick"] == _SAMPLE_LEDGER["tick"]
+    assert len(stored["records"]) == len(_SAMPLE_LEDGER["records"])
+    assert stored["records"][0]["surfaceKey"] == "direction:d-abc123"
+    assert stored["records"][1]["verdict"] == "found"
+
+    # --- snapshot does NOT expose the internal ledger -------------------------
+    # ``_exam_ledger`` is an implementation detail; ``resident_session_snapshot``
+    # must NOT leak it to operator-facing API responses.
+    snap_dict = resident_session_snapshot(fresh_project.vision)
+    assert snap_dict is not None
+    assert "_exam_ledger" not in snap_dict
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_note_ledger_mirrored_to_task_context(db_session):
+    """The exam ledger is written to task.context._exam_ledger (not only to
+    project.vision) so a runner/deploy restart can restore it: the agent reads
+    task.context._exam_ledger on startup before making any heartbeat call."""
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    note = _json.dumps(_SAMPLE_LEDGER)
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False, note=note,
+    )
+
+    # The task.context must carry _exam_ledger so the agent can read it on restart.
+    fresh_task = await db_session.get(Task, task.id)
+    assert fresh_task is not None
+    assert "_exam_ledger" in (fresh_task.context or {})
+    stored = _json.loads(fresh_task.context["_exam_ledger"])
+    assert stored["tick"] == _SAMPLE_LEDGER["tick"]
+    assert len(stored["records"]) == len(_SAMPLE_LEDGER["records"])
+
+
+@pytest.mark.asyncio
+async def test_exam_ledger_round_trips_through_task_context(db_session):
+    """FULL-RESTART round-trip: the heartbeat-persisted exam ledger is carried
+    forward into the NEXT resident session's ``task.context["_exam_ledger"]`` so
+    the agent restores the examination rotation on startup instead of resetting
+    to never-examined-first.
+
+    A real restart ENDS the prior resident task and starts a fresh session on a
+    NEW (spawned/adopted) task; the ledger the heartbeat mirrored onto the OLD
+    task's context is not reachable from the new task. This test persists a
+    ledger via a session-1 heartbeat, drives that task terminal, starts a second
+    session that ADOPTS a fresh strategic_review task, and asserts the SAME
+    records round-trip losslessly through the new task's context (read back via a
+    FRESH session — the delivery path an agent restart actually sees).
+    """
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap1 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Session 1 heartbeat carrying the serialized ledger → mirrored into task1's
+    # context AND the session blob.
+    note = _json.dumps(_SAMPLE_LEDGER)
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap1["session_id"],
+        task_id=snap1["task_id"], progress=False, note=note,
+    )
+    task1 = await db_session.get(Task, task1.id)
+    assert (task1.context or {}).get("_exam_ledger") is not None  # same-task path
+
+    # Simulate a real restart: the old resident task goes terminal and a fresh
+    # adoptable strategic_review is queued to host the next session.
+    task1.status = TaskStatus.COMPLETED
+    db_session.add(task1)
+    task2 = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # Start session 2 → adopts task2, carrying the ledger forward from the prior
+    # session blob into the NEW task's context.
+    project = await db_session.get(Project, project.id)
+    snap2 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap2["session_id"] != snap1["session_id"]
+    assert str(snap2["task_id"]) == str(task2.id)
+
+    # Read back via a FRESH session (the task.context an agent restart is served).
+    factory = _dedicated_session_factory(db_session)
+    async with factory() as s:
+        fresh_task2 = await s.get(Task, task2.id)
+        carried = (fresh_task2.context or {}).get("_exam_ledger")
+    assert carried is not None, "exam ledger not carried into the new session's task"
+
+    # Lossless: every field of every record survives the persist → restart → read.
+    restored = _json.loads(carried)
+    assert restored["tick"] == _SAMPLE_LEDGER["tick"]
+    assert restored["corrective"] == _SAMPLE_LEDGER["corrective"]
+    assert restored["records"] == _SAMPLE_LEDGER["records"]
+
+    # The carried ledger is NOT leaked by the operator-facing session snapshot.
+    fresh_project = await db_session.get(Project, project.id)
+    snap_dict = resident_session_snapshot(fresh_project.vision)
+    assert snap_dict is not None and "_exam_ledger" not in snap_dict
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_note_malformed_json_is_ignored(db_session):
+    """A malformed or non-dict note is silently ignored: the blob is updated
+    normally (no crash, no _exam_ledger written), and the response is valid."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False, note="not-json{{{",
+    )
+    assert result["stop_requested"] is False
+    assert result["exam_ledger"] is None
+
+    fresh_project = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh_project.vision)
+    assert "_exam_ledger" not in (blob or {})
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_returns_active_direction_ids(db_session):
+    """The heartbeat response includes ``active_direction_ids`` populated from
+    Direction rows with non-retired statuses; empty when no rows exist."""
+    from app.models import Direction as DirectionModel
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # No Direction rows yet → empty list.
+    project = await db_session.get(Project, project.id)
+    r0 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    assert r0["active_direction_ids"] == []
+
+    # Add directions covering all vocabulary statuses.
+    included_statuses = [("d-active1", "active"), ("d-paused1", "paused"), ("d-proposed1", "proposed")]
+    excluded_statuses = [
+        ("d-retired1", "retired"),
+        ("d-completed1", "completed"),
+        ("d-superseded1", "superseded"),
+        ("d-rejected1", "rejected"),
+        ("d-expired1", "expired"),
+    ]
+    for key, status in included_statuses + excluded_statuses:
+        db_session.add(
+            DirectionModel(
+                project_id=project.id,
+                direction_key=key,
+                status=status,
+                data={},
+            )
+        )
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    r1 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    ids = set(r1["active_direction_ids"])
+    # All three included statuses must appear.
+    assert "d-active1" in ids
+    assert "d-paused1" in ids
+    assert "d-proposed1" in ids
+    # All excluded statuses must be absent.
+    for key, _ in excluded_statuses:
+        assert key not in ids, f"{key} should be excluded from active_direction_ids"
+
+
+# ---------------------------------------------------------------------------
+# cycle_in_flight: named block reason + completion retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workday_entry_while_cycle_in_flight_records_named_reason(
+    db_session, enable_strategic_session_flag
+):
+    """Entering Workday while a batch strategic cycle is IN_PROGRESS (non-adoptable)
+    records ``cycle_in_flight`` — NOT the generic ``start_failed`` reason — and the
+    read model surfaces ``blocked`` (not ``error``) with the named reason.
+
+    This exercises the new pre-check in ``_auto_start_on_workday_entry`` that
+    detects the spawn-guard condition before the start path raises a 409.
+    """
+    project = await _make_project_with_member(db_session)
+    # A runner is required to get past the no_runner gate; the cycle_in_flight
+    # check comes AFTER the runner check so both must pass.
+    await _make_live_local_runner(db_session, project)
+    # An IN_PROGRESS strategic_review task (not adoptable — started_at is set)
+    # means: nothing to adopt AND _has_active_strategic_task returns True.
+    in_flight = Task(
+        project_id=project.id,
+        title="batch cycle",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-batch",
+        started_at=_utcnow(),
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(in_flight)
+    await db_session.commit()
+
+    factory = _dedicated_session_factory(db_session)
+    snapshot = await sync_resident_session_for_interaction_mode(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="chat",
+        new_mode="continuous",
+        session_factory=factory,
+    )
+    # Auto-start was blocked — no session started.
+    assert snapshot is None
+
+    vision = await _fresh_vision(factory, project.id)
+    blocked_reason = read_resident_session_blocked_reason(vision)
+    # Must be the named cycle_in_flight reason, NOT the generic start_failed.
+    assert blocked_reason == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT
+
+    # The read model must surface ``blocked`` (not ``error``).
+    avail = _resident_session_availability(
+        _project_with_vision(vision), eligible_live_runner_count=1
+    )
+    assert avail["state"] == "blocked"
+    assert avail["reason"] == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT
+
+    # The operator_user_id must be stored so the retry handler can use it.
+    raw_blob = vision.get(RESIDENT_SESSION_REASON_KEY) or {}
+    assert raw_blob.get("operator_user_id") == TEST_USER_ID
+
+
+@pytest.mark.asyncio
+async def test_cycle_completion_retries_workday_auto_start(
+    db_session, enable_strategic_session_flag
+):
+    """Completing a blocking strategic cycle re-triggers the Workday auto-start
+    when the project is in continuous mode with a ``cycle_in_flight`` block.
+
+    This exercises ``_maybe_retry_workday_auto_start`` from
+    ``app.strategic_completion``, which reads the blocked reason, checks the
+    interaction mode, and calls ``_auto_start_on_workday_entry`` on a fresh
+    session. The retry succeeds when an adoptable task and a live runner are
+    available after the blocking cycle finishes.
+    """
+    from app.strategic_completion import _maybe_retry_workday_auto_start
+    from app.workbench_state import upsert_strategic_workbench_state_with_previous
+
+    project = await _make_project_with_member(db_session)
+    # Provide a live runner so the retry auto-start can pick a device.
+    await _make_live_local_runner(db_session, project)
+    # Provide an adoptable strategic_review task (QUEUED, no started_at) so the
+    # retry can adopt it rather than spawning (which would be blocked by the
+    # still-present in-flight task state).
+    adoptable_task = await _make_strategic_review_task(db_session, project)
+
+    # Set interaction_mode=continuous via the real per-user prefs store
+    # (MessagesNoisePrefs), which is where workbench state is actually persisted.
+    await upsert_strategic_workbench_state_with_previous(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "continuous"},
+    )
+
+    # Manually set the RESIDENT_SESSION_REASON_KEY == cycle_in_flight in vision.
+    project = await db_session.get(Project, project.id)
+    from sqlalchemy.orm.attributes import flag_modified as _fm
+
+    vision = dict(project.vision or {})
+    vision[RESIDENT_SESSION_REASON_KEY] = {
+        "reason": RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+        "recorded_at": _utcnow().isoformat(),
+        "operator_user_id": TEST_USER_ID,
+    }
+    project.vision = vision
+    _fm(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    factory = _dedicated_session_factory(db_session)
+    # Call the retry helper directly (as strategic_completion does post-commit).
+    await _maybe_retry_workday_auto_start(project.id, session_factory=factory)
+
+    # The retry should have started a session: the session blob is now active.
+    vision_after = await _fresh_vision(factory, project.id)
+    assert resident_session_is_active(read_resident_session(vision_after)), (
+        "Expected an active resident session after the cycle_in_flight retry"
+    )
+    # The session must have adopted the available strategic_review task.
+    blob = read_resident_session(vision_after) or {}
+    assert blob.get("task_id") == str(adoptable_task.id)
+    # The blocked reason is cleared on a successful start.
+    assert read_resident_session_blocked_reason(vision_after) is None
+
+
+# ---------------------------------------------------------------------------
+# message_cursor + handled_message_ids (durable resident message state)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_message_cursor_in_session_blob_and_task_context(db_session):
+    """A heartbeat carrying ``message_cursor`` writes it to both the session blob
+    (``_message_cursor``) and ``task.context["message_cursor"]``, so a restarted
+    agent restores the high-water mark instead of re-delivering answered messages."""
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    cursor = "2026-07-06T12:34:56.789000"
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        message_cursor=cursor,
+    )
+
+    # The heartbeat itself succeeds.
+    assert result["stop_requested"] is False
+
+    # The cursor is persisted in the session blob.
+    fresh_project = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh_project.vision)
+    assert blob is not None
+    assert blob.get("_message_cursor") == cursor
+
+    # The cursor is mirrored into task.context so the agent reads it on restart.
+    fresh_task = await db_session.get(Task, task.id)
+    assert fresh_task is not None
+    assert (fresh_task.context or {}).get("message_cursor") == cursor
+
+    # The cursor must NOT appear in the operator-facing session snapshot.
+    snap_dict = resident_session_snapshot(fresh_project.vision)
+    assert snap_dict is not None
+    assert "_message_cursor" not in snap_dict
+
+
+@pytest.mark.asyncio
+async def test_start_carries_message_cursor_forward_across_restart(db_session):
+    """A cursor persisted by the session-1 heartbeat is carried into the NEW
+    task's ``context["message_cursor"]`` when a second session starts — the same
+    round-trip the exam ledger uses."""
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap1 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    cursor = "2026-07-06T10:00:00.000000"
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap1["session_id"],
+        task_id=snap1["task_id"],
+        progress=False,
+        message_cursor=cursor,
+    )
+
+    # Drive session-1 task to terminal and queue a fresh task for adoption.
+    task1 = await db_session.get(Task, task1.id)
+    task1.status = TaskStatus.COMPLETED
+    db_session.add(task1)
+    task2 = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # Start session 2 → adopts task2; cursor should be carried forward.
+    project = await db_session.get(Project, project.id)
+    snap2 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap2["session_id"] != snap1["session_id"]
+
+    # The new task carries the cursor in its context (delivery path on restart).
+    fresh_task2 = await db_session.get(Task, task2.id)
+    assert fresh_task2 is not None
+    assert (fresh_task2.context or {}).get("message_cursor") == cursor
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_marks_handled_message_ids(db_session):
+    """A heartbeat carrying ``handled_message_ids`` updates those messages'
+    ``status`` from ``'open'`` to ``'handled'``, scoped to the project and session."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    session_id = snap["session_id"]
+
+    # Insert two messages scoped to THIS session.
+    msg1 = await _make_operator_message(
+        db_session, project, content="hello", resident_session_id=session_id
+    )
+    msg2 = await _make_operator_message(
+        db_session, project, content="world", resident_session_id=session_id
+    )
+
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=session_id,
+        task_id=snap["task_id"],
+        progress=True,
+        handled_message_ids=[str(msg1.id), str(msg2.id)],
+    )
+    assert result["stop_requested"] is False
+
+    # Both messages are now marked handled.
+    fresh_msg1 = await db_session.get(ProjectMessage, msg1.id)
+    fresh_msg2 = await db_session.get(ProjectMessage, msg2.id)
+    assert fresh_msg1 is not None and fresh_msg1.status == "handled"
+    assert fresh_msg2 is not None and fresh_msg2.status == "handled"
+
+
+@pytest.mark.asyncio
+async def test_handled_messages_excluded_from_work_state_new_operator_messages_count(db_session):
+    """Messages marked ``handled`` are excluded from
+    ``work_state_summary.new_operator_messages`` so the strategist's inbox count
+    reflects only genuinely-unread messages, not ones it already answered."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    session_id = snap["session_id"]
+
+    # Insert one open and one to-be-handled message.
+    await _make_operator_message(
+        db_session, project, content="open", resident_session_id=session_id
+    )
+    handled_msg = await _make_operator_message(
+        db_session, project, content="answered", resident_session_id=session_id
+    )
+
+    # Mark the second message handled via a progress heartbeat.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=session_id,
+        task_id=snap["task_id"],
+        progress=True,
+        handled_message_ids=[str(handled_msg.id)],
+    )
+
+    # A subsequent heartbeat must count only the open message.
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=session_id,
+        task_id=snap["task_id"],
+        progress=False,
+    )
+    summary = result.get("work_state_summary", {})
+    assert summary.get("new_operator_messages") == 1, (
+        f"Expected 1 open (the handled one must be excluded), got {summary}"
+    )
+    # Verify the handled message really has status=handled.
+    fresh_handled = await db_session.get(ProjectMessage, handled_msg.id)
+    assert fresh_handled is not None and fresh_handled.status == "handled"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_handled_ids_only_affect_own_session(db_session):
+    """Handled-id updates are scoped to the session: a message from a DIFFERENT
+    session is NOT affected even if its id appears in ``handled_message_ids``."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    session_id = snap["session_id"]
+
+    # Message without a resident_session_id (legacy/cadence row — no session scope).
+    unscoped_msg = await _make_operator_message(db_session, project, content="no-session")
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=session_id,
+        task_id=snap["task_id"],
+        progress=True,
+        handled_message_ids=[str(unscoped_msg.id)],
+    )
+
+    # The unscoped message is NOT marked handled (different session_id / None).
+    fresh_msg = await db_session.get(ProjectMessage, unscoped_msg.id)
+    assert fresh_msg is not None and fresh_msg.status == "open"

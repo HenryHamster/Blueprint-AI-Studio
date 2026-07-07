@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo, useCallback } from 'react';
 import { ChevronDown, Plus, ToggleLeft, ToggleRight, X } from 'lucide-react';
 import DesignDocViewer from './DesignDocViewer';
 import ProblemModelViewer from './ProblemModelViewer';
@@ -163,6 +163,13 @@ export interface Direction {
     implementation_constraints?: string;
     [key: string]: unknown;
   } | null;
+  // Churn-retirement recommendation: set by the zombie-retire ladder when a
+  // paused direction has hit the max churn-pause-cycles threshold. The direction
+  // is held PAUSED pending an explicit operator Keep/Retire decision. All three
+  // fields are cleared once the operator submits a decision.
+  churn_retirement_recommended?: boolean;
+  churn_retirement_recommended_reason?: string | null;
+  churn_retirement_recommended_at?: string | null;
   // Advisory outcome-less-scaffolding flag: set by the backend detector when a
   // long-running direction keeps merging PRs at a healthy rate but shows no
   // progress toward its stated success_evidence. ADVISORY ONLY — never auto-pauses.
@@ -255,10 +262,12 @@ export function DirectionsPanel({
     setCollapsed(prev => ({ ...prev, [key]: !prev[key] }));
   }
 
-  const categoryFilterFn = (d: Direction) =>
-    categoryFilter === 'all' || d.category === categoryFilter;
+  const categoryFilterFn = useCallback(
+    (d: Direction) => categoryFilter === 'all' || d.category === categoryFilter,
+    [categoryFilter]
+  );
 
-  const grouped = STATUS_GROUPS.map(({ key, label }) => ({
+  const grouped = useMemo(() => STATUS_GROUPS.map(({ key, label }) => ({
     key,
     label,
     items: key === 'active'
@@ -267,10 +276,16 @@ export function DirectionsPanel({
           .filter(d => d.status === key)
           .filter(categoryFilterFn)
           .sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]),
-  }));
+  })), [data.directions, categoryFilterFn]);
 
-  const proposedCount = data.directions.filter(d => d.status === 'proposed').length;
-  const activeItems = (grouped.find(g => g.key === 'active') ?? { items: [] }).items;
+  const proposedCount = useMemo(
+    () => data.directions.filter(d => d.status === 'proposed').length,
+    [data.directions]
+  );
+  const activeItems = useMemo(
+    () => (grouped.find(g => g.key === 'active') ?? { items: [] }).items,
+    [grouped]
+  );
 
   return (
       <div className="flex-1 overflow-hidden flex flex-col bg-neutral-950">
@@ -449,6 +464,7 @@ export function DirectionsPanel({
             dismissDirectionUpdate={data.dismissDirectionUpdate}
             triggerResearch={data.triggerResearch}
             reorderDirections={data.reorderDirections}
+            decideChurnRetirement={data.decideChurnRetirement}
             taskCounts={data.taskCounts}
             activeTasks={data.activeTasks}
             cooldownMinutes={config.cooldownMinutes}

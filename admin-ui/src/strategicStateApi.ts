@@ -972,6 +972,36 @@ export interface StrategicStateResponse {
     stale?: boolean | null;
     stale_reason?: string | null;
   } | null;
+  model_integrity?: {
+    orphaned_gaps: Array<{ id: string; name: string; status: string; recovery_hint?: string }>;
+    ungrounded_directions: Array<{
+      id: string;
+      text: string;
+      gap_id: string | null;
+      reason: 'no_gap_id' | 'gap_not_active' | string;
+      recovery_hint?: string;
+    }>;
+    stale_active_moves: Array<{
+      gap_id: string;
+      gap_name: string;
+      stale_direction_ids: string[];
+      recovery_hint?: string;
+    }>;
+    criterion_link_conflicts?: Array<{
+      direction_id: string;
+      direction_text: string;
+      criterion_key: string;
+      classification: 'inactive' | 'dangling' | string;
+      recovery_hint?: string;
+    }>;
+    counts: {
+      orphaned_gaps: number;
+      ungrounded_directions: number;
+      stale_active_moves: number;
+      criterion_link_conflicts?: number;
+      total: number;
+    };
+  } | null;
 }
 
 export async function fetchStrategicState(
@@ -1047,6 +1077,25 @@ export async function fetchStrategicSession(
   );
   if (!res.ok) throw new Error(`Failed to fetch Strategic session: ${res.status}`);
   return res.json() as Promise<StrategicSessionResponse>;
+}
+
+export async function fetchStrategicConversation(
+  projectId: string,
+  includeMessageId?: string | null,
+  signal?: AbortSignal,
+): Promise<{ conversation: StrategicSessionConversation }> {
+  const params = new URLSearchParams();
+  if (includeMessageId) params.set('include_message_id', includeMessageId);
+  const query = params.toString();
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-conversation${query ? `?${query}` : ''}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch Strategic conversation: ${res.status}`);
+  return res.json() as Promise<{ conversation: StrategicSessionConversation }>;
 }
 
 export async function createStrategicSessionMessage(

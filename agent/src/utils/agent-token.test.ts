@@ -1,5 +1,25 @@
-import { describe, it, expect } from 'vitest';
-import { computeRefreshDelayMs, isBootstrapToken } from './agent-token.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { expectCalledWith } from './typed-mock-call.js';
+
+// Mock the two token-persistence modules the GitHub-token refresh callback
+// touches so the refresh path can be exercised without writing real files or
+// shelling out to git. Only the symbols agent-token.ts imports need to exist.
+vi.mock('../token-file.js', () => ({
+  writeGithubTokenFile: vi.fn(),
+}));
+vi.mock('../git-credential.js', () => ({
+  writeGitTokenFile: vi.fn(),
+  setupGitCredentialHelper: vi.fn(),
+}));
+
+import {
+  computeRefreshDelayMs, isBootstrapToken,
+  initTokenModule,
+  scheduleGithubTokenRefresh, stopGithubTokenRefresh,
+} from './agent-token.js';
+import * as agentTokenModule from './agent-token.js';
+import { writeGithubTokenFile } from '../token-file.js';
+import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 import {
   TOKEN_REFRESH_FLOOR_MS,
   TOKEN_REFRESH_CEILING_MS,
@@ -96,5 +116,120 @@ describe('isBootstrapToken', () => {
     const payload = Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64url');
     const token = `${header}.${payload}.sig`;
     expect(isBootstrapToken(token, now)).toBe(false);
+  });
+});
+
+// ── scheduleGithubTokenRefresh / stopGithubTokenRefresh ───────────────────────
+
+describe('scheduleGithubTokenRefresh / stopGithubTokenRefresh lifecycle', () => {
+  // These tests verify the timer start/stop contract without actually firing the
+  // 45-min timer. We use vitest fake timers to stay fast and deterministic.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // initTokenModule must be called before schedule* functions.
+    initTokenModule({
+      getOrchestratorUrl: () => 'http://test-orchestrator',
+      getHeaders: () => ({ 'X-Agent-Token': 'test-token' }),
+      getToken: () => 'test-token',
+      setToken: () => {},
+      log: () => {},
+    });
+    stopGithubTokenRefresh();
+  });
+  afterEach(() => {
+    stopGithubTokenRefresh();
+    vi.useRealTimers();
+  });
+
+  it('scheduleGithubTokenRefresh sets a timer that stopGithubTokenRefresh clears', () => {
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
+    scheduleGithubTokenRefresh('task-1', '/tmp/ws', 'owner', 'repo', false);
+    expect(agentTokenModule.githubTokenRefreshTimer).not.toBeNull();
+    stopGithubTokenRefresh();
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
+  });
+
+  it('calling scheduleGithubTokenRefresh twice replaces the previous timer (no orphan)', () => {
+    scheduleGithubTokenRefresh('task-1', '/tmp/ws', 'owner', 'repo', false);
+    const first = agentTokenModule.githubTokenRefreshTimer;
+    scheduleGithubTokenRefresh('task-2', '/tmp/ws', 'owner', 'repo', false);
+    const second = agentTokenModule.githubTokenRefreshTimer;
+    // The second call must replace the first — no orphaned timers.
+    expect(second).not.toBeNull();
+    expect(second).not.toBe(first);
+  });
+
+  it('stopGithubTokenRefresh is a no-op when no timer is running', () => {
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
+    expect(() => { stopGithubTokenRefresh(); }).not.toThrow();
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
+  });
+
+  it('scheduleGithubTokenRefresh works for both read-only and non-read-only tasks', () => {
+    scheduleGithubTokenRefresh('task-ro', '/tmp/ws', 'owner', 'repo', true);
+    expect(agentTokenModule.githubTokenRefreshTimer).not.toBeNull();
+    stopGithubTokenRefresh();
+    scheduleGithubTokenRefresh('task-rw', '/tmp/ws', 'owner', 'repo', false);
+    expect(agentTokenModule.githubTokenRefreshTimer).not.toBeNull();
+  });
+});
+
+// ── GitHub token refresh callback: credential-exposure hardening ──────────────
+// Finding 11: the refresh must NOT re-embed the installation token in the git
+// remote URL (which persists it in .git/config and briefly in the git argv). It
+// keeps the origin URL clean and delegates auth to the credential helper.
+describe('scheduleGithubTokenRefresh refresh callback (no token in remote URL)', () => {
+  // The local const in agent-token.ts (not exported); mirrored here.
+  const GITHUB_TOKEN_REFRESH_MS = 45 * 60 * 1000;
+  const FRESH_TOKEN = 'ghs_fresh_write_token';
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    initTokenModule({
+      getOrchestratorUrl: () => 'http://test-orchestrator',
+      getHeaders: () => ({ 'X-Agent-Token': 'test-token' }),
+      getToken: () => 'test-token',
+      setToken: () => {},
+      log: () => {},
+    });
+    stopGithubTokenRefresh();
+    vi.mocked(writeGithubTokenFile).mockReset();
+    vi.mocked(writeGitTokenFile).mockReset();
+    vi.mocked(setupGitCredentialHelper).mockReset();
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ data: { token: FRESH_TOKEN } }),
+    })));
+  });
+  afterEach(() => {
+    stopGithubTokenRefresh();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('write task: refreshes token file + credential helper, never embeds token in a remote URL', async () => {
+    scheduleGithubTokenRefresh('task-rw', '/tmp/ws', 'owner', 'repo', false);
+    await vi.advanceTimersByTimeAsync(GITHUB_TOKEN_REFRESH_MS);
+    stopGithubTokenRefresh(); // cancel the self-reschedule before assertions
+
+    // Fresh token mirrored to both on-disk token files (helper reads the git one).
+    expectCalledWith(writeGithubTokenFile, FRESH_TOKEN);
+    expectCalledWith(writeGitTokenFile, FRESH_TOKEN);
+    // Auth delegated to the credential helper against a CLEAN origin URL — the
+    // token is never written into .git/config nor passed on the git command line.
+    expectCalledWith(setupGitCredentialHelper, 'owner', 'repo', '/tmp/ws');
+    // Regression guard: the raw token must never appear in any git-remote argument.
+    expect(vi.mocked(setupGitCredentialHelper).mock.calls.flat().join(' ')).not.toContain(FRESH_TOKEN);
+  });
+
+  it('read-only task: refreshes the token file only, touches no git auth config', async () => {
+    scheduleGithubTokenRefresh('task-ro', '/tmp/ws', 'owner', 'repo', true);
+    await vi.advanceTimersByTimeAsync(GITHUB_TOKEN_REFRESH_MS);
+    stopGithubTokenRefresh();
+
+    expectCalledWith(writeGithubTokenFile, FRESH_TOKEN);
+    expect(vi.mocked(writeGitTokenFile)).not.toHaveBeenCalled();
+    expect(vi.mocked(setupGitCredentialHelper)).not.toHaveBeenCalled();
   });
 });

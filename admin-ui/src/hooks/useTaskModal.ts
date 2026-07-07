@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import type React from 'react';
 import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog, createComputeExperiment, computeExperimentPreflight } from '../api';
+import { usePersistedState } from './usePersistedState';
 import type { ComputeSuccessOperator, ComputeExperimentLaunchRequest, ComputeSuccessCriterion, ComputeExperimentPreflightResponse } from '../api';
 import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
 import { USER_LAUNCHABLE_TASK_TYPE_IDS, USER_LAUNCHABLE_TASK_TYPE_OPTIONS, resolveTaskCapabilities } from '../taskCapabilities';
@@ -135,6 +136,14 @@ export function useTaskModal(
   // newTaskType === 'compute_experiment'; otherwise inert.
   const [computeExperiment, setComputeExperiment] =
     useState<ComputeExperimentForm>(defaultComputeExperimentForm);
+
+  // Draft provenance — lifted from NewTaskModal so the hook can include them in
+  // the launch request without prop threading through submit.
+  const [ideaText, setIdeaText] = usePersistedState('compute-experiment-idea', '');
+  const [draftNotes, setDraftNotes] = usePersistedState<string | null>('compute-experiment-draft-notes', null);
+  // True when the operator applied an AI-drafted refinement before launching;
+  // false for a purely hand-typed contract. Reset on each modal open.
+  const [cameFromDraft, setCameFromDraft] = useState(false);
 
   // Preflight projection state — debounced on hardware/budget inputs.
   const [preflightResult, setPreflightResult] = useState<ComputeExperimentPreflightResponse | null>(null);
@@ -355,6 +364,8 @@ export function useTaskModal(
     return () => clearTimeout(timer);
   }, [newTaskTitle, newTaskPrompt, showNewTaskModal, modalOpener, selectedProjectRepoRef]);
 
+  const onDraftApplied = () => { setCameFromDraft(true); };
+
   const openNewTaskModal = () => {
     setModalOpener('new');
     setShowNewTaskModal(true);
@@ -367,6 +378,7 @@ export function useTaskModal(
     setBranchOptions([]);
     setBranchError(null);
     setComputeExperiment(defaultComputeExperimentForm());
+    setCameFromDraft(false);
     restoreDraft();
     fetchRepoOptions();
     fetchLaunchableTaskTypeOptions();
@@ -527,6 +539,9 @@ export function useTaskModal(
         : {}),
       ...(newTaskModel ? { model: newTaskModel } : {}),
       ...(newTaskEffort ? { effort: newTaskEffort } : {}),
+      ...(ideaText.trim() ? { idea: ideaText.trim() } : {}),
+      ...(draftNotes ? { draft_notes: draftNotes } : {}),
+      ...(cameFromDraft ? { drafted_from_refinement: true } : {}),
     };
     try {
       const response = await createComputeExperiment(body);
@@ -697,6 +712,7 @@ export function useTaskModal(
     setUseManualBranch(false);
     setBranchOptions([]);
     setBranchError(null);
+    setCameFromDraft(false);
 
     // For compute_experiment tasks, prefill the compute experiment form from the payload.
     if ((task.task_type as string) === COMPUTE_EXPERIMENT_TASK_TYPE) {
@@ -764,6 +780,7 @@ export function useTaskModal(
     setNewTaskRepo, setNewTaskBranch, setNewTaskTitle, setNewTaskPrompt,
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     computeExperiment, setComputeExperiment,
+    ideaText, setIdeaText, draftNotes, setDraftNotes, cameFromDraft, onDraftApplied,
     preflightResult, preflightLoading, preflightError,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,

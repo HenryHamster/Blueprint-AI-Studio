@@ -36,6 +36,11 @@ vi.mock('../api', () => ({
   listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
   registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret' })),
   revokeFleetRunner: vi.fn(async () => {}),
+  // FleetRunnersPanel also statically imports rotateFleetRunnerToken for the
+  // per-runner token-rotation action; browser-mode ESM requires the mock factory
+  // to expose it or the linker fails at import time with "does not provide an
+  // export named 'rotateFleetRunnerToken'".
+  rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated' })),
 }));
 
 describe('FleetRunnersPanel — viewport regression', () => {

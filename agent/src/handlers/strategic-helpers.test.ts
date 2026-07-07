@@ -7,6 +7,7 @@ import {
   writeStrategicHelpers,
   writeFetchHelper,
   buildFetchGuidance,
+  renderStrategicFetchVerbHelpLines,
   RESEARCH_FETCH_VERBS,
   PLAN_FETCH_VERBS,
   DESIGN_DOC_FETCH_VERBS,
@@ -18,7 +19,12 @@ import {
   STRATEGIC_CHALLENGE_VERSION,
   portfolioOperationFingerprint,
 } from './strategic-helpers.js';
-import { VmConfigMissingError } from '../providers/runners.js';
+import { VmConfigMissingError, provisionAmbientHelpers } from '../providers/runners.js';
+import {
+  writePlaybookHelper,
+  writeMessagesHelper,
+  writeDesignDocHelper,
+} from '../prompt.js';
 
 // Use the OS temp dir (not a hardcoded /tmp) so this suite runs on Windows too.
 const testWorkspace = path.join(os.tmpdir(), 'test-strategic-helpers-workspace');
@@ -99,7 +105,10 @@ describe('writeStrategicHelpers', () => {
 
     const content = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
     expect(content).toContain('set-acceptance-criteria');
-    expect(content).toContain('set-acceptance-criteria)   _call "set_acceptance_criteria"');
+    // The case arms are now derived from the canonical registry with uniform
+    // single-space padding (was hand-aligned columns); the alias→op mapping is
+    // unchanged.
+    expect(content).toContain('set-acceptance-criteria) _call "set_acceptance_criteria"');
   });
 
   it('embeds projectId in fetch script safely', () => {
@@ -114,6 +123,33 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('playbook');
     expect(content).toContain('gap');
     expect(content).toContain('message');
+  });
+
+  it('includes task and tasks fetch verbs in the strategic fetch script', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // Single-task lookup: task <id> -> tasks/$ID
+    expect(content).toContain('task)');
+    expect(content).toContain('PATH_SUFFIX="tasks/$ID"');
+    // List lookup: tasks -> tasks (no id required)
+    expect(content).toContain('tasks)');
+    expect(content).toContain('PATH_SUFFIX="tasks"');
+    // tasks (list) must not require an id argument — it should be in the no-id exclusion list
+    expect(content).toContain('"tasks"');
+  });
+
+  it('task and tasks verbs are in STRATEGIC_FETCH_VERBS and have help text', () => {
+    expect(STRATEGIC_FETCH_VERBS).toContain('task');
+    expect(STRATEGIC_FETCH_VERBS).toContain('tasks');
+
+    writeStrategicHelpers('t', 'p', testWorkspace);
+    const fetchContent = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // Both verbs appear in the generated case statement
+    expect(fetchContent).toContain('task)');
+    expect(fetchContent).toContain('tasks)');
   });
 
   // ── Live token resolution (resident write-token-expiry fix) ─────────────────
@@ -166,6 +202,56 @@ describe('writeStrategicHelpers', () => {
         expect(() => execFileSync('bash', ['-n', p], { stdio: 'pipe' })).not.toThrow();
       }
     });
+
+    it('_call retries only on 429 and 5xx — not on permanent 4xx (400/422/404)', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // 429 is in the retry branch (string comparison form used in the condition)
+      expect(s).toContain('"429"');
+      // 5xx range is retried alongside 429
+      expect(s).toContain('-ge 500');
+      // Non-retryable permanent 4xx exits immediately with a clear label
+      expect(s).toContain('non-retryable');
+      // The non-retryable branch prints the body before reporting the error
+      expect(s).toContain('"$body" >&2');
+    });
+
+    it('_call retries a curl transport failure (http_code 000) instead of treating it as permanent', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // curl reports http_code "000" on a connect timeout / DNS / TLS / dropped
+      // connection — no HTTP response. It must be retried alongside 429/5xx, not
+      // fall through to the non-retryable else branch (which would make a network
+      // blip a permanent failure).
+      expect(s).toContain('[ "$http_code" = "000" ]');
+      // The 000 check shares the SAME retry condition as 429 (one `if` line).
+      expect(s).toMatch(/\[ "\$http_code" = "000" \] \|\| \[ "\$http_code" = "429" \]/);
+    });
+
+    it('_call honors Retry-After header on 429 contention', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // Headers are captured to a dump file so Retry-After can be parsed
+      expect(s).toContain('-D "$dump"');
+      // Retry-After is read from the dump file (case-insensitive header match)
+      expect(s).toContain("grep -i '^retry-after:'");
+      // Delay is honoured in the sleep call
+      expect(s).toContain('sleep "$delay"');
+    });
+
+    it('_call terminal error includes HTTP status code', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // Non-auth terminal error reports the actual HTTP status so the agent can diagnose
+      expect(s).toContain('failed after $max attempts (HTTP $http_code)');
+    });
+
+    it('_call prints response body on failed non-retryable attempt', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // Body is surfaced to stderr on non-retryable 4xx so the error detail is visible
+      expect(s).toContain('"$body" >&2');
+    });
   });
 
   it('supports fetching a message by short ref via the messages endpoint', () => {
@@ -174,13 +260,20 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
-    // The new subcommand maps `fetch message <ref>` to the read-only lookup
-    // endpoint that resolves a short ref or full UUID backend-side.
-    expect(content).toContain('message)    PATH_SUFFIX="messages/$ID"');
-    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance [id]');
+    // The new subcommand maps `fetch message [ref]` to the read-only lookup
+    // endpoint that resolves a short ref or full UUID backend-side. When no ref
+    // is supplied it lists open messages (compact) via /messages/open;
+    // messages/${ID:-open} substitutes the ref when one is provided.
+    expect(content).toContain('message)    PATH_SUFFIX="messages/${ID:-open}"');
+    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks [id]');
     // Reuses the existing X-Agent-Token GET path — no new auth/curl block.
     expect(content).toContain('-H "X-Agent-Token: $TOKEN"');
-    // The shared id-required guard covers `message`; version-phase is explicitly id-less.
+    // Both direction and message are excluded from the id-required guard: they
+    // support a no-id compact-listing mode (direction via ${ID:+/$ID};
+    // message via messages/${ID:-open}).
+    expect(content).toContain('[ "$KIND" != "direction" ]');
+    expect(content).toContain('[ "$KIND" != "message" ]');
+    // The id-required guard still fires for verbs that do require an id.
     expect(content).toContain('fetch $KIND requires an id argument');
     expect(content).toContain('[ "$KIND" != "version-phase" ]');
   });
@@ -191,7 +284,7 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
-    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance [id]');
+    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks [id]');
     expect(content).toContain('problem-model) PATH_SUFFIX="problem-model"');
     expect(content).toContain('fetch $KIND requires an id argument');
   });
@@ -356,7 +449,7 @@ describe('writeStrategicHelpers', () => {
 
     const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
     // ci-compliance appears in the usage string.
-    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance [id]');
+    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks [id]');
     // ci-compliance has the correct case arm and PATH_SUFFIX.
     expect(content).toContain('ci-compliance)        PATH_SUFFIX="ci-compliance"');
     // ci-compliance is exempt from the id-required guard (no id needed).
@@ -390,9 +483,9 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     const viaStrategic = readFetch();
     expect(viaWriter).toBe(viaStrategic);
     // Spot-check the load-bearing usage + case lines the strategic suite pins.
-    expect(viaWriter).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance [id]');
+    expect(viaWriter).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks [id]');
     expect(viaWriter).toContain('problem-model) PATH_SUFFIX="problem-model"');
-    expect(viaWriter).toContain('message)    PATH_SUFFIX="messages/$ID"');
+    expect(viaWriter).toContain('message)    PATH_SUFFIX="messages/${ID:-open}"');
     expect(viaWriter).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
     expect(viaWriter).toContain('compute-sweeps) PATH_SUFFIX="compute-sweeps${ID:+/$ID}"');
     expect(viaWriter).toContain('version-phase) PATH_SUFFIX="version-phase"');
@@ -401,13 +494,14 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
   it('bakes ONLY the granted verbs into the case statement (research subset)', () => {
     writeFetchHelper('t', 'proj-1', testWorkspace, { verbs: RESEARCH_FETCH_VERBS });
     const content = readFetch();
-    // Granted verbs are real case branches.
-    expect(content).toContain('direction)  PATH_SUFFIX="directions/$ID"');
+    // Granted verbs are real case branches. direction uses ${ID:+/$ID} so it
+    // lists all directions when called without an id (compact form).
+    expect(content).toContain('direction)  PATH_SUFFIX="directions${ID:+/$ID}"');
     expect(content).toContain('problem-model) PATH_SUFFIX="problem-model"');
     expect(content).toContain('gap)        PATH_SUFFIX="gaps/$ID"');
-    // Non-granted verbs have NO resolving branch.
+    // Non-granted verbs have NO resolving branch (check both old and new literal forms).
     expect(content).not.toContain('PATH_SUFFIX="playbook/$ID"');
-    expect(content).not.toContain('PATH_SUFFIX="messages/$ID"');
+    expect(content).not.toContain('PATH_SUFFIX="messages/${ID:-open}"');
     expect(content).not.toContain('PATH_SUFFIX="design-doc/$ID"');
     // Usage line lists only the granted subset (canonical order; qualification last).
     expect(content).toContain('Usage: fetch problem-model|direction|gap|knowledge|qualification [id]');
@@ -418,31 +512,34 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     const content = readFetch();
     // playbook/message/section are full-vocabulary verbs not granted here — they
     // get an explicit reject branch rather than a generic "unknown kind".
-    expect(content).toContain('playbook|message|section|compute-sweeps|version-phase|vm-cost|efficiency-snapshot|ci-compliance) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: problem-model|direction|gap|knowledge|qualification)."');
+    expect(content).toContain('playbook|message|section|compute-sweeps|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: problem-model|direction|gap|knowledge|qualification)."');
   });
 
   it('different subsets bake different verb vocabularies (plan subset)', () => {
     writeFetchHelper('t', 'proj-2', testWorkspace, { verbs: PLAN_FETCH_VERBS });
     const content = readFetch();
-    expect(content).toContain('direction)  PATH_SUFFIX="directions/$ID"');
+    // direction uses ${ID:+/$ID}: lists all directions when called without an id.
+    expect(content).toContain('direction)  PATH_SUFFIX="directions${ID:+/$ID}"');
     expect(content).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
     expect(content).toContain('playbook)   PATH_SUFFIX="playbook/$ID"');
     expect(content).toContain('Usage: fetch direction|playbook|section|knowledge|qualification [id]');
     // problem-model / gap / message are rejected here.
-    expect(content).toContain('problem-model|gap|message|compute-sweeps|version-phase|vm-cost|efficiency-snapshot|ci-compliance) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|section|knowledge|qualification)."');
+    expect(content).toContain('problem-model|gap|message|compute-sweeps|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|section|knowledge|qualification)."');
   });
 
   it('different subsets bake different verb vocabularies (design-doc subset)', () => {
     writeFetchHelper('t', 'proj-3', testWorkspace, { verbs: DESIGN_DOC_FETCH_VERBS });
     const content = readFetch();
-    expect(content).toContain('direction)  PATH_SUFFIX="directions/$ID"');
+    // direction uses ${ID:+/$ID}; message uses messages/${ID:-open}: both give a
+    // compact listing when called without an id.
+    expect(content).toContain('direction)  PATH_SUFFIX="directions${ID:+/$ID}"');
     expect(content).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
     expect(content).toContain('playbook)   PATH_SUFFIX="playbook/$ID"');
     expect(content).toContain('gap)        PATH_SUFFIX="gaps/$ID"');
-    expect(content).toContain('message)    PATH_SUFFIX="messages/$ID"');
+    expect(content).toContain('message)    PATH_SUFFIX="messages/${ID:-open}"');
     expect(content).toContain('Usage: fetch direction|playbook|gap|message|section|knowledge [id]');
     // problem-model and qualification are rejected here because they are not part of the design-doc subset.
-    expect(content).toContain('problem-model|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|gap|message|section|knowledge)."');
+    expect(content).toContain('problem-model|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|gap|message|section|knowledge)."');
   });
 
   it('bakes the project id and escapes shell-injection attempts', () => {
@@ -493,7 +590,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).not.toContain('  knowledge)\n    shift');
     expect(content).toContain('not permitted in this workspace');
     // The reject branch enumerates knowledge among the disallowed verbs.
-    expect(content).toMatch(/knowledge\|compute-sweeps\|qualification\|version-phase\|vm-cost\|efficiency-snapshot\|ci-compliance\) echo "Error: \.\/fetch/);
+    expect(content).toMatch(/knowledge\|compute-sweeps\|qualification\|version-phase\|vm-cost\|efficiency-snapshot\|ci-compliance\|capability-trials\|sections\|task\|tasks\) echo "Error: \.\/fetch/);
   });
 
   it('ci-compliance is rejected in non-strategic subsets with a clear not-permitted message', () => {
@@ -507,7 +604,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).toContain('not permitted in this workspace');
     expect(content).toContain('ci-compliance');
     // It is listed among the rejected verbs (not the allowed list).
-    expect(content).toContain('playbook|message|section|compute-sweeps|version-phase|vm-cost|efficiency-snapshot|ci-compliance) echo "Error: ./fetch');
+    expect(content).toContain('playbook|message|section|compute-sweeps|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks) echo "Error: ./fetch');
   });
 });
 
@@ -515,7 +612,8 @@ describe('buildFetchGuidance', () => {
   it('lists ONLY the granted verbs and advertises ./fetch', () => {
     const block = buildFetchGuidance(RESEARCH_FETCH_VERBS);
     expect(block).toContain('./fetch');
-    expect(block).toContain('`./fetch direction <id>`');
+    // direction now uses [id] (optional) — compact list when id omitted.
+    expect(block).toContain('`./fetch direction [id]`');
     expect(block).toContain('`./fetch problem-model`');
     expect(block).toContain('`./fetch gap <id>`');
     // Verbs not granted to research are absent from the guidance.
@@ -525,11 +623,12 @@ describe('buildFetchGuidance', () => {
 
   it('lists the architecture-focused design-doc verbs', () => {
     const block = buildFetchGuidance(DESIGN_DOC_FETCH_VERBS);
-    expect(block).toContain('`./fetch direction <id>`');
+    // direction and message now use [id]/[ref] (optional) — compact list when omitted.
+    expect(block).toContain('`./fetch direction [id]`');
     expect(block).toContain('`./fetch section <key>`');
     expect(block).toContain('`./fetch playbook <key>`');
     expect(block).toContain('`./fetch gap <id>`');
-    expect(block).toContain('`./fetch message <ref>`');
+    expect(block).toContain('`./fetch message [ref]`');
     expect(block).not.toContain('`./fetch problem-model`');
   });
 
@@ -557,6 +656,27 @@ describe('buildFetchGuidance', () => {
 
   it('returns empty string when no verbs are granted', () => {
     expect(buildFetchGuidance([])).toBe('');
+  });
+});
+
+describe('renderStrategicFetchVerbHelpLines', () => {
+  it('lists every verb in STRATEGIC_FETCH_VERBS with its description', () => {
+    const lines = renderStrategicFetchVerbHelpLines();
+    expect(lines).toHaveLength(STRATEGIC_FETCH_VERBS.length);
+    for (const verb of STRATEGIC_FETCH_VERBS) {
+      const match = lines.find(l => l.includes(`./fetch ${verb}`));
+      expect(match, `expected a line advertising ./fetch ${verb}`).toBeDefined();
+    }
+  });
+
+  it('includes the previously-omitted verbs', () => {
+    const joined = renderStrategicFetchVerbHelpLines().join('\n');
+    expect(joined).toContain('./fetch efficiency-snapshot');
+    expect(joined).toContain('./fetch ci-compliance');
+    expect(joined).toContain('./fetch qualification');
+    expect(joined).toContain('./fetch compute-sweeps');
+    expect(joined).toContain('./fetch vm-cost');
+    expect(joined).toContain('./fetch knowledge');
   });
 });
 
@@ -1040,5 +1160,150 @@ describe('buildStrategicChallengeExecutorSection (retirement gate)', () => {
     });
     expect(section).toContain('approving NOTHING');
     expect(section).toContain('(none — no retirement was approved this cycle)');
+  });
+});
+
+// ── Shared _post_with_retry function across all write helpers ─────────────────
+// These tests verify that the bounded 429/5xx retry logic with Retry-After
+// honoring is present in ALL generated write-capable helper scripts.
+describe('shared _post_with_retry retry logic across all write helpers', () => {
+  const ws = path.join(os.tmpdir(), 'test-shared-retry-workspace');
+
+  beforeEach(() => {
+    if (!fs.existsSync(ws)) fs.mkdirSync(ws, { recursive: true });
+  });
+  afterEach(() => {
+    if (fs.existsSync(ws)) {
+      try { fs.rmSync(ws, { recursive: true }); } catch { /* ignore */ }
+    }
+  });
+
+  // Helper: verify the _post_with_retry function is present in a script and has
+  // the correct retry structure: 429, 5xx, Retry-After, max=4, 5s/15s/30s backoff.
+  function assertRetryPresent(script: string, label: string): void {
+    // Shared function signature
+    expect(script, `${label}: missing _post_with_retry function`).toContain('_post_with_retry()');
+    // max=4 attempts (3 retry slots + initial)
+    expect(script, `${label}: expected max=4`).toContain('max=4');
+    // Retry on 429 (lock contention) and 5xx (transient)
+    expect(script, `${label}: missing 429 retry`).toContain('"$http_code" = "429"');
+    expect(script, `${label}: missing 5xx retry`).toContain('"$http_code" -ge 500');
+    // Retry-After header honored
+    expect(script, `${label}: missing dump file for Retry-After`).toContain('-D "$dump"');
+    expect(script, `${label}: missing retry-after header parse`).toContain("grep -i '^retry-after:'");
+    expect(script, `${label}: missing sleep "$delay"`).toContain('sleep "$delay"');
+    // Backoff schedule: 5s/15s/30s (not attempt*2)
+    expect(script, `${label}: missing 5s backoff`).toContain('delay=5');
+    expect(script, `${label}: missing 15s backoff`).toContain('delay=15');
+    expect(script, `${label}: missing 30s backoff`).toContain('delay=30');
+    // Auth retry: re-reads token on 401/403
+    expect(script, `${label}: missing auth retry`).toContain('_load_agent_token || return 1');
+    // Passes bash -n syntax check
+    const tmpFile = path.join(os.tmpdir(), `retry_check_${Date.now()}.sh`);
+    fs.writeFileSync(tmpFile, script);
+    try {
+      expect(() => execFileSync('bash', ['-n', tmpFile], { stdio: 'pipe' }), `${label}: bash -n failed`).not.toThrow();
+    } finally {
+      try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+    }
+  }
+
+  it('./messages send/resolve use _post_with_retry (not a bare curl)', () => {
+    writeMessagesHelper('t-retry', ws);
+    const script = fs.readFileSync(`${ws}/messages`, 'utf-8');
+    assertRetryPresent(script, 'messages');
+    // Both send and resolve route through the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/strategic" "messages $OP"');
+    // No bare curl with -f (fail-fast) in the write path.
+    expect(script).not.toContain('curl -f');
+  });
+
+  it('./playbook set uses _post_with_retry (not a bare curl)', () => {
+    writePlaybookHelper('t-retry', ws);
+    const script = fs.readFileSync(`${ws}/playbook`, 'utf-8');
+    assertRetryPresent(script, 'playbook');
+    // The set write op routes through the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/playbook" "playbook set"');
+    // Read ops (get/list) remain fail-fast (no retry wrapper).
+    expect(script).toContain('curl -f -sS');
+  });
+
+  it('./design-doc set/delete use _post_with_retry (not a bare curl)', () => {
+    writeDesignDocHelper('t-retry', ws);
+    const script = fs.readFileSync(`${ws}/design-doc`, 'utf-8');
+    assertRetryPresent(script, 'design-doc');
+    // set and delete route through the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/design-doc" "design-doc set"');
+    expect(script).toContain('_post_with_retry "$API/api/agent/design-doc" "design-doc delete"');
+    // Read ops (get/list) remain fail-fast via _post_once.
+    expect(script).toContain('_post_once()');
+  });
+
+  it('./note uses _post_with_retry (not a bare curl)', () => {
+    provisionAmbientHelpers('t-retry', ws);
+    const script = fs.readFileSync(`${ws}/note`, 'utf-8');
+    assertRetryPresent(script, 'note');
+    // The annotation POST routes through the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/annotate" "note $TYPE"');
+    // No bare curl with -f in the write path.
+    expect(script).not.toContain('curl -f');
+  });
+
+  it('429 without Retry-After uses the 5s/15s/30s schedule (not attempt*2)', () => {
+    // The previous backoff was attempt*2 (2s, 4s, 6s). The new schedule is 5s/15s/30s.
+    // Verify that ALL write helpers use the new schedule and none use attempt*2.
+    writeMessagesHelper('t-backoff', ws);
+    const messages = fs.readFileSync(`${ws}/messages`, 'utf-8');
+    expect(messages).not.toContain('delay=$((attempt * 2))');
+    expect(messages).toContain('delay=5');
+    expect(messages).toContain('delay=15');
+    expect(messages).toContain('delay=30');
+
+    writePlaybookHelper('t-backoff', ws);
+    const playbook = fs.readFileSync(`${ws}/playbook`, 'utf-8');
+    expect(playbook).not.toContain('delay=$((attempt * 2))');
+    expect(playbook).toContain('delay=5');
+    expect(playbook).toContain('delay=15');
+    expect(playbook).toContain('delay=30');
+
+    writeDesignDocHelper('t-backoff', ws);
+    const designDoc = fs.readFileSync(`${ws}/design-doc`, 'utf-8');
+    expect(designDoc).not.toContain('delay=$((attempt * 2))');
+    expect(designDoc).toContain('delay=5');
+    expect(designDoc).toContain('delay=15');
+    expect(designDoc).toContain('delay=30');
+
+    provisionAmbientHelpers('t-backoff', ws);
+    const note = fs.readFileSync(`${ws}/note`, 'utf-8');
+    expect(note).not.toContain('delay=$((attempt * 2))');
+    expect(note).toContain('delay=5');
+    expect(note).toContain('delay=15');
+    expect(note).toContain('delay=30');
+  });
+
+  it('429 with Retry-After: the header value takes priority over the default backoff', () => {
+    // Every write helper must honor a Retry-After header by reading the dump file
+    // and using it as the sleep duration, overriding the default 5s/15s/30s schedule.
+    writeMessagesHelper('t-retry-after', ws);
+    const script = fs.readFileSync(`${ws}/messages`, 'utf-8');
+    // Header is captured to a dump file each attempt.
+    expect(script).toContain('dump=$(mktemp)');
+    expect(script).toContain('-D "$dump"');
+    // Retry-After is extracted from the dump (case-insensitive).
+    expect(script).toContain("grep -i '^retry-after:'");
+    // If delay is non-empty (from Retry-After), it skips the default schedule.
+    expect(script).toContain('if [ -z "$delay" ]');
+    // Sleep uses the extracted/computed delay.
+    expect(script).toContain('sleep "$delay"');
+  });
+
+  it('read-only design-doc workspace does not get the retry function', () => {
+    writeDesignDocHelper('t-ro', ws, { readOnly: true });
+    const script = fs.readFileSync(`${ws}/design-doc`, 'utf-8');
+    // Read-only mode must NOT include the write retry path.
+    expect(script).not.toContain('_post_with_retry');
+    expect(script).not.toContain('delay=5');
+    // But it still has the fail-fast read helper.
+    expect(script).toContain('_post_once()');
   });
 });

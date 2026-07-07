@@ -5,6 +5,7 @@ import { excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted, DEF
 import { extractJsonObject } from '../json-extract.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import { agentTokenShellFn } from '../token-file.js';
+import { cliOps } from './strategic-ops-registry.js';
 
 // Strategic shell-helper generators
 // Generates three independent bash scripts for strategic-mode task execution:
@@ -12,12 +13,48 @@ import { agentTokenShellFn } from '../token-file.js';
 // - fetch: detail-pull for items trimmed by the packer
 // - design-doc: CRUD operations for design document sections
 
+// Case arms for CLI ops that need a body beyond the default `_call "<op>"`,
+// keyed by the backend op name. set_running_update reads a markdown FILE path
+// and wraps its contents as {markdown: "..."} before the usual POST. Kept here
+// (not in the pure registry) so the registry stays plain metadata and the
+// shared manifest carries no bash. The value is the FULL case arm (label + body
+// + `;;`); ops absent here render the uniform default arm.
+const SPECIAL_CLI_CASE_BODIES: Record<string, string> = {
+  set_running_update: `  set-running-update)
+    # DATA is a path to the markdown file written by the Thinker. Wrap
+    # the file contents as {markdown: "..."} before the usual body build.
+    FILE="$DATA"
+    [ -f "$FILE" ] || { echo "[ERROR] set-running-update: file not found: $FILE" >&2; exit 1; }
+    DATA=$(jq -Rs '{markdown: .}' < "$FILE")
+    _call "set_running_update"
+    ;;`,
+};
+
+// Render the `./strategic` CLI's usage alias list and case body from the single
+// canonical registry (strategic-ops-registry.ts) so neither can drift from the
+// backend dispatch chain. Every CLI-flagged op becomes a `<alias>) _call "<op>"`
+// arm (or its SPECIAL_CLI_CASE_BODIES override); the usage string lists the same
+// aliases in the same order.
+function renderStrategicUsageAliases(): string {
+  return cliOps().map(e => e.alias).join('|');
+}
+
+function renderStrategicCaseBody(): string {
+  return cliOps()
+    .map(e => SPECIAL_CLI_CASE_BODIES[e.op] ?? `  ${e.alias}) _call "${e.op}" ;;`)
+    .join('\n');
+}
+
 function generateStrategicScript(taskIdRaw: string): string {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
+  const usageAliases = renderStrategicUsageAliases();
+  const caseBody = renderStrategicCaseBody();
   return `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
-OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|stage-direction|approve-direction|reject-direction|create-message|resolve-message|spawn-task|spawn-fix|set-retirement-critiques|set-evidence-progress|set-acceptance-criteria <json-or-file>}"
+# The op vocabulary below is DERIVED from the canonical registry
+# (strategic-ops-registry.ts) — do not hand-edit the case/usage list.
+OP="\${1:?Usage: strategic ${usageAliases} <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
@@ -26,24 +63,25 @@ TASK="${taskId}"
 DATA="$1"
 
 _call() {
-  local attempt=0 saw_auth=0
-  while [ $attempt -lt 3 ]; do
+  local attempt=0 saw_auth=0 max=3 delay http_code body dump response
+  while [ $attempt -lt $max ]; do
     # Re-read the live token each attempt so a token that rotated between tries
     # (the agent refreshes at ~45min) is picked up — the resident-session
     # write-token-expiry fix.
     _load_agent_token || return 1
-    local response
+    dump=$(mktemp)
     response=$(printf '{"task_id":"%s","op":"%s","data":%s}' "$TASK" "$1" "$DATA" | \\
       curl -sS --max-time 30 --connect-timeout 10 \\
         -X POST "$API/api/agent/strategic" \\
         -H "Content-Type: application/json" \\
         -H "X-Agent-Token: $TOKEN" \\
         --data-binary @- \\
+        -D "$dump" \\
         -w '\\n%{http_code}')
-    local http_code
     http_code=$(printf '%s' "$response" | tail -n1)
-    local body
     body=$(printf '%s' "$response" | head -n -1)
+    delay=$(grep -i '^retry-after:' "$dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
+    rm -f "$dump"
     if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
       printf '%s' "$body"
       return 0
@@ -53,47 +91,36 @@ _call() {
       echo "[CONSTRAINT] $1 rejected (HTTP 409)" >&2
       return 0
     fi
-    if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+    attempt=$((attempt + 1))
+    if [ $attempt -ge $max ]; then break; fi
+    # curl emits http_code "000" on a transport-level failure (connect timeout,
+    # DNS failure, TLS handshake, dropped connection) — no HTTP response at all.
+    # Treat it as a transient failure and retry alongside 429/5xx so a network
+    # blip (or a token-budget hiccup) is not booked as a permanent failure.
+    if [ "$http_code" = "000" ] || [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
+      [ -z "$delay" ] && delay=$((attempt * 2))
+      echo "[RETRY $attempt/$((max - 1))] $1 failed (HTTP $http_code), retrying in \${delay}s..." >&2
+      sleep "$delay"
+    elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
       saw_auth=1
       echo "[AUTH] $1 rejected (HTTP $http_code) — re-reading rotated agent token and retrying" >&2
+      sleep 1
+    else
+      printf '%s' "$body" >&2
+      echo "[ERROR] $1 failed (HTTP $http_code, non-retryable)" >&2
+      return 1
     fi
-    attempt=$((attempt + 1))
-    [ $attempt -lt 3 ] && echo "[RETRY $attempt/3] $1 failed (HTTP $http_code), retrying in 5s..." >&2 && sleep 5
   done
-  if [ "$saw_auth" -eq 1 ]; then
+  if [ "$saw_auth" -eq 1 ] && { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; }; then
     echo "[ERROR] $1 failed: agent token expired and no refreshed token was available after 3 attempts. The resident session must be restarted (agent JWT TTL is 1h and the agent's proactive refresh appears wedged)." >&2
   else
-    echo "[ERROR] $1 failed after 3 attempts" >&2
+    echo "[ERROR] $1 failed after $max attempts (HTTP $http_code)" >&2
   fi
   return 1
 }
 
 case "$OP" in
-  set-problem-model)    _call "set_problem_model" ;;
-  set-running-update)
-    # DATA is a path to the markdown file written by the Thinker. Wrap
-    # the file contents as {markdown: "..."} before the usual body build.
-    FILE="$DATA"
-    [ -f "$FILE" ] || { echo "[ERROR] set-running-update: file not found: $FILE" >&2; exit 1; }
-    DATA=$(jq -Rs '{markdown: .}' < "$FILE")
-    _call "set_running_update"
-    ;;
-  reflect)              _call "reflect" ;;
-  pending-confirm)      _call "pending_confirm" ;;
-  set-vision)           _call "set_vision" ;;
-  create-direction)     _call "create_direction" ;;
-  update-direction)     _call "update_direction" ;;
-  retire-direction)     _call "retire_direction" ;;
-  stage-direction)      _call "stage_direction" ;;
-  approve-direction)    _call "approve_direction" ;;
-  reject-direction)     _call "reject_direction" ;;
-  create-message)            _call "create_message" ;;
-  resolve-message)           _call "resolve_message" ;;
-  spawn-task)                _call "spawn_task" ;;
-  spawn-fix)                 _call "spawn_fix" ;;
-  set-retirement-critiques)  _call "set_retirement_critiques" ;;
-  set-evidence-progress)     _call "set_evidence_progress" ;;
-  set-acceptance-criteria)   _call "set_acceptance_criteria" ;;
+${caseBody}
   *) echo "Unknown op: $OP" >&2; exit 1 ;;
 esac
 echo ""
@@ -104,13 +131,13 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'capability-trials' | 'sections' | 'task' | 'tasks';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
 // distinct from the single-id project-path verbs that precede it.
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'capability-trials', 'sections', 'task', 'tasks',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -129,10 +156,10 @@ export const DESIGN_DOC_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'pla
 // query filters, no project path) and gets a self-contained arm below.
 const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'problem-model': 'problem-model) PATH_SUFFIX="problem-model"',
-  'direction':     'direction)  PATH_SUFFIX="directions/$ID"',
+  'direction':     'direction)  PATH_SUFFIX="directions${ID:+/$ID}"',
   'playbook':      'playbook)   PATH_SUFFIX="playbook/$ID"',
   'gap':           'gap)        PATH_SUFFIX="gaps/$ID"',
-  'message':       'message)    PATH_SUFFIX="messages/$ID"',
+  'message':       'message)    PATH_SUFFIX="messages/${ID:-open}"',
   'section':       'section)    PATH_SUFFIX="design-doc/$ID"',
   'compute-sweeps': 'compute-sweeps) PATH_SUFFIX="compute-sweeps${ID:+/$ID}"',
   'qualification': 'qualification) PATH_SUFFIX="qualification"',
@@ -140,6 +167,10 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'vm-cost':            'vm-cost)              PATH_SUFFIX="vm-cost"',
   'efficiency-snapshot': 'efficiency-snapshot)  PATH_SUFFIX="efficiency-snapshot"',
   'ci-compliance':       'ci-compliance)        PATH_SUFFIX="ci-compliance"',
+  'capability-trials':   'capability-trials)    PATH_SUFFIX="capability-trials"',
+  'sections':            'sections)             PATH_SUFFIX="sections/$ID"',
+  'task':                'task)                 PATH_SUFFIX="tasks/$ID"',
+  'tasks':               'tasks)                PATH_SUFFIX="tasks"',
 };
 
 // Self-contained case arm for the SEARCH-shaped `knowledge` verb. Unlike the
@@ -181,12 +212,12 @@ const KNOWLEDGE_FETCH_CASE = `  knowledge)
     ;;`;
 
 // One-line description of what each verb resolves, for the prompt guidance block.
-const FETCH_VERB_HELP: Record<FetchVerb, string> = {
+export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'problem-model': '`./fetch problem-model` — the full current problem model (no id)',
-  'direction':     '`./fetch direction <id>` — full detail for a direction',
+  'direction':     '`./fetch direction [id]` — compact listing of all directions (no id), or full detail for one direction by id',
   'playbook':      '`./fetch playbook <key>` — a full playbook entry',
   'gap':           '`./fetch gap <id>` — a full gap record',
-  'message':       '`./fetch message <ref>` — an operator message (short ref or UUID)',
+  'message':       '`./fetch message [ref]` — compact listing of open messages (no id), or full detail for one message by short ref or UUID',
   'section':       '`./fetch section <key>` — a full design-doc section',
   'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--sweep-id S] [--tag T]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body',
   'compute-sweeps': '`./fetch compute-sweeps [sweep_id]` — list completed compute experiment sweeps, or fetch one sweep by id',
@@ -195,6 +226,10 @@ const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'vm-cost':            '`./fetch vm-cost` — live VM cost by task type: cost_usd, task/VM count, merged count, and merge-yield per type over the last 7 days (no id)',
   'efficiency-snapshot': '`./fetch efficiency-snapshot` — current efficiency metrics: cost_per_merged_pr, vm_reuse_rate, llm_cost_per_merged_pr, and format_compliance over the last 7 days (no id)',
   'ci-compliance':       '`./fetch ci-compliance` — CI compliance status for the current integration branch HEAD: module-size breaches and branch-literal violations (no id)',
+  'capability-trials':   '`./fetch capability-trials` — capability-trial verdicts keyed by cap_name: verdict, lift, n_with/n_without, and accrual projection (no id)',
+  'sections':            '`./fetch sections <name>` — freshly-built payload section by name (self_reflection_log, anomaly_summary, playbook_summary, retired_directions_summary, rejected_proposals, past_retirement_critiques, previous_decision_outcomes, outcome_evaluation); use when that section was dropped under budget pressure',
+  'task':                '`./fetch task <task_id>` — status and outcome for a single task by id; visible for any STRATEGIC_AGENT-spawned task or its transitive descendants (fields: id, parent_task_id, status, created_at, progress message, pr_url/failure_reason for terminal tasks); includes a `children` list of direct pipeline-spawned subtasks with their own status/task_type/title/pr_url',
+  'tasks':               '`./fetch tasks` — list of recent tasks for this project (most recent first, default limit 20); includes STRATEGIC_AGENT-spawned tasks AND their transitive descendants; each item carries parent_task_id (null for strategist roots) to map failing descendants back to the spawned task, plus a `children` list of direct pipeline-spawned subtasks',
 };
 
 function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
@@ -239,7 +274,7 @@ case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi
@@ -323,6 +358,15 @@ ${lines}
 `;
 }
 
+// Returns the full STRATEGIC_FETCH_VERBS set as an array of one-line
+// description strings (the FETCH_VERB_HELP values in canonical order).
+// Consumed by strategic.ts to render both the packer-meta recovery bullet list
+// and the executor tools reference block from a single canonical source, so
+// neither list can drift from the provisioned verb set.
+export function renderStrategicFetchVerbHelpLines(): string[] {
+  return STRATEGIC_FETCH_VERBS.map(v => FETCH_VERB_HELP[v]);
+}
+
 // ── Strategic judgment challenge (independent adversarial second opinion) ────
 //
 // The strategic loop's self-produced judgments — evidence_progress ratings
@@ -374,6 +418,7 @@ const _PORTFOLIO_OP_ALIASES: Record<string, string> = {
   stage: 'stage_direction',
   approve: 'approve_direction',
   reject: 'reject_direction',
+  activate: 'activate_direction',
 };
 const _VALID_PORTFOLIO_OPS = new Set<string>(Object.values(_PORTFOLIO_OP_ALIASES));
 const _VALID_PORTFOLIO_VERDICTS = new Set<string>(['approved', 'rejected', 'warned', 'uncertain']);
@@ -386,6 +431,7 @@ const _HARD_BLOCK_PORTFOLIO_OPS = new Set<string>([
   'stage_direction',
   'approve_direction',
   'reject_direction',
+  'activate_direction',
 ]);
 
 export interface ChallengePortfolioOperationVerdict {
@@ -650,7 +696,7 @@ You are an INDEPENDENT adversarial reviewer. A strategist ("thinker") just produ
 2. **retirement_approvals** — for EVERY direction the thinker proposes to retire, judge whether the retirement reasoning names a real, evidenced pattern (approve) or is shallow/boilerplate/unsupported (reject). When in doubt, REJECT — approving an unsupported retirement is the costly error. If the thinker proposes no retirements, emit an empty array.
 3. **retirement_critique_quality** — whether the thinker's retirement critiques name a real pattern + lesson (solid) or are shallow/boilerplate.
 4. **portfolio_shape_risk** — whether the resulting active-direction portfolio is over-concentrated, has coverage gaps, or is over capacity.
-5. **portfolio_operations** — each concrete portfolio MUTATION the thinker proposed: create / update / retire / stage / approve / reject of a direction. Judge each one and its NET effect on the active portfolio (capacity, concentration, fan-out, coverage). Be STRICT on destructive or fan-out-sensitive moves: REJECT a retire / stage / approve / reject / lane-removing update when the analysis does NOT present a real, evidenced reason. A create can also be rejected when it is genuinely unsafe to commit. Use "warned"/"uncertain" for advisory, subjective concerns that should NOT block; reserve "rejected" for moves that are genuinely unsafe to commit.
+5. **portfolio_operations** — each concrete portfolio MUTATION the thinker proposed: create / update / retire / stage / approve / reject / activate of a direction. Judge each one and its NET effect on the active portfolio (capacity, concentration, fan-out, coverage). Be STRICT on destructive or fan-out-sensitive moves: REJECT a retire / stage / approve / reject / activate / lane-removing update when the analysis does NOT present a real, evidenced reason. A create can also be rejected when it is genuinely unsafe to commit. Use "warned"/"uncertain" for advisory, subjective concerns that should NOT block; reserve "rejected" for moves that are genuinely unsafe to commit.
 
 You do NOT commit anything. You ONLY emit a verdict record. Be terse and skeptical.
 
@@ -672,14 +718,14 @@ Output ONLY a single JSON object — no markdown, no code fences, no preamble �
   "retirement_critique_quality": {"verdict": "solid|shallow|not_assessed", "rationale": "one line"},
   "portfolio_shape_risk": {"verdict": "low|elevated|high", "rationale": "one line"},
   "portfolio_operations": [
-    {"op": "create_direction|update_direction|retire_direction|stage_direction|approve_direction|reject_direction", "direction_id": "d-xxx", "text": "<proposed text — creates only>", "verdict": "approved|warned|uncertain|rejected", "rationale": "one line"}
+    {"op": "create_direction|update_direction|retire_direction|stage_direction|approve_direction|reject_direction|activate_direction", "direction_id": "d-xxx", "text": "<proposed text — creates only>", "verdict": "approved|warned|uncertain|rejected", "rationale": "one line"}
   ]
 }
 Rules:
 - Add an evidence_progress entry for EVERY direction the thinker rated advancing or met (verdict "approved" only with concrete evidence, otherwise "rejected"). Directions the thinker called stalled need no entry — stalled is advisory and never gated. If the thinker rated none, emit an empty array.
 - Add a retirement_approvals entry for EVERY direction the thinker proposes to retire (verdict "approved" only when the reasoning names a real evidenced pattern, otherwise "rejected"). When in doubt, REJECT. If the thinker proposes no retirements, emit an empty array.
 - "retirement_critique_quality" and "portfolio_shape_risk" are REQUIRED keys even when there is little to say.
-- Add a portfolio_operations entry for EVERY concrete create/update/retire/stage/approve/reject the thinker proposed. For ops on an existing direction set "direction_id" (its id); for a create set "text" to the proposed direction text (omit/empty "direction_id"). A NEW direction the thinker proposes to STAGE for the next version is op "create_direction" (set "text", no "direction_id") — it executes as a staged create; "stage_direction" is only for an EXISTING direction (set "direction_id"). Use "rejected" ONLY for destructive/fan-out-sensitive moves that are unsafe to commit; "warned"/"uncertain" for advisory subjective concerns; "approved" for clean moves.
+- Add a portfolio_operations entry for EVERY concrete create/update/retire/stage/approve/reject/activate the thinker proposed. For ops on an existing direction set "direction_id" (its id); for a create set "text" to the proposed direction text (omit/empty "direction_id"). A NEW direction the thinker proposes to STAGE for the next version is op "create_direction" (set "text", no "direction_id") — it executes as a staged create; "stage_direction" is only for an EXISTING direction (set "direction_id"). Use "rejected" ONLY for destructive/fan-out-sensitive moves that are unsafe to commit; "warned"/"uncertain" for advisory subjective concerns; "approved" for clean moves.
 - Output the JSON object and nothing else.`;
 }
 

@@ -87,6 +87,53 @@ def _record_crash_and_count(
     return len(crash_timestamps[name])
 
 
+async def _emit_crash_alert(
+    session_factory,
+    name: str,
+    cause_str: str,
+) -> int:
+    """Emit a deduped ``AlertSeverity.ERROR`` per-crash Alert for every project.
+
+    Uses a single batched query to check for existing open alerts rather than
+    one query per project. Returns the number of Alert rows actually created.
+    """
+    alert_title = f"Background service crashed: {name}"
+    async with session_factory() as alert_session:
+        project_ids = (
+            (await alert_session.execute(select(Project.id))).scalars().all()
+        )
+        if not project_ids:
+            return 0
+        already_alerted = set(
+            (
+                await alert_session.execute(
+                    select(Alert.project_id).where(
+                        Alert.project_id.in_(project_ids),
+                        Alert.title == alert_title,
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        created = 0
+        for project_id in project_ids:
+            if project_id in already_alerted:
+                continue
+            alert_session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.ERROR,
+                    title=alert_title,
+                    message=f"Background service '{name}' crashed with: {cause_str[:300]}. Auto-restarting with backoff.",
+                )
+            )
+            created += 1
+        await alert_session.commit()
+    return created
+
+
 async def _emit_crash_episode_alert(
     session_factory,
     name: str,
@@ -189,6 +236,96 @@ async def _seed_initial_admin():
                 logger.warning(
                     "[STARTUP] AllowedUser table is empty and INITIAL_ADMIN_EMAIL not set. No users can sign in."
                 )
+
+
+async def _seed_completion_debt_inventory():
+    """Seed the completion-debt ledger from the HEAD dormant-state inventory.
+
+    Best-effort and idempotent (dedupe_key upserts): a seed failure must never
+    abort startup, and repeated restarts never create duplicate rows.
+    """
+    try:
+        from app.completion_debt import aseed_completion_debt_inventory
+
+        async with AsyncSessionLocal() as seed_session:
+            created = await aseed_completion_debt_inventory(seed_session)
+            await seed_session.commit()
+        if created:
+            logger.info(
+                "[STARTUP] Seeded %d completion-debt inventory row(s)", created
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[STARTUP] completion-debt inventory seed failed (non-fatal)",
+            exc_info=True,
+        )
+
+
+async def _reconcile_dormant_knob_debts():
+    """Reconcile dormant-knob debts against the current runtime config.
+
+    Best-effort and idempotent: a reconciliation failure must never abort
+    startup, and repeated startup calls should converge to the same ledger
+    state even when knobs graduate outside the PATCH handler.
+    """
+    try:
+        from app.completion_debt import areconcile_dormant_knob_debts
+
+        async with AsyncSessionLocal() as seed_session:
+            stats = await areconcile_dormant_knob_debts(seed_session)
+            await seed_session.commit()
+        if stats["opened"] or stats["resolved"]:
+            logger.info(
+                "[STARTUP] Reconciled dormant-knob debts (opened=%d resolved=%d)",
+                stats["opened"],
+                stats["resolved"],
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[STARTUP] dormant-knob debt reconciliation failed (non-fatal)",
+            exc_info=True,
+        )
+
+
+async def _seed_completion_debt_design_doc():
+    """Seed the completion-debt design-doc section for all projects.
+
+    Best-effort and idempotent: a seed failure on one project must never block
+    startup or other projects. Repeated startup calls never duplicate or churn
+    code-authored sections.
+    """
+    try:
+        from app.completion_debt import seed_completion_debt_design_doc_section
+
+        async with AsyncSessionLocal() as seed_session:
+            project_ids = (
+                (await seed_session.execute(select(Project.id))).scalars().all()
+            )
+            seeded = 0
+            for project_id in project_ids:
+                try:
+                    if await seed_completion_debt_design_doc_section(
+                        seed_session, project_id
+                    ):
+                        seeded += 1
+                        await seed_session.commit()
+                except Exception:  # noqa: BLE001
+                    await seed_session.rollback()
+                    logger.warning(
+                        "[STARTUP] completion-debt design-doc seed failed for project %s (non-fatal)",
+                        project_id,
+                        exc_info=True,
+                    )
+            if seeded:
+                logger.info(
+                    "[STARTUP] Seeded completion-debt design-doc section for %d project(s)",
+                    seeded,
+                )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[STARTUP] completion-debt design-doc seed failed (non-fatal)",
+            exc_info=True,
+        )
 
 
 async def _leader_lock_keepalive_tick(leader_conn) -> str:
@@ -422,6 +559,18 @@ async def lifespan(app):
 
     # Check deployment state (detect new deploy, rollback, or normal restart)
     await _init_deployment_state()
+
+    # Seed the completion-debt ledger from the standing HEAD dormant-state
+    # inventory (idempotent: dedupe_key upserts, so restarts never duplicate).
+    await _seed_completion_debt_inventory()
+
+    # Reconcile dormant-knob debt rows against the current runtime config so
+    # env-var/redeploy graduations and live demotions converge immediately.
+    await _reconcile_dormant_knob_debts()
+
+    # Seed the completion-debt design-doc section for all projects (idempotent:
+    # absent sections are seeded, existing sections only refresh code fields).
+    await _seed_completion_debt_design_doc()
 
     # Log the resolved deploy-level identity so operators can confirm that
     # deploy-level serving confirmation (backend_revision, agent_image) is
@@ -1252,37 +1401,9 @@ async def lifespan(app):
                             )
                         )
                         try:
-                            async with AsyncSessionLocal() as alert_session:
-                                project_ids = (
-                                    (await alert_session.execute(select(Project.id)))
-                                    .scalars()
-                                    .all()
-                                )
-                                alert_title = f"Background service crashed: {name}"
-                                for project_id in project_ids:
-                                    existing = (
-                                        (
-                                            await alert_session.execute(
-                                                select(Alert).where(
-                                                    Alert.project_id == project_id,
-                                                    Alert.title == alert_title,
-                                                    Alert.dismissed_at.is_(None),
-                                                )
-                                            )
-                                        )
-                                        .scalars()
-                                        .first()
-                                    )
-                                    if existing:
-                                        continue
-                                    alert = Alert(
-                                        project_id=project_id,
-                                        severity=AlertSeverity.ERROR,
-                                        title=alert_title,
-                                        message=f"Background service '{name}' crashed with: {cause_str[:300]}. Auto-restarting with backoff.",
-                                    )
-                                    alert_session.add(alert)
-                                await alert_session.commit()
+                            await _emit_crash_alert(
+                                AsyncSessionLocal, name, cause_str
+                            )
                         except Exception as alert_exc:
                             logger.warning(
                                 f"[MONITOR] Failed to create crash alert: {alert_exc}"

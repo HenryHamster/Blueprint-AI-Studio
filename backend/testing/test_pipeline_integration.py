@@ -42,6 +42,10 @@ def _default_no_migration_pr(mocker):
     from unittest.mock import AsyncMock
 
     mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("ok", None)),
+    )
 
 
 def _naive_utcnow() -> datetime:

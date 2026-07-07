@@ -150,6 +150,8 @@ async def upsert_direction(
             )
         )
     ).scalar_one_or_none()
+    # Snapshot status before any mutation so the event trail sees the old value.
+    prior_status_snapshot = existing.status if existing is not None else None
     if existing is None:
         session.add(
             Direction(
@@ -166,6 +168,20 @@ async def upsert_direction(
         existing.text = promoted["text"]
         existing.updated_at = _utcnow()
         session.add(existing)
+    # Best-effort lifecycle event — prior_status_snapshot captures the old status
+    # before the mutation above so the helper sees the correct prior value.
+    try:
+        from app.direction_event_trail import maybe_record_direction_event
+        await maybe_record_direction_event(
+            session, pid, direction, existing,
+            prior_status_snapshot=prior_status_snapshot,
+        )
+    except Exception as _evt_exc:  # noqa: BLE001
+        logger.warning(
+            "[directions_repo] event trail write failed for %s: %s",
+            direction_key,
+            _evt_exc,
+        )
 
 
 async def sync_directions(
@@ -201,6 +217,31 @@ async def sync_directions(
     )
     stale = existing_keys - keys_in_blob
     if stale:
+        # Emit pruned events before hard-deleting so the event trail survives.
+        try:
+            from app.direction_event_trail import record_direction_pruned
+            stale_rows = (
+                (
+                    await session.execute(
+                        select(Direction).where(
+                            Direction.project_id == pid,
+                            Direction.direction_key.in_(stale),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for stale_row in stale_rows:
+                await record_direction_pruned(
+                    session, pid, stale_row.direction_key, dict(stale_row.data or {})
+                )
+        except Exception as _prune_exc:  # noqa: BLE001
+            logger.warning(
+                "[directions_repo] pruned event trail write failed for project %s: %s",
+                project_id,
+                _prune_exc,
+            )
         await session.execute(
             delete(Direction).where(
                 Direction.project_id == pid,
@@ -283,6 +324,7 @@ async def activate_eligible_staged_directions(
 
     activated: List[str] = []
     activated_meta: List[Dict[str, Any]] = []
+    activated_with_gaps: List[tuple] = []  # (direction_id, gap_id) for PM re-staffing
     now_iso = _utcnow().isoformat()
 
     def _mutate(directions: List[Dict[str, Any]]) -> None:
@@ -342,6 +384,8 @@ async def activate_eligible_staged_directions(
             did = d.get("id")
             if did:
                 activated.append(str(did))
+                if d.get("gap_id"):
+                    activated_with_gaps.append((str(did), str(d["gap_id"])))
             activated_meta.append(
                 {"id": str(did) if did else None, "text": d.get("text")}
             )
@@ -349,6 +393,47 @@ async def activate_eligible_staged_directions(
     applied = await with_directions_locked(session, project_id, _mutate)
     if not applied or not activated:
         return []
+    # Re-staff problem-model gaps for each activated direction in the SAME
+    # transaction (committed below). Mirrors create_direction's staffing:
+    # add direction_id to gap.active_moves and clear any GapDeferral.
+    if activated_with_gaps:
+        from app.problem_model import reconcile_gap_staffing_raw_result as _rcgs  # noqa: PLC0415
+        from app.task_locking import with_problem_model_locked as _wpm_locked  # noqa: PLC0415
+
+        def _restaff_pm(pm: dict) -> None:
+            current = dict(pm)
+            for _did, _gid in activated_with_gaps:
+                result = _rcgs(
+                    current,
+                    _did,
+                    _gid,
+                    None,
+                    new_status="active",
+                    prior_status="staged",
+                    now_iso=now_iso,
+                )
+                if result.get("problem_model") is not None:
+                    current = result["problem_model"]
+                details = result.get("result") or {}
+                if details.get("malformed_model") or details.get("unresolved_gap_ids"):
+                    logger.warning(
+                        "[directions_repo] staged-activation gap re-staffing "
+                        "classified drift for %s: %s",
+                        _did,
+                        details,
+                    )
+            pm.clear()
+            pm.update(current)
+
+        try:
+            await _wpm_locked(session, project_id, _restaff_pm)
+        except Exception as exc:  # noqa: BLE001 — re-staffing is best-effort
+            logger.warning(
+                "[directions_repo] staged-activation gap re-staffing failed for "
+                "project %s (activation will still commit): %s",
+                project_id,
+                exc,
+            )
     # Best-effort operator notification — posted into the SAME session so it
     # rides the commit below atomically with the activation notes. Wrapped in
     # its own try/except (log-and-swallow) so a notification failure can never

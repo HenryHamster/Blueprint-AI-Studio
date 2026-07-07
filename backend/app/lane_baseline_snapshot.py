@@ -95,6 +95,7 @@ _TASK_SNAPSHOT_COLUMNS = (
     Task.status,
     Task.created_at,
     Task.started_at,
+    Task.completed_at,
     Task.updated_at,
     Task.status_log,
     Task.payloads,

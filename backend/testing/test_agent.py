@@ -443,6 +443,70 @@ async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_ancestor_chain_fetched_in_single_query(
+    client: AsyncClient, db_session
+):
+    """Ancestor walk uses a recursive CTE — all levels are found in one round-trip.
+
+    Builds a grandparent -> parent -> task chain; the grandparent holds the
+    reservation. The claim must surface the reservation even though it is two
+    hops away, exercising that the CTE walks the full chain.
+    """
+    from app.models import MigrationReservation, MigrationReservationStatus
+
+    project = Project(name="Agent Claim Ancestor Chain", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    grandparent_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(grandparent_task)
+    await db_session.commit()
+    await db_session.refresh(grandparent_task)
+
+    reservation = MigrationReservation(
+        project_id=project.id,
+        task_id=grandparent_task.id,
+        provisional_revision="0301",
+        provisional_down_revision="0299",
+        status=MigrationReservationStatus.ACTIVE,
+    )
+    db_session.add(reservation)
+    await db_session.commit()
+
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan"}],
+        parent_task_id=grandparent_task.id,
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    leaf_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        parent_task_id=parent_task.id,
+        vm_instance_id="agent-vm-ancestor-chain",
+    )
+    db_session.add(leaf_task)
+    await db_session.commit()
+    await db_session.refresh(leaf_task)
+
+    token = create_agent_token(str(leaf_task.id), "agent-vm-ancestor-chain")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert resp.json()["migration_reservation"] == {
+        "provisional_revision": "0301",
+        "provisional_down_revision": "0299",
+    }
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_includes_compute_experiment_capability_slice(
     client: AsyncClient, db_session
 ):
@@ -2189,6 +2253,43 @@ async def test_agent_status_complete_with_artifacts_creates_artifact_record(
 
 
 @pytest.mark.asyncio
+async def test_terminal_status_transition_stamps_completed_at(
+    client: AsyncClient, db_session, mocker
+):
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Terminal Stamp Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "run"}],
+        vm_instance_id="agent-vm-terminal-stamp",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    before = _utcnow()
+    token = create_agent_token(str(task.id), "agent-vm-terminal-stamp")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED"},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.completed_at is not None
+    assert task.completed_at >= before
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_session):
     """
     Tests that the claim response includes project_metadata with build_config.
@@ -3101,6 +3202,201 @@ async def test_refresh_token_replaces_expiring_token(client: AsyncClient, db_ses
     assert heartbeat_resp.status_code == 200, (
         f"Refreshed token was rejected on the next request: {heartbeat_resp.text}"
     )
+
+
+@pytest.mark.asyncio
+async def test_git_read_token_returns_token(client: AsyncClient, db_session, mocker):
+    """GET /api/agent/git-read-token returns owner/repo/token for a valid task."""
+    project = Project(
+        name="Git Token Test",
+        user_id="test-user-123",
+        github_owner="testowner",
+        github_repo="testrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-git",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.github_auth.get_repo_installation_token",
+        return_value="ghs_test_installation_token",
+    )
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-git")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["token"] == "ghs_test_installation_token"
+    assert data["owner"] == "testowner"
+    assert data["repo"] == "testrepo"
+
+
+@pytest.mark.asyncio
+async def test_git_read_token_missing_github_repo(client: AsyncClient, db_session):
+    """GET /api/agent/git-read-token returns 422 when project has no GitHub repo."""
+    project = Project(name="No Repo", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-no-repo",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-no-repo")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["message"] == "project_has_no_github_repo"
+
+
+@pytest.mark.asyncio
+async def test_git_read_token_no_installation(client: AsyncClient, db_session, mocker):
+    """GET /api/agent/git-read-token returns 502 when GitHub App is not installed."""
+    project = Project(
+        name="No App",
+        user_id="test-user-123",
+        github_owner="testowner",
+        github_repo="testrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-no-app",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.github_auth.get_repo_installation_token",
+        return_value=None,
+    )
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-no-app")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["error"]["message"] == "github_token_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_git_read_token_rejects_inactive_status_task(
+    client: AsyncClient, db_session, mocker
+):
+    """git-read-token must reach authorization parity with /refresh-token: a
+    task in a non-terminal-but-non-active status (EVALUATING) passes
+    verify_agent_token (it is not in _AGENT_INACTIVE_TASK_STATUSES) but must NOT
+    be able to mint a fresh GitHub read token. Regression for the audit finding
+    that a stale-but-unexpired JWT for a requeued/finished task kept minting
+    read tokens until JWT expiry.
+    """
+    project = Project(
+        name="Git Token Stale Status",
+        user_id="test-user-123",
+        github_owner="testowner",
+        github_repo="testrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-git-stale",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # A token mint here would be the bug; assert we never reach the GitHub call.
+    gh_mock = mocker.patch(
+        "app.github_auth.get_repo_installation_token",
+        return_value="ghs_should_not_be_minted",
+    )
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-git-stale")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["message"].startswith("task_not_active")
+    gh_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_git_read_token_rejects_requeued_cleared_vm(
+    client: AsyncClient, db_session, mocker
+):
+    """git-read-token must reject a requeued task whose vm_instance_id was
+    cleared. verify_agent_token's mismatch guard short-circuits when
+    task.vm_instance_id is falsy, so this liveness gap is closed only by the
+    endpoint's own vm_instance_id match (parity with /refresh-token).
+    """
+    project = Project(
+        name="Git Token Requeued VM",
+        user_id="test-user-123",
+        github_owner="testowner",
+        github_repo="testrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    gh_mock = mocker.patch(
+        "app.github_auth.get_repo_installation_token",
+        return_value="ghs_should_not_be_minted",
+    )
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-git-requeued")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["message"] == "vm_instance_mismatch"
+    gh_mock.assert_not_called()
 
 
 def _agent_auth_body(endpoint: str, task_id: str, vm_instance_id: str) -> dict:
@@ -6017,6 +6313,66 @@ async def test_claim_caps_playbook_entries_for_create_tasks(
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_caps_playbook_by_bytes(
+    client: AsyncClient, db_session
+):
+    """Playbook byte cap (12,000 bytes) trims lowest-relevance tail entries even
+    when the entry-count cap would otherwise allow them through. Seeding 10
+    entries of ~1,500 chars each (~15,000 bytes total) into a create task
+    (entry cap = 12) verifies that the returned playbook stays under the byte
+    limit by dropping tail entries."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Playbook Byte Cap Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Each entry is ~1,500 chars; 10 entries = ~15,000 bytes, which exceeds the
+    # 12,000-byte cap. Entries are ranked by confirmed_count ascending so that
+    # higher-index entries are higher-relevance and sort to the front; the
+    # lowest-relevance tail (index 0, 1, ...) should be dropped.
+    large_content = "x" * 1500
+    design_doc = {}
+    for i in range(10):
+        design_doc[f"playbook/byte-entry-{i:02d}"] = {
+            "content": large_content,
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": i,
+            "reference_count": 1,
+        }
+    project.design_doc = design_doc
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Build X"}],
+        vm_instance_id="agent-vm-pbcap-bytes-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pbcap-bytes-test")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    playbook = resp.json().get("playbook", {})
+    # 12,000 bytes / 1,500 bytes per entry = 8 entries max
+    assert len(playbook) <= 8, (
+        f"byte cap should trim playbook to ≤8 entries, got {len(playbook)}"
+    )
+    total_bytes = sum(len(v.get("content", "")) for v in playbook.values())
+    assert total_bytes <= 12_000, (
+        f"total playbook content should be ≤12,000 bytes, got {total_bytes}"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_appends_recent_outcomes_on_reference(
     client: AsyncClient, db_session
 ):
@@ -6733,6 +7089,101 @@ async def test_claim_direction_context_absent_review_iteration_when_no_history(
     dc = resp.json()["direction_context"]
     assert "review_iteration_rolling_median" not in dc
     assert "review_iteration_last_cycle" not in dc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_recent_findings_evidence_in_direction_context(
+    client: AsyncClient, db_session
+):
+    """Claim surfaces direction.recent_findings_evidence under direction_context for create tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    evidence = [
+        {
+            "title": "Eliminate N+1 query in user loader",
+            "claims": ["loader issues 50 queries per request"],
+            "source_refs": ["backend/app/loaders.py:42"],
+        }
+    ]
+    project = Project(name="RFE Direction Context Test", user_id="test-user-rfe")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Optimize database access",
+            "priority": "high",
+            "research_context": "",
+            "research_history": [],
+            "recent_findings_evidence": evidence,
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Fix the N+1 query"}],
+        vm_instance_id="agent-vm-rfe-ctx",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rfe-ctx")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json()["direction_context"]
+    assert dc.get("recent_findings_evidence") == evidence, (
+        "claim response should surface direction.recent_findings_evidence in direction_context"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_omits_recent_findings_evidence_when_absent_or_non_list(
+    client: AsyncClient, db_session
+):
+    """direction_context omits recent_findings_evidence when the direction has none or a non-list value."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="RFE Absent Test", user_id="test-user-rfe-absent")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor auth",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [],
+            # No recent_findings_evidence key at all
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "Fix auth bug"}],
+        vm_instance_id="agent-vm-rfe-absent",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rfe-absent")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json()["direction_context"]
+    assert "recent_findings_evidence" not in dc, (
+        "direction_context should not include recent_findings_evidence when direction has none"
+    )
 
 
 @pytest.mark.smoketest
@@ -11857,7 +12308,8 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
 ):
     """
     When a task completes on first attempt and the project has playbook entries,
-    confirmed_count is incremented for entries applicable to that task type.
+    confirmed_count is incremented ONLY for entries actually shown to that task
+    (via _shown_playbook_keys). Type-matching entries not shown are not credited.
     Entries not applicable to the task type are NOT incremented.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
@@ -11870,6 +12322,13 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
             "source_task_id": None,
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 2,
+        },
+        "playbook/create-unshown": {
+            "content": "create guidance but not shown",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 5,
         },
         "playbook/review-only": {
             "content": "review guidance",
@@ -11889,6 +12348,7 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
         vm_instance_id="agent-vm-confirm-1",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
+        context={"_shown_playbook_keys": ["create-entry"]},
     )
     db_session.add(task)
     await db_session.commit()
@@ -11903,10 +12363,76 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
     assert resp.status_code == 200
 
     await db_session.refresh(project)
-    # create-entry is applicable to 'create' tasks — confirmed_count should be incremented
+    # create-entry was shown — confirmed_count should be incremented
     assert project.design_doc["playbook/create-entry"]["confirmed_count"] == 3
+    # create-unshown is type-applicable but NOT in _shown_playbook_keys — must not be credited
+    assert project.design_doc["playbook/create-unshown"]["confirmed_count"] == 5
     # review-only is NOT applicable to 'create' tasks — confirmed_count unchanged
     assert project.design_doc["playbook/review-only"]["confirmed_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_completion_persists_when_playbook_capture_hits_lock_timeout(
+    client: AsyncClient, db_session, mocker
+):
+    """Regression (DB-contention fix B): a first-attempt COMPLETED report must
+    persist the terminal status even when the best-effort playbook success-
+    pattern capture raises a DB lock error.
+
+    Prod chain being guarded: capture_success_pattern took a FOR UPDATE lock on
+    the Project row, hit the 30s lock_timeout (LockNotAvailableError), and its
+    except rolled the WHOLE request transaction back — dropping the pending
+    COMPLETED write, so the finished PR/commit was silently lost. Capture now
+    runs inside a nested SAVEPOINT, so its failure rolls back only the savepoint
+    and the completion still commits."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    class _FakeLockNotAvailableError(Exception):
+        sqlstate = "55P03"
+
+        def __str__(self):
+            return "canceling statement due to lock timeout"
+
+    capture_mock = mocker.patch(
+        "app.playbook_learning.capture_success_pattern",
+        new_callable=AsyncMock,
+        side_effect=_FakeLockNotAvailableError(),
+    )
+
+    project = Project(name="Capture Lock Timeout", user_id="test-user-capture-lock")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-capture-lock-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,  # first attempt → capture path is exercised
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    token = create_agent_token(str(task_id), "agent-vm-capture-lock-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task_id), "status": "COMPLETED", "logs": "done"},
+        headers={"x-agent-token": token},
+    )
+    # Capture failure is swallowed — the request must not 500.
+    assert resp.status_code == 200
+    # The guarded capture path was actually exercised.
+    assert capture_mock.await_count >= 1
+
+    # The terminal status must be durably committed despite the capture failure.
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED, (
+        "COMPLETED must persist even when playbook capture raises a DB lock "
+        f"error; got {task.status}"
+    )
 
 
 @pytest.mark.asyncio
@@ -11954,6 +12480,97 @@ async def test_playbook_confirmed_count_not_incremented_on_retry_success(
     await db_session.refresh(project)
     # attempt_count=2 → _first_attempt_succeeded=False → confirmed_count unchanged
     assert project.design_doc["playbook/some-entry"]["confirmed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_playbook_integrity_ignores_unshown_confirmations_and_dedupes_tombstones(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    Acceptance: playbook integrity accounting is tight on two axes:
+
+    1. confirmed_count credits ONLY entries present in _shown_playbook_keys — a
+       type-applicable entry that was NOT shown must remain at its prior count.
+    2. Operator-deletion tombstones are idempotent: calling record_playbook_tombstone
+       twice for the same key produces exactly one operator_deleted archive row and
+       one deleted_keys entry.
+    """
+    from app.playbook_storage import record_playbook_tombstone
+
+    # ── Part 1: shown-key gate on confirmed_count ──────────────────────────
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Playbook Integrity Test", user_id="test-user-integrity"
+    )
+    project.design_doc = {
+        "playbook/shown-entry": {
+            "content": "shown guidance",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+        },
+        "playbook/unshown-entry": {
+            "content": "unshown guidance",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 3,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "integrity check"}],
+        vm_instance_id="agent-vm-integrity-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        context={"_shown_playbook_keys": ["shown-entry"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-integrity-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "logs": "done"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    # shown-entry was in _shown_playbook_keys — must be credited
+    assert project.design_doc["playbook/shown-entry"]["confirmed_count"] == 2, (
+        "shown entry must be credited on first-attempt success"
+    )
+    # unshown-entry is type-applicable but NOT shown — must NOT be credited
+    assert project.design_doc["playbook/unshown-entry"]["confirmed_count"] == 3, (
+        "unshown type-applicable entry must not receive confirmation credit"
+    )
+
+    # ── Part 2: idempotent tombstone deduplication ─────────────────────────
+    doc: dict = {}
+    from app.time_utils import _utcnow  # noqa: PLC0415
+
+    now_iso = _utcnow().isoformat()
+    record_playbook_tombstone(doc, "playbook/tip", archived_at=now_iso)
+    record_playbook_tombstone(doc, "playbook/tip", archived_at=now_iso)
+
+    deleted_keys = doc["playbook_deleted_keys"]
+    assert deleted_keys == ["playbook/tip"], (
+        "deleted_keys must list 'playbook/tip' exactly once"
+    )
+    archive = doc["playbook_archive"]
+    assert len(archive) == 1, (
+        f"idempotent tombstone must produce exactly 1 archive row, got {len(archive)}"
+    )
+    assert archive[0]["_retirement_reason"] == "operator_deleted"
+    assert archive[0]["_archived_key"] == "playbook/tip"
 
 
 @pytest.mark.asyncio
@@ -18056,7 +18673,7 @@ async def test_claim_stamps_provision_slot_acquired_at_from_compute(
 
 @pytest.mark.asyncio
 async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_session):
-    """Heartbeat persists llm_call_count + token totals into Task.api_call_summary."""
+    """Heartbeat persists llm_call_count, num_turns, and token totals into Task.api_call_summary."""
     project = Project(name="API Call Summary", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
@@ -18079,6 +18696,7 @@ async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_sessi
         json={
             "task_id": str(task.id),
             "llm_call_count": 3,
+            "num_turns": 7,
             "total_input_tokens": 12345,
             "total_output_tokens": 678,
         },
@@ -18090,6 +18708,7 @@ async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_sessi
     summary = task.api_call_summary
     assert summary is not None
     assert summary["llm_call_count"] == 3
+    assert summary["num_turns"] == 7
     assert summary["total_input_tokens"] == 12345
     assert summary["total_output_tokens"] == 678
     assert "last_updated_at" in summary
@@ -18100,6 +18719,7 @@ async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_sessi
         json={
             "task_id": str(task.id),
             "llm_call_count": 5,
+            "num_turns": 11,
             "total_input_tokens": 20000,
             "total_output_tokens": 999,
         },
@@ -18108,6 +18728,7 @@ async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_sessi
     assert resp2.status_code == 200
     await db_session.refresh(task)
     assert task.api_call_summary["llm_call_count"] == 5
+    assert task.api_call_summary["num_turns"] == 11
     assert task.api_call_summary["total_input_tokens"] == 20000
     assert task.api_call_summary["total_output_tokens"] == 999
 
@@ -18171,6 +18792,133 @@ async def test_heartbeat_persists_cache_input_token_breakdown(
     await db_session.refresh(task)
     assert "total_cache_creation_input_tokens" not in task.api_call_summary
     assert "total_cache_read_input_tokens" not in task.api_call_summary
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_tool_result_bytes(client: AsyncClient, db_session):
+    """Heartbeat persists total_tool_result_bytes into api_call_summary; key is
+    absent when the agent doesn't send it (backwards-compatible with older agents)."""
+    project = Project(name="Tool Result Bytes", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-tool-bytes",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-tool-bytes")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 2,
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "total_tool_result_bytes": 65536,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.api_call_summary
+    assert summary is not None
+    assert summary["total_tool_result_bytes"] == 65536
+
+    # A heartbeat that omits total_tool_result_bytes leaves the key absent —
+    # unknown ≠ zero; backwards-compatible with older agents.
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 3,
+            "total_input_tokens": 700,
+            "total_output_tokens": 150,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert "total_tool_result_bytes" not in task.api_call_summary
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_prompt_size_telemetry(client: AsyncClient, db_session):
+    """Heartbeat persists prompt_size_bytes, prompt_section_count, and
+    prompt_section_sizes into api_call_summary; keys are absent when the agent
+    doesn't send them (backwards-compatible with older agents)."""
+    project = Project(name="Prompt Size Telemetry", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "research"}],
+        vm_instance_id="agent-vm-prompt-size",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.api_call_summary is None
+
+    token = create_agent_token(str(task.id), "agent-vm-prompt-size")
+    section_sizes = [
+        {"name": "context_prefix", "bytes": 4096},
+        {"name": "playbook", "bytes": 2048},
+        {"name": "directions", "bytes": 1024},
+    ]
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 1,
+            "total_input_tokens": 50000,
+            "total_output_tokens": 1000,
+            "prompt_size_bytes": 32768,
+            "prompt_section_count": 12,
+            "prompt_section_sizes": section_sizes,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.api_call_summary
+    assert summary is not None
+    assert summary["prompt_size_bytes"] == 32768
+    assert summary["prompt_section_count"] == 12
+    assert summary["prompt_section_sizes"] == section_sizes
+    # Unrelated summary keys must be present too
+    assert summary["total_input_tokens"] == 50000
+
+    # A heartbeat that omits prompt-size fields leaves those keys absent —
+    # unknown ≠ zero; backwards-compatible with older agents.
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 2,
+            "total_input_tokens": 60000,
+            "total_output_tokens": 1200,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert "prompt_size_bytes" not in task.api_call_summary
+    assert "prompt_section_count" not in task.api_call_summary
+    assert "prompt_section_sizes" not in task.api_call_summary
+    # Unrelated summary keys still present
+    assert task.api_call_summary["total_input_tokens"] == 60000
 
 
 @pytest.mark.asyncio
@@ -24376,3 +25124,143 @@ async def test_sr_analytics_sibling_isolation_after_rollback(
         assert isinstance(fp, dict), (
             f"first_payload is not a dict after sibling rollback: {type(fp)}"
         )
+
+
+@pytest.mark.asyncio
+async def test_design_doc_playbook_and_reserved_keys_protected(
+    client: AsyncClient, db_session
+):
+    """playbook/* and reserved keys are excluded from list and rejected by set/delete."""
+    project = Project(
+        name="Design Doc Reserved Key Test",
+        user_id="test-user-123",
+        design_doc={
+            "normal-key": "visible",
+            "playbook/lint-rules": "hidden",
+            "playbook_archive": [],
+            "proposed_changes": {},
+            "lane_baselines": {},
+            "module_feedback": {},
+            "sr_catch_rate_trends": {},
+            "efficiency_baseline": {},
+            "retired_diagnoses_archive": [],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-reserved-keys",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-reserved-keys", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # list must omit playbook/* and all reserved keys
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "list"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    keys = resp.json()["keys"]
+    assert "normal-key" in keys
+    assert "playbook/lint-rules" not in keys
+    for reserved in (
+        "playbook_archive",
+        "proposed_changes",
+        "lane_baselines",
+        "module_feedback",
+        "sr_catch_rate_trends",
+        "efficiency_baseline",
+        "retired_diagnoses_archive",
+    ):
+        assert reserved not in keys, f"Reserved key '{reserved}' must not appear in list"
+
+    # set on a playbook/* key must return 400
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "playbook/some-entry",
+            "value": "oops",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "playbook" in resp.json()["error"]["message"].lower()
+
+    # delete on a playbook/* key must return 400
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "delete",
+            "key": "playbook/lint-rules",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "playbook" in resp.json()["error"]["message"].lower()
+
+    # set/delete on each exact reserved key must return 400
+    for reserved in (
+        "playbook_archive",
+        "proposed_changes",
+        "lane_baselines",
+        "module_feedback",
+        "sr_catch_rate_trends",
+        "efficiency_baseline",
+        "retired_diagnoses_archive",
+    ):
+        r_set = await client.post(
+            "/api/agent/design-doc",
+            json={
+                "task_id": str(task.id),
+                "op": "set",
+                "key": reserved,
+                "value": "nope",
+            },
+            headers=headers,
+        )
+        assert r_set.status_code == 400, (
+            f"Expected 400 for set on reserved key '{reserved}', got {r_set.status_code}"
+        )
+        r_del = await client.post(
+            "/api/agent/design-doc",
+            json={"task_id": str(task.id), "op": "delete", "key": reserved},
+            headers=headers,
+        )
+        assert r_del.status_code == 400, (
+            f"Expected 400 for delete on reserved key '{reserved}', got {r_del.status_code}"
+        )
+
+    # normal keys are unaffected
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "normal-key",
+            "value": "updated",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "delete", "key": "normal-key"},
+        headers=headers,
+    )
+    assert resp.status_code == 200

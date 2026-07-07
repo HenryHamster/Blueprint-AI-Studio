@@ -34,6 +34,7 @@ Three public entry points:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -174,8 +175,8 @@ async def _scan_capped_files(
     """
     from testing.check_size_limits import classify_size_record
 
-    violations: list[dict] = []
-    checked = 0
+    # Collect all (section, rel, cap, path) entries to fetch in parallel.
+    entries: list[tuple[str, str, int, str]] = []
     for section, prefix in _SECTION_PREFIXES.items():
         caps = limits.get(section)
         if not isinstance(caps, dict):
@@ -183,35 +184,43 @@ async def _scan_capped_files(
         for rel, cap in caps.items():
             if not isinstance(cap, int):
                 continue
-            path = f"{prefix}{rel}"
-            try:
-                text = await github.get_file_text_at_ref(
-                    path,
-                    token=token,
-                    owner=owner,
-                    repo=repo,
-                    ref=ref,
-                    project_id=project_id,
-                )
-            except Exception as exc:  # noqa: BLE001 — never crash the producer
-                logger.debug(
-                    "[CI-COMPLIANCE] read of %s at %s/%s@%s raised: %s — skipping",
-                    path,
-                    owner,
-                    repo,
-                    ref,
-                    exc,
-                )
-                continue
-            if text is None:
-                continue
-            checked += 1
-            count = len(text.splitlines())
-            rec = classify_size_record(rel, count, cap, section, with_verdict=False)
-            if rec["breach"]:
-                violations.append(
-                    {"section": section, "rel": rel, "count": count, "cap": cap}
-                )
+            entries.append((section, rel, cap, f"{prefix}{rel}"))
+
+    async def _fetch(path: str) -> str | None:
+        try:
+            return await github.get_file_text_at_ref(
+                path,
+                token=token,
+                owner=owner,
+                repo=repo,
+                ref=ref,
+                project_id=project_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — never crash the producer
+            logger.debug(
+                "[CI-COMPLIANCE] read of %s at %s/%s@%s raised: %s — skipping",
+                path,
+                owner,
+                repo,
+                ref,
+                exc,
+            )
+            return None
+
+    texts = await asyncio.gather(*(_fetch(path) for _, _, _, path in entries))
+
+    violations: list[dict] = []
+    checked = 0
+    for (section, rel, cap, _path), text in zip(entries, texts):
+        if text is None:
+            continue
+        checked += 1
+        count = len(text.splitlines())
+        rec = classify_size_record(rel, count, cap, section, with_verdict=False)
+        if rec["breach"]:
+            violations.append(
+                {"section": section, "rel": rel, "count": count, "cap": cap}
+            )
     return violations, checked
 
 
@@ -236,7 +245,8 @@ async def _scan_uncapped_files(
 
     Returns a list of ``{section, rel, count, cap: None}`` violation dicts.
     """
-    violations: list[dict] = []
+    # Collect candidates that pass the cheap pre-filters, then fetch in parallel.
+    candidates: list[tuple[str, str, str]] = []  # (section, rel, path)
 
     for section, prefix in _SECTION_PREFIXES.items():
         caps = limits.get(section) or {}
@@ -262,32 +272,43 @@ async def _scan_uncapped_files(
             file_size = entry.get("size", 0)
             if isinstance(file_size, int) and file_size < _UNCAPPED_THRESHOLD:
                 continue
-            try:
-                text = await github.get_file_text_at_ref(
-                    path,
-                    token=token,
-                    owner=owner,
-                    repo=repo,
-                    ref=ref,
-                    project_id=project_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "[CI-COMPLIANCE] uncapped read of %s at %s/%s@%s raised: %s — skipping",
-                    path,
-                    owner,
-                    repo,
-                    ref,
-                    exc,
-                )
-                continue
-            if text is None:
-                continue
-            count = len(text.splitlines())
-            if count > _UNCAPPED_THRESHOLD:
-                violations.append(
-                    {"section": section, "rel": rel, "count": count, "cap": None}
-                )
+            candidates.append((section, rel, path))
+
+    if not candidates:
+        return []
+
+    async def _fetch(path: str) -> str | None:
+        try:
+            return await github.get_file_text_at_ref(
+                path,
+                token=token,
+                owner=owner,
+                repo=repo,
+                ref=ref,
+                project_id=project_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[CI-COMPLIANCE] uncapped read of %s at %s/%s@%s raised: %s — skipping",
+                path,
+                owner,
+                repo,
+                ref,
+                exc,
+            )
+            return None
+
+    texts = await asyncio.gather(*(_fetch(path) for _, _, path in candidates))
+
+    violations: list[dict] = []
+    for (section, rel, _path), text in zip(candidates, texts):
+        if text is None:
+            continue
+        count = len(text.splitlines())
+        if count > _UNCAPPED_THRESHOLD:
+            violations.append(
+                {"section": section, "rel": rel, "count": count, "cap": None}
+            )
     return violations
 
 
@@ -312,71 +333,43 @@ async def _scan_branch_literals(
     Returns a list of ``{section, rel, line, text}`` violation dicts where
     ``line`` is the 1-based line number and ``text`` is the offending line.
     """
-    violations: list[dict] = []
-
     _backend_allow = SURFACE_CONFIGS["backend"].allowlisted_filenames
     _backend_patterns = [p.regex for p in BACKEND_PATTERNS]
 
-    # --- backend/app/*.py branch-literal scan ---
+    # --- Collect backend and agent paths to scan ---
     backend_prefix = _SECTION_PREFIXES["backend"]
-    backend_py_paths = [
-        entry["path"]
-        for entry in tree_paths
-        if entry["path"].startswith(backend_prefix)
-        and entry["path"].endswith(".py")
-    ]
-    for path in backend_py_paths:
+    backend_entries: list[tuple[str, str]] = []  # (path, rel)
+    for entry in tree_paths:
+        path = entry["path"]
+        if not path.startswith(backend_prefix) or not path.endswith(".py"):
+            continue
         rel = path[len(backend_prefix):]
         fname = rel.rsplit("/", 1)[-1] if "/" in rel else rel
-        if fname in _backend_allow:
-            continue
-        try:
-            text = await github.get_file_text_at_ref(
-                path,
-                token=token,
-                owner=owner,
-                repo=repo,
-                ref=ref,
-                project_id=project_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "[CI-COMPLIANCE] branch-literal read of %s raised: %s — skipping",
-                path,
-                exc,
-            )
-            continue
-        if text is None:
-            continue
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            lstripped = line.lstrip()
-            if lstripped.startswith("#") or "# noqa" in line:
-                continue
-            if any(pat.search(line) for pat in _backend_patterns):
-                violations.append(
-                    {"section": "backend", "rel": rel, "line": lineno, "text": line.strip()}
-                )
+        if fname not in _backend_allow:
+            backend_entries.append((path, rel))
 
-    # --- agent/src/ branch-literal scan (tree-based discovery) ---
     agent_config = SURFACE_CONFIGS["agent"]
     agent_prefix = _SECTION_PREFIXES["agent"]
-    agent_ts_paths = [
-        entry["path"]
-        for entry in tree_paths
-        if entry["path"].startswith(agent_prefix)
-        and entry["path"].endswith(".ts")
-        and not any(
-            entry["path"].endswith(suffix) for suffix in agent_config.exclude_suffixes
-        )
-    ]
     _agent_allowset = {
         f"{entry.path}::{entry.line}::{entry.pattern}"
         for entry in agent_config.allowlist
     }
-    for path in agent_ts_paths:
-        agent_rel = path[len(agent_prefix):]
+    agent_entries: list[tuple[str, str]] = []  # (path, rel)
+    for entry in tree_paths:
+        path = entry["path"]
+        if not path.startswith(agent_prefix) or not path.endswith(".ts"):
+            continue
+        if any(path.endswith(suffix) for suffix in agent_config.exclude_suffixes):
+            continue
+        agent_entries.append((path, path[len(agent_prefix):]))
+
+    all_entries = [("backend", path, rel) for path, rel in backend_entries] + [
+        ("agent", path, rel) for path, rel in agent_entries
+    ]
+
+    async def _fetch(path: str) -> str | None:
         try:
-            text = await github.get_file_text_at_ref(
+            return await github.get_file_text_at_ref(
                 path,
                 token=token,
                 owner=owner,
@@ -390,37 +383,56 @@ async def _scan_branch_literals(
                 path,
                 exc,
             )
-            continue
+            return None
+
+    texts = await asyncio.gather(*(_fetch(path) for _, path, _ in all_entries))
+
+    violations: list[dict] = []
+    for (section, _path, rel), text in zip(all_entries, texts):
         if text is None:
             continue
-        for lineno, line in strip_typescript_with_linenos(text):
-            cleaned = _strip_agent_paren_fallbacks(line)
-            for pat in AGENT_PATTERNS:
-                if pat.regex.search(cleaned):
-                    allow_key = f"{agent_rel}::{lineno}::{pat.name}"
-                    if allow_key not in _agent_allowset:
-                        violations.append(
-                            {
-                                "section": "agent",
-                                "rel": agent_rel,
-                                "line": lineno,
-                                "text": line.strip(),
-                            }
-                        )
-            for pat_name, pat_re in _AGENT_SUPPLEMENTAL_PATTERNS:
-                if pat_re.search(cleaned):
-                    allow_key = f"{agent_rel}::{lineno}::{pat_name}"
-                    if allow_key not in _agent_allowset:
-                        violations.append(
-                            {
-                                "section": "agent",
-                                "rel": agent_rel,
-                                "line": lineno,
-                                "text": line.strip(),
-                            }
-                        )
+        if section == "backend":
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                lstripped = line.lstrip()
+                if lstripped.startswith("#") or "# noqa" in line:
+                    continue
+                if any(pat.search(line) for pat in _backend_patterns):
+                    violations.append(
+                        {"section": "backend", "rel": rel, "line": lineno, "text": line.strip()}
+                    )
+        else:
+            for lineno, line in strip_typescript_with_linenos(text):
+                cleaned = _strip_agent_paren_fallbacks(line)
+                for pat in AGENT_PATTERNS:
+                    if pat.regex.search(cleaned):
+                        allow_key = f"{rel}::{lineno}::{pat.name}"
+                        if allow_key not in _agent_allowset:
+                            violations.append(
+                                {
+                                    "section": "agent",
+                                    "rel": rel,
+                                    "line": lineno,
+                                    "text": line.strip(),
+                                }
+                            )
+                for pat_name, pat_re in _AGENT_SUPPLEMENTAL_PATTERNS:
+                    if pat_re.search(cleaned):
+                        allow_key = f"{rel}::{lineno}::{pat_name}"
+                        if allow_key not in _agent_allowset:
+                            violations.append(
+                                {
+                                    "section": "agent",
+                                    "rel": rel,
+                                    "line": lineno,
+                                    "text": line.strip(),
+                                }
+                            )
 
     return violations
+
+
+async def _empty_list() -> list:
+    return []
 
 
 async def evaluate_ci_compliance_at_ref(
@@ -470,9 +482,16 @@ async def evaluate_ci_compliance_at_ref(
     evaluate, never a crash). An unavailable repo tree yields ``tree_available=False``
     and skips guardrails 2 and 3 (branch-literal, uncapped).
     """
-    limits = await _load_size_limits_at_ref(
-        token=token, owner=owner, repo=repo, ref=ref, project_id=project_id
+    # Fetch limits and repo tree in parallel — they are independent.
+    limits, tree_paths_raw = await asyncio.gather(
+        _load_size_limits_at_ref(
+            token=token, owner=owner, repo=repo, ref=ref, project_id=project_id
+        ),
+        github.list_repo_tree_paths_at_ref(
+            token, owner, repo, ref, project_id=project_id
+        ),
     )
+
     if not limits:
         return {
             "ref": ref,
@@ -481,19 +500,16 @@ async def evaluate_ci_compliance_at_ref(
             "branch_literal_violations": [],
             "checked": 0,
             "limits_available": False,
-            "tree_available": False,
+            "tree_available": tree_paths_raw is not None,
         }
 
-    # Get repo tree once; shared by uncapped-file and branch-literal scans.
-    tree_paths = await github.list_repo_tree_paths_at_ref(
-        token, owner, repo, ref, project_id=project_id
-    )
-    tree_available = tree_paths is not None
-    if tree_paths is None:
-        tree_paths = []
+    tree_available = tree_paths_raw is not None
+    tree_paths: list[dict] = tree_paths_raw if tree_paths_raw is not None else []
 
-    # Guardrail 1: capped files.
-    capped_violations, checked = await _scan_capped_files(
+    # Run all three guardrails in parallel: capped-file reads (guardrail 1),
+    # uncapped large-file reads (guardrail 2), and branch-literal scans
+    # (guardrail 3). Guardrails 2 and 3 are no-ops when the tree is unavailable.
+    capped_task = _scan_capped_files(
         limits=limits,
         token=token,
         owner=owner,
@@ -501,11 +517,8 @@ async def evaluate_ci_compliance_at_ref(
         ref=ref,
         project_id=project_id,
     )
-
-    # Guardrail 2: uncapped large files (requires tree).
-    uncapped_violations: list[dict] = []
-    if tree_available:
-        uncapped_violations = await _scan_uncapped_files(
+    uncapped_task = (
+        _scan_uncapped_files(
             limits=limits,
             tree_paths=tree_paths,
             token=token,
@@ -514,11 +527,11 @@ async def evaluate_ci_compliance_at_ref(
             ref=ref,
             project_id=project_id,
         )
-
-    # Guardrail 3: branch-literal regressions (requires tree for backend scan).
-    branch_literal_violations: list[dict] = []
-    if tree_available:
-        branch_literal_violations = await _scan_branch_literals(
+        if tree_available
+        else _empty_list()
+    )
+    branch_task = (
+        _scan_branch_literals(
             tree_paths=tree_paths,
             token=token,
             owner=owner,
@@ -526,6 +539,13 @@ async def evaluate_ci_compliance_at_ref(
             ref=ref,
             project_id=project_id,
         )
+        if tree_available
+        else _empty_list()
+    )
+
+    (capped_violations, checked), uncapped_violations, branch_literal_violations = (
+        await asyncio.gather(capped_task, uncapped_task, branch_task)
+    )
 
     all_size_violations = capped_violations + uncapped_violations
     compliant = not all_size_violations and not branch_literal_violations

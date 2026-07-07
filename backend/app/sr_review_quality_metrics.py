@@ -18,9 +18,8 @@ from app.sr_blind_spots import (
     reviewer_confirmed_categories,
     safe_check_results,
 )
+from app.sr_analytics_common import _SR_CODE_CHANGE_TYPES
 from app.time_utils import _to_naive_utc
-
-_SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
 
 _SR_SEVERITY_WEIGHTS: Dict[str, int] = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
 

@@ -11,7 +11,7 @@ import logging
 import uuid
 from typing import Any, Dict, List, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -370,6 +370,8 @@ async def register_runner(
 @router.get("/projects/{project_id}/runners")
 async def list_runners(
     project_id: uuid.UUID,
+    limit: int | None = Query(default=None, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
@@ -377,7 +379,7 @@ async def list_runners(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
-    result = await session.execute(
+    query = (
         select(LocalRunner)
         .where(
             LocalRunner.project_id == project_id,
@@ -385,7 +387,60 @@ async def list_runners(
         )
         .order_by(LocalRunner.created_at.desc())
     )
+    if limit is not None:
+        query = query.limit(limit).offset(offset)
+    result = await session.execute(query)
     return [_runner_view(r) for r in result.scalars().all()]
+
+
+@router.post("/projects/{project_id}/runners/{runner_id}/rotate-token")
+async def rotate_runner_token(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Rotate a runner secret and return the new plaintext token exactly once."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    result = await session.execute(
+        select(LocalRunner)
+        .where(
+            LocalRunner.id == runner_id,
+            LocalRunner.project_id == project_id,
+        )
+        .with_for_update()
+    )
+    runner = result.scalars().first()
+    if runner is None or runner.status == "deleted":
+        raise HTTPException(status_code=404, detail="Runner not found")
+
+    token = create_runner_token(runner.id)
+    runner.token_hash = hash_runner_token(token)
+    summary_status = runner.status
+    summary_hostname = runner.hostname
+    session.add(runner)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Rotated token for runner %s on project %s",
+        runner_id,
+        project_id,
+    )
+    await emit_workbench_refetch(
+        project_id,
+        resource="local_runner",
+        action="token_rotated",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="runner",
+        summary={
+            "id": str(runner_id),
+            "status": summary_status,
+            "hostname": summary_hostname,
+        },
+    )
+    return {"runner_id": str(runner_id), "token": token}
 
 
 async def _release_unpulled_runner_pins(

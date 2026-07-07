@@ -6,21 +6,24 @@ import { PR_INELIGIBLE_TASK_TYPES } from './research-plan.js';
 
 describe('PR-ineligible task type contract', () => {
   it('keeps the agent stats renderer in sync with the backend denominator contract', () => {
-    const backendSource = readFileSync(
-      path.resolve(process.cwd(), '..', 'backend/app/direction_outcomes.py'),
+    // PR_INELIGIBLE_TASK_TYPES is now READ_ONLY_TASK_TYPES derived from the
+    // registry in task_capabilities.py. Parse it via TaskCapability entries
+    // with "read_only" as the third (agent_mode) argument.
+    const capabilitiesSource = readFileSync(
+      path.resolve(process.cwd(), '..', 'backend/app/task_capabilities.py'),
       'utf8',
     );
-    const match = backendSource.match(
-      /PR_INELIGIBLE_TASK_TYPES = frozenset\(\s*\{([\s\S]*?)\}\s*\)/,
-    );
-    expect(
-      match,
-      'backend PR_INELIGIBLE_TASK_TYPES literal should be parseable',
-    ).not.toBeNull();
-    if (!match) {
-      throw new Error('backend PR_INELIGIBLE_TASK_TYPES literal should be parseable');
+    // Match: TaskCapability(\n    TaskType.<id>,\n    "<Name>",\n    "read_only",
+    const readOnlyPattern = /TaskCapability\(\s+TaskType\.(\w+),\s+"[^"]+",\s+"read_only"/g;
+    const backendTypes: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = readOnlyPattern.exec(capabilitiesSource)) !== null) {
+      backendTypes.push(m[1]);
     }
-    const backendTypes = Array.from(match[1].matchAll(/"([^"]+)"/g), (m) => m[1]);
+    expect(
+      backendTypes.length,
+      'backend task_capabilities.py must contain at least one read_only TaskCapability',
+    ).toBeGreaterThan(0);
     expect([...PR_INELIGIBLE_TASK_TYPES].sort()).toEqual(backendTypes.sort());
   });
 });

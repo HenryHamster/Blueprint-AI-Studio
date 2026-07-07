@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import func
 from sqlmodel import select
 
 from app.knowledge_completion import (
@@ -2098,6 +2099,120 @@ async def test_origin_provenance_legacy_null_serialization(
 
 
 @pytest.mark.asyncio
+async def test_knowledge_index_durable_docs_outrank_newer_stubs(db_session):
+    """Durable design/web_research docs outrank newer research_audit stubs within
+    the 20-slot bound. Documents are ranked by source-kind tier (durable first),
+    then creation date descending, so newer stubs do not crowd out older durable knowledge."""
+    from app.knowledge_query import build_knowledge_index
+    from datetime import timedelta
+
+    proj = await _seed_project_with_membership(db_session, "KDrank")
+    base_time = (await db_session.execute(select(func.now()))).scalar()
+
+    # Create durable task sources.
+    design_task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    web_task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(design_task)
+    db_session.add(web_task)
+    await db_session.commit()
+    await db_session.refresh(design_task)
+    await db_session.refresh(web_task)
+
+    # Create older durable docs (should rank first).
+    durable_design = KnowledgeDocument(
+        project_id=proj.id,
+        source_task_id=design_task.id,
+        title="Durable design doc (old)",
+        summary="Design knowledge.",
+        body="# Design\n\nImportant design decisions.",
+        topic="design",
+        tags=["design"],
+        source_citations=["backend/app/models.py"],
+        source_kind="design",
+        forward_quality_verdict={"passed": True, "strategy": "forward-quality"},
+        created_at=base_time - timedelta(days=5),
+    )
+    durable_web = KnowledgeDocument(
+        project_id=proj.id,
+        source_task_id=web_task.id,
+        title="Durable web research doc (old)",
+        summary="Web research knowledge.",
+        body="# Research\n\nWeb survey findings.",
+        topic="web",
+        tags=["web"],
+        source_citations=["https://example.com"],
+        source_kind="web_research",
+        forward_quality_verdict={"passed": True, "strategy": "forward-quality"},
+        created_at=base_time - timedelta(days=3),
+    )
+    db_session.add(durable_design)
+    db_session.add(durable_web)
+    await db_session.commit()
+
+    # Create many newer research_audit stubs (should rank after durables).
+    for i in range(25):
+        stub_task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+        db_session.add(stub_task)
+    await db_session.commit()
+
+    stub_tasks = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == proj.id,
+                    Task.id != design_task.id,
+                    Task.id != web_task.id,
+                )
+                .order_by(Task.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for i, stub_task in enumerate(stub_tasks):
+        stub = KnowledgeDocument(
+            project_id=proj.id,
+            source_task_id=stub_task.id,
+            title=f"Research audit stub {i}",
+            summary=f"{i} finding(s) recorded",
+            body=f"Audit findings {i}.",
+            topic="audit",
+            tags=["audit"],
+            source_citations=[],
+            source_kind="research_audit",
+            forward_quality_verdict={"passed": True, "strategy": "forward-quality"},
+            created_at=base_time - timedelta(hours=1 - i),
+        )
+        db_session.add(stub)
+    await db_session.commit()
+
+    # Build the index (limited to 20 slots).
+    index = await build_knowledge_index(db_session, proj.id, limit=20)
+
+    # Both durable docs should be in the index.
+    titles = {entry["title"] for entry in index}
+    assert "Durable design doc (old)" in titles
+    assert "Durable web research doc (old)" in titles
+
+    # The durable docs should come before research_audit stubs in the ranking.
+    durable_positions = [
+        i
+        for i, entry in enumerate(index)
+        if entry["source_kind"] in ("design", "web_research")
+    ]
+    stub_positions = [
+        i
+        for i, entry in enumerate(index)
+        if entry["source_kind"] == "research_audit"
+    ]
+    # All durable docs should appear before all stubs.
+    if durable_positions and stub_positions:
+        assert max(durable_positions) < min(stub_positions)
+
+
+@pytest.mark.asyncio
 async def test_origin_provenance_unknown_null_serialization(
     client: AsyncClient, db_session
 ):
@@ -3920,3 +4035,102 @@ async def test_compute_sweep_groups_expose_existing_disposition_state(db_session
     assert "sweep_disposition" not in first_b, (
         "sweep_b must not have sweep_disposition when no disposition task exists"
     )
+
+
+# ── _build_research_audit_document: summary signal + title deduplication ─────
+
+
+class TestBuildResearchAuditDocument:
+    """Unit tests for _build_research_audit_document (pure function, no DB)."""
+
+    def _make_task_with_topic(self, topic=None):
+        from testing.factories import make_task
+
+        payloads = [{"type": "research"}]
+        if topic:
+            payloads = [{"type": "research", "topic": topic}]
+        return make_task(
+            project_id=uuid.uuid4(),
+            title="Research task",
+            payloads=payloads,
+        )
+
+    def test_research_audit_summary_carries_signal(self):
+        """Summary includes leading finding titles, not just a bare count."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("context efficiency")
+        findings = [
+            {"title": "TypeScript migration gap", "description": "desc 1"},
+            {"title": "Missing error boundaries", "description": "desc 2"},
+            {"title": "Stale test fixtures", "description": "desc 3"},
+        ]
+        doc = _build_research_audit_document(task, findings, [], None)
+
+        assert doc is not None
+        assert "TypeScript migration gap" in doc["summary"]
+        assert "Missing error boundaries" in doc["summary"]
+        # Should NOT be just a bare count like "3 finding(s) recorded."
+        assert "finding(s) recorded" not in doc["summary"]
+        # Should include the count
+        assert "3" in doc["summary"]
+
+    def test_research_audit_title_no_redundant_prefix(self):
+        """When topic falls back to 'Research audit', title is not 'Research audit: Research audit'."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        # No topic in payload, no direction title — falls back to "Research audit"
+        task = self._make_task_with_topic(topic=None)
+        findings = [{"title": "Some finding", "description": "d"}]
+        doc = _build_research_audit_document(task, findings, [], None)
+
+        assert doc is not None
+        # Title must NOT be the redundant double form
+        assert doc["title"] != "Research audit: Research audit"
+        # Title should be the clean fallback
+        assert doc["title"] == "Research audit"
+
+    def test_research_audit_title_with_real_topic(self):
+        """When a real topic is present, the 'Research audit: <topic>' prefix is used."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("context efficiency cuts")
+        findings = [{"title": "Finding A", "description": "d"}]
+        doc = _build_research_audit_document(task, findings, [], None)
+
+        assert doc is not None
+        assert doc["title"] == "Research audit: context efficiency cuts"
+
+    def test_research_audit_summary_fallback_with_no_findings_but_insights(self):
+        """When there are only insights (no findings), the summary still carries signal."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("some topic")
+        insights = [
+            {"summary": "First insight text."},
+            {"summary": "Second insight text."},
+        ]
+        doc = _build_research_audit_document(task, [], insights, None)
+
+        assert doc is not None
+        assert "insight(s)" in doc["summary"]
+        assert "2" in doc["summary"]
+
+    def test_research_audit_summary_single_finding_title(self):
+        """With a single finding, summary contains just that title."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("perf")
+        findings = [{"title": "Cache miss on hot path"}]
+        doc = _build_research_audit_document(task, findings, [], None)
+
+        assert doc is not None
+        assert "Cache miss on hot path" in doc["summary"]
+        assert "1" in doc["summary"]
+
+    def test_research_audit_returns_none_when_empty(self):
+        """Empty findings and insights yield None (no document to persist)."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("topic")
+        assert _build_research_audit_document(task, [], [], None) is None

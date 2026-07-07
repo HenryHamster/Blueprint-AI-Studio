@@ -26,7 +26,9 @@ vi.mock('../telemetry.js', async (importOriginal) => {
     recordFormatRepairTokens: vi.fn(),
     getLlmTelemetry: vi.fn().mockReturnValue({
       llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0,
-      viewport_screenshot_forwarded_count: 0,
+      total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0,
+      viewport_screenshot_forwarded_count: 0, num_turns: 0, total_tool_result_bytes: 0,
+      prompt_size_bytes: null, prompt_section_count: null, prompt_section_sizes: null,
     }),
   };
 });
@@ -667,8 +669,8 @@ describe('repairStructuredOutput', () => {
   it('records repair token delta via recordFormatRepairTokens with schemaLabel when the reopen run consumes tokens', async () => {
     // Simulate getLlmTelemetry returning different snapshots before and after the reopen run.
     vi.mocked(getLlmTelemetry)
-      .mockReturnValueOnce({ llm_call_count: 3, total_input_tokens: 500, total_output_tokens: 200, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 })
-      .mockReturnValueOnce({ llm_call_count: 4, total_input_tokens: 900, total_output_tokens: 450, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0 });
+      .mockReturnValueOnce({ llm_call_count: 3, total_input_tokens: 500, total_output_tokens: 200, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0, num_turns: 0, total_tool_result_bytes: 0, prompt_size_bytes: null, prompt_section_count: null, prompt_section_sizes: null })
+      .mockReturnValueOnce({ llm_call_count: 4, total_input_tokens: 900, total_output_tokens: 450, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0, viewport_screenshot_forwarded_count: 0, num_turns: 0, total_tool_result_bytes: 0, prompt_size_bytes: null, prompt_section_count: null, prompt_section_sizes: null });
 
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,

@@ -9,7 +9,7 @@ that don't require a database.
 import json
 import pytest
 import pytest_asyncio
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import MagicMock, AsyncMock
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -1085,16 +1085,17 @@ class TestMonitoringWindowEdgeCases:
         should_rollback still returns the recommendation — the caller
         must check revision equality."""
         from app.shared_state import deploy_monitoring
+        from app.time_utils import _utcnow
 
         deploy_monitoring["task_results"] = [
-            (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
-            (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
-            (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
-            (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
-            (datetime.utcnow().isoformat(), "failure", "CODE_ERROR"),
+            (_utcnow().isoformat(), "failure", "CODE_ERROR"),
+            (_utcnow().isoformat(), "failure", "CODE_ERROR"),
+            (_utcnow().isoformat(), "failure", "CODE_ERROR"),
+            (_utcnow().isoformat(), "failure", "CODE_ERROR"),
+            (_utcnow().isoformat(), "failure", "CODE_ERROR"),
         ]
         deploy_monitoring["pre_deploy_failure_rate"] = 0.0
-        deploy_monitoring["window_start"] = datetime.utcnow() - timedelta(minutes=20)
+        deploy_monitoring["window_start"] = _utcnow() - timedelta(minutes=20)
         do_rollback, _reason, response = should_rollback()
         assert do_rollback
         assert response == "ROLLBACK"
@@ -1326,7 +1327,8 @@ async def test_rollup_not_blocked_by_stale_review_task(rollup_db, mocker):
         status=TaskStatus.FAILED,
         latest_status_message="lint error",
     )
-    stale_started = datetime.utcnow() - timedelta(minutes=30)
+    from app.time_utils import _utcnow
+    stale_started = _utcnow() - timedelta(minutes=30)
     stale_review = Task(
         project_id=project.id,
         parent_task_id=parent.id,
@@ -1378,13 +1380,14 @@ async def test_rollup_blocked_by_fresh_review_task(rollup_db, mocker):
         status=TaskStatus.FAILED,
         latest_status_message="lint error",
     )
+    from app.time_utils import _utcnow
     fresh_review = Task(
         project_id=project.id,
         parent_task_id=parent.id,
         payloads=[{"type": "review", "prompt": "review PR"}],
         status=TaskStatus.IN_PROGRESS,
-        started_at=datetime.utcnow() - timedelta(minutes=1),
-        last_heartbeat=datetime.utcnow(),
+        started_at=_utcnow() - timedelta(minutes=1),
+        last_heartbeat=_utcnow(),
     )
     rollup_db.add(failed)
     rollup_db.add(fresh_review)
@@ -1593,7 +1596,7 @@ async def _make_rollup_parent_with_completed_child(
         payloads=[{"type": "research", "prompt": "parent"}],
         status=TaskStatus.EVALUATING,
         context={
-            "plan_branch": "research/abc12345",
+            "plan_branch": "research/rollup-stg",
             "parent_base": target_branch,
         },
     )
@@ -1653,6 +1656,15 @@ def _patch_common_rollup_mocks(mocker):
             "html_url": "https://example.com/pr/777",
             "empty_diff": False,
         },
+    )
+    # The rollup auto-merge path now runs a module size-cap preflight that
+    # fetches the caps JSON and changed-file contents at the staging branch.
+    # Default to "ok" so the guard is a no-op; tests exercising breach cases
+    # override this.
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("ok", None),
     )
 
 

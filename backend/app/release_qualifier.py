@@ -179,7 +179,11 @@ from app.release_scoring import (
     _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
     _audit_findings_carry_meta,
     _audit_missing_reason,
+    compute_enforce_confidence_preview,  # noqa: F401 — re-exported for callers/tests
+    DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT,
+    MAX_COMPLETION_DEBT_WEIGHT,
     _clamp01,  # noqa: F401
+    coerce_completion_debt_weight,
     _compute_audit_reconciliation,
     _compute_audit_challenge_synthesis,  # noqa: F401 — re-exported for callers/tests
     _compute_challenge_synthesis_from_binding_verdicts,
@@ -192,6 +196,7 @@ from app.release_scoring import (
     _fmt_sub_scores,
     _reconcile_audit_with_challenge,
     _score_audit,
+    _score_completion_debt_pressure,
     _score_smoketest,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
@@ -227,7 +232,10 @@ from app.release_qualifier_sweep import (
     _force_finalize_sweep_crash_loop,  # noqa: F401 — re-exported for tests
     _force_finalize_timed_out_qualification,
     _parse_started_at,
+    _fire_initial_qualification_if_coverage_complete,  # noqa: F401 — re-exported for tests
+    _reconcile_if_criterion_coverage_now_complete,  # noqa: F401 — re-exported for tests
     _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
+    _redrive_dry_run_candidate,  # noqa: F401 — re-exported for tests
     _redrive_not_promoted_qualification,  # noqa: F401 — re-exported for tests
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
@@ -404,6 +412,13 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
             raise ValueError(
                 f"runtime_config promotion_weights sum to {weight_sum:.4f}, expected ~1.0"
             )
+        # completion_debt is an OPTIONAL, SEPARATE blend factor — NOT part of the
+        # three-core-weight sum above.  Read + preserve it (default 0.0, clamped
+        # to [0, 0.5]) so the mode gate in _resolve_policy_with_provenance can
+        # turn the debt-pressure signal on; absent => 0.0 = the legacy behaviour.
+        _cd = coerce_completion_debt_weight(weights_raw)
+        if _cd > 0.0:
+            weights["completion_debt"] = _cd
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
         for _k in ("merge_grade_block_threshold",):
             _v = _runtime_config.get(_k)
@@ -464,6 +479,11 @@ def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | Non
                 raise ValueError(
                     f"build_config promotion_weights sum to {wsum:.4f}, expected ~1.0"
                 )
+            # Optional per-project completion_debt blend factor (separate from the
+            # three-core-weight sum; default 0.0, clamped to [0, 0.5]).
+            _cd = coerce_completion_debt_weight(weights_raw)
+            if _cd > 0.0:
+                weights["completion_debt"] = _cd
             if weights["audit"] < _MIN_AUDIT_WEIGHT:
                 raise ValueError(
                     f"build_config promotion_weights audit={weights['audit']:.3f} "
@@ -501,6 +521,63 @@ def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | Non
         return None
 
 
+# The operator-facing graduation gate for the completion-debt pressure signal.
+# ``completion_debt_weight_mode`` is a real runtime_config key (default
+# "observe"); only "enforce" lets the configured completion_debt weight reach
+# the composite blend.
+_COMPLETION_DEBT_WEIGHT_MODES: frozenset[str] = frozenset({"off", "observe", "enforce"})
+
+
+def _resolve_completion_debt_weight_mode() -> str:
+    """Return the live ``completion_debt_weight_mode`` (default "observe").
+
+    Any unrecognised / unset value degrades to the safe "observe" default so a
+    malformed knob can never silently arm the enforce blend.
+    """
+    mode = str(_runtime_config.get("completion_debt_weight_mode", "observe")).strip().lower()
+    return mode if mode in _COMPLETION_DEBT_WEIGHT_MODES else "observe"
+
+
+def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]:
+    """Mode-gate a resolved policy's ``weights["completion_debt"]`` blend factor.
+
+    Centralises Defect 2's graduation gate so ``compute_composite`` stays pure:
+    the returned policy already carries the *effective* completion_debt weight.
+
+      * "observe" / "off"  → the effective weight is forced to 0.0 and the key is
+        DROPPED, so ``weights`` is the legacy three-key shape and the debt-
+        pressure score is recorded in sub_scores but never blended (the shipped
+        observe behaviour, backward compatible).
+      * "enforce"          → the configured completion_debt weight is applied; if
+        the operator graduated but left it unset/zero, fall back to
+        ``DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT`` so graduation actually changes
+        the composite.  The effective weight is clamped to
+        ``[0, MAX_COMPLETION_DEBT_WEIGHT]``.
+
+    Returns a shallow copy with a fresh ``weights`` dict — the caller's input is
+    never mutated.
+    """
+    weights = dict(policy.get("weights") or {})
+    configured = coerce_completion_debt_weight(weights)
+    mode = _resolve_completion_debt_weight_mode()
+    if mode == "enforce":
+        effective = (
+            configured
+            if configured > 0.0
+            else DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+        )
+        effective = max(0.0, min(effective, MAX_COMPLETION_DEBT_WEIGHT))
+    else:
+        effective = 0.0
+    if effective > 0.0:
+        weights["completion_debt"] = effective
+    else:
+        weights.pop("completion_debt", None)
+    gated = dict(policy)
+    gated["weights"] = weights
+    return gated
+
+
 def _resolve_policy_with_provenance(
     project: "Project | None" = None,
 ) -> tuple[dict[str, Any], str, str | None]:
@@ -510,6 +587,11 @@ def _resolve_policy_with_provenance(
     shape. This helper layers operator-visible provenance on top so callers can tell
     whether the active rubric came from the project's build_config, runtime config,
     the YAML file, or the hardcoded defaults after a YAML failure.
+
+    The final step mode-gates ``weights["completion_debt"]`` via
+    ``_apply_completion_debt_weight_mode`` so every consumer (the qualifier and
+    the admin provenance surface) sees the same effective, graduation-gated blend
+    factor.
     """
     fleet_policy, fleet_source, fleet_error = _resolve_fleet_policy_with_provenance()
     overrides = _policy_from_build_config(project)
@@ -521,8 +603,8 @@ def _resolve_policy_with_provenance(
         merged = dict(fleet_policy)
         merged["weights"] = overrides["weights"]
         merged["threshold"] = overrides["threshold"]
-        return merged, "build_config", fleet_error
-    return fleet_policy, fleet_source, fleet_error
+        return _apply_completion_debt_weight_mode(merged), "build_config", fleet_error
+    return _apply_completion_debt_weight_mode(fleet_policy), fleet_source, fleet_error
 
 
 def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
@@ -566,6 +648,12 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
             raise ValueError(
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
+
+        # Optional completion_debt blend factor from the on-disk rubric (separate
+        # from the three-core-weight sum; default 0.0, clamped to [0, 0.5]).
+        _cd = coerce_completion_debt_weight(weights_raw)
+        if _cd > 0.0:
+            weights["completion_debt"] = _cd
 
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
         for _k in ("merge_grade_block_threshold",):
@@ -614,7 +702,11 @@ def _load_policy(project: "Project | None" = None) -> dict[str, Any]:
 
     The returned dict always has the shape
     ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
-       "threshold": float}`` with every value coerced to float.
+       "threshold": float}`` with every value coerced to float.  An OPTIONAL
+    ``weights["completion_debt"]`` blend factor is present only when the operator
+    has graduated ``completion_debt_weight_mode`` to "enforce" (mode-gated in
+    ``_resolve_policy_with_provenance``); in observe/off mode the key is absent
+    and the three-core-weight shape is preserved unchanged.
     """
     policy, _, _ = _resolve_policy_with_provenance(project)
     return policy
@@ -700,20 +792,26 @@ async def _qualification_in_flight(
         # still mid-spawn rather than risk a duplicate.
         return True
 
-    for task_id in child_ids:
-        task = await session.get(Task, task_id)
-        if task is None:
-            # The child row is not (yet) persisted — the spawning run is still
-            # in progress; treat as in flight.
-            return True
-        if task.status not in _TERMINAL_STATUSES:
-            return True
+    rows = (
+        await session.execute(
+            select(Task.id, Task.status).where(Task.id.in_(child_ids))
+        )
+    ).all()
+    found_ids = {r.id for r in rows}
+    if any(cid not in found_ids for cid in child_ids):
+        # A child row is not (yet) persisted — the spawning run is still
+        # in progress; treat as in flight.
+        return True
+    if any(r.status not in _TERMINAL_STATUSES for r in rows):
+        return True
     # status == "pending" but every child already terminated → not in flight.
     return False
 
 
 def _promotion_in_flight_result(
     version: release_version.ReleaseVersion,
+    *,
+    latest_verdict: Any = None,
 ) -> dict[str, Any] | None:
     """Return a promotion-blocking status dict, or None when not mid-promotion.
 
@@ -730,10 +828,21 @@ def _promotion_in_flight_result(
     lever does (``abandon_current_version`` raises ``VersionCutBlockedByPromotion``
     on the same predicate). Reuses ``summarize_qualification_state`` so all the
     operator levers agree by construction.
+
+    When ``latest_verdict`` is passed, applies finalized-verdict substitution
+    (via :func:`~app.qualification_state_resolver.apply_verdict_substitution`)
+    before classifying so stale-pending records with an already-finalized verdict
+    row are not misclassified as still-blocking.
     """
-    qual_state = release_version.summarize_qualification_state(
+    from app.qualification_state_resolver import apply_verdict_substitution
+
+    qual = (
         version.last_qualification
+        if isinstance(version.last_qualification, dict)
+        else {}
     )
+    effective_qual, _ = apply_verdict_substitution(qual, latest_verdict)
+    qual_state = release_version.summarize_qualification_state(effective_qual)
     if (
         qual_state
         and qual_state.get("state") in release_version.PROMOTION_BLOCKING_STATES
@@ -1531,13 +1640,20 @@ async def run_qualification(
         )
         return {"status": "already_pending"}
 
-    # Cheap pre-lock promotion-in-flight check (no I/O — pure DB read).  A
-    # version whose audit passed and now has an open promotion PR auto-merging
+    # Cheap pre-lock promotion-in-flight check (no I/O beyond verdict fetch).
+    # A version whose audit passed and now has an open promotion PR auto-merging
     # must not be re-qualified: doing so spawns a fresh heavy audit/smoketest
     # pair and clobbers the promotion-pending record.  Consistent with the
     # version-cut lever, which refuses in the same state.  Best-effort fast path
     # — the authoritative re-check happens under the row lock below.
-    _promo = _promotion_in_flight_result(version)
+    # Fetch the newest verdict so stale-pending+finalized-verdict is not
+    # misclassified as still-blocking.
+    from app.qualification_state_resolver import resolve_newest_qualification_verdict
+
+    _latest_verdict_prelock = await resolve_newest_qualification_verdict(
+        session, version
+    )
+    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict_prelock)
     if _promo is not None:
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
@@ -1592,7 +1708,7 @@ async def run_qualification(
         version.last_qualification = {
             "status": "error",
             "error": "sha_error",
-            "detail": str(exc)[:300],
+            "detail": f"{type(exc).__name__}: {exc}"[:300],
             "started_at": _utcnow().isoformat(),
         }
         flag_modified(version, "last_qualification")
@@ -1825,7 +1941,12 @@ async def run_qualification(
     # record would discard the provenance the rest of the system relies on to
     # know the promotion is still legitimately merging — so refuse (no-op),
     # consistent with the version-cut lever.
-    _promo = _promotion_in_flight_result(version)
+    # Re-fetch the verdict under the lock (the pre-lock fetch may be stale if a
+    # concurrent promotion finalized between the pre-lock check and here).
+    _latest_verdict_locked = await resolve_newest_qualification_verdict(
+        session, version
+    )
+    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict_locked)
     if _promo is not None:
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
@@ -1844,6 +1965,10 @@ async def run_qualification(
     # new candidate is unscored and a fresh qualification is always permitted.
     # ``ci_unresolved`` is the narrow transient exception: a same-SHA
     # not_promoted verdict may re-run once the fresh CI snapshot is green.
+    # ``criterion_coverage_incomplete`` is the second narrow exception: a
+    # same-SHA not_promoted verdict may re-run once the live coverage summary
+    # shows the coverage gate would no longer fire (a retracted/superseded
+    # criterion cleared the wedge) — the acceptance-contract safety valve.
     prior_qual = version.last_qualification or {}
     prior_status = prior_qual.get("status")
     ci_unresolved_recovered_same_sha = (
@@ -1852,6 +1977,39 @@ async def run_qualification(
         and prior_qual.get("candidate_sha") == candidate_sha
         and ci_green
     )
+    # Criterion-coverage recovery — the acceptance-contract safety valve.  A
+    # same-SHA not_promoted verdict whose blocker was
+    # ``criterion_coverage_incomplete`` (set in release_scoring when active
+    # criteria are uncovered) may re-run once the LIVE coverage summary shows the
+    # gate would no longer fire: every active criterion covered, or ZERO active
+    # criteria remain after a retraction/supersession cleared an uncoverable one.
+    # This is the deadlock this direction exists to break — retracting an
+    # uncoverable criterion must let the qualifier re-audit and clear the gate
+    # WITHOUT a SHA change or operator action.  Mirrors the ``ci_unresolved``
+    # narrow exception exactly: it relaxes caching for THIS blocker only and
+    # only on the SAME SHA (a different SHA already re-runs via the normal cache
+    # miss), and every downstream gate still applies to the fresh re-audit.
+    criterion_coverage_recovered_same_sha = False
+    if (
+        prior_status == "not_promoted"
+        and prior_qual.get("blocker") == "criterion_coverage_incomplete"
+        and prior_qual.get("candidate_sha") == candidate_sha
+    ):
+        try:
+            _coverage = await get_version_coverage_summary(session, version.id)
+            _total = int(_coverage.get("total") or 0)
+            _covered = int(_coverage.get("covered") or 0)
+            # Mirror the release_scoring gate exactly: it fires when
+            # ``total > 0 and covered < total``, so the gate is CLEAR when no
+            # active criteria remain (total == 0) or every active one is covered.
+            criterion_coverage_recovered_same_sha = _total == 0 or _covered >= _total
+        except Exception:  # noqa: BLE001 — a coverage lookup failure stays cached (safe: no wrong re-run)
+            logger.warning(
+                "[RELEASE_QUALIFIER] run_qualification: coverage-recovery check "
+                "failed for v%d — leaving the not_promoted verdict cached",
+                version.version_number,
+            )
+            criterion_coverage_recovered_same_sha = False
     # Content-hash reuse: a newer commit whose AUDITED SURFACE is byte-identical
     # to the prior conclusive candidate (differs only in excluded CI/fixture/
     # config files) carries the same verdict — reuse it instead of re-rolling the
@@ -1884,6 +2042,7 @@ async def run_qualification(
             or _same_audited_surface
         )
         and not ci_unresolved_recovered_same_sha
+        and not criterion_coverage_recovered_same_sha
     ):
         _reuse_reason = (
             "automain unchanged"
@@ -2812,6 +2971,25 @@ async def _candidate_already_on_main_at_finalize(
             exc,
         )
         return False
+
+
+async def _count_project_actionable_open_completion_debt(
+    session: AsyncSession, project_id: Any
+) -> int:
+    """Count open completion-debt rows owned by the qualified project only."""
+    if project_id is None:
+        return 0
+    from app.models import CompletionDebtEntry  # noqa: PLC0415
+
+    stmt = (
+        select(sa_func.count())
+        .select_from(CompletionDebtEntry)
+        .where(
+            CompletionDebtEntry.project_id == project_id,
+            CompletionDebtEntry.status == "open",
+        )
+    )
+    return int((await session.execute(stmt)).scalar_one() or 0)
 
 
 async def _finalize_qualification(
@@ -3910,6 +4088,44 @@ async def _finalize_qualification(
             "status": "already_on_main_exempt",
             "blocked": False,
         }
+    # --- Completion-debt snapshot (additive, informational, best-effort) ------
+    # Fetched before compute_composite so the pressure score can be passed in as
+    # an observe-mode sub-score signal.  Never a blocker.  Best-effort: if the
+    # completion_debt module is not yet landed or raises, finalize continues
+    # with completion_debt=None (pressure score = None → omitted from sub_scores).
+    _completion_debt: dict[str, Any] | None = None
+    try:
+        from importlib import import_module  # noqa: PLC0415
+
+        _cd_mod = import_module("app.completion_debt")
+        _completion_debt = await _cd_mod.get_open_completion_debt(
+            session, version.project_id
+        )
+    except Exception:
+        pass
+    _project_actionable_open: int | None = None
+    if _completion_debt is not None:
+        try:
+            _project_actionable_open = (
+                await _count_project_actionable_open_completion_debt(
+                    session, version.project_id
+                )
+            )
+        except Exception:
+            pass
+    _completion_debt_scoring_snapshot: dict[str, Any] | None = None
+    if _completion_debt is not None:
+        _completion_debt_scoring_snapshot = dict(_completion_debt)
+        if _project_actionable_open is not None:
+            _completion_debt_scoring_snapshot["project_actionable_open"] = (
+                _project_actionable_open
+            )
+    _debt_pressure_score: float | None = (
+        _score_completion_debt_pressure(_completion_debt_scoring_snapshot)
+        if _completion_debt_scoring_snapshot is not None
+        else None
+    )
+
     composite = compute_composite(
         ci_green=ci_green,
         audit_score=audit_score,
@@ -3923,6 +4139,7 @@ async def _finalize_qualification(
         migration_apply_blocked=migration_apply_blocked,
         criterion_coverage=criterion_coverage,
         merge_grade_misses=merge_grade_misses,
+        debt_pressure_score=_debt_pressure_score,
     )
 
     # --- Acceptance-window counts (additive evidence, no score impact) -----
@@ -4007,7 +4224,31 @@ async def _finalize_qualification(
         # version.goal is set. None when no goal is configured or the audit
         # predates this field.
         "goal_alignment": (audit_report or {}).get("goal_alignment"),
+        # Open completion-debt snapshot at qualification time (additive, informational).
+        # None when the ledger module is not yet available or returned no data.
+        "completion_debt": _completion_debt,
     }
+
+    # Enforce-mode confidence preview — only in observe/off mode, only when no
+    # hard blocker fired and debt pressure was actually scored.  Records what
+    # enforce would have done to confidence so the operator can graduate the
+    # completion_debt_weight_mode knob with accumulated evidence rather than
+    # flying blind.  Has no effect on the live composite.
+    if (
+        _resolve_completion_debt_weight_mode() != "enforce"
+        and composite["blocker"] is None
+        and _debt_pressure_score is not None
+    ):
+        _configured_cd_weight = coerce_completion_debt_weight(
+            _runtime_config.get("promotion_weights") or {}
+        )
+        _preview = compute_enforce_confidence_preview(
+            composite["confidence"],
+            _debt_pressure_score,
+            configured_weight=_configured_cd_weight,
+        )
+        base_record["debt_enforce_confidence_preview"] = _preview["enforce_confidence"]
+        base_record["debt_enforce_weight_preview"] = _preview["effective_weight"]
 
     # Per-project override (falls back to the fleet-wide promotion_enabled when
     # this project has no explicit override) — additive, behavior unchanged for
@@ -4469,7 +4710,11 @@ async def _maybe_trigger_strategic_after_qualification(
             # Lazy import — release_qualifier <-> strategic_spawning is circular.
             from app.strategic_spawning import _spawn_strategic_review
 
-            spawned = await _spawn_strategic_review(project, session)
+            spawned = await _spawn_strategic_review(
+                project,
+                session,
+                apply_spawn_budget_guard=True,
+            )
             if spawned:
                 await session.commit()
                 logger.info(
@@ -4847,7 +5092,12 @@ async def _force_promote_locked(
     # Refuse when a promotion is already in flight (an audit-passed PR open + the
     # Fix-3 claim, or a concurrent force-promote) — mirrors the /qualify + the
     # version-cut levers so every lever over an in-flight promotion agrees.
-    _promo = _promotion_in_flight_result(version)
+    # Apply finalized-verdict substitution so a stale-pending+finalized-verdict
+    # is not misclassified as still-blocking.
+    from app.qualification_state_resolver import resolve_newest_qualification_verdict
+
+    _latest_verdict_force = await resolve_newest_qualification_verdict(session, version)
+    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict_force)
     if _promo is not None:
         return _promo
     now = _utcnow()
@@ -4963,7 +5213,7 @@ async def force_promote_current_version(
                 token, owner, repo, integration_branch, live=True
             )
         except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
-            return {"status": "sha_error", "detail": str(exc)[:300]}
+            return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
     if not candidate_sha:
         return {"status": "sha_error", "detail": "empty candidate sha"}
     candidate_diff_hash = compute_audited_surface_hash(

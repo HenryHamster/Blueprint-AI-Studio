@@ -529,15 +529,14 @@ function ErrorLogsBlock({ errorLogs }: { errorLogs: string }) {
   );
 }
 
-function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
-  const subtasks = planOutput.subtasks as Record<string, unknown>[] | undefined;
-  if (!subtasks) return null;
+function PlanPreview({ subtasks }: { subtasks: Array<{ title: string; depends_on_indices?: number[] }> }) {
+  if (!subtasks.length) return null;
   return (
     <div className="bg-purple-950/20 text-purple-300 text-ui-md p-2.5 rounded-lg mb-3 border border-purple-900/30 max-h-32 overflow-y-auto">
       <span className="font-semibold block mb-1 text-purple-400 font-sans">Plan ({subtasks.length} subtasks):</span>
       {subtasks.map((s, i) => (
         <div key={i} className="mb-0.5 text-neutral-300 font-mono">
-          {(s.depends_on_indices as number[] || []).length > 0 ? '  \u2514\u2500 ' : ''}{String(s.title)}
+          {(s.depends_on_indices ?? []).length > 0 ? '  \u2514\u2500 ' : ''}{s.title}
         </div>
       ))}
     </div>
@@ -1073,7 +1072,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         </div>
       ) : null}
 
-      {task.plan_output ? <PlanPreview planOutput={task.plan_output} /> : null}
+      {task.plan_subtasks && task.plan_subtasks.length > 0 ? <PlanPreview subtasks={task.plan_subtasks} /> : null}
 
       {(task.status === 'BLOCKED' || task.blocker_kind || task.blocked_reason) ? (
         <div className="bg-amber-950/30 border border-amber-900/40 rounded-lg px-2.5 py-2 mb-2">

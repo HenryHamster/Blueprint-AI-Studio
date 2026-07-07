@@ -28,6 +28,11 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.release_artifacts import version_serving_summary as _version_serving_summary
+from app.qualification_state_resolver import (
+    resolve_effective_qualification_state,
+    resolve_open_version_qualification_state,
+    resolve_promotion_blocking_result,
+)
 from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
 from app import compute as _compute
@@ -222,6 +227,9 @@ async def _serialize_version_history_entry(
     )
 
     aggregate, artifacts = _version_serving_summary(version, project)
+    qualification_state, _ = resolve_effective_qualification_state(
+        version, project, serving=(aggregate, artifacts)
+    )
 
     # Enrich each history entry with the same server-computed highlights and
     # merged counts the per-version summary endpoint produces, bounded by the
@@ -281,14 +289,7 @@ async def _serialize_version_history_entry(
         "aggregate_deploy_failure_reason": aggregate["reason_code"],
         "artifacts": artifacts,
         "serving": _compose_serving_block(aggregate, artifacts, version),
-        "qualification_state": _release_version.summarize_qualification_state(
-            version.last_qualification,
-            version.serving_status,
-            version.deploy_failure_reason,
-            aggregate_serving_status=aggregate["serving_status"],
-            aggregate_deploy_failure_reason=aggregate["reason_code"],
-            artifact_evidence=artifacts,
-        ),
+        "qualification_state": qualification_state,
         "abandoned_at": (
             (version.last_qualification or {}).get("abandoned_at")
             if version.status == "abandoned"
@@ -316,6 +317,8 @@ async def _serialize_version_history_entry(
         "merged_count": merged_count,
         "merged_task_count": merged_task_count,
         "acceptance_aggregate": acceptance_aggregate,
+        # Same shape as current_version. total/covered/partial/uncovered count
+        # active criteria only; inactive audit rows may still appear in criteria.
         "criterion_coverage": criterion_coverage,
     }
 
@@ -551,6 +554,27 @@ async def get_version_lifecycle(
                     project_id,
                 )
 
+        # Full-suite drift-sentinel CI gate (ADDITIVE, read-only).  Surfaces the
+        # latest ci.yml run state for the integration-branch HEAD so the admin UI
+        # can show full-suite status without waiting for a promotion PR. dispatch=False
+        # so this read NEVER triggers a workflow run; the sweep sentinel dispatches.
+        full_suite_ci_gate: Optional[Dict[str, Any]] = None
+        if open_row is not None:
+            try:
+                from app.release_readiness import (  # noqa: PLC0415
+                    compute_promotion_ci_green_gate,
+                )
+
+                full_suite_ci_gate = await compute_promotion_ci_green_gate(
+                    session, project_id, dispatch=False
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] full-suite CI gate compute failed "
+                    "for project %s; serving lifecycle without the signal",
+                    project_id,
+                )
+
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
             merged_count = await count_merged_since(
@@ -568,10 +592,28 @@ async def get_version_lifecycle(
                 open_row, project_row
             )
             acceptance_aggregate = None
-            if isinstance(qual, dict):
-                acceptance_aggregate = qual.get("acceptance_aggregate")
-            if acceptance_aggregate is None:
-                acceptance_aggregate = getattr(open_row, "acceptance_aggregate", None)
+            try:
+                from app.release_version import (  # noqa: PLC0415
+                    compute_version_acceptance_aggregate,
+                )
+
+                acceptance_aggregate = await compute_version_acceptance_aggregate(
+                    session,
+                    project_id,
+                    since=open_row.opened_at,
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] acceptance aggregate compute failed "
+                    "for project %s; serving lifecycle with the stored fallback",
+                    project_id,
+                )
+                if isinstance(qual, dict):
+                    acceptance_aggregate = qual.get("acceptance_aggregate")
+                if acceptance_aggregate is None:
+                    acceptance_aggregate = getattr(
+                        open_row, "acceptance_aggregate", None
+                    )
             # Verdict-staleness signal: how many tasks merged AT/AFTER the open
             # version's last qualification verdict was finalized. Each verdict is
             # evaluated against one candidate commit; merges landing after
@@ -606,14 +648,17 @@ async def get_version_lifecycle(
             # so a crashed audit (terminal-failed, no report) reconciles to
             # ``audit_crashed`` instead of a misleading ``qualifying``/'wait' — the top
             # badge and the audit-findings section then agree by construction.
-            qual_state = _release_version.summarize_qualification_state(
-                qual,
-                open_row.serving_status,
-                open_row.deploy_failure_reason,
+            # Routed through the shared OPEN-version resolver so this endpoint ALSO
+            # applies the finalized-verdict substitution (stale-pending window) that
+            # it previously omitted: reuse the ``latest_audit`` already resolved above
+            # for the audit-findings section, and let the helper backfill the newest
+            # verdict so all four open-version surfaces agree.
+            qual_state, _ = await resolve_open_version_qualification_state(
+                session,
+                open_row,
+                project_row,
                 audit_child=latest_audit,
-                aggregate_serving_status=aggregate_serving["serving_status"],
-                aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-                artifact_evidence=artifact_evidence,
+                serving=(aggregate_serving, artifact_evidence),
             )
 
             # Fetch live current_focus from the project's problem_model
@@ -721,11 +766,17 @@ async def get_version_lifecycle(
                 # tasks; the UI can show a "showing N of total" indicator.
                 "tasks_merged_has_more": tasks_merged_has_more,
                 # Version-scoped acceptance criterion coverage (additive; nullable
-                # when the signal could not be computed). Shape:
-                # {total, covered, partial, uncovered, criteria:[{criterion_key,
-                # text, coverage, evidence_count}]}. total=0 with empty criteria
-                # list when no criteria are defined.
+                # when the signal could not be computed). Active totals are kept
+                # separate from the audit trail: total/covered/partial/uncovered
+                # count active criteria only, while inactive criteria can still
+                # appear in criteria with status=retracted|superseded and
+                # inactive lifecycle counts.
                 "criterion_coverage": criterion_coverage,
+                # Full-suite drift-sentinel CI gate (additive; nullable when the
+                # gate could not be computed or project lacks GitHub creds).
+                # Shows the latest ci.yml run state for the integration-branch HEAD
+                # so operators can see full-suite health without a promotion PR.
+                "full_suite_ci_gate": full_suite_ci_gate,
             }
 
         history_rows = (
@@ -863,15 +914,11 @@ async def set_version_phase(
     # predicate. (Only the operator endpoint guards this — the internal
     # set_version_phase helper stays open for finalize/sweep/promotion flows that
     # legitimately flip phase mid-promotion.)
-    # Re-check this against the LOCKED row's last_qualification, not a stale read.
-    _qual_state = _release_version.summarize_qualification_state(
-        open_ver.last_qualification
-    )
-    if (
-        _qual_state
-        and _qual_state.get("state") in _release_version.PROMOTION_BLOCKING_STATES
-    ):
-        if _qual_state.get("state") == "promotion_check_wait":
+    # Re-check against the LOCKED row with finalized-verdict substitution so a
+    # stale-pending+finalized-verdict is not misclassified as still-blocking.
+    _promo_state = await resolve_promotion_blocking_result(session, open_ver)
+    if _promo_state is not None:
+        if _promo_state.get("status") == "promotion_check_wait":
             detail = (
                 "a migration-carrying promotion PR is open and waiting for "
                 "required checks — Blueprint will retry the merge automatically; "
@@ -882,14 +929,14 @@ async def set_version_phase(
                 "a promotion PR is open and auto-merging — wait for it to land or "
                 "cancel it before changing the phase"
             )
-        pr_number = _qual_state.get("promotion_pr_number")
+        pr_number = _promo_state.get("promotion_pr_number")
         if pr_number is not None:
             detail += f" (PR #{pr_number}"
-            pr_url = _qual_state.get("promotion_pr_url")
+            pr_url = _promo_state.get("promotion_pr_url")
             if pr_url:
                 detail += f" {pr_url}"
             detail += ")"
-        detail += _release_version.format_promotion_freshness(_qual_state)
+        detail += _release_version.format_promotion_freshness(_promo_state)
         raise HTTPException(status_code=409, detail=detail)
 
     operator_id = current_user.get("email") or current_user["user_id"]
@@ -1317,13 +1364,8 @@ async def get_version_summary(
 
     aggregate_serving, artifacts = _version_serving_summary(version, project)
 
-    qualification_state = _release_version.summarize_qualification_state(
-        version.last_qualification,
-        version.serving_status,
-        version.deploy_failure_reason,
-        aggregate_serving_status=aggregate_serving["serving_status"],
-        aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-        artifact_evidence=artifacts,
+    qualification_state, _ = resolve_effective_qualification_state(
+        version, project, serving=(aggregate_serving, artifacts)
     )
 
     highlights = _release_version.build_version_highlights(
@@ -1680,13 +1722,8 @@ async def get_release_version_summary(
 
     aggregate_serving, artifacts = _version_serving_summary(version, project)
 
-    qualification_state = _release_version.summarize_qualification_state(
-        version.last_qualification,
-        version.serving_status,
-        version.deploy_failure_reason,
-        aggregate_serving_status=aggregate_serving["serving_status"],
-        aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-        artifact_evidence=artifacts,
+    qualification_state, _ = resolve_effective_qualification_state(
+        version, project, serving=(aggregate_serving, artifacts)
     )
 
     # Derive highlights from the data above — no extra I/O. Shared helper so the

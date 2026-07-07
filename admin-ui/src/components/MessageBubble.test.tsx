@@ -3,6 +3,13 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { MessageBubble } from './MessageBubble';
 import type { MessageBubbleProps, ProjectMessage } from './MessageBubble';
 
+// MarkdownContent uses React.lazy/Suspense which renders its fallback (empty span)
+// synchronously in jsdom — the lazy chunk never resolves. Replace with a passthrough
+// so getByText assertions on message content don't spuriously fail.
+vi.mock('./MarkdownContent', () => ({
+  MarkdownContent: ({ content }: { content: string }) => <span>{content}</span>,
+}));
+
 function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
   return {
     id: 'msg-1',

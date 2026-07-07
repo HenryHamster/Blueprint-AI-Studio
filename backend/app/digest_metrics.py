@@ -26,11 +26,11 @@ from app.landed_signal import has_landed_signal, merge_verification_status
 from app.models import (
     Alert,
     Project,
+    QualificationVerdict,
     Task,
     TaskStatus,
     TaskWakeRegistration,
     WakeDeliveryState,
-    ReleaseVersion,
     get_task_total_vm_cost_usd,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
@@ -1284,9 +1284,13 @@ def _compute_non_code_outcomes(
 
     Uses evaluate_task_outcome so each task type contributes its own honest
     success signal rather than appearing as a zero-output in the PR-based view.
+    Window is determined by terminal/completion time, not created_at: a task
+    created before the window but completed within it is included; a task created
+    within the window but completed before it is excluded.
     Returns an empty dict when no qualifying tasks exist in the window.
     """
     from app.task_outcomes import evaluate_task_outcome  # noqa: PLC0415
+    from app.routers.admin_analytics import _derive_completed_at
 
     success = 0
     neutral = 0
@@ -1305,7 +1309,8 @@ def _compute_non_code_outcomes(
             continue
         if isinstance((t.context or {}).get("review_loop"), dict):
             continue
-        if t.created_at is not None and t.created_at < window_start:
+        completed_at = _derive_completed_at(t)
+        if completed_at < window_start:
             continue
         outcome = evaluate_task_outcome(t)
         kind = outcome.kind
@@ -1435,8 +1440,8 @@ def compute_anomaly_adjustment_summary() -> Dict[str, Any]:
 # measurable without changing resume or conflict-resolution behavior.
 
 # Code-change ("write") task types — the ones that produce a PR and can build a
-# foundation. Mirrors ``sr_review_quality_metrics._SR_CODE_CHANGE_TYPES``.
-_WRITE_TASK_TYPES = frozenset({"create", "fix", "refactor", "migrate"})
+# foundation. Imported from sr_analytics_common to avoid re-literal drift.
+_WRITE_TASK_TYPES = frozenset(_SR_CODE_CHANGE_TYPES)
 # Two active write-tasks under DIFFERENT parents whose related-file sets overlap
 # by at least this Jaccard ratio are surfaced as a candidate duplicated
 # foundation. Deliberately conservative (strong overlap only) so the signal
@@ -3937,7 +3942,7 @@ def compute_retry_analytics(
         _attempt = (t.context or {}).get("_attempt_number") or 0
         if _attempt > 1:
             _retry_task_count += 1
-            _retry_attempt_sum += _attempt
+            _retry_attempt_sum += _attempt - 1
             _task_retry_cost = 0.0
             if (
                 t.vm_provisioned_at
@@ -4056,8 +4061,10 @@ async def compute_release_qualifier_infra_metrics(
 ) -> Dict[str, Any]:
     """Aggregate release-qualifier audit-pipeline infra failure counters.
 
-    Scans ReleaseVersion.last_qualification JSONB (one record per version,
-    latest qualification only) and returns infra counters over the digest window.
+    Scans the immutable QualificationVerdict table (one row per finalized
+    attempt) and returns infra counters over the digest window.  Using verdict
+    history rather than ReleaseVersion.last_qualification means earlier infra
+    attempts are not silently dropped when a later re-qualification succeeds.
     Returns zeroed counters when no qualifying rows exist.
 
     Counters:
@@ -4070,14 +4077,14 @@ async def compute_release_qualifier_infra_metrics(
       release_infra_failure_repeat_signature_total — infra failures matching prior signature
       release_infra_failure_repeat_different_candidate_total — repeat signature on new candidate
     """
-    stmt = select(ReleaseVersion)
+    stmt = select(QualificationVerdict).where(
+        QualificationVerdict.finalized_at >= window_start
+    )
     if project_id:
-        stmt = stmt.where(ReleaseVersion.project_id == project_id)
+        stmt = stmt.where(QualificationVerdict.project_id == project_id)
 
-    result = await session.execute(stmt.limit(10000))
-    versions = result.scalars().all()
-
-    window_iso = window_start.isoformat()
+    result = await session.execute(stmt)
+    verdicts = result.scalars().all()
 
     qualifier_runs_total = 0
     release_infra_failure_total = 0
@@ -4088,33 +4095,24 @@ async def compute_release_qualifier_infra_metrics(
     release_infra_failure_repeat_signature_total = 0
     release_infra_failure_repeat_different_candidate_total = 0
 
-    for version in versions:
-        qual = version.last_qualification
-        if not isinstance(qual, dict):
-            continue
-        finalized_at = qual.get("finalized_at")
-        if not finalized_at or finalized_at < window_iso:
-            continue
+    for verdict in verdicts:
         qualifier_runs_total += 1
-        if qual.get("status") != "infra_failure":
+        if verdict.terminal_status != "infra_failure":
             continue
         release_infra_failure_total += 1
-        if qual.get("same_error_as_prior") or qual.get(
-            "same_infra_failure_as_previous"
-        ):
+        infra = (verdict.sub_scores or {}).get("infra_failure") or {}
+        if infra.get("same_error_as_prior"):
             release_infra_failure_repeat_signature_total += 1
-        if qual.get("same_error_different_candidate") or qual.get(
-            "same_infra_failure_different_candidate"
-        ):
+        if infra.get("same_error_different_candidate"):
             release_infra_failure_repeat_different_candidate_total += 1
-        error = qual.get("error") or ""
+        error = infra.get("error") or ""
         if error == "audit_report_missing":
             audit_report_missing_count += 1
         elif error == "audit_report_parseable_but_unscoreable":
             audit_report_parseable_but_unscoreable_count += 1
         elif error == "smoketest_report_missing":
             smoketest_report_missing_count += 1
-        streak = int(qual.get("consecutive_infra_errors") or 0)
+        streak = int(infra.get("consecutive_infra_errors") or 0)
         if streak > release_infra_failure_streak_max:
             release_infra_failure_streak_max = streak
 

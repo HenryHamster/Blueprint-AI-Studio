@@ -1328,6 +1328,139 @@ class TestRecordRemediationOutcome:
         entry = project.directions[0]["remediation_history"][-1]
         assert entry["ci_failure_type"] == "test"
 
+    @pytest.mark.asyncio
+    async def test_dedup_skips_second_call_same_task_id(self, db_session):
+        """Calling _record_remediation_outcome twice for the same task does not
+        inflate remediation_attempts or duplicate remediation_history."""
+        project = make_project(directions=[{"id": "dir-1", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-dedup",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # First call records normally.
+        first = await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        assert first is True
+        assert project.directions[0]["remediation_attempts"] == 1
+        assert len(project.directions[0]["remediation_history"]) == 1
+
+        # Second call with same task must not increment attempts or add a history entry.
+        second = await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        assert second is True
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 1, "attempt count must not increment on dedup"
+        assert len(d["remediation_history"]) == 1, "history must not grow on dedup"
+
+    @pytest.mark.asyncio
+    async def test_remediation_outcome_recorded_once_per_task(self, db_session):
+        """Gate test: each unique task_id is recorded exactly once regardless of
+        how many times the function is called, while distinct tasks each land."""
+        project = make_project(directions=[{"id": "dir-2", "status": "active"}])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task_a = make_task(
+            project_id=project.id,
+            context={
+                "diagnosis_task_id": "diag-a",
+                "direction_id": "dir-2",
+                "diagnosis_fingerprint": "fp-a",
+            },
+        )
+        task_b = make_task(
+            project_id=project.id,
+            context={
+                "diagnosis_task_id": "diag-b",
+                "direction_id": "dir-2",
+                "diagnosis_fingerprint": "fp-a",
+            },
+        )
+        db_session.add(task_a)
+        db_session.add(task_b)
+        await db_session.commit()
+        await db_session.refresh(task_a)
+        await db_session.refresh(task_b)
+
+        # Record task_a twice — second call must be a no-op.
+        await _record_remediation_outcome(task_a, merged=False, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await _record_remediation_outcome(task_a, merged=False, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 1
+        assert len(d["remediation_history"]) == 1
+        assert d["remediation_history"][0]["task_id"] == str(task_a.id)
+
+        # Record task_b — it is a different task so it must land as a second entry.
+        await _record_remediation_outcome(task_b, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        d = project.directions[0]
+        assert d["remediation_attempts"] == 2
+        assert len(d["remediation_history"]) == 2
+        assert d["remediation_history"][1]["task_id"] == str(task_b.id)
+
+
+class TestRecordProjectRemediationOutcome:
+    """Dedup behaviour for _record_project_remediation_outcome."""
+
+    @pytest.mark.asyncio
+    async def test_dedup_skips_second_call_same_task_id(self, db_session):
+        """Calling _record_project_remediation_outcome twice for the same task
+        does not increment state['attempts'] or duplicate state['history']."""
+        project = make_project(directions=[])
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            context={},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # First call records normally.
+        first = await _record_project_remediation_outcome(
+            task, merged=True, session=db_session
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+        assert first is True
+        state = project.remediation_tracking
+        assert state["attempts"] == 1
+        assert len(state["history"]) == 1
+
+        # Second call with same task must be a no-op.
+        second = await _record_project_remediation_outcome(
+            task, merged=True, session=db_session
+        )
+        await db_session.commit()
+        await db_session.refresh(project)
+        assert second is True
+        state = project.remediation_tracking
+        assert state["attempts"] == 1, "attempt count must not increment on dedup"
+        assert len(state["history"]) == 1, "history must not grow on dedup"
+
 
 class TestRemediationSuccessPropagation:
     """Propagation of merged remediation context to sibling directions via fingerprint match."""
@@ -1385,6 +1518,43 @@ class TestRemediationSuccessPropagation:
         # Target direction still stamped normally.
         target = next(d for d in project.directions if d["id"] == "dir-1")
         assert target["last_remediation_result"] == "merged"
+
+    @pytest.mark.asyncio
+    async def test_resumed_paused_sibling_gets_grace_marker(self, db_session):
+        """A paused sibling resumed by remediation propagation gets the
+        auto_recovered_at grace marker so its frozen research_history cannot
+        immediately re-pause or zombie-retire it before a new cycle runs."""
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-shared"),
+            ]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"prompt": "Fix the shared import error."}],
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-shared",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        assert sibling["status"] == "active"
+        assert sibling.get("auto_recovered_at") is not None, (
+            "resuming a paused sibling must stamp the grace marker"
+        )
 
     @pytest.mark.asyncio
     async def test_noop_when_no_siblings_share_fingerprint(self, db_session):

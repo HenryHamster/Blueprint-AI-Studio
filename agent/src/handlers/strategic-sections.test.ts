@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   fmtScalar,
   buildSystemMaturitySection,
@@ -18,6 +21,7 @@ import {
   buildCiComplianceSection,
   buildSweepComparisonSection,
   buildPayloadStalenessSection,
+  buildCompletionDebtSection,
 } from './strategic-sections.js';
 import { buildThinkerPrompt } from '../prompts/thinker.js';
 
@@ -427,6 +431,37 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('d-aaaabbbb cited in running_update');
   });
 
+  it('renders broken criterion links (inactive + dangling) with recovery hints', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      stale_active_moves: [],
+      criterion_link_conflicts: [
+        { direction_id: 'd-1', direction_text: 'ship valve', criterion_key: 'c-dead', classification: 'inactive', recovery_hint: 'Remap to an active criterion.' },
+        { direction_id: 'd-2', direction_text: 'wrong version', criterion_key: 'c-ghost', classification: 'dangling', recovery_hint: 'Remap to a criterion in the open version.' },
+      ],
+      direction_pipeline: [],
+      counts: { criterion_link_conflicts: 2 },
+    });
+
+    expect(result).toContain('Broken criterion links — direction maps to a non-active criterion (2)');
+    expect(result).toContain('ship valve (id: d-1) → criterion c-dead is retracted or superseded — Remap to an active criterion.');
+    expect(result).toContain('wrong version (id: d-2) → criterion c-ghost is not in the open version — Remap to a criterion in the open version.');
+  });
+
+  it('omits the criterion-link section when there are no criterion conflicts', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      stale_active_moves: [],
+      direction_pipeline: [],
+      counts: {},
+    });
+    expect(result).not.toContain('Broken criterion links');
+  });
+
   it('splits the research pipeline into held / recent / waiting / in-progress / idle', () => {
     const result = buildCycleStartReconciliationSection({
       capability_contradictions: [],
@@ -579,6 +614,91 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('noisy dir (id: d-1) — 5 NOT landed, 0 landed, 0 unverifiable');
     expect(result).toContain('+3 more not-landed title(s) not shown');
     expect(result).toContain('+3 more direction(s) with drift not shown');
+  });
+
+  it('renders pending-in-open-rollup titles outside the conflict list', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      merge_accounting: [],
+      pending_in_open_rollup: [{
+        direction_id: 'd-rollup',
+        direction_text: 'pending rollup dir',
+        pending_in_open_rollup_titles: ['Feature A (merged to staging)', 'Feature B (merged to staging)'],
+        pending_in_open_rollup_titles_overflow: 0,
+        pending_in_open_rollup: 2,
+      }],
+      counts: {
+        merge_accounting: 0,
+        merge_landed: 1,
+        merge_not_landed: 0,
+        merge_unverifiable: 0,
+        merge_pending_in_open_rollup: 2,
+        merge_pending_in_open_rollup_accounting: 1,
+      },
+    });
+    expect(result).toContain('## Pending rollup merges — work awaiting squash-merge to integration branch');
+    expect(result).toContain('pending rollup dir (id: d-rollup) — 2 pending rollup merge');
+    expect(result).toContain('Feature A (merged to staging)');
+    expect(result).toContain('Feature B (merged to staging)');
+    expect(result).not.toContain('Merge-accounting drift');
+    expect(result).not.toContain('NOT landed');
+  });
+
+  it('renders qualification_surface_conflicts entries with conflict_type and description', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      qualification_surface_conflicts: [
+        { conflict_type: 'status_state_mismatch', description: "last_qualification.status='pending' but qualification_state.state='not_started' (states do not align for this status)." },
+        { conflict_type: 'criterion_coverage_vs_confidence', description: 'Confidence 85.00% meets threshold 80.00%, but only 2/5 criteria are covered.' },
+      ],
+      counts: { qualification_surface_conflicts: 2 },
+    });
+    expect(result).toContain('Qualification surface conflicts — coherence disagreements (2)');
+    expect(result).toContain("[status_state_mismatch] last_qualification.status='pending' but qualification_state.state='not_started' (states do not align for this status).");
+    expect(result).toContain('[criterion_coverage_vs_confidence] Confidence 85.00% meets threshold 80.00%, but only 2/5 criteria are covered.');
+  });
+
+  it('omits the qualification_surface_conflicts section when the array is empty or absent', () => {
+    const withEmpty = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      qualification_surface_conflicts: [],
+      counts: { qualification_surface_conflicts: 0 },
+    });
+    expect(withEmpty).not.toContain('Qualification surface conflicts');
+
+    const withAbsent = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      counts: {},
+    });
+    expect(withAbsent).not.toContain('Qualification surface conflicts');
+  });
+
+  it('shows +N more tail when counts.qualification_surface_conflicts exceeds shown entries', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      qualification_surface_conflicts: [
+        { conflict_type: 'stale_candidate_with_promotion_failed_status', description: 'Candidate currency says the pinned SHA is stale/behind HEAD, but last_qualification.status is promotion_failed.' },
+      ],
+      counts: { qualification_surface_conflicts: 4 },
+    });
+    expect(result).toContain('Qualification surface conflicts — coherence disagreements (4)');
+    expect(result).toContain('[stale_candidate_with_promotion_failed_status]');
+    expect(result).toContain('- +3 more not shown');
   });
 });
 
@@ -1277,6 +1397,73 @@ describe('buildDirSummaryText', () => {
     }]);
     expect(result).not.toContain('[SCAFFOLDING]');
   });
+
+  it('renders CHURN-RETIRE-RECOMMENDED marker and evidence when recommended', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-churn-rec',
+      text: 'churn direction recommended for retirement',
+      status: 'paused',
+      priority: 'medium',
+      total_cycles: 6,
+      auto_paused: true,
+      paused_reason: 'Unproductive: 0 PRs merged',
+      churn_retirement_recommended: true,
+      churn_retirement_evidence: {
+        churn_family_pause_count: 2,
+        threshold: 2,
+        merge_rate: 0,
+        summary: 'Paused 2x for churn with no escape; retirement recommended.',
+      },
+    }]);
+    expect(result).toContain('[CHURN-RETIRE-RECOMMENDED]');
+    expect(result).toContain('CHURN-RETIREMENT-RECOMMENDED');
+    expect(result).toContain('will NOT auto-retire');
+    expect(result).toContain('2x churn');
+  });
+
+  it('omits CHURN-RETIRE marker when churn_retirement_recommended is false or absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-no-churn-rec',
+      text: 'ordinary paused direction',
+      status: 'paused',
+      priority: 'medium',
+      total_cycles: 3,
+      auto_paused: true,
+      paused_reason: 'Unproductive: 0 PRs merged',
+      churn_retirement_recommended: false,
+    }]);
+    expect(result).not.toContain('CHURN-RETIRE');
+  });
+
+  it('renders retired_direction_grounding when present on an active direction', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-grounding',
+      text: 'Re-staffed direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 1,
+      retired_direction_grounding: {
+        direction_id: 'd-prior-001',
+        classification: 'abandoned',
+        metrics: { prs_merged: 0, cycles: 5 },
+        reason: 'stalled on flaky infra',
+      },
+    }]);
+    expect(result).toContain('d-prior-001');
+    expect(result).toContain('[abandoned]');
+    expect(result).toContain('stalled on flaky infra');
+  });
+
+  it('omits grounding section when retired_direction_grounding is absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-no-grounding',
+      text: 'Novel direction',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 2,
+    }]);
+    expect(result).not.toContain('Re-staffing of retired work');
+  });
 });
 
 describe('buildDirHealthSummary', () => {
@@ -1821,6 +2008,32 @@ describe('buildPayloadStalenessSection', () => {
     expect(result).toContain('freshness check could not be completed');
   });
 
+  it('api_unreachable verdict — renders TEMPORARY reachability warning distinct from UNKNOWN/STALE', () => {
+    const result = buildPayloadStalenessSection({
+      verdict: 'api_unreachable',
+      reason: 'github_http_502',
+      checked_at: '2026-06-30T12:00:00',
+    });
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+    expect(result).toContain('⚠ API UNREACHABLE');
+    expect(result).toContain('could not reach GitHub');
+    expect(result).toContain('github_http_502');
+    expect(result).toContain('2026-06-30T12:00:00');
+    // Key regression: must NOT push the strategist to re-ground everything as stale.
+    expect(result).toContain('TEMPORARY API-reachability problem');
+    expect(result).toContain('Do NOT re-ground');
+    // Distinct from the other verdicts — no STALE/UNKNOWN/CURRENT framing.
+    expect(result).not.toContain('⚠ STALE');
+    expect(result).not.toContain('⚠ UNKNOWN');
+    expect(result).not.toContain('Candidate is CURRENT');
+  });
+
+  it('api_unreachable verdict without reason/checked_at — still renders API UNREACHABLE section', () => {
+    const result = buildPayloadStalenessSection({ verdict: 'api_unreachable' });
+    expect(result).toContain('⚠ API UNREACHABLE');
+    expect(result).toContain('TEMPORARY API-reachability problem');
+  });
+
   it('divergence rendered — stale=true shows ⚠ STALE block with truncated SHAs (legacy payload_compiled_sha fallback)', () => {
     const result = buildPayloadStalenessSection({
       stale: true,
@@ -1982,5 +2195,277 @@ describe('buildPayloadStalenessSection', () => {
     expect(stalenessPos).toBeGreaterThan(-1);
     expect(problemModelPos).toBeGreaterThan(-1);
     expect(stalenessPos).toBeLessThan(problemModelPos);
+  });
+});
+
+describe('buildCompletionDebtSection', () => {
+  it('returns empty string for null, undefined, empty array, and empty dict', () => {
+    expect(buildCompletionDebtSection(null)).toBe('');
+    expect(buildCompletionDebtSection(undefined)).toBe('');
+    expect(buildCompletionDebtSection([])).toBe('');
+    expect(buildCompletionDebtSection({ items: [], total_open: 0 })).toBe('');
+  });
+
+  it('renders total_open from dict shape, not list length', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        { kind: 'dormant_knob', title: 'Knob X default-off', description: 'Knob X default-off', age_days: 3 },
+      ],
+      total_open: 25,
+    });
+    expect(result).toContain('25 open obligation(s)');
+    expect(result).toContain('+24 more not shown');
+    expect(result).toContain('[dormant_knob] Knob X default-off');
+    expect(result).toContain('(3d old)');
+  });
+
+  it('shows no tail note when items length equals total_open', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        { kind: 'no_ci_gate', description: 'Gate fell open', age_days: 1 },
+        { kind: 'capability_trial', description: 'Trial pending', age_days: 0 },
+      ],
+      total_open: 2,
+    });
+    expect(result).toContain('2 open obligation(s)');
+    expect(result).not.toContain('more not shown');
+  });
+
+  it('backward-compat: accepts a plain array and uses its length as total', () => {
+    const result = buildCompletionDebtSection([
+      { kind: 'seed_inventory', title: 'Legacy item', description: 'Legacy item', age_days: 10 },
+    ]);
+    expect(result).toContain('1 open obligation(s)');
+    expect(result).not.toContain('more not shown');
+    expect(result).toContain('[seed_inventory] Legacy item');
+  });
+
+  it('includes advisory footer', () => {
+    const result = buildCompletionDebtSection({ items: [{ kind: 'dormant_knob', title: 'x', description: 'x', age_days: 0 }], total_open: 1 });
+    expect(result).toContain('Address open completion debt');
+  });
+
+  it('renders the stable debt id and the disposition/linkage hint', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        { id: 'debt-abc123', kind: 'dormant_knob', title: 'Knob X default-off', description: 'Knob X default-off', age_days: 4 },
+      ],
+      total_open: 1,
+    });
+    // The stable id must be surfaced so the strategist can address it.
+    expect(result).toContain('`debt-abc123`');
+    expect(result).toContain('[dormant_knob] `debt-abc123` Knob X default-off');
+    // The disposition/linkage instruction must be present.
+    expect(result).toContain('dispose-completion-debt');
+    expect(result).toContain('"disposition":"resolved"');
+    expect(result).toContain('"debt_id":"<id>"');
+  });
+
+  it('leads with title and does NOT show bare knob value for dormant_knob row', () => {
+    // The backend sets description = title for dormant_knob to avoid "off"/"observe"
+    // being the primary label. The renderer must not show the bare knob state.
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          id: 'debt-knob1',
+          kind: 'dormant_knob',
+          title: 'Feature X shipped default-off',
+          description: 'Feature X shipped default-off',
+          age_days: 5,
+        },
+      ],
+      total_open: 1,
+    });
+    expect(result).toContain('[dormant_knob] `debt-knob1` Feature X shipped default-off');
+    // The bare knob value "off" must NOT appear as a standalone label.
+    expect(result).not.toContain('[dormant_knob] `debt-knob1` off');
+  });
+
+  it('appends description only when it differs from title', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          kind: 'no_ci_gate',
+          title: 'No-CI gate fell open',
+          description: 'Unverified merge',
+          age_days: 2,
+        },
+      ],
+      total_open: 1,
+    });
+    // Title appears as the primary label.
+    expect(result).toContain('No-CI gate fell open');
+    // Description (distinct from title) appended.
+    expect(result).toContain('Unverified merge');
+  });
+
+  it('renders linked task statuses inline', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          kind: 'no_ci_gate',
+          title: 'Gate fell open',
+          description: 'Unverified merge',
+          age_days: 1,
+          linked_tasks: [
+            { task_id: 'aaaa1111bbbb2222', status: 'IN_PROGRESS' },
+          ],
+        },
+      ],
+      total_open: 1,
+    });
+    expect(result).toContain('Linked task(s):');
+    expect(result).toContain('aaaa1111: IN_PROGRESS');
+  });
+
+  it('emits dispose nudge when a linked task is COMPLETED', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          kind: 'no_ci_gate',
+          title: 'Gate fell open',
+          description: 'Gate fell open',
+          age_days: 3,
+          linked_tasks: [
+            { task_id: 'cccc3333dddd4444', status: 'COMPLETED' },
+          ],
+        },
+      ],
+      total_open: 1,
+    });
+    expect(result).toContain('COMPLETED');
+    expect(result).toContain('dispose-completion-debt');
+    // Specifically the inline nudge for the completed task.
+    expect(result).toContain('work landed; consider dispose-completion-debt');
+  });
+
+  it('omits linked_tasks block when list is empty or absent', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          kind: 'dormant_knob',
+          title: 'Knob Y',
+          description: 'Knob Y',
+          age_days: 0,
+          linked_tasks: [],
+        },
+      ],
+      total_open: 1,
+    });
+    expect(result).not.toContain('Linked task(s)');
+  });
+});
+
+// ── Reconciliation sections fixture contract (agent render coverage) ──────────
+
+const RECON_FIXTURE_RELATIVE = 'backend/testing/__fixtures__/reconciliation_sections.json';
+
+function loadReconSectionsFixture(): { schema_version: number; list_keys: string[] } {
+  const candidates = [
+    import.meta.url.startsWith('file:')
+      ? resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', RECON_FIXTURE_RELATIVE)
+      : null,
+    resolve(process.cwd(), '..', RECON_FIXTURE_RELATIVE),
+    resolve(process.cwd(), RECON_FIXTURE_RELATIVE),
+  ].filter((p): p is string => Boolean(p));
+  const fixturePath = candidates.find(c => existsSync(c));
+  if (!fixturePath) {
+    throw new Error(`Missing reconciliation_sections fixture. Checked: ${candidates.join(', ')}`);
+  }
+  return JSON.parse(readFileSync(fixturePath, 'utf-8')) as { schema_version: number; list_keys: string[] };
+}
+
+// A recognisable marker embedded in each minimal item so we can assert the
+// renderer actually outputs it (rather than silently ignoring the key).
+const CANARY = 'recon-contract-canary-marker';
+
+// One minimal item per fixture list key, structured so the renderer's
+// conditional guard fires and the CANARY string appears in the output.
+const MINIMAL_ITEMS: Partial<Record<string, unknown[]>> = {
+  capability_contradictions: [
+    { name: CANARY, stored_status: 'working', effective_status: 'absent', missing: [] },
+  ],
+  orphaned_gaps: [
+    { gap_id: 'g-1', name: CANARY, priority: 'high' },
+  ],
+  staffed_but_deferred: [
+    { name: CANARY, priority: 'high', gap_id: 'g-1', status: 'active' },
+  ],
+  ungrounded_directions: [
+    { direction_id: 'd-1', text: CANARY, reason: 'no_gap' },
+  ],
+  stale_active_moves: [
+    { gap_name: CANARY, gap_id: 'g-1', stale_direction_ids: ['d-stale'] },
+  ],
+  direction_pipeline: [
+    { direction_id: 'd-1', text: CANARY, state: 'research_waiting_on_action', findings: 1 },
+  ],
+  merge_accounting: [
+    {
+      direction_id: 'd-1',
+      direction_text: CANARY,
+      not_landed: 1,
+      landed: 0,
+      unverifiable: 0,
+      not_landed_titles: ['pr-ghost'],
+    },
+  ],
+  pending_in_open_rollup: [
+    {
+      direction_id: 'd-1',
+      direction_text: CANARY,
+      pending_in_open_rollup: 1,
+      pending_in_open_rollup_titles: ['pr-pending'],
+    },
+  ],
+  phantom_direction_refs: [
+    { direction_id: CANARY, cited_in: 'intent' },
+  ],
+  qualification_prose_drift: [
+    { stale_sha: 'deadbeef', active_candidate_sha: '11223344', cited_in: CANARY },
+  ],
+  qualification_surface_conflicts: [
+    { conflict_type: 'canary_type', description: CANARY },
+  ],
+};
+
+describe('reconciliation_sections fixture contract (agent render coverage)', () => {
+  it('fixture has schema_version 1 and a non-empty list_keys array', () => {
+    const fixture = loadReconSectionsFixture();
+    expect(fixture.schema_version).toBe(1);
+    expect(Array.isArray(fixture.list_keys)).toBe(true);
+    expect(fixture.list_keys.length).toBeGreaterThan(0);
+  });
+
+  it('MINIMAL_ITEMS covers every fixture list key', () => {
+    const fixture = loadReconSectionsFixture();
+    const uncovered = fixture.list_keys.filter(k => !(k in MINIMAL_ITEMS));
+    expect(
+      uncovered,
+      `Test gap: add a MINIMAL_ITEMS entry for each new fixture key so the render check can run: ${uncovered.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('buildCycleStartReconciliationSection renders every fixture list key when populated', () => {
+    const fixture = loadReconSectionsFixture();
+    const missingRenderers: string[] = [];
+
+    for (const key of fixture.list_keys) {
+      const items = MINIMAL_ITEMS[key];
+      if (!items) continue; // covered by the previous test
+      const recon: Record<string, unknown> = { [key]: items, counts: {} };
+      const output = buildCycleStartReconciliationSection(recon);
+      if (!output.includes(CANARY)) {
+        missingRenderers.push(key);
+      }
+    }
+
+    expect(
+      missingRenderers,
+      `These list keys are declared in the reconciliation_sections fixture but ` +
+      `buildCycleStartReconciliationSection does not render them. ` +
+      `Add a renderer in agent/src/handlers/strategic-sections.ts: ` +
+      missingRenderers.join(', '),
+    ).toEqual([]);
   });
 });

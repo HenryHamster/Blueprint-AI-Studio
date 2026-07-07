@@ -53,6 +53,32 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "cap_pipeline_slots",
         "reserve_slots_for_types",
     ),
+    "app.orchestrator_provision": (
+        # VM provisioning + provision-failure handling (the create_task target
+        # the dispatch loop fires once a task is committed to PROVISIONING).
+        "provision_and_handle",
+    ),
+    "app.orchestrator_runner_dispatch": (
+        # Local-runner + compute-experiment dispatch cluster.
+        "RunnerDispatchSnapshot",
+        "_runner_handles_task_type",
+        "_runner_at_capacity",
+        "_load_active_runners_cache",
+        "_try_runner_dispatch",
+        "_task_requires_strategic_local_runner",
+        "_hold_strategic_local_runner_task",
+        "_try_strategic_local_required_runner_path",
+        "_num_or_none",
+        "_select_eligible_runner",
+        "_build_compute_launch_kwargs",
+        "_fail_compute_experiment_task",
+        "_dispatch_compute_experiment_directly",
+        "_deactivate_stale_runners",
+        "_fail_stale_local_runner_holds",
+        "_emit_all_accounts_blocked_stall",
+        "_RUNNER_LIVENESS_SECONDS",
+        "_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS",
+    ),
 }
 
 
@@ -181,3 +207,22 @@ class TestOrchestratorHealthModuleExists:
     def test_module_importable(self):
         mod = importlib.import_module("app.orchestrator_health")
         assert mod is not None
+
+
+class TestOrchestratorProvisionModuleExists:
+    """The extracted provisioning module must exist and be importable.
+
+    Also guards the re-export cycle: importing the leaf module first must not
+    deadlock (``provision_and_handle`` imports ``app.orchestrator`` lazily, so a
+    leaf-first import is safe) and must expose the same object the facade does.
+    """
+
+    def test_module_importable(self):
+        mod = importlib.import_module("app.orchestrator_provision")
+        assert mod is not None
+        assert hasattr(mod, "provision_and_handle")
+
+    def test_facade_reexports_same_object(self):
+        prov = importlib.import_module("app.orchestrator_provision")
+        orch = importlib.import_module("app.orchestrator")
+        assert orch.provision_and_handle is prov.provision_and_handle

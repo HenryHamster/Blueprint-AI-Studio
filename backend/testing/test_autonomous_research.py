@@ -24,13 +24,19 @@ import app.shared_state as _shared_state
 from app.models import (
     Alert,
     AlertSeverity,
+    Artifact,
+    ArtifactType,
     MessageType,
     Project,
     ProjectMessage,
     Task,
     TaskStatus,
 )
-from app.autonomous_research import _spawn_research_task
+from app.autonomous_research import _spawn_periodic_task, _spawn_research_task
+from app.autonomous_spawn_budget import (
+    classify_autonomous_spawn_budget_category,
+    compute_autonomous_spawn_budget_snapshot,
+)
 from app.research_completion import _handle_research_completion
 from app.direction_outcomes import _update_direction_research_outcomes
 from app.max_plan_pool import _max_plan_pools, _account_by_id
@@ -321,6 +327,49 @@ async def test_research_payload_includes_compute_experiment_sweeps(
     assert "Experiment arm-b" in arm_titles
     # Bodies must not be included (index entries only)
     assert all("body" not in e for e in sweeps[sweep_id])
+
+
+@pytest.mark.asyncio
+async def test_research_payload_playbook_bounded_to_keys_index(db_session):
+    """The research payload's design_doc carries only playbook key names (_playbook_keys),
+    never full verbatim content. The capped ranked selection already ships via task.playbook;
+    embedding all entries here would double the context on every agentic turn."""
+    project = Project(
+        name="Playbook Bounded Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-playbook-bounded")],
+        vision={"purpose": "test"},
+        design_doc={
+            "playbook/key-one": {"content": "Verbose playbook entry content that should not ship"},
+            "playbook/key-two": {"content": "Another verbose entry that should not ship"},
+            "playbook/pending-key": {"content": "Pending entry", "pending_source": "task-abc"},
+            "systems/sys-test": {"name": "Test System", "status": "functional"},
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(research) == 1
+    payload = research[0].first_payload
+    design_doc = payload.get("design_doc", {})
+
+    # Full playbook content must NOT be embedded in design_doc
+    for k in design_doc:
+        assert not k.startswith("playbook/"), (
+            f"Full playbook entry '{k}' was embedded verbatim — should only ship key names"
+        )
+
+    # _playbook_keys must list non-pending entries only
+    assert "_playbook_keys" in design_doc, "design_doc must carry _playbook_keys index"
+    assert set(design_doc["_playbook_keys"]) == {"key-one", "key-two"}, (
+        "pending_source entries must be excluded from _playbook_keys"
+    )
 
 
 @pytest.mark.asyncio
@@ -3090,6 +3139,351 @@ async def test_spawn_skipped_at_global_rate_limit(db_session):
         )
     finally:
         _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original
+
+
+@pytest.mark.asyncio
+async def test_autonomous_budget_classifies_downstream_churn_out_of_initiative_count(
+    db_session,
+):
+    """Downstream servicing tasks do not consume initiative budget headroom."""
+    project = Project(
+        name="Autonomous Budget Classification",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-budget01")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.now(timezone.utc)
+    parent_research = Task(
+        project_id=project.id,
+        title="Research: initiative",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(minutes=15),
+    )
+    db_session.add(parent_research)
+    await db_session.flush()
+
+    rows = [
+        Task(
+            project_id=project.id,
+            title="Create: initiative",
+            payloads=[{"type": "create", "prompt": "build the feature"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=10),
+        ),
+        Task(
+            project_id=project.id,
+            title="Review: servicing",
+            payloads=[{"type": "review", "pr_number": 101, "branch": "feature/a"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent_research.id,
+            created_at=now - timedelta(minutes=9),
+        ),
+        Task(
+            project_id=project.id,
+            title="Fix: servicing",
+            payloads=[{"type": "fix", "pr_number": 101, "branch": "feature/a"}],
+            context={"review_loop": {"pr_number": 101, "branch": "feature/a"}},
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent_research.id,
+            created_at=now - timedelta(minutes=8),
+        ),
+        Task(
+            project_id=project.id,
+            title="Perf: servicing",
+            payloads=[{"type": "perf", "prompt": "profile PR churn"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent_research.id,
+            depends_on=[str(parent_research.id)],
+            created_at=now - timedelta(minutes=7),
+        ),
+        Task(
+            project_id=project.id,
+            title="Panel Review: servicing",
+            payloads=[{"type": "panel_review", "pr_number": 101}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent_research.id,
+            created_at=now - timedelta(minutes=6),
+        ),
+        Task(
+            project_id=project.id,
+            title="Unknown: backstop",
+            payloads=[{"type": "new_future_type"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=5),
+        ),
+        Task(
+            project_id=project.id,
+            title="Old review outside window",
+            payloads=[{"type": "review", "pr_number": 44}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(hours=2),
+        ),
+        Task(
+            project_id=project.id,
+            title="User task ignored",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.QUEUED,
+            created_by="USER",
+            created_at=now - timedelta(minutes=4),
+        ),
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+
+    snapshot = await compute_autonomous_spawn_budget_snapshot(
+        db_session,
+        runtime_config={
+            **_shared_state.runtime_config,
+            "max_global_autonomous_initiative_tasks_per_hour": 3,
+        },
+        now=now,
+    )
+
+    assert snapshot.initiative_count == 2
+    assert snapshot.servicing_count == 4
+    assert snapshot.other_count == 1
+    assert snapshot.initiative_headroom == 1
+    assert snapshot.task_type_counts["initiative"] == {"create": 1, "research": 1}
+    assert snapshot.task_type_counts["servicing"] == {
+        "fix": 1,
+        "panel_review": 1,
+        "perf": 1,
+        "review": 1,
+    }
+    assert snapshot.task_type_counts["other"] == {"new_future_type": 1}
+
+
+def test_autonomous_spawn_budget_classifies_initiative_with_parent_lineage_as_servicing():
+    assert (
+        classify_autonomous_spawn_budget_category(
+            task_type="create",
+            parent_task_id=object(),
+            payload={},
+            context={},
+        )
+        == "servicing"
+    )
+    assert (
+        classify_autonomous_spawn_budget_category(
+            task_type="research",
+            depends_on=["parent-task-id"],
+            payload={},
+            context={},
+        )
+        == "servicing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_research_blocks_in_enforce_mode_when_initiative_budget_exhausted(
+    db_session,
+):
+    """Enforce mode blocks new initiative spawns once the initiative budget is spent."""
+    project = Project(
+        name="Initiative Budget Enforce",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-init-budget-enforce")],
+        vision={"purpose": "test"},
+    )
+    source_project = Project(
+        name="Budget Source",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-init-budget-source")],
+        vision={"purpose": "test"},
+    )
+    db_session.add_all([project, source_project])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(source_project)
+
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        Task(
+            project_id=source_project.id,
+            title="Research budget source",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert len(result.scalars().all()) == 0
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_spawn_research_observe_mode_allows_initiative_over_budget(
+    db_session,
+):
+    """Observe mode keeps the initiative snapshot visible without blocking the spawn."""
+    project = Project(
+        name="Initiative Budget Observe",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-init-budget-observe")],
+        vision={"purpose": "test"},
+    )
+    source_project = Project(
+        name="Budget Source Observe",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-init-budget-source-observe")],
+        vision={"purpose": "test"},
+    )
+    db_session.add_all([project, source_project])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(source_project)
+
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        Task(
+            project_id=source_project.id,
+            title="Research budget source observe",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "observe"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        spawned_tasks = result.scalars().all()
+        assert len(spawned_tasks) == 1
+        assert spawned_tasks[0].first_payload["type"] == "research"
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_spawn_periodic_task_enforce_mode_uses_runtime_categories(
+    db_session,
+):
+    """Periodic enforcement blocks when runtime categories place the task in initiative."""
+    project = Project(
+        name="Periodic Budget Enforce",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-periodic-budget-enforce")],
+        vision={"purpose": "test"},
+    )
+    source_project = Project(
+        name="Periodic Budget Source",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-periodic-budget-source")],
+        vision={"purpose": "test"},
+    )
+    db_session.add_all([project, source_project])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(source_project)
+
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        Task(
+            project_id=source_project.id,
+            title="Review budget source",
+            payloads=[{"type": "review"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    original_categories = _shared_state.runtime_config.get(
+        "autonomous_spawn_budget_categories"
+    )
+    original_periodic = _shared_state.runtime_config.get("autonomous_periodic_tasks")
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    _shared_state.runtime_config["autonomous_spawn_budget_categories"] = {
+        "initiative": ["review"],
+        "servicing": ["qa", "deps", "security_audit"],
+    }
+    _shared_state.runtime_config["autonomous_periodic_tasks"] = {
+        **(original_periodic or {}),
+        "review": {"enabled": True, "interval_hours": 1},
+    }
+    try:
+        await _spawn_periodic_task(project, "review", db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert len(result.scalars().all()) == 0
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+        _shared_state.runtime_config["autonomous_spawn_budget_categories"] = (
+            original_categories
+        )
+        _shared_state.runtime_config["autonomous_periodic_tasks"] = original_periodic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7112,10 +7506,12 @@ async def test_recent_findings_evidence_absent_when_no_findings(db_session, mock
 
 
 @pytest.mark.asyncio
-async def test_recent_findings_evidence_in_direction_summary_payload(
+async def test_recent_findings_evidence_not_in_direction_summary_payload(
     db_session, mocker
 ):
-    """recent_findings_evidence on a direction is included in the spawned research task payload."""
+    """recent_findings_evidence is NOT copied into the spawned research task payload.
+    It was moved to the claim response's direction_context (routers/agent.py) so the
+    context-prefix renderer receives it there instead of via the bulkier research payload."""
     direction_id = "d-rfe0003"
     evidence = [
         {"title": "Fix N+1 query", "claims": ["query runs 100x"], "source_refs": []}
@@ -7143,7 +7539,10 @@ async def test_recent_findings_evidence_in_direction_summary_payload(
     spawned_dirs = research[0].payloads[0].get("directions", [])
     target = next((d for d in spawned_dirs if d.get("id") == direction_id), None)
     assert target is not None
-    assert target.get("recent_findings_evidence") == evidence
+    assert "recent_findings_evidence" not in target, (
+        "recent_findings_evidence should not be in the research summary payload; "
+        "it now flows via direction_context in the claim response"
+    )
 
 
 @pytest.mark.asyncio
@@ -7384,6 +7783,307 @@ async def test_stage_dropout_breakdown(db_session):
     # rollup succeeded (research task COMPLETED) — no staging-only merges
     assert dropout.get("tasks_merged_staging_only") == 0, (
         f"Expected 0 staging-only, got {dropout}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _opened_pr type-awareness — review/fix tasks must NOT be misclassified
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_review_task_with_pr_number_counts_as_no_pr(db_session):
+    """A completed review task with pr_number in payload and no PULL_REQUEST artifact
+    must be counted as tasks_completed_no_pr, not as having opened a PR.
+    ReviewPayload.pr_number is the PR under review, not one opened by the task.
+    """
+    direction_id = "d-openedpr001"
+    direction = _active_direction(direction_id, "Opened-PR classification test")
+    project = Project(
+        name="Opened PR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = await _make_research_task(project, direction, db_session)
+
+    # A review task: pr_number is the PR being reviewed (input), not a new PR opened.
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #42",
+        payloads=[{"type": "review", "pr_number": 42, "branch": "feature/x"}],
+        status=TaskStatus.COMPLETED,
+        context={"research_task_id": str(research_task.id)},
+        parent_task_id=research_task.id,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    dirs = project.directions or []
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 1,
+                    "finding_titles": [],
+                }
+            ]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+
+    # review task with pr_number but no artifact → no-PR completion
+    assert entry.get("tasks_completed_no_pr") == 1, (
+        f"Review task with pr_number but no PULL_REQUEST artifact should count as "
+        f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
+        f"entry={entry}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_task_with_pr_artifact_does_not_count_as_no_pr(db_session):
+    """A completed create task with a PULL_REQUEST artifact must NOT appear in
+    tasks_completed_no_pr — it genuinely opened a PR.
+    """
+    direction_id = "d-openedpr002"
+    direction = _active_direction(direction_id, "Create-task PR classification")
+    project = Project(
+        name="Create PR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = await _make_research_task(project, direction, db_session)
+
+    create_task = Task(
+        project_id=project.id,
+        title="Implement feature X",
+        payloads=[{"type": "create", "prompt": "add feature X"}],
+        status=TaskStatus.COMPLETED,
+        context={"research_task_id": str(research_task.id)},
+        parent_task_id=research_task.id,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(create_task)
+    await db_session.commit()
+    await db_session.refresh(create_task)
+
+    # The create task recorded a PULL_REQUEST artifact when it opened the PR.
+    pr_artifact = Artifact(
+        task_id=create_task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/acme/repo/pull/99",
+    )
+    db_session.add(pr_artifact)
+    await db_session.commit()
+
+    dirs = project.directions or []
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 1,
+                    "finding_titles": [],
+                }
+            ]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+
+    # create task has a PULL_REQUEST artifact → it opened a PR, not a no-PR completion
+    assert entry.get("tasks_completed_no_pr") == 0, (
+        f"Create task with PULL_REQUEST artifact should NOT count as tasks_completed_no_pr; "
+        f"got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, entry={entry}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
+    """A completed fix task with pr_number in payload and no PULL_REQUEST artifact
+    must be counted as tasks_completed_no_pr.
+    Fix tasks iterate an existing PR rather than opening a new one.
+    """
+    direction_id = "d-openedpr003"
+    direction = _active_direction(direction_id, "Fix-task PR classification")
+    project = Project(
+        name="Fix PR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = await _make_research_task(project, direction, db_session)
+
+    fix_task = Task(
+        project_id=project.id,
+        title="Fix lint errors on PR #55",
+        payloads=[{"type": "fix", "prompt": "fix lints", "pr_number": 55, "branch": "feature/y"}],
+        status=TaskStatus.COMPLETED,
+        context={"research_task_id": str(research_task.id)},
+        parent_task_id=research_task.id,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    dirs = project.directions or []
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 1,
+                    "finding_titles": [],
+                }
+            ]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+
+    # fix task with pr_number but no PULL_REQUEST artifact → no-PR completion
+    assert entry.get("tasks_completed_no_pr") == 1, (
+        f"Fix task with pr_number but no PULL_REQUEST artifact should count as "
+        f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
+        f"entry={entry}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_panel_review_task_with_pr_number_counts_as_no_pr(db_session):
+    """A completed panel_review task with pr_number in payload and no PULL_REQUEST artifact
+    must be counted as tasks_completed_no_pr, not as having opened a PR.
+    PanelReviewPayload.pr_number is the PR under review (input), not one opened by the task.
+    """
+    direction_id = "d-openedpr004"
+    direction = _active_direction(direction_id, "Panel-review PR classification")
+    project = Project(
+        name="Panel Review PR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = await _make_research_task(project, direction, db_session)
+
+    panel_review_task = Task(
+        project_id=project.id,
+        title="Panel review of PR #77",
+        payloads=[{"type": "panel_review", "pr_number": 77, "branch": "feature/z"}],
+        status=TaskStatus.COMPLETED,
+        context={"research_task_id": str(research_task.id)},
+        parent_task_id=research_task.id,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(panel_review_task)
+    await db_session.commit()
+    await db_session.refresh(panel_review_task)
+
+    dirs = project.directions or []
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 1,
+                    "finding_titles": [],
+                }
+            ]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+
+    # panel_review task with pr_number but no PULL_REQUEST artifact → no-PR completion
+    assert entry.get("tasks_completed_no_pr") == 1, (
+        f"Panel_review task with pr_number but no PULL_REQUEST artifact should count as "
+        f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
+        f"entry={entry}"
     )
 
 
@@ -13192,6 +13892,129 @@ async def test_capability_verification_does_not_mutate_design_doc(db_session, mo
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-pointer normalization: path:Symbol and directory/ refs
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_system_verification_path_symbol_pointer_not_flagged_missing(
+    db_session, mocker
+):
+    """A path:Symbol module pointer resolves to the bare file, not flagged missing.
+
+    Before the fix, classify_paths_tristate passed 'models.py:Alert' raw to git,
+    which found nothing → status 'claimed_absent'.  After the fix, the :Symbol
+    suffix is stripped before the existence check, so the underlying file is found
+    and the system is reported 'verified'.
+    """
+    direction = _active_direction("d-pathsym-norm", "Improve symbol system")
+    project = Project(
+        name="PathSymbol Norm",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/alerts": {
+                "status": "mature",
+                "modules": ["backend/app/models.py:Alert"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The real _file_exists_at_head normalizes a path:Symbol pointer internally
+    # (via _normalize_module_ptr) BEFORE the existence check, so 'models.py:Alert'
+    # resolves to the bare file. Stub it faithfully: run that same real
+    # normalization, then report the bare file present. Returning True only for a
+    # normalized bare path (no residual :Symbol) is what discriminates a working
+    # normalizer (→ present, verified) from a regressed one (→ missing). This
+    # exercises the real normalizer while staying hermetic — no /tmp/workspace.
+    from app.source_ref_validation import _normalize_module_ptr
+
+    async def _exists(path, **kwargs):
+        normalized = _normalize_module_ptr(path)
+        return ":" not in normalized and "/" in normalized
+
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head", side_effect=_exists
+    )
+    # The symbol-level depth check (detect_absent_symbols → _symbol_defined_at_head)
+    # shells out to `git show` in /tmp/workspace, which does not exist in the test
+    # harness. Symbol absence is out of scope for this file-normalization test
+    # (covered by the symbol-verification tests); stub it to report none absent so
+    # the test stays hermetic and asserts only the path-normalization behavior.
+    mocker.patch(
+        "app.autonomous_research.detect_absent_symbols",
+        new=AsyncMock(return_value=[]),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    sv = payload.get("system_verification")
+    assert sv is not None, "system_verification should be present"
+    assert sv["alerts"]["status"] == "verified", (
+        f"path:Symbol module pointer should resolve to the bare file — got {sv['alerts']}"
+    )
+    assert sv["alerts"]["missing"] == [], (
+        "normalized module pointer should not land in the missing bucket"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_path_symbol_pointer_not_flagged_missing(
+    db_session, mocker
+):
+    """A path:Symbol module pointer in a capability resolves to the bare file."""
+    direction = _active_direction("d-capsym-norm", "Improve symbol capability")
+    project = Project(
+        name="CapSymbol Norm",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/auth": {
+                "status": "working",
+                "modules": ["backend/app/auth.py:verify_token"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # See the system-verification sibling above: the real _file_exists_at_head
+    # normalizes the path:Symbol suffix internally, so stub it to run that same
+    # real normalization and report the bare file present. Hermetic — no
+    # /tmp/workspace dependency.
+    from app.source_ref_validation import _normalize_module_ptr
+
+    async def _exists(path, **kwargs):
+        normalized = _normalize_module_ptr(path)
+        return ":" not in normalized and "/" in normalized
+
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head", side_effect=_exists
+    )
+    # The symbol-level check shells out to `git show` in /tmp/workspace (absent in
+    # the harness); symbol absence is out of scope here, so report none absent.
+    mocker.patch(
+        "app.autonomous_research.detect_absent_symbols",
+        new=AsyncMock(return_value=[]),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None, "capability_verification should be present"
+    assert cv["auth"]["status"] == "verified", (
+        f"path:Symbol capability module should resolve to bare file — got {cv['auth']}"
+    )
+    assert cv["auth"]["missing"] == []
+
+
 # ── Undirected (cross-cutting) research spawn guard ──────────────────────────
 
 
@@ -13326,7 +14149,12 @@ async def _add_directed_research(
     session.add(t)
     await session.commit()
     if age_minutes:
-        t.created_at = datetime.utcnow() - timedelta(minutes=age_minutes)
+        backdated = datetime.utcnow() - timedelta(minutes=age_minutes)
+        t.created_at = backdated
+        # _on_status_set auto-stamps completed_at=now() for terminal tasks;
+        # backdate it too so _derive_completed_at returns the intended age.
+        if t.completed_at is not None:
+            t.completed_at = backdated
         session.add(t)
         await session.commit()
     return t
@@ -13675,7 +14503,11 @@ async def test_spawn_allowed_when_completed_directed_research_outside_cooldown(
         )
         db_session.add(old_completed)
         await db_session.commit()
-        old_completed.created_at = datetime.utcnow() - timedelta(minutes=90)
+        backdated = datetime.utcnow() - timedelta(minutes=90)
+        old_completed.created_at = backdated
+        # Backdate completed_at too — _on_status_set stamps it at now() on init,
+        # but _derive_completed_at prefers completed_at over created_at.
+        old_completed.completed_at = backdated
         db_session.add(old_completed)
         await db_session.commit()
 
@@ -16904,4 +17736,132 @@ async def test_research_requeue_clone_reuses_inherited_staging_branch(
         f"got '{captured_branch[0]!r}'. "
         "Fix: research_completion.py must reuse inherited research_branch when "
         "rollup_pr_number is set (mirrors plan_completion.py:554-560)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_prune_block_generates_tombstone_for_completed_direction(db_session):
+    """The lifecycle prune block records retired memory for pruned terminal directions.
+
+    A direction with status='completed' is not in the live set and must appear in
+    pending_retired_memory after _process_direction_lifecycle_locked so the
+    with_vision_locked flush writes it to _recently_retired_directions.
+    """
+    from app.direction_lifecycle import _process_direction_lifecycle_locked
+
+    completed_dir = {
+        "id": "d-prune-tombstone-01",
+        "status": "completed",
+        "text": "Tombstone test direction",
+        "auto_completed_reason": "manually_completed",
+        "gap_id": "g-test",
+    }
+    project = Project(
+        name="Tombstone Test",
+        user_id="test-user-tombstone",
+        autonomous_enabled=True,
+        directions=[completed_dir],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.now(timezone.utc)
+    pending_retired_memory: list = []
+    await _process_direction_lifecycle_locked(
+        project,
+        db_session,
+        set(),
+        now,
+        pending_retired_memory=pending_retired_memory,
+    )
+
+    recorded_ids = [d.get("id") for d, _ in pending_retired_memory]
+    assert "d-prune-tombstone-01" in recorded_ids, (
+        f"Pruned completed direction must appear in pending_retired_memory; got {recorded_ids}"
+    )
+    matched_reason = next(
+        reason for d, reason in pending_retired_memory if d.get("id") == "d-prune-tombstone-01"
+    )
+    assert matched_reason == "manually_completed", (
+        f"Expected reason 'manually_completed', got {matched_reason!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_vision_lock_miss_logs_warning(db_session, mocker):
+    """When with_vision_locked returns False, a structured warning is emitted and no exception raised."""
+    from unittest.mock import AsyncMock, patch
+    from app.direction_lifecycle import _process_direction_lifecycle
+
+    completed_dir = {
+        "id": "d-lock-miss-01",
+        "status": "completed",
+        "text": "Lock miss test direction",
+        "auto_completed_reason": "manually_completed",
+        "gap_id": "g-test-lock-miss",
+    }
+    project = Project(
+        name="Lock Miss Test",
+        user_id="test-user-lock-miss",
+        autonomous_enabled=True,
+        directions=[completed_dir],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    lock_mock = AsyncMock(return_value=False)
+    with patch("app.task_locking.with_vision_locked", new=lock_mock):
+        with patch("app.direction_lifecycle.logger") as mock_logger:
+            await _process_direction_lifecycle(project, db_session, set(), datetime.now(timezone.utc))
+
+    warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+    assert any("d-lock-miss-01" in c for c in warning_calls), (
+        f"Expected warning mentioning dropped direction ID; got: {warning_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_vision_lock_timeout_logs_error_and_reraises(db_session, mocker):
+    """When with_vision_locked raises OperationalError, a structured error is logged and re-raised."""
+    from unittest.mock import patch
+    from sqlalchemy.exc import OperationalError
+    from app.direction_lifecycle import _process_direction_lifecycle
+
+    completed_dir = {
+        "id": "d-lock-timeout-01",
+        "status": "completed",
+        "text": "Lock timeout test direction",
+        "auto_completed_reason": "manually_completed",
+        "gap_id": "g-test-lock-timeout",
+    }
+    project = Project(
+        name="Lock Timeout Test",
+        user_id="test-user-lock-timeout",
+        autonomous_enabled=True,
+        directions=[completed_dir],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    op_err = OperationalError("lock timeout", None, None)
+
+    async def _raise(*args, **kwargs):
+        raise op_err
+
+    with patch("app.task_locking.with_vision_locked", new=_raise):
+        with patch("app.direction_lifecycle.logger") as mock_logger:
+            with pytest.raises(OperationalError):
+                await _process_direction_lifecycle(
+                    project, db_session, set(), datetime.now(timezone.utc)
+                )
+
+    error_calls = [str(c) for c in mock_logger.error.call_args_list]
+    assert any("d-lock-timeout-01" in c for c in error_calls), (
+        f"Expected error mentioning dropped direction ID; got: {error_calls}"
     )

@@ -71,6 +71,7 @@ import {
   writeMessagesHelper,
   writeDesignDocHelper,
   writePlaybookHelper,
+  configureResidentAgentPermissions,
   CODE_CHANGE_HELPER_GUIDANCE,
   buildCodeChangeHelperGuidance,
   codeChangeGuidanceVariant,
@@ -2262,6 +2263,17 @@ describe('configureAgentPermissions', () => {
     configureAgentPermissions('fix');
     expect(fs.unlinkSync).not.toHaveBeenCalled();
   });
+
+  it('gives the strategic resident seat an explicit read-only posture without rewriting origin', () => {
+    const result = configureResidentAgentPermissions('strategic_review');
+
+    expect(result).toEqual(['Write', 'Edit', 'NotebookEdit']);
+    expect(execFileSync).not.toHaveBeenCalled();
+    const writes = vi.mocked(fs.writeFileSync).mock.calls;
+    const hookPaths = writes.map((c) => c[0]);
+    expect(hookPaths).toContain('/tmp/workspace/.git/hooks/pre-commit');
+    expect(hookPaths).toContain('/tmp/workspace/.git/hooks/pre-push');
+  });
 });
 
 // ── getTaskTypeHints ──────────────────────────────────────────────────────────
@@ -3247,7 +3259,7 @@ describe('extractModuleInterfaces', () => {
     // Re-establish defaults so overrides from prior tests don't bleed through
     vi.mocked(fs.existsSync).mockReturnValue(false);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue('');
-    vi.mocked(execFileSync).mockReturnValue(Buffer.from('') as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
   });
 
   it('returns empty string when relatedFiles is empty', () => {
@@ -3323,7 +3335,7 @@ describe('extractModuleInterfaces', () => {
       'export function buildPrompt(): string { return ""; }\n'
     );
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\nagent/src/index.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\nagent/src/index.ts\n'
     );
     const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
     expect(result).toContain('Imported by:');
@@ -3380,8 +3392,8 @@ describe('extractModuleInterfaces', () => {
     );
     // models callers include services (in related set); services has no related callers
     vi.mocked(execFileSync)
-      .mockReturnValueOnce('backend/app/services.py\n' as unknown as ReturnType<typeof execFileSync>)
-      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+      .mockReturnValueOnce('backend/app/services.py\n')
+      .mockReturnValueOnce('');
     const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
     expect(result).toContain('## Suggested Change Order');
     expect(result).toContain('1. models.py');
@@ -3396,8 +3408,8 @@ describe('extractModuleInterfaces', () => {
     );
     // Both files' callers are outside the related set
     vi.mocked(execFileSync)
-      .mockReturnValueOnce('other/caller.py\n' as unknown as ReturnType<typeof execFileSync>)
-      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+      .mockReturnValueOnce('other/caller.py\n')
+      .mockReturnValueOnce('');
     const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
     expect(result).not.toContain('## Suggested Change Order');
   });
@@ -3409,9 +3421,9 @@ describe('extractModuleInterfaces', () => {
     );
     // models callers: [services, admin]; services callers: [admin]; admin callers: []
     vi.mocked(execFileSync)
-      .mockReturnValueOnce('backend/app/services.py\nbackend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
-      .mockReturnValueOnce('backend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
-      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+      .mockReturnValueOnce('backend/app/services.py\nbackend/app/admin.py\n')
+      .mockReturnValueOnce('backend/app/admin.py\n')
+      .mockReturnValueOnce('');
     const result = extractModuleInterfaces(null, [
       'backend/app/models.py',
       'backend/app/services.py',
@@ -3430,7 +3442,7 @@ describe('discoverAffectedConsumers', () => {
     vi.clearAllMocks();
     vi.mocked(fs.existsSync).mockReturnValue(false);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue('');
-    vi.mocked(execFileSync).mockReturnValue(Buffer.from('') as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
   });
 
   it('returns empty string when relatedFiles is empty', () => {
@@ -3439,7 +3451,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('skips test files in relatedFiles', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\n'
     );
     const result = discoverAffectedConsumers(null, ['agent/src/prompt.test.ts', 'backend/testing/test_models.py']);
     expect(result).toBe('');
@@ -3459,7 +3471,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('returns empty string when consumer files do not exist on disk', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\n'
     );
     // existsSync returns false by default — consumer file cannot be read
     const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
@@ -3468,7 +3480,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('filters out test files returned by git grep', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/prompt.test.ts\nbackend/testing/test_models.py\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/prompt.test.ts\nbackend/testing/test_models.py\n'
     );
     const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
     expect(result).toBe('');
@@ -3476,7 +3488,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('extracts named TypeScript imports from consumer files', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
@@ -3493,7 +3505,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('appends call-site usage counts to imported symbols', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     // Build a file: import line at line 0, then 79 padding lines so body starts at line 80
@@ -3517,7 +3529,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('extracts Python imports from consumer files', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'backend/app/orchestrator.py\n' as unknown as ReturnType<typeof execFileSync>
+      'backend/app/orchestrator.py\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
@@ -3533,7 +3545,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('shows consumer without imports when no import line matches', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'backend/app/main.py\n' as unknown as ReturnType<typeof execFileSync>
+      'backend/app/main.py\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     // File mentions module name but no parseable import line
@@ -3548,7 +3560,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('includes the Affected Consumers header and description', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/index.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/index.ts\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
@@ -3564,7 +3576,7 @@ describe('discoverAffectedConsumers', () => {
       `agent/src/consumers/module${i}.ts`
     ).join('\n') + '\n';
     vi.mocked(execFileSync).mockReturnValue(
-      manyConsumers as unknown as ReturnType<typeof execFileSync>
+      manyConsumers
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
@@ -4230,6 +4242,7 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
 
   it('DEFAULT_TOOL_GUIDANCE contains fingerprint used by handler structural tests', () => {
     expect(DEFAULT_TOOL_GUIDANCE).toContain('Use Grep/Glob for code search');
+    expect(DEFAULT_TOOL_GUIDANCE).toContain('./messages send --stdin');
   });
 
   it('CODE_CHANGE_HELPER_GUIDANCE contains fingerprint used by handler structural tests', () => {
@@ -4758,16 +4771,32 @@ describe('writeDesignDocHelper', () => {
   it('makes set/delete durable: a retry loop honoring Retry-After on 429/5xx', () => {
     writeDesignDocHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/design-doc'];
-    // Bounded retry loop wired to the write ops.
-    expect(script).toContain('_post_retry()');
-    expect(script).toContain('max=3');
-    expect(script).toContain('_post_retry "$(printf');
+    // Shared bounded retry function wired to the write ops (max=4, 5s/15s/30s backoff).
+    expect(script).toContain('_post_with_retry()');
+    expect(script).toContain('max=4');
+    // set and delete pipe through the shared retry wrapper.
+    expect(script).toContain('| \\\n    _post_with_retry "$API/api/agent/design-doc" "design-doc set"');
+    expect(script).toContain('| \\\n    _post_with_retry "$API/api/agent/design-doc" "design-doc delete"');
     // Retries on contention (429) and transient server errors (5xx).
     expect(script).toContain('"$http_code" = "429"');
     expect(script).toContain('"$http_code" -ge 500');
     // Honors the Retry-After header before backing off.
     expect(script).toContain('retry-after:');
     expect(script).toContain('sleep "$delay"');
+  });
+
+  it('retries curl transport failures (http_code 000) alongside 429/5xx', () => {
+    writeDesignDocHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/design-doc'];
+    // curl reports http_code "000" on a transport-level failure (connect
+    // timeout, DNS, TLS, dropped connection) — no HTTP response. The shared
+    // _post_with_retry wrapper must treat it as transient and retry, not fall
+    // through to the non-retryable else branch (which would book a network blip
+    // as a permanent write failure and silently drop the write).
+    expect(script).toContain('[ "$http_code" = "000" ]');
+    // The 000 check shares the SAME retry condition as 429 (one `if` line) so it
+    // reuses the existing backoff/sleep path rather than a separate branch.
+    expect(script).toMatch(/\[ "\$http_code" = "000" \] \|\| \[ "\$http_code" = "429" \]/);
   });
 
   it('keeps read ops (list/get) fail-fast with no retry', () => {
@@ -4803,10 +4832,11 @@ describe('writeDesignDocHelper', () => {
     expect(script).toContain('_load_agent_token()');
     expect(script).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
     expect(script).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
-    // The durable write loop re-reads the token per attempt and treats 401/403 as
+    // The shared retry wrapper re-reads the token per attempt and treats 401/403 as
     // a rotated-token retry rather than an immediate non-retryable failure.
     expect(script).toContain('_load_agent_token || return 1');
-    expect(script).toContain('[ "$http_code" = "401" ] || [ "$http_code" = "403" ]');
+    // The shared function uses -eq for numeric comparison (not string "= \"401\"").
+    expect(script).toContain('[ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]');
   });
 
   // ── Read-only mode (research / plan workspaces) ──────────────────────────────
@@ -4831,7 +4861,7 @@ describe('writeDesignDocHelper', () => {
       const script = capturedScripts['/tmp/workspace/design-doc'];
       expect(script).toContain('read-only in this workspace');
       // No durable write path is emitted at all.
-      expect(script).not.toContain('_post_retry');
+      expect(script).not.toContain('_post_with_retry');
       expect(script).not.toContain('"op":"set"');
       expect(script).not.toContain('"op":"delete"');
     });
@@ -4871,11 +4901,14 @@ describe('writeMessagesHelper', () => {
     writeMessagesHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/messages'];
     expect(script).toBeDefined();
-    expect(script).toContain('_post_strategic()');
-    expect(script).toContain('if ! response=$(printf \'%s\' "$payload" | curl $CURL_OPTS -X POST "$API/api/agent/strategic"');
+    expect(script).toContain('./messages send --stdin [type]');
+    // Uses the shared _post_with_retry function (not a private _post_strategic).
+    expect(script).toContain('_post_with_retry()');
+    // POSTs to the strategic endpoint via the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/strategic" "messages $OP"');
     expect(script).toContain("-w '\\n%{http_code}'");
     expect(script).toContain('printf \'%s\\n\' "$body" >&2');
-    expect(script).toContain('[ERROR] messages $OP failed (HTTP $http_code)');
+    expect(script).toContain('[ERROR] $op_label failed');
     expect(script).not.toContain('curl -f -sS');
 
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -4890,26 +4923,243 @@ describe('writeMessagesHelper', () => {
     }
   });
 
-  it('reads the live token, captures stdin, retries once on 401, and fails loud (resident write-token fix)', async () => {
+  it('reads the live token, captures stdin, retries on 401, and fails loud (resident write-token fix)', async () => {
     writeMessagesHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/messages'];
     // Fresh live-token resolution with env fallback (no stale hard-`:?` snapshot).
     expect(script).toContain('_load_agent_token()');
     expect(script).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
     expect(script).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
-    // The JSON body is captured from stdin ONCE so the 401 path can re-send it.
+    expect(script).toContain('CONTENT="$(cat)"');
+    // The JSON body is captured from stdin ONCE via payload=$(cat) in _post_with_retry.
     expect(script).toContain('payload=$(cat)');
     expect(script).toContain('_load_agent_token || return 1');
-    // 401/403 → re-read the rotated token and retry once...
-    expect(script).toContain('re-reading rotated agent token and retrying once');
-    // ...else fail LOUD ("restart the resident session") rather than silently.
-    expect(script).toContain('restart the resident session');
+    // 401/403 → re-read the rotated token and retry via the shared wrapper.
+    expect(script).toContain('re-reading rotated agent token and retrying');
+    // ...else fail LOUD ("restart the session") rather than silently.
+    expect(script).toContain('restart the session');
 
     // Structural change is still syntactically valid bash.
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
     const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/messages_token_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, script);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+
+  it('retries up to 3 times on 429/5xx, honors Retry-After, then fails loud', async () => {
+    writeMessagesHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    // Shared bounded retry wrapper: max=4 (3 retry slots + the initial attempt).
+    expect(script).toContain('max=4');
+    expect(script).toContain('while [ $attempt -lt $max ]');
+    // Header capture for Retry-After extraction.
+    expect(script).toContain('-D "$dump"');
+    expect(script).toContain('retry-after:');
+    expect(script).toContain('sleep "$delay"');
+    // Retries on 429 (lock contention) and 5xx (transient server error).
+    expect(script).toContain('"$http_code" = "429"');
+    expect(script).toContain('"$http_code" -ge 500');
+    // Progress message so the agent can see retry activity.
+    expect(script).toContain('[RETRY');
+    expect(script).toContain('retrying in');
+    // After all retries exhausted, surfaces a real error via the shared wrapper.
+    expect(script).toContain('[ERROR] $op_label failed after $max attempts');
+
+    // Generated script must be syntactically valid bash.
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/messages_429_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, script);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+});
+
+// ── writeMessagesHelper stdin-based send (quote-safety) ──────────────────────
+describe('writeMessagesHelper stdin-based send', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('reads content from stdin when --stdin flag is used, MSG_TYPE from $3', () => {
+    writeMessagesHelper('task-stdin-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    expect(script).toBeDefined();
+    // --stdin flag triggers stdin mode
+    expect(script).toContain('--stdin');
+    // Content is read from stdin with double-quoted command substitution
+    expect(script).toContain('CONTENT="$(cat)"');
+    // MSG_TYPE is $3 in --stdin mode (first positional after verb and --stdin flag)
+    expect(script).toContain('MSG_TYPE="${3:-NOTE}"');
+  });
+
+  it('fails loud with a clear error when content is empty', () => {
+    writeMessagesHelper('task-stdin-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    expect(script).toContain('Error: send requires message content');
+  });
+
+  it('captures jq-built payload into PAYLOAD variable and fails loud on jq errors', () => {
+    writeMessagesHelper('task-stdin-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    expect(script).toContain('PAYLOAD=$(jq -n');
+    expect(script).toContain('[ERROR] send: failed to serialize message payload');
+    // Sends the PAYLOAD (not raw jq pipe) via _post_with_retry
+    expect(script).toContain('printf \'%s\' "$PAYLOAD" | _post_with_retry');
+  });
+
+  it('sends content with single quotes end-to-end via stdin', async () => {
+    writeMessagesHelper('task-q-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmpDir = realOs.tmpdir();
+    // Write the messages script
+    const scriptPath = realPath.join(tmpDir, `messages_quote_test_${process.pid}.sh`);
+    realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    // Mock curl: captures --data-binary stdin, writes to a file, exits 0 with 200
+    const captureFile = realPath.join(tmpDir, `messages_captured_${process.pid}.json`);
+    const mockCurlDir = realPath.join(tmpDir, `messages_mockbin_${process.pid}`);
+    realFs.mkdirSync(mockCurlDir, { recursive: true });
+    const mockCurlPath = realPath.join(mockCurlDir, 'curl');
+    realFs.writeFileSync(mockCurlPath, [
+      '#!/bin/bash',
+      `CAPTURE_FILE="${captureFile}"`,
+      '# Read piped stdin (--data-binary @-) and capture it',
+      'cat > "$CAPTURE_FILE"',
+      "echo '{\"status\":\"ok\"}'",
+      'echo "200"',
+    ].join('\n'), { mode: 0o755 });
+    const mockJqDir = realPath.join(tmpDir, `messages_mockjq_${process.pid}`);
+    realFs.mkdirSync(mockJqDir, { recursive: true });
+    const mockJqPath = realPath.join(mockJqDir, 'jq');
+    realFs.writeFileSync(mockJqPath, [
+      '#!/bin/bash',
+      '# Passthrough to real jq',
+      'exec /usr/bin/jq "$@"',
+    ].join('\n'), { mode: 0o755 });
+    const contentWithQuote = "Everything's fine and \"quoted\"";
+    try {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', '--stdin', 'NOTE'], {
+        input: contentWithQuote,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'http://mock',
+          AGENT_API_TOKEN: 'tok',
+          PATH: `${mockCurlDir}:${process.env.PATH}`,
+        },
+        timeout: 5000,
+      });
+      expect(result.status).toBe(0);
+      const captured = realFs.readFileSync(captureFile, 'utf8').trim();
+      const parsed = JSON.parse(captured) as { data: { content: string; type: string } };
+      expect(parsed.data.content).toBe(contentWithQuote);
+      expect(parsed.data.type).toBe('NOTE');
+    } finally {
+      try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
+      try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
+      try { realFs.unlinkSync(mockCurlPath); realFs.rmdirSync(mockCurlDir); } catch { /* ignore */ }
+      try { realFs.unlinkSync(mockJqPath); realFs.rmdirSync(mockJqDir); } catch { /* ignore */ }
+    }
+  });
+
+  it('sends content with newlines end-to-end via stdin', async () => {
+    writeMessagesHelper('task-nl-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmpDir = realOs.tmpdir();
+    const scriptPath = realPath.join(tmpDir, `messages_nl_test_${process.pid}.sh`);
+    realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    const captureFile = realPath.join(tmpDir, `messages_captured_nl_${process.pid}.json`);
+    const mockCurlDir = realPath.join(tmpDir, `messages_mockbin_nl_${process.pid}`);
+    realFs.mkdirSync(mockCurlDir, { recursive: true });
+    const mockCurlPath = realPath.join(mockCurlDir, 'curl');
+    realFs.writeFileSync(mockCurlPath, [
+      '#!/bin/bash',
+      `CAPTURE_FILE="${captureFile}"`,
+      'cat > "$CAPTURE_FILE"',
+      "echo '{\"status\":\"ok\"}'",
+      'echo "200"',
+    ].join('\n'), { mode: 0o755 });
+    const contentWithNewlines = 'Line one\nLine two has an apostrophe\'s content\nLine three: "quoted"';
+    try {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', '--stdin', 'BUG_REPORT'], {
+        input: contentWithNewlines,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'http://mock',
+          AGENT_API_TOKEN: 'tok',
+          PATH: `${mockCurlDir}:${process.env.PATH}`,
+        },
+        timeout: 5000,
+      });
+      expect(result.status).toBe(0);
+      const captured = realFs.readFileSync(captureFile, 'utf8').trim();
+      const parsed = JSON.parse(captured) as { data: { content: string; type: string } };
+      expect(parsed.data.content).toBe(contentWithNewlines);
+      expect(parsed.data.type).toBe('BUG_REPORT');
+    } finally {
+      try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
+      try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
+      try { realFs.unlinkSync(mockCurlPath); realFs.rmdirSync(mockCurlDir); } catch { /* ignore */ }
+    }
+  });
+
+  it('fails loud (non-zero exit + stderr message) when stdin is empty', async () => {
+    writeMessagesHelper('task-empty-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmpDir = realOs.tmpdir();
+    const scriptPath = realPath.join(tmpDir, `messages_empty_test_${process.pid}.sh`);
+    realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    try {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', '--stdin', 'NOTE'], {
+        input: '',
+        encoding: 'utf8',
+        env: { ...process.env, ORCHESTRATOR_URL: 'http://mock', AGENT_API_TOKEN: 'tok' },
+        timeout: 5000,
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('Error: send requires message content');
+    } finally {
+      try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
+    }
+  });
+
+  it('generated script passes bash -n syntax check', async () => {
+    writeMessagesHelper('task-syntax-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmp = realPath.join(realOs.tmpdir(), `messages_stdin_syntax_${process.pid}.sh`);
     realFs.writeFileSync(tmp, script);
     try {
       realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });

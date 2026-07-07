@@ -2948,6 +2948,7 @@ def _health_autonomy(args: argparse.Namespace) -> None:
     data, err = _safe_read("/api/admin/autonomous-status")
     data = data or {}
     projects = data.get("projects") or []
+    global_rate_limit = data.get("global_rate_limit") or {}
     out = {
         "projects": [
             {
@@ -2955,11 +2956,22 @@ def _health_autonomy(args: argparse.Namespace) -> None:
                 "autonomous_enabled": p.get("autonomous_enabled"),
                 "consecutive_failures": p.get("consecutive_failures", 0),
                 "tasks_spawned_last_hour": p.get("tasks_spawned_last_hour", 0),
+                "initiative_tasks_spawned_last_hour": p.get(
+                    "initiative_tasks_spawned_last_hour", 0
+                ),
+                "servicing_tasks_spawned_last_hour": p.get(
+                    "servicing_tasks_spawned_last_hour", 0
+                ),
+                "research_create_tasks_spawned_last_hour": p.get(
+                    "research_create_tasks_spawned_last_hour", 0
+                ),
                 "last_research_at": p.get("last_research_at"),
+                "global_rate_limit_headroom": global_rate_limit.get("global_headroom"),
                 "current_direction": p.get("current_direction"),
             }
             for p in projects
         ],
+        "global_rate_limit": global_rate_limit,
         "errors": {"autonomy": err} if err else {},
     }
     _emit(args, out, _render_health_autonomy)
@@ -2967,16 +2979,41 @@ def _health_autonomy(args: argparse.Namespace) -> None:
 
 def _render_health_autonomy(data: dict) -> None:
     projects = data.get("projects") or []
+    global_rate_limit = data.get("global_rate_limit") or {}
     print("=== AUTONOMY STATE ===")
     if not projects:
         print("  No projects configured.")
         return
+    if global_rate_limit:
+        print("  Global budget:")
+        print(
+            f"    total:                {global_rate_limit.get('total', 0)}/"
+            f"{global_rate_limit.get('global_cap', '?')} "
+            f"(headroom {global_rate_limit.get('global_headroom', '?')})"
+        )
+        print(
+            f"    initiative:           {global_rate_limit.get('initiative', 0)}/"
+            f"{global_rate_limit.get('initiative_cap', '?')} "
+            f"(headroom {global_rate_limit.get('initiative_headroom', '?')})"
+        )
     for p in projects:
         print(f"  Project: {p.get('project_name', '?')}")
         print(f"    enabled:              {p.get('autonomous_enabled')}")
         print(f"    consecutive_failures: {p.get('consecutive_failures', 0)}")
         print(f"    tasks_last_hour:      {p.get('tasks_spawned_last_hour', 0)}")
+        print(
+            f"    initiative_last_hour: {p.get('initiative_tasks_spawned_last_hour', 0)}"
+        )
+        print(
+            f"    servicing_last_hour:  {p.get('servicing_tasks_spawned_last_hour', 0)}"
+        )
+        print(
+            f"    research_create_hr:   {p.get('research_create_tasks_spawned_last_hour', 0)}"
+        )
         print(f"    last_research_at:     {p.get('last_research_at', 'never')}")
+        global_headroom = p.get("global_rate_limit_headroom")
+        if global_headroom is not None:
+            print(f"    global_headroom:      {global_headroom}")
         direction = p.get("current_direction") or {}
         if direction:
             print(f"    direction:            {(direction.get('summary') or '?')[:100]}")

@@ -4025,9 +4025,16 @@ async def test_create_pull_request_posts_when_no_existing_pr(mocker):
 
 
 @pytest.mark.asyncio
-async def test_create_pull_request_precheck_error_falls_through_to_post(mocker):
-    """A failing pre-check lookup must NOT block creation — it falls through to
-    the POST (best-effort idempotency)."""
+async def test_create_pull_request_precheck_error_refuses_post(mocker):
+    """FAIL-CLOSED (WI-3): a failing pre-check lookup is UNCERTAIN, not
+    "no existing PR". create_pull_request must REFUSE to POST (a POST here could
+    duplicate an existing PR once a drained GitHub quota resets) and raise a
+    retryable HTTP 503 + Retry-After instead of falling through to the POST.
+
+    This replaces the removed fail-open fall-through behavior; the fail-closed
+    contract is also covered end-to-end in
+    testing/test_github_pulls.py::test_create_pr_refuses_when_lookup_raises.
+    """
     from app.github import create_pull_request
 
     calls = []
@@ -4036,16 +4043,19 @@ async def test_create_pull_request_precheck_error_falls_through_to_post(mocker):
         calls.append(method)
         if method == "GET":
             raise RuntimeError("transient lookup failure")
-        return MockResponse(201, {"number": 555})
+        return MockResponse(201, {"number": 555})  # POST must never run
 
     mocker.patch("app.github._github_request", side_effect=fake_request)
 
-    result = await create_pull_request(
-        "tok", "owner", "repo", title="t", head="feature", base="main"
-    )
+    with pytest.raises(HTTPException) as exc_info:
+        await create_pull_request(
+            "tok", "owner", "repo", title="t", head="feature", base="main"
+        )
 
-    assert result["number"] == 555
-    assert calls == ["GET", "POST"]
+    assert exc_info.value.status_code == 503
+    assert (exc_info.value.headers or {}).get("Retry-After")
+    # Refused BEFORE any POST — only the pre-check GET happened.
+    assert calls == ["GET"]
 
 
 @pytest.mark.asyncio
@@ -4629,3 +4639,254 @@ async def test_github_budget_alert_silent_above_threshold(mocker):
     spy = mocker.patch.object(github, "_post_github_budget_alert")
     github._update_quota_state(4000, 5000, 3000, bucket_name="install")  # 80%
     assert spy.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_consumer_attribution_and_rollover_snapshot(mocker):
+    """_record_consumer_call bumps github_consumer_counts; rollover snapshots
+    the counts into github_consumer_counts_snapshot and clears the live dict;
+    _post_github_budget_alert snapshots at alert time without clearing."""
+    import app.shared_state as _ss
+    import app.github as github
+    from app.github import _record_consumer_call, _update_quota_state
+
+    # --- setup: clean state ---
+    _ss.github_consumer_counts.clear()
+    _ss.github_consumer_counts_snapshot.clear()
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    github._last_budget_alert_window = None
+
+    # --- part 1: _record_consumer_call bumps the correct consumer key ---
+    _record_consumer_call("release_qualifier", "https://api.github.com/repos/x/y/pulls")
+    _record_consumer_call("release_qualifier", "https://api.github.com/repos/x/y/pulls")
+    _record_consumer_call("ci_monitor", "https://api.github.com/repos/x/y/check-runs")
+    _record_consumer_call(None, "https://api.github.com/repos/x/y/issues")  # falls back to "unknown"
+
+    assert _ss.github_consumer_counts["release_qualifier"] == 2
+    assert _ss.github_consumer_counts["ci_monitor"] == 1
+    assert _ss.github_consumer_counts["unknown"] == 1
+
+    # --- part 2: quota-window rollover snapshots then clears ---
+    # Seed a prior reset_ts so _update_quota_state sees a new reset_ts as a rollover.
+    _ss.github_quota["reset_at"] = 9000000
+    _ss.github_quota["limit"] = 5000
+    _update_quota_state(4800, 5000, 9003600, bucket_name="install")  # new reset_ts
+
+    # Live dict is cleared after rollover.
+    assert _ss.github_consumer_counts == {}
+    # Snapshot holds the pre-rollover breakdown.
+    assert _ss.github_consumer_counts_snapshot["release_qualifier"] == 2
+    assert _ss.github_consumer_counts_snapshot["ci_monitor"] == 1
+    assert _ss.github_consumer_counts_snapshot["unknown"] == 1
+
+    # --- part 3: budget alert snapshots without clearing ---
+    _record_consumer_call("orchestrator", "https://api.github.com/repos/x/y/issues")
+    _record_consumer_call("orchestrator", "https://api.github.com/repos/x/y/issues")
+
+    mocker.patch("app.notification._send_webhook_notification")
+    github._post_github_budget_alert(800, 5000, 9003600)
+
+    # Snapshot updated with current counts; live dict still intact.
+    assert _ss.github_consumer_counts_snapshot["orchestrator"] == 2
+    assert _ss.github_consumer_counts.get("orchestrator") == 2  # not cleared
+
+
+@pytest.mark.asyncio
+async def test_off_backend_burn_estimated_from_header_drift(mocker):
+    """When X-RateLimit-Remaining drops more than local call count, the excess
+    is attributed to off-backend consumers and accumulated in
+    github_off_backend_estimate['cumulative_this_window']."""
+    import app.shared_state as _ss
+    from app.github import _update_quota_state
+
+    # Reset all relevant state.
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_call_counts.clear()
+    _ss.github_off_backend_estimate["cumulative_this_window"] = 0
+    _ss.github_off_backend_estimate["_last_remaining"] = None
+    _ss.github_off_backend_estimate["_last_backend_calls"] = 0
+
+    # First observation — establishes anchor; no diff yet.
+    _update_quota_state(1000, 5000, 9000000, bucket_name="install")
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 0
+
+    # Simulate 1 backend call counted locally, but remaining dropped by 11
+    # (10 extra calls came from external processes).
+    _ss.github_call_counts["GET /repos/{owner}/{repo}/pulls/{n}"] = 1
+    _update_quota_state(989, 5000, 9000000, bucket_name="install")
+    # observed_drop=11, local_delta=1 -> drift=10
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 10
+
+    # Another observation: remaining drops by 6, 5 more backend calls recorded.
+    _ss.github_call_counts["GET /repos/{owner}/{repo}/pulls/{n}"] = 6
+    _update_quota_state(983, 5000, 9000000, bucket_name="install")
+    # observed_drop=6, local_delta=5 -> drift=1, cumulative=11
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 11
+
+
+@pytest.mark.asyncio
+async def test_off_backend_burn_zero_when_drop_equals_local_calls(mocker):
+    """When X-RateLimit-Remaining drop exactly matches the local backend call
+    count, the off-backend estimate stays at zero (no external burn)."""
+    import app.shared_state as _ss
+    from app.github import _update_quota_state
+
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_call_counts.clear()
+    _ss.github_off_backend_estimate["cumulative_this_window"] = 0
+    _ss.github_off_backend_estimate["_last_remaining"] = None
+    _ss.github_off_backend_estimate["_last_backend_calls"] = 0
+
+    _update_quota_state(2000, 5000, 9000001, bucket_name="install")
+
+    # 3 backend calls, remaining drops by exactly 3 — no external burn.
+    _ss.github_call_counts["GET /repos/{owner}/{repo}/issues/{n}"] = 3
+    _update_quota_state(1997, 5000, 9000001, bucket_name="install")
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 0
+
+
+@pytest.mark.asyncio
+async def test_off_backend_burn_resets_on_window_rollover(mocker):
+    """When the quota window rolls over (new reset_ts), the cumulative
+    off-backend estimate resets to zero for the new window."""
+    import app.shared_state as _ss
+    from app.github import _update_quota_state
+
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_call_counts.clear()
+    _ss.github_off_backend_estimate["cumulative_this_window"] = 0
+    _ss.github_off_backend_estimate["_last_remaining"] = None
+    _ss.github_off_backend_estimate["_last_backend_calls"] = 0
+
+    # Build up a nonzero cumulative in the first window.
+    _update_quota_state(1000, 5000, 9000100, bucket_name="install")
+    _ss.github_call_counts["GET /repos/{owner}/{repo}/pulls/{n}"] = 1
+    _update_quota_state(990, 5000, 9000100, bucket_name="install")
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 9
+
+    # New reset_ts triggers a rollover — cumulative must reset to 0.
+    _ss.github_quota["limit"] = 5000
+    _update_quota_state(4999, 5000, 9003700, bucket_name="install")
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 0
+
+    assert _ss.github_off_backend_estimate["_last_remaining"] == 4999
+
+
+
+# ─── DEFERRABLE_QUOTA_FLOOR tests ────────────────────────────────────────────
+
+
+def test_deferrable_quota_active_false_when_unobserved():
+    """_deferrable_quota_active returns False when remaining is None (boot-time
+    safety: an unobserved bucket must never gate consumers)."""
+    import app.shared_state as _ss
+    from app.github import _deferrable_quota_active
+
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+    assert _deferrable_quota_active() is False
+
+
+def test_deferrable_quota_active_false_when_above_floor():
+    """_deferrable_quota_active returns False when remaining is at or above
+    DEFERRABLE_QUOTA_FLOOR — the floor only gates when the bucket is genuinely low."""
+    import time as _time
+
+    import app.shared_state as _ss
+    from app.github import DEFERRABLE_QUOTA_FLOOR, _deferrable_quota_active
+
+    _ss.github_quota.update(
+        {
+            "remaining": DEFERRABLE_QUOTA_FLOOR,
+            "limit": 5000,
+            "reset_at": int(_time.time()) + 3600,
+        }
+    )
+    assert _deferrable_quota_active() is False
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+
+
+def test_deferrable_quota_active_false_when_window_expired():
+    """_deferrable_quota_active returns False when the reset window has already
+    passed — a stale low reading from a previous window must not block callers."""
+    import time as _time
+
+    import app.shared_state as _ss
+    from app.github import DEFERRABLE_QUOTA_FLOOR, _deferrable_quota_active
+
+    _ss.github_quota.update(
+        {
+            "remaining": DEFERRABLE_QUOTA_FLOOR - 50,
+            "limit": 5000,
+            "reset_at": int(_time.time()) - 1,  # already expired
+        }
+    )
+    assert _deferrable_quota_active() is False
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+
+
+@pytest.mark.asyncio
+async def test_deferrable_consumers_respect_quota_reserve_floor(mocker):
+    """get_check_runs() and get_workflow_run_for_sha() skip their diagnostic
+    fan-out (job-log fetches, workflow-run lookup) when the install-bucket
+    remaining falls below DEFERRABLE_QUOTA_FLOOR with a reset still pending.
+    Status and conclusion are still derived from the check-run listing.
+    get_workflow_run_for_sha() returns None without firing any API call.
+    """
+    import time as _time
+
+    import app.shared_state as _ss
+    from app.github import DEFERRABLE_QUOTA_FLOOR, get_check_runs, get_workflow_run_for_sha
+
+    _ss.github_quota.update(
+        {
+            "remaining": DEFERRABLE_QUOTA_FLOOR - 50,
+            "limit": 5000,
+            "reset_at": int(_time.time()) + 3600,
+        }
+    )
+
+    check_runs_payload = {
+        "check_runs": [
+            {
+                "id": 999,
+                "name": "Backend Tests",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+    }
+    request_calls: list[tuple[str, str]] = []
+
+    async def mock_request(method, url, *args, **kwargs):
+        request_calls.append((method, url))
+        return MockResponse(200, check_runs_payload, links={})
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_check_runs("token", "owner", "repo", "deadbeef1234")
+
+    # Status and conclusion are still derived from the check-run listing data.
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "failure"
+    assert len(result["details"]) == 1
+
+    # Diagnostic fan-out was skipped entirely under the quota floor.
+    assert result["failed_logs"] == ""
+    assert result["setup_phase_failure"] is False
+    assert result["failed_run_ids"] == []
+
+    # Only the single check-runs listing call was made — no workflow/job requests.
+    assert len(request_calls) == 1, (
+        f"Expected 1 API call (check-runs listing), got {len(request_calls)}: {request_calls}"
+    )
+
+    # get_workflow_run_for_sha returns None without making any API call.
+    request_calls.clear()
+    wf_result = await get_workflow_run_for_sha("token", "owner", "repo", "deadbeef1234")
+    assert wf_result is None
+    assert len(request_calls) == 0, (
+        f"Expected 0 API calls from get_workflow_run_for_sha, got {len(request_calls)}: {request_calls}"
+    )
+
+    # Cleanup to avoid contaminating sibling tests.
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})

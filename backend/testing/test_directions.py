@@ -757,6 +757,87 @@ async def test_update_direction_priority(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
+async def test_operator_update_direction_reconciles_gap_staffing_on_status_and_gap_changes(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH re-ground/status changes keep problem-model gap staffing in sync."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project_id = await _deploy_project(client, mocker)
+    direction_id = "d-staffed"
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    project.problem_model = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": "g-old",
+                "name": "old gap",
+                "status": "active",
+                "active_moves": [direction_id],
+                "past_moves": [],
+            },
+            {
+                "id": "g-new",
+                "name": "new gap",
+                "status": "active",
+                "active_moves": [],
+                "past_moves": [],
+                "deferral": {
+                    "rationale": "parked before staffing",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            },
+        ],
+    }
+    flag_modified(project, "problem_model")
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "Move from old gap to new gap",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "gap_id": "g-old",
+            "added_at": "2026-01-01T00:00:00",
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    pause_resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"gap_id": "g-new", "status": "paused"},
+    )
+    assert pause_resp.status_code == 200, pause_resp.text
+    assert pause_resp.json()["direction"]["gap_id"] == "g-new"
+    assert pause_resp.json()["direction"]["status"] == "paused"
+
+    await db_session.refresh(project)
+    gaps = {g["id"]: g for g in project.problem_model["gaps"]}
+    assert gaps["g-old"]["active_moves"] == []
+    assert gaps["g-old"]["past_moves"] == [direction_id]
+    assert gaps["g-old"]["deferral"]["created_at"]
+    assert direction_id in gaps["g-old"]["deferral"]["rationale"]
+    assert gaps["g-new"]["active_moves"] == []
+    assert gaps["g-new"]["deferral"]["rationale"] == "parked before staffing"
+
+    active_resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "active"},
+    )
+    assert active_resp.status_code == 200, active_resp.text
+    await db_session.refresh(project)
+    gaps = {g["id"]: g for g in project.problem_model["gaps"]}
+    assert gaps["g-new"]["active_moves"] == [direction_id]
+    assert gaps["g-new"]["deferral"] is None
+
+
+@pytest.mark.asyncio
 async def test_update_direction_status_stage_sets_version_marker(
     client: AsyncClient, db_session, mocker
 ):
@@ -820,6 +901,171 @@ async def test_update_direction_status_stage_sets_version_marker(
     assert row is not None
     assert row.status == "staged"
     assert row.data["staged_for_version"] == 7
+
+
+async def _seed_churn_recommended_direction(
+    db_session,
+    project_id: str,
+    direction_id: str,
+    *,
+    gap_id: str = "g-churn",
+    churn_count: int = 2,
+) -> None:
+    """Seed a direction held PAUSED pending a keep/retire decision, staffing a gap."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    project.problem_model = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": gap_id,
+                "name": "churn gap",
+                "status": "active",
+                "active_moves": [direction_id],
+                "past_moves": [],
+            }
+        ],
+    }
+    flag_modified(project, "problem_model")
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "Zombie direction pending keep/retire decision",
+            "status": "paused",
+            "priority": "medium",
+            "paths": [],
+            "gap_id": gap_id,
+            "added_at": "2026-01-01T00:00:00",
+            "auto_paused": True,
+            "paused_reason": "Churn guardrail: repeated no-merge cycles",
+            "paused_at": "2026-06-01T00:00:00",
+            "churn_family_pause_count": churn_count,
+            "churn_pause_evidence": {"windowed_non_merge": 9},
+            "needs_manual_intervention": True,
+            "needs_manual_intervention_at": "2026-06-01T00:00:00",
+            "churn_retirement_recommended": True,
+            "churn_retirement_recommended_reason": (
+                "Retirement recommended: zombie direction paused twice."
+            ),
+            "churn_retirement_recommended_at": "2026-06-01T00:00:00",
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_churn_retirement_decision_keep_and_retire_clear_flag(
+    client: AsyncClient, db_session, mocker
+):
+    """The keep/retire decision seam clears the churn-retirement recommendation.
+
+    KEEP reactivates the held-paused direction, resets the churn-family ladder
+    counter to 0, and clears the recommendation + manual-hold flags. RETIRE
+    confirms the terminal outcome (completed/auto_completed), clears the
+    recommendation, and reconciles the freed problem-model gap.
+    """
+    # ── KEEP ────────────────────────────────────────────────────────────────
+    keep_project_id = await _deploy_project(client, mocker)
+    keep_dir = "d-keep-churn"
+    await _seed_churn_recommended_direction(db_session, keep_project_id, keep_dir)
+
+    keep_resp = await client.post(
+        f"/api/admin/projects/{keep_project_id}/directions/{keep_dir}/churn-retirement-decision",
+        json={"decision": "KEEP", "rationale": "still worth pursuing"},
+    )
+    assert keep_resp.status_code == 200, keep_resp.text
+    keep_body = keep_resp.json()
+    assert keep_body["status"] == "kept"
+    assert keep_body["decision"] == "KEEP"
+    kept = keep_body["direction"]
+    assert kept["status"] == "active"
+    # Recommendation + manual-hold residue cleared; churn ladder reset to 0.
+    assert "churn_retirement_recommended" not in kept
+    assert "churn_retirement_recommended_reason" not in kept
+    assert "needs_manual_intervention" not in kept
+    assert kept["churn_family_pause_count"] == 0
+    assert "churn_pause_evidence" not in kept
+    # Grace marker stamped so frozen history can't immediately re-pause it.
+    assert kept.get("auto_recovered_at")
+
+    # Persisted state matches the response.
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(keep_project_id))
+        )
+    ).scalar_one()
+    await db_session.refresh(project)
+    blob = next(d for d in project.directions if d["id"] == keep_dir)
+    assert blob["status"] == "active"
+    assert not blob.get("churn_retirement_recommended")
+    assert blob["churn_family_pause_count"] == 0
+
+    # Idempotent: a second KEEP on a now-decided direction is a clean no-op.
+    noop_resp = await client.post(
+        f"/api/admin/projects/{keep_project_id}/directions/{keep_dir}/churn-retirement-decision",
+        json={"decision": "KEEP"},
+    )
+    assert noop_resp.status_code == 200, noop_resp.text
+    assert noop_resp.json()["status"] == "noop"
+
+    # ── RETIRE ──────────────────────────────────────────────────────────────
+    retire_project_id = await _deploy_project(client, mocker)
+    retire_dir = "d-retire-churn"
+    await _seed_churn_recommended_direction(
+        db_session, retire_project_id, retire_dir, gap_id="g-retire"
+    )
+
+    retire_resp = await client.post(
+        f"/api/admin/projects/{retire_project_id}/directions/{retire_dir}/churn-retirement-decision",
+        json={"decision": "RETIRE", "rationale": "no path to value"},
+    )
+    assert retire_resp.status_code == 200, retire_resp.text
+    retire_body = retire_resp.json()
+    assert retire_body["status"] == "retired"
+    assert retire_body["decision"] == "RETIRE"
+    retired = retire_body["direction"]
+    assert retired["status"] == "completed"
+    assert retired["auto_completed"] is True
+    assert "decision" in retired["auto_completed_reason"].lower()
+    assert retired["completed_at"]
+    assert "churn_retirement_recommended" not in retired
+    assert "needs_manual_intervention" not in retired
+
+    # Gap reconciled: the retired direction is pruned from active_moves.
+    retire_project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(retire_project_id))
+        )
+    ).scalar_one()
+    await db_session.refresh(retire_project)
+    gap = next(g for g in retire_project.problem_model["gaps"] if g["id"] == "g-retire")
+    assert retire_dir not in gap["active_moves"]
+    assert retire_dir in gap["past_moves"]
+    # Retired-direction memory recorded so a same-gap re-spawn is blocked next cycle.
+    retired_mem = (retire_project.vision or {}).get("_recently_retired_directions") or []
+    assert any(m.get("id") == retire_dir for m in retired_mem)
+
+
+@pytest.mark.asyncio
+async def test_churn_retirement_decision_rejects_invalid_decision(
+    client: AsyncClient, db_session, mocker
+):
+    """An unknown decision value is a 400, not a silent no-op or 500."""
+    project_id = await _deploy_project(client, mocker)
+    direction_id = "d-bad-decision"
+    await _seed_churn_recommended_direction(db_session, project_id, direction_id)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/churn-retirement-decision",
+        json={"decision": "MAYBE"},
+    )
+    assert resp.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -1306,6 +1552,92 @@ async def test_manual_research_409_when_concurrent_spawn_holds_claim(
         select(Task).where(Task.idempotency_key == claim_key)
     )
     assert len(result.scalars().all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_research_409_semi_modern_current_direction_id(
+    client: AsyncClient, db_session, mocker
+):
+    """Semi-modern fast path: a task that carries current_direction_id but no
+    idempotency key (predates the claim-key stamp) must still be detected as
+    an in-flight duplicate and return 409."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Semi-modern in flight")
+    direction_id = direction["id"]
+
+    semi_modern = Task(
+        project_id=uuid.UUID(project_id),
+        title="Research: semi-modern in flight",
+        # Has current_direction_id but no idempotency_key.
+        payloads=[
+            {
+                "type": "research",
+                "current_direction_id": direction_id,
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(semi_modern)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 409, resp.text
+    assert "in progress" in resp.text.lower()
+
+    # A different direction is unaffected.
+    other = await _add_direction(client, project_id, text="Other direction")
+    resp2 = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{other['id']}/research"
+    )
+    assert resp2.status_code == 200, resp2.text
+
+
+@pytest.mark.asyncio
+async def test_manual_research_ignores_non_research_current_direction_id(
+    client: AsyncClient, db_session, mocker
+):
+    """An active task from another workflow may still carry current_direction_id,
+    but it must not block research unless it is itself a research task."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Non-research payload")
+    direction_id = direction["id"]
+
+    blocker = Task(
+        project_id=uuid.UUID(project_id),
+        title="Create task with direction attribution",
+        payloads=[
+            {
+                "type": "create",
+                "current_direction_id": direction_id,
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(blocker)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 200, resp.text
+
+    created = await db_session.execute(
+        select(Task).where(
+            Task.project_id == uuid.UUID(project_id),
+            Task.status == TaskStatus.QUEUED,
+        )
+    )
+    assert any(
+        task.idempotency_key is not None for task in created.scalars().all()
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2780,6 +3112,80 @@ async def test_reactivation_clears_manual_intervention_state(
     assert "escalation_notification_pending" not in d
     assert "escalation_notification_retries" not in d
     assert d["remediation_attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_reactivation_stamps_grace_blocks_immediate_repause(
+    client: AsyncClient, db_session, mocker
+):
+    """Operator reactivating an auto-paused churn direction stamps grace so the
+    frozen unproductive research_history cannot immediately re-pause or
+    zombie-retire it on the next lifecycle tick until a new cycle is appended."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Churn direction")
+    direction_id = direction["id"]
+
+    # Auto-paused (churn-family) with 5 stale cycles, 0 merges — Rule 2 would fire.
+    paused_at = datetime.utcnow() - timedelta(days=1)
+    stale_history = [
+        {
+            "timestamp": (paused_at - timedelta(days=i)).isoformat(),
+            "tasks_created": 5,
+            "tasks_completed": 5,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(5, 0, -1)
+    ]
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    for d in project.directions:
+        if d["id"] == direction_id:
+            d["status"] = "paused"
+            d["auto_paused"] = True
+            d["paused_reason"] = "Unproductive: 0 PRs merged across 5 cycles"
+            d["paused_at"] = paused_at.isoformat()
+            d["research_history"] = stale_history
+            d["churn_family_pause_count"] = 1
+    flag_modified(project, "directions")
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "active"},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    assert d["status"] == "active"
+    # Grace marker stamped, counter preserved.
+    assert d.get("auto_recovered_at") is not None
+    assert d.get("churn_family_pause_count") == 1
+
+    # A lifecycle tick must NOT immediately re-pause the just-reactivated
+    # direction while the stale history predates the grace stamp.
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == direction_id)
+    assert d["status"] == "active", (
+        "grace should block immediate re-pause of an operator-reactivated direction"
+    )
+    assert d.get("auto_recovered_at") is not None
 
 
 @pytest.mark.asyncio
@@ -8483,6 +8889,98 @@ async def test_strategic_cycle_endpoint_defaults_to_main(
         assert t.first_payload.get("base_branch") == "main"
 
 
+@pytest.mark.asyncio
+async def test_manual_strategic_cycle_ignores_exhausted_initiative_budget(
+    client: AsyncClient, db_session
+):
+    """The operator /strategic-cycle path should not inherit the autonomous initiative cap."""
+    project = await _make_strategic_project(db_session, "manual strategic budget")
+    project.build_config = {"bootstrap_completed_at": "2026-01-01T00:00:00"}
+    await db_session.commit()
+
+    budget_source = Project(name="budget source", user_id="test-user-123")
+    db_session.add(budget_source)
+    await db_session.commit()
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Budget source task",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    from app.shared_state import runtime_config as _runtime_config
+
+    original_mode = _runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _runtime_config["max_global_autonomous_tasks_per_hour"]
+    _runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    try:
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-cycle",
+            params={"phase": "design_doc"},
+        )
+        assert resp.status_code == 200, resp.text
+    finally:
+        _runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = original_initiative
+        _runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_manual_strategic_review_ignores_exhausted_global_budget(
+    client: AsyncClient, db_session
+):
+    """The operator /strategic-cycle strategic_review path should ignore the autonomous backstop."""
+    project = await _make_strategic_project(db_session, "manual strategic review budget")
+    project.build_config = {"bootstrap_completed_at": "2026-01-01T00:00:00"}
+    await db_session.commit()
+
+    budget_source = Project(name="budget source global", user_id="test-user-123")
+    db_session.add(budget_source)
+    await db_session.commit()
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Budget source task",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    from app.shared_state import runtime_config as _runtime_config
+
+    original_mode = _runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _runtime_config["max_global_autonomous_tasks_per_hour"]
+    _runtime_config["autonomous_spawn_budget_mode"] = "observe"
+    _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 500
+    _runtime_config["max_global_autonomous_tasks_per_hour"] = 1
+    try:
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-cycle",
+            params={"phase": "strategic_review"},
+        )
+        assert resp.status_code == 200, resp.text
+    finally:
+        _runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = original_initiative
+        _runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
 def test_no_hardcoded_main_base_branch_in_directions_router():
     """Static guard: spawn payloads in routers/directions.py must never
     hardcode {"base_branch": "main"} — they must route through
@@ -10279,3 +10777,390 @@ async def test_strategic_api_reject_direction_cancels_queued_tasks(
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Guarded resurrection endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _churn_history(now: datetime) -> list[dict]:
+    """5 cycles that trip the churn guardrail (Rule 5): 1 merge total, ~2% rate."""
+    return [
+        {
+            "timestamp": (now - timedelta(days=5)).isoformat(),
+            "tasks_created": 10,
+            "tasks_completed": 10,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 1,  # one merge => total_merged=1, bypasses Rule 2
+        },
+        *[
+            {
+                "timestamp": (now - timedelta(days=i)).isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 10,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
+            for i in range(4, 0, -1)
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resurrect_pruned_direction_resets_ladder_and_restaffs_gap(
+    client: AsyncClient, db_session, mocker
+):
+    """End-to-end: auto-retire+prune a gap-linked direction, then resurrect it.
+
+    Asserts the resurrected direction is back in project.directions with
+    status='active', every auto-retire ladder counter reset to 0, terminal
+    residue cleared, auto_recovered_at (grace) set, and its id re-staffed into the
+    owning gap's active_moves.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.directions_repo import sync_directions
+
+    project_id = await _deploy_project(client, mocker)
+    pid = uuid.UUID(project_id)
+    now = datetime.utcnow()
+
+    # The exact terminal end-state the zombie auto-retire ladder leaves: status
+    # 'completed', auto_completed residue stamped, EVERY ladder counter primed at
+    # or above its threshold, and a gap link. This is what a raw completed->active
+    # flip cannot safely undo.
+    direction = {
+        "id": "d-resurrect-me",
+        "text": "Direction that was wrongly auto-retired",
+        "status": "completed",
+        "auto_completed": True,
+        "auto_completed_reason": (
+            "Auto-retired: zombie direction paused 2 times with no merged PRs."
+        ),
+        "completed_at": now.isoformat(),
+        "priority": "medium",
+        "paths": ["backend/app/foo.py"],
+        "added_at": "2026-01-01T00:00:00",
+        "gap_id": "g-resurrect",
+        "churn_family_pause_count": 2,
+        "lifetime_burn_pause_count": 2,
+        "code_failure_pause_count": 1,
+        "auto_pause_count": 3,
+        "churn_pause_evidence": {"non_merge_finished": 49, "merge_rate": 0.02},
+        "lifetime_burn_pause_evidence": {"lifetime_non_merge": 200},
+        "research_history": _churn_history(now),
+    }
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    project.autonomous_enabled = True
+    # Row already pruned out of the blob (as the lifecycle sweep does within one
+    # tick), and the gap already unstaffed (the retire reconciliation moved the
+    # direction from active_moves into past_moves).
+    project.directions = []
+    project.problem_model = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": "g-resurrect",
+                "name": "the gap this direction staffs",
+                "status": "active",
+                "active_moves": [],
+                "past_moves": ["d-resurrect-me"],
+            }
+        ],
+    }
+    flag_modified(project, "directions")
+    flag_modified(project, "problem_model")
+    db_session.add(project)
+    await db_session.commit()
+
+    # (a) Reproduce the append-only DirectionEvent trail the real retire+prune
+    # emits: a snapshot-carrying row is written, then pruned. The pruned event's
+    # snapshot_data is what makes a vanished direction resurrectable at all.
+    await sync_directions(db_session, pid, [direction])
+    await db_session.commit()
+    await sync_directions(db_session, pid, [])  # prune -> emits pruned snapshot event
+    await db_session.commit()
+
+    # Precondition: the direction is gone and the gap is unstaffed.
+    db_session.expire_all()
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    assert all(d.get("id") != "d-resurrect-me" for d in (project.directions or []))
+    gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-resurrect")
+    assert "d-resurrect-me" not in gap["active_moves"], "gap unstaffed before resurrect"
+
+    # (b) Resurrect via the endpoint (reconstructs from the DirectionEvent snapshot).
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/d-resurrect-me/resurrect",
+        json={"rationale": "operator confirmed this retirement was wrong"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["resurrected_at"]
+    d = body["direction"]
+
+    # (c) Clean, resurrectable end-state: ladder reset, residue stripped, grace set.
+    assert d["status"] == "active"
+    assert d["churn_family_pause_count"] == 0
+    assert d["lifetime_burn_pause_count"] == 0
+    assert d["code_failure_pause_count"] == 0
+    assert d["auto_pause_count"] == 0
+    assert "churn_pause_evidence" not in d
+    assert "lifetime_burn_pause_evidence" not in d
+    assert "auto_completed" not in d
+    assert "auto_completed_reason" not in d
+    assert "completed_at" not in d
+    assert d.get("auto_recovered_at") is not None
+    assert d.get("resurrected_at") is not None
+    # Full contract reconstructed from the snapshot even though the row was gone.
+    assert d["gap_id"] == "g-resurrect"
+    assert d["paths"] == ["backend/app/foo.py"]
+
+    # Persisted back into project.directions + gap re-staffed. Read through the
+    # GET endpoint (app session) so the assertion sees the committed write.
+    get_resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert get_resp.status_code == 200, get_resp.text
+    get_body = get_resp.json()
+    ids = [x.get("id") for x in (get_body["directions"] or [])]
+    assert "d-resurrect-me" in ids, "resurrected direction back in project.directions"
+    revived = next(
+        x for x in get_body["directions"] if x.get("id") == "d-resurrect-me"
+    )
+    assert revived["status"] == "active"
+    gap = next(
+        g for g in get_body["problem_model"]["gaps"] if g["id"] == "g-resurrect"
+    )
+    assert "d-resurrect-me" in gap["active_moves"], (
+        "resurrected direction id must be re-staffed into its gap's active_moves"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resurrect_direction_409_when_at_active_cap(
+    client: AsyncClient, db_session, mocker
+):
+    """Resurrection enforces the active-direction cap exactly like reactivation."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.shared_state import runtime_config
+
+    project_id = await _deploy_project(client, mocker)
+    pid = uuid.UUID(project_id)
+
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    project.directions = [
+        {
+            "id": "d-active-1",
+            "text": "already active",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+        },
+        {
+            "id": "d-terminal",
+            "text": "terminal direction to resurrect",
+            "status": "completed",
+            "auto_completed": True,
+            "completed_at": "2026-06-01T00:00:00",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+        },
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    prior_cap = runtime_config.get("max_active_directions")
+    runtime_config["max_active_directions"] = 1
+    try:
+        resp = await client.post(
+            f"/api/admin/projects/{project_id}/directions/d-terminal/resurrect",
+            json={},
+        )
+    finally:
+        if prior_cap is None:
+            runtime_config.pop("max_active_directions", None)
+        else:
+            runtime_config["max_active_directions"] = prior_cap
+    assert resp.status_code == 409, resp.text
+    assert "cap" in resp.json()["error"]["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_resurrect_direction_404_when_no_snapshot(
+    client: AsyncClient, db_session, mocker
+):
+    """Resurrecting a pruned direction with no event snapshot returns 404."""
+    project_id = await _deploy_project(client, mocker)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/d-never-existed/resurrect",
+        json={},
+    )
+    assert resp.status_code == 404, resp.text
+    assert "snapshot" in resp.json()["error"]["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_resurrect_snapshot_with_non_terminal_status_returns_409(
+    client: AsyncClient, db_session, mocker
+):
+    """Resurrection from a non-resurrectable snapshot (e.g. 'rejected') returns 409.
+
+    A snapshot captured while the direction was in a non-terminal, non-resurrectable
+    state (status not in {completed, expired, superseded} and auto_completed unset)
+    must be rejected by the endpoint with a 409, not silently reinserted as active.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.directions_repo import sync_directions
+
+    project_id = await _deploy_project(client, mocker)
+    pid = uuid.UUID(project_id)
+
+    # A 'rejected' direction (strategic proposal rejected — not auto-completed, not
+    # in a resurrectable terminal status). This is the state that reaches terminal
+    # via a non-retirement path, and _is_terminal_direction returns False for it.
+    rejected_direction = {
+        "id": "d-rejected-snap",
+        "text": "A rejected strategic proposal",
+        "status": "rejected",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    project.directions = []
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Write the direction into the event trail then prune it, so a snapshot
+    # exists for d-rejected-snap with status='rejected'.
+    await sync_directions(db_session, pid, [rejected_direction])
+    await db_session.commit()
+    await sync_directions(db_session, pid, [])  # prune -> emits pruned snapshot event
+    await db_session.commit()
+
+    # Resurrect endpoint must reject: snapshot status='rejected' is not resurrectable.
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/d-rejected-snap/resurrect",
+        json={"rationale": "trying to resurrect a rejected direction"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert "terminal" in resp.json()["error"]["message"].lower(), (
+        f"Expected 'terminal' in error message, got: {resp.json()['error']['message']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gap_staffing_reconcile_survives_concurrent_problem_model_write(
+    client: AsyncClient, db_session, mocker
+):
+    """Gap-staffing reconciliation on direction PATCH reads problem_model inside
+    with_problem_model_locked, not from a stale project snapshot.
+
+    Simulates the concurrent-write race: the project is loaded before the
+    directions lock is acquired, then a concurrent session modifies problem_model.
+    The endpoint must reconcile against the freshly-locked value, not the stale
+    pre-lock snapshot.  Verified by:
+
+    1. Spying on with_problem_model_locked to assert the new code path is active.
+    2. Asserting the DB reflects the correct reconciled state (direction moved
+       from g-alpha active_moves to g-beta active_moves after the PATCH).
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.task_locking import with_problem_model_locked as _orig_wpm
+
+    project_id = await _deploy_project(client, mocker)
+    pid = uuid.UUID(project_id)
+
+    direction_id = "d-concurrent-pm-test"
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "test concurrent pm direction",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "gap_id": "g-alpha",
+        }
+    ]
+    project.problem_model = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": "g-alpha",
+                "name": "alpha gap",
+                "status": "active",
+                "active_moves": [direction_id],
+                "past_moves": [],
+            },
+            {
+                "id": "g-beta",
+                "name": "beta gap",
+                "status": "active",
+                "active_moves": [],
+                "past_moves": [],
+            },
+        ],
+    }
+    flag_modified(project, "directions")
+    flag_modified(project, "problem_model")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Spy: record every invocation of with_problem_model_locked so we can
+    # assert the new locked code path is exercised (not the old stale read).
+    pm_locked_calls: list[bool] = []
+
+    async def _spy_wpm(session, project_id, mutate_fn, **kwargs):
+        pm_locked_calls.append(True)
+        return await _orig_wpm(session, project_id, mutate_fn, **kwargs)
+
+    mocker.patch("app.routers.directions.with_problem_model_locked", side_effect=_spy_wpm)
+
+    # PATCH: move direction from gap g-alpha to g-beta.  The reconciliation
+    # should (a) call with_problem_model_locked, (b) remove direction from
+    # g-alpha active_moves / add to past_moves, and (c) add it to g-beta
+    # active_moves — all using the freshly-locked PM, not a stale snapshot.
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"gap_id": "g-beta"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # (1) The new locked path was exercised.
+    assert pm_locked_calls, (
+        "with_problem_model_locked must be called for gap-staffing reconciliation "
+        "on direction PATCH — stale direct read is no longer acceptable"
+    )
+
+    # (2) Correct reconciled state in the DB. Use refresh on the existing object
+    # (same pattern as test_operator_update_direction_reconciles_gap_staffing*).
+    await db_session.refresh(project)
+    gaps = {g["id"]: g for g in project.problem_model["gaps"]}
+    assert direction_id not in gaps["g-alpha"]["active_moves"], (
+        "direction must be removed from g-alpha active_moves after gap change"
+    )
+    assert direction_id in gaps["g-alpha"]["past_moves"], (
+        "direction must appear in g-alpha past_moves after leaving the gap"
+    )
+    assert direction_id in gaps["g-beta"]["active_moves"], (
+        "direction must be added to g-beta active_moves after gap change"
+    )

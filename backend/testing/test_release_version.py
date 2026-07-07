@@ -16,15 +16,18 @@ Focus areas:
 from __future__ import annotations
 
 import contextlib
+import json
 import uuid
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app import release_version as rv
-from app.models import Project, ReleaseVersion, Task, TaskStatus
+from app import strategic_spawning as ss
+from app.models import Project, QualificationVerdict, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _utcnow
 
 
@@ -2046,6 +2049,64 @@ def test_qual_state_unknown_status_passes_through():
     assert state["state"] == "some_new_status"
 
 
+def test_qual_state_error_no_credentials_is_in_vocab():
+    """status='error' with error='no_credentials' returns state='error' ∈ vocab."""
+    state = rv.summarize_qualification_state(
+        {"status": "error", "error": "no_credentials"}
+    )
+    assert state is not None
+    assert state["state"] == "error"
+    assert state["state"] in rv.QUALIFICATION_STATE_VOCAB
+    assert state["error"] == "no_credentials"
+    # Summary must mention credentials / config problem, not a passing audit.
+    assert "credentials" in state["summary"].lower() or "config" in state["summary"].lower()
+
+
+def test_qual_state_error_forwards_sub_reason_and_detail():
+    """status='error' forwards the error sub-reason and detail into the returned dict."""
+    state = rv.summarize_qualification_state(
+        {"status": "error", "error": "sha_error", "detail": "ref not found"}
+    )
+    assert state is not None
+    assert state["state"] == "error"
+    assert state["error"] == "sha_error"
+    assert state["detail"] == "ref not found"
+    assert "ref not found" in state["summary"]
+
+
+def test_qual_state_error_spawn_failed_is_in_vocab():
+    """status='error' with error='spawn_failed' returns state='error' ∈ vocab."""
+    state = rv.summarize_qualification_state(
+        {"status": "error", "error": "spawn_failed"}
+    )
+    assert state is not None
+    assert state["state"] == "error"
+    assert state["state"] in rv.QUALIFICATION_STATE_VOCAB
+
+
+def test_qual_state_infra_failure_is_in_vocab():
+    """status='infra_failure' returns state='infra_failure' ∈ vocab."""
+    state = rv.summarize_qualification_state({"status": "infra_failure"})
+    assert state is not None
+    assert state["state"] == "infra_failure"
+    assert state["state"] in rv.QUALIFICATION_STATE_VOCAB
+    # Summary must make clear this is non-conclusive and re-qualify is needed.
+    lowered = state["summary"].lower()
+    assert "non-conclusive" in lowered or "conclusive" in lowered
+    assert "re-qualify" in lowered
+
+
+def test_qual_state_infra_failure_forwards_detail():
+    """status='infra_failure' forwards detail into the returned dict and summary."""
+    state = rv.summarize_qualification_state(
+        {"status": "infra_failure", "detail": "executor OOM"}
+    )
+    assert state is not None
+    assert state["state"] == "infra_failure"
+    assert state["detail"] == "executor OOM"
+    assert "executor OOM" in state["summary"]
+
+
 # ===========================================================================
 # TestQualificationStateVocab — pin QUALIFICATION_STATE_VOCAB contract
 # ===========================================================================
@@ -2061,26 +2122,17 @@ class TestQualificationStateVocab:
         assert vocab, "vocab must not be empty"
         assert all(isinstance(s, str) for s in vocab)
 
-    def test_contains_all_14_states(self):
-        expected = frozenset(
-            {
-                "qualifying",
-                "audit_crashed",
-                "promotion_check_wait",
-                "promotion_in_flight",
-                "promotion_failed",
-                "required_check_failed",
-                "protection_blocked_review",
-                "not_promoted",
-                "dry_run",
-                "promoted",
-                "promoted_unconfirmed",
-                "promotion_deploy_failed",
-                "promotion_confirmation_timed_out",
-                "deferred_unsynced",
-            }
+    def test_contains_all_16_states(self):
+        fixture_path = (
+            Path(__file__).parent / "__fixtures__" / "qualification_state_vocab.json"
         )
-        assert rv.QUALIFICATION_STATE_VOCAB == expected
+        fixture = json.loads(fixture_path.read_text())
+        expected = frozenset(fixture["states"])
+        assert rv.QUALIFICATION_STATE_VOCAB == expected, (
+            f"QUALIFICATION_STATE_VOCAB does not match fixture. "
+            f"Extra in vocab: {rv.QUALIFICATION_STATE_VOCAB - expected}. "
+            f"Missing from vocab: {expected - rv.QUALIFICATION_STATE_VOCAB}."
+        )
 
     def test_promotion_blocking_states_subset_of_vocab(self):
         assert rv.PROMOTION_BLOCKING_STATES <= rv.QUALIFICATION_STATE_VOCAB
@@ -2140,6 +2192,16 @@ class TestQualificationStateVocab:
             ),
             # deferred_unsynced
             ({"status": "deferred_unsynced"}, {}),
+            # error — no_credentials sub-reason
+            ({"status": "error", "error": "no_credentials"}, {}),
+            # error — sha_error sub-reason
+            ({"status": "error", "error": "sha_error"}, {}),
+            # error — spawn_failed sub-reason
+            ({"status": "error", "error": "spawn_failed"}, {}),
+            # error — unknown sub-reason (generic fallback)
+            ({"status": "error", "error": "unknown_reason"}, {}),
+            # infra_failure
+            ({"status": "infra_failure"}, {}),
         ],
     )
     def test_returned_state_is_in_vocab(self, verdict, kwargs):
@@ -2161,6 +2223,134 @@ class TestQualificationStateVocab:
             "protection_blocked_review",
         }
         assert hint_states <= rv.QUALIFICATION_STATE_VOCAB
+
+    def test_status_to_expected_states_map_covers_all_classifier_derivations(self):
+        """_QUAL_STATUS_STATE_MAP in strategic_spawning mirrors every state that
+        summarize_qualification_state can return for each raw status it covers.
+
+        Drift scenario: a new state is added under an existing status in the
+        classifier (e.g. a new "pending" sub-state) without updating the map.
+        Every strategic payload then flags a false status_state_mismatch conflict.
+        This test exercises all reachable branches for each mapped status and
+        asserts:
+          (a) each returned state is declared in _QUAL_STATUS_STATE_MAP[status], and
+          (b) every declared state in the map is reachable by at least one input
+              (no dead entries silently diverging from the classifier).
+        """
+        # Representative inputs that trigger every branch for each mapped status.
+        # Each entry is (raw_status, call_kwargs).
+        _pending_inputs = [
+            # qualifying — bare pending, no promotion sub-key
+            ({"status": "pending"}, {}),
+            # audit_crashed — pending with a terminal-failed audit child and no report
+            (
+                {"status": "pending"},
+                {"audit_child": {"task_status": "FAILED", "report": None}},
+            ),
+            # promotion_check_wait — managed_check_wait promotion
+            (
+                {"status": "pending", "promotion_pending": {"managed_check_wait": True}},
+                {},
+            ),
+            # promotion_in_flight — normal (non-managed) promotion PR open
+            (
+                {"status": "pending", "promotion_pending": {"auto_merge_enabled": True}},
+                {},
+            ),
+        ]
+        _promotion_failed_inputs = [
+            # promotion_failed (generic fallback)
+            ({"status": "promotion_failed"}, {}),
+            # required_check_failed — specific error sub-reason
+            ({"status": "promotion_failed", "error": "required_check_failed"}, {}),
+            # protection_blocked_review — specific error sub-reason
+            ({"status": "promotion_failed", "error": "protection_blocked_review"}, {}),
+        ]
+        _promoted_inputs = [
+            # promoted — no serving info (bare)
+            ({"status": "promoted"}, {}),
+            # promoted — serving confirmed
+            ({"status": "promoted"}, {"serving_status": "serving_confirmed"}),
+            # promoted_unconfirmed
+            ({"status": "promoted"}, {"serving_status": "unconfirmed"}),
+            # promotion_deploy_failed
+            ({"status": "promoted"}, {"serving_status": "deploy_failed"}),
+            # promotion_confirmation_timed_out
+            ({"status": "promoted"}, {"serving_status": "confirmation_timed_out"}),
+        ]
+        inputs_by_status = {
+            "pending": _pending_inputs,
+            "promotion_failed": _promotion_failed_inputs,
+            "promoted": _promoted_inputs,
+        }
+
+        map_under_test = ss._QUAL_STATUS_STATE_MAP
+        # Verify the map exists and covers exactly the statuses we have inputs for.
+        assert set(map_under_test.keys()) == set(inputs_by_status.keys()), (
+            "_QUAL_STATUS_STATE_MAP keys diverged from the inputs_by_status fixture — "
+            "update this test when adding or removing a top-level status from the map"
+        )
+
+        for raw_status, inputs in inputs_by_status.items():
+            declared = map_under_test[raw_status]
+            observed: set[str] = set()
+            for verdict, kwargs in inputs:
+                result = rv.summarize_qualification_state(verdict, **kwargs)
+                assert result is not None, (
+                    f"summarize_qualification_state returned None for status={raw_status!r}, "
+                    f"verdict={verdict!r}, kwargs={kwargs!r} — expected a non-None result"
+                )
+                state = result.get("state")
+                assert state in declared, (
+                    f"summarize_qualification_state returned state={state!r} for "
+                    f"status={raw_status!r} which is NOT in _QUAL_STATUS_STATE_MAP[{raw_status!r}]="
+                    f"{declared!r}. Add the new state to the map or fix the classifier."
+                )
+                observed.add(state)
+
+            # Every declared state must be reachable — dead entries in the map
+            # hide future drift.
+            unreachable = declared - observed
+            assert not unreachable, (
+                f"_QUAL_STATUS_STATE_MAP[{raw_status!r}] declares states that no input "
+                f"reached: {unreachable!r}. Either add inputs that exercise them or "
+                f"remove dead entries from the map."
+            )
+
+    def test_qual_status_state_map_pinned_to_vocab(self):
+        """Every state value declared in _QUAL_STATUS_STATE_MAP is a member of
+        QUALIFICATION_STATE_VOCAB.
+
+        Drift scenario: QUALIFICATION_STATE_VOCAB is updated (a state is added,
+        renamed, or removed) but _QUAL_STATUS_STATE_MAP is not, causing the map
+        to reference invalid/outdated states. This test catches that by requiring
+        all declared state values to be valid vocab members.
+
+        Note: This test complements test_status_to_expected_states_map_covers_all_
+        classifier_derivations by pinning the vocab-membership direction. The
+        existing reachability test ensures the map is complete (no dead entries);
+        this test ensures the map's values are valid (no drift).
+        """
+        map_under_test = ss._QUAL_STATUS_STATE_MAP
+        declared_states = set()
+        for status, states in map_under_test.items():
+            for state in states:
+                declared_states.add(state)
+
+        # Every declared state must be in the authoritative vocab
+        invalid_states = declared_states - rv.QUALIFICATION_STATE_VOCAB
+        assert not invalid_states, (
+            f"_QUAL_STATUS_STATE_MAP declares states not in QUALIFICATION_STATE_VOCAB: "
+            f"{invalid_states!r}. Either (a) update QUALIFICATION_STATE_VOCAB if these "
+            f"are legitimate new states from summarize_qualification_state, or (b) remove "
+            f"them from _QUAL_STATUS_STATE_MAP if they are no longer produced."
+        )
+
+        # Sanity check: the map should declare some states
+        assert declared_states, (
+            "_QUAL_STATUS_STATE_MAP is empty — expected at least some states to be "
+            "declared for the mapped statuses."
+        )
 
 
 # ===========================================================================
@@ -2851,6 +3041,77 @@ async def test_abandon_concurrent_race_guard_independent_of_idempotency(db_sessi
     )
 
     assert abandoned is None and new_version is None
+
+
+@pytest.mark.asyncio
+async def test_abandon_current_version_blocked_when_promotion_in_flight(db_session):
+    """abandon_current_version raises VersionCutBlockedByPromotion when the
+    version's last_qualification carries promotion_pending and no finalized
+    verdict row exists (true in-flight promotion must still block)."""
+    project = await _make_project(db_session)
+    version = await _make_open_version_row(db_session, project, version_number=5)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "dead" * 10,
+        "promotion_pending": {
+            "pr_number": 55,
+            "pr_url": "http://pr/55",
+            "enabled_at": "2026-07-01T00:00:00",
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    with pytest.raises(rv.VersionCutBlockedByPromotion) as exc_info:
+        await rv.abandon_current_version(
+            db_session, project.id, reason="operator cut", operator_id="op@example.com"
+        )
+
+    assert exc_info.value.promotion_pr_number == 55
+
+
+@pytest.mark.asyncio
+async def test_abandon_current_version_succeeds_when_verdict_finalized(db_session):
+    """Stale-pending window: last_qualification has promotion_pending but the
+    newest QualificationVerdict row already carries a finalized terminal_status.
+    abandon_current_version must NOT raise VersionCutBlockedByPromotion — the
+    promotion already resolved, so cutting is allowed."""
+    project = await _make_project(db_session)
+    version = await _make_open_version_row(db_session, project, version_number=6)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "babe" * 10,
+        "promotion_pending": {
+            "pr_number": 66,
+            "pr_url": "http://pr/66",
+            "enabled_at": "2026-07-01T00:00:00",
+        },
+    }
+    db_session.add(version)
+
+    # Finalized verdict already exists — promotion resolved.
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="babe" * 10,
+        terminal_status="promoted",
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="cut after promotion resolved",
+        operator_id="op@example.com",
+    )
+    await db_session.commit()
+
+    assert abandoned is not None and new_version is not None
+    await db_session.refresh(abandoned)
+    assert abandoned.status == "abandoned"
 
 
 # ===========================================================================

@@ -27,6 +27,7 @@ from app.drift_detection import (
     last_n_drift_snapshots,
     persist_drift_snapshot,
 )
+from app.landed_signal import NON_MERGE_UNBLOCK_REASON_KEY
 from app.models import (
     Alert,
     AlertSeverity,
@@ -310,6 +311,29 @@ async def test_window_excludes_older_tasks(
     sig = drift["by_direction"]["d-healthy"]
     assert sig["claimed_changes_count"] == 3, "out-of-window claims should be excluded"
     assert sig["actually_merged_prs"] == 3
+
+
+@pytest.mark.asyncio
+async def test_compute_direction_drift_ignores_non_integration_unblock_signal(
+    db_session,
+    project_with_directions,
+):
+    """Legacy pr_merged=True with a non-landing marker must not count as merged."""
+    project = project_with_directions
+    task = await _make_completed_task(
+        db_session,
+        project,
+        direction_id="d-overclaim",
+        pr_merged=True,
+        has_pr_artifact=True,
+    )
+    task.context[NON_MERGE_UNBLOCK_REASON_KEY] = "staging_rollup"
+    await db_session.commit()
+
+    drift = await compute_direction_drift(db_session, project)
+    sig = drift["by_direction"]["d-overclaim"]
+    assert sig["claimed_changes_count"] == 1
+    assert sig["actually_merged_prs"] == 0
 
 
 # ── Test 7: Empty project → empty signal dicts ─────────────────────────────

@@ -1,0 +1,157 @@
+/**
+ * SINGLE SOURCE OF TRUTH for the strategist's mutating operation surface.
+ *
+ * The strategist's mutating ops used to be advertised in three (four, counting
+ * the resident stream monitor) hand-maintained lists that drifted out of sync:
+ * the backend dispatch chain (routers/admin_agent_ops.py `strategic_operation`),
+ * the generated `./strategic` CLI script (strategic-helpers.ts), and the
+ * resident bootstrap prompt (strategic-resident-lib.ts). This ordered registry
+ * is the ONE place the op surface is declared; the CLI `case`/usage string and
+ * the resident prompt op list are DERIVED from it (no more hand-typed lists),
+ * and a checked-in shared manifest (`backend/app/strategic_ops_manifest.json`)
+ * mirrors it so the Python backend and the TypeScript agent stay in lockstep.
+ *
+ * Drift-guard tests keep every surface honest:
+ *  - agent-side (strategic-ops-registry.test.ts): the generated CLI + resident
+ *    prompt list EXACTLY the registry's cli/prompt-flagged aliases, and the
+ *    registry equals the shared JSON manifest.
+ *  - backend-side (test_strategic_ops_registry.py): the dispatch chain accepts
+ *    EXACTLY the registry's backend op names — every registry op has a live
+ *    handler, and every accepted op is in the registry (no silent additions).
+ *
+ * This module is intentionally pure and dependency-free (no `../index.js`, no
+ * `fs`/`ws` imports) so both the resident lib and the helper generator can
+ * import it without pulling in the heavy agent surface.
+ */
+
+export interface StrategicOpEntry {
+  /** Backend op name accepted by POST /api/agent/strategic (e.g. `stage_direction`). */
+  op: string;
+  /** CLI alias exposed by the `./strategic` script (e.g. `stage-direction`), or
+   *  null for backend ops that are intentionally NOT surfaced on the CLI. */
+  alias: string | null;
+  /** One-line description of what the op does. */
+  description: string;
+  /** True when the op appears in the generated `./strategic` CLI (case + usage). */
+  cli: boolean;
+  /** True when the op is advertised in the resident bootstrap prompt op list. */
+  prompt: boolean;
+  /** For ops with cli=false/prompt=false: WHY they are intentionally excluded
+   *  (internal-only / auto-invoked). Null for surfaced ops. Marks exclusion
+   *  explicitly rather than by omission. */
+  internalReason: string | null;
+}
+
+/**
+ * The canonical, ordered strategist mutating-op registry. Order defines the CLI
+ * `case`/usage order and the resident prompt op list order, so the first 19
+ * surfaced ops are listed in the sequence the CLI historically used; the five
+ * internal-only ops follow.
+ */
+export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
+  { op: 'set_problem_model', alias: 'set-problem-model', cli: true, prompt: true, internalReason: null,
+    description: "Replace/refresh the project's problem model (gaps, systems, priorities)." },
+  { op: 'set_running_update', alias: 'set-running-update', cli: true, prompt: true, internalReason: null,
+    description: 'Update the operator-facing running-update snapshot (markdown file input).' },
+  { op: 'reflect', alias: 'reflect', cli: true, prompt: true, internalReason: null,
+    description: 'Record a strategic self-reflection note for the cycle.' },
+  { op: 'pending_confirm', alias: 'pending-confirm', cli: true, prompt: true, internalReason: null,
+    description: 'Queue a pending user-confirmation item on the problem model.' },
+  { op: 'set_vision', alias: 'set-vision', cli: true, prompt: true, internalReason: null,
+    description: 'Update the project vision (purpose, systems, priorities, context).' },
+  { op: 'create_direction', alias: 'create-direction', cli: true, prompt: true, internalReason: null,
+    description: 'Open a new strategic direction (optionally staged for the next version).' },
+  { op: 'update_direction', alias: 'update-direction', cli: true, prompt: true, internalReason: null,
+    description: "Update an existing direction's fields, status, or gap linkage." },
+  { op: 'retire_direction', alias: 'retire-direction', cli: true, prompt: true, internalReason: null,
+    description: 'Retire a direction (expired/superseded); gated by the challenge.' },
+  { op: 'stage_direction', alias: 'stage-direction', cli: true, prompt: true, internalReason: null,
+    description: 'Stage an existing direction to begin after the current version promotes.' },
+  { op: 'approve_direction', alias: 'approve-direction', cli: true, prompt: true, internalReason: null,
+    description: 'Approve a staged/proposed direction.' },
+  { op: 'reject_direction', alias: 'reject-direction', cli: true, prompt: true, internalReason: null,
+    description: 'Reject a staged/proposed direction.' },
+  { op: 'activate_direction', alias: 'activate-direction', cli: true, prompt: true, internalReason: null,
+    description: 'Reactivate a staged or paused direction back to active.' },
+  { op: 'create_message', alias: 'create-message', cli: true, prompt: true, internalReason: null,
+    description: 'Post a message to the operator (available to all agent types).' },
+  { op: 'resolve_message', alias: 'resolve-message', cli: true, prompt: true, internalReason: null,
+    description: 'Resolve an addressed operator message (available to all agent types).' },
+  { op: 'spawn_task', alias: 'spawn-task', cli: true, prompt: true, internalReason: null,
+    description: 'Spawn an implementation/research/plan task for a direction.' },
+  { op: 'spawn_fix', alias: 'spawn-fix', cli: true, prompt: true, internalReason: null,
+    description: 'Spawn a one-time fix task.' },
+  { op: 'dispose_completion_debt', alias: 'dispose-completion-debt', cli: true, prompt: true, internalReason: null,
+    description: 'Dispose of an open completion-debt ledger entry.' },
+  { op: 'set_retirement_critiques', alias: 'set-retirement-critiques', cli: true, prompt: true, internalReason: null,
+    description: 'Record retirement critiques for the cycle.' },
+  { op: 'set_evidence_progress', alias: 'set-evidence-progress', cli: true, prompt: true, internalReason: null,
+    description: 'Record evidence-progress verdicts (gated by the challenge).' },
+  { op: 'set_acceptance_criteria', alias: 'set-acceptance-criteria', cli: true, prompt: true, internalReason: null,
+    description: 'Author acceptance criteria for a direction/task.' },
+  { op: 'record_finding_resolution', alias: 'record-finding-resolution', cli: true, prompt: true, internalReason: null,
+    description: 'Record a carried audit finding as resolved or code-verified stale in the re-qualification resolution ledger.' },
+  // ── Internal-only / auto-invoked backend ops (deliberately NOT on the CLI or
+  //    resident prompt). They are accepted by the dispatch chain but are invoked
+  //    programmatically by the one-shot cycle / operator seams, never as a
+  //    `./strategic <alias>` command. Excluded EXPLICITLY (flagged), not by
+  //    omission, so the drift-guard covers them too.
+  { op: 'decide_churn_retirement', alias: null, cli: false, prompt: false,
+    internalReason: 'Autonomous keep/retire decision for a churn/zombie-flagged direction; mirrors the operator seam and is not surfaced as a standalone CLI verb.',
+    description: 'Decide keep/retire for a direction the churn/zombie ladder paused pending review.' },
+  { op: 'declare_capability_adoption', alias: null, cli: false, prompt: false,
+    internalReason: 'Records a capability-adoption trial verdict; reserved/auto-invoked, not surfaced on the CLI.',
+    description: 'Declare a capability-adoption verdict for a named capability.' },
+  { op: 'cite_memos', alias: null, cli: false, prompt: false,
+    internalReason: 'Invoked programmatically by the one-shot cycle to record cited memo ids, not via the CLI.',
+    description: 'Record the memo task_ids the thinker cited in its analysis.' },
+  { op: 'cite_knowledge', alias: null, cli: false, prompt: false,
+    internalReason: 'Invoked programmatically by the one-shot cycle to record cited knowledge ids, not via the CLI.',
+    description: 'Record the knowledge-document ids the strategist cited in its analysis.' },
+  { op: 'set_strategic_challenge', alias: null, cli: false, prompt: false,
+    internalReason: 'Persists the independent adversarial challenge record; invoked programmatically by the cycle, not via the CLI.',
+    description: "Persist the independent adversarial second-opinion record over the strategist's self-judgments." },
+];
+
+/** Registry entries surfaced on the `./strategic` CLI, in canonical order. */
+export function cliOps(): StrategicOpEntry[] {
+  return STRATEGIC_OPS_REGISTRY.filter(e => e.cli);
+}
+
+/** Registry entries advertised in the resident bootstrap prompt, in order. */
+export function promptOps(): StrategicOpEntry[] {
+  return STRATEGIC_OPS_REGISTRY.filter(e => e.prompt);
+}
+
+/** Every backend op name the dispatch chain must accept (the full registry). */
+export function allBackendOps(): string[] {
+  return STRATEGIC_OPS_REGISTRY.map(e => e.op);
+}
+
+/** Shape of one entry in the checked-in cross-language manifest. */
+export interface StrategicOpManifestEntry {
+  op: string;
+  alias: string | null;
+  description: string;
+  cli: boolean;
+  prompt: boolean;
+  internal_reason: string | null;
+}
+
+/**
+ * Project the registry to the checked-in shared manifest shape
+ * (`backend/app/strategic_ops_manifest.json`). The manifest is the
+ * cross-language contract: the agent test asserts this equals the JSON file,
+ * and the backend test asserts the dispatch chain accepts exactly these `op`s.
+ * Rendering-only details (CLI case bodies) are deliberately excluded.
+ */
+export function strategicOpsManifest(): StrategicOpManifestEntry[] {
+  return STRATEGIC_OPS_REGISTRY.map(e => ({
+    op: e.op,
+    alias: e.alias,
+    description: e.description,
+    cli: e.cli,
+    prompt: e.prompt,
+    internal_reason: e.internalReason,
+  }));
+}

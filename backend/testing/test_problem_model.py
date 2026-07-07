@@ -33,17 +33,23 @@ from app.problem_model import (
     ProjectContext,
     SelfReflectionEntry,
     Source,
+    active_direction_gap_ids,
     append_revision_log,
     append_self_reflection,
     apply_agent_update,
     apply_user_intent_patch,
     archive_closed_gaps,
+    check_gap_id_write,
+    classify_gap_link,
     compute_model_size_signal,
     gc_problem_model,
     is_empty,
+    normalize_active_moves_writeback,
+    normalize_gap_active_moves,
     parse_problem_model,
     reconcile_gap_staffing,
     reconcile_gap_staffing_raw,
+    reconcile_gap_staffing_raw_result,
     reconcile_gaps_for_retired_directions,
 )
 
@@ -271,6 +277,50 @@ def test_archive_is_idempotent_and_preserves_prior_archive():
     assert {g.id for g in model.archived_gaps} == {"g-old", "g-closed"}
 
 
+def test_archive_closed_gaps_skips_already_archived_id():
+    """A gap already in archived_gaps must not be duplicated when it also
+    appears in gaps with status=closed -- the upstream trigger for the
+    production duplicate bug (stale strategist payload re-submits a gap that
+    was archived in a prior cycle)."""
+    model = ProblemModel(
+        gaps=[Gap(id="g-already-archived", name="done", status="closed")],
+        archived_gaps=[Gap(id="g-already-archived", name="done", status="closed")],
+    )
+    archive_closed_gaps(model)
+    # Still exactly one entry, not two.
+    assert len(model.archived_gaps) == 1
+    assert model.archived_gaps[0].id == "g-already-archived"
+    # The closed gap is removed from the active gaps list regardless.
+    assert model.gaps == []
+
+
+def test_stale_echo_of_archived_gap_does_not_duplicate_or_resurrect():
+    """A stale strategist echo must not repopulate ``gaps`` or duplicate
+    ``archived_gaps`` when it re-sends a gap id that is already archived."""
+    current = {
+        "revision": 3,
+        "archived_gaps": [
+            {"id": "g-self-qualify-ci-wedge", "name": "ci wedge", "status": "closed"},
+        ],
+    }
+    # Stale strategist payload re-submits the same gap in the active gaps list
+    # and also echoes the historical archived entry.
+    proposed = {
+        "gaps": [
+            {"id": "g-self-qualify-ci-wedge", "name": "ci wedge", "status": "active"},
+        ],
+        "archived_gaps": [
+            {"id": "g-self-qualify-ci-wedge", "name": "ci wedge", "status": "closed"},
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-07-05T00:00:00")
+    archived_ids = [g["id"] for g in new_raw["archived_gaps"]]
+    assert archived_ids.count("g-self-qualify-ci-wedge") == 1, (
+        f"duplicate archived_gaps entry: {archived_ids}"
+    )
+    assert len([g for g in new_raw["gaps"] if g["id"] == "g-self-qualify-ci-wedge"]) == 0
+
+
 # ---------------------------------------------------------------------------
 # Revision log
 # ---------------------------------------------------------------------------
@@ -421,6 +471,55 @@ def test_apply_agent_update_preserves_prior_archive_and_log():
     assert new_raw["revision_log"][1]["revision"] == 3
 
 
+def test_apply_agent_update_dedupes_archived_gaps():
+    """Agent that echoes its payload view re-appends already-archived gaps;
+    deduplication by id prevents accumulating duplicates every cycle."""
+    current = {
+        "revision": 5,
+        "archived_gaps": [
+            {"id": "g-1", "name": "gap 1", "status": "closed"},
+            {"id": "g-2", "name": "gap 2", "status": "closed"},
+            {"id": "g-3", "name": "gap 3", "status": "closed"},
+        ],
+    }
+    # Agent echoes back all three archived gaps in its payload view (common
+    # when the agent reads/edits archived gaps via strategic context).
+    proposed = {
+        "archived_gaps": [
+            {"id": "g-1", "name": "gap 1", "status": "closed"},
+            {"id": "g-2", "name": "gap 2", "status": "closed"},
+            {"id": "g-3", "name": "gap 3", "status": "closed"},
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    # Deduplication by id: the three archived gaps appear exactly once.
+    archived_ids = [g["id"] for g in new_raw["archived_gaps"]]
+    assert archived_ids == ["g-1", "g-2", "g-3"]
+    assert len(new_raw["archived_gaps"]) == 3
+
+
+def test_apply_agent_update_archived_gaps_new_entries_added():
+    """When proposed includes a gap not in current, it is added to the archive."""
+    current = {
+        "revision": 5,
+        "archived_gaps": [
+            {"id": "g-1", "name": "gap 1", "status": "closed"},
+        ],
+    }
+    # Agent echoes back the existing gap and adds a new one to the archive
+    # (e.g., manually archived or archiving after closing).
+    proposed = {
+        "archived_gaps": [
+            {"id": "g-1", "name": "gap 1", "status": "closed"},
+            {"id": "g-4", "name": "gap 4", "status": "closed"},
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    archived_ids = {g["id"] for g in new_raw["archived_gaps"]}
+    assert archived_ids == {"g-1", "g-4"}
+    assert len(new_raw["archived_gaps"]) == 2
+
+
 def test_gc_problem_model_keeps_most_recent_archived():
     """Direct unit test of eviction ordering: oldest archived gaps (by
     closed/opened timestamp) roll off, the most-recent ARCHIVED_GAPS_DURABLE_MAX
@@ -462,6 +561,47 @@ def test_gc_problem_model_noop_under_cap():
 
     assert summary == {}
     assert model.model_dump() == before
+
+
+def test_gc_problem_model_deduplicates_archived_gaps():
+    """When archived_gaps holds duplicates (same id, persisted by append-without-
+    dedup), gc_problem_model collapses them, keeping the newest by timestamp,
+    and records the heal in the summary."""
+    archived = [
+        Gap(
+            id="g-dup",
+            name="old copy",
+            status="closed",
+            closed="2026-01-01T00:00:00",
+        ),
+        Gap(
+            id="g-dup",
+            name="newer copy",
+            status="closed",
+            closed="2026-01-02T00:00:00",
+        ),
+        Gap(
+            id="g-dup",
+            name="oldest copy",
+            status="closed",
+            closed="2025-12-31T00:00:00",
+        ),
+        Gap(id="g-unique", name="solo", status="closed", closed="2026-01-03T00:00:00"),
+    ]
+    model = ProblemModel(archived_gaps=archived)
+
+    summary = gc_problem_model(model)
+
+    # 2 duplicates collapsed, 1 healed
+    assert summary["archived_gaps_deduplicated"] == 2
+    # Kept only 2 unique ids
+    assert len(model.archived_gaps) == 2
+    kept_ids = {g.id for g in model.archived_gaps}
+    assert kept_ids == {"g-dup", "g-unique"}
+    # The kept duplicate is the newest one
+    kept_dup = next(g for g in model.archived_gaps if g.id == "g-dup")
+    assert kept_dup.closed == "2026-01-02T00:00:00"
+    assert kept_dup.name == "newer copy"
 
 
 def test_apply_agent_update_caps_archived_gaps():
@@ -1473,6 +1613,63 @@ def test_apply_agent_update_does_not_preserve_agent_authored_intent():
     assert new_raw["intent"]["purpose"] == ""
 
 
+def test_apply_agent_update_heals_blank_purpose_from_user_purpose_when_source_null():
+    """Regression: purpose="" + source=null + user_purpose populated → self-heal.
+
+    This is the exact broken state that stalled strategic_review tasks: the
+    durable model had intent.purpose="" with source=null while user_purpose held
+    the operator's real text.  The source-gated guard (purpose_was_operator=False)
+    could not restore it; the new user_purpose fallback must.
+    """
+    current = {
+        "revision": 3,
+        "last_updated_by": "agent",
+        "intent": {
+            "purpose": "",
+            "current_focus": "some focus",
+            "source": None,
+            "user_purpose": "Make Blueprint handle any project well.",
+        },
+    }
+    proposed = {"intent": {"purpose": "", "current_focus": "next focus"}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    # purpose must be restored from user_purpose
+    assert new_raw["intent"]["purpose"] == "Make Blueprint handle any project well."
+    # source must be re-stamped as user_message so future cycles protect it
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    # agent-owned current_focus advances freely
+    assert new_raw["intent"]["current_focus"] == "next focus"
+
+
+def test_apply_agent_update_heals_schema_placeholder_from_user_purpose():
+    """Purpose matches a schema-placeholder pattern → healed from user_purpose."""
+    for placeholder in ("...", "<from analysis>", "<placeholder>", ""):
+        current = {
+            "revision": 1,
+            "intent": {
+                "purpose": placeholder,
+                "source": None,
+                "user_purpose": "Real operator purpose.",
+            },
+        }
+        proposed = {"intent": {"purpose": placeholder}}
+        new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+        assert new_raw["intent"]["purpose"] == "Real operator purpose.", (
+            f"Failed to heal placeholder: {placeholder!r}"
+        )
+
+
+def test_apply_agent_update_no_heal_when_user_purpose_empty():
+    """If user_purpose is also empty there is nothing to restore; stay blank."""
+    current = {
+        "revision": 1,
+        "intent": {"purpose": "", "source": None, "user_purpose": ""},
+    }
+    proposed = {"intent": {"purpose": ""}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == ""
+
+
 # ---------------------------------------------------------------------------
 # apply_agent_update — append-only gap-memory restore after payload trim
 # ---------------------------------------------------------------------------
@@ -2469,6 +2666,71 @@ def test_constraints_survive_full_agent_cycle_wipe_legacy_path():
     assert second_cycle["constraints"] == ["No breaking changes", "PCI-DSS compliance"], (
         "operator-seeded constraints must survive an agent proposal with constraints:[] "
         "even on the legacy path where provenance is lost"
+    )
+
+
+def test_intent_purpose_restores_when_blank_regardless_of_source():
+    """Regression: intent.purpose auto-heals from user_purpose when source is None.
+
+    Observed incident (2026-07-04, direction d-d3cb208c): intent.purpose was
+    found blank with intent.source=null and intent.user_purpose holding the
+    correct operator text.  _preserve_operator_intent previously gated on
+    source.type=="user_message", so source=None caused purpose_was_operator=False
+    and the blank purpose propagated through.  The thinker-gate then rejected the
+    problem model (schema-placeholder check: empty string) and every spawned
+    strategic_review sub-task failed 3/3 retries, stalling direction retirement
+    for 5 cycles.
+    """
+    # Onboarding seeds purpose, user_purpose, and source=user_message.
+    seeded = apply_user_intent_patch(
+        None,
+        {"intent": {"purpose": "Operator real purpose", "current_focus": ""}},
+        "2026-07-04T00:00:00",
+    )
+    assert seeded.intent.user_purpose == "Operator real purpose"
+    assert seeded.intent.source is not None and seeded.intent.source.type == "user_message"
+
+    # Agent cycle 1: rewrites purpose with non-blank text, dropping provenance.
+    # This is the known legacy-path behaviour: source becomes None.
+    cycle1, _ = apply_agent_update(
+        seeded.model_dump(),
+        {
+            "intent": {
+                "purpose": "Agent rewritten purpose",
+                "current_focus": "Something",
+                # source intentionally absent — models that don't carry it end up null
+            }
+        },
+        "2026-07-04T01:00:00",
+        baseline_raw=None,
+    )
+    assert cycle1["intent"].get("source") is None, (
+        "agent rewrite drops provenance — precondition for the regression"
+    )
+
+    # Corrupted state: simulate the exact live incident — purpose blanked,
+    # source=null, user_purpose has the real text.
+    corrupted = dict(cycle1)
+    corrupted["intent"] = dict(cycle1["intent"])
+    corrupted["intent"]["purpose"] = ""
+    corrupted["intent"]["source"] = None
+    # user_purpose is the durable backstop — must still have the operator value.
+    assert corrupted["intent"]["user_purpose"] == "Operator real purpose"
+
+    # Agent cycle 2: proposes anything; the auto-heal must fire regardless.
+    cycle2, _ = apply_agent_update(
+        corrupted,
+        {
+            "intent": {
+                "purpose": "",  # blank — the thinker-gate would reject this
+                "current_focus": "New focus",
+            }
+        },
+        "2026-07-04T02:00:00",
+        baseline_raw=None,
+    )
+    assert cycle2["intent"]["purpose"] == "Operator real purpose", (
+        "intent.purpose must be restored from user_purpose when blank and source=null"
     )
 
 
@@ -4178,6 +4440,25 @@ def test_unknown_gap_id_is_safe_no_op():
     assert model.gaps[0].active_moves == []
 
 
+def test_raw_gap_staffing_classifies_unresolved_gap_id():
+    """Dangling links remain fail-open but are classified for caller logging."""
+    raw = ProblemModel(gaps=[Gap(id="g-1", name="real")]).model_dump()
+
+    result = reconcile_gap_staffing_raw_result(
+        raw,
+        "d-new",
+        "g-missing",
+        None,
+        new_status="active",
+    )
+
+    assert result["changed"] is False
+    assert result["problem_model"] is None
+    details = result["result"]
+    assert details["unresolved_gap_ids"] == {"new_gap_id": "g-missing"}
+    assert details["malformed_model"] is False
+
+
 def test_reground_to_same_gap_is_no_op():
     """gap_id 'change' to the same value does not prune-then-restage — the old
     gap is left alone and staffing stays idempotent."""
@@ -4251,3 +4532,588 @@ def test_reconcile_raw_malformed_model_fails_open():
     can never block a direction write."""
     # `gaps` must be a list of gap objects; a string is malformed.
     assert reconcile_gap_staffing_raw({"gaps": "nope"}, "d-1", "g-1", None) is None
+
+
+# ---------------------------------------------------------------------------
+# classify_gap_link — direction–gap referential-integrity guard
+# ---------------------------------------------------------------------------
+
+
+def test_classify_gap_link_none_when_no_gap_id():
+    """A direction with no gap_id (ungrounded) classifies as 'none'."""
+    model = ProblemModel(gaps=[Gap(id="g-1", name="x")])
+    assert classify_gap_link(None, model) == "none"
+    assert classify_gap_link("", model) == "none"
+
+
+def test_classify_gap_link_valid_for_active_gap():
+    """A gap_id pointing to an active gap classifies as 'valid'."""
+    model = ProblemModel(gaps=[Gap(id="g-active", name="x", status="active")])
+    assert classify_gap_link("g-active", model) == "valid"
+
+
+def test_classify_gap_link_valid_for_blocked_gap():
+    """A gap_id pointing to a blocked gap is still workable — 'valid'."""
+    model = ProblemModel(gaps=[Gap(id="g-blocked", name="x", status="blocked")])
+    assert classify_gap_link("g-blocked", model) == "valid"
+
+
+def test_classify_gap_link_closed_for_terminal_active_list_gap():
+    """A gap that is still in model.gaps but has a terminal status (closed or
+    abandoned) classifies as 'closed', not 'valid' or 'dangling'."""
+    model = ProblemModel(
+        gaps=[
+            Gap(id="g-closed", name="done", status="closed"),
+            Gap(id="g-abandoned", name="gave up", status="abandoned"),
+        ]
+    )
+    assert classify_gap_link("g-closed", model) == "closed"
+    assert classify_gap_link("g-abandoned", model) == "closed"
+
+
+def test_classify_gap_link_closed_for_archived_gap():
+    """A gap_id matching an archived gap (fully moved to archived_gaps)
+    classifies as 'closed'."""
+    model = ProblemModel(
+        archived_gaps=[Gap(id="g-old", name="historical", status="closed")]
+    )
+    assert classify_gap_link("g-old", model) == "closed"
+
+
+def test_classify_gap_link_dangling_when_no_match():
+    """A gap_id that matches nothing — neither active gaps nor archived — is
+    'dangling'. This is the orphaned-gap conflict class."""
+    model = ProblemModel(gaps=[Gap(id="g-real", name="x")])
+    assert classify_gap_link("g-nonexistent", model) == "dangling"
+
+
+def test_classify_gap_link_dangling_on_empty_model():
+    """On a blank problem model every gap_id is dangling."""
+    assert classify_gap_link("g-anything", ProblemModel()) == "dangling"
+
+
+def test_classify_gap_link_pure_no_mutation():
+    """classify_gap_link must not mutate the model (pure read)."""
+    model = ProblemModel(gaps=[Gap(id="g-1", name="x", status="active")])
+    before = model.model_dump()
+    classify_gap_link("g-1", model)
+    assert model.model_dump() == before
+
+
+# ---------------------------------------------------------------------------
+# check_gap_id_write — write-time guard for direction gap_id linkage
+# ---------------------------------------------------------------------------
+
+
+def test_check_gap_id_write_no_error_for_valid_gap():
+    pm = ProblemModel(gaps=[Gap(id="g-open", name="x", status="active")]).model_dump()
+    err, open_ids = check_gap_id_write("g-open", pm)
+    assert err is None
+    assert open_ids == []
+
+
+def test_check_gap_id_write_no_error_for_blocked_gap():
+    pm = ProblemModel(gaps=[Gap(id="g-blk", name="x", status="blocked")]).model_dump()
+    err, open_ids = check_gap_id_write("g-blk", pm)
+    assert err is None
+
+
+def test_check_gap_id_write_error_for_closed_gap():
+    pm = ProblemModel(gaps=[Gap(id="g-done", name="x", status="closed")]).model_dump()
+    err, open_ids = check_gap_id_write("g-done", pm)
+    assert err == "closed"
+    assert open_ids == []  # no open gaps in this model
+
+
+def test_check_gap_id_write_error_for_dangling_gap():
+    pm = ProblemModel(gaps=[Gap(id="g-real", name="x", status="active")]).model_dump()
+    err, open_ids = check_gap_id_write("g-ghost", pm)
+    assert err == "dangling"
+    assert open_ids == ["g-real"]  # the one open gap is surfaced
+
+
+def test_check_gap_id_write_open_ids_exclude_closed_gaps():
+    pm = ProblemModel(gaps=[
+        Gap(id="g-open1", name="a", status="active"),
+        Gap(id="g-closed", name="b", status="closed"),
+        Gap(id="g-open2", name="c", status="blocked"),
+    ]).model_dump()
+    err, open_ids = check_gap_id_write("g-ghost", pm)
+    assert err == "dangling"
+    assert sorted(open_ids) == ["g-open1", "g-open2"]
+
+
+def test_check_gap_id_write_no_gap_id_is_ok():
+    pm = ProblemModel(gaps=[Gap(id="g-x", name="x", status="active")]).model_dump()
+    err, open_ids = check_gap_id_write(None, pm)
+    assert err is None
+    err2, _ = check_gap_id_write("", pm)
+    assert err2 is None
+
+
+def test_check_gap_id_write_no_problem_model_skips_validation():
+    """When the project has no problem model, validation is skipped (fail-open)."""
+    err, open_ids = check_gap_id_write("g-anything", None)
+    assert err is None
+    assert open_ids == []
+
+
+def test_check_gap_id_write_malformed_model_skips_validation():
+    """A malformed problem model dict skips validation rather than raising."""
+    err, open_ids = check_gap_id_write("g-x", {"gaps": "not-a-list"})
+    assert err is None
+
+
+# ---------------------------------------------------------------------------
+# normalize_gap_active_moves
+# ---------------------------------------------------------------------------
+
+_NORM_NOW = "2026-07-04T00:00:00"
+
+
+def test_normalize_gap_active_moves_prunes_non_active():
+    """A paused/expired direction ID in active_moves is moved to past_moves."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-active", "d-paused"])
+    model = ProblemModel(gaps=[gap])
+    corrections = normalize_gap_active_moves(model, {"d-active"}, _NORM_NOW)
+    assert model.gaps[0].active_moves == ["d-active"]
+    assert "d-paused" in model.gaps[0].past_moves
+    assert any("d-paused" in c for c in corrections)
+
+
+def test_normalize_gap_active_moves_auto_defers_emptied_gap():
+    """A gap whose active_moves becomes empty is auto-deferred."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-old"])
+    model = ProblemModel(gaps=[gap])
+    corrections = normalize_gap_active_moves(model, set(), _NORM_NOW)
+    assert model.gaps[0].active_moves == []
+    assert model.gaps[0].deferral is not None
+    assert model.gaps[0].deferral.created_at == _NORM_NOW
+    assert any("auto-deferred" in c for c in corrections)
+
+
+def test_normalize_gap_active_moves_preserves_existing_deferral():
+    """An existing deferral is not overwritten when active_moves empties."""
+    existing = GapDeferral(rationale="operator hold", created_at="2026-01-01T00:00:00")
+    gap = Gap(id="g-1", name="x", active_moves=["d-1"], deferral=existing)
+    model = ProblemModel(gaps=[gap])
+    normalize_gap_active_moves(model, set(), _NORM_NOW)
+    assert model.gaps[0].deferral.rationale == "operator hold"
+
+
+def test_normalize_gap_active_moves_no_change_when_all_active():
+    """No corrections when all active_moves IDs are in active_direction_ids."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-1", "d-2"])
+    model = ProblemModel(gaps=[gap])
+    corrections = normalize_gap_active_moves(model, {"d-1", "d-2"}, _NORM_NOW)
+    assert corrections == []
+    assert model.gaps[0].active_moves == ["d-1", "d-2"]
+
+
+def test_normalize_gap_active_moves_no_duplicate_past_moves():
+    """A stale ID already in past_moves is not duplicated."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-1"], past_moves=["d-1"])
+    model = ProblemModel(gaps=[gap])
+    normalize_gap_active_moves(model, set(), _NORM_NOW)
+    assert model.gaps[0].past_moves.count("d-1") == 1
+
+
+# ---------------------------------------------------------------------------
+# normalize_active_moves_writeback (shared helper)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_active_moves_writeback_no_corrections_unchanged():
+    """Returns raw dict unchanged and empty corrections when all moves are active."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-active"])
+    pm = ProblemModel(gaps=[gap])
+    raw = pm.model_dump()
+    updated_raw, corrections = normalize_active_moves_writeback(raw, {"d-active"}, _NORM_NOW)
+    assert corrections == []
+    assert updated_raw == raw
+
+
+def test_normalize_active_moves_writeback_records_revision_log():
+    """When corrections occur, a revision-log entry is written into the returned raw dict."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-paused"])
+    pm = ProblemModel(gaps=[gap])
+    raw = pm.model_dump()
+    updated_raw, corrections = normalize_active_moves_writeback(raw, set(), _NORM_NOW)
+    assert len(corrections) >= 1
+    log = updated_raw.get("revision_log") or []
+    assert any(
+        isinstance(e, dict) and "active_moves_normalized" in e.get("changes", {})
+        for e in log
+    ), "expected revision_log entry for active_moves normalization"
+
+
+def test_normalize_active_moves_writeback_prunes_stale():
+    """Stale active_moves ID ends up in past_moves in the returned raw dict."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-paused", "d-active"])
+    pm = ProblemModel(gaps=[gap])
+    raw = pm.model_dump()
+    updated_raw, _ = normalize_active_moves_writeback(raw, {"d-active"}, _NORM_NOW)
+    g = updated_raw["gaps"][0]
+    assert "d-paused" not in g["active_moves"]
+    assert "d-paused" in g["past_moves"]
+
+
+# ---------------------------------------------------------------------------
+# active_direction_gap_ids
+# ---------------------------------------------------------------------------
+
+
+def test_active_direction_gap_ids_returns_active_only():
+    dirs = [
+        {"id": "d-1", "status": "active", "gap_id": "g-1"},
+        {"id": "d-2", "status": "paused", "gap_id": "g-2"},
+        {"id": "d-3", "status": "active", "gap_id": "g-3"},
+    ]
+    assert active_direction_gap_ids(dirs) == {"g-1", "g-3"}
+
+
+def test_active_direction_gap_ids_skips_missing_gap_id():
+    dirs = [{"id": "d-1", "status": "active"}]
+    assert active_direction_gap_ids(dirs) == set()
+
+
+def test_active_direction_gap_ids_empty_input():
+    assert active_direction_gap_ids([]) == set()
+    assert active_direction_gap_ids(None) == set()
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update with protected_gap_ids (Residual 2 guard)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_agent_update_gap_deletion_orphan_guard():
+    """A _deletions.gaps entry that orphans an active direction is blocked.
+
+    The gap must survive (not be deleted), and diff['gaps_deletion_blocked']
+    must list the blocked id.  This is the named acceptance-criterion test.
+    """
+    current = {
+        "revision": 1,
+        "gaps": [
+            {"id": "g-protected", "name": "live gap", "status": "active"},
+            {"id": "g-safe", "name": "safe gap", "status": "active"},
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {"id": "g-protected", "name": "live gap", "status": "active"},
+            {"id": "g-safe", "name": "safe gap", "status": "active"},
+        ],
+        "_deletions": {"gaps": ["g-protected", "g-safe"]},
+    }
+    # g-protected is still the gap_id of an active direction.
+    protected = {"g-protected"}
+    new_raw, diff = apply_agent_update(
+        current, proposed, _NORM_NOW, protected_gap_ids=protected
+    )
+    assert "g-protected" in diff.get("gaps_deletion_blocked", [])
+    assert "g-safe" in diff.get("gaps_deleted", [])
+    surviving_ids = [g["id"] for g in new_raw.get("gaps", [])]
+    assert "g-protected" in surviving_ids, "protected gap must not be deleted"
+    assert "g-safe" not in surviving_ids, "unprotected gap should be deleted"
+
+
+def test_apply_agent_update_gap_deletion_no_protected_ids_deletes_all():
+    """Without protected_gap_ids, all requested deletions proceed as before."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "x", "status": "active"}],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "x", "status": "active"}],
+        "_deletions": {"gaps": ["g-1"]},
+    }
+    new_raw, diff = apply_agent_update(current, proposed, _NORM_NOW)
+    assert "g-1" in diff.get("gaps_deleted", [])
+    surviving_ids = [g["id"] for g in new_raw.get("gaps", [])]
+    assert "g-1" not in surviving_ids
+
+
+def test_apply_agent_update_gap_deletion_protected_empty_set_deletes_all():
+    """An empty protected set allows all deletions (no false blocks)."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "x", "status": "active"}],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "x", "status": "active"}],
+        "_deletions": {"gaps": ["g-1"]},
+    }
+    new_raw, diff = apply_agent_update(
+        current, proposed, _NORM_NOW, protected_gap_ids=set()
+    )
+    assert "g-1" in diff.get("gaps_deleted", [])
+    surviving_ids = [g["id"] for g in new_raw.get("gaps", [])]
+    assert "g-1" not in surviving_ids
+
+
+def test_apply_agent_update_gap_deletion_blocked_does_not_block_write():
+    """The write succeeds even when a gap deletion is blocked (non-fatal)."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-protected", "name": "y", "status": "active"}],
+        "intent": {"purpose": "test", "current_focus": ""},
+    }
+    proposed = {
+        "gaps": [{"id": "g-protected", "name": "y updated", "status": "active"}],
+        "_deletions": {"gaps": ["g-protected"]},
+        "intent": {"purpose": "test updated", "current_focus": ""},
+    }
+    new_raw, diff = apply_agent_update(
+        current, proposed, _NORM_NOW, protected_gap_ids={"g-protected"}
+    )
+    assert new_raw["revision"] == 2
+    assert "g-protected" in diff["gaps_deletion_blocked"]
+    surviving = [g["id"] for g in new_raw["gaps"]]
+    assert "g-protected" in surviving
+
+
+# ---------------------------------------------------------------------------
+# Round-trip: operator intent.purpose preserved on both write paths
+#
+# Criterion c-8cdb5049: source=null corrupted shape full round-trip
+# Criterion c-543d4959: placeholder auto-restore from operator-owned user_purpose
+#
+# Both apply_agent_update (agent write path) and apply_user_intent_patch (user
+# write path) must handle corrupted shapes correctly. The existing tests for
+# apply_agent_update without baseline_raw are at lines 1575-1630; the tests
+# below extend coverage to (a) the 3-way-merge code path (baseline_raw
+# provided) and (b) the apply_user_intent_patch write path.
+# ---------------------------------------------------------------------------
+
+
+# --- apply_user_intent_patch path ---
+
+
+def test_apply_user_intent_patch_source_null_shape_restamps_source_and_user_purpose():
+    """c-8cdb5049 / apply_user_intent_patch path: when the current model holds the
+    corrupted shape (purpose="", source=null, user_purpose populated) and the
+    operator re-patches with a real intent, the write path correctly stamps
+    source=user_message and user_purpose — healing the corruption."""
+    corrupted = {
+        "revision": 5,
+        "intent": {
+            "purpose": "",
+            "current_focus": "some focus",
+            "source": None,
+            "user_purpose": "Make Blueprint handle any project well.",
+        },
+    }
+    model = apply_user_intent_patch(
+        corrupted,
+        {"intent": {"purpose": "Make Blueprint handle any project well.", "current_focus": "v22"}},
+        "2026-07-05T00:00:00",
+    )
+    assert model.intent.purpose == "Make Blueprint handle any project well."
+    assert model.intent.source is not None
+    assert model.intent.source.type == "user_message"
+    assert model.intent.user_purpose == "Make Blueprint handle any project well.", (
+        "user_purpose must mirror the operator-set purpose after intent patch"
+    )
+    assert model.revision == 6
+    assert model.last_updated_by == "user"
+
+
+def test_apply_user_intent_patch_placeholder_shape_stamps_user_purpose():
+    """c-543d4959 / apply_user_intent_patch path: when the current model holds a
+    placeholder purpose and the operator re-patches, the user_purpose is set to
+    the real purpose so future agent cycles can self-heal from it."""
+    for placeholder in ("...", "<from analysis>", "<placeholder>", ""):
+        corrupted = {
+            "revision": 2,
+            "intent": {
+                "purpose": placeholder,
+                "source": None,
+                "user_purpose": "Real operator purpose.",
+            },
+        }
+        model = apply_user_intent_patch(
+            corrupted,
+            {"intent": {"purpose": "Real operator purpose.", "current_focus": ""}},
+            "2026-07-05T00:00:00",
+        )
+        assert model.intent.purpose == "Real operator purpose.", (
+            f"placeholder {placeholder!r} not replaced"
+        )
+        assert model.intent.source is not None
+        assert model.intent.source.type == "user_message"
+        assert model.intent.user_purpose == "Real operator purpose.", (
+            f"user_purpose not set after replacing placeholder {placeholder!r}"
+        )
+
+
+def test_apply_user_intent_patch_context_only_preserves_user_purpose_on_corrupted_model():
+    """c-8cdb5049 / apply_user_intent_patch path: a context-only patch on a
+    source=null, blank-purpose corrupted model carries user_purpose forward so a
+    subsequent apply_agent_update can heal from it — full round-trip."""
+    corrupted = {
+        "revision": 5,
+        "intent": {
+            "purpose": "",
+            "source": None,
+            "user_purpose": "Operator real purpose.",
+        },
+    }
+    # User only patches context (no intent in patch).
+    patched = apply_user_intent_patch(
+        corrupted,
+        {"context": {"project_type": "startup"}},
+        "2026-07-05T00:00:00",
+    )
+    # user_purpose must survive the context-only patch.
+    assert patched.intent.user_purpose == "Operator real purpose.", (
+        "user_purpose must be preserved on a non-intent patch over a corrupted model"
+    )
+    assert patched.context.project_type == "startup"
+    assert patched.intent.purpose == ""  # still blank — user did not fix it
+
+    # apply_agent_update then heals from user_purpose regardless of source=null.
+    new_raw, _ = apply_agent_update(
+        patched.model_dump(),
+        {"intent": {"purpose": "", "current_focus": "new focus"}},
+        "2026-07-05T01:00:00",
+    )
+    assert new_raw["intent"]["purpose"] == "Operator real purpose.", (
+        "intent.purpose must be restored from user_purpose after context-only "
+        "apply_user_intent_patch preserves user_purpose across the corrupted model"
+    )
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    assert new_raw["intent"]["current_focus"] == "new focus"
+
+
+# --- apply_agent_update path WITH baseline_raw (3-way merge code path) ---
+
+
+def test_apply_agent_update_heals_source_null_on_3way_merge_path():
+    """c-8cdb5049 / apply_agent_update with baseline_raw: source=null + blank
+    purpose + user_purpose populated — the user_purpose fallback in
+    _preserve_operator_intent fires on the 3-way-merge code path just as it does
+    on the legacy path (baseline_raw=None)."""
+    current = {
+        "revision": 3,
+        "last_updated_by": "agent",
+        "intent": {
+            "purpose": "",
+            "current_focus": "some focus",
+            "source": None,
+            "user_purpose": "Make Blueprint handle any project well.",
+        },
+    }
+    baseline = {
+        "revision": 2,
+        "intent": {
+            "purpose": "Make Blueprint handle any project well.",
+            "source": {"type": "user_message", "message_id": "m-seed"},
+        },
+    }
+    proposed = {"intent": {"purpose": "", "current_focus": "next focus"}}
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-07-05T00:00:00", baseline_raw=baseline
+    )
+    assert new_raw["intent"]["purpose"] == "Make Blueprint handle any project well.", (
+        "intent.purpose must be restored from user_purpose even on the 3-way-merge path"
+    )
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    # agent-owned current_focus still advances
+    assert new_raw["intent"]["current_focus"] == "next focus"
+    assert new_raw["intent"]["user_purpose"] == "Make Blueprint handle any project well."
+
+
+def test_apply_agent_update_heals_placeholder_on_3way_merge_path():
+    """c-543d4959 / apply_agent_update with baseline_raw: placeholder purpose +
+    user_purpose — the user_purpose fallback fires on the 3-way-merge path."""
+    for placeholder in ("...", "<from analysis>", ""):
+        current = {
+            "revision": 1,
+            "intent": {
+                "purpose": placeholder,
+                "source": None,
+                "user_purpose": "Real operator purpose.",
+            },
+        }
+        baseline = {
+            "revision": 0,
+            "intent": {
+                "purpose": "Real operator purpose.",
+                "source": {"type": "user_message"},
+            },
+        }
+        proposed = {"intent": {"purpose": placeholder, "current_focus": "next"}}
+        new_raw, _ = apply_agent_update(
+            current, proposed, "2026-07-05T00:00:00", baseline_raw=baseline
+        )
+        assert new_raw["intent"]["purpose"] == "Real operator purpose.", (
+            f"placeholder {placeholder!r} not healed from user_purpose on 3-way-merge path"
+        )
+        assert new_raw["intent"]["source"]["type"] == "user_message"
+        assert new_raw["intent"]["user_purpose"] == "Real operator purpose."
+
+
+def test_full_round_trip_both_write_paths_source_null_and_placeholder():
+    """c-8cdb5049 + c-543d4959: full round-trip exercising both write paths.
+
+    1. apply_user_intent_patch seeds purpose + user_purpose (user write path).
+    2. Agent cycle corrupts: source=null, purpose blanked to placeholder.
+    3. apply_user_intent_patch context-only patch preserves user_purpose
+       (user write path — no intent in patch).
+    4. apply_agent_update heals from user_purpose (agent write path, with
+       baseline_raw to exercise the 3-way-merge code path).
+    """
+    # Step 1: operator seeds purpose via the user write path.
+    seeded = apply_user_intent_patch(
+        None,
+        {"intent": {"purpose": "Operator steering purpose.", "current_focus": ""}},
+        "2026-07-05T00:00:00",
+    )
+    assert seeded.intent.purpose == "Operator steering purpose."
+    assert seeded.intent.user_purpose == "Operator steering purpose."
+    assert seeded.intent.source is not None
+    assert seeded.intent.source.type == "user_message"
+
+    # Step 2: agent cycle drops provenance and then something blanks purpose.
+    cycle1, _ = apply_agent_update(
+        seeded.model_dump(),
+        {"intent": {"purpose": "Agent derived purpose.", "current_focus": "phase 1"}},
+        "2026-07-05T01:00:00",
+        baseline_raw=None,  # legacy path drops source
+    )
+    # Corrupt: simulate purpose being overwritten with a placeholder.
+    corrupted = dict(cycle1)
+    corrupted["intent"] = dict(cycle1["intent"])
+    corrupted["intent"]["purpose"] = "..."
+    corrupted["intent"]["source"] = None
+    assert corrupted["intent"]["user_purpose"] == "Operator steering purpose."
+
+    # Step 3: operator issues a context-only patch (user write path, no intent).
+    after_context_patch = apply_user_intent_patch(
+        corrupted,
+        {"context": {"project_type": "product"}},
+        "2026-07-05T02:00:00",
+    )
+    # user_purpose is preserved across the non-intent patch.
+    assert after_context_patch.intent.user_purpose == "Operator steering purpose.", (
+        "user_purpose must survive a context-only apply_user_intent_patch call"
+    )
+    assert after_context_patch.intent.purpose == "...", "placeholder still present"
+
+    # Step 4: agent cycle heals from user_purpose (3-way-merge path).
+    baseline = {"revision": cycle1["revision"], "intent": {"purpose": "Agent derived purpose."}}
+    final, _ = apply_agent_update(
+        after_context_patch.model_dump(),
+        {"intent": {"purpose": "...", "current_focus": "phase 2"}},
+        "2026-07-05T03:00:00",
+        baseline_raw=baseline,
+    )
+    assert final["intent"]["purpose"] == "Operator steering purpose.", (
+        "intent.purpose must be healed from user_purpose after the full round-trip "
+        "through both write paths"
+    )
+    assert final["intent"]["source"]["type"] == "user_message"
+    assert final["intent"]["user_purpose"] == "Operator steering purpose."
+    assert final["intent"]["current_focus"] == "phase 2"
