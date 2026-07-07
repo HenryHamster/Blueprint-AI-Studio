@@ -29401,6 +29401,115 @@ async def test_acceptance_window_metric_distinguishes_verified_merge_predicate_f
 
 
 @pytest.mark.asyncio
+async def test_acceptance_window_denominator_write_task_population(db_session):
+    """Denominator counts only write-task merges; read-only types are excluded.
+
+    Fixture: 2 write-type tasks (type='create') — one with proven acceptance,
+    one without — plus 2 non-write tasks (type='research' and type='review')
+    that are also merged. The denominator must equal 2 (write tasks only),
+    fraction = 1/2, and the observability field must equal 4 (all merges).
+    When there are zero write-task merges, fraction must be None.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Write task with proven acceptance — counts in total AND verified.
+    write_proven = Task(
+        project_id=project.id,
+        title="write-proven",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "test_name": "test_write_feature",
+            },
+        },
+    )
+    # Write task without acceptance — counts in total but NOT in verified.
+    write_undeclared = Task(
+        project_id=project.id,
+        title="write-undeclared",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    # Non-write task (research) — must NOT count in write-task total or verified.
+    read_research = Task(
+        project_id=project.id,
+        title="research-task",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    # Non-write task (review) — must NOT count in write-task total or verified.
+    read_review = Task(
+        project_id=project.id,
+        title="review-task",
+        payloads=[{"type": "review"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    db_session.add(write_proven)
+    db_session.add(write_undeclared)
+    db_session.add(read_research)
+    db_session.add(read_review)
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    # Denominator: write tasks only (create + fix = 2).
+    assert agg["acceptance_window_total"] == 2, (
+        f"denominator should count only write-task merges; got {agg['acceptance_window_total']}"
+    )
+    assert agg["acceptance_window_write_total"] == 2
+    # Numerator: only the proven write task.
+    assert agg["acceptance_window_verified"] == 1
+    # Fraction: 1 verified / 2 write-task merges.
+    assert agg["acceptance_window_fraction"] == pytest.approx(0.5)
+    # Observability field includes ALL landed merges (2 write + 2 read = 4).
+    assert agg["acceptance_window_total_all_merges"] == 4, (
+        f"all-merges field should include non-write tasks; got {agg['acceptance_window_total_all_merges']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_denominator_none_when_no_write_tasks(db_session):
+    """fraction must be None when zero write-task merges land in the window.
+
+    Non-write merges inflate acceptance_window_total_all_merges but must NOT
+    produce a 0.0 fraction — None signals 'no coverage judgement possible'.
+    """
+    project, version = await _make_project_and_version(db_session)
+
+    for task_type in ("research", "review", "audit"):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"{task_type}-task",
+                payloads=[{"type": task_type}],
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+            )
+        )
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    assert agg["acceptance_window_total"] == 0
+    assert agg["acceptance_window_write_total"] == 0
+    assert agg["acceptance_window_verified"] == 0
+    assert agg["acceptance_window_fraction"] is None, (
+        "fraction must be None when no write-task merges exist, not 0.0"
+    )
+    assert agg["acceptance_window_total_all_merges"] == 3
+
+
+@pytest.mark.asyncio
 async def test_finalize_records_acceptance_window_counts_in_verdict_sub_scores(
     db_session, mocker
 ):

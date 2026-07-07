@@ -2007,9 +2007,6 @@ async def check_first_attempt_rate_denominator_coverage(
         total = 0
         measured = 0
         for t in tasks:
-            ttype = (t.first_payload or {}).get("type", "")
-            if ttype not in _FA_ELIGIBLE_TYPES:
-                continue
             total += 1
             if "_first_attempt_succeeded" in (t.context or {}):
                 measured += 1
@@ -2056,6 +2053,131 @@ async def check_first_attempt_rate_denominator_coverage(
                     ),
                 )
             )
+    return results
+
+
+@register_check(
+    "acceptance_window_sub_scores_invariant",
+    "Scan recent ReleaseVersion qualification verdicts and flag any that violate "
+    "the acceptance_window population invariants (verified <= write_total <= "
+    "total_all_merges; fraction == verified/write_total or None when write_total=0).",
+)
+async def check_acceptance_window_sub_scores_invariant(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: the ``acceptance_window_*`` fields recorded in
+    ``last_qualification["sub_scores"]`` must satisfy the population invariants
+    defined by ``acceptance_window_sub_scores_violations`` — the same invariants
+    the release-qualifier writes when it restricts the denominator to
+    WRITE_TASK_TYPES merges.
+
+    A violation means the numerator/denominator pair was written inconsistently
+    (e.g. the old mixed-population bug where the denominator counted ALL landed
+    merges while the numerator only counted write-task verified merges). Flag-only:
+    never mutates the verdict it audits. Verdicts that predate the
+    acceptance_window keys (legacy rows) are skipped, not falsely flagged.
+
+    Bounded to ``max_projects`` open ReleaseVersion rows.
+    """
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+    from app.models import ReleaseVersion
+
+    versions = (
+        await ctx.session.execute(
+            select(ReleaseVersion)
+            .where(ReleaseVersion.status == "open")
+            .limit(ctx.max_projects)
+        )
+    ).scalars().all()
+
+    if not versions:
+        return [
+            CheckResult(
+                check="acceptance_window_sub_scores_invariant",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no open ReleaseVersion rows to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for version in versions:
+        pid = str(version.project_id)
+        qual = version.last_qualification or {}
+        sub_scores = qual.get("sub_scores") or {}
+        violations = acceptance_window_sub_scores_violations(sub_scores)
+        if violations is None:
+            # Should never happen (helper always returns a list), but guard.
+            continue
+        # Skip when the new population keys are absent — covers both the zero-key
+        # case and the pre-fix 3-key schema (total/verified/fraction without the
+        # write_total/total_all_merges population keys).
+        from app.acceptance_gate import _ACCEPTANCE_WINDOW_POPULATION_KEYS
+
+        has_fields = any(k in sub_scores for k in _ACCEPTANCE_WINDOW_POPULATION_KEYS)
+        if not has_fields:
+            results.append(
+                CheckResult(
+                    check="acceptance_window_sub_scores_invariant",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail=(
+                        f"version {version.id}: last_qualification sub_scores "
+                        "lacks acceptance_window fields (legacy verdict)"
+                    ),
+                )
+            )
+            continue
+
+        any_checked = True
+        if violations:
+            results.append(
+                CheckResult(
+                    check="acceptance_window_sub_scores_invariant",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=int(sub_scores.get("acceptance_window_verified") or 0),
+                    ground_truth=int(
+                        sub_scores.get("acceptance_window_write_total") or 0
+                    ),
+                    delta=len(violations),
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"version {version.id}: "
+                        + "; ".join(violations[:3])
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="acceptance_window_sub_scores_invariant",
+                    status=CheckStatus.OK,
+                    self_reported=int(sub_scores.get("acceptance_window_verified") or 0),
+                    ground_truth=int(
+                        sub_scores.get("acceptance_window_write_total") or 0
+                    ),
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"version {version.id}: acceptance_window sub_scores consistent"
+                    ),
+                )
+            )
+
+    if not any_checked and not any(
+        r.status != CheckStatus.SKIPPED for r in results
+    ):
+        return [
+            CheckResult(
+                check="acceptance_window_sub_scores_invariant",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no open versions with acceptance_window fields found",
+            )
+        ]
+
     return results
 
 

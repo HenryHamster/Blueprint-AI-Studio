@@ -2172,6 +2172,50 @@ def _make_sr_task(project_id, check_results, human_cats, hours_ago=1):
     )
 
 
+def test_per_type_failure_rate_excludes_empty_type_rows():
+    """Per-type failure rate must exclude empty-type rows from the sample.
+
+    When querying for a specific task type, rows with empty/absent task_type
+    should not be included in the sample. This prevents empty-type failures from
+    inflating a healthy type's failure rate and empty-type successes from
+    deflating a genuinely-failing type below the throttle threshold.
+    """
+    from app.shared_state import get_task_type_failure_rate
+    import app.shared_state as ss
+    from app.time_utils import _utcnow
+    from collections import deque
+
+    ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+    ts = _utcnow().isoformat()
+
+    # Healthy "create" type: 3 successes
+    ss.deploy_monitoring["task_results"].extend(
+        [
+            (ts, "success", "", "create"),
+            (ts, "success", "", "create"),
+            (ts, "success", "", "create"),
+        ]
+    )
+
+    # Empty-type failures that should NOT contaminate the "create" sample
+    ss.deploy_monitoring["task_results"].extend(
+        [
+            (ts, "failure", "CODE_ERROR"),  # old 3-tuple format
+            (ts, "failure", "CODE_ERROR", ""),  # 4-tuple with empty type
+            (ts, "failure", "CODE_ERROR", ""),
+        ]
+    )
+
+    # Query for "create" type specifically
+    rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
+
+    # The sample should contain only the 3 "create" successes, not the empty-type failures
+    assert sample_size == 3, f"Expected sample_size=3 (only 'create' rows), got {sample_size}"
+    assert (
+        rate == 0.0
+    ), f"Expected rate=0.0 (3 successes, 0 failures in 'create'), got {rate}"
+
+
 @pytest.mark.asyncio
 async def test_self_review_prediction_accuracy_null_when_sample_too_small():
     """Returns None when fewer than 5 tasks have both fields."""

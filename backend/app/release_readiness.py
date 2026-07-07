@@ -495,11 +495,14 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "promotion_conflict": verdict.promotion_conflict,
         "promotion_error_detail": verdict.promotion_error_detail,
         # --- Acceptance-window signal (additive; None on legacy rows without aggregate) -
-        # Surfaces the proven-vs-delivered distinction: how many landed merges in the
-        # qualification window have verified acceptance evidence vs. raw delivered count.
+        # acceptance_window_total / verified / fraction use the write-task-only population:
+        # only task types that can declare acceptance evidence count in the denominator.
+        # acceptance_window_total_all_merges is the raw landed count for observability.
         "acceptance_window_total": _sub(verdict, "acceptance_window_total"),
         "acceptance_window_verified": _sub(verdict, "acceptance_window_verified"),
         "acceptance_window_fraction": _sub(verdict, "acceptance_window_fraction"),
+        "acceptance_window_write_total": _sub(verdict, "acceptance_window_write_total"),
+        "acceptance_window_total_all_merges": _sub(verdict, "acceptance_window_total_all_merges"),
         # Goal-alignment cert (additive; None on legacy rows predating migration 0328).
         "goal_alignment": verdict.goal_alignment,
         # Blind merge-grade cert (additive; None on legacy rows predating migration 0327).

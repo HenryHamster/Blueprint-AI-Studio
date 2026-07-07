@@ -243,6 +243,7 @@ from app.migration_apply_gate import run_migration_apply_gate
 from app.rollup_migration_validation import (
     check_qualification_migration_identity,
 )
+from app.task_capabilities import WRITE_TASK_TYPES
 from app.release_readiness import (
     # Re-exports — release_qualifier is the canonical import surface for the
     # readiness layer (tests access via ``rq.*``; strategic_spawning and
@@ -2698,20 +2699,24 @@ async def _compute_acceptance_window_aggregate(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
 ) -> dict[str, Any]:
-    """Count merged tasks in this version's window with explicit verified acceptance.
+    """Count write-task merges in this version's window with explicit verified acceptance.
 
     Queries all COMPLETED tasks with the landed-signal predicate that completed
-    at or after ``version.opened_at`` (the version window lower bound), then
-    in-Python applies the canonical acceptance-bucket classifier: a merge is
-    acceptance-verified only when it lands in the ``proven`` or
-    ``satisfied_unproven`` buckets. Undeclared (legacy), degraded, explicitly
-    unsatisfied, and malformed rows do not count as verified.
+    at or after ``version.opened_at`` (the version window lower bound). The
+    denominator and numerator are both restricted to WRITE_TASK_TYPES so the
+    fraction reflects the population that can actually declare acceptance evidence
+    (non-write tasks such as research/review/plan/audit can never enter the
+    ``proven``/``satisfied_unproven`` buckets). A None fraction means no
+    write-task merges landed in the window — distinct from a genuine 0-coverage
+    failure.
 
     Returns:
       {
-        "acceptance_window_total": int,    # all landed merges in the window
-        "acceptance_window_verified": int, # merges with explicit declared-and-verified acceptance
-        "acceptance_window_fraction": float | None,  # None when total == 0
+        "acceptance_window_total": int,           # write-task merges in the window
+        "acceptance_window_verified": int,         # write-task merges with proven/satisfied acceptance
+        "acceptance_window_fraction": float|None,  # None when write-task total == 0
+        "acceptance_window_write_total": int,      # same as acceptance_window_total (explicit alias)
+        "acceptance_window_total_all_merges": int, # all landed merges regardless of type (observability)
       }
     """
 
@@ -2728,10 +2733,16 @@ async def _compute_acceptance_window_aggregate(
         if release_version._task_completed_at(task) >= since
     ]
 
-    total = len(rows)
+    total_all_merges = len(rows)
+    rows_write = [
+        task
+        for task in rows
+        if (task.first_payload or {}).get("type") in WRITE_TASK_TYPES
+    ]
+    total = len(rows_write)
     verified = sum(
         1
-        for task in rows
+        for task in rows_write
         if classify_merged_acceptance_context(task.context or {})
         in {"proven", "satisfied_unproven"}
     )
@@ -2740,6 +2751,8 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_total": total,
         "acceptance_window_verified": verified,
         "acceptance_window_fraction": fraction,
+        "acceptance_window_write_total": total,
+        "acceptance_window_total_all_merges": total_all_merges,
     }
 
 

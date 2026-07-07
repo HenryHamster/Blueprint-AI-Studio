@@ -389,8 +389,10 @@ def get_task_type_failure_rate(
 ) -> tuple[float, int]:
     """Compute failure rate for a specific task_type within the trailing window.
 
-    Backward-compatible: entries without a task_type field (old format or empty
-    string) are treated as matching any type filter and included in the sample.
+    Rows with empty or absent task_type are excluded from per-type queries to
+    prevent sample contamination. Empty-type failures should not inflate a
+    healthy type's failure rate, and empty-type successes should not deflate
+    a genuinely-failing type below the throttle threshold.
 
     Returns (rate, sample_size).  Returns (0.0, 0) when no samples exist.
     """
@@ -398,7 +400,7 @@ def get_task_type_failure_rate(
     relevant = [
         r
         for r in deploy_monitoring["task_results"]
-        if r[0] >= cutoff and (len(r) < 4 or not r[3] or r[3] == task_type)
+        if r[0] >= cutoff and len(r) >= 4 and r[3] == task_type
     ]
     if not relevant:
         return 0.0, 0

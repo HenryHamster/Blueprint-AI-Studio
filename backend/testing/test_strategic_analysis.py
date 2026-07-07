@@ -3171,7 +3171,12 @@ def test_cost_sums_recorded_and_proxy_entries():
 
 
 def test_retired_summary_uses_recorded_cost_per_merge():
-    """cost_per_merge in retired summary uses estimated_cost_usd when present."""
+    """cost_per_merge in retired summary uses estimated_cost_usd when present.
+
+    Uses canonical cost_per_merged_pr denominator: ALL merged PRs (raw total),
+    not verified-only. This ensures directions with unverified/degraded merges
+    report cost metrics that reflect actual work per delivered PR.
+    """
     directions = [
         {
             "id": "dir-ret-recorded",
@@ -3195,7 +3200,9 @@ def test_retired_summary_uses_recorded_cost_per_merge():
     assert len(result) == 1
     entry = result[0]
     assert entry["prs_merged"] == 4
-    assert entry.get("cost_per_merge") == round(8.00 / 2, 2)
+    # Canonical rule: denominator MUST be ALL merged PRs (the raw 4), not verified-only.
+    # Using the canonical helper ensures cost_per_merge is consistent with live path.
+    assert entry.get("cost_per_merge") == round(8.00 / 4, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -3705,6 +3712,48 @@ def test_retired_directions_summary_cost_per_merge_includes_aggregate_cost():
         f"expected cost_per_merge=5.0 from aggregate, got {entry.get('cost_per_merge')!r}"
     )
     assert entry["status"] == "retired"
+
+
+def test_retired_summary_cost_per_merge_uses_raw_denominator():
+    """cost_per_merge divides by ALL merged PRs, not verified-only subset.
+
+    The canonical cost_per_merged_pr helper mandates that the denominator
+    must cover the same population as the numerator: ALL work (cost) divided
+    by ALL merged PRs (autonomous + assisted). Using verified-only merges
+    while including all costs overstates the metric for directions with
+    unverified/degraded merges. This test ensures retired summary uses raw
+    total_merged count, not verified_total_merged.
+    """
+    directions = [
+        {
+            "id": "dir-mixed-merges",
+            "text": "Direction with degraded merges",
+            "status": "retired",
+            "retired_at": _recent_iso(5),
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(5),
+                    "prs_merged": 4,  # raw total: 4 PRs
+                    "verified_prs_merged": 2,  # only 2 verified; 2 were degraded
+                    "tasks_created": 10,
+                    "avg_time_to_merge_hours": 1.0,
+                    "estimated_cost_usd": 8.0,  # cost reflects all 4 merges
+                }
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+
+    # Canonical rule: denominator MUST be ALL merged PRs (the raw count).
+    # Cost is 8.0, which reflects work on all 4 merges. Dividing by only 2
+    # (verified) would inflate the reported cost/merge from 2.0 to 4.0.
+    assert entry["prs_merged"] == 4
+    assert entry.get("cost_per_merge") == round(8.0 / 4, 4)
+    # The inflated value (dividing by verified-only) must NOT appear.
+    assert entry.get("cost_per_merge") != round(8.0 / 2, 4)
 
 
 # ---------------------------------------------------------------------------

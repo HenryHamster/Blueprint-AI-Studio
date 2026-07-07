@@ -97,9 +97,6 @@ def _build_retired_directions_summary(
         total_merged = sum(h.get("prs_merged", 0) for h in history) + (
             agg.get("total_prs_merged") or 0
         )
-        verified_total_merged = sum(verified_merged_count(h) for h in history) + (
-            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
-        )
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
             agg.get("total_prs_rejected") or 0
         )
@@ -129,11 +126,11 @@ def _build_retired_directions_summary(
         estimated_cost_usd = round(
             sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history) + agg_cost, 2
         )
-        cost_per_merge = (
-            round(estimated_cost_usd / verified_total_merged, 2)
-            if verified_total_merged > 0 and estimated_cost_usd > 0
-            else None
-        )
+        # Use canonical_cost_per_merged_pr to enforce population consistency:
+        # denominator must be ALL merged PRs (raw total_merged), not verified-only.
+        cost_per_merge = canonical_cost_per_merged_pr(
+            estimated_cost_usd, total_merged
+        ) if estimated_cost_usd > 0 else None
 
         # Top failed approaches from research_context
         ctx = d.get("research_context", "")
