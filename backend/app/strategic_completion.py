@@ -3477,7 +3477,7 @@ def _retired_grounding_note(grounding: dict, block_reason: str) -> str:
 
 
 async def _check_direction_starvation(
-    project: Any, dirs_created: int, session: AsyncSession
+    project: Any, dirs_created: int, session: AsyncSession, task: Any = None
 ) -> None:
     """Detect consecutive strategic cycles with no direction creation despite active gaps.
 
@@ -3510,8 +3510,14 @@ async def _check_direction_starvation(
 
     vision = dict(project.vision or {})
     if dirs_created == 0 and has_gaps:
+        task_id_str = str(task.id) if task is not None else None
+        if task_id_str and vision.get("_direction_starvation_last_task_id") == task_id_str:
+            # Already processed this cycle on a prior run — skip to avoid double-counting.
+            return
         starvation_count = vision.get("_direction_starvation_count", 0) + 1
         vision["_direction_starvation_count"] = starvation_count
+        if task_id_str:
+            vision["_direction_starvation_last_task_id"] = task_id_str
 
         if starvation_count >= 5:
             # Auto-create a fallback direction as last resort
@@ -4278,7 +4284,7 @@ async def _handle_strategic_completion(
                 f"[STRATEGIC] Task {task.id}: applied {_ep_applied} "
                 f"evidence_progress verdict(s) to directions"
             )
-        await _check_direction_starvation(project, dirs_created, session)
+        await _check_direction_starvation(project, dirs_created, session, task=task)
         # Reset the consecutive-failure breaker on a successful cycle. The
         # counter is otherwise only cleared on a vision *write* (the
         # set-problem-model API path at admin_agent_ops and the legacy
@@ -6186,7 +6192,7 @@ async def _handle_strategic_completion(
                 reason="strategic_review fallback path produced no vision",
             )
 
-    await _check_direction_starvation(project, dirs_created, session)
+    await _check_direction_starvation(project, dirs_created, session, task=task)
     session.add(project)
 
     # Deferred import of message/resolution caps — same STRATEGIC_* namespace

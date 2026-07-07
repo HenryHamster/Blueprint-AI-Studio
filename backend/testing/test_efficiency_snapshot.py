@@ -10157,3 +10157,110 @@ async def test_llm_cost_attribution_window_delta_in_read_baseline(db_session):
     # sonnet model must appear in the by_model_delta list
     model_keys = {(r["provider"], r["model"]) for r in wd["by_model_delta"]}
     assert ("anthropic", "claude-sonnet-4-6") in model_keys
+
+
+def test_landed_rate_denominator_excludes_pr_ineligible():
+    """landed_rate and verified_landed_rate use only PR-eligible tasks as denominator.
+
+    PR-ineligible tasks (review, plan, research, …) can never open a PR, so they
+    can only inflate run_count without contributing to landed_count.  The fix
+    divides by pr_eligible_run_count (ci_and_review types only) instead of
+    run_count, so the rate truly answers "of the tasks that could ship code, what
+    fraction did?"
+
+    Scenario:
+      - 1 merged create task  (PR-eligible, verified)
+      - 1 unmerged create task (PR-eligible, did not land)
+      - 3 review tasks        (PR-ineligible — must not enter the denominator)
+
+    Expected:
+      - totals.pr_eligible_run_count == 2
+      - totals.landed_rate == 0.5  (1 landed / 2 pr-eligible)
+      - totals.verified_landed_rate == 0.5
+      Without the fix: run_count == 5 → landed_rate == 0.2 (wrong).
+    """
+    import uuid
+    from app.efficiency_snapshot import compute_effort_model_efficiency
+    from app.models import TaskStatus
+
+    project_id = uuid.uuid4()
+
+    merged_create = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "effort": "medium"}],
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    unmerged_create = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "create", "effort": "medium"}],
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    # Three review tasks — PR-ineligible; must not count in landed_rate denominator.
+    review_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=[{"type": "review", "effort": "high"}],
+            provider="anthropic",
+            model="claude-opus-4-8",
+        )
+        for _ in range(3)
+    ]
+
+    result = compute_effort_model_efficiency(
+        [merged_create, unmerged_create] + review_tasks
+    )
+
+    totals = result["totals"]
+
+    assert totals["run_count"] == 5, "run_count must include all tasks"
+    assert totals["pr_eligible_run_count"] == 2, (
+        "pr_eligible_run_count must count only ci_and_review tasks (create x2)"
+    )
+    assert totals["landed_count"] == 1
+    # landed_rate = 1 landed / 2 pr-eligible = 0.5
+    assert totals["landed_rate"] == 0.5, (
+        f"landed_rate must divide by pr_eligible_run_count (2), got {totals['landed_rate']}"
+    )
+    # With no is_verified_merge signal (context lacks review_loop CI info), the
+    # merged create counts as verified too (no unverified_merge_reason set).
+    assert totals["verified_landed_rate"] == 0.5, (
+        f"verified_landed_rate must use pr_eligible denominator, got {totals['verified_landed_rate']}"
+    )
+
+    # The by_effort breakdown must also carry pr_eligible_run_count per tier.
+    by_effort_map = {row["effort"]: row for row in result["by_effort"]}
+    medium_row = by_effort_map.get("medium")
+    assert medium_row is not None, "medium effort bucket must exist for create tasks"
+    assert medium_row["pr_eligible_run_count"] == 2
+    assert medium_row["landed_rate"] == 0.5
+
+    # The by_model breakdown must credit pr_eligible_run_count in the per-model
+    # crediting loop too, else landed_rate/verified_landed_rate collapse to None
+    # (divide-by-zero denominator) for every model row.
+    by_model_map = {(r["provider"], r["model"]): r for r in result["by_model"]}
+    sonnet_row = by_model_map.get(("anthropic", "claude-sonnet-4-6"))
+    assert sonnet_row is not None, "create tasks' model must appear in by_model"
+    assert sonnet_row["pr_eligible_run_count"] == 2, (
+        "by_model pr_eligible_run_count must count PR-eligible create tasks, "
+        f"got {sonnet_row['pr_eligible_run_count']}"
+    )
+    assert sonnet_row["landed_count"] == 1
+    assert sonnet_row["landed_rate"] == 0.5, (
+        f"by_model landed_rate must divide by pr_eligible_run_count (2), got "
+        f"{sonnet_row['landed_rate']}"
+    )
+    # PR-ineligible review-only model: zero pr_eligible denominator → rate is None.
+    opus_row = by_model_map.get(("anthropic", "claude-opus-4-8"))
+    assert opus_row is not None, "review tasks' model must appear in by_model"
+    assert opus_row["pr_eligible_run_count"] == 0
+    assert opus_row["landed_rate"] is None

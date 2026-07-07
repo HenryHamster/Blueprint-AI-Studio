@@ -1105,6 +1105,17 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
     }
 
 
+def is_pr_eligible_task_type(task_type: str | TaskType) -> bool:
+    """Return True if tasks of this type can produce a merged PR.
+
+    Only ``ci_and_review`` evaluation-strategy types (create, fix, qa, deps,
+    migrate, refactor, …) can land a PR; all read-only / research / audit types
+    return False.  Unknown types return False (fail-safe: treat as ineligible).
+    """
+    capability = get_task_capability(task_type)
+    return capability is not None and capability.evaluation_strategy == "ci_and_review"
+
+
 def task_type_catalog() -> list[dict]:
     """Return the full task-type registry as a list of plain dicts.
 

@@ -2448,6 +2448,101 @@ class TestCheckDirectionStarvation:
         # Alert fired to prompt manual intervention
         alert_mock.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_starvation_and_bootstrap_counters_idempotent_on_replay(
+        self, strat_fail_db, mocker
+    ):
+        """Replay of the same task must not double-count either counter.
+
+        Starvation: calling _check_direction_starvation twice with the same
+        task id should increment _direction_starvation_count exactly once.
+
+        Bootstrap degraded: calling _handle_repo_bootstrap_completion twice
+        with the same task (no overview → degraded path) should record
+        bootstrap_recovery_attempts == 1, not 2.
+        """
+        from contextlib import asynccontextmanager
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
+
+        # ── Starvation counter ──────────────────────────────────────────────
+        project = Project(
+            name="StarveP",
+            user_id="u1",
+            vision={},
+            directions=[_active_dir(id="1", category="structural")],  # <3 active → gap
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        task_mock = MagicMock()
+        task_mock.id = uuid.uuid4()
+
+        # First run: counter should go from 0 → 1
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db, task=task_mock
+        )
+        assert project.vision.get("_direction_starvation_count") == 1
+
+        # Replay with same task id: counter must stay at 1
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db, task=task_mock
+        )
+        assert project.vision.get("_direction_starvation_count") == 1, (
+            "Replay with same task id must not re-increment _direction_starvation_count"
+        )
+
+        # ── Bootstrap recovery counter ──────────────────────────────────────
+        bs_project = Project(
+            name="BootstrapP",
+            user_id="u1",
+            build_config={},
+            design_doc={},
+        )
+        strat_fail_db.add(bs_project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(bs_project)
+
+        bs_task = Task(
+            project_id=bs_project.id,
+            payloads=[{"type": "repo_bootstrap"}],
+            context={},  # No repo_overview → degraded path
+        )
+        strat_fail_db.add(bs_task)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(bs_task)
+
+        # Mock project_lock to yield bs_project directly
+        @asynccontextmanager
+        async def _mock_project_lock(session, project_id, **kwargs):
+            yield bs_project
+
+        mocker.patch("app.task_completion.project_lock", side_effect=_mock_project_lock)
+        mocker.patch(
+            "app.task_completion.with_design_doc_locked",
+            new=AsyncMock(),
+        )
+        mocker.patch("app.task_completion._stamp_command_memory_status")
+        mocker.patch(
+            "app.task_completion._seed_bootstrap_playbook_commands", new=AsyncMock()
+        )
+        mocker.patch(
+            "app.task_completion._upsert_domain_knowledge_document", new=AsyncMock()
+        )
+
+        # First run: degraded path records attempts == 1
+        await _handle_repo_bootstrap_completion(bs_task, logs="", session=strat_fail_db)
+        bc = bs_project.build_config or {}
+        assert bc.get("bootstrap_recovery_attempts") == 1
+
+        # Replay with same task: must stay at 1
+        await _handle_repo_bootstrap_completion(bs_task, logs="", session=strat_fail_db)
+        bc = bs_project.build_config or {}
+        assert bc.get("bootstrap_recovery_attempts") == 1, (
+            "Replay of the same bootstrap task must not re-increment bootstrap_recovery_attempts"
+        )
+
 
 # ── Rationale persistence & retrieval ────────────────────────────────────────
 

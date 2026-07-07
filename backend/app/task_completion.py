@@ -5270,31 +5270,37 @@ async def _handle_repo_bootstrap_completion(
             )
         else:
             if not build_config.get("bootstrap_completed_at"):
-                attempts = (
-                    coerce_recovery_attempts(
-                        build_config.get("bootstrap_recovery_attempts")
+                _last_degraded_task_id = build_config.get(
+                    "bootstrap_recovery_last_task_id"
+                )
+                if _last_degraded_task_id != str(task.id):
+                    # New degraded occurrence — increment counter and record state.
+                    attempts = (
+                        coerce_recovery_attempts(
+                            build_config.get("bootstrap_recovery_attempts")
+                        )
+                        + 1
                     )
-                    + 1
-                )
-                build_config["bootstrap_degraded_reason"] = "overview_missing"
-                build_config["bootstrap_recovery_attempts"] = attempts
-                build_config["bootstrap_recovery_last_degraded_at"] = now.isoformat()
-                if attempts >= BOOTSTRAP_RECOVERY_MAX_ATTEMPTS:
-                    build_config["bootstrap_recovery_state"] = "exhausted"
-                    build_config["bootstrap_recovery_exhausted_at"] = now.isoformat()
-                    build_config.pop("bootstrap_recovery_next_at", None)
-                else:
-                    build_config["bootstrap_recovery_state"] = "backoff"
-                    build_config["bootstrap_recovery_next_at"] = (
-                        now + next_recovery_backoff(attempts)
-                    ).isoformat()
-                    build_config.pop("bootstrap_recovery_exhausted_at", None)
-                logger.warning(
-                    "[BOOTSTRAP] No repo_overview in completion payload for project %s "
-                    "(task %s) — recording degraded marker",
-                    task.project_id,
-                    task.id,
-                )
+                    build_config["bootstrap_degraded_reason"] = "overview_missing"
+                    build_config["bootstrap_recovery_attempts"] = attempts
+                    build_config["bootstrap_recovery_last_task_id"] = str(task.id)
+                    build_config["bootstrap_recovery_last_degraded_at"] = now.isoformat()
+                    if attempts >= BOOTSTRAP_RECOVERY_MAX_ATTEMPTS:
+                        build_config["bootstrap_recovery_state"] = "exhausted"
+                        build_config["bootstrap_recovery_exhausted_at"] = now.isoformat()
+                        build_config.pop("bootstrap_recovery_next_at", None)
+                    else:
+                        build_config["bootstrap_recovery_state"] = "backoff"
+                        build_config["bootstrap_recovery_next_at"] = (
+                            now + next_recovery_backoff(attempts)
+                        ).isoformat()
+                        build_config.pop("bootstrap_recovery_exhausted_at", None)
+                    logger.warning(
+                        "[BOOTSTRAP] No repo_overview in completion payload for project %s "
+                        "(task %s) — recording degraded marker",
+                        task.project_id,
+                        task.id,
+                    )
 
         # ── Command-memory status (independent of overview persistence) ──────
         # A valid overview no longer implies complete command memory. The agent

@@ -744,13 +744,16 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
         target = next((d for d in dirs if d.get("id") == direction_id), None)
         if not target:
             return
+        _task_id_str = str(task.id)
         target["last_researched_at"] = now_iso
         target["last_cycle_productive"] = False
-        new_consec = int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
-        target["consecutive_unproductive_cycles"] = new_consec
-        # Only mark saturated after 3+ consecutive unproductive cycles, consistent
-        # with _compute_saturation's history-based threshold.
-        target["possibly_saturated"] = new_consec >= 3
+        if target.get("_last_productivity_task_id") != _task_id_str:
+            target["_last_productivity_task_id"] = _task_id_str
+            new_consec = int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
+            target["consecutive_unproductive_cycles"] = new_consec
+            # Only mark saturated after 3+ consecutive unproductive cycles, consistent
+            # with _compute_saturation's history-based threshold.
+            target["possibly_saturated"] = new_consec >= 3
         stamp_direction_refractory(target)
 
         # Auto-complete the most exhausted directions (those producing zero
@@ -5827,10 +5830,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         touched_dir_ids.add(current_direction_id)
     if touched_dir_ids:
 
+        _productivity_task_id = str(task.id)
+
         def _update_productivity(dirs: list) -> None:
             for d in dirs:
                 did = d.get("id")
                 if did in touched_dir_ids:
+                    if d.get("_last_productivity_task_id") == _productivity_task_id:
+                        continue
+                    d["_last_productivity_task_id"] = _productivity_task_id
                     productive = tasks_by_dir.get(did, 0) > 0
                     d["last_cycle_productive"] = productive
                     if productive:

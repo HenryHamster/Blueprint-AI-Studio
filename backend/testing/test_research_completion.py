@@ -16110,6 +16110,84 @@ async def test_apply_post_spawn_state_outcome_progress_and_findings_idempotent_o
     )
 
 
+class TestProductivityCounterReplay:
+    """consecutive_unproductive_cycles must not double-count on completion-handler replay."""
+
+    async def test_productivity_counter_idempotent_on_replay(self, monkeypatch):
+        """_stamp_no_findings_refractory must increment the counter exactly once even when
+        replayed with the same task (post-commit re-run scenario)."""
+        import app.research_completion as rc
+        from app.research_completion import _stamp_no_findings_refractory
+
+        direction_id = str(uuid.uuid4())
+        task = _Task(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            title="research",
+            payloads=[{"type": "research", "current_direction_id": direction_id}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"direction_id": direction_id},
+        )
+
+        directions = [{"id": direction_id, "status": "active", "consecutive_unproductive_cycles": 1}]
+
+        async def _fake_with_dirs_locked(session, project_id, fn, **kwargs):
+            fn(directions)
+            return True
+
+        monkeypatch.setattr(rc, "with_directions_locked", _fake_with_dirs_locked)
+
+        session = AsyncMock()
+
+        # First call (original run): counter should increment 1 → 2
+        await _stamp_no_findings_refractory(task, session)
+        assert directions[0]["consecutive_unproductive_cycles"] == 2, (
+            "counter should have incremented on first call"
+        )
+
+        # Second call (replay, same task): counter must NOT increment again
+        await _stamp_no_findings_refractory(task, session)
+        assert directions[0]["consecutive_unproductive_cycles"] == 2, (
+            "counter must remain at 2 on replay — double-counting a no-findings cycle "
+            "inflates the streak and triggers false saturation/auto-retirement"
+        )
+
+    async def test_productivity_counter_increments_for_different_task(self, monkeypatch):
+        """A genuinely new task (different task_id) on the same direction must still increment."""
+        import app.research_completion as rc
+        from app.research_completion import _stamp_no_findings_refractory
+
+        direction_id = str(uuid.uuid4())
+        directions = [{"id": direction_id, "status": "active", "consecutive_unproductive_cycles": 1}]
+
+        async def _fake_with_dirs_locked(session, project_id, fn, **kwargs):
+            fn(directions)
+            return True
+
+        monkeypatch.setattr(rc, "with_directions_locked", _fake_with_dirs_locked)
+        session = AsyncMock()
+
+        def _make_task():
+            return _Task(
+                id=uuid.uuid4(),
+                project_id=uuid.uuid4(),
+                title="research",
+                payloads=[{"type": "research", "current_direction_id": direction_id}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                context={"direction_id": direction_id},
+            )
+
+        await _stamp_no_findings_refractory(_make_task(), session)
+        assert directions[0]["consecutive_unproductive_cycles"] == 2
+
+        await _stamp_no_findings_refractory(_make_task(), session)
+        assert directions[0]["consecutive_unproductive_cycles"] == 3, (
+            "a different task's no-findings cycle must still increment the counter"
+        )
+
+
 async def test_note_apply_is_idempotent_on_replay(db_session):
     """Direction notes must not duplicate when apply_post_spawn_state is replayed.
 

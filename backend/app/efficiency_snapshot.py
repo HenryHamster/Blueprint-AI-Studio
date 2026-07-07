@@ -72,6 +72,7 @@ from app.llm_cost_attribution import (
     compute_llm_cost_by_task_type,
     compute_pr_rework_chain_breakdown,
 )
+from app.task_capabilities import is_pr_eligible_task_type
 from app.task_locking import project_lock
 from app.vm_cost_rates import idle_cost_usd
 
@@ -1227,6 +1228,10 @@ def _new_efficiency_bucket() -> Dict[str, Any]:
         # Verified landings only (is_verified_merge) — degraded fall-open merges
         # count in landed_count but NOT here, mirroring compute_llm_cost_breakdown.
         "verified_landed_count": 0,
+        # Tasks whose type can land a PR (evaluation_strategy=ci_and_review).
+        # landed_rate / verified_landed_rate divide by this, not run_count, so
+        # review/plan/research tasks that can never open a PR don't deflate the rate.
+        "pr_eligible_run_count": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "llm_call_count": 0,
@@ -1243,17 +1248,28 @@ def _finalize_efficiency_bucket(b: Dict[str, Any], **extra: Any) -> Dict[str, An
     run_count = int(b["run_count"])
     landed_count = int(b["landed_count"])
     verified_landed_count = int(b["verified_landed_count"])
+    pr_eligible_run_count = int(b["pr_eligible_run_count"])
     cost = round(float(b["cost_usd"]), 6)
     priceable = int(b["priced_run_count"]) + int(b["unpriced_run_count"])
     out: Dict[str, Any] = {
         "run_count": run_count,
+        # PR-eligible denominator: only tasks that can land a PR are counted.
+        # Review/plan/research tasks inflate run_count but can never contribute
+        # to the numerator, so landed_rate uses this narrower denominator.
+        "pr_eligible_run_count": pr_eligible_run_count,
         "landed_count": landed_count,
-        "landed_rate": round(landed_count / run_count, 4) if run_count else None,
+        "landed_rate": (
+            round(landed_count / pr_eligible_run_count, 4)
+            if pr_eligible_run_count
+            else None
+        ),
         # Verified payoff alongside the raw landed figures: degraded (no-CI
         # fall-open) merges are kept in landed_count/landed_rate but excluded here.
         "verified_landed_count": verified_landed_count,
         "verified_landed_rate": (
-            round(verified_landed_count / run_count, 4) if run_count else None
+            round(verified_landed_count / pr_eligible_run_count, 4)
+            if pr_eligible_run_count
+            else None
         ),
         "total_cost_usd": cost,
         # Cost-per-merge is the headline payoff number: priced LLM dollars spent
@@ -1465,8 +1481,13 @@ def compute_effort_model_efficiency(
         # Effort is a TASK-level attribute: credit its bucket and the grand total
         # once per task. Model buckets are credited once per distinct bucket the
         # task touched, so a multi-attempt/multi-model task never inflates counts.
+        task_type_str = first_payload.get("type") if first_payload else None
+        pr_eligible = is_pr_eligible_task_type(task_type_str or "")
         eff_bucket["run_count"] += 1
         totals["run_count"] += 1
+        if pr_eligible:
+            eff_bucket["pr_eligible_run_count"] += 1
+            totals["pr_eligible_run_count"] += 1
         if landed:
             eff_bucket["landed_count"] += 1
             totals["landed_count"] += 1
@@ -1476,6 +1497,8 @@ def compute_effort_model_efficiency(
         for key in credit_keys:
             mb = model_buckets[key]
             mb["run_count"] += 1
+            if pr_eligible:
+                mb["pr_eligible_run_count"] += 1
             if landed:
                 mb["landed_count"] += 1
             if verified:
