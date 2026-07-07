@@ -8786,6 +8786,103 @@ async def test_coverage_recovery_backfills_stranded_evidence_before_check(
 
 
 @pytest.mark.asyncio
+async def test_coverage_recovery_records_acceptance_window_evidence_before_check(
+    db_session, mocker
+):
+    """Reconciler re-scores the acceptance-window metric and records covering
+    evidence for the acceptance-window criterion before deciding coverage.
+
+    An acceptance-window criterion (its text names the metric) is uncovered by
+    proven task_merge evidence because the merges are UNDECLARED inferred
+    test-cochange merges. The reconciler must call
+    record_acceptance_window_coverage_evidence, which flips the criterion to
+    covered off the recomputed non-zero window, then spawn a fresh qualification.
+    """
+    from datetime import timedelta
+
+    from app.acceptance_criteria import (
+        get_evidence_for_criterion,
+        get_version_coverage_summary,
+    )
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "windowev" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await _add_version_criterion(
+        db_session, project, version,
+        key="c-window-metric",
+        text="The false acceptance-coverage 0/346 is fixed (acceptance_window_fraction non-zero)",
+    )
+
+    # Two inferred_test_cochange merges in the window: CI-verified, undeclared,
+    # test+prod co-change → verified=2, write_total=2, fraction=1.0.
+    for i in range(2):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "prompt": "implement it"}],
+                context={
+                    LANDED_SIGNAL_KEY: True,
+                    LANDED_ON_INTEGRATION_KEY: True,
+                    "_pr_changed_files": [f"testing/test_{i}.py", f"app/mod_{i}.py"],
+                },
+                status=TaskStatus.COMPLETED,
+                completed_at=version.opened_at + timedelta(seconds=i + 1),
+            )
+        )
+    await db_session.commit()
+
+    pre_coverage = await get_version_coverage_summary(db_session, version.id)
+    assert pre_coverage["covered"] == 0
+    assert pre_coverage["total"] == 1
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True, (
+        "Expected reconciled=True after acceptance-window recompute cleared coverage"
+    )
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+
+    evidence = await get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1
+    assert evidence[0].source_kind == "acceptance_window_recompute"
+    assert evidence[0].detail["acceptance_window_verified"] == 2
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_cached_promoted_same_sha_is_noop(db_session, mocker):
     """Idempotent qualification: when a conclusive promoted verdict exists
     for this candidate_sha and automain HEAD still equals it, run_qualification

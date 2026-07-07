@@ -4139,3 +4139,287 @@ async def test_record_task_merge_evidence_logs_direction_fetch_failed(db_session
     assert any(MergeEvidenceReason.direction_fetch_failed in r.message for r in caplog.records), (
         f"Expected direction_fetch_failed in log; got: {[r.message for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# record_acceptance_window_coverage_evidence
+# ---------------------------------------------------------------------------
+
+
+def _make_inferred_cochange_task(project, version, *, changed_files, seconds=1):
+    """Build a COMPLETED, CI-verified, UNDECLARED merged write-task.
+
+    With a test path AND a production path in ``_pr_changed_files`` this
+    classifies as ``inferred_test_cochange`` (verified numerator); with only a
+    production path it classifies as ``undeclared`` (denominator-only, false-zero
+    numerator).
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    return Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement it"}],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": changed_files,
+            # No CODE_ACCEPTANCE_VERDICT_KEY → undeclared; a verified merge with a
+            # test+prod co-change is credited via the inferred_test_cochange path.
+        },
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=seconds),
+    )
+
+
+def test_acceptance_window_recompute_evidence_marks_covered():
+    """An ``acceptance_window_recompute`` evidence row is covering on its own."""
+    assert (
+        ac.compute_criterion_coverage(
+            [_make_evidence("acceptance_window_recompute", detail={"acceptance_window_verified": 3})]
+        )
+        == "covered"
+    )
+
+
+def test_names_acceptance_window_metric_matches_and_rejects():
+    """The metric-name matcher recognises acceptance-window text and rejects others."""
+    assert ac._names_acceptance_window_metric("The false acceptance-coverage 0/346 is fixed")
+    assert ac._names_acceptance_window_metric("acceptance_window_fraction is non-zero")
+    assert ac._names_acceptance_window_metric("recompute the ACCEPTANCE WINDOW aggregate")
+    assert not ac._names_acceptance_window_metric("subtask_merge_rate drops SCOPE_OVERFLOW")
+    assert not ac._names_acceptance_window_metric(None)
+    assert not ac._names_acceptance_window_metric("")
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_records_covering_evidence(db_session):
+    """Named acceptance-evidence test: inferred_test_cochange merges flip the
+    acceptance-window criterion from uncovered to covered.
+
+    Given an open version whose merge window contains inferred_test_cochange
+    merges (COMPLETED write-tasks whose PR co-changed a test AND a production
+    file, CI-verified, no explicit verdict) such that the recomputed aggregate
+    scores ``verified > 0``, the recorder records ONE covering
+    ``acceptance_window_recompute`` row for the criterion whose text names the
+    metric and ``get_version_coverage_summary`` reports it ``covered``.
+    """
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowRecompute")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    # The operator-authored criterion that tracks the acceptance-window metric.
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="The false acceptance-coverage 0/346 is fixed (acceptance_window_fraction non-zero)",
+        created_by="operator",
+    )
+
+    # Two inferred_test_cochange merges (verified numerator) + one prod-only
+    # undeclared merge (denominator only). verified=2, write_total=3.
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
+        )
+    )
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["testing/test_b.py", "app/b.py"], seconds=2
+        )
+    )
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["app/c.py"], seconds=3
+        )
+    )
+    await db_session.commit()
+
+    # Before: no evidence, criterion uncovered.
+    summary_before = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_before["covered"] == 0
+    assert summary_before["uncovered"] == 1
+
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 1, f"Expected 1 covering row for the target criterion; got {recorded}"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1
+    row = evidence[0]
+    assert row.source_kind == "acceptance_window_recompute"
+    assert row.detail["acceptance_window_verified"] == 2
+    assert row.detail["acceptance_window_write_total"] == 3
+    assert row.detail["acceptance_window_inferred_test_cochange"] == 2
+    assert row.detail["acceptance_window_fraction"] == pytest.approx(2 / 3)
+
+    # After: the criterion flips to covered.
+    summary_after = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_after["covered"] == 1
+    assert summary_after["uncovered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_covers_via_direction_mapping(db_session):
+    """A criterion whose OWN text is generic is still covered when it is mapped to
+    a Direction whose text names the acceptance-window metric (rule b)."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowViaDirection")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="c-986db347 tracked outcome",  # generic text, not itself a match
+        created_by="operator",
+    )
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key="d-window",
+        data={"id": "d-window", "text": "Drive acceptance_window_fraction non-zero", "status": "active"},
+        text="Drive acceptance_window_fraction non-zero",
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
+        )
+    )
+    await db_session.commit()
+
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 1
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["covered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_nothing_when_verified_zero(db_session):
+    """False zero: write_total > 0 but verified == 0 → records NOTHING, stays uncovered."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowFalseZero")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="acceptance_window_fraction is non-zero",
+        created_by="operator",
+    )
+    # Prod-only undeclared merge: contributes to write_total but not verified.
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["app/only_prod.py"], seconds=1
+        )
+    )
+    await db_session.commit()
+
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 0, "Must record nothing when verified == 0 (false zero)"
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["uncovered"] == 1
+    assert summary["covered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_nothing_when_no_merges(db_session):
+    """Empty window: write_total == 0 → records NOTHING."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowEmpty")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="acceptance_window_fraction is non-zero",
+        created_by="operator",
+    )
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 0
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["uncovered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_does_not_over_cover(db_session):
+    """An unrelated active criterion (text does not name the metric, no mapping)
+    must NOT receive acceptance-window evidence — no blanket coverage."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowNoOverCover")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    target = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="acceptance_window_fraction is non-zero",
+        created_by="operator",
+    )
+    unrelated = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="subtask_merge_rate drops SCOPE_OVERFLOW from denominator",
+        created_by="operator",
+    )
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
+        )
+    )
+    await db_session.commit()
+
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 1, "Only the target criterion should be covered"
+
+    assert await ac.get_evidence_for_criterion(db_session, target.id) != []
+    assert await ac.get_evidence_for_criterion(db_session, unrelated.id) == [], (
+        "Unrelated criterion must not receive acceptance-window evidence"
+    )
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["covered"] == 1
+    assert summary["uncovered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_is_idempotent(db_session):
+    """Running the recorder twice records at most one row (stable per-version source_id)."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowIdempotent")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="acceptance_window_fraction is non-zero",
+        created_by="operator",
+    )
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
+        )
+    )
+    await db_session.commit()
+
+    first = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    second = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert first == 1
+    assert second == 0, "Second run must be idempotent (0 new rows)"
+    assert len(await ac.get_evidence_for_criterion(db_session, criterion.id)) == 1

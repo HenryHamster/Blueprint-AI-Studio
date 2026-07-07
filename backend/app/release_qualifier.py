@@ -2720,6 +2720,7 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_fraction": float|None,  # None when write-task total == 0
         "acceptance_window_write_total": int,      # same as acceptance_window_total (explicit alias)
         "acceptance_window_total_all_merges": int, # all landed merges regardless of type (observability)
+        "acceptance_window_inferred_test_cochange": int,  # verified merges credited via inferred_test_cochange
       }
     """
 
@@ -2743,11 +2744,16 @@ async def _compute_acceptance_window_aggregate(
         if (task.first_payload or {}).get("type") in WRITE_TASK_TYPES
     ]
     total = len(rows_write)
+    write_buckets = [
+        classify_merged_acceptance_context(task.context or {}) for task in rows_write
+    ]
     verified = sum(
         1
-        for task in rows_write
-        if classify_merged_acceptance_context(task.context or {})
-        in {"proven", "satisfied_unproven", "inferred_test_cochange"}
+        for bucket in write_buckets
+        if bucket in {"proven", "satisfied_unproven", "inferred_test_cochange"}
+    )
+    inferred_test_cochange = sum(
+        1 for bucket in write_buckets if bucket == "inferred_test_cochange"
     )
     fraction = (verified / total) if total > 0 else None
     return {
@@ -2756,6 +2762,12 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_fraction": fraction,
         "acceptance_window_write_total": total,
         "acceptance_window_total_all_merges": total_all_merges,
+        # Additive audit breakdown: how many verified merges were credited via the
+        # inferred test-cochange path (undeclared merge, CI-verified, test+prod
+        # co-change) rather than an explicit proven/satisfied declaration. Consumed
+        # by acceptance_criteria.record_acceptance_window_coverage_evidence for the
+        # evidence detail; no score impact.
+        "acceptance_window_inferred_test_cochange": inferred_test_cochange,
     }
 
 

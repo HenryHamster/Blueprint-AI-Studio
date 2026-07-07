@@ -347,6 +347,7 @@ async def _reconcile_if_criterion_coverage_now_complete(
     from app.acceptance_criteria import (
         backfill_direction_merge_evidence,
         get_version_coverage_summary,
+        record_acceptance_window_coverage_evidence,
     )
     from app.models import Direction
 
@@ -422,6 +423,28 @@ async def _reconcile_if_criterion_coverage_now_complete(
                             total,
                             covered,
                         )
+
+                # Re-score the acceptance-window metric and, when the window is
+                # genuinely populated and non-zero, record covering evidence for
+                # the criteria that track that metric. This closes the false
+                # acceptance-coverage 0/N by letting the coverage gate re-evaluate
+                # on fresher data in the same pass, without an operator in the loop.
+                window_recorded = await record_acceptance_window_coverage_evidence(
+                    session, version
+                )
+                if window_recorded:
+                    coverage = await get_version_coverage_summary(session, version.id)
+                    total = int(coverage.get("total") or 0)
+                    covered = int(coverage.get("covered") or 0)
+                    logger.info(
+                        "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                        "recorded %d acceptance-window recompute evidence row(s) on v%d "
+                        "(total=%d covered=%d after recompute)",
+                        window_recorded,
+                        version.version_number,
+                        total,
+                        covered,
+                    )
 
             if not (total == 0 or covered >= total):
                 return False
