@@ -43,6 +43,7 @@ from app.compute import get_zone_health_summary
 from app.fleet_utilization import get_fleet_utilization_snapshot
 from app.pipeline_health import compute_pipeline_health_summary
 from app.routers.admin_debug import _build_stuck_tasks
+from app.deploy_identity import project_is_deploy_repo
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +200,7 @@ async def get_null_branch_config_diagnostics(
             if project.created_at
             else None,
         }
-        if project.is_self_repo and project.integration_branch is None:
+        if project_is_deploy_repo(project) and project.integration_branch is None:
             self_repo_skipped.append(item)
         else:
             projects.append(item)

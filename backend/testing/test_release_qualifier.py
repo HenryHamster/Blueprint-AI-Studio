@@ -30448,6 +30448,60 @@ class TestRecoverConfidenceFromCiUnresolved:
         assert out["blocker"] is None
         assert out["confidence"] > 0.0
 
+    def test_enforce_mode_ci_unresolved_recovery_includes_debt_blend(self):
+        """NAMED ACCEPTANCE TEST — enforce-mode ci_unresolved recovery records a debt-blended confidence.
+
+        When ci_unresolved forces confidence to 0.0, the recovery helper
+        recomputes the 'real' qualified confidence. In enforce mode (completion_debt
+        weight > 0), the debt blend must be applied, so the recovered confidence
+        equals a normal finalize of the same sub_scores.
+        """
+        # Establish enforce-mode policy with debt weight.
+        enforce_policy = {
+            "weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+                "completion_debt": 0.15,
+            },
+            "threshold": 0.90,
+        }
+
+        # Sub-scores for a normally-qualifying candidate.
+        sub_scores = {
+            "audit": 0.85,
+            "test_erosion": 0.90,
+            "smoketest": 0.95,
+            "debt_pressure": 0.50,  # moderate open debt
+        }
+
+        # Normal finalize with ci_green=True (control case).
+        normal_result = rq.compute_composite(
+            ci_green=True,
+            audit_score=sub_scores["audit"],
+            test_erosion=sub_scores["test_erosion"],
+            smoketest_score=sub_scores["smoketest"],
+            policy=enforce_policy,
+            debt_pressure_score=sub_scores["debt_pressure"],
+        )
+
+        # ci_unresolved blocker — confidence forced to 0.0 (no debt blend).
+        blocked_record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": sub_scores,
+            "smoketest_enabled": True,
+        }
+
+        # Recovery applies the debt blend.
+        recovered = self._fn(blocked_record, policy=enforce_policy)
+
+        # Recovered confidence must equal the normally-finalized confidence
+        # (both include the debt blend).
+        assert recovered["confidence"] == pytest.approx(normal_result["confidence"])
+        assert recovered.get("confidence_recovered_from_ci_unresolved") is True
+        assert recovered.get("blocker") is None
+
 
 
 # ===========================================================================

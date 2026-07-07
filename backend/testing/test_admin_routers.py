@@ -561,6 +561,62 @@ class TestNullBranchConfigDiagnostics:
         assert skipped["is_self_repo"] is True
         assert "created_at" in skipped
 
+    @pytest.mark.asyncio
+    async def test_buckets_deploy_repo_by_identity_despite_misset_flag(
+        self, client: AsyncClient, db_session
+    ):
+        """Verify deploy-identity predicate is used instead of is_self_repo flag.
+
+        When a project matches the deploy identity (github_owner/repo) but has
+        is_self_repo=False (misset), it should still be classified in
+        self_repo_skipped because deploy-identity is the source of truth.
+        """
+        from app.runtime_config_state import runtime_config
+
+        # Set deploy identity via runtime_config (simulates DEPLOY_REPO_IDENTITY env)
+        runtime_config["deploy_repo_identity"] = "acme/deploy-repo"
+
+        # Create the actual deploy repo with misset is_self_repo flag
+        deploy_repo_misset = Project(
+            name="Deploy Repo (misset flag)",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="deploy-repo",
+            is_self_repo=False,  # Misset — should be True but isn't
+        )
+
+        # Create a properly configured non-deploy project
+        other_project = Project(
+            name="Other Project",
+            user_id=TEST_USER_ID,
+            github_owner="other",
+            github_repo="other-repo",
+            is_self_repo=False,
+        )
+
+        db_session.add_all([deploy_repo_misset, other_project])
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/diagnostics/null-branch-config")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        # The deploy_repo_misset should be in self_repo_skipped (despite is_self_repo=False)
+        # because it matches the deploy identity
+        assert data["total"] == 2
+        assert len(data["self_repo_skipped"]) == 1
+        skipped = data["self_repo_skipped"][0]
+        assert skipped["id"] == str(deploy_repo_misset.id)
+        assert skipped["name"] == "Deploy Repo (misset flag)"
+        assert skipped["github_owner"] == "acme"
+        assert skipped["github_repo"] == "deploy-repo"
+        assert skipped["is_self_repo"] is False  # Misset flag, but still skipped by identity
+
+        # The other project should be in projects (not skipped)
+        assert len(data["projects"]) == 1
+        project = data["projects"][0]
+        assert project["id"] == str(other_project.id)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_projects.py — Project CRUD + Autonomous Mode

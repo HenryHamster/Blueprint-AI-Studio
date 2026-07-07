@@ -263,6 +263,7 @@ def _recover_confidence_from_ci_unresolved(
     audit_raw = sub_scores.get("audit")
     test_erosion_raw = sub_scores.get("test_erosion")
     smoketest_raw = sub_scores.get("smoketest")
+    debt_pressure_raw = sub_scores.get("debt_pressure")
     smoketest_enabled = bool(base_record.get("smoketest_enabled", True))
 
     if not isinstance(audit_raw, (int, float)) or isinstance(audit_raw, bool):
@@ -287,6 +288,12 @@ def _recover_confidence_from_ci_unresolved(
         and not isinstance(smoketest_raw, bool)
         else None
     )
+    debt_pressure_score = (
+        float(debt_pressure_raw)
+        if isinstance(debt_pressure_raw, (int, float))
+        and not isinstance(debt_pressure_raw, bool)
+        else None
+    )
 
     recovered = compute_composite(
         ci_green=True,
@@ -299,6 +306,7 @@ def _recover_confidence_from_ci_unresolved(
         migration_apply_blocked=base_record.get("migration_apply_safety") == "block",
         criterion_coverage=base_record.get("criterion_coverage"),
         merge_grade_misses=_merge_grade_misses_armed(base_record, _policy),
+        debt_pressure_score=debt_pressure_score,
     )
 
     return {
