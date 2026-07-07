@@ -1054,6 +1054,67 @@ async def test_cancelled_task_with_vm_cost_included_in_cost_per_merged_pr(db_ses
     assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm
 
 
+def test_merged_count_excludes_rollup_parent():
+    """Rollup parents must not be counted as merged PRs alongside their children.
+
+    When a rollup lands, is_merged_completion is True on the parent AND on every
+    child.  Counting the parent inflates cost_per_merged_pr and per-type
+    merged_count.  The fix: build the set of task IDs that appear as
+    parent_task_id on at least one sibling, and exclude those from the merged
+    count.
+    """
+    import uuid
+
+    from app.efficiency_snapshot import _cost_and_merges, compute_vm_cost_by_task_type
+
+    project_id = uuid.uuid4()
+    parent_id = uuid.uuid4()
+
+    now = _utcnow()
+
+    # Rollup parent: merged, but should be excluded from count.
+    parent = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    parent.id = parent_id
+
+    # Two children: each merged, both should count.
+    child1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=3),
+        vm_stopped_at=now,
+        vm_spot=False,
+        parent_task_id=parent_id,
+    )
+    child2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=4),
+        vm_stopped_at=now,
+        vm_spot=False,
+        parent_task_id=parent_id,
+    )
+
+    tasks = [parent, child1, child2]
+
+    # _cost_and_merges: merged count must be 2 (children only), not 3.
+    _, merged = _cost_and_merges(tasks)
+    assert merged == 2, f"Expected 2 merged (children only), got {merged}"
+
+    # compute_vm_cost_by_task_type: merged_count per bucket must also be 2.
+    by_type = compute_vm_cost_by_task_type(tasks)
+    total_merged = sum(b["merged_count"] for b in by_type)
+    assert total_merged == 2, f"Expected 2 merged across types, got {total_merged}"
+
+
 @pytest.mark.asyncio
 async def test_review_skipped_tasks_count_as_zero_iterations(db_session):
     """Regression: a task that was auto-approved (pr_merged=True, no review_loop)

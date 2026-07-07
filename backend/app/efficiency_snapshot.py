@@ -423,13 +423,24 @@ def _compute_checkpoint_loss_rate(lanes: list[ImprovementLane]) -> float | None:
     return round(total_requeues / denominator, 4)
 
 
+def _rollup_parent_ids(tasks: list[Task]) -> frozenset:
+    """Return the set of task IDs that are parents of at least one other task.
+
+    Rollup parents get is_merged_completion=True alongside all their children
+    when the rollup lands, so counting them in merged-PR metrics double-counts
+    the landing. Callers exclude these IDs from merged/landed counts.
+    """
+    return frozenset(t.parent_task_id for t in tasks if t.parent_task_id is not None)
+
+
 def _cost_and_merges(tasks: list[Task]) -> tuple[float, int]:
     """Return (total task-attached VM cost, merged-PR count) over the window."""
     total_cost = 0.0
     merged = 0
+    parent_ids = _rollup_parent_ids(tasks)
     for t in tasks:
         total_cost += get_task_total_vm_cost_usd(t)
-        if is_merged_completion(t):
+        if is_merged_completion(t) and t.id not in parent_ids:
             merged += 1
     return total_cost, merged
 
@@ -1137,10 +1148,11 @@ def compute_vm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
         lambda: {"task_count": 0, "merged_count": 0, "cost_usd": 0.0}
     )
     total_cost = 0.0
+    parent_ids = _rollup_parent_ids(tasks)
 
     for t in tasks:
         task_type = (t.first_payload or {}).get("type") or "unspecified"
-        merged = is_merged_completion(t)
+        merged = is_merged_completion(t) and t.id not in parent_ids
         vm_cost = get_task_total_vm_cost_usd(t)
         b = buckets[task_type]
         b["task_count"] += 1
@@ -1337,6 +1349,11 @@ def compute_effort_model_efficiency(
     fallback_total = 0
     fallback_combos: Dict[tuple[str, str, str, str], int] = defaultdict(int)
 
+    # Rollup parents get is_merged_completion=True alongside all their children
+    # when a rollup lands; exclude them so each rollup counts as N child landings,
+    # not N+1.
+    _parent_ids = _rollup_parent_ids(tasks)
+
     def _accumulate_attempt(
         b: Dict[str, Any],
         input_tokens: int,
@@ -1357,8 +1374,8 @@ def compute_effort_model_efficiency(
             b["unpriced_run_count"] += 1
 
     for t in tasks:
-        landed = is_merged_completion(t)
-        verified = is_verified_merge(t)
+        landed = is_merged_completion(t) and t.id not in _parent_ids
+        verified = is_verified_merge(t) and t.id not in _parent_ids
         # Bucket by the EFFECTIVE routing effort the dispatcher resolves (the
         # tier that actually selected the model and drove cost), not just the
         # explicit payload effort that only scope-aware types carry. Read the

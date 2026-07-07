@@ -2249,65 +2249,97 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 
     child_tasks = []
 
-    # Bundle all high-severity findings into a single child task
-    if actionable:
-        # Enumerate findings in the prompt so the agent addresses them all
-        findings_text = "\n".join(
-            f"{i + 1}. [{finding.get('area', 'general')}] {finding.get('title', f'Finding {i + 1}')}\n"
-            f"   Description: {finding.get('description', '')}\n"
-            f"   Suggested approach: {finding.get('fix_prompt', '')}"
-            for i, finding in enumerate(actionable)
-        )
+    # Already-spawned guard: if a prior attempt committed a child but died before
+    # flipping the parent to EVALUATING, a replay would re-parse the same findings
+    # and spawn a duplicate. Detect that case and skip spawning.
+    existing_children = (
+        (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    already_spawned = [
+        ct
+        for ct in existing_children
+        if (ct.context or {}).get("perf_task_id") == str(task.id)
+    ]
 
-        bundled_prompt = (
-            f"Performance audit identified {len(actionable)} high-severity findings:\n\n"
-            f"{findings_text}\n\n"
-            f"Address each finding independently in a single PR. You may skip individual "
-            f"findings that prove risky or out of scope rather than failing the entire task. "
-            f"Aim to fix as many as feasible without coupling unrelated changes."
-        )
+    create_suffix = _runtime_config.get("agent_prompt_suffixes", {}).get("create")
 
-        new_task = Task(
-            project_id=task.project_id,
-            title=f"[PERF] Fix {len(actionable)} high-severity performance findings",
-            description=f"Bundle of {len(actionable)} performance findings from audit",
-            parent_task_id=task.id,
-            payloads=[
-                validate_internal_payload(
-                    {
-                        "type": "create",
-                        "prompt": bundled_prompt,
-                        "base_branch": base_branch,
-                    },
-                    "task_completion:perf_findings_bundle",
-                )
-            ],
-            context={
-                "perf_task_id": str(task.id),
-                "finding_count": len(actionable),
-                "severity": "high",
-                "findings_areas": list(
-                    set(f.get("area", "") for f in actionable if f.get("area"))
-                ),
-            },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-            status=TaskStatus.QUEUED,
-            created_by="ORCHESTRATOR",
-            requires_approval=False,
-            depends_on=[],
+    if already_spawned:
+        # Replay path: child already committed in a prior attempt.
+        # Skip spawning; use existing child to complete remaining effects.
+        child_tasks = already_spawned
+        logger.info(
+            "[PERF] Task %s replay: found already-spawned child, skipping re-spawn",
+            task.id,
         )
-        session.add(new_task)
-        child_tasks.append(new_task)
+    else:
+        # Bundle all high-severity findings into a single child task
+        if actionable:
+            # Enumerate findings in the prompt so the agent addresses them all
+            findings_text = "\n".join(
+                f"{i + 1}. [{finding.get('area', 'general')}] {finding.get('title', f'Finding {i + 1}')}\n"
+                f"   Description: {finding.get('description', '')}\n"
+                f"   Suggested approach: {finding.get('fix_prompt', '')}"
+                for i, finding in enumerate(actionable)
+            )
 
-    await session.flush()
+            bundled_prompt = (
+                f"Performance audit identified {len(actionable)} high-severity findings:\n\n"
+                f"{findings_text}\n\n"
+                f"Address each finding independently in a single PR. You may skip individual "
+                f"findings that prove risky or out of scope rather than failing the entire task. "
+                f"Aim to fix as many as feasible without coupling unrelated changes."
+            )
+
+            new_task = Task(
+                project_id=task.project_id,
+                title=f"[PERF] Fix {len(actionable)} high-severity performance findings",
+                description=f"Bundle of {len(actionable)} performance findings from audit",
+                parent_task_id=task.id,
+                payloads=[
+                    validate_internal_payload(
+                        {
+                            "type": "create",
+                            "prompt": bundled_prompt,
+                            "base_branch": base_branch,
+                            **(
+                                {"prompt_suffix": create_suffix}
+                                if create_suffix
+                                else {}
+                            ),
+                        },
+                        "task_completion:perf_findings_bundle",
+                    )
+                ],
+                context={
+                    "perf_task_id": str(task.id),
+                    "finding_count": len(actionable),
+                    "severity": "high",
+                    "findings_areas": list(
+                        set(f.get("area", "") for f in actionable if f.get("area"))
+                    ),
+                },
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+                requires_approval=False,
+                depends_on=[],
+            )
+            session.add(new_task)
+            child_tasks.append(new_task)
+
+        await session.flush()
+        for ct in child_tasks:
+            history = TaskHistory(
+                task_id=ct.id,
+                action="SPAWNED",
+                details={"spawned_by": "PERF_AUDIT", "parent_perf_id": str(task.id)},
+            )
+            session.add(history)
+
     pending_broadcasts: list[tuple[str, str, dict]] = []
     for ct in child_tasks:
-        history = TaskHistory(
-            task_id=ct.id,
-            action="SPAWNED",
-            details={"spawned_by": "PERF_AUDIT", "parent_perf_id": str(task.id)},
-        )
-        session.add(history)
         pending_broadcasts.append(
             (
                 str(task.project_id),

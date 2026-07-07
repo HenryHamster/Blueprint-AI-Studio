@@ -4406,3 +4406,114 @@ class TestHandleSecurityAuditCompletion:
 
         assert len(children) == 0
         assert audit_task.status == TaskStatus.COMPLETED
+
+
+_PERF_FINDINGS_JSON = json.dumps(
+    [
+        {
+            "severity": "high",
+            "area": "database",
+            "title": "N+1 query in user listing",
+            "description": "User list endpoint queries database in loop.",
+            "fix_prompt": "Use join query to fetch all users at once.",
+        },
+        {
+            "severity": "high",
+            "area": "cache",
+            "title": "Missing cache invalidation",
+            "description": "Cache not invalidated after updates.",
+            "fix_prompt": "Add cache clear on update endpoints.",
+        },
+    ]
+)
+
+
+class TestHandlePerfCompletion:
+    """Tests for _handle_perf_completion focusing on idempotency."""
+
+    async def _run(self, db_session, mocker, task, logs=None):
+        from app.task_completion import _handle_perf_completion
+
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch(
+            "app.task_completion.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.task_completion.get_open_pull_requests",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        mocker.patch("app.task_completion._runtime_config", {})
+        if logs is None:
+            logs = _PERF_FINDINGS_JSON
+        await _handle_perf_completion(task, logs, db_session)
+
+    @pytest.mark.asyncio
+    async def test_perf_completion_idempotent_on_post_commit_replay(
+        self, db_session, mocker
+    ):
+        """Replaying _handle_perf_completion when a child already exists
+        must not spawn a duplicate — the already-spawned guard must fire."""
+        from sqlmodel import select as sqlmodel_select
+        from app.models import Task as TaskModel
+
+        project = make_project(name="PerfIdempotencyProj")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        perf_task = make_task(
+            project_id=project.id,
+            title="perf: main",
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {"type": "perf", "prompt": "audit", "base_branch": "main"}
+            ],
+        )
+        db_session.add(perf_task)
+        await db_session.commit()
+        await db_session.refresh(perf_task)
+
+        # Simulate prior attempt: pre-commit child with the perf_task_id
+        # context key (as if the first attempt committed a child but crashed before
+        # flipping the parent to EVALUATING).
+        prior_child = make_task(
+            project_id=project.id,
+            title="[PERF] Fix 2 high-severity performance findings",
+            status=TaskStatus.QUEUED,
+            parent_task_id=perf_task.id,
+            context={"perf_task_id": str(perf_task.id), "finding_count": 2},
+            payloads=[
+                {"type": "create", "prompt": "fix perf issues", "base_branch": "main"}
+            ],
+        )
+        db_session.add(prior_child)
+        await db_session.commit()
+        await db_session.refresh(prior_child)
+
+        # Invoke the handler a second time (replay)
+        await self._run(db_session, mocker, perf_task)
+
+        # Exactly one child should exist — the pre-existing one; no new ones spawned
+        children = (
+            (
+                await db_session.execute(
+                    sqlmodel_select(TaskModel).where(
+                        TaskModel.parent_task_id == perf_task.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1, (
+            f"Expected 1 child (pre-existing), got {len(children)} — duplicate children spawned on replay"
+        )
+
+        # Parent must be EVALUATING after the replay completes remaining effects
+        await db_session.refresh(perf_task)
+        assert perf_task.status == TaskStatus.EVALUATING, (
+            f"Expected parent EVALUATING after replay, got {perf_task.status}"
+        )

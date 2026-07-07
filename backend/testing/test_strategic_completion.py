@@ -2918,6 +2918,88 @@ async def test_strategic_completion_persists_recommended_mode_on_create(
 
 
 @pytest.mark.asyncio
+async def test_fallback_direction_create_idempotent_on_replay(db_session, mocker):
+    """Calling _handle_strategic_completion twice with the same direction_ops
+    (simulating a post-commit replay) must produce exactly ONE direction, not two.
+
+    The fallback path previously minted a fresh random UUID on every run so the
+    id-based dedup guard could never fire. The fix makes the ID deterministic
+    (task_id + text hash), so the second call finds the already-committed direction
+    and skips creation.
+    """
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Improve test coverage across modules",
+                    "priority": "medium",
+                    "rationale": "coverage gaps",
+                    "success_evidence": "Coverage reaches 80% on all modules",
+                    "retirement_condition": "Coverage stable for 2 cycles",
+                },
+            ],
+        }
+    )
+
+    # First call — creates the direction
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+    dirs_after_first = [
+        d for d in (project.directions or [])
+        if d.get("text") == "Improve test coverage across modules"
+    ]
+    assert len(dirs_after_first) == 1, (
+        f"Expected 1 direction after first call, got {len(dirs_after_first)}"
+    )
+    first_id = dirs_after_first[0]["id"]
+
+    # Second call — simulates a post-commit replay; must NOT create a duplicate
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+    dirs_after_replay = [
+        d for d in (project.directions or [])
+        if d.get("text") == "Improve test coverage across modules"
+    ]
+    assert len(dirs_after_replay) == 1, (
+        f"Replay created a duplicate: expected 1 direction, got {len(dirs_after_replay)}"
+    )
+    assert dirs_after_replay[0]["id"] == first_id, (
+        f"Replay changed the direction id: {first_id!r} -> {dirs_after_replay[0]['id']!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_api_completion_resets_strategic_failures_breaker(db_session, mocker):
     """A successful API-path strategic cycle resets the _strategic_failures
     breaker even when it does NOT rewrite the vision.

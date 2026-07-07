@@ -5067,8 +5067,20 @@ async def _handle_strategic_completion(
                     else "medium"
                 )
                 _DIR_FIELD_MAX = 500
+                # Deterministic ID: same task + same text always produces the same
+                # direction ID, so a post-commit replay that re-parses direction_ops
+                # from agent stdout will find the already-committed direction and skip
+                # rather than appending a duplicate with a fresh random UUID.
+                _dir_id = f"d-{hashlib.sha256(f'{task.id}:{text}'.encode()).hexdigest()[:8]}"
+                if any(d.get("id") == _dir_id for d in directions):
+                    logger.info(
+                        "[STRATEGIC] Task %s: skipping create_direction replay — id %s already exists",
+                        task.id,
+                        _dir_id,
+                    )
+                    continue
                 new_dir = {
-                    "id": f"d-{uuid.uuid4().hex[:8]}",
+                    "id": _dir_id,
                     "text": text,
                     "status": "active",
                     "priority": priority,
