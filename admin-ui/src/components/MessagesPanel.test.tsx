@@ -1499,6 +1499,53 @@ describe('MessagesPanel chrome modes', () => {
     }
   });
 
+  test('a completed reply renders once even when the strategist narrates a post-send summary', async () => {
+    // Operator complaint (2026-07-07): each reply appeared twice — the durable
+    // message, then a separate "sent confirmation + summary" bubble. Root cause:
+    // after `./messages send`, the resident strategist keeps narrating in the live
+    // stream ("Sent — here is a summary…"); those post-send reply deltas carry a ts
+    // NEWER than the durable message's created_at, so the time-only water mark alone
+    // let them survive as a second streaming bubble. The turn's `done` frame (always
+    // last) must supersede them so exactly ONE chat entry renders.
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = vi.fn();
+    try {
+      const transcript: StrategicSessionDelta[] = [
+        { id: 1, session_id: 'ss-xyz', task_id: 't-9', seq: 1, kind: 'reasoning', text: 'Weighing the options', ts: '2026-06-01T10:00:00Z' },
+        { id: 2, session_id: 'ss-xyz', task_id: 't-9', seq: 2, kind: 'message', text: 'The smaller plan is cheaper.', ts: '2026-06-01T10:00:02Z' },
+        { id: 3, session_id: 'ss-xyz', task_id: 't-9', seq: 3, kind: 'message', text: 'Sent — here is a summary of what I told the operator.', ts: '2026-06-01T10:00:08Z' },
+        { id: 4, session_id: 'ss-xyz', task_id: 't-9', seq: 4, kind: 'status', text: 'done', status: 'done', ts: '2026-06-01T10:00:09Z' },
+      ];
+      const durable = makeMsg({
+        id: 'strategic-reply-narrated',
+        from_type: 'strategic',
+        message_type: 'NOTE',
+        content: 'The smaller plan is cheaper.',
+        status: 'open',
+        created_at: '2026-06-01T10:00:05Z',
+      });
+
+      const el = await renderPanel({
+        filterChrome: 'minimal',
+        strategicSessionTranscript: transcript,
+      }, [durable]);
+
+      await waitFor(() => {
+        expect(el.querySelector('[data-message-id="strategic-reply-narrated"]')).toBeTruthy();
+      });
+      // No streaming preview survives the completed turn's done frame.
+      expect(el.querySelector('[data-testid="strategic-streaming-bubble"]')).toBeNull();
+      // The post-send narration is NOT shown anywhere in the conversation.
+      expect(el.textContent).not.toContain('Sent — here is a summary');
+      // The durable reply renders as exactly one chat entry.
+      const durableBubbles = [...el.querySelectorAll('[data-testid="message-bubble"]')]
+        .filter(node => node.textContent?.includes('The smaller plan is cheaper.'));
+      expect(durableBubbles).toHaveLength(1);
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
   test('minimal chat question replies still resolve through the generic message patch', async () => {
     const question = makeMsg({
       id: 'question-target',

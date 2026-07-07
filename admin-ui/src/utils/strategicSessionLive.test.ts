@@ -62,6 +62,42 @@ describe('computeStrategicStreamingTurn', () => {
     const turn = computeStrategicStreamingTurn(transcript, [strategicMsg('2026-06-01T10:00:05Z')]);
     expect(turn?.text).toBe('new reply');
   });
+
+  it('previews in-flight reply text while a turn is streaming (no done frame yet)', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'status', text: 'responding', status: 'responding' }),
+      delta({ id: 2, seq: 2, kind: 'message', text: 'Here is my answer' }),
+    ];
+    // No durable reply has landed and the turn has not ended — the preview shows.
+    const turn = computeStrategicStreamingTurn(transcript, []);
+    expect(turn?.text).toBe('Here is my answer');
+  });
+
+  it('drops a completed turn\'s reply (incl. post-send narration) once its done frame lands', () => {
+    // Reproduces the operator complaint: the strategist sends its durable reply,
+    // then narrates a "Sent — here is a summary…" in the live stream. That post-send
+    // narration carries a ts NEWER than the durable message's created_at, so the
+    // time-only water mark alone would leave it as a SECOND bubble. The turn's `done`
+    // frame (always last) supersedes it, so the streaming preview must be empty and
+    // only the single durable persisted reply remains — exactly one chat entry.
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'message', text: 'The plan is cheaper.', ts: '2026-06-01T10:00:00Z' }),
+      delta({ id: 2, seq: 2, kind: 'message', text: 'Sent — here is a summary of what I said.', ts: '2026-06-01T10:00:08Z' }),
+      delta({ id: 3, seq: 3, kind: 'status', text: 'done', status: 'done', ts: '2026-06-01T10:00:09Z' }),
+    ];
+    const durableReply = strategicMsg('2026-06-01T10:00:05Z');
+    expect(computeStrategicStreamingTurn(transcript, [durableReply])).toBeNull();
+  });
+
+  it('keeps the NEXT turn\'s streaming reply after a prior turn\'s done frame', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'message', text: 'first turn reply' }),
+      delta({ id: 2, seq: 2, kind: 'status', text: 'done', status: 'done' }),
+      delta({ id: 3, seq: 3, kind: 'message', text: 'second turn reply' }),
+    ];
+    const turn = computeStrategicStreamingTurn(transcript, []);
+    expect(turn?.text).toBe('second turn reply');
+  });
 });
 
 describe('computeStrategicSessionActivity', () => {
