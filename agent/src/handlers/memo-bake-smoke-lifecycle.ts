@@ -18,7 +18,10 @@
 
 import { createServer } from 'http';
 import { spawn } from 'child_process';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
+import path from 'path';
 
 import { buildBakeSmokeCapabilityContract } from './bake-smoke-capability-contract.js';
 
@@ -106,6 +109,13 @@ childEnv.AGENT_SECRET_TOKEN = 'lifecycle-smoke-token';
 childEnv.TASK_ID = MEMO_TASK.task_id as string;
 childEnv.BLUEPRINT_SMOKE_SKIP_VALIDATION = '1';
 
+// Redirect token files to an isolated sandbox so the smoke child cannot
+// overwrite the host session's live JWT or GitHub installation token.
+// Same isolation rationale as omitting VM_INSTANCE_ID above.
+const smokeSandboxDir = mkdtempSync(path.join(tmpdir(), 'memo-lifecycle-smoke-'));
+childEnv['AGENT_TOKEN_FILE'] = path.join(smokeSandboxDir, 'agent-token.jwt');
+childEnv['GITHUB_TOKEN_FILE'] = path.join(smokeSandboxDir, 'github-token.txt');
+
 const proc = spawn('node', ['--import', 'tsx', agentEntry], {
   env: childEnv,
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -123,6 +133,7 @@ const exitCode = await new Promise<number>((resolve) => {
 });
 
 server.close();
+try { rmSync(smokeSandboxDir, { recursive: true, force: true }); } catch { /* ignore */ }
 
 if (exitCode !== 0) {
   throw new Error(

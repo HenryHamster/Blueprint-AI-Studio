@@ -1,6 +1,6 @@
 import { describe, it, expect, afterAll } from 'vitest';
 import { spawnSync } from 'child_process';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import path from 'path';
@@ -110,5 +110,35 @@ describe('memo bake-smoke scripts execute with PACKER sentinel and exit 0', { ti
       String(result.stdout),
       failMsg('memo-bake-smoke-lifecycle.ts', result),
     ).toContain('PACKER_MEMO_LIFECYCLE_OK');
+  });
+
+  it('memo-bake-smoke-lifecycle.ts does not write the host AGENT_TOKEN_FILE path', () => {
+    // Use separate dirs: the agent deletes AGENT_WORKSPACE during workspace prep,
+    // so the host token file must live outside the workspace directory.
+    const workspaceTmpDir = mkdtempSync(path.join(tmpdir(), 'bake-smoke-lifecycle-ws-'));
+    const hostTokenDir = mkdtempSync(path.join(tmpdir(), 'bake-smoke-token-isolation-'));
+    try {
+      // Simulate the host session having a live JWT at a known path.
+      const hostTokenFile = path.join(hostTokenDir, 'host-agent-token.jwt');
+      const hostSentinel = 'host-session-jwt-sentinel-must-not-be-overwritten';
+      writeFileSync(hostTokenFile, hostSentinel, { encoding: 'utf-8' });
+
+      // Pass the host token path via AGENT_TOKEN_FILE. The smoke lifecycle
+      // script must redirect child writes to a sandbox path, not this one.
+      const result = runSmoke('memo-bake-smoke-lifecycle.ts', {
+        BLUEPRINT_SMOKE_SKIP_VALIDATION: '1',
+        AGENT_WORKSPACE: workspaceTmpDir,
+        AGENT_TOKEN_FILE: hostTokenFile,
+      });
+      expect(result.status, failMsg('memo-bake-smoke-lifecycle.ts (token isolation)', result)).toBe(0);
+
+      // The host token file must still contain the original sentinel — not the
+      // smoke fixture token ('lifecycle-smoke-token') written by the child agent.
+      const afterContent = readFileSync(hostTokenFile, { encoding: 'utf-8' });
+      expect(afterContent).toBe(hostSentinel);
+    } finally {
+      try { rmSync(workspaceTmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      try { rmSync(hostTokenDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   });
 });
