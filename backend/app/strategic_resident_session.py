@@ -1617,24 +1617,22 @@ async def stop_resident_session(
             commit=False,
         )
 
-    # Drive the resident task terminal (instant reclaim). Only touch a live task.
-    task_id = (blob or {}).get("task_id")
-    cancelled_task_id: uuid.UUID | None = None
-    if task_id:
-        try:
-            task = await session.get(Task, uuid.UUID(str(task_id)))
-        except (ValueError, TypeError):
-            task = None
-        if task is not None and task.status in _LIVE_TASK_STATUSES:
-            task.status = TaskStatus.CANCELLED
-            task.latest_status_message = "Resident strategic session stopped by operator"
-            ctx = dict(task.context or {})
-            ctx["failure_category"] = ADMIN_CANCEL
-            task.context = ctx
-            flag_modified(task, "context")
-            session.add(task)
-            cancelled_task_id = task.id
-
+    # Release the continuation lease + end the session blob under the PROJECT row
+    # lock FIRST, THEN drive the resident task terminal under the TASK row lock —
+    # canonical Project→Task order (findings: lock-order inversion, context
+    # lost-update, and double-completion, which share this one locking fix).
+    #
+    # The resident heartbeat's ledger mirror holds the project lock (via
+    # ``with_vision_locked``) and only THEN takes this same task row lock (via
+    # ``with_task_context_locked``). The prior stop code mutated the task and
+    # ``session.add``-ed it BEFORE ``with_vision_locked``, so autoflush acquired
+    # the task row lock ahead of the project SELECT — Task→Project — inverting the
+    # heartbeat's order and opening an AB-BA deadlock window (every heartbeat that
+    # mirrors a ledger/cursor opens the opposing side). Ending the blob first and
+    # taking the task lock only while the project lock is still held (the lock is
+    # held until the commit below) makes stop strictly Project→Task, matching the
+    # heartbeat and the ``lock_project_then_task`` convention, so the two paths can
+    # no longer deadlock.
     def _release_and_end(vision: dict[str, Any]) -> None:
         # Release the continuation lease (the resident session is over) and mark
         # the session blob ended, in one locked read-modify-write.
@@ -1654,6 +1652,55 @@ async def stop_resident_session(
         vision[RESIDENT_SESSION_KEY] = ended
 
     await with_vision_locked(session, project.id, _release_and_end, skip_locked=False)
+
+    # Drive the resident task terminal (instant reclaim) under the TASK row lock,
+    # held together with the project lock acquired just above. The task is re-read
+    # FRESH inside the lock (``task_lock`` uses ``populate_existing``), which fixes
+    # two lost-update/ordering hazards the prior unlocked ``session.get`` had:
+    #
+    #   * Context lost-update: the read-modify-write that merges
+    #     ``failure_category`` now reads the CURRENT ``context`` column (not a
+    #     stale identity-map copy), so it can no longer clobber a concurrent
+    #     strategic-API commit's ``_strategic_api_called`` / ``_strategic_dirs_*``
+    #     markers — which would have made ``_run_resident_completion_on_stop``
+    #     silently skip stop-time completion processing. A strategic-API writer
+    #     cannot even reach the task lock while we hold it, because it must take
+    #     the project lock (which we hold) first.
+    #   * Double-completion: ``status`` is re-checked against a possibly
+    #     interleaved terminal (COMPLETED) commit from the agent. If the task has
+    #     ALREADY gone terminal on its own we do NOT overwrite it to CANCELLED and
+    #     do NOT run stop-time completion — so completion processing runs at most
+    #     once (the normal post-commit pipeline handles the agent's own terminal;
+    #     ``mark_phase2_completed`` has no already-processed guard to fall back
+    #     on). Only a still-live task is cancelled + bridged by
+    #     ``_run_resident_completion_on_stop``.
+    cancelled_task_id: uuid.UUID | None = None
+    task_id = (blob or {}).get("task_id")
+    resident_task_uuid: uuid.UUID | None = None
+    if task_id:
+        try:
+            resident_task_uuid = uuid.UUID(str(task_id))
+        except (ValueError, TypeError):
+            resident_task_uuid = None
+    if resident_task_uuid is not None:
+        async with task_lock(
+            session, resident_task_uuid, skip_locked=False
+        ) as locked_task:
+            if (
+                locked_task is not None
+                and locked_task.status in _LIVE_TASK_STATUSES
+            ):
+                locked_task.status = TaskStatus.CANCELLED
+                locked_task.latest_status_message = (
+                    "Resident strategic session stopped by operator"
+                )
+                ctx = dict(locked_task.context or {})
+                ctx["failure_category"] = ADMIN_CANCEL
+                locked_task.context = ctx
+                flag_modified(locked_task, "context")
+                session.add(locked_task)
+                cancelled_task_id = locked_task.id
+
     await session.commit()
     await session.refresh(project)
     logger.info(
@@ -2239,7 +2286,19 @@ async def renew_resident_session_lease(
                         .where(
                             ProjectMessage.project_id == project.id,
                             ProjectMessage.id.in_(safe_ids),
-                            ProjectMessage.resident_session_id == session_id,
+                            # Mirror the poll's delivery predicate: the poll
+                            # (``_session_scope_conditions``) delivers THIS
+                            # session's rows PLUS legacy/cadence NULL-session rows,
+                            # so the handled-update must ack that same set — else
+                            # an answered legacy (NULL-session) message the agent
+                            # reports here stays ``status='open'`` forever and
+                            # re-inflates the open-message backlog this change set
+                            # exists to drain. The explicit ``id.in_(safe_ids)``
+                            # already restricts this to messages the agent
+                            # actually answered, and a row stamped for a DIFFERENT
+                            # session is still excluded, so this can never mark
+                            # another session's conversation handled.
+                            *_session_scope_conditions(session_id),
                             ProjectMessage.status == "open",
                         )
                         .values(status="handled")

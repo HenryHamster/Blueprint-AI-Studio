@@ -14,6 +14,7 @@ import {
   gitCredentialHelperPath,
   writeGitTokenFile,
   setupGitCredentialHelper,
+  ensureGitCredentialHelperScript,
   GH_READ_TOKEN_FILE_ENV,
   GH_CREDENTIAL_HELPER_PATH_ENV,
   GIT_TOKEN_REFRESH_MS,
@@ -136,5 +137,34 @@ describe('setupGitCredentialHelper', () => {
     vi.stubEnv(GH_READ_TOKEN_FILE_ENV, existing);
     setupGitCredentialHelper('owner', 'repo', tmpDir);
     expect(process.env[GH_READ_TOKEN_FILE_ENV]).toBe(existing);
+  });
+});
+
+describe('ensureGitCredentialHelperScript — generated bash validity', () => {
+  // Register the credential-helper generator (a multi-line bash script emitted
+  // from a TS string array with backslash-escape sequences) in the same `bash -n`
+  // syntax harness that guards the other generated shell in this repo, rather
+  // than only asserting substrings — so an escaping regression is caught as a
+  // syntax error at test time.
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-cred-bashn-'));
+    vi.stubEnv(GH_CREDENTIAL_HELPER_PATH_ENV, path.join(tmpDir, 'git-credential-helper'));
+    vi.stubEnv(GH_READ_TOKEN_FILE_ENV, path.join(tmpDir, 'gh-read-token'));
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('emits a helper script that passes `bash -n` syntax check', async () => {
+    const helperPath = ensureGitCredentialHelperScript();
+    expect(fs.existsSync(helperPath)).toBe(true);
+    // child_process.execFileSync is mocked at module scope; use the real module
+    // to actually shell out to bash for the syntax check.
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    expect(() => realCp.execFileSync('bash', ['-n', helperPath], { stdio: 'pipe' })).not.toThrow();
   });
 });

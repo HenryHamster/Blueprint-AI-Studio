@@ -712,6 +712,33 @@ def _load_policy(project: "Project | None" = None) -> dict[str, Any]:
     return policy
 
 
+def _resolve_configured_completion_debt_weight(
+    project: "Project | None" = None,
+) -> float:
+    """Resolve the completion_debt blend weight through the SAME provenance chain
+    the enforce blend reads (build_config > runtime_config > yaml), BEFORE the
+    observe/off mode gate drops it.
+
+    ``_apply_completion_debt_weight_mode``'s enforce branch reads its configured
+    weight via ``coerce_completion_debt_weight(policy["weights"])`` on the fully
+    resolved (pre-gate) policy — which honours a per-project build_config override
+    and the on-disk YAML rubric, not just runtime_config.  The observe-mode
+    ``debt_enforce_confidence_preview`` must feed ``compute_enforce_confidence_preview``
+    that SAME configured weight; reading ``_runtime_config["promotion_weights"]``
+    alone would show operators a preview derived from a different weight than
+    enforce would actually apply (finding: preview/enforce weight-source drift).
+
+    Mirrors the build_config-vs-fleet selection in ``_resolve_policy_with_provenance``
+    exactly: a valid build_config override supplies the weight, otherwise the fleet
+    (runtime_config → yaml → defaults) rubric does.
+    """
+    overrides = _policy_from_build_config(project)
+    if overrides is not None:
+        return coerce_completion_debt_weight(overrides["weights"])
+    fleet_policy, _, _ = _resolve_fleet_policy_with_provenance()
+    return coerce_completion_debt_weight(fleet_policy["weights"])
+
+
 # Terminal task statuses — a qualifier child in any of these has finished
 # (whether it succeeded, failed, was cancelled, or is BLOCKED on a precondition
 # and so will not progress without intervention). BLOCKED is included so a
@@ -4101,8 +4128,18 @@ async def _finalize_qualification(
         _completion_debt = await _cd_mod.get_open_completion_debt(
             session, version.project_id
         )
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — best-effort debt snapshot, fail-open
+        # Keep finalize fail-open, but make the signal loss OBSERVABLE: without
+        # this log a debt-ledger query failure would silently yield
+        # debt_pressure_score=None, so in enforce mode compute_composite skips
+        # the (1 - w_debt) down-scaling and the candidate scores HIGHER on the
+        # exact attempt where the debt signal failed, with no trace.
+        logger.warning(
+            "[RELEASE_QUALIFIER] v%d completion-debt snapshot fetch failed "
+            "(%s); continuing without the debt-pressure signal",
+            version.version_number,
+            exc,
+        )
     _project_actionable_open: int | None = None
     if _completion_debt is not None:
         try:
@@ -4111,8 +4148,13 @@ async def _finalize_qualification(
                     session, version.project_id
                 )
             )
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — best-effort count, fail-open
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d actionable-open completion-debt count "
+                "failed (%s); continuing without the actionable-open enrichment",
+                version.version_number,
+                exc,
+            )
     _completion_debt_scoring_snapshot: dict[str, Any] | None = None
     if _completion_debt is not None:
         _completion_debt_scoring_snapshot = dict(_completion_debt)
@@ -4239,8 +4281,12 @@ async def _finalize_qualification(
         and composite["blocker"] is None
         and _debt_pressure_score is not None
     ):
-        _configured_cd_weight = coerce_completion_debt_weight(
-            _runtime_config.get("promotion_weights") or {}
+        # Resolve the configured weight through the FULL provenance chain the
+        # enforce blend uses (build_config > runtime_config > yaml), not
+        # runtime_config alone — otherwise the preview an operator graduates the
+        # knob on could be derived from a different weight than enforce applies.
+        _configured_cd_weight = _resolve_configured_completion_debt_weight(
+            _policy_project
         )
         _preview = compute_enforce_confidence_preview(
             composite["confidence"],

@@ -346,13 +346,17 @@ TASK="${cfg.taskId}"
 # depend on an external env var to fetch the push token.
 TASK_ID="${cfg.taskId}"
 
-# 3. Refresh GitHub token + remote URL right before push. _load_github_token
-#    prefers the live token file (kept fresh by the Node agent at ~45min
-#    intervals) and falls back to the backend API. _set_github_remote rewrites
-#    the origin URL so git push uses the rotated token instead of the stale
-#    clone-time one.
-_load_github_token || { echo "[pr] Failed to load GitHub token" >&2; exit 1; }
-_set_github_remote "${cfg.owner}" "${cfg.repo}"
+# 3. Push. Auth flows through the git credential helper that setupWorkspace
+#    configured in this workspace's .git/config at clone time (git-credential.ts).
+#    The helper reads the on-disk GitHub token file that the Node agent seeds at
+#    clone and keeps fresh on a ~45min cadence, so git push authenticates with a
+#    rotated token WITHOUT the installation token ever being written into
+#    .git/config or exposed in the git process argv. We therefore do NOT rewrite
+#    the origin URL to embed the token (the old _set_github_remote path): that
+#    would contradict the token-never-in-.git/config invariant, is redundant with
+#    the helper Node's own push relies on, and would leave the secret persisted in
+#    .git/config until the next refresh scrubs it. The origin URL stays clean
+#    (https://github.com/owner/repo.git); the helper supplies credentials.
 
 # 4. Push (with retry — concurrent-push handling)
 PUSH_OK=0

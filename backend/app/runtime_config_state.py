@@ -98,11 +98,26 @@ runtime_config: Dict = {
         os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")
     ),
     "max_autonomous_tasks_per_hour": 12,
-    "max_global_autonomous_tasks_per_hour": 500,  # Cross-project backstop ceiling
-    # Observe-only replacement accounting for the global autonomous spawn guard.
-    # Enforcement stays on the initiative budget until the dedicated rollout
-    # switches the gate over.
+    # HARD cross-project backstop ceiling. Deliberately raised 50 -> 500
+    # (2026-07-05): the old 50/hr counted ALL orchestrator tasks (including
+    # review/fix servicing churn) and was checked BEFORE the per-project research
+    # caps, starving legitimate research. This global ceiling is enforced in ALL
+    # budget modes (off/observe/enforce) — build_autonomous_spawn_budget_guard
+    # blocks on total_count >= global_cap independent of mode — so a real hard
+    # cross-project ceiling always remains, even under the shipped observe default.
+    # Per-project caps (max_autonomous_tasks_per_hour=12) still bound any single
+    # project, so 500/hr only binds in aggregate across the whole fleet.
+    "max_global_autonomous_tasks_per_hour": 500,
+    # Rollout mode for the CATEGORIZED spawn budget (initiative vs servicing).
+    #   off/observe — the tighter initiative cap below is advisory (recorded, not
+    #                 blocking); the 500/hr global backstop above still binds.
+    #   enforce     — the initiative cap additionally blocks initiative spawns.
+    # Ships "observe" as a deliberate gradual-rollout posture so operators can
+    # measure the initiative/servicing split before switching the tighter gate on.
     "autonomous_spawn_budget_mode": "observe",
+    # Tighter cross-project cap on INITIATIVE-category spawns (net-new research/
+    # create, excluding review/fix servicing churn). Only binds when
+    # autonomous_spawn_budget_mode == "enforce"; pending its dedicated rollout.
     "max_global_autonomous_initiative_tasks_per_hour": 50,
     "autonomous_spawn_budget_categories": {
         "initiative": sorted(AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES),
