@@ -4023,6 +4023,22 @@ async def _maybe_retry_workday_auto_start(
         )
 
 
+def _merge_rejected_proposals(vision: dict, batch: list) -> None:
+    """Append batch entries to vision['rejected_proposals'], deduplicating by text.
+
+    Safe to call multiple times with the same batch (replay-idempotent): an entry
+    whose 'text' already exists in the list is silently skipped.  The list is
+    capped at 30 entries after merging.
+    """
+    _rp = list(vision.get("rejected_proposals") or [])
+    existing_texts = {e.get("text") for e in _rp}
+    for entry in batch:
+        if entry.get("text") not in existing_texts:
+            _rp.append(entry)
+            existing_texts.add(entry.get("text"))
+    vision["rejected_proposals"] = _rp[-30:]
+
+
 async def _handle_strategic_completion(
     task: Task,
     logs: str,
@@ -5658,16 +5674,15 @@ async def _handle_strategic_completion(
                         d["staged_for_version"] = staged_for_version
                         d["staged_at"] = _utcnow().isoformat()
                         notes = d.get("notes", [])
-                        notes.append(
-                            {
-                                "text": (
-                                    f"Staged to begin after v{staged_for_version} promotes"
-                                    + (f": {rationale}" if rationale else "")
-                                ),
-                                "added_at": _utcnow().isoformat(),
-                            }
+                        note_text = (
+                            f"Staged to begin after v{staged_for_version} promotes"
+                            + (f": {rationale}" if rationale else "")
                         )
-                        d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                        if not any(n.get("text") == note_text for n in notes):
+                            notes.append(
+                                {"text": note_text, "added_at": _utcnow().isoformat()}
+                            )
+                            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         ctx = task.context or {}
                         task.context = {
                             **ctx,
@@ -5751,17 +5766,16 @@ async def _handle_strategic_completion(
                         )
                     )
                 notes = target.get("notes", [])
-                notes.append(
-                    {
-                        "text": (
-                            f"Approved by strategic review: {rationale}"
-                            if rationale
-                            else "Approved by strategic review"
-                        ),
-                        "added_at": _utcnow().isoformat(),
-                    }
+                note_text = (
+                    f"Approved by strategic review: {rationale}"
+                    if rationale
+                    else "Approved by strategic review"
                 )
-                target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                if not any(n.get("text") == note_text for n in notes):
+                    notes.append(
+                        {"text": note_text, "added_at": _utcnow().isoformat()}
+                    )
+                    target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                 ctx = task.context or {}
                 task.context = {
                     **ctx,
@@ -5943,13 +5957,12 @@ async def _handle_strategic_completion(
                 target.pop("staged_at", None)
                 if rationale:
                     notes = target.get("notes", [])
-                    notes.append(
-                        {
-                            "text": f"Reactivated by strategic op: {rationale}",
-                            "added_at": _utcnow().isoformat(),
-                        }
-                    )
-                    target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                    note_text = f"Reactivated by strategic op: {rationale}"
+                    if not any(n.get("text") == note_text for n in notes):
+                        notes.append(
+                            {"text": note_text, "added_at": _utcnow().isoformat()}
+                        )
+                        target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                 _gap_id_activate_fb = target.get("gap_id")
                 if _gap_id_activate_fb:
                     _pending_gap_reconciles.append(
@@ -6107,9 +6120,7 @@ async def _handle_strategic_completion(
             _rejected_batch = list(_pending_rejected_proposals)
 
             def _apply_rejected_proposals(vision: dict) -> None:
-                _rp = list(vision.get("rejected_proposals") or [])
-                _rp.extend(_rejected_batch)
-                vision["rejected_proposals"] = _rp[-30:]
+                _merge_rejected_proposals(vision, _rejected_batch)
 
             await with_vision_locked(
                 session, task.project_id, _apply_rejected_proposals

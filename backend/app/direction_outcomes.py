@@ -527,13 +527,45 @@ def _longest_chain_length(deps_map: dict[str, list[str]]) -> int:
     return max((depth(n, frozenset()) for n in nodes), default=0)
 
 
-def _apply_cochange_to_doc(doc: dict, merged_files_lists: list[list[str]]) -> None:
+def _apply_cochange_to_doc(
+    doc: dict,
+    merged_files_lists: list[list[str]],
+    pr_keys: list[str] | None = None,
+) -> None:
     """Apply co-change affinity index updates to a design_doc dict in place.
 
     Core logic extracted from _update_cochange_index so it can be called
     inside with_design_doc_locked (which passes the doc dict directly).
+
+    When pr_keys is provided (a list aligned with merged_files_lists), each
+    entry is only folded in once — already-applied keys are skipped.  If all
+    keys are already recorded the function returns without touching the index
+    (no spurious decay).  The applied-key set is capped at 1000 entries; an
+    evicted key may be re-folded on the next refresh at most once, which is
+    safe (it does not corrupt scores the way saturation does).
     """
-    if not merged_files_lists:
+    APPLIED_CAP = 1000
+
+    if pr_keys is not None:
+        # Idempotent path: filter to only genuinely-new PRs.
+        applied_list: list[str] = list(doc.get("cochange_applied_prs") or [])
+        applied_set = set(applied_list)
+        new_pairs = [
+            (key, files)
+            for key, files in zip(pr_keys, merged_files_lists)
+            if key not in applied_set
+        ]
+        if not new_pairs:
+            return
+        new_keys = [key for key, _ in new_pairs]
+        effective_files_lists = [files for _, files in new_pairs]
+    else:
+        # Legacy path: no idempotency tracking; apply all lists as before.
+        new_keys = []
+        effective_files_lists = merged_files_lists
+        applied_list = []
+
+    if not effective_files_lists:
         return
 
     DECAY = 0.90
@@ -555,7 +587,7 @@ def _apply_cochange_to_doc(doc: dict, merged_files_lists: list[list[str]]) -> No
             del index[file_key]
 
     # Accumulate new co-change pairs from each merged PR
-    for files in merged_files_lists:
+    for files in effective_files_lists:
         unique_files = list(dict.fromkeys(files))
         if len(unique_files) < 2:
             continue
@@ -584,6 +616,13 @@ def _apply_cochange_to_doc(doc: dict, merged_files_lists: list[list[str]]) -> No
         index = {f: index[f] for f in top_files}
 
     doc["cochange_index"] = index
+
+    # Persist applied keys (idempotent path only).
+    if pr_keys is not None and new_keys:
+        updated_applied = applied_list + new_keys
+        if len(updated_applied) > APPLIED_CAP:
+            updated_applied = updated_applied[-APPLIED_CAP:]
+        doc["cochange_applied_prs"] = updated_applied
 
 
 def _update_cochange_index(
@@ -1066,6 +1105,7 @@ async def _update_direction_research_outcomes(
     if not project:
         return
     merged_files_lists: list[list[str]] = []
+    merged_pr_keys: list[str] = []
     # Snapshot read for early-exit guards and computation base; the actual
     # write is serialized via with_directions_locked below.
     d = next(
@@ -1782,12 +1822,15 @@ async def _update_direction_research_outcomes(
     )
     # remediation_tasks_{created,merged,failed} retired 2026-06-05 —
     # see RESEARCH_HISTORY_METRIC_MANIFEST.
-    # Collect changed files from merged PRs for co-change index update
-    merged_files_lists = [
-        (ct.context or {}).get("_pr_changed_files", [])
+    # Collect changed files from merged PRs for co-change index update.
+    # Build parallel (key, files) pairs so each PR is folded in at most once.
+    _merged_cochange_entries = [
+        (str(ct.id), (ct.context or {}).get("_pr_changed_files", []))
         for ct in child_tasks_rows
         if is_merged_completion(ct) and (ct.context or {}).get("_pr_changed_files")
     ]
+    merged_files_lists = [files for _, files in _merged_cochange_entries]
+    merged_pr_keys = [key for key, _ in _merged_cochange_entries]
     # Generalized outcome aggregates — ADDITIVE alongside existing PR metrics.
     # Uses evaluate_task_outcome to count successes across ALL task types (code
     # merges + research quality + audit findings + memo artifacts + verification
@@ -2609,7 +2652,9 @@ async def _update_direction_research_outcomes(
         await with_design_doc_locked(
             session,
             project_id,
-            lambda doc: _apply_cochange_to_doc(doc, merged_files_lists),
+            lambda doc: _apply_cochange_to_doc(
+                doc, merged_files_lists, pr_keys=merged_pr_keys
+            ),
         )
 
     await session.commit()

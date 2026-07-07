@@ -230,6 +230,13 @@ MEMO_SPAWN_CAP_PER_CYCLE = 5
 # deferral. Findings beyond this ceiling are deferred to the next cycle.
 _MAX_FINDINGS_PER_CYCLE = 15
 
+# Trailing cap for the durable spawn-count idempotency ledger persisted in
+# project.vision. Only the most recent IDs can plausibly be replayed by a
+# post-commit re-run, so an unbounded list would grow forever inside the
+# JSONB for no dedup benefit. Matches the sibling durable-history caps
+# (rejected_proposals=30, *_DURABLE_MAX=200) — see the review note.
+_RESEARCH_SPAWN_COUNTED_IDS_MAX = 200
+
 # Drop reason stamped on the memo a reproduce-on-HEAD rejection spawns. Distinct
 # from the capacity/quality drop reasons (low_actionability / degradation_gate)
 # so strategic review can tell "the cited code is unambiguously gone" — the
@@ -1390,8 +1397,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # immediately tripped the modulo-6 gate for the next strategic_review.
     project_obj = await session.get(Project, task.project_id)
 
+    _task_id_str = str(task.id)
+
     def _increment_research_spawn_count(vision: dict) -> None:
+        # Idempotency guard: on post-commit replay the three-verdict guard
+        # below still passes (all verdicts are None on the initial pass), so
+        # we track counted task IDs to prevent double-incrementing.
+        counted = vision.get("_research_spawn_counted_ids") or []
+        if _task_id_str in counted:
+            return
         vision["_research_spawn_count"] = (vision.get("_research_spawn_count") or 0) + 1
+        vision["_research_spawn_counted_ids"] = (counted + [_task_id_str])[
+            -_RESEARCH_SPAWN_COUNTED_IDS_MAX:
+        ]
 
     # Only on the FIRST pass — a re-entrant resume after grading or a
     # per-finding challenge must not re-count the cycle (verdict already

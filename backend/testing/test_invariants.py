@@ -5884,7 +5884,10 @@ class TestEdgesConsideredInvariants:
         result = _compute_edges_considered_metrics(tasks)
         assert result is not None
         assert result["reviewer_caught_count"] == 1
-        assert result["reviewer_caught_rate"] == round(1 / 3, 3)
+        assert result["reviewer_caught_rate"] == 1.0, (
+            "reviewer_caught_rate must denominate on reviewer-eligible tasks "
+            "(tasks_with_reviewer_edges_count), not all code-change tasks."
+        )
         assert result["tasks_with_reviewer_edges_count"] == 1
 
     def test_reviewer_caught_count_via_handled_downgrade(self):
@@ -5912,7 +5915,10 @@ class TestEdgesConsideredInvariants:
         result = _compute_edges_considered_metrics(tasks)
         assert result is not None
         assert result["reviewer_caught_count"] == 1
-        assert result["reviewer_caught_rate"] == round(1 / 3, 3)
+        assert result["reviewer_caught_rate"] == 1.0, (
+            "reviewer_caught_rate must denominate on reviewer-eligible tasks "
+            "(tasks_with_reviewer_edges_count), not all code-change tasks."
+        )
 
     def test_reviewer_caught_case_match_is_normalized(self):
         """Case-string comparison must be lowercased + trimmed so that
@@ -5941,6 +5947,55 @@ class TestEdgesConsideredInvariants:
         assert result["reviewer_caught_count"] == 0, (
             "Reviewer entry whose case matches an author case (modulo case/whitespace) "
             "and is handled=true must NOT count as a reviewer catch."
+        )
+
+    def test_reviewer_caught_rate_denominated_on_reviewer_eligible(self):
+        """reviewer_caught_rate must use tasks_with_reviewer_edges_count as the
+        denominator, not all code-change tasks.
+
+        5 tasks total; 2 have reviewer edges; 1 of those 2 is a catch.
+        With the correct denominator: 1/2 = 0.5.
+        With the wrong (all-tasks) denominator: 1/5 = 0.2.
+        The test asserts 0.5 to enforce reviewer-eligible-only denominator.
+        """
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        def _make_task(edges):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {"_self_review_outcome": {"edges_considered": edges}}
+            return t
+
+        # task A: reviewer raises a new case the author missed → reviewer caught
+        task_a = _make_task(
+            [
+                {"case": "null payload", "handled": True, "origin": "author"},
+                {"case": "concurrent writes", "handled": False, "origin": "reviewer"},
+            ]
+        )
+        # task B: reviewer reviews but matches the author's case → no catch
+        task_b = _make_task(
+            [
+                {"case": "empty input", "handled": True, "origin": "author"},
+                {"case": "empty input", "handled": True, "origin": "reviewer"},
+            ]
+        )
+        # tasks C–E: no reviewer edges — ineligible to appear in the denominator
+        task_c = _make_task([{"case": "c1", "handled": True}])
+        task_d = _make_task([{"case": "c2", "handled": True}])
+        task_e = _make_task([{"case": "c3", "handled": True}])
+
+        result = _compute_edges_considered_metrics(
+            [task_a, task_b, task_c, task_d, task_e]
+        )
+        assert result is not None
+        assert result["tasks_with_reviewer_edges_count"] == 2
+        assert result["reviewer_caught_count"] == 1
+        assert result["reviewer_caught_rate"] == 0.5, (
+            "reviewer_caught_rate must equal reviewer_caught_count / "
+            "tasks_with_reviewer_edges_count (1/2 = 0.5), not 1/5 = 0.2 "
+            "which would be the deflated all-tasks denominator."
         )
 
     def test_origin_missing_defaults_to_author(self):

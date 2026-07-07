@@ -65,6 +65,7 @@ from app.strategic_completion import (
     _compute_model_gc_telemetry,
     record_retired_direction_memory,
     _check_gap_respawn_block,
+    _merge_rejected_proposals,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -3091,6 +3092,87 @@ async def test_fallback_direction_create_idempotent_on_replay(db_session, mocker
     )
     assert dirs_after_replay[0]["id"] == first_id, (
         f"Replay changed the direction id: {first_id!r} -> {dirs_after_replay[0]['id']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_stage_direction_note_idempotent_on_replay(db_session, mocker):
+    """Replaying stage_direction must NOT append the staged note twice.
+
+    The stage_direction branch has no "already staged, skip" pre-guard — it
+    re-enters on a post-commit replay and re-sets status/staged_for_version.
+    The only thing preventing a duplicate note is the inline
+    ``not any(n.get("text") == note_text ...)`` dedup guard, so this pins that
+    idempotency contract directly.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+    # stage_direction requires an open version; make one deterministically.
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new_callable=AsyncMock,
+        return_value=SimpleNamespace(version_number=7),
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-stage-1", "text": "Stage me", "status": "proposed", "notes": []}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "stage",
+                    "direction_id": "d-stage-1",
+                    "rationale": "sequence after current version",
+                },
+            ],
+        }
+    )
+
+    expected_note = "Staged to begin after v7 promotes: sequence after current version"
+
+    # First call — stages the direction and appends the note.
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == "d-stage-1")
+    assert target["status"] == "staged"
+    staged_notes = [n for n in target.get("notes", []) if n.get("text") == expected_note]
+    assert len(staged_notes) == 1, f"Expected 1 staged note, got {len(staged_notes)}"
+
+    # Second call — simulates a post-commit replay; must NOT duplicate the note.
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == "d-stage-1")
+    staged_notes = [n for n in target.get("notes", []) if n.get("text") == expected_note]
+    assert len(staged_notes) == 1, (
+        f"Replay duplicated the staged note: expected 1, got {len(staged_notes)}"
     )
 
 
@@ -19353,3 +19435,49 @@ def test_self_reflection_log_dedups_replayed_cycle():
     # Verify the entry is unchanged
     assert log[0]["cycle_task_id"] == cycle_task_id
     assert log[0]["what_was_hard"] == "Missing context on async patterns"
+
+
+def test_rejected_proposals_dedup_on_replay():
+    """_merge_rejected_proposals must not create duplicate entries on replay.
+
+    The recovery sweeper can re-run _apply_rejected_proposals with the same
+    batch after a post-commit crash.  Each call must be idempotent: an entry
+    whose 'text' is already present in vision['rejected_proposals'] must be
+    skipped, so the list does not grow beyond the number of genuinely distinct
+    proposals.
+    """
+    batch = [
+        {"text": "Improve user onboarding", "rejected_at": "2024-01-01T00:00:00+00:00"},
+        {"text": "Add dashboard charts", "rejected_at": "2024-01-01T00:00:01+00:00"},
+    ]
+    vision: dict = {}
+
+    # Initial run
+    _merge_rejected_proposals(vision, batch)
+    assert len(vision["rejected_proposals"]) == 2
+
+    # Replay: same batch applied again (simulating recovery-sweeper re-dispatch)
+    _merge_rejected_proposals(vision, batch)
+    rp = vision["rejected_proposals"]
+    assert len(rp) == 2, (
+        f"Replay must not duplicate entries: expected 2, got {len(rp)}. "
+        "This fires when _merge_rejected_proposals appends without checking existing texts."
+    )
+    texts = {e["text"] for e in rp}
+    assert "Improve user onboarding" in texts
+    assert "Add dashboard charts" in texts
+
+
+def test_rejected_proposals_dedup_preserves_cap():
+    """_merge_rejected_proposals caps at 30 and still deduplicates on replay."""
+    # Pre-populate with 29 distinct entries
+    existing = [{"text": f"proposal-{i}", "rejected_at": "2024-01-01T00:00:00+00:00"} for i in range(29)]
+    vision = {"rejected_proposals": list(existing)}
+
+    batch = [{"text": "proposal-new", "rejected_at": "2024-01-02T00:00:00+00:00"}]
+    _merge_rejected_proposals(vision, batch)
+    assert len(vision["rejected_proposals"]) == 30
+
+    # Replay: the new entry is already present — list must stay at 30
+    _merge_rejected_proposals(vision, batch)
+    assert len(vision["rejected_proposals"]) == 30

@@ -5139,41 +5139,47 @@ async def _process_post_commit(
                             # from the iteration cap). stale_head_consecutive_discards has
                             # no underscore so it IS propagated, letting the fresh review
                             # inherit the running count and eventually accept on the 2nd hit.
-                            task.context = {
-                                **(task.context or {}),
-                                "stale_head_consecutive_discards": _stale_discard_count
-                                + 1,
-                                "_review_stale_head": True,
-                            }
-                            flag_modified(task, "context")
-                            task.status = TaskStatus.COMPLETED
-                            task.latest_status_message = (
-                                f"Stale-head review discarded for PR #{pr_number} "
-                                f"(reviewed {reviewed_head_sha[:8]}, "
-                                f"head is now {head_sha[:8]}) — respawning fresh review"
-                            )
-                            session.add(task)
-                            logger.warning(
-                                f"[REVIEW PIPELINE] PR #{pr_number}: stale-head verdict "
-                                f"discarded (reviewed={reviewed_head_sha[:8]}, "
-                                f"live={head_sha[:8]}) — respawning review "
-                                f"(discard #{_stale_discard_count + 1})"
-                            )
-                            fresh_review, _ = await _spawn_pipeline_task(
-                                task,
-                                "review",
-                                session,
-                                pr_number,
-                                branch,
-                                base_branch,
-                                original_task_id=original_task_id,
-                            )
-                            if fresh_review:
-                                logger.info(
-                                    f"[REVIEW PIPELINE] Spawned fresh review "
-                                    f"{fresh_review.id} for PR #{pr_number} "
-                                    f"after stale-head discard"
+                            #
+                            # Replay guard: _review_stale_head being set means a prior run
+                            # already committed the counter increment and spawned the fresh
+                            # review.  Skip both actions to avoid double-increment and
+                            # double-spawn.
+                            if not (task.context or {}).get("_review_stale_head"):
+                                task.context = {
+                                    **(task.context or {}),
+                                    "stale_head_consecutive_discards": _stale_discard_count
+                                    + 1,
+                                    "_review_stale_head": True,
+                                }
+                                flag_modified(task, "context")
+                                task.status = TaskStatus.COMPLETED
+                                task.latest_status_message = (
+                                    f"Stale-head review discarded for PR #{pr_number} "
+                                    f"(reviewed {reviewed_head_sha[:8]}, "
+                                    f"head is now {head_sha[:8]}) — respawning fresh review"
                                 )
+                                session.add(task)
+                                logger.warning(
+                                    f"[REVIEW PIPELINE] PR #{pr_number}: stale-head verdict "
+                                    f"discarded (reviewed={reviewed_head_sha[:8]}, "
+                                    f"live={head_sha[:8]}) — respawning review "
+                                    f"(discard #{_stale_discard_count + 1})"
+                                )
+                                fresh_review, _ = await _spawn_pipeline_task(
+                                    task,
+                                    "review",
+                                    session,
+                                    pr_number,
+                                    branch,
+                                    base_branch,
+                                    original_task_id=original_task_id,
+                                )
+                                if fresh_review:
+                                    logger.info(
+                                        f"[REVIEW PIPELINE] Spawned fresh review "
+                                        f"{fresh_review.id} for PR #{pr_number} "
+                                        f"after stale-head discard"
+                                    )
                             await session.commit()
                             return {"status": "accepted"}
                         else:

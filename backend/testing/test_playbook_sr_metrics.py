@@ -7253,15 +7253,91 @@ async def test_compute_edges_trend_author_vs_reviewer_breakdown(
     assert cur["tasks_with_reviewer_edges_count"] == 2
     assert cur["tasks_with_reviewer_edges_rate"] == round(2 / 5, 3)
     assert cur["reviewer_caught_count"] == 2
-    assert cur["reviewer_caught_rate"] == round(2 / 5, 3)
+    # reviewer_caught_rate is denominated on tasks that HAVE reviewer edges
+    # (n_with_reviewer == 2), not on all tasks in the window: 2/2 == 1.0.
+    assert cur["reviewer_caught_rate"] == round(2 / 2, 3)
     assert cur["author_avg_edges_per_task"] == 1.0
     assert cur["reviewer_avg_edges_per_task"] == 1.0
 
     prev = result["previous"]
     assert prev["tasks_with_reviewer_edges_count"] == 0
     assert prev["reviewer_caught_count"] == 0
+    # No reviewer edges in the previous window -> n_with_reviewer == 0, so the
+    # rate is None (not a 0/0 division) and no delta/trend can be computed.
+    assert prev["reviewer_caught_rate"] is None
 
-    assert result["reviewer_caught_rate_delta"] == round(2 / 5 - 0, 3)
+    assert result["reviewer_caught_rate_delta"] is None
+    assert result["reviewer_caught_trend"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_edges_trend_reviewer_caught_rate_denominator(
+    db_session: AsyncSession,
+):
+    """reviewer_caught_rate divides caught tasks by tasks-with-reviewer-edges
+    (n_with_reviewer), NOT by the whole window, and a rising ratio between
+    windows surfaces an ``improving`` reviewer_caught_trend.
+
+    This pins the denominator on ``_compute_edges_stats`` directly: reverting
+    it to ``n_total`` (or dropping the ``n_with_reviewer == 0`` None guard)
+    would change these numbers and fail here rather than at the promotion PR.
+    """
+    from app.playbook_learning import compute_edges_trend
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window: 5 tasks. 4 carry a reviewer edge; 3 of those 4 catch a
+    # case the author missed -> reviewer_caught_rate == 3/4 (NOT 3/5).
+    def _author_hit(case, missed):
+        edges = [{"case": case, "handled": True, "origin": "author"}]
+        if missed:
+            edges.append({"case": missed, "handled": False, "origin": "reviewer"})
+        else:
+            # reviewer edge that agrees with the author (no catch)
+            edges.append({"case": case, "handled": True, "origin": "reviewer"})
+        return edges
+
+    current_payloads = [
+        _author_hit("a1", "miss-1"),
+        _author_hit("a2", "miss-2"),
+        _author_hit("a3", "miss-3"),
+        _author_hit("a4", None),  # reviewer present but caught nothing
+        [{"case": "a5", "handled": True, "origin": "author"}],  # no reviewer edge
+    ]
+    for payload in current_payloads:
+        t = _make_edges_task(project.id, age_days=2, edges_considered=payload)
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 tasks. 2 carry a reviewer edge; 1 of those catches a
+    # miss -> reviewer_caught_rate == 1/2 == 0.5.
+    previous_payloads = [
+        _author_hit("p1", "pmiss-1"),
+        _author_hit("p2", None),
+        [{"case": "p3", "handled": True, "origin": "author"}],
+        [],
+        [],
+    ]
+    for payload in previous_payloads:
+        t = _make_edges_task(project.id, age_days=20, edges_considered=payload)
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_edges_trend(project.id, db_session, tasks)
+
+    assert result is not None
+    cur = result["current"]
+    prev = result["previous"]
+    assert cur["tasks_with_reviewer_edges_count"] == 4
+    assert cur["reviewer_caught_count"] == 3
+    assert cur["reviewer_caught_rate"] == round(3 / 4, 3)
+    assert prev["tasks_with_reviewer_edges_count"] == 2
+    assert prev["reviewer_caught_count"] == 1
+    assert prev["reviewer_caught_rate"] == round(1 / 2, 3)
+
+    assert result["reviewer_caught_rate_delta"] == round(3 / 4 - 1 / 2, 3)
     assert result["reviewer_caught_trend"] == "improving"
 
 

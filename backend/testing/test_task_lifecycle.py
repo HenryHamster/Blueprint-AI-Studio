@@ -10523,6 +10523,81 @@ async def test_stale_head_second_consecutive_accepts_verdict_with_annotation(
 
 
 @pytest.mark.asyncio
+async def test_stale_head_discard_counter_idempotent_on_replay(tl_db, mocker):
+    """Post-commit replay of a first stale-head discard must NOT double-increment
+    stale_head_consecutive_discards and must NOT spawn a second fresh review.
+
+    Simulates replay by seeding the task context with _review_stale_head=True and
+    stale_head_consecutive_discards=1 (the state written by the first run before it
+    crashed), then re-running _process_post_commit with the same stale verdict.
+    The counter must stay at 1 and no spawn must occur.
+
+    Approach: run _run_stale_head_branch with prior_discard_count=0 (fresh) so
+    the first discard sets the counter to 1 and _review_stale_head=True, then
+    manually call _process_post_commit on the SAME task (now carrying those
+    fields) and confirm no second spawn and the counter stays at 1."""
+    import json as _json
+    from app.task_lifecycle import _process_post_commit
+
+    session, factory = tl_db
+
+    # First, run a clean first-discard to get the committed post-discard state.
+    calls1, review_task1 = await _run_stale_head_branch(
+        tl_db,
+        mocker,
+        reviewed_head_sha="stalehd000000",
+        live_head_sha="livehd1111111",
+        prior_discard_count=0,
+    )
+    # Confirm the first run set _review_stale_head and count=1.
+    ctx1 = review_task1.context or {}
+    assert ctx1.get("_review_stale_head") is True, "first run must set _review_stale_head"
+    assert ctx1.get("stale_head_consecutive_discards") == 1, (
+        "first run must set stale_head_consecutive_discards to 1"
+    )
+    assert len(calls1) == 1 and calls1[0][0][1] == "review", (
+        "first run must spawn exactly one fresh review"
+    )
+
+    # Now replay: call _process_post_commit again with the same task (context
+    # already has _review_stale_head=True and counter=1).
+    spawn_calls_replay: list[tuple] = []
+
+    async def _capture_spawn_replay(*args, **kwargs):
+        spawn_calls_replay.append((args, kwargs))
+        return (None, False)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn_replay)
+
+    verdict_json = _json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Found a real bug.",
+            "issues": [{"description": "Real bug", "severity": "major"}],
+            "reviewed_head_sha": "stalehd000000",
+        }
+    )
+    payload = AgentStatusPayload(
+        task_id=review_task1.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/o/r/pull/7070",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json=verdict_json,
+    )
+    await _process_post_commit(review_task1.id, payload, _session_factory=factory)
+    await session.refresh(review_task1)
+
+    ctx_replay = review_task1.context or {}
+    assert ctx_replay.get("stale_head_consecutive_discards") == 1, (
+        f"replay must NOT increment stale_head_consecutive_discards "
+        f"(got {ctx_replay.get('stale_head_consecutive_discards')})"
+    )
+    assert not spawn_calls_replay, (
+        f"replay must NOT spawn a second fresh review (got {len(spawn_calls_replay)} calls)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
     """Old verdicts without reviewed_head_sha must behave exactly as before:
     REQUEST_CHANGES spawns a fix without any stale-head guard firing."""

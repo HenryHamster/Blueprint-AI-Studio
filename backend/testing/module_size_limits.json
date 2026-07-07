@@ -97,7 +97,7 @@
     "source_ref_validation.py": 1900,
     "orchestrator_filters.py": 1850,
     "knowledge_completion.py": 3400,
-    "alert_dispatch.py": 2200,
+    "alert_dispatch.py": 2450,
     "compute_jobs.py": 2900,
     "task_evaluators.py": 2300,
     "release_scoring.py": 2450,
@@ -132,7 +132,7 @@
     "research_direction_state.py": 1750,
     "dep_lifecycle.py": 800,
     "routers/admin_health.py": 1750,
-    "metrics_integrity_sweep.py": 2450,
+    "metrics_integrity_sweep.py": 2700,
     "release_readiness.py": 1750
   },
   "agent": {

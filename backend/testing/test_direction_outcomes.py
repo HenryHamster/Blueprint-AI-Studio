@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.direction_outcomes import (
+    _apply_cochange_to_doc,
     _counts_as_failure,
     _is_cascade_cancelled,
     _is_non_genuine_cancelled,
@@ -2785,6 +2786,49 @@ def test_cochange_index_caps_total_files():
     assert len(idx) <= 200
 
 
+def test_apply_cochange_idempotent_same_pr_not_double_counted():
+    """Calling _apply_cochange_to_doc twice with the same pr_key leaves score at 1.0."""
+    doc: dict = {}
+    files = [["a.py", "b.py"]]
+    _apply_cochange_to_doc(doc, files, pr_keys=["pr-1"])
+    assert doc["cochange_index"]["a.py"]["b.py"] == pytest.approx(1.0, abs=0.01)
+    # Second call — same key, must be a no-op (no decay, no accumulation)
+    _apply_cochange_to_doc(doc, files, pr_keys=["pr-1"])
+    assert doc["cochange_index"]["a.py"]["b.py"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_apply_cochange_new_pr_still_accumulates():
+    """Different pr_keys accumulate; second call decays existing and adds new."""
+    doc: dict = {}
+    files = [["a.py", "b.py"]]
+    _apply_cochange_to_doc(doc, files, pr_keys=["pr-1"])
+    score_1 = doc["cochange_index"]["a.py"]["b.py"]
+    assert score_1 == pytest.approx(1.0, abs=0.01)
+    # Second call with a different key: decay existing (1.0 → 0.9) then +1.0 → 1.9
+    _apply_cochange_to_doc(doc, files, pr_keys=["pr-2"])
+    score_2 = doc["cochange_index"]["a.py"]["b.py"]
+    assert score_2 == pytest.approx(1.9, abs=0.01)
+
+
+def test_apply_cochange_applied_prs_persisted_in_doc():
+    """Applied PR keys are stored under cochange_applied_prs in the doc."""
+    doc: dict = {}
+    _apply_cochange_to_doc(doc, [["a.py", "b.py"]], pr_keys=["pr-abc"])
+    assert "cochange_applied_prs" in doc
+    assert "pr-abc" in doc["cochange_applied_prs"]
+
+
+def test_apply_cochange_no_keys_preserves_legacy_behavior():
+    """Without pr_keys, the function re-applies every call (legacy contract)."""
+    doc: dict = {}
+    files = [["a.py", "b.py"]]
+    _apply_cochange_to_doc(doc, files)  # pr_keys=None
+    _apply_cochange_to_doc(doc, files)  # pr_keys=None — should accumulate
+    # Second call decays 1.0 → 0.9 then adds 1.0 → 1.9
+    assert doc["cochange_index"]["a.py"]["b.py"] == pytest.approx(1.9, abs=0.01)
+    assert "cochange_applied_prs" not in doc
+
+
 @pytest.mark.asyncio
 async def test_cochange_index_updated_on_merged_pr(db_session: AsyncSession):
     """_update_direction_research_outcomes populates cochange_index from _pr_changed_files."""
@@ -2865,6 +2909,101 @@ async def test_cochange_index_not_updated_when_no_changed_files(
     # cochange_index should not exist or be empty
     idx = (project.design_doc or {}).get("cochange_index", {})
     assert idx == {}
+
+
+@pytest.mark.asyncio
+async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSession):
+    """Replaying _update_direction_research_outcomes with the same merged PRs must not
+    re-accumulate scores (no saturation toward 10) and must not apply spurious decay.
+    A genuinely new PR key still accumulates on the second call."""
+    direction_id = "d-cochange-idempotent"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    # First merged PR — its key is the child task id
+    child1 = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": ["app/models.py", "app/schemas.py"],
+        },
+        title="merged-pr-1",
+    )
+    await db_session.flush()
+
+    # First refresh: folds child1 in
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    idx_after_first = dict(
+        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+    )
+    score_after_first = idx_after_first.get("app/schemas.py", 0.0)
+    assert score_after_first == pytest.approx(1.0, abs=0.01), (
+        f"Expected score 1.0 after first refresh, got {score_after_first}"
+    )
+    applied_after_first = (project.design_doc or {}).get("cochange_applied_prs", [])
+    assert str(child1.id) in applied_after_first
+
+    # Second refresh with identical child set (simulates post-commit replay) —
+    # scores must be unchanged; no decay, no extra accumulation.
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    idx_after_replay = dict(
+        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+    )
+    score_after_replay = idx_after_replay.get("app/schemas.py", 0.0)
+    assert score_after_replay == pytest.approx(score_after_first, abs=0.01), (
+        f"Replay must not change score: was {score_after_first}, got {score_after_replay}"
+    )
+
+    # Now add a genuinely new PR — it must still accumulate
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": ["app/models.py", "app/schemas.py"],
+        },
+        title="merged-pr-2",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    idx_after_new_pr = dict(
+        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+    )
+    score_after_new_pr = idx_after_new_pr.get("app/schemas.py", 0.0)
+    # New PR increments by 1, previous score decayed once: ~1.0 * 0.9 + 1.0 = 1.9
+    assert score_after_new_pr > score_after_first, (
+        f"New PR should have added to score: was {score_after_first}, got {score_after_new_pr}"
+    )
 
 
 @pytest.mark.asyncio

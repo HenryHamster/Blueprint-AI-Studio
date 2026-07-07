@@ -4983,6 +4983,44 @@ async def test_finding_challenge_reentry_does_not_double_increment_spawn_count(
 
 
 @_pytest.mark.asyncio
+async def test_research_spawn_count_idempotent_on_replay(db_session, mocker):
+    """Post-commit replay of the initial completion must not double-increment _research_spawn_count.
+
+    On a replay, all three verdicts (grader/adversarial/challenge) are still None,
+    so the existing verdict-presence guard passes again. Without the task_id stamp,
+    the counter increments on every replay, shifting the modulo gate that decides
+    when to fire a strategic_review.
+    """
+    project, _direction, task = await _grader_project_and_task(db_session, "d-idem-rsc")
+    project.vision = {"_research_spawn_count": 4, "purpose": "keep-me"}
+    task.status = TaskStatus.COMPLETED
+    # No verdicts — this is the initial-completion state (also what replay sees).
+    task.context = {**(task.context or {})}
+    db_session.add(project)
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[])
+
+    # First call: should increment once (4 → 5) and stamp the task_id.
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(project)
+    assert project.vision["_research_spawn_count"] == 5
+    assert str(task.id) in (project.vision.get("_research_spawn_counted_ids") or [])
+
+    # Second call (simulates post-commit replay): counter must stay at 5.
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(project)
+    assert project.vision["_research_spawn_count"] == 5, (
+        "replay must not double-increment _research_spawn_count"
+    )
+    assert project.vision["purpose"] == "keep-me"
+
+
+@_pytest.mark.asyncio
 async def test_evaluating_flip_is_atomic_with_child_spawn(db_session, mocker):
     """A failure in the post-spawn wiring (AFTER the child-spawn commit) must leave
     the parent EVALUATING-with-children, never COMPLETED-with-children.
