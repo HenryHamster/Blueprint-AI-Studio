@@ -149,6 +149,9 @@ if touches "admin-ui/"; then
   # memory cgroup constraints. tsc -b --noEmit catches all type errors; the
   # full vite bundle runs in CI after ./pr open.
   run "admin-ui typecheck" bash -c 'cd "admin-ui" && npm run typecheck'
+  if [ "$WITH_TESTS" = "1" ]; then
+    run "admin-ui vitest" bash -c 'set -o pipefail; cd admin-ui && npx vitest run 2>&1 | tail -80'
+  fi
 fi
 
 if touches "agent/"; then
@@ -167,6 +170,9 @@ if touches "agent/"; then
     fi
   fi
   run "agent build" bash -c 'cd "agent" && npm run build'
+  if [ "$WITH_TESTS" = "1" ]; then
+    run "agent vitest" bash -c 'set -o pipefail; cd agent && npx vitest run 2>&1 | tail -80'
+  fi
 fi
 
 if touches "backend/"; then
