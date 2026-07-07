@@ -549,8 +549,8 @@ async def test_runner_escalation_cadence_survives_restart(db_session, mocker):
     alert_policy) and last_escalated_at=None (never escalated by sweep). The sweep must
     use last_escalated_at — NOT last_seen_at — to decide when to first re-page.
     """
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._send_webhook_notification", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts._send_webhook_notification", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -658,7 +658,7 @@ async def test_runner_degraded_escalation_cadence_survives_restart(db_session, m
     inside the 4h repeat window, because the cadence lives in the persisted
     ``last_escalated_at`` column, not in memory.
     """
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
     dispatch = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -707,7 +707,7 @@ async def test_runner_degraded_escalation_cadence_survives_restart(db_session, m
 async def test_runner_degraded_escalation_flips_warning_to_error(db_session, mocker):
     """A degraded alert aged past the 4h threshold flips WARNING→ERROR and broadcasts."""
     bcast = mocker.patch(
-        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
     )
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -745,7 +745,7 @@ async def test_runner_degraded_escalation_flips_warning_to_error(db_session, moc
 @pytest.mark.asyncio
 async def test_runner_degraded_escalation_suppressed_when_acknowledged(db_session, mocker):
     """An acknowledged degraded alert is never re-paged or escalated."""
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
     dispatch = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -778,7 +778,7 @@ async def test_runner_degraded_escalation_suppressed_when_acknowledged(db_sessio
 @pytest.mark.asyncio
 async def test_runner_degraded_escalation_noop_when_resolved(db_session, mocker):
     """A recovered (dismissed) degraded alert is not escalated — flap suppression."""
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
     dispatch = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -809,7 +809,7 @@ async def test_runner_degraded_escalation_via_check_degraded_runners(db_session,
     from app.models import LocalRunner
     from app.orchestrator_runner_dispatch import _check_degraded_runners
 
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
     dispatch = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -875,7 +875,7 @@ async def _fleet_no_healthy_alerts(db_session, project_id):
 @pytest.mark.asyncio
 async def test_fleet_no_healthy_runner_alert_creates_and_broadcasts(db_session, mocker):
     bcast = mocker.patch(
-        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
     )
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -907,7 +907,7 @@ async def test_fleet_no_healthy_runner_alert_creates_and_broadcasts(db_session, 
 
 @pytest.mark.asyncio
 async def test_fleet_no_healthy_runner_alert_deduped(db_session, mocker):
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -933,7 +933,7 @@ async def test_fleet_no_healthy_runner_alert_deduped(db_session, mocker):
 @pytest.mark.asyncio
 async def test_fleet_no_healthy_runner_alert_auto_resolves_on_recovery(db_session, mocker):
     bcast = mocker.patch(
-        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
     )
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -970,7 +970,7 @@ async def test_fleet_no_healthy_runner_alert_auto_resolves_on_recovery(db_sessio
 
 @pytest.mark.asyncio
 async def test_fleet_no_healthy_runner_resolve_is_idempotent(db_session, mocker):
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -1012,7 +1012,7 @@ async def _low_disk_alerts(db_session, project_id):
 async def test_runner_low_disk_alert_creates_and_broadcasts(db_session, mocker):
     """A runner below the disk floor raises one WARNING alert and broadcasts it."""
     bcast = mocker.patch(
-        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
     )
     project = make_project()
     db_session.add(project)
@@ -1046,7 +1046,7 @@ async def test_runner_low_disk_alert_creates_and_broadcasts(db_session, mocker):
 @pytest.mark.asyncio
 async def test_runner_low_disk_alert_deduped(db_session, mocker):
     """Repeated sweep passes create exactly one alert row."""
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -1071,7 +1071,7 @@ async def test_runner_low_disk_alert_deduped(db_session, mocker):
 async def test_runner_low_disk_alert_auto_resolves_on_recovery(db_session, mocker):
     """Alert fires when disk is low and auto-resolves when disk recovers."""
     bcast = mocker.patch(
-        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
     )
     project = make_project()
     db_session.add(project)
@@ -1113,7 +1113,7 @@ async def test_low_disk_runner_check_integration(db_session, mocker):
     from app.orchestrator_runner_dispatch import _check_degraded_runners
     from app.time_utils import _utcnow
 
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -1173,7 +1173,7 @@ async def test_fleet_no_healthy_runner_check_integration(db_session, mocker):
     from app.orchestrator_runner_dispatch import _check_degraded_runners
     from app.time_utils import _utcnow
 
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,

@@ -3502,9 +3502,9 @@ class TestRunnerDeathEscalation:
         )
         alert = await self._seed_alert(db_session, project.id, runner.id, age_hours=5)
         with patch(
-            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+            "app.runner_health_alerts.broadcast_to_project", new=AsyncMock()
         ), patch(
-            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
         ) as webhook:
             escalated = await alert_dispatch._maybe_escalate_runner_deactivated_alert(
                 db_session,
@@ -3532,7 +3532,7 @@ class TestRunnerDeathEscalation:
         db_session.add(alert)
         await db_session.commit()
         with patch(
-            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
         ) as webhook:
             escalated = await alert_dispatch._maybe_escalate_runner_deactivated_alert(
                 db_session,
@@ -3561,7 +3561,7 @@ class TestRunnerDeathEscalation:
         )
         await db_session.commit()
         with patch(
-            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
         ) as webhook:
             escalated = await alert_dispatch._maybe_escalate_runner_deactivated_alert(
                 db_session,
@@ -3581,9 +3581,9 @@ class TestRunnerDeathEscalation:
         )
         await self._seed_alert(db_session, project.id, runner.id, age_hours=5)
         with patch(
-            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+            "app.runner_health_alerts.broadcast_to_project", new=AsyncMock()
         ), patch(
-            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
         ) as webhook:
             await orch._sweep_runner_deactivated_escalations(db_session)
         webhook.assert_awaited_once()
@@ -3599,7 +3599,7 @@ class TestRunnerDeathEscalation:
         )
         await self._seed_alert(db_session, project.id, runner.id, age_hours=5)
         with patch(
-            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
         ) as webhook:
             await orch._sweep_runner_deactivated_escalations(db_session)
         webhook.assert_not_awaited()
