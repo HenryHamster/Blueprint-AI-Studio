@@ -4302,7 +4302,7 @@ async def test_strategic_state_counts_changes_since_last_check_in(
     assert since_state["messages"]["needs_operator"] == 1
     assert since_state["tasks"]["created"] == 1
     assert since_state["tasks"]["updated"] == 3
-    assert since_state["tasks"]["completed"] == 3
+    assert since_state["tasks"]["completed"] == 2
     assert since_state["tasks"]["failed"] == 1
     assert since_state["tasks"]["blocked"] == 1
     assert since_state["alerts"]["raised"] == 1

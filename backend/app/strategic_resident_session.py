@@ -535,6 +535,10 @@ async def _compute_resident_work_state(
             )
         )
     ).scalar_one_or_none()
+    # task_max comes from raw SQL (asyncpg returns TIMESTAMPTZ as tz-aware);
+    # msg_max/cycle_max go through NaiveUTCDateTime and are tz-naive. Normalise.
+    if task_max is not None and task_max.tzinfo is not None:
+        task_max = task_max.astimezone(timezone.utc).replace(tzinfo=None)
     stamps = [dt for dt in (task_max, msg_max, cycle_max) if dt is not None]
     work_state_rev = max(stamps).isoformat() if stamps else None
 

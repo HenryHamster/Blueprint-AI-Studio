@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { expectCalledWith } from './typed-mock-call.js';
 
 // Mock the two token-persistence modules the GitHub-token refresh callback
 // touches so the refresh path can be exercised without writing real files or
@@ -195,10 +196,10 @@ describe('scheduleGithubTokenRefresh refresh callback (no token in remote URL)',
     vi.mocked(writeGithubTokenFile).mockReset();
     vi.mocked(writeGitTokenFile).mockReset();
     vi.mocked(setupGitCredentialHelper).mockReset();
-    vi.stubGlobal('fetch', vi.fn(async () => ({
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
       ok: true,
       status: 200,
-      json: async () => ({ data: { token: FRESH_TOKEN } }),
+      json: () => Promise.resolve({ data: { token: FRESH_TOKEN } }),
     })));
   });
   afterEach(() => {
@@ -213,11 +214,11 @@ describe('scheduleGithubTokenRefresh refresh callback (no token in remote URL)',
     stopGithubTokenRefresh(); // cancel the self-reschedule before assertions
 
     // Fresh token mirrored to both on-disk token files (helper reads the git one).
-    expect(vi.mocked(writeGithubTokenFile)).toHaveBeenCalledWith(FRESH_TOKEN);
-    expect(vi.mocked(writeGitTokenFile)).toHaveBeenCalledWith(FRESH_TOKEN);
+    expectCalledWith(writeGithubTokenFile, FRESH_TOKEN);
+    expectCalledWith(writeGitTokenFile, FRESH_TOKEN);
     // Auth delegated to the credential helper against a CLEAN origin URL — the
     // token is never written into .git/config nor passed on the git command line.
-    expect(vi.mocked(setupGitCredentialHelper)).toHaveBeenCalledWith('owner', 'repo', '/tmp/ws');
+    expectCalledWith(setupGitCredentialHelper, 'owner', 'repo', '/tmp/ws');
     // Regression guard: the raw token must never appear in any git-remote argument.
     expect(vi.mocked(setupGitCredentialHelper).mock.calls.flat().join(' ')).not.toContain(FRESH_TOKEN);
   });
@@ -227,7 +228,7 @@ describe('scheduleGithubTokenRefresh refresh callback (no token in remote URL)',
     await vi.advanceTimersByTimeAsync(GITHUB_TOKEN_REFRESH_MS);
     stopGithubTokenRefresh();
 
-    expect(vi.mocked(writeGithubTokenFile)).toHaveBeenCalledWith(FRESH_TOKEN);
+    expectCalledWith(writeGithubTokenFile, FRESH_TOKEN);
     expect(vi.mocked(writeGitTokenFile)).not.toHaveBeenCalled();
     expect(vi.mocked(setupGitCredentialHelper)).not.toHaveBeenCalled();
   });

@@ -1244,11 +1244,16 @@ async def test_with_task_context_locked_preserves_disjoint_keys(db_session):
 
     assert applied is True
     # Both the pre-existing strategic-API flag AND the mirrored keys survive.
-    assert task.context == {
+    # Use subset check: the model may add framework keys (e.g. provides_capability)
+    # that the test doesn't control.
+    expected_subset = {
         "_strategic_api_called": True,
         "_exam_ledger": "ledger-blob-v1",
         "message_cursor": "cursor-42",
-    }, f"lost update on task.context: {task.context}"
+    }
+    assert expected_subset.items() <= task.context.items(), (
+        f"lost update on task.context: {task.context}"
+    )
 
 
 @pytest.mark.asyncio

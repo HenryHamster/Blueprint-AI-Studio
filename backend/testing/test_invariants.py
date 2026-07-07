@@ -1467,6 +1467,12 @@ class TestSchemaRevisionSync:
             # Only consider upgrade() — drops in downgrade() must not cancel creates
             content = content.split("def downgrade", 1)[0]
 
+            # Snapshot idx_by_name before processing this file's creates so that
+            # drop processing uses the pre-create state. This correctly handles the
+            # drop-then-recreate pattern (e.g. widening an index by adding a column)
+            # where the create would otherwise overwrite the drop target in idx_by_name.
+            idx_by_name_snapshot = dict(idx_by_name)
+
             for m in create_idx_re.finditer(content):
                 name, table, cols_raw = m.group(1), m.group(2), m.group(3)
                 cols = frozenset(str_re.findall(cols_raw))
@@ -1484,7 +1490,7 @@ class TestSchemaRevisionSync:
                         effective.add((table, frozenset([col_m.group(1)])))
 
             for m in drop_idx_re.finditer(content):
-                target = idx_by_name.get(m.group(1))
+                target = idx_by_name_snapshot.get(m.group(1))
                 if target:
                     effective.discard(target)
 

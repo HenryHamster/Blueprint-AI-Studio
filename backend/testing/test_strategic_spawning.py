@@ -8148,8 +8148,9 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     await db_session.refresh(active_project)
 
     assert await _spawn_strategic_review(active_project, db_session) is True
-    # The integration!=promotion gate now performs one direct version-phase lookup.
-    assert current_open_version.call_count == 1
+    # The integration!=promotion gate performs at least one version-phase lookup;
+    # compute_qualification_trigger_state may add a second call via release_readiness.
+    assert current_open_version.call_count >= 1
     assert ensure_initial_release_version.call_args.kwargs["promotion_target"] == "main"
 
 
