@@ -35,6 +35,7 @@ from app.efficiency_snapshot import (
     SELF_REPAIR_SUCCESS_RATE_KEY,
     _PROMPT_STATIC_CONST_NAMES,
     _PROMPT_STATIC_PLAIN_CONST_NAMES,
+    _TASK_TYPE_FOCUS_CONST_NAMES,
     _compute_checkpoint_loss_rate,
     _extract_ts_plain_string_length,
     _extract_ts_template_literal_length,
@@ -8741,10 +8742,17 @@ def test_extract_ts_template_literal_length_unterminated_returns_none():
 
 def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
     """When all template-literal and plain-string constants are found the result
-    is a positive integer equal to the sum of all their body lengths."""
+    is a positive integer equal to the sum of all their body lengths.
+
+    Both prompt.ts and prompts/task-type-focus.ts are mocked via builtins.open
+    (which returns the same synthetic source for every open call), so the
+    combined synthetic source must contain constants from all three tuples.
+    """
     from unittest.mock import mock_open, patch
 
-    # Build a synthetic prompt.ts with all template-literal constants.
+    # Build a synthetic source containing all template-literal constants from
+    # both prompt.ts and task-type-focus.ts (builtins.open returns same source
+    # for both file opens).
     tl_bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
     synthetic_src = "\n".join(
         f"const {name} = `{body}`;" for name, body in tl_bodies.items()
@@ -8756,8 +8764,17 @@ def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
     synthetic_src += "\n" + "\n".join(
         f"const {name} = '{body}';" for name, body in ps_bodies.items()
     )
-    expected_total = sum(len(b) for b in tl_bodies.values()) + sum(
-        len(b) for b in ps_bodies.values()
+    # Append task-type-focus template-literal constants.
+    ttf_bodies = {
+        name: f"ttf body of {name} " * 4 for name in _TASK_TYPE_FOCUS_CONST_NAMES
+    }
+    synthetic_src += "\n" + "\n".join(
+        f"const {name} = `{body}`;" for name, body in ttf_bodies.items()
+    )
+    expected_total = (
+        sum(len(b) for b in tl_bodies.values())
+        + sum(len(b) for b in ps_bodies.values())
+        + sum(len(b) for b in ttf_bodies.values())
     )
 
     import app.efficiency_snapshot as es_mod
@@ -8849,6 +8866,202 @@ def test_compute_prompt_static_bytes_no_agent_src_returns_none():
         result = _compute_prompt_static_bytes()
 
     assert result is None
+
+
+def test_compute_prompt_static_bytes_missing_task_type_focus_file_returns_none():
+    """Returns None when prompts/task-type-focus.ts is absent even if prompt.ts is present."""
+    from unittest.mock import mock_open, patch
+
+    import app.efficiency_snapshot as es_mod
+
+    # Build a synthetic source that satisfies ALL prompt.ts constants.
+    tl_src = "\n".join(
+        f"const {name} = `body of {name}`;" for name in _PROMPT_STATIC_CONST_NAMES
+    )
+    ps_src = "\n".join(
+        f"const {name} = 'plain body';" for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    )
+    prompt_src = tl_src + "\n" + ps_src
+
+    def _fake_exists(path):
+        # prompt.ts exists; task-type-focus.ts does NOT.
+        return "task-type-focus.ts" not in path
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", side_effect=_fake_exists),
+        patch("builtins.open", mock_open(read_data=prompt_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+def test_compute_prompt_static_bytes_missing_task_type_focus_constant_returns_none():
+    """Returns None when a constant in _TASK_TYPE_FOCUS_CONST_NAMES is absent from
+    prompts/task-type-focus.ts even if all prompt.ts constants are present."""
+    from unittest.mock import mock_open, patch
+
+    import app.efficiency_snapshot as es_mod
+
+    # Build a combined source that has all prompt.ts constants but is missing
+    # the last _TASK_TYPE_FOCUS_CONST_NAMES entry.
+    tl_src = "\n".join(
+        f"const {name} = `body of {name}`;" for name in _PROMPT_STATIC_CONST_NAMES
+    )
+    ps_src = "\n".join(
+        f"const {name} = 'plain body';" for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    )
+    ttf_present = _TASK_TYPE_FOCUS_CONST_NAMES[:-1]  # omit the last one
+    ttf_src = "\n".join(
+        f"const {name} = `ttf body of {name}`;" for name in ttf_present
+    )
+    synthetic_src = tl_src + "\n" + ps_src + "\n" + ttf_src
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=synthetic_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+def test_compute_prompt_static_bytes_task_type_focus_additive():
+    """task-type-focus constants add to the total beyond prompt.ts-only constants."""
+    from unittest.mock import mock_open, patch
+
+    import app.efficiency_snapshot as es_mod
+
+    # Build prompt.ts-only source.
+    tl_bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
+    prompt_src = "\n".join(
+        f"const {name} = `{body}`;" for name, body in tl_bodies.items()
+    )
+    ps_bodies = {
+        name: f"plain body of {name} " * 3 for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    }
+    prompt_src += "\n" + "\n".join(
+        f"const {name} = '{body}';" for name, body in ps_bodies.items()
+    )
+    prompt_only_total = sum(len(b) for b in tl_bodies.values()) + sum(
+        len(b) for b in ps_bodies.values()
+    )
+
+    # Extend to include task-type-focus constants in the SAME source (builtins.open
+    # returns same content for both file opens under mock_open).
+    ttf_bodies = {
+        name: f"ttf body of {name} " * 4 for name in _TASK_TYPE_FOCUS_CONST_NAMES
+    }
+    combined_src = prompt_src + "\n" + "\n".join(
+        f"const {name} = `{body}`;" for name, body in ttf_bodies.items()
+    )
+    ttf_total = sum(len(b) for b in ttf_bodies.values())
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=combined_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is not None
+    assert isinstance(result, int)
+    assert result > prompt_only_total, (
+        f"result ({result}) should exceed prompt.ts-only total ({prompt_only_total}); "
+        "task-type-focus constants must be additive"
+    )
+    assert result == prompt_only_total + ttf_total
+
+
+def test_prompt_static_bytes_covers_task_type_focus():
+    """_TASK_TYPE_FOCUS_CONST_NAMES lists the six per-task-type focus blocks and
+    _compute_prompt_static_bytes() includes their byte counts in the total.
+
+    This is the acceptance test for the v11 AXIS_PROMPT_STATIC_BYTES extension:
+    it exercises _compute_prompt_static_bytes() against the live source files so
+    any PR that removes or renames a task-type focus constant without updating
+    _TASK_TYPE_FOCUS_CONST_NAMES will fail here.
+
+    The test makes three assertions:
+    1. Every name in _TASK_TYPE_FOCUS_CONST_NAMES exists as a template-literal
+       constant in the live task-type-focus.ts source.
+    2. _compute_prompt_static_bytes() returns a value larger than what prompt.ts
+       alone would produce, confirming the task-type-focus bytes are included.
+    3. The combined result exceeds the prompt.ts-only lower bound (8 000 bytes)
+       and the task-type-focus contribution alone exceeds 1 000 bytes (the six
+       blocks together are several thousand bytes in the live source).
+    """
+    import os
+
+    import app.efficiency_snapshot as es_mod
+
+    result = _compute_prompt_static_bytes()
+    if result is None:
+        pytest.skip(
+            "agent/src/prompt.ts or agent/src/prompts/task-type-focus.ts not "
+            "available in this environment"
+        )
+
+    assert len(_TASK_TYPE_FOCUS_CONST_NAMES) >= 6, (
+        f"_TASK_TYPE_FOCUS_CONST_NAMES has only {len(_TASK_TYPE_FOCUS_CONST_NAMES)} "
+        "entries; expected at least 6 task-type focus blocks (refactor, qa, create, "
+        "fix, docs, deps)"
+    )
+
+    # Verify every declared constant exists in the live task-type-focus.ts.
+    agent_src = es_mod._find_agent_src()
+    assert agent_src is not None
+    ttf_path = os.path.join(agent_src, "prompts", "task-type-focus.ts")
+    assert os.path.exists(ttf_path), (
+        f"prompts/task-type-focus.ts not found at {ttf_path}"
+    )
+    with open(ttf_path, encoding="utf-8") as fh:
+        ttf_src = fh.read()
+
+    for name in _TASK_TYPE_FOCUS_CONST_NAMES:
+        length = es_mod._extract_ts_template_literal_length(ttf_src, name)
+        assert length is not None, (
+            f"Constant {name!r} not found as a template literal in task-type-focus.ts. "
+            "Either the constant was removed/renamed or _TASK_TYPE_FOCUS_CONST_NAMES "
+            "needs updating."
+        )
+        assert length > 0, f"{name!r} has an empty template literal body"
+
+    # Compute prompt.ts-only total to verify task-type-focus adds bytes.
+    prompt_ts = os.path.join(agent_src, "prompt.ts")
+    assert os.path.exists(prompt_ts)
+    with open(prompt_ts, encoding="utf-8") as fh:
+        prompt_src = fh.read()
+
+    prompt_only = 0
+    for name in _PROMPT_STATIC_CONST_NAMES:
+        length = es_mod._extract_ts_template_literal_length(prompt_src, name)
+        assert length is not None
+        prompt_only += length
+    for name in _PROMPT_STATIC_PLAIN_CONST_NAMES:
+        length = es_mod._extract_ts_plain_string_length(prompt_src, name)
+        assert length is not None
+        prompt_only += length
+
+    ttf_contribution = sum(
+        es_mod._extract_ts_template_literal_length(ttf_src, name) or 0
+        for name in _TASK_TYPE_FOCUS_CONST_NAMES
+    )
+
+    assert result == prompt_only + ttf_contribution, (
+        f"_compute_prompt_static_bytes() returned {result} but expected "
+        f"prompt_only ({prompt_only}) + ttf_contribution ({ttf_contribution}) = "
+        f"{prompt_only + ttf_contribution}"
+    )
+    assert result > 8_000, (
+        f"combined total {result} is below 8 000 — something is missing"
+    )
+    assert ttf_contribution > 1_000, (
+        f"task-type-focus contribution ({ttf_contribution} bytes) is below 1 000; "
+        "expected several thousand bytes across the six focus blocks"
+    )
 
 
 # ── self_repair_burn_share suppression test ──────────────────────────────────

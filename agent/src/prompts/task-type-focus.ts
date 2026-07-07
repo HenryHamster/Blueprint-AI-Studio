@@ -8,7 +8,6 @@
 const SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC =
   'lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`, `go.sum`), generated outputs, `.gitignore`, sibling test files (`.test.*`/`.spec.*`)';
 
-
 // Builds the migrate-task self-review focus block. Defaults reproduce
 // Blueprint's own layout byte-for-byte (`backend/app/main.py` /
 // `EXPECTED_SCHEMA_REVISION`) so existing content tests stay valid. Callers on
@@ -156,11 +155,7 @@ failing, and scope creep into unrelated files. Apply these additional checks:
    as \`_self_review_outcome\` in context) is reference material, not a template to copy.
    Write to \`/tmp/self_review_<YOUR_task_id>.json\` using the CURRENT task ID from the
    ORCHESTRATOR env — never a prior task's ID.
-5. **Cross-file consistency** — when the fix touches multiple files, confirm the fix pattern
-   is applied consistently across all affected files. Identify the primary fix pattern and
-   verify it is applied in all relevant locations. If the fix is incomplete across files,
-   record under \`correctness\` with \`passed: false\` and the issue: "fix pattern inconsistency:
-   [description of where pattern is/isn't applied]".
+5. **Cross-file consistency** — when the diff touches multiple files, identify the dominant pattern introduced or modified (e.g., 'added null guard before .map calls', 'switched timestamps to UTC-aware', 'added try/except around external HTTP call'). Enumerate every touched file and attest that the pattern is applied consistently. If the pattern is inconsistently applied across files, record under \`correctness\` with \`passed: false\` and the issue: \`"pattern X inconsistently applied: present in [files], missing/divergent in [files]"\`.
 `;
 
 export const DOCS_TASK_FOCUS = `

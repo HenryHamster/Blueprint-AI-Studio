@@ -78,6 +78,7 @@ import {
   computePromptFingerprint,
   CREATE_TASK_FOCUS,
   FIX_TASK_FOCUS,
+  REFACTOR_TASK_FOCUS,
   PLAYBOOK_GUIDANCE,
   DEFAULT_TOOL_GUIDANCE,
   READ_THE_FAILURE_MESSAGE,
@@ -4147,6 +4148,18 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
     expect(CREATE_TASK_FOCUS).toContain('git diff --name-only');
     expect(FIX_TASK_FOCUS).toContain('related_files');
     expect(FIX_TASK_FOCUS).toContain('git diff --name-only');
+    expect(REFACTOR_TASK_FOCUS).toContain('related_files');
+    expect(REFACTOR_TASK_FOCUS).toContain('git diff --name-only');
+  });
+
+  it('test_scope_drift_guidance_defined_once — canonical lockfile allowlist appears identically in all scope-drift-enforcing focus blocks', () => {
+    // If this fails, scope-drift guidance was edited in one place but not the
+    // others. Fix: update SHARED_SCOPE_DRIFT_BODY in task-type-focus.ts so all
+    // blocks re-derive from the single constant.
+    const CANONICAL_ALLOWLIST = '`package-lock.json`, `poetry.lock`, `Cargo.lock`, `go.sum`';
+    expect(CREATE_TASK_FOCUS).toContain(CANONICAL_ALLOWLIST);
+    expect(FIX_TASK_FOCUS).toContain(CANONICAL_ALLOWLIST);
+    expect(REFACTOR_TASK_FOCUS).toContain(CANONICAL_ALLOWLIST);
   });
 });
 

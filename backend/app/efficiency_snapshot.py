@@ -269,7 +269,7 @@ _SNAPSHOT_HISTORY_MAX = 365
 # v10: prompt_static_bytes axis added — source character count of the dominant static
 #      prompt sections (SHARED_LIFECYCLE_REMAINDER + assembleFailureGuidanceBlocks
 #      constants in agent/src/prompt.ts) as a leading indicator for token budget growth.
-METRIC_DEF_VERSION = "v10"
+METRIC_DEF_VERSION = "v11"
 
 
 async def _load_recent_tasks(
@@ -2114,20 +2114,33 @@ _PROMPT_STATIC_CONST_NAMES: tuple[str, ...] = (
 # static prompt footprint and are not template literals.
 _PROMPT_STATIC_PLAIN_CONST_NAMES: tuple[str, ...] = ("DEFAULT_TOOL_GUIDANCE",)
 
+# Template-literal constants from agent/src/prompts/task-type-focus.ts that
+# contribute to the static prompt footprint. MIGRATE_TASK_FOCUS is omitted
+# because it is a function-call assignment (buildMigrateTaskFocus()) rather than
+# a direct template literal and cannot be measured by _extract_ts_template_literal_length.
+_TASK_TYPE_FOCUS_CONST_NAMES: tuple[str, ...] = (
+    "REFACTOR_TASK_FOCUS",
+    "QA_TASK_FOCUS",
+    "CREATE_TASK_FOCUS",
+    "FIX_TASK_FOCUS",
+    "DOCS_TASK_FOCUS",
+    "DEPS_TASK_FOCUS",
+)
+
 
 def _compute_prompt_static_bytes() -> int | None:
     """Sum the source character lengths of all static code-change prompt sections.
 
     Reads agent/src/prompt.ts and measures the template-literal constants in
     _PROMPT_STATIC_CONST_NAMES plus the plain-string constants in
-    _PROMPT_STATIC_PLAIN_CONST_NAMES. Returns None when prompt.ts is unavailable
-    (production backend containers that do not mount agent/src) or when any
-    declared constant is absent from the source.
+    _PROMPT_STATIC_PLAIN_CONST_NAMES. Also reads agent/src/prompts/task-type-focus.ts
+    and measures the template-literal constants in _TASK_TYPE_FOCUS_CONST_NAMES.
+    Returns None when any source file is unavailable (production backend containers
+    that do not mount agent/src) or when any declared constant is absent.
 
-    Baseline (post-v16, 2026-06-20): ~16 420 bytes / ~4 678 tokens.
-    The 2026-06-19 experiment measured ~34 997 bytes before v16 prompt reductions
-    (SHARED_LIFECYCLE_REMAINDER cut from ~6 742 to ~1 712 tokens in PR #10960;
-    SIZE_GUARDRAIL_GUIDANCE cut from ~573 to ~266 tokens in PR #10956).
+    Baseline (post-v16, 2026-06-20): ~16 420 bytes / ~4 678 tokens from prompt.ts.
+    v11 adds task-type-focus.ts constants (~5 500 bytes), raising the combined
+    baseline to ~21 900 bytes.
     """
     agent_src = _find_agent_src()
     if agent_src is None:
@@ -2148,6 +2161,20 @@ def _compute_prompt_static_bytes() -> int | None:
         total += length
     for name in _PROMPT_STATIC_PLAIN_CONST_NAMES:
         length = _extract_ts_plain_string_length(src, name)
+        if length is None:
+            return None
+        total += length
+
+    task_type_focus_ts = os.path.join(agent_src, "prompts", "task-type-focus.ts")
+    if not os.path.exists(task_type_focus_ts):
+        return None
+    try:
+        with open(task_type_focus_ts, encoding="utf-8") as fh:
+            ttf_src = fh.read()
+    except OSError:
+        return None
+    for name in _TASK_TYPE_FOCUS_CONST_NAMES:
+        length = _extract_ts_template_literal_length(ttf_src, name)
         if length is None:
             return None
         total += length
