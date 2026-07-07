@@ -529,13 +529,16 @@ async def agent_fetch_qualification(
     exists or no qualification has run yet.
 
     Payload includes: candidate_sha, finalized_at, status, confidence,
-    sub_scores, findings, excluded_findings, challenger_refuted_findings.
+    sub_scores, findings, excluded_findings, challenger_refuted_findings, and
+    serving_sha (the git SHA of the deployed code producing this response).
     """
+    from app.deployed_sha import get_serving_sha  # noqa: PLC0415
     from app.release_qualifier import (  # noqa: PLC0415
         get_latest_qualification_audit_findings,
     )
 
     await _resolve_agent_project(project_id, token, session)
+    serving_sha = get_serving_sha()
 
     open_row = (
         (
@@ -555,6 +558,7 @@ async def agent_fetch_qualification(
     if open_row is None:
         return {
             "source": "no_open_version",
+            "serving_sha": serving_sha,
             "qualification_trigger_state": {
                 "trigger_state": "blocked",
                 "open_version_id": None,
@@ -737,6 +741,7 @@ async def agent_fetch_qualification(
             "source_disagreement": source_disagreement,
             "goal_coverage_drift": goal_coverage_drift,
             "qualification_trigger_state": qualification_trigger_state,
+            "serving_sha": serving_sha,
             **requalification_extra,
         }
 
@@ -791,6 +796,7 @@ async def agent_fetch_qualification(
         "source": "last_qualification",
         "goal_coverage_drift": goal_coverage_drift,
         "qualification_trigger_state": qualification_trigger_state,
+        "serving_sha": serving_sha,
         **requalification_extra,
     }
 

@@ -2065,6 +2065,163 @@ async def test_agent_fetch_qualification_promotion_context_in_fallback(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_qualification_stamps_serving_sha_on_verdict_path(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """agent_fetch_qualification includes serving_sha on verdict path to identify
+    which deployed code revision produced the response."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qa-sha-verdict"
+    )
+
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abc12345def6789012345678901234567890abcd",
+        confidence=0.72,
+        sub_scores={"audit": 0.5, "test_erosion": 1.0},
+        terminal_status="dry_run",
+        finalized_at=datetime(2026, 6, 1, 12, 0, 0),
+        audit_findings=[{"severity": "HIGH", "summary": "Missing guard"}],
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(verdict)
+
+    # Mock the serving SHA to a known test value
+    test_serving_sha = "f" * 40
+    monkeypatch.setattr(
+        "app.deployed_sha.get_serving_sha",
+        lambda: test_serving_sha,
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "qualification_verdict"
+    assert body["serving_sha"] == test_serving_sha
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_stamps_serving_sha_on_fallback_path(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """agent_fetch_qualification includes serving_sha on fallback (last_qualification) path."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qa-sha-fb"
+    )
+
+    version.last_qualification = {
+        "status": "not_promoted",
+        "confidence": 0.45,
+        "candidate_sha": "deadbeef" * 5,
+        "finalized_at": "2026-05-01T10:00:00",
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    # Mock the serving SHA
+    test_serving_sha = "e" * 40
+    monkeypatch.setattr(
+        "app.deployed_sha.get_serving_sha",
+        lambda: test_serving_sha,
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "last_qualification"
+    assert body["serving_sha"] == test_serving_sha
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_stamps_serving_sha_on_no_open_version(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """agent_fetch_qualification includes serving_sha even when no open version exists."""
+    project = Project(name="No Open Version SHA", user_id="test-user-nov-sha")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-nov-sha")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Mock the serving SHA
+    test_serving_sha = "d" * 40
+    monkeypatch.setattr(
+        "app.deployed_sha.get_serving_sha",
+        lambda: test_serving_sha,
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "no_open_version"
+    assert body["serving_sha"] == test_serving_sha
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_stamps_serving_sha_when_none(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """serving_sha is included in response even when get_serving_sha returns None."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qa-sha-none"
+    )
+
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abc12345def6789012345678901234567890abcd",
+        confidence=0.72,
+        terminal_status="dry_run",
+        audit_findings=[],
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+
+    # Mock get_serving_sha to return None (e.g., running locally without DEPLOY_SHA)
+    monkeypatch.setattr(
+        "app.deployed_sha.get_serving_sha",
+        lambda: None,
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "qualification_verdict"
+    assert body["serving_sha"] is None
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     client: AsyncClient, db_session
 ):
