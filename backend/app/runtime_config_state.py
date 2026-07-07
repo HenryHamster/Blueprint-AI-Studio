@@ -106,11 +106,11 @@ runtime_config: Dict = {
     # blocks on total_count >= global_cap independent of mode — so a real hard
     # cross-project ceiling always remains, even under the shipped observe default.
     # Per-project caps (max_autonomous_tasks_per_hour=12) still bound any single
-    # project, so 500/hr only binds in aggregate across the whole fleet.
-    "max_global_autonomous_tasks_per_hour": 500,
+    # project, so 50/hr only binds in aggregate across the whole fleet.
+    "max_global_autonomous_tasks_per_hour": 50,
     # Rollout mode for the CATEGORIZED spawn budget (initiative vs servicing).
     #   off/observe — the tighter initiative cap below is advisory (recorded, not
-    #                 blocking); the 500/hr global backstop above still binds.
+    #                 blocking); the 50/hr global backstop above still binds.
     #   enforce     — the initiative cap additionally blocks initiative spawns.
     # Ships "observe" as a deliberate gradual-rollout posture so operators can
     # measure the initiative/servicing split before switching the tighter gate on.

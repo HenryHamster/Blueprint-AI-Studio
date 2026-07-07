@@ -33133,7 +33133,7 @@ async def test_finalize_logs_actionable_open_count_failure(db_session, mocker, c
 
     # Should log the actionable-open count failure.
     assert any(
-        "completion-debt actionable-open count" in record.message
+        "actionable-open completion-debt count" in record.message
         for record in caplog.records
     ), f"Expected warning about actionable-open count, got: {[r.message for r in caplog.records]}"
 
