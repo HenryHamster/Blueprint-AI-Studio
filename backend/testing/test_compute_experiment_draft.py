@@ -222,8 +222,8 @@ class TestDraftRefinementRevisesPriorDraft:
 
         # Verify the LLM was called with the prior_draft so refinement is context-aware.
         mock_llm.assert_called_once()
-        call_kwargs = mock_llm.call_args
-        assert call_kwargs.args[4] == prior_draft_dict or call_kwargs.kwargs.get("prior_draft") == prior_draft_dict
+        call_args = mock_llm.call_args
+        assert call_args.kwargs.get("prior_draft") == prior_draft_dict
 
         # Revised draft should reflect the refinement (3 arms, higher spend cap).
         assert data["arms"] is not None and len(data["arms"]) == 3

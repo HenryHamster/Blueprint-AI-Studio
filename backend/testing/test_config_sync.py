@@ -198,7 +198,9 @@ async def test_sync_applies_runtime_config_json():
     assert _shared_state.runtime_config["require_approval_gates"] is False
     assert _shared_state.runtime_config["max_provision_retries"] == 5
     assert _shared_state.runtime_config["provider_settings_defaults"] == {
-        "anthropic": {"effort": "high"}
+        "anthropic": {"effort": "high"},
+        "zai": {},
+        "deepseek": {},
     }
     assert _shared_state.runtime_config["task_type_provider_overrides"] == {
         "research": {"anthropic": {"effort": "max"}}

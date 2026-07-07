@@ -2814,7 +2814,7 @@ async def compute_experiment_draft(
         payload.idea,
         payload.github_repo,
         payload.base_branch,
-        payload.prior_draft,
+        prior_draft=payload.prior_draft,
     )
     if raw is None:
         return ComputeExperimentDraft(
