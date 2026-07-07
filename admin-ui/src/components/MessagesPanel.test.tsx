@@ -71,7 +71,7 @@ function _setupApiFetchMock(opts: {
     if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
       return new Response(JSON.stringify({ last_seen_at: lastSeenAt }), { status: 200 });
     }
-    if (/\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(urlStr) && method === 'GET') {
+    if (/\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr) && method === 'GET') {
       const msgs = queue
         ? queue[Math.min(qIdx, queue.length - 1)]
         : defaultMessages;
@@ -83,11 +83,6 @@ function _setupApiFetchMock(opts: {
           order: 'oldest_first',
           items: msgs,
         },
-        recent_outputs: [],
-        session: {},
-        status: 'unavailable',
-        location: 'unavailable',
-        status_reason: 'no_runner',
       }), { status: 200 });
     }
     if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
@@ -143,7 +138,7 @@ function _strategicSessionGetCalls(): unknown[][] {
   return vi.mocked(apiFetch).mock.calls.filter((c) => {
     const url = String(c[0]);
     const init = c[1] as RequestInit | undefined;
-    return /\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(url) && (!init?.method || init.method === 'GET');
+    return /\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(url) && (!init?.method || init.method === 'GET');
   });
 }
 function _strategicSessionMessagePostCalls(): unknown[][] {
@@ -3683,6 +3678,8 @@ describe('MessagesPanel Investigate action', () => {
       status: 'open',
     });
     const el = await renderWithMessages([blocker]);
+    // Clear any fetch calls from initial render (e.g. ui-load-timing analytics).
+    (global.fetch as ReturnType<typeof vi.fn>).mockClear();
     const investigateBtn = el.querySelector('button[title="Investigate"]') as HTMLButtonElement;
     expect(investigateBtn).toBeTruthy();
 
@@ -5240,14 +5237,9 @@ describe('MessagesPanel auto-scroll', () => {
       if (/\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr) && method === 'POST') {
         return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
       }
-      if (/\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(urlStr) && method === 'GET') {
+      if (/\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr) && method === 'GET') {
         return new Response(JSON.stringify({
           conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
-          recent_outputs: [],
-          session: {},
-          status: 'unavailable',
-          location: 'unavailable',
-          status_reason: 'no_runner',
         }), { status: 200 });
       }
       if (method === 'GET' && (
@@ -5331,11 +5323,10 @@ describe('MessagesPanel auto-scroll', () => {
       if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
         return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
       }
-      if (/\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(urlStr) && method === 'GET') {
+      if (/\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr) && method === 'GET') {
         const batch = messageQueue.shift() ?? [];
         return new Response(JSON.stringify({
           conversation: { limit: 20, has_more: false, order: 'oldest_first', items: batch },
-          recent_outputs: [], session: {}, status: 'unavailable', location: 'unavailable', status_reason: 'no_runner',
         }), { status: 200 });
       }
       if (method === 'GET' && (
@@ -6012,14 +6003,9 @@ describe('MessagesPanel composer draft persistence', () => {
         postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
         return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
       }
-      if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr)) {
+      if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr)) {
         return new Response(JSON.stringify({
           conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
-          recent_outputs: [],
-          session: {},
-          status: 'unavailable',
-          location: 'unavailable',
-          status_reason: 'no_runner',
         }), { status: 200 });
       }
       if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
@@ -6159,14 +6145,9 @@ describe('MessagesPanel composer draft persistence', () => {
         postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
         return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
       }
-      if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr)) {
+      if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr)) {
         return new Response(JSON.stringify({
           conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
-          recent_outputs: [],
-          session: {},
-          status: 'unavailable',
-          location: 'unavailable',
-          status_reason: 'no_runner',
         }), { status: 200 });
       }
       if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
