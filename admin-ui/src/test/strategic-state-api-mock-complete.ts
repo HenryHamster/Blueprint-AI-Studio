@@ -1,7 +1,7 @@
 import { vi } from 'vitest';
 
 export function createStrategicStateApiMock(overrides: Record<string, unknown> = {}) {
-  return {
+  const base: Record<keyof typeof import('../strategicStateApi'), unknown> = {
     fetchStrategicState: vi.fn(),
     fetchStrategicWorkbenchState: vi.fn(),
     updateStrategicWorkbenchState: vi.fn(),
@@ -12,6 +12,6 @@ export function createStrategicStateApiMock(overrides: Record<string, unknown> =
     executeStrategicWorkSessionCommand: vi.fn(),
     startStrategicSession: vi.fn(),
     stopStrategicSession: vi.fn(),
-    ...overrides,
   };
+  return { ...base, ...overrides };
 }

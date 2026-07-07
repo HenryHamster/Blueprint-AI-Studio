@@ -1,0 +1,8 @@
+{
+  "GET /api/agent/projects/{project_id}/tasks": {
+    "owner": "test_agent_tasks.py",
+    "search_pattern": "/api/agent/projects/[^\"']+/tasks(?![/\\w])",
+    "exempt_tests": ["test_list_tasks_includes_children_inline"],
+    "notes": "Flat-list contract (count, data, ordering, visibility filtering) for the agent tasks list endpoint. test_list_tasks_includes_children_inline in test_agent_strategic_fetch.py is exempt because it tests the children inline field — a different response aspect — rather than duplicating the flat-list contract."
+  }
+}

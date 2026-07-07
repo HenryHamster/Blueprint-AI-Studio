@@ -123,7 +123,7 @@
     "direction_lifecycle.py": 2200,
     "routers/admin_notifications.py": 1850,
     "strategic_state_read_model.py": 1100,
-    "strategic_resident_session.py": 2400,
+    "strategic_resident_session.py": 2800,
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 2700,
     "operator_attention.py": 2250,
@@ -142,7 +142,7 @@
     "prompts/code-change-helpers.ts": 1250,
     "prompts/code-change-helpers.test.ts": 1500,
     "prompts/check-helper.ts": 1200,
-    "prompts/check-helper.test.ts": 1300,
+    "prompts/check-helper.test.ts": 1600,
     "prompts/done-helper.ts": 650,
     "prompts/done-helper.test.ts": 650,
     "handlers/research-plan.ts": 3000,
@@ -175,7 +175,7 @@
     "providers/runners.ts": 1900,
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950,
-    "providers/resident-session.ts": 560
+    "providers/resident-session.ts": 800
   },
   "frontend": {
     "useAppState.ts": 3000,

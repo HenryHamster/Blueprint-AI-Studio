@@ -10538,6 +10538,92 @@ def test_string_patch_target_scanner_self_tests():
         assert _collect_app_patch_targets(tmpdir_path) == {}
 
 
+# ── Route Contract Ownership ────────────────────────────────────────────────
+
+
+def _find_test_funcs_matching(content: str, pattern: re.Pattern) -> list[str]:
+    """Return names of test functions whose body contains the given pattern."""
+    func_starts = list(re.finditer(r"^(?:async )?def (test_\w+)", content, re.MULTILINE))
+    offending: list[str] = []
+    for i, match in enumerate(func_starts):
+        start = match.start()
+        end = func_starts[i + 1].start() if i + 1 < len(func_starts) else len(content)
+        if pattern.search(content[start:end]):
+            offending.append(match.group(1))
+    return offending
+
+
+class TestRouteContractOwnership:
+    """Standalone guard: each endpoint's response-shape contract must live in
+    exactly one owner test file (declared in route_contract_owners.json).
+
+    A second test file asserting the same endpoint's shape is a contract
+    violation caught at standalone CI time — the mechanical speed bump that was
+    missing when the /tasks flat-vs-nested contradiction merged undetected.
+    """
+
+    def test_no_duplicate_route_contracts(self):
+        """No non-owner test file may introduce response-shape tests for a
+        registered endpoint unless the test function is explicitly exempted.
+
+        To register a new endpoint: add an entry to route_contract_owners.json.
+        To exempt a pre-existing co-located test: add its function name to
+        'exempt_tests' for that endpoint's entry.
+        """
+        import json
+
+        registry_path = BACKEND_ROOT / "testing" / "route_contract_owners.json"
+        assert registry_path.exists(), (
+            f"Route contract registry not found: {registry_path}. "
+            "Create backend/testing/route_contract_owners.json to use this guard."
+        )
+
+        with open(registry_path) as f:
+            registry = json.load(f)
+
+        testing_dir = BACKEND_ROOT / "testing"
+        violations: list[str] = []
+
+        for endpoint, config in registry.items():
+            owner_file: str = config["owner"]
+            raw_pattern: str = config["search_pattern"]
+            exempt_tests: set[str] = set(config.get("exempt_tests", []))
+
+            try:
+                compiled = re.compile(raw_pattern)
+            except re.error as exc:
+                raise AssertionError(
+                    f"route_contract_owners.json: invalid regex for '{endpoint}': {exc}"
+                ) from exc
+
+            for test_file in sorted(testing_dir.glob("test_*.py")):
+                if test_file.name == owner_file:
+                    continue
+                content = test_file.read_text()
+                if not compiled.search(content):
+                    continue
+
+                offending = [
+                    fn
+                    for fn in _find_test_funcs_matching(content, compiled)
+                    if fn not in exempt_tests
+                ]
+                if offending:
+                    violations.append(
+                        f"Endpoint '{endpoint}' response-shape contract is owned by "
+                        f"'{owner_file}' but also asserted in {test_file.name}: "
+                        + ", ".join(offending)
+                    )
+
+        assert not violations, (
+            "Route contract violations detected. Each endpoint's response-shape "
+            "contract must live in its registered owner file "
+            "(see backend/testing/route_contract_owners.json).\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+
+
+
 def test_no_deprecated_datetime_utcnow_calls():
     """No app/ file may call datetime.utcnow() — use _utcnow() from app.time_utils instead.
 

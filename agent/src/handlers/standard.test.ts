@@ -1,5 +1,55 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// ── Type-safe mock export names ────────────────────────────────────────────────
+// Ensures that renaming/removing an export in the mocked module causes tsc to
+// fail at compile time. Each type assertion verifies the array only contains
+// valid export keys from the actual module.
+const {
+  INDEX_MOCK_EXPORTS,
+  TEST_FIX_LOOP_MOCK_EXPORTS,
+  PROMPT_MOCK_EXPORTS,
+  CODE_CHANGE_MOCK_EXPORTS,
+  PRIOR_KNOWLEDGE_MOCK_EXPORTS,
+  BUILD_CONFIG_MOCK_EXPORTS,
+} = vi.hoisted(() => {
+  type IndexExportKey = keyof typeof import('../index.js');
+  type TestFixLoopExportKey = keyof typeof import('../utils/test-fix-loop.js');
+  type PromptExportKey = keyof typeof import('../prompt.js');
+  type CodeChangeExportKey = keyof typeof import('./code-change.js');
+  type PriorKnowledgeExportKey = keyof typeof import('./prior-knowledge.js');
+  type BuildConfigExportKey = keyof typeof import('../build-config.js');
+
+  return {
+    INDEX_MOCK_EXPORTS: [
+      'WORKSPACE', 'sanitize', 'sendLog', 'log', 'getAgentToken', 'apiPost',
+      'apiGet', 'persistAndPostStatus', 'readHandlerOutput', 'validateBranchName',
+      'git', 'setupWorkspace', 'runClaudeCode', 'sendHeartbeatSync', 'getProviderRunner',
+    ] satisfies readonly IndexExportKey[],
+    TEST_FIX_LOOP_MOCK_EXPORTS: [
+      'captureTestBaseline',
+    ] satisfies readonly TestFixLoopExportKey[],
+    PROMPT_MOCK_EXPORTS: [
+      'getTaskTypeHints', 'readClaudeMd', 'buildContextPrefix', 'buildFileTree',
+      'discoverRelatedTests', 'configureAgentPermissions', 'writePlaybookHelper',
+      'writeMessagesHelper', 'writeViewportSnapshotHelper', 'writeViewportLiveHelper',
+      'writeCodeChangeHelpers', 'formatPlaybook', 'buildRetryContext', 'buildRepoMap',
+      'buildAnalysisPrompt', 'parseAnalysisPlanFiles', 'parseAnalysisPlanTestFiles',
+      'parseAnalysisPlanVerifyFiles', 'extractModuleInterfaces', 'discoverAffectedConsumers',
+    ] satisfies readonly PromptExportKey[],
+    CODE_CHANGE_MOCK_EXPORTS: [
+      'runCodeChangeTask',
+    ] satisfies readonly CodeChangeExportKey[],
+    PRIOR_KNOWLEDGE_MOCK_EXPORTS: [
+      'fetchKnowledgeDocumentById', 'fetchArtifactDownloadUrl',
+    ] satisfies readonly PriorKnowledgeExportKey[],
+    BUILD_CONFIG_MOCK_EXPORTS: [
+    ] satisfies readonly BuildConfigExportKey[],
+  };
+});
+
+// Used for type checking only; suppress "unused" warnings
+void INDEX_MOCK_EXPORTS; void TEST_FIX_LOOP_MOCK_EXPORTS; void PROMPT_MOCK_EXPORTS; void CODE_CHANGE_MOCK_EXPORTS; void PRIOR_KNOWLEDGE_MOCK_EXPORTS; void BUILD_CONFIG_MOCK_EXPORTS;
+
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // 2026-05-04: standard.ts no longer drives lint/test/push/PR via wrapper helpers
 // (lintFixLoop / testFixLoop / pushAndCreatePR are still exported from index.ts
