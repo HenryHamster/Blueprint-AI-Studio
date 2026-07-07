@@ -3036,6 +3036,7 @@ async def test_digest_direction_progress_budget_alert_stamped_in_db_and_idempote
     )
 
 
+
 @pytest.mark.asyncio
 async def test_conversion_rate_not_deflated_without_type_breakdown(
     client: AsyncClient, db_session

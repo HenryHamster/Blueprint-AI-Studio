@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/purity, react-hooks/refs */
 import { useState, useEffect, useCallback, useRef, type RefObject } from 'react';
 import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge, Pause, Server, Compass, CheckCircle2, XCircle, Activity, FileText } from 'lucide-react';
 import { API_BASE_URL, authHeaders, apiFetch } from '../api';

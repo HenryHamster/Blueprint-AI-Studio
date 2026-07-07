@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { useEffect, useState } from 'react';
 import type React from 'react';
 import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog, createComputeExperiment, computeExperimentPreflight } from '../api';

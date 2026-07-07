@@ -25,6 +25,10 @@ export interface StrategicActivityItem {
   id: number;
   kind: string;
   text: string;
+  /** Epoch ms when this activity item started (from d.ts). */
+  ts?: number;
+  /** True when this is the last item of an in-flight turn (lifecycle working/responding). */
+  inFlight?: boolean;
 }
 
 export interface StrategicLiveActivity {
@@ -173,9 +177,17 @@ export function computeStrategicSessionActivity(
   }
   const doneSeq = lastDoneSeq(visible);
 
-  const items: StrategicActivityItem[] = visible
+  const inFlight = latestLifecycle === 'working' || latestLifecycle === 'responding';
+  const rawItems: StrategicActivityItem[] = visible
     .filter(d => STRATEGIC_ACTIVITY_KINDS.has(d.kind ?? '') && Boolean(d.text) && (d.seq ?? d.id) > doneSeq)
-    .map(d => ({ id: d.id, kind: d.kind ?? 'tool', text: d.text }));
+    .map(d => {
+      const tsMs = d.ts ? parseTimestamp(d.ts).getTime() : undefined;
+      return { id: d.id, kind: d.kind ?? 'tool', text: d.text, ts: Number.isNaN(tsMs) ? undefined : tsMs };
+    });
+  if (inFlight && rawItems.length > 0) {
+    rawItems[rawItems.length - 1] = { ...rawItems[rawItems.length - 1], inFlight: true };
+  }
+  const items = rawItems;
 
   const MAX_ACTIVITY = 8;
   return {

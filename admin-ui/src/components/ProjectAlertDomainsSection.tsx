@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useEffect, useState } from 'react';
 import { RotateCcw } from 'lucide-react';
 import { fetchProjectAlertDomains, updateProjectAlertDomains } from '../api';

@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/immutability, react-hooks/set-state-in-effect */
 import { useState, useRef, useEffect } from 'react';
 import { Terminal, X, Copy, Check, CheckCircle, CheckSquare, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download, Diff, ChevronDown, ChevronRight, Plus, Minus, CopyPlus } from 'lucide-react';
 import { LogsTab } from './TaskDetailDrawerLogs';

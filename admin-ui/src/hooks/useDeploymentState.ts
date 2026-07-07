@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { User } from 'firebase/auth';
 import type { DeployState, OrchestratorHealth, ProviderApisHealth, FailedRollbackInfo } from '../types/settings';

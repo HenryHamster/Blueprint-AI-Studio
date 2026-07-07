@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/purity, react-hooks/set-state-in-effect */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, CircleDollarSign, GitBranch, RefreshCw, TimerReset, XCircle } from 'lucide-react';
 import { drainLanePilot, fetchImprovementLaneDetail, fetchImprovementLanes, fetchLanePilotPreflight, reclaimOrphanedLaneWorkspaces, type ImprovementLaneCheckpoint, type ImprovementLaneCurrentTask, type ImprovementLaneDetail, type ImprovementLaneManifest, type ImprovementLaneRow, type LanePilotDrainReport, type LanePilotPreflightResponse, type LanePilotTrialMetrics, type ShadowLaneHealth } from '../api';

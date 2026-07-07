@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useEffect } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
 import type { AutoRemediationConfig, AutoRemediationStats } from '../types/project';

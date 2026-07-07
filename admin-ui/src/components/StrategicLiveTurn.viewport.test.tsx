@@ -25,6 +25,12 @@ const LONG_ACTIVITY_ITEMS: StrategicActivityItem[] = [
   { id: 3, kind: 'read', text: `https://example.com/${'z'.repeat(300)}` },
 ];
 
+// Items with an in-flight last item (simulates a long-running tool call).
+const IN_FLIGHT_ACTIVITY_ITEMS: StrategicActivityItem[] = [
+  { id: 1, kind: 'command', text: 'bash scripts/test-backend.sh testing/test_orchestrator.py' },
+  { id: 2, kind: 'tool', text: 'spawn subagent: review PR #13245', inFlight: true, ts: Date.now() - 5000 },
+];
+
 describe('StrategicLiveTurn — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -53,8 +59,21 @@ describe('StrategicLiveTurn — viewport regression', () => {
       r.render(
         <>
           <StrategicStreamingBubble text={LONG_UNBROKEN_TEXT} />
-          <StrategicActivityStrip items={LONG_ACTIVITY_ITEMS} />
+          <StrategicActivityStrip items={LONG_ACTIVITY_ITEMS} latestLifecycle="working" />
         </>,
+      );
+    });
+  }
+
+  function mountInFlightTurn() {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    return act(async () => {
+      r.render(
+        <StrategicActivityStrip items={IN_FLIGHT_ACTIVITY_ITEMS} latestLifecycle="working" />,
       );
     });
   }
@@ -86,5 +105,23 @@ describe('StrategicLiveTurn — viewport regression', () => {
       },
       { selector: 'none' },
     );
+  });
+
+  test('in-flight last item renders "running… (Ns)" indicator at 768px without overflow', async () => {
+    await expectNoOverflowAt(768, async () => {
+      await mountInFlightTurn();
+    });
+    // Verify the running indicator text is present in the DOM.
+    const indicator = host?.querySelector('[data-testid="strategic-activity-strip"]');
+    const text = indicator?.textContent ?? '';
+    if (!text.includes('running…')) {
+      throw new Error(`Expected "running…" in activity strip but got: "${text.slice(0, 200)}"`);
+    }
+  });
+
+  test('in-flight indicator fits 375px without horizontal overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      await mountInFlightTurn();
+    });
   });
 });

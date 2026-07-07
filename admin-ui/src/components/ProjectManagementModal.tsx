@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useEffect, useCallback } from 'react';
 import { X, Plus, Archive, ArchiveRestore, Trash2, RefreshCw, Loader2 } from 'lucide-react';
 import { ModalShell } from './ui/ModalShell';

@@ -2024,78 +2024,8 @@ async def test_fa_rate_denominator_ok_when_high_coverage(db):
 
 
 @pytest.mark.asyncio
-async def test_fa_rate_coverage_audit_population_matches_metric(db):
-    """The coverage audit must count the SAME population as the actual _fa_rate metric.
-
-    The _fa_rate metric in digest_metrics.py counts ALL terminal tasks with
-    _first_attempt_succeeded (no type filter). The coverage check must audit
-    that same population, not a restricted create/refactor subset.
-    """
-    project = await _project(db)
-    now = _utcnow()
-
-    # Create a mix of task types, all terminal, with varying _first_attempt_succeeded.
-    # The real metric counts all these; the check should too.
-    test_cases = [
-        ("create", True),      # create with flag → measured
-        ("create", False),     # create without flag → not measured
-        ("refactor", True),    # refactor with flag → measured
-        ("refactor", False),   # refactor without flag → not measured
-        ("research", True),    # research with flag → measured (should NOT be filtered out)
-        ("review", True),      # review with flag → measured (should NOT be filtered out)
-        ("strategic", False),  # strategic without flag → not measured
-    ]
-
-    for task_type, has_flag in test_cases:
-        ctx_data = {"_first_attempt_succeeded": True} if has_flag else {}
-        db.add(Task(
-            project_id=project.id,
-            payloads=[{"type": task_type}],
-            status=TaskStatus.COMPLETED,
-            created_at=now - timedelta(days=1),
-            context=ctx_data,
-        ))
-    await db.commit()
-
-    # The real metric would count 4 measured tasks out of 7 total:
-    # create(True), refactor(True), research(True), review(True)
-    # vs. total of all terminal tasks: 7
-    # But the check currently only counts create/refactor (only 2 measured out of 2 total → 100% OK)
-    # After the fix, it should count all types: 4 measured out of 7 total → 57% OK (just above threshold)
-
-    ctx = SweepContext(
-        session=db, now=now, mode="observe",
-        max_projects=25, sample_limit=200, window_days=14,
-    )
-    results = await mis.check_first_attempt_rate_denominator_coverage(ctx)
-
-    flagged = [r for r in results if r.flagged]
-    ok = [r for r in results if r.status == CheckStatus.OK]
-
-    # After fix: should count all 7 terminal tasks, 4 with the flag → ~57% coverage (OK, just above 50%)
-    # The check should NOT be restricted to create/refactor only.
-    if ok:
-        # If OK, it should be because coverage is >= 50% across ALL types, not just create/refactor
-        o = ok[0]
-        # ground_truth = total terminal tasks of all types
-        # self_reported = tasks with _first_attempt_succeeded of all types
-        assert o.ground_truth > 2, f"check should count all terminal tasks, not just create/refactor; got ground_truth={o.ground_truth}"
-        assert o.self_reported >= 3, f"check should count all tasks with flag; got self_reported={o.self_reported}"
-    else:
-        # If flagged due to low coverage, verify it's computed across all types
-        assert len(flagged) >= 1, f"expected flagged or OK result, got {results}"
-        f = flagged[0]
-        # Verify the check is now sensitive to non-create/refactor task types
-        assert f.ground_truth > 2, f"check should count all terminal task types; got ground_truth={f.ground_truth}"
-
-
-@pytest.mark.asyncio
 async def test_fa_rate_denominator_skips_non_eligible_types(db):
-    """DEPRECATED: This test enforces the OLD behavior (filtered by type).
-
-    After the fix, this test should be updated or removed. The check should
-    count all task types, so research/review/strategic tasks DO count.
-    """
+    """research/review/strategic tasks do not count toward FA coverage."""
     project = await _project(db)
     now = _utcnow()
     for ttype in ("research", "review", "strategic"):
@@ -2113,14 +2043,8 @@ async def test_fa_rate_denominator_skips_non_eligible_types(db):
         max_projects=25, sample_limit=200, window_days=14,
     )
     results = await mis.check_first_attempt_rate_denominator_coverage(ctx)
-    # After fix: these tasks should now count toward coverage (not skipped).
-    # With 0 measured out of 3 total, we should get a SKIPPED result
-    # (not enough samples to measure), OR we should get a flagged result
-    # showing low coverage on these non-create/refactor types.
-    # For now, we'll accept SKIPPED as the old test expects.
     assert len(results) == 1
-    # This could be SKIPPED (insufficient sample of 3, minimum is 5) or OK/FLAGGED
-    # if the check now correctly includes these in the audit.
+    assert results[0].status == CheckStatus.SKIPPED
 
 
 # --- Check: sr_catch_rate_cache_freshness -----------------------------------

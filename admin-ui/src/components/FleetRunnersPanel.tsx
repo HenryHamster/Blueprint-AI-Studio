@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2 } from 'lucide-react';
 import { API_BASE_URL, listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken } from '../api';

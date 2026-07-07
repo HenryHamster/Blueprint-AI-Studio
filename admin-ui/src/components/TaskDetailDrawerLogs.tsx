@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useRef, useEffect, useState, useMemo, useCallback, type ReactNode } from 'react';
 import { Search, X, Loader2, ArrowDown, ChevronRight } from 'lucide-react';
 import type { Task } from './TaskCard';

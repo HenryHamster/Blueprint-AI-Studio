@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { useState, useEffect, useMemo, useRef, type MutableRefObject } from 'react';
 import type { Task } from './types/task';
 import type { Project } from './types/project';

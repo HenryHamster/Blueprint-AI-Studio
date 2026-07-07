@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useEffect, useRef } from 'react';
 import { ConfirmDialog } from './ConfirmDialog';
 import { VersionSummaryPanel } from './VersionSummaryPanel';

@@ -10720,6 +10720,7 @@ def test_no_deprecated_datetime_utcnow_calls():
     )
 
 
+
 def test_spawn_budget_partition_is_exhaustive():
     """Assert that the autonomous spawn-budget partition is exhaustive and disjoint.
 

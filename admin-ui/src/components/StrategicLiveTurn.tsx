@@ -4,6 +4,7 @@
  * MessagesPanel to keep that file under its size cap. Pure derivations live in
  * utils/strategicSessionLive.ts.
  */
+import { useState, useEffect } from 'react';
 import type { StrategicActivityItem } from '../utils/strategicSessionLive';
 
 // Compact glyph per activity kind for the strip (monospace, muted).
@@ -41,13 +42,33 @@ export function StrategicStreamingBubble({ text }: { text: string }) {
   );
 }
 
+/** Ticking elapsed-seconds counter for an in-flight activity item. */
+function InFlightCounter({ startMs }: { startMs: number | undefined }) {
+  // Capture origin once on first render; never re-initialized so the counter is monotonic.
+  const [origin] = useState<number>(() => startMs ?? Date.now());
+  const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - origin) / 1000));
+
+  useEffect(() => {
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - origin) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [origin]);
+
+  return <span className="shrink-0 text-neutral-500"> running… ({elapsed}s)</span>;
+}
+
 /**
  * The LIVE, ephemeral activity strip: a compact scrolling feed of the commands /
  * tools the resident strategist is running for the current turn. Cleared the
  * moment the turn ends (`done` / durable reply lands) — it never becomes part of
  * the durable transcript.
  */
-export function StrategicActivityStrip({ items }: { items: StrategicActivityItem[] }) {
+export function StrategicActivityStrip({
+  items,
+  latestLifecycle,
+}: {
+  items: StrategicActivityItem[];
+  latestLifecycle?: 'responding' | 'working' | 'done' | null;
+}) {
   return (
     <div
       data-testid="strategic-activity-strip"
@@ -57,7 +78,7 @@ export function StrategicActivityStrip({ items }: { items: StrategicActivityItem
         <div className="mb-0.5 flex items-center gap-1.5 px-0.5 text-ui-md text-neutral-500">
           <span className="inline-flex items-center gap-1">
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400" aria-hidden="true" />
-            <span className="font-medium text-neutral-400">Workday’s on it…</span>
+            <span className="font-medium text-neutral-400">Workday's on it…</span>
           </span>
         </div>
         {items.length > 0 && (
@@ -76,6 +97,9 @@ export function StrategicActivityStrip({ items }: { items: StrategicActivityItem
                   {STRATEGIC_ACTIVITY_GLYPH[item.kind] ?? '·'}
                 </span>
                 <span className="min-w-0 truncate">{item.text}</span>
+                {item.inFlight && latestLifecycle !== 'done' && (
+                  <InFlightCounter startMs={item.ts} />
+                )}
               </div>
             ))}
           </div>

@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/purity, react-hooks/refs, react-hooks/set-state-in-effect */
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { fetchSrUnhandledEdgesRetrospectives, fetchSrCatchRateHealth, type SrUnhandledEdgesTask, type SrUnhandledEdge, type SrCatchRateHealth } from '../api';

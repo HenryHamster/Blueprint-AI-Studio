@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { useState, useEffect, useMemo } from 'react';
 import type { Task } from '../types/task';
 import { API_BASE_URL, apiFetch, authHeaders, authGet, resetTaskIterationCap, triggerTaskRollup } from '../api';

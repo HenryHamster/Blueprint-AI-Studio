@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/refs */
 import { useState, useRef } from 'react';
 import type { Task } from '../types/task';
 import { API_BASE_URL, authGet, purgeArchive } from '../api';

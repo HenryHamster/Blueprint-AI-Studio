@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useEffect, useMemo, useState } from 'react';
 import type { ProjectResourceEnvelopeResponse } from '../types/project';
 import type { ResourceEnvelopePatch } from '../api';

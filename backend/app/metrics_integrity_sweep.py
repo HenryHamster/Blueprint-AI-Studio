@@ -2011,6 +2011,9 @@ async def check_first_attempt_rate_denominator_coverage(
         total = 0
         measured = 0
         for t in tasks:
+            ttype = (t.first_payload or {}).get("type", "")
+            if ttype not in _FA_ELIGIBLE_TYPES:
+                continue
             total += 1
             if "_first_attempt_succeeded" in (t.context or {}):
                 measured += 1
