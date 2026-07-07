@@ -1617,22 +1617,13 @@ async def stop_resident_session(
             commit=False,
         )
 
-    # Release the continuation lease + end the session blob under the PROJECT row
-    # lock FIRST, THEN drive the resident task terminal under the TASK row lock —
-    # canonical Project→Task order (findings: lock-order inversion, context
-    # lost-update, and double-completion, which share this one locking fix).
-    #
-    # The resident heartbeat's ledger mirror holds the project lock (via
-    # ``with_vision_locked``) and only THEN takes this same task row lock (via
-    # ``with_task_context_locked``). The prior stop code mutated the task and
-    # ``session.add``-ed it BEFORE ``with_vision_locked``, so autoflush acquired
-    # the task row lock ahead of the project SELECT — Task→Project — inverting the
-    # heartbeat's order and opening an AB-BA deadlock window (every heartbeat that
-    # mirrors a ledger/cursor opens the opposing side). Ending the blob first and
-    # taking the task lock only while the project lock is still held (the lock is
-    # held until the commit below) makes stop strictly Project→Task, matching the
-    # heartbeat and the ``lock_project_then_task`` convention, so the two paths can
-    # no longer deadlock.
+    # Canonical Project→Task lock order (one change fixes the AB-BA deadlock,
+    # context lost-update, and double-completion findings). The heartbeat mirror
+    # takes the project lock (with_vision_locked) THEN this task's row lock; the
+    # prior stop code mutated + session.add-ed the task BEFORE with_vision_locked,
+    # so autoflush locked the task row first (Task→Project, the opposing order).
+    # Ending the blob first and locking the task only while the project lock is
+    # still held makes stop strictly Project→Task, so neither path can deadlock.
     def _release_and_end(vision: dict[str, Any]) -> None:
         # Release the continuation lease (the resident session is over) and mark
         # the session blob ended, in one locked read-modify-write.
@@ -1653,27 +1644,15 @@ async def stop_resident_session(
 
     await with_vision_locked(session, project.id, _release_and_end, skip_locked=False)
 
-    # Drive the resident task terminal (instant reclaim) under the TASK row lock,
-    # held together with the project lock acquired just above. The task is re-read
-    # FRESH inside the lock (``task_lock`` uses ``populate_existing``), which fixes
-    # two lost-update/ordering hazards the prior unlocked ``session.get`` had:
-    #
-    #   * Context lost-update: the read-modify-write that merges
-    #     ``failure_category`` now reads the CURRENT ``context`` column (not a
-    #     stale identity-map copy), so it can no longer clobber a concurrent
-    #     strategic-API commit's ``_strategic_api_called`` / ``_strategic_dirs_*``
-    #     markers — which would have made ``_run_resident_completion_on_stop``
-    #     silently skip stop-time completion processing. A strategic-API writer
-    #     cannot even reach the task lock while we hold it, because it must take
-    #     the project lock (which we hold) first.
-    #   * Double-completion: ``status`` is re-checked against a possibly
-    #     interleaved terminal (COMPLETED) commit from the agent. If the task has
-    #     ALREADY gone terminal on its own we do NOT overwrite it to CANCELLED and
-    #     do NOT run stop-time completion — so completion processing runs at most
-    #     once (the normal post-commit pipeline handles the agent's own terminal;
-    #     ``mark_phase2_completed`` has no already-processed guard to fall back
-    #     on). Only a still-live task is cancelled + bridged by
-    #     ``_run_resident_completion_on_stop``.
+    # Drive the resident task terminal under the TASK row lock, held with the
+    # project lock from above. Re-read FRESH inside the lock (task_lock uses
+    # populate_existing) to fix two hazards of the prior unlocked session.get:
+    # (1) context lost-update — the failure_category merge reads the CURRENT
+    #     context, so it can't clobber a concurrent strategic-API commit's
+    #     _strategic_api_* markers (that writer must take the project lock we hold
+    #     first, so it can't reach the task lock); (2) double-completion — status
+    #     is re-checked, so a task that already went terminal on its own is left
+    #     to the normal post-commit pipeline (mark_phase2_completed has no guard).
     cancelled_task_id: uuid.UUID | None = None
     task_id = (blob or {}).get("task_id")
     resident_task_uuid: uuid.UUID | None = None
@@ -2286,19 +2265,14 @@ async def renew_resident_session_lease(
                         .where(
                             ProjectMessage.project_id == project.id,
                             ProjectMessage.id.in_(safe_ids),
-                            # Mirror the poll's delivery predicate: the poll
-                            # (``_session_scope_conditions``) delivers THIS
-                            # session's rows PLUS legacy/cadence NULL-session rows,
-                            # so the handled-update must ack that same set — else
-                            # an answered legacy (NULL-session) message the agent
-                            # reports here stays ``status='open'`` forever and
-                            # re-inflates the open-message backlog this change set
-                            # exists to drain. The explicit ``id.in_(safe_ids)``
-                            # already restricts this to messages the agent
-                            # actually answered, and a row stamped for a DIFFERENT
-                            # session is still excluded, so this can never mark
-                            # another session's conversation handled.
-                            *_session_scope_conditions(session_id),
+                            # Strictly own-session: legacy/cadence NULL-session
+                            # rows are project-wide standing messages (e.g.
+                            # BUG_REPORTs) that a single session's heartbeat must
+                            # NOT resolve — the poll delivers them for visibility
+                            # only. Enforced invariant (test_heartbeat_handled_ids
+                            # _only_affect_own_session) and mirrored by
+                            # session_message_handoff's never-touch-unstamped rule.
+                            ProjectMessage.resident_session_id == session_id,
                             ProjectMessage.status == "open",
                         )
                         .values(status="handled")
