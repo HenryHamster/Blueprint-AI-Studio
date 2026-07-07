@@ -81,6 +81,7 @@ from app.autonomous_spawn_budget import (
     classify_autonomous_spawn_budget_category,
     compute_autonomous_spawn_budget_snapshot,
     autonomous_spawn_budget_config_from_runtime,
+    DEFAULT_AUTONOMOUS_SPAWN_BUDGET_MODE,
 )
 
 logger = logging.getLogger(__name__)
@@ -1744,9 +1745,26 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             "[AUTONOMOUS] Spawn budget snapshot: %s",
             budget_snapshot.as_log_fields(),
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # snapshot read failed; fail posture is mode-dependent
+        # A persistent snapshot/DB failure must NOT silently disable an
+        # operator-enabled 'enforce' budget (that would be the exact opposite
+        # of enforcement). The configured mode comes from runtime_config and
+        # needs no DB, so we can still read it here. Fail CLOSED under enforce
+        # (block the spawn) and preserve fail-open for the observational
+        # off/observe modes where the guard is only advisory.
+        try:
+            mode = autonomous_spawn_budget_config_from_runtime(_runtime_config).mode
+        except Exception:  # noqa: BLE001 - malformed config; stay observational
+            mode = DEFAULT_AUTONOMOUS_SPAWN_BUDGET_MODE
+        if mode == "enforce":
+            logger.exception(
+                "[AUTONOMOUS] Spawn budget snapshot failed in enforce mode; "
+                "failing CLOSED (blocking research spawn)"
+            )
+            return
         logger.warning(
-            "[AUTONOMOUS] Spawn budget calculation failed open: %s",
+            "[AUTONOMOUS] Spawn budget calculation failed open (mode=%s): %s",
+            mode,
             exc,
         )
     if budget_snapshot is not None:

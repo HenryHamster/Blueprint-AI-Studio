@@ -3255,7 +3255,7 @@ def test_alert_fires_again_after_dedup_window_elapses(clean_pipeline_events, moc
     assert len(pre_calls) == 1
 
     _ss.deploy_monitoring["pipeline_alert_last_ts"]["account_blacklisted"] = (
-        datetime.utcnow() - timedelta(seconds=PIPELINE_ALERT_DEDUP_SECONDS + 60)
+        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=PIPELINE_ALERT_DEDUP_SECONDS + 60)
     )
 
     record_pipeline_event("account_blacklisted", task_id="t-new", account_id="a-new")
@@ -3266,7 +3266,7 @@ def test_alert_fires_again_after_dedup_window_elapses(clean_pipeline_events, moc
 
 def test_events_older_than_one_hour_excluded_from_counts(clean_pipeline_events):
     """Stale events older than the rolling 1h window must not be counted."""
-    stale_ts = datetime.utcnow() - timedelta(hours=2)
+    stale_ts = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
     for i in range(20):
         _ss.deploy_monitoring["pipeline_events"].append(
             {

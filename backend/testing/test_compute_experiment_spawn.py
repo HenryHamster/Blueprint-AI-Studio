@@ -16,7 +16,7 @@ launch is dispatched, deferred, or held for operator approval.
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -578,7 +578,7 @@ async def _succeeded_job(db_session, task, *, result_reference: str | None = Non
     job.accrued_cost_usd = 0.42
     job.final_cost_usd = 0.42
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
     db_session.add(job)
     await db_session.commit()
     return job
@@ -1689,7 +1689,7 @@ async def test_launch_allows_operator_approved_above_threshold_compute_job(db_se
             payloads=[{"type": "compute_experiment", "command": "python bench.py"}],
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             requires_approval=False,
-            spend_approval_cleared_at=datetime.utcnow(),
+            spend_approval_cleared_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         db_session.add(task)
         await db_session.commit()
@@ -2753,7 +2753,7 @@ async def test_preflight_smoke_passing_command_proceeds_to_full_launch(
             launch_called.append(spec.job_id)
             return ComputeLaunchResult(
                 external_id="fake-vm-smoke-pass",
-                started_at=datetime.utcnow(),
+                started_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 cost_rate_per_second=0.001,
             )
 

@@ -138,6 +138,14 @@ Read or update the per-project task branch prefix.
 
 Read or update the branch prefixes that route into staging/rollup flows.
 
+### `GET|PATCH /api/admin/projects/{project_id}/full-suite-drift-sentinel`
+
+Enable or disable the standing full-suite CI drift sentinel (default OFF, stored in `build_config`).
+When enabled, each reaper sweep dispatches ci.yml on the integration branch for every open
+stabilize-phase version and alerts + spawns harvest remediation when a concluded run is red.
+PATCH body: `{ "full_suite_drift_sentinel_enabled": true|false }`. Response includes
+`full_suite_drift_sentinel_enabled` and `is_default`.
+
 ### `GET|PATCH /api/admin/projects/{project_id}/approval-gate-config`
 
 Read or update the file-path approval gate config. The stored value is a `{ "infra_files": [...], "critical_files": [...] }` object.

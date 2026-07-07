@@ -12,7 +12,7 @@ Covers the three deliverables of the staging spine:
      staged direction whose target version has already opened.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient
@@ -99,7 +99,7 @@ async def test_staged_direction_inert_in_lifecycle(db_session):
                 staged_for_version=2,
                 research_history=poisoned_history,
                 last_researched_at=(
-                    datetime.utcnow() - timedelta(hours=10)
+                    datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)
                 ).isoformat(),
             )
         ],
@@ -110,7 +110,7 @@ async def test_staged_direction_inert_in_lifecycle(db_session):
     await db_session.refresh(project)
 
     active = await _process_direction_lifecycle(
-        project, db_session, busy_direction_ids=set(), now=datetime.utcnow()
+        project, db_session, busy_direction_ids=set(), now=datetime.now(timezone.utc).replace(tzinfo=None)
     )
 
     # Excluded from active/eligible → spawns no research.

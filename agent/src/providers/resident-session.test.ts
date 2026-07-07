@@ -466,4 +466,46 @@ describe('startResidentClaudeSession', () => {
     expect(rB.sentOperatorMessage).toBe(false);
     session.close();
   });
+
+  it('ResidentTurnResult includes turnMs >= 0 and ttftMs is null when no text arrived', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    const turn = session.sendTurn('tool-only turn');
+    // Emit only a tool_use (no text), then a result.
+    ctl.pushLine({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'echo hi' } }] },
+    });
+    ctl.pushLine({ type: 'result', result: '' });
+
+    const r = await turn;
+    expect(r.turnMs).toBeGreaterThanOrEqual(0);
+    expect(r.ttftMs).toBeNull(); // no text → no TTFT
+    expect(r.toolCallCount).toBe(1);
+    session.close();
+  });
+
+  it('ResidentTurnResult includes positive ttftMs when text arrives before settle', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+
+    const turn = session.sendTurn('text turn');
+    // Advance time a bit before the first text token arrives.
+    await vi.advanceTimersByTimeAsync(50);
+    ctl.pushLine({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'hello' } } });
+    await vi.advanceTimersByTimeAsync(20);
+    ctl.pushLine({ type: 'result', result: 'hello' });
+
+    const r = await turn;
+    expect(r.ttftMs).not.toBeNull();
+    expect(typeof r.ttftMs).toBe('number');
+    const ttftMs = r.ttftMs as number;
+    expect(ttftMs).toBeGreaterThanOrEqual(0);
+    expect(r.turnMs).toBeGreaterThanOrEqual(ttftMs);
+    expect(r.toolCallCount).toBe(0);
+    session.close();
+  });
 });

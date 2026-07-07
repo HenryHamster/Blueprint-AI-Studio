@@ -1,4 +1,5 @@
 import json
+from datetime import timezone
 import uuid
 
 import pytest
@@ -508,7 +509,7 @@ async def test_admin_tasks_include_estimated_cost_usd(client: AsyncClient, db_se
 
     project = await _make_project_with_member(db_session)
 
-    started = datetime.utcnow().replace(microsecond=0) - timedelta(hours=1)
+    started = datetime.now(timezone.utc).replace(tzinfo=None).replace(microsecond=0) - timedelta(hours=1)
     stopped = started + timedelta(seconds=3600)
     spot_task = Task(
         project_id=project.id,
@@ -1100,7 +1101,7 @@ async def test_admin_tasks_banked_retry_cost(client: AsyncClient, db_session):
     from app.vm_cost_rates import get_vm_rate_per_second
 
     project = await _make_project_with_member(db_session)
-    started = datetime.utcnow().replace(microsecond=0) - timedelta(hours=1)
+    started = datetime.now(timezone.utc).replace(tzinfo=None).replace(microsecond=0) - timedelta(hours=1)
     stopped = started + timedelta(seconds=3600)
 
     banked_only = Task(

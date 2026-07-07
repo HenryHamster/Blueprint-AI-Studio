@@ -367,7 +367,7 @@ async def get_fix_loop_convergence(
     convergence widget.  Also returns ``tasks_abandoned_on_divergence`` (int)
     and ``recent_abandoned_task_ids`` (list, capped at 25) for drill-in.
     """
-    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    cutoff = _utcnow() - timedelta(hours=hours)
 
     stmt = (
         select(Task)
@@ -507,7 +507,7 @@ async def get_fix_loop_convergence_trend(
       - convergence_rate: fraction that exited with 'passed'
       - divergence_rate: fraction that exited with a divergence_* reason
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
 
     _TREND_LIMIT = 10_000
 
@@ -588,7 +588,7 @@ async def get_fix_loop_convergence_trend(
     # Build sorted list covering every day in the window
     buckets = []
     for i in range(days - 1, -1, -1):
-        day = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
+        day = (_utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
         entry: Dict[str, Any] = {"date": day}
         day_data = day_buckets.get(day, {ln: [] for ln in loop_names})
         for loop in loop_names:
@@ -1191,7 +1191,7 @@ async def get_fix_loop_diverged_tasks(
             detail=f"Invalid loop '{loop}'. Must be one of: lint, test, check.",
         )
 
-    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    cutoff = _utcnow() - timedelta(hours=hours)
 
     stmt = (
         select(Task)
@@ -1291,7 +1291,7 @@ async def get_pipeline_regressions(
         raise HTTPException(status_code=404, detail="Project not found")
 
     doc = project.design_doc or {}
-    now = datetime.utcnow()
+    now = _utcnow()
     regressions: List[Dict[str, Any]] = []
 
     # SR catch-rate regression signals — read from the sr_catch_rate_trends_alert

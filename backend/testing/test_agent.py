@@ -3228,7 +3228,7 @@ async def test_git_read_token_returns_token(client: AsyncClient, db_session, moc
     await db_session.refresh(task)
 
     mocker.patch(
-        "app.github_auth.get_repo_installation_token",
+        "app.github_auth.get_repo_installation_read_token",
         return_value="ghs_test_installation_token",
     )
 
@@ -3295,7 +3295,7 @@ async def test_git_read_token_no_installation(client: AsyncClient, db_session, m
     await db_session.refresh(task)
 
     mocker.patch(
-        "app.github_auth.get_repo_installation_token",
+        "app.github_auth.get_repo_installation_read_token",
         return_value=None,
     )
 
@@ -3341,7 +3341,7 @@ async def test_git_read_token_rejects_inactive_status_task(
 
     # A token mint here would be the bug; assert we never reach the GitHub call.
     gh_mock = mocker.patch(
-        "app.github_auth.get_repo_installation_token",
+        "app.github_auth.get_repo_installation_read_token",
         return_value="ghs_should_not_be_minted",
     )
 
@@ -3385,7 +3385,7 @@ async def test_git_read_token_rejects_requeued_cleared_vm(
     await db_session.refresh(task)
 
     gh_mock = mocker.patch(
-        "app.github_auth.get_repo_installation_token",
+        "app.github_auth.get_repo_installation_read_token",
         return_value="ghs_should_not_be_minted",
     )
 

@@ -1509,6 +1509,82 @@ async def update_broadcast_limit_config(
 
 
 # ---------------------------------------------------------------------------
+# Full-suite drift sentinel config endpoints
+# ---------------------------------------------------------------------------
+
+
+def _full_suite_drift_sentinel_value(project) -> bool:
+    return bool(
+        (project.build_config or {}).get("full_suite_drift_sentinel_enabled", False)
+    )
+
+
+@router.get("/projects/{project_id}/full-suite-drift-sentinel")
+async def get_full_suite_drift_sentinel_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return whether the standing full-suite CI drift sentinel is enabled (default OFF)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "full_suite_drift_sentinel_enabled": _full_suite_drift_sentinel_value(project),
+        "is_default": not _build_config_has_key(project, "full_suite_drift_sentinel_enabled"),
+    }
+
+
+@router.patch("/projects/{project_id}/full-suite-drift-sentinel")
+async def update_full_suite_drift_sentinel_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Enable or disable the standing full-suite CI drift sentinel (owner-only).
+
+    When enabled, each reaper sweep dispatches ci.yml on the integration branch
+    for every open stabilize-phase version and alerts + spawns harvest remediation
+    when a concluded run is red.  Pass ``false`` to revert to the default (OFF).
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "full_suite_drift_sentinel_enabled" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include 'full_suite_drift_sentinel_enabled'",
+        )
+
+    enabled = body["full_suite_drift_sentinel_enabled"]
+    if not isinstance(enabled, bool):
+        raise HTTPException(
+            status_code=422,
+            detail="'full_suite_drift_sentinel_enabled' must be a boolean",
+        )
+
+    project = await lock_project_or_429(session, project_id)
+    build_config = dict(project.build_config or {})
+    if enabled:
+        build_config["full_suite_drift_sentinel_enabled"] = True
+    else:
+        build_config.pop("full_suite_drift_sentinel_enabled", None)
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "full_suite_drift_sentinel_enabled": _full_suite_drift_sentinel_value(project),
+        "is_default": not _build_config_has_key(project, "full_suite_drift_sentinel_enabled"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Playbook Inspector endpoints
 # ---------------------------------------------------------------------------
 

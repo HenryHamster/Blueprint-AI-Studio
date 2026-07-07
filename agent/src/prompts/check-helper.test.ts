@@ -62,6 +62,11 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).toContain(`run "agent vitest" bash -c 'set -o pipefail; cd agent && npx vitest run 2>&1 | tail -80'`);
     // It lives inside the agent stack block, so it only runs when agent/ changed.
     expect(script).toMatch(/if touches agent\/; then[\s\S]*run "agent vitest"/);
+    // The admin-ui unit vitest suite also runs unconditionally (not behind `test`)
+    // inside the admin-ui block, matching CI's unit shards (bare npx vitest run,
+    // happy-dom, no Chromium, no VITE_* env vars needed for the unit suite).
+    expect(script).toContain(`run "admin-ui vitest" bash -c 'set -o pipefail; cd admin-ui && npx vitest run 2>&1 | tail -80'`);
+    expect(script).toMatch(/if admin_ui_runtime_touched; then[\s\S]*run "admin-ui vitest"/);
     // The standalone backend harness run propagates its failure through the
     // \`| tail\` (same pipefail rationale as the agent vitest line) — without
     // it the gate fails open when the harness exits non-zero.
@@ -1128,6 +1133,100 @@ esac
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('Docker unavailable');
     expect(r.stdout).toContain('PASS — all checks green');
+  });
+});
+
+// ── impacted-test merge-time gate ────────────────────────────────────────────
+// At the merge-time gate (baseBranch===promotionTarget / testsOnMainBranch), in
+// addition to the ~10-file standalone smoke set, mechanically run the backend
+// test files IMPACTED by the diff — test files that import a changed
+// app.<module> or mock-patch it by string target, plus test files the PR itself
+// adds — under the sanctioned Postgres harness. A still-failing impacted test
+// blocks ./pr open instead of leaking to the promotion-PR full matrix. The set
+// is derived from $CHANGED via the committed reverse-dep resolver
+// (backend/testing/impacted_tests.py), invoked BY REFERENCE (no embedded Python
+// heredoc, per CLAUDE.md), capped, with overflow deferred-to-CI, and degrading
+// gracefully (GATE-ENVIRONMENT marker, non-blocking) when Docker is absent.
+describe('writeCheckHelper — impacted-test merge-time gate', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('emits the impacted-test block at the merge-time gate (self-repo, testsOnMainBranch)', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'impacted-1',
+      workBranch: 'blueprint/impacted-1',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+    // The block exists and derives the impacted set from $CHANGED via the
+    // committed resolver, invoked BY REFERENCE (no embedded Python heredoc).
+    expect(script).toContain('impacted-test merge-time gate');
+    expect(script).toContain('python3 backend/testing/impacted_tests.py');
+    // Capped run, overflow deferred to CI (never silently dropped).
+    expect(script).toContain('IMPACTED_TEST_CAP=8');
+    expect(script).toContain('deferred-to-CI:');
+    // Runs the impacted files under the sanctioned Postgres harness, routed
+    // through `run` so a failure lands in FAILED and ./pr open (gates on
+    // ./check) cannot push.
+    expect(script).toContain('run "impacted-test gate" bash -c ');
+    expect(script).toContain('scripts/test-backend.sh --postgres');
+    // Graceful no-Docker skip writes the taskId-scoped GATE-ENVIRONMENT marker.
+    expect(script).toContain('/tmp/check_gate_env_impacted-1.txt');
+    // It is ADDITIVE — the standalone smoke run is untouched and still present.
+    expect(script).toContain('scripts/test-backend.sh --standalone --no-postgres');
+    // The block lives INSIDE the WITH_TESTS merge-time backend gate, right after
+    // the standalone run and before that gate's closing `fi`.
+    expect(script).toMatch(
+      /if \[ "\$WITH_TESTS" = "1" \][\s\S]*?--standalone --no-postgres[\s\S]*?impacted-test merge-time gate[\s\S]*?\n {2}fi/,
+    );
+  });
+
+  it('the impacted-test gate is disabled at runtime off the promotion target (non-merge branch)', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    // A normal task branch: base != promotionTarget -> the merge-time gate's
+    // second operand compiles to "0", so neither the standalone run nor the
+    // impacted block executes (same guarding as the pre-existing smoke run).
+    writeCheckHelper({
+      taskId: 'impacted-off',
+      workBranch: 'blueprint/impacted-off',
+      baseBranch: 'main',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+      promotionTarget: 'automain',
+    });
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+    // The gate's generation-time operand is "0" -> the whole block is guarded off.
+    expect(script).toContain('[ "$WITH_TESTS" = "1" ] && [ "0" = "1" ]');
+  });
+
+  it('generated ./check with the impacted-test gate passes `bash -n` syntax check', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'impacted-bashn',
+      workBranch: 'blueprint/impacted-bashn',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+    const { execSync } = await import('child_process');
+    execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
 });
 

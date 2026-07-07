@@ -15,6 +15,7 @@ vi.mock('../git-credential.js', () => ({
 import {
   computeRefreshDelayMs, isBootstrapToken,
   initTokenModule,
+  scheduleProactiveTokenRefresh, stopProactiveTokenRefresh,
   scheduleGithubTokenRefresh, stopGithubTokenRefresh,
 } from './agent-token.js';
 import * as agentTokenModule from './agent-token.js';
@@ -116,6 +117,46 @@ describe('isBootstrapToken', () => {
     const payload = Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64url');
     const token = `${header}.${payload}.sig`;
     expect(isBootstrapToken(token, now)).toBe(false);
+  });
+});
+
+// ── scheduleProactiveTokenRefresh / stopProactiveTokenRefresh ─────────────────
+
+describe('scheduleProactiveTokenRefresh / stopProactiveTokenRefresh lifecycle', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    initTokenModule({
+      getOrchestratorUrl: () => 'http://test-orchestrator',
+      getHeaders: () => ({ 'X-Agent-Token': 'test-token' }),
+      getToken: () => 'test-token',
+      setToken: () => {},
+      log: () => {},
+    });
+    stopProactiveTokenRefresh();
+  });
+  afterEach(() => {
+    stopProactiveTokenRefresh();
+    vi.useRealTimers();
+  });
+
+  it('calling scheduleProactiveTokenRefresh twice replaces the previous timer (no orphan)', () => {
+    const now = 1_000_000_000_000;
+    const expSec1 = Math.floor(now / 1000) + 3600;
+    const expSec2 = Math.floor(now / 1000) + 7200;
+
+    scheduleProactiveTokenRefresh(mockJwtWithExp(expSec1));
+    const first = agentTokenModule.tokenRefreshTimer;
+    scheduleProactiveTokenRefresh(mockJwtWithExp(expSec2));
+    const second = agentTokenModule.tokenRefreshTimer;
+    // The second call must replace the first — no orphaned timers.
+    expect(second).not.toBeNull();
+    expect(second).not.toBe(first);
+  });
+
+  it('stopProactiveTokenRefresh is a no-op when no timer is running', () => {
+    expect(agentTokenModule.tokenRefreshTimer).toBeNull();
+    expect(() => { stopProactiveTokenRefresh(); }).not.toThrow();
+    expect(agentTokenModule.tokenRefreshTimer).toBeNull();
   });
 });
 
@@ -231,5 +272,39 @@ describe('scheduleGithubTokenRefresh refresh callback (no token in remote URL)',
     expectCalledWith(writeGithubTokenFile, FRESH_TOKEN);
     expect(vi.mocked(writeGitTokenFile)).not.toHaveBeenCalled();
     expect(vi.mocked(setupGitCredentialHelper)).not.toHaveBeenCalled();
+  });
+
+  it('stale generation refresh does not re-arm after teardown', async () => {
+    // Simulate the race the generation-stamp guard exists for: a refresh
+    // callback is mid-flight (fetch not yet resolved) when the task tears
+    // down / a warm-VM rotation calls stopGithubTokenRefresh(). The in-flight
+    // callback must NOT reschedule itself once it resumes, because its
+    // captured generation is now stale.
+    // The fetch mock fires teardown (stopGithubTokenRefresh) the instant the
+    // in-flight refresh dispatches its request — mirroring a task teardown /
+    // warm-VM rotation landing while the callback is still awaiting the
+    // network response, before it gets to its trailing reschedule check.
+    vi.stubGlobal('fetch', vi.fn(() => {
+      stopGithubTokenRefresh();
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: FRESH_TOKEN } }) });
+    }));
+
+    const logSpy = vi.fn();
+    initTokenModule({
+      getOrchestratorUrl: () => 'http://test-orchestrator',
+      getHeaders: () => ({ 'X-Agent-Token': 'test-token' }),
+      getToken: () => 'test-token',
+      setToken: () => {},
+      log: logSpy,
+    });
+
+    scheduleGithubTokenRefresh('task-stale', '/tmp/ws', 'owner', 'repo', false);
+    await vi.advanceTimersByTimeAsync(GITHUB_TOKEN_REFRESH_MS);
+
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+    expectCalledWith(logSpy, 'GitHub token refresh: generation superseded during refresh — not re-arming');
+
+    // The stale-generation callback must NOT have re-armed a new timer.
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
   });
 });

@@ -1,7 +1,7 @@
 """Tests for constants and helper methods defined in app.models."""
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -174,7 +174,7 @@ def test_is_in_rate_limit_cooldown_empty_disabled_models():
 
 def test_is_in_rate_limit_cooldown_active_entry():
     """An entry disabled 5 minutes ago (within 4-hour window) → True."""
-    at = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+    at = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)).isoformat()
     acct = _make_account(
         rate_limit_state={
             "disabled_models": {
@@ -187,7 +187,7 @@ def test_is_in_rate_limit_cooldown_active_entry():
 
 def test_is_in_rate_limit_cooldown_expired_entry():
     """An entry disabled 5 hours ago (beyond 4-hour window) → False."""
-    at = (datetime.utcnow() - timedelta(hours=5)).isoformat()
+    at = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)).isoformat()
     acct = _make_account(
         rate_limit_state={
             "disabled_models": {

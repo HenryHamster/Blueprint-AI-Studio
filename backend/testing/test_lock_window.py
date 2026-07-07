@@ -46,7 +46,7 @@ import asyncio
 import contextlib
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
@@ -243,7 +243,7 @@ async def test_relock_parent_ignores_heartbeat_only_changes(db_session):
     # ``updated_at`` (the field the legacy validator checked). The
     # content snapshot must remain unchanged.
     await asyncio.sleep(0.01)
-    parent.last_heartbeat = datetime.utcnow()
+    parent.last_heartbeat = datetime.now(timezone.utc).replace(tzinfo=None)
     db_session.add(parent)
     await db_session.commit()
     await db_session.refresh(parent)
@@ -370,7 +370,7 @@ async def test_concurrent_heartbeat_not_blocked_by_slow_github(db_session):
             else:
                 b_acquired_lock_at.append(elapsed)
                 # Simulate heartbeat update — use naive UTC to match the column.
-                row.last_heartbeat = datetime.utcnow()
+                row.last_heartbeat = datetime.now(timezone.utc).replace(tzinfo=None)
                 session.add(row)
                 await session.commit()
 
@@ -1126,7 +1126,7 @@ async def test_lock_with_only_heartbeat_change_succeeds(db_session):
     # trigger advances ``updated_at`` (the field the legacy validator
     # checked); the content snapshot stays unchanged.
     await asyncio.sleep(0.01)
-    task.last_heartbeat = datetime.utcnow()
+    task.last_heartbeat = datetime.now(timezone.utc).replace(tzinfo=None)
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
@@ -1304,8 +1304,8 @@ async def test_reaper_enriches_heartbeat_timeout_with_tool_trace(db_session):
         title="task with trace",
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "create", "scope": "small"}],
-        started_at=datetime.utcnow() - timedelta(seconds=400),
-        last_heartbeat=datetime.utcnow() - timedelta(seconds=350),
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=400),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=350),
         context={
             "_tool_trace": [
                 {
@@ -1460,8 +1460,8 @@ async def test_orphan_pr_handoff_fires_within_90s_window(db_session):
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "create", "scope": "small"}],
         vm_instance_id="test-vm-1",
-        started_at=datetime.utcnow() - timedelta(seconds=10),
-        last_heartbeat=datetime.utcnow() - timedelta(seconds=120),
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=10),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=120),
     )
     db_session.add(task)
     await db_session.commit()
@@ -1479,7 +1479,7 @@ async def test_orphan_pr_handoff_fires_within_90s_window(db_session):
     # Import the cutoff function to verify the task meets the 90s orphan threshold
     from app.reaper import _heartbeat_stale_cutoff
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     # Verify the task's heartbeat is stale according to the 90s PR-cutoff
     pr_cutoff = _heartbeat_stale_cutoff(task, now, has_open_pr=True)
@@ -1917,7 +1917,7 @@ async def _run_reaper_preguard_body(db_session, mocker, bind):
     await db_session.refresh(project)
 
     dup_key = f"dup-key-{uuid.uuid4().hex}"
-    stale = datetime.utcnow() - timedelta(minutes=16)
+    stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=16)
 
     # Active peer already holding the key in an active status.
     active_dup = Task(
@@ -1926,7 +1926,7 @@ async def _run_reaper_preguard_body(db_session, mocker, bind):
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "create"}],
         idempotency_key=dup_key,
-        last_heartbeat=datetime.utcnow(),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     # Orphan whose reap would re-enter the key into an active status and collide
     # with active_dup — the guard must skip it BEFORE mutating.
@@ -2087,7 +2087,7 @@ async def test_rollup_releases_parent_lock_around_review_respawn_spawn(
 
     # Unmerged stale COMPLETED child (>10min) with a valid PR artifact so it
     # becomes a respawn candidate and Phase C actually spawns.
-    stale_time = datetime.utcnow() - timedelta(minutes=15)
+    stale_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=15)
     child = Task(
         project_id=project.id,
         parent_task_id=parent.id,

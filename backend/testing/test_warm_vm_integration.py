@@ -25,11 +25,12 @@ or a stale heartbeat from a prior test won't pollute neighbours.
 
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 from httpx import AsyncClient
 
+from app.time_utils import _utcnow
 from app.models import (
     ImprovementLane,
     ImprovementLaneStatus,
@@ -445,7 +446,7 @@ async def test_warm_vm_next_role_skips_when_heartbeat_missing(
         )
         db_session.add(source_task)
         # A QUEUED warm-pinned fix waiting for this VM's pickup.
-        deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+        deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
         pinned = Task(
             project_id=project.id,
             payloads=[{"type": "fix", "pr_number": 7777, "branch": "feat/no-hb"}],
@@ -656,7 +657,7 @@ async def test_wi5_pinned_unclaimed_sibling_exists_query(db_session):
     await db_session.refresh(other_project)
 
     vm_id = "agent-vm-wi5-sibling"
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
     pinned = Task(
         project_id=project.id,
         title="Standing warm pin",
@@ -767,7 +768,7 @@ async def test_wi5_spawn_refuses_pin_when_sibling_already_pinned(db_session, moc
         # the same source VM for the same PR. Put it on a DIFFERENT chain so the
         # (chain-scoped) same-type dedup guard ignores it and control reaches the
         # warm-pin decision block where the anti-re-pin guard runs.
-        deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+        deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
         standing_pin = Task(
             project_id=project.id,
             title="Standing warm pin for PR #8200",
@@ -866,7 +867,7 @@ async def test_warm_vm_next_role_chain_continuity_blocked_when_paused(
         )
         db_session.add(source_task)
         # A QUEUED warm-pinned follow-on (chain pin: no warm_pool_pin marker).
-        deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+        deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
         pinned = Task(
             project_id=project.id,
             payloads=[{"type": "review", "pr_number": 8123, "branch": "feat/paused"}],
@@ -1166,7 +1167,7 @@ async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
         assert member.idle_since is not None
 
         # Backdate idle_since so the IDLE->LEASED settle banks a measurable span.
-        member.idle_since = datetime.utcnow() - timedelta(seconds=600)
+        member.idle_since = _utcnow() - timedelta(seconds=600)
         db_session.add(member)
         await db_session.commit()
 
@@ -1556,7 +1557,7 @@ async def test_warm_pool_miss_paths_record_lease_miss_by_reason(
         )
 
         # (c) Circuit breaker tripped: the pool is suppressed, no lease attempted.
-        ss.warm_pool_suppressed_until = datetime.utcnow() + timedelta(seconds=300)
+        ss.warm_pool_suppressed_until = _utcnow() + timedelta(seconds=300)
         t_c = _new_task()
         await db_session.commit()
         await db_session.refresh(t_c)
@@ -1741,8 +1742,8 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
             PoolIdleSpan(
                 project_id=project.id,
                 vm_instance_id="agent-vm-axis-retired",
-                started_at=datetime.utcnow() - timedelta(days=1, hours=1),
-                settled_at=datetime.utcnow() - timedelta(days=1),
+                started_at=_utcnow() - timedelta(days=1, hours=1),
+                settled_at=_utcnow() - timedelta(days=1),
                 cost_usd=0.02,
             )
         )
@@ -1751,7 +1752,7 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
                 project_id=project.id,
                 vm_instance_id="agent-vm-axis-retired",
                 idle_cost_usd=0.02,
-                retired_at=datetime.utcnow() - timedelta(days=1),
+                retired_at=_utcnow() - timedelta(days=1),
             )
         )
 
@@ -1759,7 +1760,7 @@ async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
         # provisioned->stopped VM interval (so cost_per_merged_pr is computable),
         # pr_merged (the merged denominator), and _timing.warm_start=True (the
         # reuse-rate numerator).
-        now = datetime.utcnow()
+        now = _utcnow()
         task = Task(
             project_id=project.id,
             title="Warm-served merged task",
@@ -1826,7 +1827,7 @@ async def test_warm_pool_teardown_carries_idle_cost_into_ledger(
             state=PoolVmState.IDLE,
         )
         # Backdate idle_since so the IDLE->LEASED settle banks a measurable span.
-        member.idle_since = datetime.utcnow() - timedelta(seconds=600)
+        member.idle_since = _utcnow() - timedelta(seconds=600)
         db_session.add(member)
 
         task = Task(
@@ -1853,7 +1854,7 @@ async def test_warm_pool_teardown_carries_idle_cost_into_ledger(
         assert banked_at_lease > 0.0
 
         task.status = TaskStatus.COMPLETED
-        leased.lease_expires_at = datetime.utcnow() - timedelta(seconds=30)
+        leased.lease_expires_at = _utcnow() - timedelta(seconds=30)
         db_session.add_all([task, leased])
         await db_session.commit()
 
@@ -1864,7 +1865,7 @@ async def test_warm_pool_teardown_carries_idle_cost_into_ledger(
             "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
         )
         retired = await sweep_idle_pool_vms(
-            db_session, datetime.utcnow(), runtime_config=rc
+            db_session, _utcnow(), runtime_config=rc
         )
         assert retired == 1
         delete_mock.assert_awaited_once()
@@ -1948,7 +1949,7 @@ async def test_evaluating_parent_dead_vm_lease_is_reclaimed(
         # Parent finished its VM-side work and is now waiting on children;
         # the VM powered off and the dispatch->claim handoff window passed.
         task.status = TaskStatus.EVALUATING
-        leased.lease_expires_at = datetime.utcnow() - timedelta(seconds=30)
+        leased.lease_expires_at = _utcnow() - timedelta(seconds=30)
         db_session.add_all([task, leased])
         await db_session.commit()
 
@@ -1957,7 +1958,7 @@ async def test_evaluating_parent_dead_vm_lease_is_reclaimed(
             "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
         )
         retired = await sweep_idle_pool_vms(
-            db_session, datetime.utcnow(), runtime_config=rc
+            db_session, _utcnow(), runtime_config=rc
         )
         assert retired == 1
         delete_mock.assert_awaited_once()
@@ -2014,7 +2015,7 @@ async def test_evaluating_parent_live_vm_lease_is_spared(
         assert leased is not None
 
         task.status = TaskStatus.EVALUATING
-        leased.lease_expires_at = datetime.utcnow() - timedelta(seconds=30)
+        leased.lease_expires_at = _utcnow() - timedelta(seconds=30)
         db_session.add_all([task, leased])
         await db_session.commit()
 
@@ -2023,7 +2024,7 @@ async def test_evaluating_parent_live_vm_lease_is_spared(
             "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
         )
         retired = await sweep_idle_pool_vms(
-            db_session, datetime.utcnow(), runtime_config=rc
+            db_session, _utcnow(), runtime_config=rc
         )
         assert retired == 0
         delete_mock.assert_not_awaited()
@@ -2081,7 +2082,7 @@ async def test_warm_pool_cost_guard_drains_and_blocks_lease(
             state=PoolVmState.IDLE,
         )
         # Backdate idle_since so live idle-cost accrual clears the (trivial) floor.
-        member.idle_since = datetime.utcnow() - timedelta(seconds=600)
+        member.idle_since = _utcnow() - timedelta(seconds=600)
         db_session.add(member)
         await db_session.commit()
 
@@ -2175,7 +2176,7 @@ async def test_cost_guard_ignores_pre_window_idle_spend(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow()
+    now = _utcnow()
 
     # A ledger row retired BEFORE the 24h guard window (50 hours ago).
     # All-time compute_pool_idle_cost would see this; windowed must not.

@@ -79,6 +79,29 @@ from app.migration_reconciliation import reconcile_pre_renumber_divergence
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_tar_extractall(tar: tarfile.TarFile, dest: str) -> None:
+    """Extract a tar archive into dest, guarding against path traversal (Zip Slip).
+
+    Uses the built-in 'data' filter on Python 3.11.4+ which strips dangerous
+    attributes (setuid bits, device files, absolute/traversal paths). Falls back
+    to explicit member validation on older runtimes.
+    """
+    if sys.version_info >= (3, 11, 4):
+        tar.extractall(dest, filter="data")
+    else:
+        abs_dest = os.path.abspath(dest) + os.sep
+        safe_members = []
+        for member in tar.getmembers():
+            member_path = os.path.abspath(os.path.join(dest, member.name))
+            if not member_path.startswith(abs_dest):
+                raise ValueError(
+                    f"tarfile member {member.name!r} would extract outside destination"
+                )
+            safe_members.append(member)
+        tar.extractall(dest, members=safe_members)
+
+
 # ('ok'|'block'|'defer', detail). Mirrors check_qualification_migration_identity.
 Verdict = tuple[str, str | None]
 
@@ -536,7 +559,7 @@ async def _build_candidate_required_metadata_from_snapshot(
     with tempfile.TemporaryDirectory() as tmp:
         try:
             with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
-                tar.extractall(tmp)
+                _safe_tar_extractall(tar, tmp)
         except Exception as exc:
             raise _MigrationApplyError(
                 f"could not unpack the candidate code snapshot at "
@@ -722,7 +745,7 @@ async def _fetch_candidate_sources(
     try:
         with tempfile.TemporaryDirectory() as tmp:
             with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
-                tar.extractall(tmp)
+                _safe_tar_extractall(tar, tmp)
             # GitHub archives always unpack to a single top-level repo dir.
             extracted_roots = [
                 os.path.join(tmp, name)

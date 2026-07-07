@@ -2645,5 +2645,292 @@ class TestAgentImagePresence(unittest.TestCase):
         self.assertFalse(self._advertised_after_image_gate(inspect_rc=1))
 
 
+class TestCredentialPersistence(unittest.TestCase):
+    """Token persistence: save/load round-trip, file permissions, fallback behaviour."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_cred_dir = os.environ.get("BLUEPRINT_CREDENTIAL_DIR")
+        os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self._tmpdir
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        if self._orig_cred_dir is None:
+            os.environ.pop("BLUEPRINT_CREDENTIAL_DIR", None)
+        else:
+            os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self._orig_cred_dir
+        local_runner._shutdown_event.clear()
+
+    def test_save_and_load_roundtrip(self):
+        local_runner._save_runner_token("tok-abc123-test")
+        self.assertEqual(local_runner._load_runner_token(), "tok-abc123-test")
+
+    def test_file_permissions_0600(self):
+        local_runner._save_runner_token("tok-secret")
+        path = local_runner._credential_path()
+        mode = os.stat(path).st_mode & 0o777
+        self.assertEqual(mode, 0o600, f"Expected 0600 but got {oct(mode)}")
+
+    def test_load_nonexistent_returns_none(self):
+        self.assertIsNone(local_runner._load_runner_token())
+
+    def test_load_empty_returns_none(self):
+        path = local_runner._credential_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").close()
+        self.assertIsNone(local_runner._load_runner_token())
+
+    def test_overwrites_existing(self):
+        local_runner._save_runner_token("tok-first")
+        local_runner._save_runner_token("tok-second")
+        self.assertEqual(local_runner._load_runner_token(), "tok-second")
+
+    def test_credential_dir_created_automatically(self):
+        """_save_runner_token creates the credential directory if absent."""
+        import shutil
+        import tempfile
+        fresh_dir = os.path.join(tempfile.mkdtemp(), "nonexistent_subdir")
+        try:
+            os.environ["BLUEPRINT_CREDENTIAL_DIR"] = fresh_dir
+            local_runner._save_runner_token("tok-dir-test")
+            self.assertEqual(local_runner._load_runner_token(), "tok-dir-test")
+            self.assertTrue(os.path.isdir(fresh_dir))
+        finally:
+            shutil.rmtree(os.path.dirname(fresh_dir), ignore_errors=True)
+            os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self._tmpdir
+
+    def test_main_saves_token_from_env_to_file(self):
+        """When BLUEPRINT_RUNNER_TOKEN is set, main() persists it to the credential file."""
+        fake_body = {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}
+        calls = []
+
+        def fake_post(url, token, body, **kwargs):
+            calls.append(token)
+            local_runner._shutdown_event.set()
+            return 200, fake_body
+
+        env = {
+            "BLUEPRINT_RUNNER_TOKEN": "tok-from-env",
+            "BLUEPRINT_ORCHESTRATOR_URL": "https://api.example.com",
+            "BLUEPRINT_CREDENTIAL_DIR": self._tmpdir,
+        }
+        with patch.dict(os.environ, env, clear=False), \
+             patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_get_capabilities", return_value=_bwrap_caps()), \
+             patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+             patch.object(local_runner, "_detect_gpu", return_value={}), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "iso") as mock_iso:
+            mock_iso.detect_capabilities.return_value = _bwrap_caps()
+            mock_iso.claimable_classes.return_value = {"agent": False, "compute": False}
+            mock_iso.agent_decline_reason.return_value = "no binary"
+            mock_iso.CLASS_AGENT = "agent"
+            mock_iso.CLASS_COMPUTE = "compute"
+            mock_iso.sweep_stale_containers.return_value = None
+            mock_iso.AGENT_DOCKER_TYPES = []
+            try:
+                local_runner.main()
+            except SystemExit:
+                pass
+
+        saved = local_runner._load_runner_token()
+        self.assertEqual(saved, "tok-from-env")
+
+    def test_main_loads_token_from_file_when_env_absent(self):
+        """When BLUEPRINT_RUNNER_TOKEN is unset, main() reads from the credential file."""
+        local_runner._save_runner_token("tok-from-file")
+        fake_body = {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}
+        tokens_used = []
+
+        def fake_post(url, token, body, **kwargs):
+            tokens_used.append(token)
+            local_runner._shutdown_event.set()
+            return 200, fake_body
+
+        env = {
+            "BLUEPRINT_ORCHESTRATOR_URL": "https://api.example.com",
+            "BLUEPRINT_CREDENTIAL_DIR": self._tmpdir,
+        }
+        clean_env = {k: v for k, v in os.environ.items() if k != "BLUEPRINT_RUNNER_TOKEN"}
+        clean_env.update(env)
+        with patch.dict(os.environ, clean_env, clear=True), \
+             patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_get_capabilities", return_value=_bwrap_caps()), \
+             patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+             patch.object(local_runner, "_detect_gpu", return_value={}), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "iso") as mock_iso:
+            mock_iso.detect_capabilities.return_value = _bwrap_caps()
+            mock_iso.claimable_classes.return_value = {"agent": False, "compute": False}
+            mock_iso.agent_decline_reason.return_value = "no binary"
+            mock_iso.CLASS_AGENT = "agent"
+            mock_iso.CLASS_COMPUTE = "compute"
+            mock_iso.sweep_stale_containers.return_value = None
+            mock_iso.AGENT_DOCKER_TYPES = []
+            try:
+                local_runner.main()
+            except SystemExit:
+                pass
+
+        self.assertTrue(
+            any(t == "tok-from-file" for t in tokens_used),
+            f"Expected token from file in heartbeat calls, got: {tokens_used}",
+        )
+
+
+class TestConcurrencyPresetMismatch(unittest.TestCase):
+    """Warn when BLUEPRINT_RUNNER_MAX_CONCURRENT disagrees with server enrolled max_concurrent."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+        os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self._tmpdir
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        os.environ.pop("BLUEPRINT_CREDENTIAL_DIR", None)
+        local_runner._shutdown_event.clear()
+
+    def _run_preflight(self, enrolled_max_concurrent, client_max_concurrent=2):
+        if enrolled_max_concurrent is not None:
+            fake_body = {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00Z",
+                "enrolled_max_concurrent": enrolled_max_concurrent,
+            }
+        else:
+            fake_body = {"ok": True, "last_seen_at": "2026-01-01T00:00:00Z"}
+        with patch.object(local_runner, "_post", return_value=(200, fake_body)), \
+             patch.object(local_runner, "_workspace_writable", return_value=True):
+            return local_runner._preflight(
+                "https://api.example.com", "tok", None,
+                _bwrap_caps(), _gpu_state(()), client_max_concurrent, 2,
+            )
+
+    def test_enrolled_max_concurrent_returned_in_preflight(self):
+        """_preflight returns enrolled_max_concurrent when server provides it."""
+        result = self._run_preflight(enrolled_max_concurrent=1)
+        self.assertEqual(result.get("enrolled_max_concurrent"), 1)
+
+    def test_none_when_server_does_not_include_field(self):
+        """enrolled_max_concurrent is None when the server response omits the field."""
+        result = self._run_preflight(enrolled_max_concurrent=None)
+        self.assertIsNone(result.get("enrolled_max_concurrent"))
+
+    def test_mismatch_warning_emitted(self):
+        """main() warns when client max_concurrent != server enrolled_max_concurrent."""
+        import io
+        fake_body = {
+            "ok": True,
+            "last_seen_at": "2026-01-01T00:00:00Z",
+            "enrolled_max_concurrent": 1,
+        }
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, fake_body
+
+        env = {
+            "BLUEPRINT_RUNNER_TOKEN": "tok-test",
+            "BLUEPRINT_ORCHESTRATOR_URL": "https://api.example.com",
+            "BLUEPRINT_RUNNER_MAX_CONCURRENT": "2",
+            "BLUEPRINT_CREDENTIAL_DIR": self._tmpdir,
+        }
+        output_lines = []
+        real_print = print
+
+        def capture_print(*args, **kwargs):
+            text = " ".join(str(a) for a in args)
+            output_lines.append(text)
+            real_print(*args, **kwargs)
+
+        with patch.dict(os.environ, env, clear=False), \
+             patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_get_capabilities", return_value=_bwrap_caps()), \
+             patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+             patch.object(local_runner, "_detect_gpu", return_value={}), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch("builtins.print", side_effect=capture_print), \
+             patch.object(local_runner, "iso") as mock_iso:
+            mock_iso.detect_capabilities.return_value = _bwrap_caps()
+            mock_iso.claimable_classes.return_value = {"agent": False, "compute": False}
+            mock_iso.agent_decline_reason.return_value = "no binary"
+            mock_iso.CLASS_AGENT = "agent"
+            mock_iso.CLASS_COMPUTE = "compute"
+            mock_iso.sweep_stale_containers.return_value = None
+            mock_iso.AGENT_DOCKER_TYPES = []
+            try:
+                local_runner.main()
+            except SystemExit:
+                pass
+
+        warning_lines = [l for l in output_lines if "BLUEPRINT_RUNNER_MAX_CONCURRENT" in l and "enrolled" in l.lower()]
+        self.assertTrue(
+            warning_lines,
+            f"Expected mismatch warning in output. Got: {output_lines[:10]}",
+        )
+
+    def test_no_mismatch_warning_when_values_match(self):
+        """No concurrency warning when client max_concurrent == server enrolled_max_concurrent."""
+        import io
+        fake_body = {
+            "ok": True,
+            "last_seen_at": "2026-01-01T00:00:00Z",
+            "enrolled_max_concurrent": 2,
+        }
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, fake_body
+
+        env = {
+            "BLUEPRINT_RUNNER_TOKEN": "tok-test",
+            "BLUEPRINT_ORCHESTRATOR_URL": "https://api.example.com",
+            "BLUEPRINT_RUNNER_MAX_CONCURRENT": "2",
+            "BLUEPRINT_CREDENTIAL_DIR": self._tmpdir,
+        }
+        output_lines = []
+        real_print = print
+
+        def capture_print(*args, **kwargs):
+            text = " ".join(str(a) for a in args)
+            output_lines.append(text)
+            real_print(*args, **kwargs)
+
+        with patch.dict(os.environ, env, clear=False), \
+             patch.object(local_runner, "_post", side_effect=fake_post), \
+             patch.object(local_runner, "_get_capabilities", return_value=_bwrap_caps()), \
+             patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+             patch.object(local_runner, "_detect_gpu", return_value={}), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch("builtins.print", side_effect=capture_print), \
+             patch.object(local_runner, "iso") as mock_iso:
+            mock_iso.detect_capabilities.return_value = _bwrap_caps()
+            mock_iso.claimable_classes.return_value = {"agent": False, "compute": False}
+            mock_iso.agent_decline_reason.return_value = "no binary"
+            mock_iso.CLASS_AGENT = "agent"
+            mock_iso.CLASS_COMPUTE = "compute"
+            mock_iso.sweep_stale_containers.return_value = None
+            mock_iso.AGENT_DOCKER_TYPES = []
+            try:
+                local_runner.main()
+            except SystemExit:
+                pass
+
+        warning_lines = [l for l in output_lines if "disagrees" in l and "enrolled" in l.lower()]
+        self.assertFalse(
+            warning_lines,
+            f"Did not expect mismatch warning when values match. Got: {warning_lines}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

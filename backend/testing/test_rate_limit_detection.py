@@ -611,9 +611,7 @@ async def test_db_account_was_rate_limited_active_cooldown(monkeypatch):
     from app.max_plan_pool import db_account_was_rate_limited
     from app.models import MaxPlanAccount
 
-    disabled_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
-        minutes=5
-    )
+    disabled_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
     fake_account = MaxPlanAccount(
         user_id="test",
         name="test-acct",
@@ -869,7 +867,7 @@ async def test_db_pool_wide_cooldown_treats_zai_secret_blob_as_runtime_ready(
     from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
     from app.models import LLMAuthMode, LLMProviderName, MaxPlanAccount
 
-    rl_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    rl_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
     rl_acct = MaxPlanAccount(
         user_id="u",
         name="rl",

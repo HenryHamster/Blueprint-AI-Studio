@@ -3075,11 +3075,15 @@ class TestPersistTrialVerdictsNoticeEmission:
         mock_session.get = AsyncMock(return_value=mock_project)
         mock_session.commit = AsyncMock()
         mock_session.rollback = AsyncMock()
-        # execute returns empty result so raise_capability_verdict_notice dedup query works
+        # execute result: scalars().first() returns mock_project (for the locked project
+        # fetch), scalars().all() returns [] (for other list queries), scalar() returns
+        # None (for dedup queries in raise_capability_verdict_notice).
         scalars_mock = MagicMock()
         scalars_mock.all.return_value = []
+        scalars_mock.first.return_value = mock_project
         execute_result = MagicMock()
         execute_result.scalars.return_value = scalars_mock
+        execute_result.scalar.return_value = None
         mock_session.execute = AsyncMock(return_value=execute_result)
         mock_session.add = MagicMock()
 
@@ -4765,3 +4769,136 @@ class TestBoundedProjectMessageQueries:
         assert "_check_open_message_exists" in source, (
             "raise_ambiguous_lift_escalation_notice must use _check_open_message_exists"
         )
+
+
+# ── persist_trial_verdicts_in_transaction row locking ─────────────────────────
+
+
+class TestPersistTrialVerdictsRowLock:
+    """Verify that persist_trial_verdicts_in_transaction acquires a row lock on
+    the project before evaluating KILL-survival and other guards, so a concurrent
+    writer cannot sneak in an overwrite between fetch and commit."""
+
+    def _build_mock_db_locked(self, prior_verdicts: dict | None = None):
+        """Return (mock_session, mock_project, mock_cm) wired for the locked fetch path.
+
+        The first session.execute() call returns the project row (simulating
+        SELECT ... FOR UPDATE); subsequent calls return empty results (dedup queries).
+        session.get() is intentionally NOT set up with a project return — this lets
+        the test assert that the implementation no longer calls session.get().
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_project = MagicMock()
+        mock_project.capability_adoption_verdicts = dict(prior_verdicts or {})
+
+        # Project result: scalars().first() returns mock_project (locked fetch)
+        project_scalars = MagicMock()
+        project_scalars.first.return_value = mock_project
+        project_result = MagicMock()
+        project_result.scalars.return_value = project_scalars
+
+        # Empty result for dedup queries: scalar() returns None
+        empty_result = MagicMock()
+        empty_result.scalar.return_value = None
+
+        executed_stmts = []
+
+        async def execute_side_effect(stmt, *args, **kwargs):
+            executed_stmts.append(stmt)
+            if len(executed_stmts) == 1:
+                return project_result
+            return empty_result
+
+        mock_session = MagicMock()
+        mock_session.get = AsyncMock(return_value=None)  # must NOT be called
+        mock_session.commit = AsyncMock()
+        mock_session.rollback = AsyncMock()
+        mock_session.execute = AsyncMock(side_effect=execute_side_effect)
+        mock_session.add = MagicMock()
+
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+        mock_cm.return_value = mock_cm
+
+        return mock_session, mock_project, mock_cm, executed_stmts
+
+    @pytest.mark.asyncio
+    async def test_uses_row_lock_for_project_fetch_on_merge_test_adopt_verdict(self):
+        """Acceptance test: persist_trial_verdicts_in_transaction acquires FOR UPDATE lock.
+
+        Uses a real merge-test adopt verdict (both assigned arms >= min_n, lift above
+        adopt threshold) to exercise the full persist path.  Asserts:
+        - session.get() is NOT called (row lock enforcement — replaced by execute+lock)
+        - session.execute() IS called with a query that uses with_for_update()
+        - The adopt verdict is durably stored on the project
+        """
+        import uuid
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from app.capability_trial_verdict import (
+            evaluate_trial_verdict,
+            persist_trial_verdicts_in_transaction,
+        )
+
+        project_id = uuid.uuid4()
+        mock_session, mock_project, mock_cm, executed_stmts = (
+            self._build_mock_db_locked(prior_verdicts={})
+        )
+        mock_factory = MagicMock(return_value=mock_cm)
+
+        # Real merge-test verdict: adopt after both assigned arms meet min_n.
+        comp = {
+            "with_assigned": 35,
+            "with_receipt": 5,
+            "without_assigned": 32,
+            "without_receipt": 3,
+        }
+        adopt_entry = evaluate_trial_verdict(
+            lift=0.07,
+            n_with=40,
+            n_without=35,
+            config={"min_n_per_arm": 30, "adopt_lift": 0.05, "reject_lift": -0.03},
+            arm_composition=comp,
+            accumulation_basis="cumulative_terminal_arm_tasks",
+            evaluated_at="2026-06-23T00:00:00",
+        )
+        assert adopt_entry["verdict"] == "adopt"
+
+        with (
+            patch("sqlalchemy.ext.asyncio.async_sessionmaker", mock_factory),
+            patch("app.database.resolve_async_engine", return_value=MagicMock()),
+            patch("app.capability_trial_verdict.flag_modified"),
+            patch(
+                "app.capability_trial_verdict.raise_capability_verdict_notice",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await persist_trial_verdicts_in_transaction(
+                MagicMock(),
+                project_id,
+                pending_verdicts=[("repo_map", adopt_entry)],
+            )
+
+        # The implementation must NOT fall back to session.get (unlocked path).
+        mock_session.get.assert_not_called()
+
+        # At least one execute() call must have been made (for the locked fetch).
+        assert mock_session.execute.call_count >= 1
+
+        # The first execute() call must use with_for_update (SELECT ... FOR UPDATE).
+        first_stmt = executed_stmts[0]
+        stmt_str = str(first_stmt.compile(compile_kwargs={"literal_binds": True}))
+        assert "FOR UPDATE" in stmt_str, (
+            f"First execute() call must issue a FOR UPDATE lock; got: {stmt_str!r}"
+        )
+
+        # Verdict must be committed (not rolled back).
+        mock_session.commit.assert_called_once()
+        mock_session.rollback.assert_not_called()
+
+        # Adopt verdict stored on the project object.
+        assert mock_project.capability_adoption_verdicts.get("repo_map", {}).get(
+            "verdict"
+        ) == "adopt"

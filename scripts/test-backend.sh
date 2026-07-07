@@ -145,6 +145,41 @@ else
     fi
   fi
   PYTHON="${PYTHON:-python3}"
+
+  # Verify Python 3.11+ is available (required for asyncio.timeout)
+  PYTHON_VERSION=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "unknown")
+  if [ "$PYTHON_VERSION" != "unknown" ]; then
+    MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
+    MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
+    if [ "$MAJOR" -lt 3 ] || ([ "$MAJOR" -eq 3 ] && [ "$MINOR" -lt 11 ]); then
+      # Try to find python3.11
+      PYTHON_311=""
+      for candidate in python3.11 python311 python3.11.* /usr/bin/python3.11 /usr/local/bin/python3.11; do
+        if command -v "$candidate" &>/dev/null 2>&1; then
+          PYTHON_311="$candidate"
+          break
+        fi
+      done
+      if [ -n "$PYTHON_311" ]; then
+        echo "=== Using Python 3.11 (found $PYTHON_311; system python is $PYTHON_VERSION) ==="
+        PYTHON="$PYTHON_311"
+      else
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+        echo "!!! WARNING: NON-AUTHORITATIVE ENVIRONMENT !!!" >&2
+        echo "!!!" >&2
+        echo "!!! System Python is $PYTHON_VERSION, but the backend requires Python 3.11+." >&2
+        echo "!!! Tests will use $PYTHON_VERSION and will likely fail with asyncio.timeout" >&2
+        echo "!!! AttributeError and other compatibility errors." >&2
+        echo "!!!" >&2
+        echo "!!! To run tests properly, either:" >&2
+        echo "!!!   1. Install Docker (scripts/test-backend.sh will use the Docker image)" >&2
+        echo "!!!   2. Install Python 3.11 on this system" >&2
+        echo "!!!" >&2
+        echo "!!! Proceeding anyway (test results may be misleading)..." >&2
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      fi
+    fi
+  fi
 fi
 
 # --- Docker Hub rate-limit resilience --------------------------------------

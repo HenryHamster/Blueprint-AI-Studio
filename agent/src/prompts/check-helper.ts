@@ -131,6 +131,62 @@ fi
 `;
 }
 
+/** Emit the impacted-test merge-time gate for the generated ./check.
+ *
+ *  The standalone `--no-postgres` smoke run alongside this block covers only the
+ *  ~10-file invariant set. Test files that exercise the CHANGED modules — by
+ *  importing `app.<module>` or by mock-patching `app.<module>...` — and even test
+ *  files the PR ITSELF ADDS, never run mechanically before merge, so a contract
+ *  break merges green on the task PR and only surfaces at the promotion-PR full
+ *  matrix, burning a long diagnosis+re-provision round-trip.
+ *
+ *  This block derives the impacted backend test set from $CHANGED by piping it
+ *  into the committed reverse-dependency resolver
+ *  (`backend/testing/impacted_tests.py`) — invoked BY REFERENCE, NOT an embedded
+ *  Python heredoc (see CLAUDE.md's "Generating Code for One Language From
+ *  Another"). It runs the impacted files under the sanctioned Postgres harness,
+ *  bounded (capped; never the full suite, which OOMs the 8 GB VM — the harness
+ *  memory guard exempts targeted *.py args). A still-failing impacted test lands
+ *  in FAILED, and since ./pr open gates on ./check, the push is blocked until it
+ *  passes. Overflow past the cap is logged (deferred to CI), never silently
+ *  dropped. Graceful when Docker is absent: warn + GATE-ENVIRONMENT marker,
+ *  don't block (CI runs the authoritative suite on the PR). Does nothing (no
+ *  output, no failure) when the impacted set is empty. It is additive — it does
+ *  NOT replace the standalone smoke run; the two are complementary. */
+function buildImpactedTestBlock(taskId: string): string {
+  return `
+    # ── impacted-test merge-time gate ───────────────────────────────────────
+    # Complement to the standalone smoke run above: mechanically run the backend
+    # test files IMPACTED by this diff (test files that import a changed
+    # app.<module> or mock-patch it by string target, plus any test file the PR
+    # itself adds). Derived from $CHANGED via the committed reverse-dep resolver
+    # (invoked BY REFERENCE — no embedded Python heredoc, see CLAUDE.md), run
+    # bounded under the sanctioned Postgres harness so an impacted-test failure
+    # blocks ./pr open instead of leaking to the promotion suite.
+    IMPACTED_TEST_CAP=8
+    _it_all=$(printf '%s\\n' "$CHANGED" | python3 backend/testing/impacted_tests.py 2>/dev/null || true)
+    if [ -n "$_it_all" ]; then
+      _it_count=$(printf '%s\\n' "$_it_all" | grep -c '^' || true)
+      if [ "$_it_count" -gt "$IMPACTED_TEST_CAP" ]; then
+        echo "[check] impacted-test gate: $_it_count impacted test file(s); running first $IMPACTED_TEST_CAP under Postgres, CI verifies the rest:"
+        printf '%s\\n' "$_it_all" | tail -n +$((IMPACTED_TEST_CAP + 1)) | sed 's|^|[check]   deferred-to-CI: |'
+      fi
+      # Strip the backend/ prefix: scripts/test-backend.sh runs from backend/ and
+      # expects testing/test_x.py selectors.
+      _it_run=$(printf '%s\\n' "$_it_all" | head -n "$IMPACTED_TEST_CAP" | sed 's|^backend/||')
+      if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then
+        echo "[check] impacted-test gate: running impacted backend test file(s) via the sanctioned Postgres harness..."
+        # shellcheck disable=SC2086
+        run "impacted-test gate" bash -c 'set -o pipefail; bash scripts/test-backend.sh --postgres "$@" 2>&1 | tail -200' _ $_it_run
+      else
+        echo "[check] impacted-test gate: SKIPPED — Docker unavailable, can't run the sanctioned Postgres harness on this VM."
+        echo "[check]   The impacted backend tests were NOT verified locally; CI runs the authoritative Postgres suite on the PR."
+        printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "impacted-test gate skipped — no Docker for the sanctioned harness; CI verifies impacted tests on the PR" >> /tmp/check_gate_env_${taskId}.txt
+      fi
+    fi
+`;
+}
+
 /** Emit a bash sub-block that uploads the failed viewport screenshot(s) for a
  *  PR-only regression through the signed-URL endpoint.  Every failure mode is
  *  non-fatal (WARN + continue) so the only blocking gate remains the viewport
@@ -653,6 +709,12 @@ ${buildViewportUploadBlock(cfg.taskId)}      fi
   fi
 
   run "admin-ui build"   bash -c 'cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run build 2>&1'
+
+  # Run the admin-ui unit vitest suite on EVERY ./check (not gated behind \`test\`):
+  # mirrors the agent-vitest rationale — ./pr open gates on plain ./check, so
+  # behind-\`test\` leaves the suite unenforced. Bare \`npx vitest run\` picks up
+  # the default vitest config (happy-dom, no Chromium) matching CI's unit shards.
+  run "admin-ui vitest" bash -c 'set -o pipefail; cd admin-ui && npx vitest run 2>&1 | tail -80'
 fi
 
 if touches agent/; then
@@ -723,7 +785,7 @@ if touches backend/; then
     # exit propagates through \`| tail\` (same rationale as the agent
     # vitest line above — the outer pipefail does not reach a fresh bash -c).
     run "backend pytest" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'
-  fi
+${buildImpactedTestBlock(cfg.taskId)}  fi
   # Fast migration-chain guard: no DB, no Docker, sub-second. Runs only
   # when at least one alembic/versions/ file was added or changed.
   if printf '%s\\n' "$CHANGED" | grep -q '^backend/alembic/versions/.*\\.py$'; then

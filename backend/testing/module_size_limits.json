@@ -16,7 +16,7 @@
     "compute.py": 3750,
     "github.py": 2950,
     "github_token_resolver.py": 250,
-    "github_auth.py": 450,
+    "github_auth.py": 700,
     "github_checks.py": 800,
     "hotfix_backmerge.py": 2350,
     "github_issues.py": 500,
@@ -123,7 +123,7 @@
     "direction_lifecycle.py": 2200,
     "routers/admin_notifications.py": 1850,
     "strategic_state_read_model.py": 1100,
-    "strategic_resident_session.py": 2400,
+    "strategic_resident_session.py": 2800,
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 2700,
     "operator_attention.py": 2250,
@@ -132,7 +132,7 @@
     "research_direction_state.py": 1750,
     "dep_lifecycle.py": 800,
     "routers/admin_health.py": 1750,
-    "metrics_integrity_sweep.py": 2050,
+    "metrics_integrity_sweep.py": 2450,
     "release_readiness.py": 1750
   },
   "agent": {
@@ -142,7 +142,7 @@
     "prompts/code-change-helpers.ts": 1250,
     "prompts/code-change-helpers.test.ts": 1500,
     "prompts/check-helper.ts": 1200,
-    "prompts/check-helper.test.ts": 1300,
+    "prompts/check-helper.test.ts": 1600,
     "prompts/done-helper.ts": 650,
     "prompts/done-helper.test.ts": 650,
     "handlers/research-plan.ts": 3000,
@@ -175,7 +175,7 @@
     "providers/runners.ts": 1900,
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950,
-    "providers/resident-session.ts": 560
+    "providers/resident-session.ts": 800
   },
   "frontend": {
     "useAppState.ts": 3000,

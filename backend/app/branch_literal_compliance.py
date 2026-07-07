@@ -198,7 +198,7 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
             ),
             BranchLiteralAllowEntry(
                 path="components/ProjectBuildConfigSection.tsx",
-                line=717,
+                line=718,
                 pattern="fallback-blueprint",
                 rationale=(
                     "Display-only fallback inside a sample; user-typed "

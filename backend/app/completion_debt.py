@@ -108,12 +108,17 @@ def _bound_detail(detail: Any) -> dict | None:
     if isinstance(linked, list) and linked:
         bounded = dict(detail)
         trimmed = list(linked)
+        original_linked_len = len(linked)
         while True:
             bounded["linked_tasks"] = trimmed
             if (
                 len(json.dumps(bounded, default=str)) <= _MAX_DETAIL_BYTES
                 or len(trimmed) <= 1
             ):
+                # Record how many entries were dropped so callers can observe
+                # that trimming occurred (useful for debugging and metrics).
+                if len(trimmed) < original_linked_len:
+                    bounded["_linked_tasks_trimmed"] = original_linked_len - len(trimmed)
                 return bounded
             trimmed = trimmed[1:]  # drop the oldest linked record and retry
 

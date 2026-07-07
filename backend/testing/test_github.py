@@ -4460,6 +4460,223 @@ async def test_invalidate_repo_installation_token_forces_remint(mocker):
 
 
 @pytest.mark.asyncio
+async def test_generate_installation_access_token_includes_permissions(mocker):
+    """generate_installation_access_token passes the permissions dict in the POST body."""
+    import app.github_auth as gh_auth
+
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+
+    captured_payloads = []
+
+    async def _fake_request(method, url, headers, **kwargs):
+        if url.endswith("/access_tokens"):
+            captured_payloads.append(kwargs.get("json", {}))
+            return MockResponse(201, {"token": "ghs_read_token"})
+        return MockResponse(404, {})
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    token = await gh_auth.generate_installation_access_token(
+        "42", repositories=["myrepo"], permissions={"contents": "read"}
+    )
+    assert token == "ghs_read_token"
+    assert len(captured_payloads) == 1
+    assert captured_payloads[0].get("permissions") == {"contents": "read"}
+
+
+@pytest.mark.asyncio
+async def test_generate_installation_access_token_omits_permissions_by_default(mocker):
+    """generate_installation_access_token does NOT include permissions when None."""
+    import app.github_auth as gh_auth
+
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+
+    captured_payloads = []
+
+    async def _fake_request(method, url, headers, **kwargs):
+        if url.endswith("/access_tokens"):
+            captured_payloads.append(kwargs.get("json", {}))
+            return MockResponse(201, {"token": "ghs_full_token"})
+        return MockResponse(404, {})
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    await gh_auth.generate_installation_access_token("42")
+    assert "permissions" not in captured_payloads[0]
+
+
+@pytest.mark.asyncio
+async def test_get_repo_installation_read_token_uses_contents_read_scope(mocker):
+    """get_repo_installation_read_token mints with permissions={'contents':'read'}."""
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    gh_auth._repo_installation_read_token_cache.clear()
+    gh_auth._installation_id_cache["acme/widget"] = ("555", _t.time())
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+
+    captured_payloads = []
+
+    async def _fake_request(method, url, headers, **kwargs):
+        if url.endswith("/access_tokens"):
+            captured_payloads.append(kwargs.get("json", {}))
+            return MockResponse(201, {"token": "ghs_read_only"})
+        return MockResponse(404, {})
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    token = await gh_auth.get_repo_installation_read_token("acme", "widget")
+    assert token == "ghs_read_only"
+    assert len(captured_payloads) == 1
+    assert captured_payloads[0].get("permissions") == {"contents": "read"}
+
+    gh_auth._repo_installation_read_token_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_repo_installation_read_token_caches_separately_from_write(mocker):
+    """Read and write token caches are completely independent key spaces."""
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    gh_auth._repo_installation_token_cache.clear()
+    gh_auth._repo_installation_read_token_cache.clear()
+    gh_auth._installation_id_cache["acme/widget"] = ("555", _t.time())
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+
+    call_count = 0
+
+    async def _fake_request(method, url, headers, **kwargs):
+        nonlocal call_count
+        if url.endswith("/access_tokens"):
+            call_count += 1
+            perms = kwargs.get("json", {}).get("permissions")
+            tok = "ghs_read" if perms else "ghs_write"
+            return MockResponse(201, {"token": tok})
+        return MockResponse(404, {})
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    write_tok = await gh_auth.get_repo_installation_token("acme", "widget")
+    read_tok = await gh_auth.get_repo_installation_read_token("acme", "widget")
+
+    # Both minted independently — cache keys don't collide
+    assert write_tok == "ghs_write"
+    assert read_tok == "ghs_read"
+    assert call_count == 2
+
+    # Second read call hits cache, not GitHub
+    read_tok2 = await gh_auth.get_repo_installation_read_token("acme", "widget")
+    assert read_tok2 == "ghs_read"
+    assert call_count == 2  # no extra mint
+
+    gh_auth._repo_installation_token_cache.clear()
+    gh_auth._repo_installation_read_token_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_get_repo_installation_read_token_caches_minted_token(mocker):
+    """A 2nd call within TTL returns the cached read token without re-minting."""
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    gh_auth._repo_installation_read_token_cache.clear()
+    gh_auth._installation_id_cache["acme/widget"] = ("555", _t.time())
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+
+    mint_calls = []
+
+    async def _fake_request(method, url, headers, **kwargs):
+        if url.endswith("/access_tokens"):
+            mint_calls.append(url)
+            return MockResponse(201, {"token": "ghs_read_cached"})
+        return MockResponse(404, {})
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    t1 = await gh_auth.get_repo_installation_read_token("acme", "widget")
+    t2 = await gh_auth.get_repo_installation_read_token("acme", "widget")
+
+    assert t1 == t2 == "ghs_read_cached"
+    assert len(mint_calls) == 1, "read token should be minted once and cached"
+
+    gh_auth._repo_installation_read_token_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_read_token_forces_remint(mocker):
+    """invalidate_repo_installation_read_token_cache() drops the cached read token."""
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    gh_auth._repo_installation_read_token_cache.clear()
+    gh_auth._installation_id_cache["acme/widget"] = ("555", _t.time())
+    mocker.patch.object(gh_auth, "GITHUB_APP_ID", "123")
+    mocker.patch.object(gh_auth, "GITHUB_PRIVATE_KEY", "key")
+    mocker.patch.object(gh_auth, "generate_github_app_jwt", return_value="jwt")
+
+    mint_calls = []
+
+    async def _fake_request(method, url, headers, **kwargs):
+        if url.endswith("/access_tokens"):
+            mint_calls.append(url)
+            return MockResponse(201, {"token": "ghs_read"})
+        return MockResponse(404, {})
+
+    mocker.patch("app.github._github_request", side_effect=_fake_request)
+
+    await gh_auth.get_repo_installation_read_token("acme", "widget")
+    gh_auth.invalidate_repo_installation_read_token_cache("acme", "widget")
+    await gh_auth.get_repo_installation_read_token("acme", "widget")
+
+    assert len(mint_calls) == 2, "invalidation must force a re-mint of the read token"
+
+    gh_auth._repo_installation_read_token_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_github_request_401_invalidates_both_caches(mocker):
+    """A 401 from _github_request drops both write and read token caches for the repo."""
+    import time as _t
+
+    import app.github_auth as gh_auth
+
+    # Pre-seed both caches
+    gh_auth._repo_installation_token_cache["acme/widget"] = ("ghs_write", _t.monotonic())
+    gh_auth._repo_installation_read_token_cache["acme/widget"] = ("ghs_read", _t.monotonic())
+
+    # Mock the HTTP client so _github_request_uncoalesced runs its 401 handler
+    import unittest.mock as _mock
+
+    mock_client = _mock.AsyncMock()
+    mock_client.request = _mock.AsyncMock(
+        return_value=MockResponse(401, {"message": "Bad credentials"})
+    )
+    mocker.patch("app.github._get_client", return_value=mock_client)
+
+    import app.github as gh
+
+    await gh._github_request("GET", "https://api.github.com/repos/acme/widget/git/refs", {})
+
+    assert "acme/widget" not in gh_auth._repo_installation_token_cache, (
+        "write token cache must be cleared on 401"
+    )
+    assert "acme/widget" not in gh_auth._repo_installation_read_token_cache, (
+        "read token cache must be cleared on 401"
+    )
+
+
+@pytest.mark.asyncio
 async def test_get_open_pull_requests_paginates(mocker):
     """get_open_pull_requests follows pagination and returns PRs beyond page 1."""
     page1 = [{"number": i} for i in range(1, 101)]  # 100 PRs — full page

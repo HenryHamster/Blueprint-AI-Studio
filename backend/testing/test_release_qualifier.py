@@ -35,6 +35,7 @@ Covers:
 """
 
 from __future__ import annotations
+from datetime import timezone
 
 import contextlib
 import json
@@ -6615,7 +6616,7 @@ async def test_run_qualification_fall_through_when_unsynced_too_long(
     # Pre-seed a stale deferral so the accumulated wait exceeds the 30-min window.
     version.last_qualification = {
         "status": "deferred_unsynced",
-        "first_deferred_at": (datetime.utcnow() - timedelta(minutes=45)).isoformat(),
+        "first_deferred_at": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=45)).isoformat(),
     }
     db_session.add(version)
     await db_session.commit()
@@ -17763,7 +17764,7 @@ async def test_sweep_redrives_deferred_unsynced_when_now_synced(db_session, mock
     version.last_qualification = {
         "status": "deferred_unsynced",
         "candidate_sha": "stale00" * 5 + "00000",
-        "first_deferred_at": (datetime.utcnow() - timedelta(minutes=3)).isoformat(),
+        "first_deferred_at": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=3)).isoformat(),
     }
     db_session.add(version)
     await db_session.commit()
@@ -17795,7 +17796,7 @@ async def test_sweep_leaves_deferred_unsynced_when_still_behind(db_session, mock
     from datetime import datetime, timedelta
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    first_deferred = (datetime.utcnow() - timedelta(minutes=3)).isoformat()
+    first_deferred = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=3)).isoformat()
     version.last_qualification = {
         "status": "deferred_unsynced",
         "candidate_sha": "stale00" * 5 + "00000",
@@ -17837,7 +17838,7 @@ async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
     from datetime import datetime, timedelta
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    first_deferred = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+    first_deferred = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)).isoformat()
     version.last_qualification = {
         "status": "deferred_unsynced",
         "candidate_sha": "stale00" * 5 + "00000",
@@ -33018,3 +33019,259 @@ async def test_drift_sentinel_deduplicates_alert_on_same_sha(db_session, mocker)
         )
     ).scalars().all()
     assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_finalize_logs_completion_debt_snapshot_fetch_failure(db_session, mocker, caplog):
+    """Finalize logs when completion-debt snapshot fetch fails, then continues."""
+    from app import shared_state
+    import logging
+    from importlib import import_module as original_import
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Create a mock that raises an exception only when trying to import
+    # completion_debt, but falls back to normal behavior for other modules.
+    def mock_import_module(name, *args, **kwargs):
+        if "completion_debt" in name:
+            raise RuntimeError("completion_debt module not available")
+        return original_import(name, *args, **kwargs)
+
+    mocker.patch("importlib.import_module", new=mock_import_module)
+
+    with caplog.at_level(logging.WARNING, logger="app.release_qualifier"):
+        result = await rq._finalize_qualification(
+            db_session,
+            version,
+            _pre_gates=_clean_finalize_pre_gates(rq._CI_GREEN),
+        )
+
+    # Should log the completion-debt failure.
+    assert any(
+        "completion-debt snapshot fetch failed" in record.message
+        for record in caplog.records
+    ), f"Expected warning about completion-debt snapshot, got: {[r.message for r in caplog.records]}"
+
+    # Finalize should proceed and produce a verdict.
+    assert result["status"] in ("promoted", "not_promoted", "dry_run")
+
+
+@pytest.mark.asyncio
+async def test_finalize_logs_actionable_open_count_failure(db_session, mocker, caplog):
+    """Finalize logs when actionable-open count fails, then continues."""
+    from app import shared_state
+    import logging
+    from importlib import import_module as original_import
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Mock the completion_debt module to return a valid debt dict.
+    mock_cd_mod = AsyncMock()
+    mock_cd_mod.get_open_completion_debt = AsyncMock(
+        return_value={"open_count": 5, "total_blocked": 1}
+    )
+
+    def mock_import_module(name, *args, **kwargs):
+        if "completion_debt" in name:
+            return mock_cd_mod
+        return original_import(name, *args, **kwargs)
+
+    mocker.patch("importlib.import_module", new=mock_import_module)
+
+    # Mock the actionable-open count function to raise an exception.
+    mocker.patch(
+        "app.release_qualifier._count_project_actionable_open_completion_debt",
+        new=AsyncMock(side_effect=RuntimeError("Count failed")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.release_qualifier"):
+        result = await rq._finalize_qualification(
+            db_session,
+            version,
+            _pre_gates=_clean_finalize_pre_gates(rq._CI_GREEN),
+        )
+
+    # Should log the actionable-open count failure.
+    assert any(
+        "actionable-open completion-debt count" in record.message
+        for record in caplog.records
+    ), f"Expected warning about actionable-open count, got: {[r.message for r in caplog.records]}"
+
+    # Finalize should proceed and produce a verdict.
+    assert result["status"] in ("promoted", "not_promoted", "dry_run")
+
+
+# ===========================================================================
+# full-suite-drift-sentinel admin endpoint
+# ===========================================================================
+
+
+async def _make_project_with_owner(db_session, owner_id: str = "test-user-123"):
+    """Create a project with the given user as owner (ProjectMember row included)."""
+    from app.models import ProjectMember  # noqa: PLC0415
+
+    project = Project(
+        name="Sentinel-Test",
+        user_id=owner_id,
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id=owner_id, role="owner")
+    db_session.add(member)
+    await db_session.commit()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_get_default_off(db_session, client):
+    """GET returns enabled=False and is_default=True when flag is absent."""
+    project = await _make_project_with_owner(db_session)
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["full_suite_drift_sentinel_enabled"] is False
+    assert body["is_default"] is True
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_patch_enable_disable(db_session, client):
+    """PATCH toggles full_suite_drift_sentinel_enabled and GET reflects the change."""
+    project = await _make_project_with_owner(db_session)
+
+    # Enable the sentinel.
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
+        json={"full_suite_drift_sentinel_enabled": True},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["full_suite_drift_sentinel_enabled"] is True
+    assert body["is_default"] is False
+
+    # GET now reflects the enabled state.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["full_suite_drift_sentinel_enabled"] is True
+
+    # Disable the sentinel — is_default returns to True (key removed).
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
+        json={"full_suite_drift_sentinel_enabled": False},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["full_suite_drift_sentinel_enabled"] is False
+    assert body["is_default"] is True
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_patch_validation(db_session, client):
+    """PATCH rejects non-boolean and missing-key bodies with 422."""
+    project = await _make_project_with_owner(db_session)
+
+    # Missing required field.
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
+        json={},
+    )
+    assert resp.status_code == 422
+
+    # Non-boolean value.
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
+        json={"full_suite_drift_sentinel_enabled": "yes"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_sweep_uses_build_config(db_session, mocker):
+    """Sweep evaluates sentinel only when build_config flag is True.
+
+    Verifies that enabling via build_config causes _check_full_suite_drift_sentinel
+    to call compute_promotion_ci_green_gate (the dispatch entrypoint), while
+    a disabled flag is a no-op.
+    """
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel  # noqa: PLC0415
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "dispatched",
+                "head_sha": "aabbccdd" * 5,
+                "run_id": 42,
+            }
+        ),
+    )
+
+    # Flag OFF — gate must NOT be called.
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+    gate_mock.assert_not_called()
+
+    # Enable via build_config (as the new endpoint would do).
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+    gate_mock.assert_called_once()

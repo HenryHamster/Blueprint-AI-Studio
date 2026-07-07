@@ -829,6 +829,7 @@ async def persist_trial_verdicts_in_transaction(
     so callers can build a display payload that mirrors exactly what is durably
     persisted (rather than what was naively computed).
     """
+    from sqlalchemy import select
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from app.database import resolve_async_engine
@@ -841,7 +842,11 @@ async def persist_trial_verdicts_in_transaction(
     )
     async with factory() as session:
         try:
-            project = await session.get(Project, project_id)
+            project = (
+                await session.execute(
+                    select(Project).where(Project.id == project_id).with_for_update()
+                )
+            ).scalars().first()
             if project is None:
                 raise ValueError(
                     f"Project {project_id} not found for durable trial-verdict persist"

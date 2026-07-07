@@ -2011,7 +2011,7 @@ async def test_serialize_sr_catch_rate_trends_is_stale(client: AsyncClient, db_s
     """is_stale=True when computed_at is >7 days old; False when fresh; True when absent."""
     # Case 1: stale (8 days old)
     project = make_project()
-    stale_ts = (datetime.utcnow() - timedelta(days=8)).isoformat()
+    stale_ts = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=8)).isoformat()
     project.design_doc = {
         "sr_catch_rate_trends": {
             "computed_at": stale_ts,
@@ -2031,7 +2031,7 @@ async def test_serialize_sr_catch_rate_trends_is_stale(client: AsyncClient, db_s
 
     # Case 2: fresh (1 day old)
     project2 = make_project()
-    fresh_ts = (datetime.utcnow() - timedelta(days=1)).isoformat()
+    fresh_ts = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)).isoformat()
     project2.design_doc = {
         "sr_catch_rate_trends": {
             "computed_at": fresh_ts,
@@ -4272,7 +4272,7 @@ async def test_sr_alert_drilldown_returns_missed_tasks(client: AsyncClient, db_s
     project = make_project(
         design_doc={
             "sr_catch_rate_trends_alert": {
-                "computed_at": datetime.utcnow().isoformat(),
+                "computed_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 "categories": ["correctness"],
             }
         }

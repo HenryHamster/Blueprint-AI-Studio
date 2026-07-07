@@ -70,6 +70,8 @@ After creating, grab: App ID, Client ID, Client Secret, private key .pem file.
 
 6. **Launch a task**
 
+7. **Attach a local runner** (optional) — to run tasks on your own machine instead of / in addition to GCP VMs, see **[docs/runner-install.md](docs/runner-install.md)** for token persistence, systemd `--user` service setup, and the restart-on-crash runbook.
+
 ---
 
 ## Local Development

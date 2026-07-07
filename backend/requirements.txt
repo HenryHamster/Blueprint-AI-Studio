@@ -1,12 +1,12 @@
 fastapi==0.104.1
-uvicorn==0.49.0
+uvicorn==0.50.2
 pydantic==2.13.4
 sqlmodel==0.0.19
 sqlalchemy==2.0.51
 asyncpg==0.31.0
-greenlet==3.5.2
+greenlet==3.5.3
 google-cloud-storage==2.19.0
-google-cloud-compute==1.48.0
+google-cloud-compute==1.49.0
 google-cloud-secret-manager==2.29.0
 google-cloud-logging==3.16.0
 google-cloud-run==0.16.1
@@ -23,7 +23,7 @@ pytest-testmon==2.2.0
 # with pytest 7.4.3.
 pytest-rerunfailures==14.0
 aiosqlite==0.22.1
-alembic==1.18.4
+alembic==1.18.5
 PyJWT==2.13.0
 slowapi==0.1.10
 redis[hiredis]>=5.0.0

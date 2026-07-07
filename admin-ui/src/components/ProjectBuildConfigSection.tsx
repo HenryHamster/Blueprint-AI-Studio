@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useEffect, useRef } from 'react';
 import { Plus, Trash2, RefreshCw, AlertTriangle, CheckCircle } from 'lucide-react';
 

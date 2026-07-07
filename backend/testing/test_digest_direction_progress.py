@@ -2670,7 +2670,7 @@ def test_compute_spawn_gate_census_empty():
     from app.digest_direction_progress import compute_spawn_gate_census
     from datetime import datetime
 
-    result = compute_spawn_gate_census([], window_start=datetime.utcnow())
+    result = compute_spawn_gate_census([], window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 0
     assert result["gate_invoked_count"] == 0
     assert result["graders_attempted_total"] == 0
@@ -2690,7 +2690,7 @@ def test_compute_spawn_gate_census_skips_non_research_tasks():
         _make_census_task(task_type="create", challenged_count=3),
         _make_census_task(task_type="research", challenged_count=2),
     ]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 1
     assert result["graders_attempted_total"] == 2
 
@@ -2704,7 +2704,7 @@ def test_compute_spawn_gate_census_deduplicates_by_task_id():
     tid = uuid.uuid4()
     t1 = _make_census_task(task_id=tid, challenged_count=3)
     t2 = _make_census_task(task_id=tid, challenged_count=3)
-    result = compute_spawn_gate_census([t1, t2], window_start=datetime.utcnow())
+    result = compute_spawn_gate_census([t1, t2], window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 1
     assert result["gate_invoked_count"] == 1
 
@@ -2732,7 +2732,7 @@ def test_compute_spawn_gate_census_aggregates_trail_and_cause():
             cause_counts=None,
         ),
     ]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 3
     assert result["gate_invoked_count"] == 3
     assert result["graders_attempted_total"] == 6
@@ -2756,7 +2756,7 @@ def test_compute_spawn_gate_census_covers_undirected_tasks():
         _make_census_task(challenged_count=2, direction_id=None),
         _make_census_task(challenged_count=1, direction_id="dir-1"),
     ]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 2
     directions = [r["direction_id"] for r in result["rows"]]
     assert None in directions
@@ -2772,7 +2772,7 @@ def test_compute_spawn_gate_census_give_up_count():
         _make_census_task(give_up_adversarial=3),
         _make_census_task(give_up_adversarial=2),
     ]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["give_up_count"] == 5
 
 
@@ -2782,7 +2782,7 @@ def test_compute_spawn_gate_census_gate_not_invoked_when_no_challenged():
     from datetime import datetime
 
     tasks = [_make_census_task(challenged_count=0)]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["gate_invoked_count"] == 0
     assert result["rows"][0]["gate_invoked"] is False
 
@@ -2872,3 +2872,80 @@ async def test_conversion_denominator_excludes_knowledge_and_compute_children(
         },
     }
     assert pr_ineligible_created_in_entry(entry_ce) == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_budget_alert_stamped_in_db_and_idempotent(
+    client: AsyncClient, db_session, mocker
+):
+    """budget alert writes _budget_alerted via a locked re-fetch (not the stale snapshot).
+
+    After the first digest call:
+    - _budget_alerted is True in the DB row (confirms the locked write path executed).
+    - A second call does NOT re-fire the BUDGET_EXCEEDED notification (idempotency).
+    """
+    import asyncio as _a
+
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=mocker.AsyncMock,
+    )
+    now = _utcnow()
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-locked",
+                "text": "Locked budget dir",
+                "status": "active",
+                "cost_budget_usd": 0.01,  # spot task for 1h ≈ $0.02 → 200% utilization
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="t-budget",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-locked", "scope": "small"},
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=True,
+        )
+    )
+    await db_session.commit()
+
+    # First call — should fire the alert.
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+    assert dp["budget_utilization_pct"] >= 80
+
+    await _a.sleep(0)  # let ensure_future run
+    assert dispatch_mock.await_count == 1
+    assert dispatch_mock.call_args[0][1] == "BUDGET_EXCEEDED"
+
+    # The locked write should have persisted _budget_alerted to the DB row.
+    await db_session.refresh(project)
+    dir_map = {str(d.get("id") or d.get("direction_id")): d for d in project.directions}
+    assert dir_map["dir-locked"].get("_budget_alerted") is True, (
+        "_budget_alerted was not persisted to DB — locked write path did not execute"
+    )
+    # Release the db_session transaction before the second request. StaticPool
+    # shares a single SQLite connection; an open DEFERRED transaction on
+    # db_session would deadlock writes from dedicated-session helpers inside the
+    # second request if not closed first.
+    await db_session.rollback()
+
+    # Second call — _budget_alerted is now True in DB, so no re-fire.
+    dispatch_mock.reset_mock()
+    response2 = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response2.status_code == 200
+    await _a.sleep(0)
+    assert dispatch_mock.await_count == 0, (
+        "BUDGET_EXCEEDED fired again despite _budget_alerted=True in DB"
+    )

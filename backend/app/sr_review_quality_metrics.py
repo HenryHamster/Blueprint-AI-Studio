@@ -19,7 +19,7 @@ from app.sr_blind_spots import (
     safe_check_results,
 )
 from app.sr_analytics_common import _SR_CODE_CHANGE_TYPES
-from app.time_utils import _to_naive_utc
+from app.time_utils import _to_naive_utc, _utcnow
 
 _SR_SEVERITY_WEIGHTS: Dict[str, int] = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
 
@@ -88,7 +88,7 @@ def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]
     if computed_at_str:
         try:
             computed_at_dt = _to_naive_utc(datetime.fromisoformat(computed_at_str))
-            is_stale = computed_at_dt < datetime.utcnow() - timedelta(
+            is_stale = computed_at_dt < _utcnow() - timedelta(
                 days=_SR_TREND_STALENESS_DAYS
             )
         except (ValueError, TypeError):

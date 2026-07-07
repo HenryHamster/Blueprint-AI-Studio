@@ -6,9 +6,10 @@ module focused on pipeline orchestration. These functions have no coupling
 to DB, LLM, or broadcast layers — they operate only on strings and dicts.
 """
 
-import datetime
 import re
 from typing import Optional
+
+from app.time_utils import _utcnow
 
 
 def _parse_research_context(text: str) -> dict:
@@ -435,7 +436,7 @@ def _build_research_context(
 
     # Populate structured eviction records for callers that want audit history
     if evicted_out is not None:
-        _evicted_at = datetime.datetime.utcnow().isoformat()
+        _evicted_at = _utcnow().isoformat()
         for e in before["established"][:new_established]:
             rec = _parse_established_entry(e)
             rec["evicted_at"] = _evicted_at

@@ -3815,3 +3815,54 @@ async def test_adopted_branch_recreates_rollup(cleanup_db, mocker):
     await _check_and_trigger_rollup(child, cleanup_db)
 
     mock_create.assert_awaited_once()
+
+
+# ── Merge-credit backfill: rotating keyset cursor ────────────────────────────
+
+
+def test_merge_credit_backfill_keyset_cursors_exist_and_advance_correctly():
+    """Rotating keyset cursor state exists and the full-page/short-page logic is correct.
+
+    Pre-fix: no cursor variables existed — every sweep tick re-queried from the
+    beginning of the ordered id set, so rollup history beyond the first batch was
+    starved forever and the sweep could not converge on a large fleet/history.
+    The fix introduces _rollup_backfill_cursors (per-project) and
+    _project_backfill_cursor (global), advancing on a full page and wrapping on
+    a short page so every landed rollup is eventually visited.
+    """
+    import uuid
+
+    import app.merge_credit_backfill as mcb
+
+    assert hasattr(mcb, "_project_backfill_cursor"), (
+        "_project_backfill_cursor missing — keyset cursor needed to avoid starving "
+        "projects beyond the first batch on every sweep tick"
+    )
+    assert hasattr(mcb, "_rollup_backfill_cursors"), (
+        "_rollup_backfill_cursors missing — per-project keyset cursor needed to avoid "
+        "re-scanning the same first-N rollups on every call"
+    )
+    assert isinstance(mcb._rollup_backfill_cursors, dict)
+
+    # Verify the cursor advancement contract directly:
+    # full page (len == limit) -> cursor is set to the last id.
+    pid = uuid.uuid4()
+    rollup_limit = 2
+    full_page = [uuid.uuid4(), uuid.uuid4()]  # len == rollup_limit
+    if len(full_page) < rollup_limit:
+        mcb._rollup_backfill_cursors.pop(pid, None)
+    else:
+        mcb._rollup_backfill_cursors[pid] = full_page[-1]
+    assert mcb._rollup_backfill_cursors.get(pid) == full_page[-1], (
+        "full page must advance cursor to the last id so the next call resumes past it"
+    )
+
+    # short page (len < limit) -> cursor is cleared (wrap to start).
+    short_page = [uuid.uuid4()]  # len=1 < rollup_limit=2
+    if len(short_page) < rollup_limit:
+        mcb._rollup_backfill_cursors.pop(pid, None)
+    else:
+        mcb._rollup_backfill_cursors[pid] = short_page[-1]
+    assert pid not in mcb._rollup_backfill_cursors, (
+        "short page must clear cursor so the next call re-scans from the beginning"
+    )

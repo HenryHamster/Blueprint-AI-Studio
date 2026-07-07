@@ -2106,6 +2106,8 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // Test convention cache in discovery.ts is per-repo; stale entries from a
   // prior task's codebase must not carry into a new role on a warm VM.
   clearTestConventionCache();
+  // Per-task resident-session turn-latency telemetry.
+  resetResidentTurnLatencyTelemetry();
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────
@@ -3130,6 +3132,9 @@ import {
   getFormatComplianceTelemetry,
   resetFormatComplianceTelemetry,
   estimateTokensFromChars,
+  recordResidentTurnLatency,
+  getResidentTurnLatencyTelemetry,
+  resetResidentTurnLatencyTelemetry,
 } from './telemetry.js';
 export {
   errorFingerprint,
@@ -3148,6 +3153,9 @@ export {
   getFormatComplianceTelemetry,
   resetFormatComplianceTelemetry,
   estimateTokensFromChars,
+  recordResidentTurnLatency,
+  getResidentTurnLatencyTelemetry,
+  resetResidentTurnLatencyTelemetry,
 };
 
 // ── Divergence detection helpers ─────────────────────────────────────────────

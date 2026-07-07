@@ -166,6 +166,9 @@ def test_registry_contains_initial_checks():
         "rollup_child_landing_credit",
         "near_cap_size_warning",
         "problem_model_duplicate_id_sweep",
+        "direction_cumulative_merge_invariant",
+        "first_attempt_rate_denominator_coverage",
+        "sr_catch_rate_cache_freshness",
     } <= names
 
 
@@ -999,6 +1002,53 @@ async def test_completion_debt_resolved_row_flagged(db):
 
 
 @pytest.mark.asyncio
+async def test_completion_debt_no_ci_gate_not_flagged_when_recent_verified_run(db):
+    """last_unverified_reason is a permanent stamp (never cleared by verified runs).
+    When the most recent gate outcome in recent_outcomes is verified, the obligation
+    is no longer live and must NOT be flagged as an under-count."""
+    project = await _project(db)
+    project.merge_gate_runtime = {
+        "last_unverified_reason": "verify_setup_failed",
+        "last_unverified_at": "2026-01-01T00:00:00",
+        "recent_outcomes": [
+            {"at": "2026-01-01T00:00:00", "verified": False, "reason": "verify_setup_failed"},
+            # Most recent: verified run — gate is now functioning, obligation not live.
+            {"at": "2026-06-01T00:00:00", "verified": True, "reason": None},
+        ],
+    }
+    flag_modified(project, "merge_gate_runtime")
+    db.add(project)
+    await db.commit()
+
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    # Must NOT be flagged — the most recent gate outcome was verified.
+    assert not _flagged_for(results, str(project.id))
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_no_ci_gate_still_flagged_when_last_outcome_unverified(db):
+    """When the most recent recent_outcomes entry is still unverified, the obligation
+    is live and must be flagged even if there was an earlier verified run."""
+    project = await _project(db)
+    project.merge_gate_runtime = {
+        "last_unverified_reason": "verify_setup_failed",
+        "recent_outcomes": [
+            {"at": "2026-01-01T00:00:00", "verified": True, "reason": None},
+            # Most recent: unverified — obligation is still live.
+            {"at": "2026-06-01T00:00:00", "verified": False, "reason": "verify_setup_failed"},
+        ],
+    }
+    flag_modified(project, "merge_gate_runtime")
+    db.add(project)
+    await db.commit()
+
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    pid_flags = _flagged_for(results, str(project.id))
+    assert len(pid_flags) == 1
+    assert f"no_ci_gate:{project.id}" in pid_flags[0].detail
+
+
+@pytest.mark.asyncio
 async def test_completion_debt_inconclusive_over_bounds(db):
     for _ in range(3):
         await _project(db)
@@ -1280,6 +1330,103 @@ async def test_rollup_child_landing_credit_ignores_unmerged_rollup_parent(db):
     assert all(not r.flagged for r in results)
     statuses = {r.status for r in results}
     assert CheckStatus.FLAGGED not in statuses
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_landing_credit_samples_newest_by_created_at(db):
+    """Verify the sweep samples by created_at (newest first), not by Task.id (uuid-random).
+
+    Creates more rollup tasks than sample_limit. The oldest rollup pairs are properly
+    credited (OK). The newest pair has a landed parent but an un-credited child (FLAGGED).
+    With created_at ordering the newest tasks are sampled and the flag is detected.
+    """
+    from datetime import timedelta as td
+
+    project = await _project(db)
+    now = _utcnow()
+    sample_limit = 4
+
+    # 3 old OK rollup pairs (6 tasks): parent landed, child stamped — no flag.
+    for i in range(3):
+        old_pr = 100 + i
+        parent_old = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - td(hours=200 - i * 4),
+            context={
+                "_is_rollup_review": True,
+                "rollup_pr_number": old_pr,
+                "landed_on_integration": True,
+                "pr_merged": True,
+            },
+        )
+        db.add(parent_old)
+        await db.commit()
+        await db.refresh(parent_old)
+        child_old = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - td(hours=200 - i * 4 - 1),
+            context={
+                "rollup_pr_number": old_pr,
+                "pr_merged": True,
+                "landed_on_integration": True,
+            },
+        )
+        db.add(child_old)
+        await db.commit()
+
+    # 1 new FLAGGED pair (2 tasks): parent landed, child missing landing stamp.
+    # Most recent created_at — must be picked by created_at-ordered sampling.
+    new_rollup_pr = 200
+    parent_new = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        created_at=now - td(hours=5),
+        context={
+            "_is_rollup_review": True,
+            "rollup_pr_number": new_rollup_pr,
+            "landed_on_integration": True,
+            "pr_merged": True,
+        },
+    )
+    db.add(parent_new)
+    await db.commit()
+    await db.refresh(parent_new)
+    child_new = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        created_at=now - td(hours=4),
+        context={
+            "rollup_pr_number": new_rollup_pr,
+            "pr_merged": True,
+            "landed_on_integration": False,  # under-credited
+        },
+    )
+    db.add(child_new)
+    await db.commit()
+
+    # 8 tasks total; sample_limit=4 picks the 4 newest by created_at:
+    # child_new (now-4h), parent_new (now-5h), and the 2 newest old tasks.
+    # The new FLAGGED pair is guaranteed in the sample → FLAGGED.
+    ctx = SweepContext(
+        session=db,
+        now=now,
+        mode="observe",
+        max_projects=25,
+        sample_limit=sample_limit,
+        window_days=14,
+    )
+    results = await mis.check_rollup_child_landing_credit(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) >= 1, (
+        f"expected flagged result for newest under-credited child, got {results}"
+    )
+    assert flagged[0].delta >= 1
 
 
 @pytest.mark.asyncio
@@ -1570,3 +1717,234 @@ async def test_problem_model_dup_id_is_flag_only(db):
     await db.refresh(project)
     # Collection unchanged — both duplicates still present.
     assert len(project.problem_model["pending_user_confirmation"]) == 2
+
+
+# --- Check: direction_cumulative_merge_invariant ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_direction_cumulative_merge_invariant_flags_verified_exceeds_merged(db):
+    """A direction where lifetime verified > merged must be flagged."""
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-inv-001",
+            "research_history": [
+                {
+                    "task_id": "bbbbbbbb-0000-0000-0000-000000000001",
+                    "prs_merged": 2,
+                    "verified_prs_merged": 3,  # violates: verified (3) > merged (2)
+                }
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_direction_cumulative_merge_invariant(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "direction_cumulative_merge_invariant"
+    assert f.delta >= 1
+    assert "verified" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_direction_cumulative_merge_invariant_ok_when_consistent(db):
+    """A direction with internally-consistent lifetime totals returns OK."""
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-ok-001",
+            "research_history": [
+                {
+                    "task_id": "cccccccc-0000-0000-0000-000000000001",
+                    "prs_merged": 5,
+                    "verified_prs_merged": 4,
+                    "acceptance_proven_merged": 2,
+                    "acceptance_declared_merged": 3,
+                }
+            ],
+            "history_aggregate": {
+                "total_prs_merged": 10,
+                "total_verified_prs_merged": 9,
+                "total_acceptance_proven_merged": 3,
+                "total_acceptance_declared_merged": 5,
+            },
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_direction_cumulative_merge_invariant(ctx)
+    assert all(not r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_direction_cumulative_merge_invariant_skips_no_directions(db):
+    """A project with no directions or empty research_history returns SKIPPED."""
+    await _project(db)
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_direction_cumulative_merge_invariant(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+
+
+# --- Check: first_attempt_rate_denominator_coverage -------------------------
+
+
+@pytest.mark.asyncio
+async def test_fa_rate_denominator_flags_low_coverage(db):
+    """When <50% of eligible tasks have _first_attempt_succeeded, FLAGGED."""
+    project = await _project(db)
+    now = _utcnow()
+    # 8 eligible tasks, only 2 have the flag → 25% coverage < 50% threshold
+    for i in range(8):
+        ctx_data = {"_first_attempt_succeeded": True} if i < 2 else {}
+        db.add(Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(days=1),
+            context=ctx_data,
+        ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_first_attempt_rate_denominator_coverage(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "first_attempt_rate_denominator_coverage"
+    assert f.self_reported == 2
+    assert f.ground_truth == 8
+    assert f.delta == 6
+    assert "_first_attempt_succeeded" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_fa_rate_denominator_ok_when_high_coverage(db):
+    """When >=50% of eligible tasks have _first_attempt_succeeded, OK."""
+    project = await _project(db)
+    now = _utcnow()
+    for i in range(6):
+        ctx_data = {"_first_attempt_succeeded": i < 5}  # 5/6 = 83%
+        db.add(Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(days=1),
+            context=ctx_data,
+        ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_first_attempt_rate_denominator_coverage(ctx)
+    assert all(not r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_fa_rate_denominator_skips_non_eligible_types(db):
+    """research/review/strategic tasks do not count toward FA coverage."""
+    project = await _project(db)
+    now = _utcnow()
+    for ttype in ("research", "review", "strategic"):
+        db.add(Task(
+            project_id=project.id,
+            payloads=[{"type": ttype}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(days=1),
+            context={},
+        ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_first_attempt_rate_denominator_coverage(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+
+
+# --- Check: sr_catch_rate_cache_freshness -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_cache_freshness_flags_stale_cache(db):
+    """A sr_catch_rate_trends cache older than _SR_TREND_STALENESS_DAYS must be flagged."""
+    from app.sr_review_quality_metrics import _SR_TREND_STALENESS_DAYS
+    project = await _project(db)
+    stale_date = (_utcnow() - timedelta(days=_SR_TREND_STALENESS_DAYS + 2)).isoformat()
+    project.design_doc = {"sr_catch_rate_trends": {"computed_at": stale_date, "categories": {}}}
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "design_doc")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_sr_catch_rate_cache_freshness(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "sr_catch_rate_cache_freshness"
+    assert "stale" in f.detail or "old" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_sr_cache_freshness_ok_when_fresh(db):
+    """A recently-computed sr_catch_rate_trends cache returns OK."""
+    project = await _project(db)
+    fresh_date = (_utcnow() - timedelta(hours=12)).isoformat()
+    project.design_doc = {"sr_catch_rate_trends": {"computed_at": fresh_date, "categories": {}}}
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "design_doc")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_sr_catch_rate_cache_freshness(ctx)
+    assert all(not r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_sr_cache_freshness_skips_when_no_cache(db):
+    """A project without sr_catch_rate_trends returns SKIPPED."""
+    await _project(db)
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_sr_catch_rate_cache_freshness(ctx)
+    assert all(r.status == CheckStatus.SKIPPED for r in results)

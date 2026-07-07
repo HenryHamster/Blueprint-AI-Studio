@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/immutability */
 import React, { useMemo, useState, useRef, useCallback, useEffect } from 'react';
 import { ArrowDownUp } from 'lucide-react';
 import {

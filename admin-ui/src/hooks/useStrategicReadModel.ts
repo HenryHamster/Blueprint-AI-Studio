@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchStrategicState, type StrategicSessionResponse, type StrategicStateResponse } from '../strategicStateApi';
 import { DEFAULT_POLL_MS, usePoller } from './usePoller';

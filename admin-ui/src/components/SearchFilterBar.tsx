@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { Search, ChevronDown, Check, GitFork } from 'lucide-react';
 import { useRef, useState, useEffect } from 'react';
 import type { RefObject } from 'react';

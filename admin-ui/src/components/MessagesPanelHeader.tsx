@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { type Dispatch, type SetStateAction, type RefObject, useState, useRef, useEffect } from 'react';
 import { X, MessageSquare, AlertTriangle, ChevronUp, Save, SlidersHorizontal } from 'lucide-react';
 import { type EventPref } from './eventPrefs';

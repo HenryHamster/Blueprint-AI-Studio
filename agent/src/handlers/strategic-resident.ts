@@ -2,6 +2,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, sendWsFrame,
   apiGet, apiPost, persistAndPostStatus, resolveBaseBranch,
+  recordResidentTurnLatency, getResidentTurnLatencyTelemetry,
 } from '../index.js';
 import { prepareWorkspaceForRole, listWorkspaceTopDirs } from '../workspacePrep.js';
 import {
@@ -406,6 +407,13 @@ export async function handleStrategicResident(
     const r = await session.sendTurn(full, operator ? undefined : { stallTimeoutMs: cfg.autonomousTurnTimeoutMs });
     streamer.flush();
     streamer.done();
+    recordResidentTurnLatency({
+      kind: operator ? 'operator' : 'autonomous',
+      turnMs: r.turnMs,
+      ttftMs: r.ttftMs,
+      interrupted: r.interrupted,
+      toolCallCount: r.toolCallCount,
+    });
     return r;
   };
 
@@ -499,6 +507,10 @@ export async function handleStrategicResident(
     };
     if (handledIds && handledIds.length > 0) {
       body.handled_message_ids = handledIds;
+    }
+    const latencySummary = getResidentTurnLatencyTelemetry();
+    if (latencySummary !== null) {
+      body.turn_latency_summary = latencySummary;
     }
     try {
       const resp = await apiPost(`/api/agent/projects/${projectId}/strategic-session/heartbeat`, body) as SessionHeartbeatResponse;

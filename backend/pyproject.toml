@@ -31,8 +31,9 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # deferred mid-module imports (circular-dependency / load-order) — the same intentional
 # pattern already exempted for main.py / orchestrator.py above.
 "app/shared_state.py" = ["DTZ", "E402"]
-# Test files use convenience patterns (broad except, datetime.utcnow, etc.)
-"testing/*" = ["DTZ", "BLE", "B"]
+# Test files use convenience patterns (broad except, etc.)
+# DTZ intentionally NOT suppressed — tests must use _utcnow(), not datetime.utcnow().
+"testing/*" = ["BLE", "B"]
 # main.py has many intentional except Exception blocks for background-task error handling
 # B904: FastAPI pattern — raise HTTPException in except block is intentional HTTP conversion
 # E402: Deferred imports for circular dependency / module load order (lines 113, 202, 2035, 2042, 2174)

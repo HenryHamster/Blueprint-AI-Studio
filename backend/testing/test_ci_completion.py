@@ -11,6 +11,7 @@ Covers:
 """
 
 import uuid
+from datetime import timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -4626,7 +4627,7 @@ async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
 
     # _utcnow() returns naive UTC; review_wait_started must match so the
     # subtraction doesn't raise TypeError (caught → silent backstop skip).
-    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    old_started = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)).isoformat()
     task = _make_task_no_review_approved(
         db_session,
         project,
@@ -4670,7 +4671,7 @@ async def test_review_wait_backstop_does_not_refire(db_session, mocker):
     await db_session.refresh(project)
 
     # Naive UTC timestamp matching _utcnow() format.
-    old_started = (datetime.utcnow() - timedelta(minutes=120)).isoformat()
+    old_started = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=120)).isoformat()
     task = _make_task_no_review_approved(
         db_session,
         project,
@@ -4735,7 +4736,7 @@ async def test_orphan_review_wait_respawns_review(db_session, mocker):
         new=AsyncMock(return_value=(fake_review, True)),
     )
 
-    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    old_started = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)).isoformat()
     task = _make_task_no_review_approved(
         db_session,
         project,
@@ -4794,7 +4795,7 @@ async def test_review_wait_respawn_suppressed_falls_back_to_approval(
     await db_session.commit()
     await db_session.refresh(project)
 
-    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    old_started = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)).isoformat()
     task = _make_task_no_review_approved(
         db_session,
         project,
@@ -4839,7 +4840,7 @@ async def test_review_wait_respawn_capped(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    old_started = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)).isoformat()
     task = _make_task_no_review_approved(
         db_session,
         project,
@@ -4892,7 +4893,7 @@ async def test_review_wait_auto_respawn_disabled(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    old_started = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=70)).isoformat()
     task = _make_task_no_review_approved(
         db_session,
         project,

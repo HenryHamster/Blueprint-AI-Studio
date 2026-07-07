@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin import _get_user_project_with_role
+from app.time_utils import _utcnow
 from app.auth import require_admin
 from app.database import get_session
 from app.models import Project, ResidualCaseStatus, ResidualRemediationCase
@@ -114,7 +115,7 @@ def _scan_viewport_debt_rows() -> tuple[
     List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]
 ]:
     global _VIEWPORT_DEBT_CACHE
-    now = datetime.utcnow()
+    now = _utcnow()
     if _VIEWPORT_DEBT_CACHE is not None:
         cached_at, cached_rows, cached_untested, cached_summary = _VIEWPORT_DEBT_CACHE
         if (now - cached_at).total_seconds() < _VIEWPORT_DEBT_CACHE_TTL:
@@ -305,6 +306,6 @@ async def get_viewport_debt(
     return {
         "rows": rows,
         "untested_rows": untested_rows,
-        "scanned_at": datetime.utcnow().isoformat(),
+        "scanned_at": _utcnow().isoformat(),
         "coverage_summary": coverage_summary,
     }

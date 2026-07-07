@@ -13,8 +13,9 @@
 - Backend, targeted — **the default for task work**: `bash scripts/test-backend.sh testing/test_<module>.py [more files]` — run the test files covering what you changed.
 - Backend, standalone smoke (no DB): `bash scripts/test-backend.sh --standalone --no-postgres` — invariant/security/pipeline files; this is what `./check test` runs.
 - Backend, FULL suite: `bash scripts/test-backend.sh` with no test-file arguments — **never run this on an agent VM.** It builds the Docker image and runs the entire DB-backed suite: 45–60+ min on a 2-vCPU/8 GB VM (OOM-prone), and redundant — CI runs the same suite sharded once at the automain→main promotion PR (which targets `main`). The bare invocation exists for developer machines, not task VMs.
-- Frontend (agent VM): `cd admin-ui && npm run typecheck && npx eslint .` — `npm run build` (vite bundle) OOMs on agent VMs; typecheck catches type errors; the full vite build runs in CI.
-- Agent: `cd agent && npx tsc --noEmit`
+- Frontend (agent VM): `cd admin-ui && npm run typecheck && npx eslint .` — `npm run build` (vite bundle) OOMs on agent VMs; typecheck catches type errors; the full vite build runs in CI. `./check test` also runs `npx vitest run` (the ~1400-test happy-dom unit suite) when admin-ui files changed.
+- Agent: `cd agent && npx tsc --noEmit`. `./check test` also runs `npx vitest run` (the agent unit suite) when agent/ files changed.
+- JS/TS unit suites: `./check test` runs both `cd agent && npx vitest run` and `cd admin-ui && npx vitest run` for their respective stacks. These match the blocking CI jobs at the promotion PR, so regressions surface at the merge gate instead of weeks later.
 
 ## Test Guidelines
 - When fixing test failures, first diagnose: is the failure in the CODE or the TEST?

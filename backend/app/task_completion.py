@@ -3196,25 +3196,25 @@ async def _maybe_spawn_sweep_aggregate_followon(
         failure_mode = True
 
     # All arms are terminal — check whether an aggregate follow-on already exists.
-    for sibling in sibling_rows:
-        existing = (
-            (
-                await session.execute(
-                    select(Task).where(Task.parent_task_id == sibling.id)
-                )
+    sibling_ids = [s.id for s in sibling_rows]
+    all_children = (
+        (
+            await session.execute(
+                select(Task).where(Task.parent_task_id.in_(sibling_ids))
             )
-            .scalars()
-            .all()
         )
-        for ct in existing:
-            if (ct.context or {}).get(_ACT_ON_VERDICT_SWEEP_KEY) == sweep_id:
-                logger.info(
-                    "[COMPUTE] Sweep %s: aggregate follow-on %s already exists; "
-                    "skipping duplicate spawn",
-                    sweep_id,
-                    ct.id,
-                )
-                return ct
+        .scalars()
+        .all()
+    )
+    for ct in all_children:
+        if (ct.context or {}).get(_ACT_ON_VERDICT_SWEEP_KEY) == sweep_id:
+            logger.info(
+                "[COMPUTE] Sweep %s: aggregate follow-on %s already exists; "
+                "skipping duplicate spawn",
+                sweep_id,
+                ct.id,
+            )
+            return ct
 
     # Determine overall failure_mode: True when ANY arm failed non-intentionally.
     any_failure = any(t.status == TaskStatus.FAILED for t in sibling_rows)

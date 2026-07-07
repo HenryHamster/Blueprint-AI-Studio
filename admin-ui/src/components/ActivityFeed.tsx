@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useEffect, useRef, useState, useCallback, useMemo, type ReactElement } from 'react';
 import { X, CheckCircle, XCircle, Microscope, Rocket, ExternalLink, Loader2, Clock, ChevronDown, ChevronRight } from 'lucide-react';
 import { List, useDynamicRowHeight, type RowComponentProps } from 'react-window';

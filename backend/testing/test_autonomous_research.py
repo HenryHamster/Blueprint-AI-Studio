@@ -21,6 +21,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 import app.shared_state as _shared_state
+from app.time_utils import _utcnow
 from app.models import (
     Alert,
     AlertSeverity,
@@ -534,7 +535,7 @@ async def test_spawn_blocked_by_open_circuit_breaker(db_session):
         "state": "OPEN",
         "failure_count": 3,
         "success_count": 0,
-        "opened_at": datetime.utcnow(),
+        "opened_at": _utcnow(),
         "cooldown_seconds": 1800,
         "base_cooldown": 1800,
         "half_open_task_id": None,
@@ -573,7 +574,7 @@ async def test_spawn_allowed_when_circuit_breaker_cooldown_elapsed(db_session):
         "state": "OPEN",
         "failure_count": 3,
         "success_count": 0,
-        "opened_at": datetime.utcnow() - timedelta(hours=2),
+        "opened_at": _utcnow() - timedelta(hours=2),
         "cooldown_seconds": 1800,
         "base_cooldown": 1800,
         "half_open_task_id": None,
@@ -663,7 +664,7 @@ def _active_direction_with_cooldown_elapsed(
     """Return an active direction whose last_researched_at is well past cooldown."""
     return {
         **_active_direction(direction_id, text),
-        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+        "last_researched_at": (_utcnow() - timedelta(hours=5)).isoformat(),
     }
 
 
@@ -800,7 +801,7 @@ async def test_blocked_research_lane_keeps_direction_out_of_respawn(db_session):
         **_active_direction("d-blocked1", "Parked on prerequisite"),
         # 5h ago — well past the 4h direction cooldown, so the ONLY thing that
         # can hold this direction is the BLOCKED lane itself.
-        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+        "last_researched_at": (_utcnow() - timedelta(hours=5)).isoformat(),
     }
     project = Project(
         name="Blocked Lane Hold",
@@ -852,7 +853,7 @@ async def test_parked_research_keeps_direction_out_of_respawn(db_session):
     direction = {
         **_active_direction("d-parked1", "Waiting to wake"),
         # 5h ago — well past the 4h cooldown, so only the PARKED task holds it.
-        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+        "last_researched_at": (_utcnow() - timedelta(hours=5)).isoformat(),
     }
     project = Project(
         name="Parked Lane Hold",
@@ -902,7 +903,7 @@ async def test_parked_legacy_research_keeps_direction_out_of_respawn(db_session)
     direction = {
         **_active_direction("d-parked-legacy1", "Waiting to wake"),
         # 5h ago — well past the 4h cooldown, so only the PARKED task holds it.
-        "last_researched_at": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+        "last_researched_at": (_utcnow() - timedelta(hours=5)).isoformat(),
     }
     project = Project(
         name="Legacy Parked Lane Hold",
@@ -990,7 +991,7 @@ async def test_all_paused_directions_still_get_strategic_via_backstop(
         payloads=[{"type": "design_doc_update", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(minutes=200),
+        created_at=_utcnow() - timedelta(minutes=200),
     )
     db_session.add(stale_strategic)
     await db_session.commit()
@@ -1048,7 +1049,7 @@ async def test_strategic_spawn_skipped_when_advisory_lock_held(db_session, mocke
         payloads=[{"type": "design_doc_update", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(minutes=200),
+        created_at=_utcnow() - timedelta(minutes=200),
     )
     db_session.add(stale_strategic)
     await db_session.commit()
@@ -1101,7 +1102,7 @@ async def test_architecture_cycle_triggers_on_first_cycle_with_empty_design_doc(
         payloads=[{"type": "design_doc_update", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(minutes=200),
+        created_at=_utcnow() - timedelta(minutes=200),
     )
     db_session.add(stale_strategic)
     await db_session.commit()
@@ -1166,7 +1167,7 @@ def _recent_strategic_task(project_id, minutes_ago: int) -> Task:
         payloads=[{"type": "design_doc_update", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(minutes=minutes_ago),
+        created_at=_utcnow() - timedelta(minutes=minutes_ago),
     )
 
 
@@ -1192,7 +1193,7 @@ async def test_refresh_marker_bypasses_spawn_cooldown_and_clears(db_session, moc
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "post_qualification:promoted",
                 "count": 1,
             },
@@ -1274,9 +1275,9 @@ async def test_refresh_marker_parks_when_breaker_tripped(db_session, mocker):
         vision={
             "purpose": "test",
             "_strategic_failures": 3,
-            "_strategic_failures_at": datetime.utcnow().isoformat(),  # recent → no decay
+            "_strategic_failures_at": _utcnow().isoformat(),  # recent → no decay
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "post_qualification:promoted",
                 "count": 1,
             },
@@ -1306,7 +1307,7 @@ def _active_strategic_task(project_id) -> Task:
         payloads=[{"type": "strategic_review", "base_branch": "main"}],
         status=TaskStatus.IN_PROGRESS,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow(),
+        created_at=_utcnow(),
     )
 
 
@@ -1332,9 +1333,9 @@ async def test_operator_refresh_fires_despite_tripped_breaker(db_session, mocker
         vision={
             "purpose": "test",
             "_strategic_failures": 3,
-            "_strategic_failures_at": datetime.utcnow().isoformat(),  # recent → no decay
+            "_strategic_failures_at": _utcnow().isoformat(),  # recent → no decay
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
@@ -1383,7 +1384,7 @@ async def test_operator_refresh_deferred_behind_active_cycle_posts_once(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
@@ -1469,7 +1470,7 @@ async def test_qualification_refresh_deferred_behind_active_cycle_stays_silent(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "post_qualification:promoted",
                 "count": 1,
                 # no origin → legacy qualification
@@ -1526,7 +1527,7 @@ async def test_operator_steering_consumed_posts_acted_confirmation(db_session, m
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
@@ -1599,7 +1600,7 @@ async def test_operator_marker_without_excerpt_posts_no_acted_confirmation(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
@@ -1663,7 +1664,7 @@ async def test_qualification_consumed_posts_no_acted_confirmation(db_session, mo
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "post_qualification:promoted",
                 "count": 1,
                 # no origin → legacy qualification
@@ -1728,9 +1729,9 @@ async def test_operator_refresh_deferred_on_cooldown_not_due_posts_once(
             "purpose": "test",
             # A very recent refresh fire keeps the min-interval floor closed, so
             # the pending marker is pending-but-not-due this tick.
-            "_strategic_refresh_last_fired_at": datetime.utcnow().isoformat(),
+            "_strategic_refresh_last_fired_at": _utcnow().isoformat(),
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
@@ -1800,7 +1801,7 @@ async def test_operator_refresh_deferred_on_payload_too_large_posts_once(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
@@ -2156,7 +2157,7 @@ async def test_evaluating_releases_direction_after_timeout(db_session):
     # Backdate updated_at past the timeout via raw UPDATE so onupdate doesn't fire
     from sqlalchemy import update as _update
 
-    stale = datetime.utcnow() - timedelta(minutes=90)
+    stale = _utcnow() - timedelta(minutes=90)
     await db_session.execute(
         _update(Task).where(Task.id == existing.id).values(updated_at=stale)
     )
@@ -2240,7 +2241,7 @@ async def test_pipelining_capped_at_one_extra_per_window(db_session):
     # Backdate parent's updated_at to make EVALUATING look stale.
     from sqlalchemy import update as _update
 
-    stale = datetime.utcnow() - timedelta(minutes=90)
+    stale = _utcnow() - timedelta(minutes=90)
     await db_session.execute(
         _update(Task).where(Task.id == parent.id).values(updated_at=stale)
     )
@@ -2300,7 +2301,7 @@ async def test_pipelining_allows_first_extra_when_no_prior(db_session):
 
     from sqlalchemy import update as _update
 
-    stale = datetime.utcnow() - timedelta(minutes=90)
+    stale = _utcnow() - timedelta(minutes=90)
     await db_session.execute(
         _update(Task).where(Task.id == parent.id).values(updated_at=stale)
     )
@@ -2380,7 +2381,7 @@ async def test_pipelining_blocked_while_children_active(db_session):
 
     from sqlalchemy import update as _update
 
-    stale = datetime.utcnow() - timedelta(minutes=90)
+    stale = _utcnow() - timedelta(minutes=90)
     await db_session.execute(
         _update(Task).where(Task.id == parent.id).values(updated_at=stale)
     )
@@ -2444,7 +2445,7 @@ async def test_pipelining_blocked_while_rollup_pr_open(db_session):
 
     from sqlalchemy import update as _update
 
-    stale = datetime.utcnow() - timedelta(minutes=90)
+    stale = _utcnow() - timedelta(minutes=90)
     await db_session.execute(
         _update(Task).where(Task.id == parent.id).values(updated_at=stale)
     )
@@ -2521,7 +2522,7 @@ async def test_pipelining_blocked_when_parent_has_blocked_children(db_session):
 
     from sqlalchemy import update as _update
 
-    stale = datetime.utcnow() - timedelta(minutes=90)
+    stale = _utcnow() - timedelta(minutes=90)
     await db_session.execute(
         _update(Task).where(Task.id == parent.id).values(updated_at=stale)
     )
@@ -2716,7 +2717,7 @@ async def test_pipelined_spawn_claims_distinct_key_alongside_stuck_parent(db_ses
 
     from sqlalchemy import update as _update
 
-    stale = datetime.utcnow() - timedelta(minutes=90)
+    stale = _utcnow() - timedelta(minutes=90)
     await db_session.execute(
         _update(Task).where(Task.id == parent.id).values(updated_at=stale)
     )
@@ -3408,6 +3409,82 @@ async def test_spawn_research_observe_mode_allows_initiative_over_budget(
             "max_global_autonomous_initiative_tasks_per_hour"
         ] = original_initiative
         _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_spawn_research_fails_closed_in_enforce_mode_when_snapshot_unavailable(
+    db_session, mocker
+):
+    """Enforce mode blocks spawn when budget snapshot calculation fails."""
+    project = Project(
+        name="Budget Snapshot Failure Enforce",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-snapshot-fail-enforce")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+
+    # Mock compute_autonomous_spawn_budget_snapshot to raise an exception
+    mocker.patch(
+        "app.autonomous_research.compute_autonomous_spawn_budget_snapshot",
+        side_effect=Exception("Database unavailable"),
+    )
+
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        # In enforce mode, the spawn should be blocked when snapshot fails
+        assert len(result.scalars().all()) == 0
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+
+
+@pytest.mark.asyncio
+async def test_spawn_research_fails_open_in_observe_mode_when_snapshot_unavailable(
+    db_session, mocker
+):
+    """Observe mode allows spawn even when budget snapshot calculation fails."""
+    project = Project(
+        name="Budget Snapshot Failure Observe",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-snapshot-fail-observe")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "observe"
+
+    # Mock compute_autonomous_spawn_budget_snapshot to raise an exception
+    mocker.patch(
+        "app.autonomous_research.compute_autonomous_spawn_budget_snapshot",
+        side_effect=Exception("Database unavailable"),
+    )
+
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        # In observe mode, the spawn should succeed despite snapshot failure
+        spawned_tasks = result.scalars().all()
+        assert len(spawned_tasks) == 1
+        assert spawned_tasks[0].first_payload["type"] == "research"
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
 
 
 @pytest.mark.asyncio
@@ -6498,7 +6575,7 @@ async def test_research_history_entry_has_correct_fields(db_session, mocker):
         return_value=[_make_finding(finding_title, direction_id)],
     )
 
-    before = datetime.utcnow()
+    before = _utcnow()
     await _handle_research_completion(task, "", db_session)
 
     await db_session.refresh(project)
@@ -7053,7 +7130,7 @@ async def test_research_endpoint_returns_429_when_direction_in_cooldown(
     direction_id = direction["id"]
 
     # Inject an active refractory window via PUT.
-    future_ts = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+    future_ts = (_utcnow() + timedelta(hours=1)).isoformat()
     put_resp = await client.put(
         f"/api/admin/projects/{project_id}/directions",
         json=[
@@ -7084,7 +7161,7 @@ async def test_research_endpoint_bypass_cooldown_creates_task(
     direction_id = direction["id"]
 
     # Put it in refractory.
-    future_ts = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+    future_ts = (_utcnow() + timedelta(hours=1)).isoformat()
     await client.put(
         f"/api/admin/projects/{project_id}/directions",
         json=[{**direction, "refractory_until": future_ts}],
@@ -7111,7 +7188,7 @@ async def test_research_endpoint_ignores_last_researched_at_without_refractory(
     )
     direction_id = direction["id"]
 
-    recent_ts = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
     await client.put(
         f"/api/admin/projects/{project_id}/directions",
         json=[{**direction, "last_researched_at": recent_ts}],
@@ -8095,7 +8172,7 @@ async def test_panel_review_task_with_pr_number_counts_as_no_pr(db_session):
 @pytest.mark.asyncio
 async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session):
     """When _strategic_failures >= 3 but last failure was >48h ago, force_strategic fires."""
-    old_timestamp = (datetime.utcnow() - timedelta(hours=72)).isoformat()
+    old_timestamp = (_utcnow() - timedelta(hours=72)).isoformat()
     project = Project(
         name="Decay Test Project",
         user_id="test-user-123",
@@ -8125,7 +8202,7 @@ async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session
 @pytest.mark.asyncio
 async def test_strategic_failures_auto_decay_persists_cleared_counter(db_session):
     """When auto-decay fires, vision._strategic_failures and _strategic_failures_at are cleared."""
-    old_timestamp = (datetime.utcnow() - timedelta(hours=72)).isoformat()
+    old_timestamp = (_utcnow() - timedelta(hours=72)).isoformat()
     project = Project(
         name="Decay Persistence Test",
         user_id="test-user-123",
@@ -8225,7 +8302,7 @@ async def test_problem_model_purpose_suppresses_force_strategic(db_session):
 @pytest.mark.asyncio
 async def test_strategic_failures_no_decay_when_recent(db_session):
     """When _strategic_failures >= 3 and last failure was recent (<48h), force_strategic stays blocked."""
-    recent_timestamp = (datetime.utcnow() - timedelta(hours=12)).isoformat()
+    recent_timestamp = (_utcnow() - timedelta(hours=12)).isoformat()
     project = Project(
         name="No Decay Test Project",
         user_id="test-user-123",
@@ -8575,7 +8652,7 @@ async def test_code_error_after_cooldown_allows_reproposal(db_session, mocker):
         latest_status_message="Tests failed: AssertionError in test_registration.py line 15",
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        created_at=datetime.utcnow() - timedelta(hours=72),
+        created_at=_utcnow() - timedelta(hours=72),
     )
     db_session.add(old_code_failed)
     await db_session.commit()
@@ -8642,7 +8719,7 @@ async def test_code_error_within_cooldown_blocks_reproposal(db_session, mocker):
         latest_status_message="Build failed: NullPointerException in OrderProcessor.java:88",
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        created_at=datetime.utcnow() - timedelta(hours=24),
+        created_at=_utcnow() - timedelta(hours=24),
     )
     db_session.add(recent_code_failed)
     await db_session.commit()
@@ -8706,7 +8783,7 @@ async def test_merged_pr_blocks_reproposal_permanently(db_session, mocker):
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        created_at=datetime.utcnow() - timedelta(days=30),
+        created_at=_utcnow() - timedelta(days=30),
     )
     db_session.add(old_merged)
     await db_session.commit()
@@ -9699,12 +9776,12 @@ async def test_collection_expires_stale_deferred_findings(db_session):
 
         ttl_days = 7
         # Stale finding: originally researched 8 days ago (beyond the 7-day default TTL)
-        stale_ts = (datetime.utcnow() - timedelta(days=ttl_days + 1)).isoformat()
+        stale_ts = (_utcnow() - timedelta(days=ttl_days + 1)).isoformat()
         stale_finding = _make_finding("Stale TTL finding", direction_id)
         stale_finding["originally_researched_at"] = stale_ts
 
         # Fresh finding: originally researched 1 day ago (within TTL)
-        fresh_ts = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        fresh_ts = (_utcnow() - timedelta(days=1)).isoformat()
         fresh_finding = _make_finding("Fresh TTL finding", direction_id)
         fresh_finding["originally_researched_at"] = fresh_ts
 
@@ -10275,7 +10352,7 @@ async def test_respawn_after_cooldown_injects_prior_failure_context(db_session, 
         latest_status_message="Tests failed: AssertionError in test_webhooks.py line 42",
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        created_at=datetime.utcnow() - timedelta(hours=72),
+        created_at=_utcnow() - timedelta(hours=72),
     )
     db_session.add(prior_failed)
     await db_session.commit()
@@ -10376,7 +10453,7 @@ async def test_respawn_after_cooldown_marks_recurring_failure(db_session, mocker
         latest_status_message="pytest assert failed in test_session.py",
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        created_at=datetime.utcnow() - timedelta(hours=72),
+        created_at=_utcnow() - timedelta(hours=72),
     )
     db_session.add(prior_failed)
     await db_session.commit()
@@ -10458,7 +10535,7 @@ async def test_respawn_after_cooldown_injects_failure_class_prompt_suffix(
         latest_status_message="pytest failures: AssertionError in test_ingest.py::test_parse",
         created_by="ORCHESTRATOR",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
-        created_at=datetime.utcnow() - timedelta(hours=72),
+        created_at=_utcnow() - timedelta(hours=72),
     )
     db_session.add(prior_failed)
     await db_session.commit()
@@ -12988,7 +13065,7 @@ async def test_strategic_max_interval_backstop_fires_when_stale(db_session, mock
         payloads=[{"type": "strategic_review", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(hours=4),
+        created_at=_utcnow() - timedelta(hours=4),
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     db_session.add(stale_strategic)
@@ -13031,7 +13108,7 @@ async def test_strategic_max_interval_backstop_quiet_within_window(db_session, m
         payloads=[{"type": "strategic_review", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(minutes=30),
+        created_at=_utcnow() - timedelta(minutes=30),
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     db_session.add(fresh_strategic)
@@ -13102,7 +13179,7 @@ async def test_strategic_max_interval_backstop_fires_when_all_directions_busy(
         payloads=[{"type": "strategic_review", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(hours=4),
+        created_at=_utcnow() - timedelta(hours=4),
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     db_session.add(stale_strategic)
@@ -13147,7 +13224,7 @@ async def test_strategic_max_interval_backstop_disabled_by_zero(db_session, mock
         payloads=[{"type": "strategic_review", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(days=7),
+        created_at=_utcnow() - timedelta(days=7),
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     db_session.add(stale_strategic)
@@ -14035,7 +14112,7 @@ async def _add_cross_cutting_research(session, project_id, *, status, age_minute
     if age_minutes:
         # Backdate created_at to test the cooldown leg (set after insert so the
         # default timestamp doesn't override it).
-        t.created_at = datetime.utcnow() - timedelta(minutes=age_minutes)
+        t.created_at = _utcnow() - timedelta(minutes=age_minutes)
         session.add(t)
         await session.commit()
     return t
@@ -14149,7 +14226,7 @@ async def _add_directed_research(
     session.add(t)
     await session.commit()
     if age_minutes:
-        backdated = datetime.utcnow() - timedelta(minutes=age_minutes)
+        backdated = _utcnow() - timedelta(minutes=age_minutes)
         t.created_at = backdated
         # _on_status_set auto-stamps completed_at=now() for terminal tasks;
         # backdate it too so _derive_completed_at returns the intended age.
@@ -14219,8 +14296,8 @@ async def test_directed_completed_guard_true_when_completion_recent_but_created_
         await db_session.commit()
         await db_session.refresh(project)
 
-        completed_at = datetime.utcnow() - timedelta(minutes=15)
-        old_created = datetime.utcnow() - timedelta(hours=4)
+        completed_at = _utcnow() - timedelta(minutes=15)
+        old_created = _utcnow() - timedelta(hours=4)
         task = Task(
             project_id=project.id,
             title="Research: direction-d-dir-old",
@@ -14503,7 +14580,7 @@ async def test_spawn_allowed_when_completed_directed_research_outside_cooldown(
         )
         db_session.add(old_completed)
         await db_session.commit()
-        backdated = datetime.utcnow() - timedelta(minutes=90)
+        backdated = _utcnow() - timedelta(minutes=90)
         old_completed.created_at = backdated
         # Backdate completed_at too — _on_status_set stamps it at now() on init,
         # but _derive_completed_at prefers completed_at over created_at.
@@ -15071,7 +15148,7 @@ async def test_operator_refresh_deferred_on_circuit_breaker_open_posts_once(db_s
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
@@ -15087,7 +15164,7 @@ async def test_operator_refresh_deferred_on_circuit_breaker_open_posts_once(db_s
         "state": "OPEN",
         "failure_count": 3,
         "success_count": 0,
-        "opened_at": datetime.utcnow(),
+        "opened_at": _utcnow(),
         "cooldown_seconds": 1800,
         "base_cooldown": 1800,
         "half_open_task_id": None,
@@ -15144,7 +15221,7 @@ async def test_operator_refresh_deferred_on_no_accounts_posts_once(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
@@ -15209,7 +15286,7 @@ async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_ses
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "post_qualification",
                 "count": 1,
                 "origin": "qualification",
@@ -15224,7 +15301,7 @@ async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_ses
         "state": "OPEN",
         "failure_count": 3,
         "success_count": 0,
-        "opened_at": datetime.utcnow(),
+        "opened_at": _utcnow(),
         "cooldown_seconds": 1800,
         "base_cooldown": 1800,
         "half_open_task_id": None,
@@ -15253,7 +15330,7 @@ async def test_operator_refresh_deferred_behind_bootstrap_pending_posts_once(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
@@ -15306,7 +15383,7 @@ async def test_qualification_refresh_deferred_behind_bootstrap_pending_stays_sil
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow().isoformat(),
                 "reason": "post_qualification:promoted",
                 "count": 1,
             },
@@ -15358,7 +15435,7 @@ async def test_qualification_refresh_forces_strategic_tick_when_due_and_modulo_i
         "app.strategic_spawning._spawn_design_doc_update",
         new=AsyncMock(return_value=True),
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     project = Project(
         name="Qualification refresh forces strategic",
         user_id="test-user-123",
@@ -15416,7 +15493,7 @@ async def test_qualification_refresh_parks_at_breaker_threshold(db_session, mock
         "app.strategic_spawning._spawn_design_doc_update",
         new=AsyncMock(return_value=True),
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     project = Project(
         name="Qualification refresh parks at breaker",
         user_id="test-user-123",
@@ -15475,7 +15552,7 @@ async def test_operator_refresh_still_forces_strategic_tick_when_due(
         "app.strategic_spawning._spawn_design_doc_update",
         new=AsyncMock(return_value=True),
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     project = Project(
         name="Operator refresh forces strategic",
         user_id="test-user-123",
@@ -15539,7 +15616,7 @@ def _blocked_dependent(project_id, need, *, direction_id="d-other"):
         title="create: needs a missing foundation",
         payloads=[{"type": "create", "prompt": "build feature", "base_branch": "main"}],
         status=TaskStatus.BLOCKED,
-        blocked_at=datetime.utcnow() - timedelta(hours=4),
+        blocked_at=_utcnow() - timedelta(hours=4),
         context={
             "direction_id": direction_id,
             "blocker": {
@@ -16045,7 +16122,7 @@ async def test_refractory_expired_allows_respawn(db_session):
     eligible for re-research — operator/strategist clear the refractory by
     removing or back-dating the field.
     """
-    past = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    past = (_utcnow() - timedelta(hours=1)).isoformat()
     direction = {
         **_active_direction("d-refract2", "Direction past refractory"),
         "refractory_until": past,
@@ -16150,7 +16227,7 @@ async def test_no_findings_completion_stamps_saturation_and_refractory(
     )
     # The refractory must be in the future
     refractory_dt = datetime.fromisoformat(target["refractory_until"])
-    assert refractory_dt > datetime.utcnow(), (
+    assert refractory_dt > _utcnow(), (
         "refractory_until must be in the future after a no-findings completion"
     )
 
@@ -16452,7 +16529,7 @@ async def test_zero_eligible_directions_triggers_strategic_refresh(db_session, m
         new=AsyncMock(return_value=True),
     )
 
-    future = (datetime.utcnow() + timedelta(hours=6)).isoformat()
+    future = (_utcnow() + timedelta(hours=6)).isoformat()
     direction = {
         **_active_direction("d-zeroelig1", "All-refractory direction"),
         "refractory_until": future,

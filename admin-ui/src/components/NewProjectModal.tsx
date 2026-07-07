@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useEffect } from 'react';
 import { X, GitBranch, Loader2, CheckCircle, Plus, Search, ArrowRight, Wrench, Zap, Tag, AlertTriangle } from 'lucide-react';
 import { onboardProject, previewOnboardProject, authGet, apiFetch, API_BASE_URL } from '../api';

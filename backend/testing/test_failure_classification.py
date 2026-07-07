@@ -1,6 +1,7 @@
 """Tests for failure_classification subtype helpers and classify_failure()."""
 
 import json
+from datetime import timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -3724,7 +3725,7 @@ class TestIsRecoverableInfraTerminal:
         from datetime import datetime, timedelta
         from app.failure_classification import is_recoverable_infra_terminal
 
-        recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        recent = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)).isoformat()
         t = self._fix_task(
             {
                 "failure_category": "AGENT_TIMEOUT",
@@ -3743,7 +3744,7 @@ class TestIsRecoverableInfraTerminal:
         from datetime import datetime, timedelta
         from app.failure_classification import is_recoverable_infra_terminal
 
-        recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        recent = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)).isoformat()
         t = self._fix_task(
             {
                 "failure_category": "AGENT_TIMEOUT",
@@ -3785,7 +3786,7 @@ class TestIsRecoverableInfraTerminal:
         from datetime import datetime, timedelta
         from app.failure_classification import is_recoverable_infra_terminal
 
-        old = (datetime.utcnow() - timedelta(hours=72)).isoformat()
+        old = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=72)).isoformat()
         t = self._fix_task(
             {
                 "failure_category": "AGENT_TIMEOUT",

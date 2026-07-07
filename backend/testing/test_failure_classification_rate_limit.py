@@ -7,6 +7,7 @@ authoritative-verdict short-circuit).
 """
 
 from unittest.mock import MagicMock
+from datetime import timezone
 
 from app.failure_classification import (
     AGENT_TIMEOUT,
@@ -453,7 +454,7 @@ class TestAtTimeFailureInstantCorrelation:
                 "id": account_id,
                 "disabled_models": {
                     "claude-sonnet-4-6": {
-                        "at": datetime.utcnow() - timedelta(minutes=2),
+                        "at": datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=2),
                         "kind": "rate_limit",
                         "hits": 1,
                     }
@@ -505,7 +506,7 @@ class TestAtTimeFailureInstantCorrelation:
         )
 
         # With at_time=failure_time (non-None), cooldown is detected → RATE_LIMIT.
-        failure_time = datetime.utcnow() - timedelta(minutes=5)
+        failure_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
         assert classify_failure(task, at_time=failure_time) == RATE_LIMIT, (
             "failure at failure_time must be RATE_LIMIT (cooldown active then)"
         )
@@ -550,7 +551,7 @@ class TestAtTimeFailureInstantCorrelation:
         )
 
         # Simulate agent_status code path: task with last_heartbeat set
-        failure_time = datetime.utcnow() - timedelta(minutes=5)
+        failure_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
         task = _task(
             "",
             ctx={
@@ -612,7 +613,7 @@ class TestAtTimeFailureInstantCorrelation:
             pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
-        failure_time = datetime.utcnow() - timedelta(minutes=5)
+        failure_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
         task = _task("", ctx={"llm_account_id": account_id})
 
         # Generic code-error label + cooldown active at the failure instant → RATE_LIMIT.

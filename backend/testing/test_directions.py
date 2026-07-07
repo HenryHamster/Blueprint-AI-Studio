@@ -17,6 +17,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from app.time_utils import _utcnow
 from app.models import (
     Alert,
     AlertSeverity,
@@ -1663,7 +1664,7 @@ async def test_cooldown_filter_ignores_recent_last_researched_at_without_refract
                 "paths": [],
                 "added_at": "2026-01-01T00:00:00",
                 "last_researched_at": (
-                    datetime.utcnow() - timedelta(hours=1)
+                    _utcnow() - timedelta(hours=1)
                 ).isoformat(),
             }
         ],
@@ -1698,7 +1699,7 @@ async def test_cooldown_filter_includes_direction_past_cooldown(db_session):
                 "paths": [],
                 "added_at": "2026-01-01T00:00:00",
                 "last_researched_at": (
-                    datetime.utcnow() - timedelta(hours=5)
+                    _utcnow() - timedelta(hours=5)
                 ).isoformat(),
             }
         ],
@@ -1872,7 +1873,7 @@ async def test_handle_research_completion_updates_last_researched_at(
         ],
     )
 
-    before = datetime.utcnow()
+    before = _utcnow()
     await _handle_research_completion(task, "", db_session)
 
     # Reload project from DB to get the updated directions
@@ -3090,7 +3091,7 @@ async def test_reactivation_clears_manual_intervention_state(
             d["status"] = "paused"
             d["auto_paused"] = True
             d["paused_reason"] = "Remediation attempts exhausted"
-            d["paused_at"] = datetime.utcnow().isoformat()
+            d["paused_at"] = _utcnow().isoformat()
             d["needs_manual_intervention"] = True
             d["escalation_notification_pending"] = True
             d["escalation_notification_retries"] = 2
@@ -3128,7 +3129,7 @@ async def test_operator_reactivation_stamps_grace_blocks_immediate_repause(
     direction_id = direction["id"]
 
     # Auto-paused (churn-family) with 5 stale cycles, 0 merges — Rule 2 would fire.
-    paused_at = datetime.utcnow() - timedelta(days=1)
+    paused_at = _utcnow() - timedelta(days=1)
     stale_history = [
         {
             "timestamp": (paused_at - timedelta(days=i)).isoformat(),
@@ -3178,7 +3179,7 @@ async def test_operator_reactivation_stamps_grace_blocks_immediate_repause(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
     d = next(x for x in project.directions if x["id"] == direction_id)
@@ -3875,7 +3876,7 @@ def _make_paused_direction(
     did: str, hours_ago: float, healthy_after_cooldown: bool = True
 ) -> dict:
     """Build a direction that is auto-paused at the given age."""
-    paused_at = (datetime.utcnow() - timedelta(hours=hours_ago)).isoformat()
+    paused_at = (_utcnow() - timedelta(hours=hours_ago)).isoformat()
     history = []
     if not healthy_after_cooldown:
         # Add saturated history so _check_direction_health still returns a reason
@@ -3930,7 +3931,7 @@ async def test_auto_recovery_blocked_by_needs_manual_intervention(db_session):
     direction = _make_paused_direction("d-manint01", hours_ago=50)
     direction["needs_manual_intervention"] = True
     direction["needs_manual_intervention_at"] = (
-        datetime.utcnow() - timedelta(hours=50)
+        _utcnow() - timedelta(hours=50)
     ).isoformat()
     # Simulate a lifetime-burn pause (the only pause type that sets needs_manual_intervention)
     direction["paused_reason"] = (
@@ -3996,7 +3997,7 @@ async def test_auto_recovery_with_frozen_churn_history(db_session):
             "Churn guardrail: 25 tasks finished without merging, 0 merged "
             "in last 5 cycles (merge rate 0%)"
         ),
-        "paused_at": (datetime.utcnow() - timedelta(hours=50)).isoformat(),
+        "paused_at": (_utcnow() - timedelta(hours=50)).isoformat(),
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
@@ -4069,7 +4070,7 @@ async def test_user_paused_direction_never_auto_recovered(db_session):
         "status": "paused",
         # auto_paused intentionally NOT set
         "paused_reason": "User manually paused",
-        "paused_at": (datetime.utcnow() - timedelta(hours=100)).isoformat(),
+        "paused_at": (_utcnow() - timedelta(hours=100)).isoformat(),
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
@@ -4169,7 +4170,7 @@ async def test_re_pause_during_monitoring_flags_manual_intervention(db_session):
         "research_history": [{"tasks_created": 0}] * 5,  # unhealthy → will re-pause
         "possibly_saturated": True,
         "remediation_monitor_started_at": (
-            datetime.utcnow() - timedelta(hours=1)
+            _utcnow() - timedelta(hours=1)
         ).isoformat(),
         "remediation_attempts": 3,
         "last_remediation_result": "merged",
@@ -4230,7 +4231,7 @@ async def test_re_pause_without_monitoring_does_not_flag_intervention(db_session
 @pytest.mark.asyncio
 async def test_stuck_manual_intervention_cleared_after_ttl(db_session):
     """needs_manual_intervention auto-clears via TTL when no remediation monitor ever started."""
-    flagged_at = (datetime.utcnow() - timedelta(hours=80)).isoformat()
+    flagged_at = (_utcnow() - timedelta(hours=80)).isoformat()
     direction = {
         "id": "d-stuck001",
         "text": "Stuck flagged direction",
@@ -4260,7 +4261,7 @@ async def test_stuck_manual_intervention_cleared_after_ttl(db_session):
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
 
     await db_session.refresh(project)
@@ -4272,7 +4273,7 @@ async def test_stuck_manual_intervention_cleared_after_ttl(db_session):
 @pytest.mark.asyncio
 async def test_stuck_manual_intervention_preserved_when_monitor_active(db_session):
     """TTL clear does not fire when a remediation_monitor_started_at is present."""
-    flagged_at = (datetime.utcnow() - timedelta(hours=80)).isoformat()
+    flagged_at = (_utcnow() - timedelta(hours=80)).isoformat()
     direction = {
         "id": "d-stuck002",
         "text": "Flagged with monitor",
@@ -4287,7 +4288,7 @@ async def test_stuck_manual_intervention_preserved_when_monitor_active(db_sessio
         "needs_manual_intervention": True,
         "needs_manual_intervention_at": flagged_at,
         "remediation_monitor_started_at": (
-            datetime.utcnow() - timedelta(hours=1)
+            _utcnow() - timedelta(hours=1)
         ).isoformat(),
     }
     project = Project(
@@ -4305,7 +4306,7 @@ async def test_stuck_manual_intervention_preserved_when_monitor_active(db_sessio
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
 
     await db_session.refresh(project)
@@ -8650,7 +8651,7 @@ async def test_completion_suggestion_toggles_off_when_no_longer_complete(db_sess
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
 
     # Direction stays active and eligible.
@@ -9179,7 +9180,7 @@ async def test_update_direction_clear_refractory_until(client: AsyncClient, mock
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id, text="Hold-clear direction")
 
-    future_ts = (datetime.utcnow() + timedelta(minutes=30)).isoformat()
+    future_ts = (_utcnow() + timedelta(minutes=30)).isoformat()
     await client.patch(
         f"/api/admin/projects/{project_id}/directions/{direction['id']}",
         json={"refractory_until": future_ts},
@@ -10825,7 +10826,7 @@ async def test_resurrect_pruned_direction_resets_ladder_and_restaffs_gap(
 
     project_id = await _deploy_project(client, mocker)
     pid = uuid.UUID(project_id)
-    now = datetime.utcnow()
+    now = _utcnow()
 
     # The exact terminal end-state the zombie auto-retire ladder leaves: status
     # 'completed', auto_completed residue stamped, EVERY ladder counter primed at

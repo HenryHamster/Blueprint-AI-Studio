@@ -357,6 +357,7 @@ async def compute_direction_progress(
     scope_conversion_rates: Dict[str, Dict[str, Any]] = {}
     prev_scope_conversion_rates: Dict[str, Dict[str, Any]] = {}
     budget_alert_fired = False
+    _budget_alert_direction_ids: List[str] = []
 
     active_directions = [
         d
@@ -1120,8 +1121,7 @@ async def compute_direction_progress(
             budget_utilization_pct = round((dir_cost / cost_budget_usd) * 100, 1)
             budget_exceeded = dir_cost > cost_budget_usd
             if budget_utilization_pct >= 80 and not d.get("_budget_alerted"):
-                d["_budget_alerted"] = True
-                flag_modified(project, "directions")
+                _budget_alert_direction_ids.append(did)
                 budget_alert_fired = True
                 asyncio.ensure_future(
                     dispatch_external_notification(
@@ -1244,9 +1244,39 @@ async def compute_direction_progress(
 
     direction_progress_list.sort(key=lambda x: x["cycles_in_window"], reverse=True)
 
-    if budget_alert_fired:
+    if budget_alert_fired and _budget_alert_direction_ids:
+        # Re-fetch the project row with FOR UPDATE (PostgreSQL) to avoid clobbering
+        # concurrent locked writes. The digest reads an unlocked snapshot; writing
+        # the whole directions column back from that snapshot would silently revert
+        # any concurrent update that touched the same column.
+        # On SQLite (tests), no concurrent writes exist so we write the already-
+        # loaded snapshot directly — a re-fetch via select() causes StaticPool
+        # connection conflicts when dedicated-session helpers are also in flight.
         try:
-            await session.commit()
+            from sqlmodel import select as _select
+            from app.database import resolve_dialect_name
+
+            _alert_set = set(_budget_alert_direction_ids)
+            if resolve_dialect_name(session) == "postgresql":
+                _write_target = (
+                    await session.execute(
+                        _select(Project)
+                        .where(Project.id == project_id)
+                        .with_for_update()
+                    )
+                ).scalars().first()
+            else:
+                _write_target = project
+            if _write_target is not None:
+                _any_stamped = False
+                for _ld in _write_target.directions or []:
+                    _lid = str(_ld.get("id") or _ld.get("direction_id") or "")
+                    if _lid in _alert_set and not _ld.get("_budget_alerted"):
+                        _ld["_budget_alerted"] = True
+                        _any_stamped = True
+                if _any_stamped:
+                    flag_modified(_write_target, "directions")
+                    await session.commit()
         except Exception:
             await session.rollback()
 
