@@ -562,6 +562,40 @@ describe('writePrHelper — generated script content', () => {
     expect(script).toContain('BODY=$(printf \'%s\\n\\n%s\' "$BODY" "$SHOTS_SECTION")');
   });
 
+  it('emits the mandatory test gate for self-repo automain task PR (baseBranch=automain, promotionTarget=main)', () => {
+    writePrHelper({
+      taskId: 'task-selfrepo-1',
+      workBranch: 'blueprint/task-selfrepo-1',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: false,
+      promotionTarget: 'main',
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    // shouldRunBackendMergeGate returns true for self-repo regardless of branch.
+    expect(script).toContain('# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/');
+    expect(script).toContain('backend/ touched on LTS branch — forcing WITH_TESTS=1 (mandatory test gate)');
+    expect(script).toContain('WITH_TESTS=1');
+  });
+
+  it('does NOT emit the mandatory test gate for a foreign repo off promotion target (baseBranch=automain, promotionTarget=main)', () => {
+    writePrHelper({
+      taskId: 'task-foreign-1',
+      workBranch: 'blueprint/task-foreign-1',
+      baseBranch: 'automain',
+      owner: 'SomeOtherOrg',
+      repo: 'SomeOtherRepo',
+      testsOnMainBranch: false,
+      promotionTarget: 'main',
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    // Foreign repo off promotion target: shouldRunBackendMergeGate is false.
+    expect(script).not.toContain('# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/');
+  });
+
   // Assert the generated ./pr script emits the fail-closed-aware create-PR
   // backoff — honoring Retry-After, exponential backoff with a cap, 503 treated
   // as retryable, and the old tight linear loop removed.

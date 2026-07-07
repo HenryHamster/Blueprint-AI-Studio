@@ -31,6 +31,17 @@ export function isBlueprintSelfRepo(owner: string, repo: string): boolean {
   );
 }
 
+/** True when the backend merge-time gate (standalone smoke + impacted-test
+ *  block) should run for a given config. Always true for the Blueprint self-repo
+ *  so that automain task PRs get the gate even though baseBranch !== promotionTarget.
+ *  For all other repos the existing LTS condition applies. */
+export function shouldRunBackendMergeGate(cfg: Pick<CodeChangeHelperConfig, 'owner' | 'repo' | 'baseBranch' | 'promotionTarget' | 'testsOnMainBranch'>): boolean {
+  if (isBlueprintSelfRepo(cfg.owner, cfg.repo)) return true;
+  return cfg.promotionTarget !== undefined
+    ? cfg.baseBranch === cfg.promotionTarget
+    : cfg.testsOnMainBranch;
+}
+
 // ── Git exclude for agent helper scripts ────────────────────────────────────
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they

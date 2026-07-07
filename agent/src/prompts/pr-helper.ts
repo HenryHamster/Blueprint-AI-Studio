@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { WORKSPACE } from '../index.js';
 import { agentTokenShellFn, githubTokenShellFn } from '../token-file.js';
-import { validateCfgShellSafety, type CodeChangeHelperConfig } from './code-change-helpers.js';
+import { validateCfgShellSafety, shouldRunBackendMergeGate, type CodeChangeHelperConfig } from './code-change-helpers.js';
 
 // Load the canonical sr-pr-section.js renderer from disk and base64-encode
 // it for safe bash-level injection into the generated ./pr script. Per
@@ -205,7 +205,7 @@ if [ -n "$SHOTS_SECTION" ]; then
   BODY=$(printf '%s\\n\\n%s' "$BODY" "$SHOTS_SECTION")
 fi
 
-${(cfg.promotionTarget !== undefined ? cfg.baseBranch === cfg.promotionTarget : cfg.testsOnMainBranch) ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
+${shouldRunBackendMergeGate(cfg) ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
 # The agent must not be able to skip backend tests on LTS-branch tasks.
 _BASE_GATE="${cfg.baseBranch}"
 _CMT_GATE=""

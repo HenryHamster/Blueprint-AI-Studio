@@ -8,6 +8,7 @@ import {
   detectLinterKind,
   validateCfgShellSafety,
   isBlueprintSelfRepo,
+  shouldRunBackendMergeGate,
   sanitizeCiFailureSelectors,
   type CodeChangeHelperConfig,
 } from './code-change-helpers.js';
@@ -773,7 +774,7 @@ if touches backend/; then
   else
     echo "[check] ruff not installed, skipping backend lint"
   fi
-  if [ "$WITH_TESTS" = "1" ] && [ "${(cfg.promotionTarget !== undefined ? cfg.baseBranch === cfg.promotionTarget : cfg.testsOnMainBranch) ? '1' : '0'}" = "1" ]; then
+  if [ "$WITH_TESTS" = "1" ] && [ "${shouldRunBackendMergeGate(cfg) ? '1' : '0'}" = "1" ]; then
     # --standalone --no-postgres: agent VM is e2-standard-2 (8 GB) and
     # cannot fit Docker build + Postgres sidecar + full pytest suite +
     # agent + Claude subprocess in memory. The full suite OOMs (exit
