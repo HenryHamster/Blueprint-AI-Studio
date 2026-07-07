@@ -258,6 +258,14 @@ describe('buildBootstrapPrompt', () => {
     expect(p).toContain('heredoc or pipe');
   });
 
+  it('bootstrap_prompt_states_dispatched_work_runs_concurrently', () => {
+    const p = buildBootstrapPrompt(base);
+    expect(p).toContain('Dispatched work runs concurrently and independently');
+    expect(p).toContain('dispatching BOTH now is the DEFAULT');
+    expect(p).toContain('do not stage one behind the other');
+    expect(p).toContain('conflicts_with');
+  });
+
   it('includes canonical fetch guidance when provided', () => {
     const p = buildBootstrapPrompt({
       ...base,
