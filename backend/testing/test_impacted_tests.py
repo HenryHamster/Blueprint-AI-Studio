@@ -60,10 +60,10 @@ def test_changed_module_maps_to_mock_patch_string_target(tmp_path):
     _write(
         root,
         "backend/testing/test_foo_patch.py",
-        'from unittest.mock import patch\n\n\n'
-        'def test_x():\n'
+        "from unittest.mock import patch\n\n\n"
+        "def test_x():\n"
         '    with patch("app.foo.bar", return_value=9):\n'
-        '        pass\n',
+        "        pass\n",
     )
     result = impacted_tests.resolve_impacted(["backend/app/foo.py"], root)
     assert result == ["backend/testing/test_foo_patch.py"]
@@ -90,9 +90,7 @@ def test_nested_app_module_resolves_both_import_forms(tmp_path):
         "backend/testing/test_agent_from_parent.py",
         "from app.routers import agent\n\n\ndef test_b():\n    assert agent\n",
     )
-    result = impacted_tests.resolve_impacted(
-        ["backend/app/routers/agent.py"], root
-    )
+    result = impacted_tests.resolve_impacted(["backend/app/routers/agent.py"], root)
     assert result == [
         "backend/testing/test_agent_dotted.py",
         "backend/testing/test_agent_from_parent.py",
@@ -225,6 +223,210 @@ def test_missing_testing_dir_is_graceful(tmp_path):
     # No backend/testing at all — the scan must be skipped, not raise.
     _write(root, "backend/app/foo.py", "def bar():\n    return 1\n")
     assert impacted_tests.resolve_impacted(["backend/app/foo.py"], root) == []
+
+
+def _write_surface_manifest(root: str, surfaces) -> None:
+    """Write a drift_sentinel_surfaces.json with the given surface entries."""
+    import json
+
+    _write(
+        root,
+        "backend/testing/drift_sentinel_surfaces.json",
+        json.dumps({"surfaces": surfaces}),
+    )
+
+
+def test_glob_to_regex_double_star_semantics():
+    """`**/` spans any depth (including zero); `*` stays within one segment."""
+    rx = impacted_tests._glob_to_regex("backend/app/**/*.py")
+    assert rx.match("backend/app/foo.py")  # zero intermediate dirs
+    assert rx.match("backend/app/routers/agent.py")  # one dir
+    assert rx.match("backend/app/a/b/c.py")  # many dirs
+    assert not rx.match("backend/app/foo.txt")  # extension guarded
+    assert not rx.match("backend/testing/test_foo.py")  # prefix guarded
+    # A single-segment '*' must not cross a '/'.
+    seg = impacted_tests._glob_to_regex("backend/app/*.py")
+    assert seg.match("backend/app/foo.py")
+    assert not seg.match("backend/app/routers/agent.py")
+
+
+def test_surface_glob_selects_drift_sentinel(tmp_path):
+    """A changed app path the sentinel never imports still selects it via surface.
+
+    This is the core gap this feature closes: a drift sentinel that AST-walks the
+    whole tree (and therefore imports no `app.<module>`) is invisible to the
+    dotted-import reverse-dep scan, but the surface manifest maps its guarded
+    surface glob to it so any matching changed path selects it.
+    """
+    root = str(tmp_path)
+    _make_tree(root)
+    # A sentinel that imports NO app module — only a testing/ helper — so the
+    # reverse-dep scan can never reach it.
+    _write(
+        root,
+        "backend/testing/test_tree_sentinel.py",
+        "from websocket_event_inventory import build\n\n\ndef test_x():\n    assert True\n",
+    )
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "backend/app/**/*.py",
+                "sentinels": ["backend/testing/test_tree_sentinel.py"],
+            }
+        ],
+    )
+    # A newly added app module the sentinel does NOT import.
+    _write(root, "backend/app/newthing.py", "def emit(): pass\n")
+    result = impacted_tests.resolve_impacted(["backend/app/newthing.py"], root)
+    assert result == ["backend/testing/test_tree_sentinel.py"]
+
+
+def test_surface_glob_non_matching_change_does_not_select_sentinel(tmp_path):
+    """A changed path outside the registered surface does NOT select the sentinel."""
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(
+        root,
+        "backend/testing/test_tree_sentinel.py",
+        "from websocket_event_inventory import build\n",
+    )
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "backend/app/**/*.py",
+                "sentinels": ["backend/testing/test_tree_sentinel.py"],
+            }
+        ],
+    )
+    # Frontend/agent/docs changes fall outside the surface -> no sentinel.
+    result = impacted_tests.resolve_impacted(
+        ["admin-ui/src/App.tsx", "agent/src/index.ts", "docs/API_REFERENCE.md"], root
+    )
+    assert result == []
+
+
+def test_surface_scoped_glob_matches_only_listed_files(tmp_path):
+    """A file-scoped surface glob fires only for the exact files it names."""
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(
+        root,
+        "backend/testing/test_event_sentinel.py",
+        "from pathlib import Path\n",
+    )
+    _write(root, "backend/app/notification_dispatch.py", "x = 1\n")
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "backend/app/notification_dispatch.py",
+                "sentinels": ["backend/testing/test_event_sentinel.py"],
+            }
+        ],
+    )
+    # The registered file selects the sentinel...
+    assert impacted_tests.resolve_impacted(
+        ["backend/app/notification_dispatch.py"], root
+    ) == ["backend/testing/test_event_sentinel.py"]
+    # ...but a sibling app file the glob does not name does not.
+    assert impacted_tests.resolve_impacted(["backend/app/foo.py"], root) == []
+
+
+def test_surface_sentinel_deduped_with_reference_match(tmp_path):
+    """A sentinel selected by BOTH import-reference and surface appears once."""
+    root = str(tmp_path)
+    _make_tree(root)
+    # This sentinel BOTH imports app.foo AND is registered against the tree.
+    _write(
+        root,
+        "backend/testing/test_dual.py",
+        "from app.foo import bar\n\n\ndef test_x():\n    assert bar()\n",
+    )
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "backend/app/**/*.py",
+                "sentinels": ["backend/testing/test_dual.py"],
+            }
+        ],
+    )
+    result = impacted_tests.resolve_impacted(["backend/app/foo.py"], root)
+    assert result == ["backend/testing/test_dual.py"]
+
+
+def test_surface_sentinel_absent_on_disk_not_emitted(tmp_path):
+    """A registered sentinel that does not exist on disk is never selected."""
+    root = str(tmp_path)
+    _make_tree(root)
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "backend/app/**/*.py",
+                "sentinels": ["backend/testing/test_vanished.py"],
+            }
+        ],
+    )
+    assert impacted_tests.resolve_impacted(["backend/app/foo.py"], root) == []
+
+
+def test_missing_surface_manifest_is_graceful(tmp_path):
+    """No manifest file at all -> no sentinels, no crash."""
+    root = str(tmp_path)
+    _make_tree(root)
+    # No drift_sentinel_surfaces.json written.
+    assert impacted_tests.resolve_impacted(["backend/app/foo.py"], root) == []
+
+
+def test_malformed_surface_manifest_is_graceful(tmp_path):
+    """Invalid JSON / wrong shape degrades to no sentinels rather than raising."""
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(root, "backend/testing/test_tree_sentinel.py", "x = 1\n")
+    # Invalid JSON.
+    _write(root, "backend/testing/drift_sentinel_surfaces.json", "{not json")
+    assert impacted_tests.resolve_impacted(["backend/app/foo.py"], root) == []
+    # Valid JSON but wrong shape (surfaces not a list).
+    _write(
+        root,
+        "backend/testing/drift_sentinel_surfaces.json",
+        '{"surfaces": "nope"}',
+    )
+    assert impacted_tests.resolve_impacted(["backend/app/foo.py"], root) == []
+    # Entry missing sentinels is skipped, not fatal.
+    _write_surface_manifest(root, [{"glob": "backend/app/**/*.py"}])
+    assert impacted_tests.resolve_impacted(["backend/app/foo.py"], root) == []
+
+
+def test_live_surface_manifest_is_valid_and_registers_websocket_sentinel():
+    """The committed manifest is well-formed and lists on-disk sentinels only.
+
+    Uses the REAL repo root: every glob must compile, every sentinel path must
+    exist under backend/testing/, and the reference websocket emitter inventory
+    sentinel must be registered against the backend/app tree surface.
+    """
+    repo_root = impacted_tests._DEFAULT_REPO_ROOT
+    manifest = impacted_tests._load_surface_manifest(repo_root)
+    assert manifest, "live drift_sentinel_surfaces.json compiled to no surfaces"
+    all_sentinels: set[str] = set()
+    for _regex, sentinels in manifest:
+        for sentinel in sentinels:
+            all_sentinels.add(sentinel)
+            assert sentinel.startswith("backend/testing/"), sentinel
+            assert os.path.isfile(os.path.join(repo_root, sentinel)), (
+                f"registered sentinel missing on disk: {sentinel}"
+            )
+    assert "backend/testing/test_websocket_emitter_inventory.py" in all_sentinels, (
+        "reference websocket emitter inventory sentinel must be registered"
+    )
+    # And it must actually fire for a changed app source path.
+    selected = impacted_tests.resolve_impacted(
+        ["backend/app/websocket_manager.py"], repo_root
+    )
+    assert "backend/testing/test_websocket_emitter_inventory.py" in selected
 
 
 def test_main_reads_stdin_and_writes_stdout(tmp_path, monkeypatch, capsys):

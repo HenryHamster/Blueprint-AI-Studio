@@ -39,9 +39,27 @@ Contract
 * Robust on partial trees: any listed path absent on disk is skipped (deletions),
   and the reverse-dep scan is skipped gracefully when ``backend/testing`` is
   absent.
+
+Drift-sentinel surfaces
+-----------------------
+Some test files are *drift sentinels*: they AST/rglob-scan a whole source tree
+(or a fixed source-file set) and diff it against a stored ``__fixtures__/*.json``
+snapshot — ``test_websocket_emitter_inventory.py`` walks the entire
+``backend/app`` tree, imports only ``backend/testing`` helpers, and never
+references any ``app.<module>``. The dotted-import reverse-dep scan above can
+NEVER select such a sentinel, so a drift-introducing change (a new emitter, a new
+``event_type``) merges green on the task PR and only breaks at the promotion-PR
+full matrix. To close that gap a committed manifest
+(``backend/testing/drift_sentinel_surfaces.json``) maps a SURFACE GLOB
+(``**`` = any depth, ``*`` = one path segment) to the sentinel test file(s) that
+guard it; ``resolve_impacted`` selects a registered sentinel whenever a changed
+path matches its surface glob (and the sentinel exists on disk). The manifest is
+data-only and the load is fail-open: a missing / unreadable / malformed manifest
+yields no sentinels rather than crashing the gate.
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -56,6 +74,9 @@ _DEFAULT_REPO_ROOT = os.path.normpath(
 _APP_PY_RE = re.compile(r"^backend/app/(.+)\.py$")
 # A backend test file, by the pytest ``test_`` collection convention.
 _TEST_PY_RE = re.compile(r"^backend/testing/test_[A-Za-z0-9_]+\.py$")
+
+# The committed surface -> drift-sentinel manifest, relative to the repo root.
+_SURFACE_MANIFEST_REL = "backend/testing/drift_sentinel_surfaces.json"
 
 
 def app_module_for_path(repo_rel: str) -> "str | None":
@@ -138,17 +159,119 @@ def _find_app_importers(changed_module: str, repo_root: str) -> "list[str]":
     return importers
 
 
+def _glob_to_regex(glob: str) -> "re.Pattern":
+    """Compile a repo-relative surface glob to an anchored regex.
+
+    Segment semantics match the manifest's documented convention:
+
+    * ``**/`` matches zero or more path segments (any depth, including none), so
+      ``backend/app/**/*.py`` matches both ``backend/app/foo.py`` and
+      ``backend/app/routers/agent.py``.
+    * a bare ``**`` matches anything, ``/`` included.
+    * ``*`` matches a single path segment (no ``/``).
+    * every other character is matched literally.
+    """
+    out: "list[str]" = []
+    i, n = 0, len(glob)
+    while i < n:
+        c = glob[i]
+        if c == "*":
+            if i + 1 < n and glob[i + 1] == "*":
+                if i + 2 < n and glob[i + 2] == "/":
+                    out.append(r"(?:.*/)?")  # '**/' -> optional any-depth dirs
+                    i += 3
+                else:
+                    out.append(r".*")  # bare '**'
+                    i += 2
+            else:
+                out.append(r"[^/]*")  # single-segment '*'
+                i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]]":
+    """Load and compile the drift-sentinel surface manifest (fail-open).
+
+    Returns a list of ``(compiled_glob, [sentinel_rel_path, ...])`` pairs. Any
+    problem — file absent, unreadable, invalid JSON, or a malformed/empty entry —
+    yields no pairs rather than raising, so a broken manifest can never crash the
+    merge gate (mirroring the module's "robust on partial trees" contract).
+    """
+    manifest_path = os.path.join(repo_root, _SURFACE_MANIFEST_REL)
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    surfaces = data.get("surfaces")
+    if not isinstance(surfaces, list):
+        return []
+    compiled: "list[tuple[re.Pattern, list[str]]]" = []
+    for entry in surfaces:
+        if not isinstance(entry, dict):
+            continue
+        glob = entry.get("glob")
+        sentinels = entry.get("sentinels")
+        if not isinstance(glob, str) or not glob:
+            continue
+        if not isinstance(sentinels, list):
+            continue
+        paths = [s for s in sentinels if isinstance(s, str) and s]
+        if not paths:
+            continue
+        try:
+            regex = _glob_to_regex(glob)
+        except re.error:
+            continue
+        compiled.append((regex, paths))
+    return compiled
+
+
+def _surface_sentinels(changed_paths, repo_root: str) -> "set[str]":
+    """Drift sentinels whose surface glob matches any changed path (on-disk only).
+
+    A registered sentinel is added only if it exists as a file under ``repo_root``,
+    so a stale manifest entry (sentinel deleted/renamed) never selects a vanished
+    file — the same existence discipline the reverse-dep scan applies.
+    """
+    manifest = _load_surface_manifest(repo_root)
+    if not manifest:
+        return set()
+    selected: "set[str]" = set()
+    for raw in changed_paths:
+        path = raw.strip()
+        if not path:
+            continue
+        for regex, sentinels in manifest:
+            if not regex.match(path):
+                continue
+            for sentinel in sentinels:
+                if sentinel in selected:
+                    continue
+                if os.path.isfile(os.path.join(repo_root, sentinel)):
+                    selected.add(sentinel)
+    return selected
+
+
 def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
     """Compute the impacted ``backend/testing/test_*.py`` set (sorted, deduped).
 
     ``changed_paths`` is any iterable of repo-relative paths. ``repo_root`` roots
     the on-disk existence checks and the reverse-dep scan.
     """
+    # Materialize once: ``changed_paths`` may be a single-use iterable, and it is
+    # scanned both here and by the surface-glob sentinel pass below.
+    changed_list = list(changed_paths)
     testing_dir = os.path.join(repo_root, "backend", "testing")
     impacted: "set[str]" = set()
     changed_modules: "list[str]" = []
 
-    for raw in changed_paths:
+    for raw in changed_list:
         path = raw.strip()
         if not path:
             continue
@@ -188,6 +311,11 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
                 if any(pat.search(content) for pat in pats):
                     impacted.add("backend/testing/" + name)
                     break
+
+    # Surface-glob drift sentinels: select whole-tree/fixed-set sentinels the
+    # dotted-import scan structurally cannot reach. Merged into the same set so
+    # dedup + stable-sort still hold.
+    impacted |= _surface_sentinels(changed_list, repo_root)
 
     return sorted(impacted)
 
