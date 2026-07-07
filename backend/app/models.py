@@ -2622,6 +2622,7 @@ class Alert(SQLModel, table=True):
         Index("ix_alert_project_severity", "project_id", "severity"),
         Index("ix_alert_project_domain", "project_id", "domain"),
         Index("ix_alert_project_event_type", "project_id", "event_type"),
+        Index("ix_alert_project_source", "project_id", "source"),
         Index(
             "ux_alert_active_dedupe_key",
             "project_id",

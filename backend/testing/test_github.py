@@ -4639,3 +4639,133 @@ async def test_github_budget_alert_silent_above_threshold(mocker):
     spy = mocker.patch.object(github, "_post_github_budget_alert")
     github._update_quota_state(4000, 5000, 3000, bucket_name="install")  # 80%
     assert spy.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_consumer_attribution_and_rollover_snapshot(mocker):
+    """_record_consumer_call bumps github_consumer_counts; rollover snapshots
+    the counts into github_consumer_counts_snapshot and clears the live dict;
+    _post_github_budget_alert snapshots at alert time without clearing."""
+    import app.shared_state as _ss
+    import app.github as github
+    from app.github import _record_consumer_call, _update_quota_state
+
+    # --- setup: clean state ---
+    _ss.github_consumer_counts.clear()
+    _ss.github_consumer_counts_snapshot.clear()
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    github._last_budget_alert_window = None
+
+    # --- part 1: _record_consumer_call bumps the correct consumer key ---
+    _record_consumer_call("release_qualifier", "https://api.github.com/repos/x/y/pulls")
+    _record_consumer_call("release_qualifier", "https://api.github.com/repos/x/y/pulls")
+    _record_consumer_call("ci_monitor", "https://api.github.com/repos/x/y/check-runs")
+    _record_consumer_call(None, "https://api.github.com/repos/x/y/issues")  # falls back to "unknown"
+
+    assert _ss.github_consumer_counts["release_qualifier"] == 2
+    assert _ss.github_consumer_counts["ci_monitor"] == 1
+    assert _ss.github_consumer_counts["unknown"] == 1
+
+    # --- part 2: quota-window rollover snapshots then clears ---
+    # Seed a prior reset_ts so _update_quota_state sees a new reset_ts as a rollover.
+    _ss.github_quota["reset_at"] = 9000000
+    _ss.github_quota["limit"] = 5000
+    _update_quota_state(4800, 5000, 9003600, bucket_name="install")  # new reset_ts
+
+    # Live dict is cleared after rollover.
+    assert _ss.github_consumer_counts == {}
+    # Snapshot holds the pre-rollover breakdown.
+    assert _ss.github_consumer_counts_snapshot["release_qualifier"] == 2
+    assert _ss.github_consumer_counts_snapshot["ci_monitor"] == 1
+    assert _ss.github_consumer_counts_snapshot["unknown"] == 1
+
+    # --- part 3: budget alert snapshots without clearing ---
+    _record_consumer_call("orchestrator", "https://api.github.com/repos/x/y/issues")
+    _record_consumer_call("orchestrator", "https://api.github.com/repos/x/y/issues")
+
+    mocker.patch("app.notification._send_webhook_notification")
+    github._post_github_budget_alert(800, 5000, 9003600)
+
+    # Snapshot updated with current counts; live dict still intact.
+    assert _ss.github_consumer_counts_snapshot["orchestrator"] == 2
+    assert _ss.github_consumer_counts.get("orchestrator") == 2  # not cleared
+
+
+@pytest.mark.asyncio
+async def test_off_backend_burn_estimated_from_header_drift(mocker):
+    """When X-RateLimit-Remaining drops more than local call count, the excess
+    is attributed to off-backend consumers and accumulated in
+    github_off_backend_estimate['cumulative_this_window']."""
+    import app.shared_state as _ss
+    from app.github import _update_quota_state
+
+    # Reset all relevant state.
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_call_counts.clear()
+    _ss.github_off_backend_estimate["cumulative_this_window"] = 0
+    _ss.github_off_backend_estimate["_last_remaining"] = None
+    _ss.github_off_backend_estimate["_last_backend_calls"] = 0
+
+    # First observation — establishes anchor; no diff yet.
+    _update_quota_state(1000, 5000, 9000000, bucket_name="install")
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 0
+
+    # Simulate 1 backend call counted locally, but remaining dropped by 11
+    # (10 extra calls came from external processes).
+    _ss.github_call_counts["GET /repos/{owner}/{repo}/pulls/{n}"] = 1
+    _update_quota_state(989, 5000, 9000000, bucket_name="install")
+    # observed_drop=11, local_delta=1 -> drift=10
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 10
+
+    # Another observation: remaining drops by 6, 5 more backend calls recorded.
+    _ss.github_call_counts["GET /repos/{owner}/{repo}/pulls/{n}"] = 6
+    _update_quota_state(983, 5000, 9000000, bucket_name="install")
+    # observed_drop=6, local_delta=5 -> drift=1, cumulative=11
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 11
+
+
+@pytest.mark.asyncio
+async def test_off_backend_burn_zero_when_drop_equals_local_calls(mocker):
+    """When X-RateLimit-Remaining drop exactly matches the local backend call
+    count, the off-backend estimate stays at zero (no external burn)."""
+    import app.shared_state as _ss
+    from app.github import _update_quota_state
+
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_call_counts.clear()
+    _ss.github_off_backend_estimate["cumulative_this_window"] = 0
+    _ss.github_off_backend_estimate["_last_remaining"] = None
+    _ss.github_off_backend_estimate["_last_backend_calls"] = 0
+
+    _update_quota_state(2000, 5000, 9000001, bucket_name="install")
+
+    # 3 backend calls, remaining drops by exactly 3 — no external burn.
+    _ss.github_call_counts["GET /repos/{owner}/{repo}/issues/{n}"] = 3
+    _update_quota_state(1997, 5000, 9000001, bucket_name="install")
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 0
+
+
+@pytest.mark.asyncio
+async def test_off_backend_burn_resets_on_window_rollover(mocker):
+    """When the quota window rolls over (new reset_ts), the cumulative
+    off-backend estimate resets to zero for the new window."""
+    import app.shared_state as _ss
+    from app.github import _update_quota_state
+
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None, "last_updated": None})
+    _ss.github_call_counts.clear()
+    _ss.github_off_backend_estimate["cumulative_this_window"] = 0
+    _ss.github_off_backend_estimate["_last_remaining"] = None
+    _ss.github_off_backend_estimate["_last_backend_calls"] = 0
+
+    # Build up a nonzero cumulative in the first window.
+    _update_quota_state(1000, 5000, 9000100, bucket_name="install")
+    _ss.github_call_counts["GET /repos/{owner}/{repo}/pulls/{n}"] = 1
+    _update_quota_state(990, 5000, 9000100, bucket_name="install")
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 9
+
+    # New reset_ts triggers a rollover — cumulative must reset to 0.
+    _ss.github_quota["limit"] = 5000
+    _update_quota_state(4999, 5000, 9003700, bucket_name="install")
+    assert _ss.github_off_backend_estimate["cumulative_this_window"] == 0
+    assert _ss.github_off_backend_estimate["_last_remaining"] == 4999

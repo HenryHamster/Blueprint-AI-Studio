@@ -459,6 +459,28 @@ github_call_counts: Dict[str, int] = {}
 # through the facade (``shared_state.github_call_counts_window_reset_at = ...``),
 # so it lives on the :mod:`app.shared_state` facade, not here.
 
+# Per-consumer call counters — tracks which caller (e.g. "orchestrator",
+# "release_qualifier", "ci_monitor") is burning the install-token quota this
+# window. Reset on rollover alongside github_call_counts. Keyed by the
+# consumer tag passed to _record_consumer_call; "unknown" when no tag supplied.
+github_consumer_counts: Dict[str, int] = {}
+
+# Snapshot of github_consumer_counts captured at low-budget alert time and at
+# each quota-window rollover (just before clearing the live dict). Unlike the
+# live dict this is never cleared on rollover — it holds the last complete or
+# partial window's breakdown for post-incident inspection.
+github_consumer_counts_snapshot: Dict[str, int] = {}
+
+# Off-backend quota burn estimate — tracks the gap between observed
+# X-RateLimit-Remaining drops and locally-counted backend calls. A nonzero
+# cumulative value indicates external processes (agent VMs, CI scripts) are
+# consuming quota this window that backend counters don't see.
+github_off_backend_estimate: Dict = {
+    "cumulative_this_window": 0,  # sum of (remaining_drop - local_calls) per observation
+    "_last_remaining": None,       # raw remaining at last observation (for delta)
+    "_last_backend_calls": 0,      # total backend calls at last observation
+}
+
 # Cache-hit counters — exposed in /api/health/detailed so we can see whether
 # the dedup caches are actually firing in production.  Each entry here is a
 # request we didn't have to send to GitHub.  Reset on the same window as

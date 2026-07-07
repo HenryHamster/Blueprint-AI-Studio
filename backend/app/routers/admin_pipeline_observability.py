@@ -1899,7 +1899,9 @@ async def get_ui_load_timing(
     """
     rows = (
         await session.execute(
-            select(UiLoadTimingSample).order_by(UiLoadTimingSample.recorded_at.asc())
+            select(UiLoadTimingSample)
+            .order_by(UiLoadTimingSample.recorded_at.asc())
+            .limit(5000)
         )
     ).scalars().all()
     surfaces: Dict[str, List[Dict[str, Any]]] = {}

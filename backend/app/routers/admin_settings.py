@@ -3909,6 +3909,9 @@ async def reset_github_quota_tracking(
     )
     _ss.github_call_counts.clear()
     _ss.github_call_counts_window_reset_at = None
+    _ss.github_off_backend_estimate["cumulative_this_window"] = 0
+    _ss.github_off_backend_estimate["_last_remaining"] = None
+    _ss.github_off_backend_estimate["_last_backend_calls"] = 0
     # Immediately probe to repopulate with a fresh observation.
     from app.github import probe_rate_limit  # noqa: PLC0415
 
