@@ -144,6 +144,16 @@ const GITHUB_TOKEN_REFRESH_MS = 45 * 60 * 1000;
 
 export let githubTokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
+// Monotonic generation stamp for the GitHub-token refresh schedule. Every
+// scheduleGithubTokenRefresh (via its leading stopGithubTokenRefresh) and every
+// stopGithubTokenRefresh bumps it. A refresh callback captures the generation it
+// was armed under and only reschedules itself if that generation is still
+// current — so a 45-min refresh caught in flight at task teardown or a warm-VM
+// task rotation cannot clear the NEXT task's freshly-armed timer and re-arm with
+// the finished task's captured params (which would silently disable proactive
+// GitHub token refresh for the new task).
+let githubRefreshGeneration = 0;
+
 /**
  * Schedule a proactive GitHub installation token refresh every 45 min, mirroring
  * scheduleProactiveTokenRefresh for the agent JWT. On each fire:
@@ -168,6 +178,12 @@ export function scheduleGithubTokenRefresh(
   stopGithubTokenRefresh();
 
   const { getOrchestratorUrl, getHeaders, log } = cfg();
+
+  // Capture the generation this schedule belongs to. stopGithubTokenRefresh()
+  // (called just above, and on every teardown/re-schedule) bumps the counter, so
+  // the trailing self-reschedule below can tell whether a newer task has since
+  // taken over the single module-level timer.
+  const myGeneration = githubRefreshGeneration;
 
   githubTokenRefreshTimer = setTimeout(() => {
     void (async () => {
@@ -212,11 +228,23 @@ export function scheduleGithubTokenRefresh(
       } catch (e) {
         log(`GitHub token refresh failed: ${String(e)}`);
       }
-      scheduleGithubTokenRefresh(taskId, workspace, owner, repo, isReadOnly);
+      // Only reschedule if this refresh still owns the active schedule. A newer
+      // scheduleGithubTokenRefresh (warm-VM task rotation) or a
+      // stopGithubTokenRefresh (task teardown) bumped the generation while this
+      // async body was in flight; re-arming here with this task's captured
+      // taskId/workspace/owner/repo would clobber the newer task's timer and
+      // silently disable its proactive refresh.
+      if (githubRefreshGeneration === myGeneration) {
+        scheduleGithubTokenRefresh(taskId, workspace, owner, repo, isReadOnly);
+      }
     })();
   }, GITHUB_TOKEN_REFRESH_MS);
 }
 
 export function stopGithubTokenRefresh(): void {
+  // Bump the generation so any in-flight refresh callback armed under the prior
+  // generation skips its trailing self-reschedule instead of re-arming a timer
+  // after teardown / for a superseded task.
+  githubRefreshGeneration++;
   if (githubTokenRefreshTimer) { clearTimeout(githubTokenRefreshTimer); githubTokenRefreshTimer = null; }
 }

@@ -306,6 +306,7 @@ def _clear_dispatch_prep_failures(task: Task) -> None:
     before it) still crashes, the rollback restores the counter so quarantine
     progress is never lost to a partially-successful attempt.
     """
+    _dispatch_prep_contention_streak.pop(str(task.id), None)
     if "_dispatch_prep_failures" in (task.context or {}):
         ctx = dict(task.context)
         ctx.pop("_dispatch_prep_failures", None)
@@ -446,6 +447,26 @@ ORCHESTRATOR_THROTTLE_SECONDS = int(os.getenv("ORCHESTRATOR_THROTTLE_SECONDS", "
 DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD = int(
     os.getenv("DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD", "3")
 )
+
+# A task whose dispatch preparation keeps hitting DB *contention* (lock timeout
+# / serialization failure — see is_db_contention_error) is normally left QUEUED
+# and retried next cycle WITHOUT counting toward the poison quarantine above,
+# because genuine contention self-heals in a cycle or two (prod saw ~489
+# lock_timeout events/24h falsely FAILing healthy tasks). But a PERSISTENT
+# non-transient error that keeps surfacing as a contention SQLSTATE (raw 25P02,
+# or an error raised while handling a contention error) would otherwise retry
+# EVERY cycle forever. This far-higher bound is the safety valve: a task that
+# hits contention this many CONSECUTIVE cycles is quarantined like a poison
+# task. The streak is tracked in leader-process memory (not the DB) so the
+# common transient path adds no write during the very contention burst it
+# handles; it resets on any successful dispatch (via
+# _clear_dispatch_prep_failures) so only a genuinely stuck task reaches the cap.
+DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD = int(
+    os.getenv("DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD", "40")
+)
+# task_id -> consecutive contention-classified dispatch-prep failures (leader
+# memory only; a leader restart harmlessly resets streaks to 0).
+_dispatch_prep_contention_streak: dict[str, int] = {}
 
 # ---------------------------------------------------------------------------
 # Liveness heartbeat + hard-watchdog machinery — extracted to
@@ -3498,6 +3519,11 @@ async def orchestrator_worker():
                         _prep_is_contention = is_db_contention_error(
                             _dispatch_prep_exc
                         )
+                        # Set when a contention-classified failure has recurred so
+                        # many consecutive cycles it is no longer plausibly
+                        # transient — forces the quarantine block below to fire
+                        # even though the poison counter was never incremented.
+                        _force_quarantine = False
                         if _prep_is_contention:
                             logger.warning(
                                 "[ORCHESTRATOR] Dispatch prep hit transient DB "
@@ -3532,14 +3558,48 @@ async def orchestrator_worker():
                                     f"for task {_qt_id}"
                                 )
                         if _prep_is_contention:
-                            # Leave the task QUEUED untouched: the rollback above
-                            # discarded any partial in-txn mutation and the
-                            # pre-claimed account was released, so the next cycle
-                            # re-dispatches cleanly once the lock frees. Do NOT
-                            # touch _dispatch_prep_failures and do NOT quarantine
-                            # — transient contention must never transition the
-                            # task to FAILED.
-                            continue
+                            # Transient DB contention self-heals in a cycle or two,
+                            # so the common case leaves the task QUEUED untouched:
+                            # the rollback above discarded any partial in-txn
+                            # mutation and the pre-claimed account was released, so
+                            # the next cycle re-dispatches cleanly once the lock
+                            # frees. Do NOT touch _dispatch_prep_failures and do
+                            # NOT quarantine — transient contention must never
+                            # transition the task to FAILED.
+                            #
+                            # Safety valve: a PERSISTENT non-transient error that
+                            # keeps surfacing as a contention SQLSTATE would
+                            # otherwise retry every cycle forever. Track the
+                            # consecutive-contention streak in leader memory (no DB
+                            # write on the hot contention path); only once it
+                            # exceeds the far-higher contention bound treat the
+                            # task as stuck and fall through to quarantine.
+                            _cont_key = str(_qt_id)
+                            _cont_streak = (
+                                _dispatch_prep_contention_streak.get(_cont_key, 0)
+                                + 1
+                            )
+                            if (
+                                _cont_streak
+                                < DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD
+                            ):
+                                _dispatch_prep_contention_streak[_cont_key] = (
+                                    _cont_streak
+                                )
+                                continue
+                            # Streak exhausted — no longer plausibly transient.
+                            _dispatch_prep_contention_streak.pop(_cont_key, None)
+                            _force_quarantine = True
+                            logger.error(
+                                "[ORCHESTRATOR] Task %s hit DB contention on "
+                                "dispatch prep %d consecutive cycles (threshold "
+                                "%d) — no longer treating as transient; "
+                                "quarantining as a stuck task. Last error: %r",
+                                _qt_id,
+                                _cont_streak,
+                                DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD,
+                                _dispatch_prep_exc,
+                            )
                         try:
                             _crashed_task = await _lock_dispatchable_task_for_mutation(
                                 session, _qt_id
@@ -3551,7 +3611,8 @@ async def orchestrator_worker():
                                     + 1
                                 )
                                 if (
-                                    _prep_failures
+                                    _force_quarantine
+                                    or _prep_failures
                                     >= DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD
                                 ):
                                     # Quarantine: take the poison task out of the
@@ -3569,9 +3630,19 @@ async def orchestrator_worker():
                                     if _crashed_task.vm_provisioned_at:
                                         _crashed_task.vm_stopped_at = _utcnow()
                                     _crashed_task.latest_status_message = (
-                                        f"Dispatch preparation crashed {_prep_failures} "
-                                        "consecutive cycles — quarantined: "
-                                        f"{_dispatch_prep_exc!r}"
+                                        (
+                                            "Dispatch preparation hit persistent DB "
+                                            "contention "
+                                            f"{DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD} "
+                                            "consecutive cycles — quarantined: "
+                                            f"{_dispatch_prep_exc!r}"
+                                        )
+                                        if _force_quarantine
+                                        else (
+                                            f"Dispatch preparation crashed {_prep_failures} "
+                                            "consecutive cycles — quarantined: "
+                                            f"{_dispatch_prep_exc!r}"
+                                        )
                                     )[:500]
                                     from app.failure_classification import (
                                         persist_failure_category as _pfc_dispatch,

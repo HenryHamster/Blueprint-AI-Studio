@@ -449,8 +449,21 @@ async def run_metrics_integrity_sweep(
                 with contextlib.suppress(Exception):
                     await session.rollback()
         if enrolled:
-            with contextlib.suppress(Exception):
+            try:
                 await session.commit()
+            except Exception as exc:  # noqa: BLE001 — a failed commit must not abort the tick
+                # The enrolled EvergreenBacklogItem rows are rolled back on a failed
+                # commit; log it (observability was about to report enrolled=N) and
+                # zero the count so the tick summary does not overstate its own numbers.
+                logger.warning(
+                    "[METRICS_INTEGRITY] enrollment commit failed; %d enrolled "
+                    "finding(s) rolled back: %s",
+                    enrolled,
+                    exc,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+                enrolled = 0
 
     tick = _OBSERVABILITY.record_tick(
         now=_now, mode=cfg["mode"], results=results, enrolled=enrolled
@@ -1170,6 +1183,7 @@ async def check_completion_debt_completeness(
     from app.completion_debt import (
         STATUS_DISMISSED,
         STATUS_OPEN,
+        STATUS_RESOLVED,
         _iter_seed_debts,
     )
     from app.models import CompletionDebtEntry, Project
@@ -1293,8 +1307,22 @@ async def check_completion_debt_completeness(
             if status == STATUS_OPEN:
                 open_count += 1
                 continue
-            # Absent, resolved, or any other non-open/non-dismissed state while the
-            # obligation is currently expected active == an under-count.
+            # The no-CI gate obligation is triggered by
+            # ``merge_gate_runtime.last_unverified_reason``, a PERMANENT historical
+            # stamp that a verified run NEVER clears (see
+            # ci_resolution.record_no_ci_gate_runtime). The stamp therefore does NOT
+            # prove the obligation is currently live — the authoritative live signal
+            # is the debt row itself, which the recorder RE-OPENS (arecord_completion_debt)
+            # on any genuine recurrence. A RESOLVED row is thus a legitimate operator
+            # disposition, not an under-count; only an ABSENT row (recorder silently
+            # failed to open one at all) is real drift. Without this carve-out,
+            # resolving the no_ci_gate debt makes the sweep flag the project on every
+            # tick forever (evergreen re-enroll in enforce mode).
+            if status == STATUS_RESOLVED and key.startswith("no_ci_gate:"):
+                continue
+            # Absent, resolved (for obligations recomputed live from ground truth
+            # every tick, e.g. capability_trial), or any other non-open/non-dismissed
+            # state while the obligation is currently expected active == an under-count.
             missing.append(key)
 
         expected_active = open_count + len(missing)
@@ -1375,7 +1403,12 @@ async def check_rollup_child_landing_credit(ctx: SweepContext) -> List[CheckResu
         await ctx.session.execute(
             select(Task)
             .where(Task.status == TaskStatus.COMPLETED)
-            .order_by(Task.id.desc())
+            # Order by created_at, NOT Task.id: task ids are uuid4 (non-monotonic),
+            # so id.desc() yields a quasi-static RANDOM subset instead of the most
+            # recent tasks — new rollup regressions would land outside the sample
+            # with ~uniform probability and go unaudited. Matches the recency
+            # ordering used by the other DB checks in this module.
+            .order_by(Task.created_at.desc())
             .limit(ctx.sample_limit)
         )
     ).scalars().all()
@@ -1662,6 +1695,10 @@ async def check_problem_model_duplicate_id_sweep(
     ``pending_user_confirmation`` append on replay, ``gaps`` re-open without
     dedup). The check is purely structural — it does NOT parse or validate any
     business rules, only checks ``item["id"]`` uniqueness within each collection.
+    Rows missing an ``id`` entirely are reported as a DISTINCT population (id-less
+    rows) rather than folded into the duplicate count — a missing id is exactly the
+    malformed-write population this sweep targets and mislabeling it as a duplicate
+    misdirects triage.
 
     Collections audited: ``pending_user_confirmation``, ``gaps``,
     ``archived_gaps``, and ``friction`` (all carry a top-level ``"id"`` field).
@@ -1711,18 +1748,31 @@ async def check_problem_model_duplicate_id_sweep(
 
         total_raw = 0
         total_distinct = 0
+        total_true_dups = 0
+        total_missing = 0
         dup_collections: List[str] = []
+        missing_collections: List[str] = []
         for coll_name in _ID_KEYED_COLLECTIONS:
             items = pm.get(coll_name)
             if not isinstance(items, list) or not items:
                 continue
             ids = [item.get("id") for item in items if isinstance(item, dict)]
-            raw_len = len(ids)
-            distinct_len = len({i for i in ids if i is not None})
-            total_raw += raw_len
+            # Separate the two malformed populations: id-less rows (item has no
+            # "id") vs TRUE duplicate ids (a non-None id repeated). Counting raw
+            # length against distinct non-None ids conflates them, so a single
+            # missing-id row would be mislabeled as a "duplicate id".
+            present_ids = [i for i in ids if i is not None]
+            missing = len(ids) - len(present_ids)
+            distinct_len = len(set(present_ids))
+            true_dups = len(present_ids) - distinct_len
+            total_raw += len(ids)
             total_distinct += distinct_len
-            if distinct_len < raw_len:
+            total_true_dups += true_dups
+            total_missing += missing
+            if true_dups > 0:
                 dup_collections.append(coll_name)
+            if missing > 0:
+                missing_collections.append(coll_name)
 
         if total_raw == 0:
             results.append(
@@ -1735,22 +1785,33 @@ async def check_problem_model_duplicate_id_sweep(
             )
             continue
 
-        duplicates = total_raw - total_distinct
-        if duplicates > 0:
+        # delta == total_true_dups + total_missing == total_raw - total_distinct,
+        # so the self_reported/ground_truth/delta relationship is preserved while
+        # the detail attributes each anomaly to its true category.
+        if total_true_dups > 0 or total_missing > 0:
+            note_parts: List[str] = []
+            if total_true_dups > 0:
+                note_parts.append(
+                    f"{total_true_dups} duplicate id(s) across "
+                    f"{len(dup_collections)} collection(s): "
+                    + ", ".join(dup_collections)
+                )
+            if total_missing > 0:
+                note_parts.append(
+                    f"{total_missing} id-less row(s) across "
+                    f"{len(missing_collections)} collection(s): "
+                    + ", ".join(missing_collections)
+                )
             results.append(
                 CheckResult(
                     check="problem_model_duplicate_id_sweep",
                     status=CheckStatus.FLAGGED,
                     self_reported=total_raw,
                     ground_truth=total_distinct,
-                    delta=duplicates,
+                    delta=total_true_dups + total_missing,
                     severity="warn",
                     subject=pid,
-                    detail=(
-                        f"{duplicates} duplicate id(s) across "
-                        f"{len(dup_collections)} collection(s): "
-                        + ", ".join(dup_collections)
-                    ),
+                    detail="; ".join(note_parts),
                 )
             )
         else:
