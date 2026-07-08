@@ -524,7 +524,16 @@ vi.mock('./strategic-sections.js', () => ({
 
 vi.mock('../telemetry.js', () => ({
   ...Object.fromEntries(TELEMETRY_EXPORT_NAMES.map((name) => [name, vi.fn()])),
-  buildPromptSizeTelemetry: vi.fn(),
+  buildPromptSizeTelemetry: vi.fn().mockReturnValue({
+    prompt_size_bytes: 5000,
+    prompt_section_count: 3,
+    prompt_section_sizes: [
+      { name: 'problem_model', bytes: 2000 },
+      { name: 'running_update', bytes: 1500 },
+      { name: 'design_doc', bytes: 1000 },
+    ],
+  }),
+  setPromptSizeTelemetry: vi.fn(),
   recordFormatMiss: vi.fn(),
   recordFormatRepairAttempt: vi.fn(),
   recordFormatRepairSuccess: vi.fn(),
@@ -573,7 +582,7 @@ import * as mockedResearchDirectionContextModule from './research-direction-cont
 import * as mockedResearchPlanModule from './research-plan.js';
 import * as mockedStrategicSectionsModule from './strategic-sections.js';
 import * as mockedTelemetryModule from '../telemetry.js';
-import { recordFormatMiss, recordFormatRepairAttempt } from '../telemetry.js';
+import { recordFormatMiss, recordFormatRepairAttempt, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 
 async function expectMockCoversActualNamedExports(moduleId: string, mockedModule: Record<string, unknown>) {
   const actual = await vi.importActual<Record<string, unknown>>(moduleId);
@@ -1686,6 +1695,57 @@ describe('handleStrategic prompt_suffix wiring', () => {
       'task-4', { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef,
     );
     expect(capturedThinkerParams?.availableCapabilitiesSection).toBe('');
+  });
+});
+
+describe('handleStrategic prompt section telemetry', () => {
+  beforeEach(() => {
+    capturedThinkerPrompt = undefined;
+    vi.mocked(buildPromptSizeTelemetry).mockClear();
+    vi.mocked(setPromptSizeTelemetry).mockClear();
+  });
+
+  it('test_strategic_handler_emits_prompt_section_telemetry', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      prompt_suffix: 'DEPLOY FRAMING: integration-branch.',
+      problem_model: { intent: { purpose: 'real' }, capabilities: [], gaps: [] },
+    };
+    const statusRef = { value: '' };
+
+    await handleStrategic(
+      'task-telemetry', payload, {}, 'tok', 'owner', 'repo', null, statusRef,
+    );
+
+    // buildPromptSizeTelemetry must have been called with the assembled prompt
+    // and a non-empty list of named section tuples.
+    expect(buildPromptSizeTelemetry).toHaveBeenCalledTimes(1);
+    const callArgs = vi.mocked(buildPromptSizeTelemetry).mock.calls[0];
+    const fullPrompt = callArgs[0];
+    const sections = callArgs[1];
+
+    // The full prompt must contain the base thinker prompt content plus the suffix.
+    expect(fullPrompt).toContain('BASE_THINKER_PROMPT');
+    expect(fullPrompt).toContain('DEPLOY FRAMING: integration-branch.');
+
+    // Section tuples must include the major content-bearing params.
+    const sectionNames = new Set(sections.map(([name]) => name));
+    expect(sectionNames.has('problem_model')).toBe(true);
+    expect(sectionNames.has('running_update')).toBe(true);
+    expect(sectionNames.has('context_prefix')).toBe(true);
+    expect(sectionNames.has('design_doc')).toBe(true);
+    expect(sectionNames.has('portfolio_composition')).toBe(true);
+
+    // setPromptSizeTelemetry must have been called with the telemetry result.
+    expect(setPromptSizeTelemetry).toHaveBeenCalledTimes(1);
+    const telemetryArgs = vi.mocked(setPromptSizeTelemetry).mock.calls[0];
+    expect(telemetryArgs[0]).toBe(5000);   // prompt_size_bytes from mock
+    expect(telemetryArgs[1]).toBe(3);       // prompt_section_count from mock
+    expect(telemetryArgs[2]).toEqual([
+      { name: 'problem_model', bytes: 2000 },
+      { name: 'running_update', bytes: 1500 },
+      { name: 'design_doc', bytes: 1000 },
+    ]);
   });
 });
 

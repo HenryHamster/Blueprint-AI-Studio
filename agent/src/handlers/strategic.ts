@@ -32,6 +32,7 @@ import {
   buildThinkerPrompt,
   runThinkerWithGate,
 } from '../prompts/thinker.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import {
   buildStrategicCompletionLogs,
   readProgressArtifact,
@@ -781,6 +782,61 @@ prompts, schemas, tools, or orchestration.` : '';
     // input — deployment framing, stabilize audit-findings hints, stall nudges,
     // mode hints — so it belongs in the analysis pass that produces decisions.
     const thinkerPromptWithSuffix = thinkerPrompt + promptSuffix;
+
+    // ── Prompt section telemetry ──
+    // Build per-section byte attribution from the major thinker-prompt blocks so
+    // strategic-turn cost is visible in the per-section cost breakdown. Sections
+    // map 1:1 to thinkerParams fields; buildPromptSizeTelemetry sorts descending
+    // and caps at the top 3 for heartbeat payload size.
+    const thinkerPromptSectionTuples: Array<[string, string]> = [
+      ['context_prefix', thinkerParams.contextPrefix],
+      ['packer_meta', thinkerParams.packerMetaSection],
+      ['strategic_context', thinkerParams.strategicContext],
+      ['problem_model', thinkerParams.problemModelSection],
+      ['cycle_start_reconciliation', thinkerParams.cycleStartReconciliationSection || ''],
+      ['reflection', thinkerParams.reflectionSection],
+      ['self_improvement', thinkerParams.selfImprovementBlock],
+      ['running_update', thinkerParams.runningUpdateSection],
+      ['running_update_superseded', thinkerParams.runningUpdateSupersededSection || ''],
+      ['design_doc', thinkerParams.designDocJson],
+      ['vision', thinkerParams.visionJson],
+      ['outcome', thinkerParams.outcomeSection],
+      ['decision_outcomes', thinkerParams.previousDecisionOutcomes],
+      ['retirement_critiques', thinkerParams.pastRetirementCritiquesSection],
+      ['retired_directions', thinkerParams.retiredDirectionsSummarySection],
+      ['dir_summary', thinkerParams.dirSummaryText],
+      ['dir_health', thinkerParams.dirHealthSummary],
+      ['staged_directions', thinkerParams.stagedDirectionsSection || ''],
+      ['user_paused', thinkerParams.userPausedSection],
+      ['rejected_proposals', thinkerParams.rejectedProposalsSection],
+      ['operator_overrides', thinkerParams.operatorOverridesSection],
+      ['portfolio_composition', thinkerParams.portfolioCompositionText],
+      ['available_capabilities', thinkerParams.availableCapabilitiesSection || ''],
+      ['model_health', thinkerParams.modelHealthSection],
+      ['prune_candidates', thinkerParams.pruneCandidatesSection || ''],
+      ['system_maturity', thinkerParams.systemMaturitySection],
+      ['drift', thinkerParams.driftSection],
+      ['held_directions', thinkerParams.heldDirectionsSection || ''],
+      ['resident_exam_leads', thinkerParams.residentExamLeadsSection || ''],
+      ['recent_work', thinkerParams.recentWorkSection],
+      ['feedback', thinkerParams.feedbackSection],
+      ['question', thinkerParams.questionSection],
+      ['thread', thinkerParams.threadSection],
+      ['version_phase', thinkerParams.versionPhaseSection],
+      ['memo_citations', thinkerParams.memoCitationsSection],
+      ['efficiency_snapshot', thinkerParams.efficiencySnapshotSection],
+      ['ci_compliance', thinkerParams.ciComplianceSection || ''],
+      ['completion_debt', thinkerParams.completionDebtSection || ''],
+      ['sweep_comparison', thinkerParams.sweepComparisonSection || ''],
+      ['local_runner', thinkerParams.localRunnerSection || ''],
+      ['payload_staleness', thinkerParams.payloadStalenessSection || ''],
+    ];
+    const thinkerTelemetry = buildPromptSizeTelemetry(thinkerPromptWithSuffix, thinkerPromptSectionTuples);
+    setPromptSizeTelemetry(
+      thinkerTelemetry.prompt_size_bytes,
+      thinkerTelemetry.prompt_section_count,
+      thinkerTelemetry.prompt_section_sizes,
+    );
 
     const thinkerGateResult = await runThinkerWithGate(
       thinkerPromptWithSuffix, taskId, ws, statusRef, model, effort, disallowedTools,
