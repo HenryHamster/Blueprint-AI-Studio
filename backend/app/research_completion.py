@@ -826,7 +826,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                         "total_cycles": total_cycles,
                     }
                 )
-            elif not _proven_gated and _should_autocomplete_exhausted(target):
+            elif not _proven_gated and not _owns_uncovered and _should_autocomplete_exhausted(target):
                 reason = _exhaustion_complete_reason(target)
                 target["status"] = "completed"
                 target["completed_at"] = now_iso

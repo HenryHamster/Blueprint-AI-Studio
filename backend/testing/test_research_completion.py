@@ -3080,6 +3080,127 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
 
 
 @_pytest.mark.asyncio
+async def test_dedup_deadlock_exhaustion_deferred_when_owns_uncovered_criterion(
+    db_session,
+):
+    """The dedup-deadlock exhaustion path (line 750 call site of
+    _maybe_autocomplete_exhausted_direction) must defer auto-complete when the
+    direction owns an uncovered acceptance criterion.
+
+    Mirrors the _stamp_no_findings_refractory exhaustion-gate test
+    (test_exhaustion_autocomplete_deferred_when_direction_owns_uncovered_criterion).
+    Without this gate, a dedup-deadlocked direction that owns uncovered criteria
+    would retire without satisfying those criteria.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import (
+        _active_direction,
+        _make_research_task,
+        _map_direction_to_criterion,
+    )
+
+    direction_id = "d-dl-uncovered-criterion"
+    old_history = [
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)
+            ).isoformat(),
+            "task_id": "t-dl-crit1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 2,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)
+            ).isoformat(),
+            "task_id": "t-dl-crit2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1,
+                "word_overlap_dedup": 1,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+    ]
+    direction = {
+        **_active_direction(direction_id, "Dedup deadlock + uncovered criterion"),
+        "research_history": old_history,
+    }
+    project = _Project(
+        name="Deadlock Criterion Gate Test",
+        user_id="test-user-dlcrit",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Map the direction to an UNCOVERED criterion so the gate fires.
+    await _map_direction_to_criterion(
+        db_session, project, direction_id, covered=False
+    )
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Trigger dedup deadlock via a 3rd consecutive dedup-zero cycle.
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        1,  # hash_dedup_count — dedup activity
+        0,  # word_overlap_count
+        0,  # file_overlap_count
+        0,  # evidence_overlap_count
+        0,  # type_filtered_count
+        0,  # empty_prompt_count
+        "research-branch",
+        "main",
+        0,  # research_depth
+        None,  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    # The criterion gate defers exhaustion auto-complete; the direction falls
+    # through to the existing auto-pause path (status='paused').  The critical
+    # invariant is that it is NOT terminal-completed.
+    assert d["status"] != "completed", (
+        "dedup-deadlocked direction with uncovered criterion must NOT be "
+        f"terminal-completed (gate must defer exhaustion auto-complete), "
+        f"got status={d['status']!r}"
+    )
+    assert d.get("auto_completed") is not True, (
+        "auto_completed must NOT be set when exhaustion is gated on uncovered criteria"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
     """When a dedup deadlock fires but exhaustion-completion is DECLINED (the
     direction is externally frozen), the existing auto-pause path still runs and
@@ -14651,6 +14772,47 @@ class TestStampNoFindingsRefractory:
         direction2 = project2.directions[0]
         assert direction2.get("status") != "completed", (
             "A budget-paused (cost_pause_evidence) direction must NOT be auto-completed"
+        )
+
+    def test_exhaustion_autocomplete_deferred_when_direction_owns_uncovered_criterion(self):
+        """A genuinely-exhausted direction with an uncovered acceptance criterion
+        must NOT auto-complete via the exhaustion route — the criterion must be
+        satisfied first.
+
+        The proven-merge path (>=3 verified merges) already gates on criterion
+        coverage via direction_owns_uncovered_criterion; this guards the additive
+        exhaustion path (<3 merges, saturated/deadlocked) against the same blind
+        spot. Without this gate, a direction that owns uncovered criteria can
+        retire via dedup-deadlock, already-fixed-deadlock, or saturation-with-
+        <3-merges without satisfying those criteria.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+        from unittest.mock import patch, AsyncMock
+
+        # Saturated, genuinely exhausted history (< 3 merges)
+        already_fixed_history = [
+            {"tasks_created": 2, "scope_empty_noop_count": 2, "prs_merged": 0}
+            for _ in range(3)
+        ]
+        task = self._make_task()
+        project = self._make_exhausted_project(research_history=already_fixed_history)
+
+        with patch(
+            "app.acceptance_criteria.direction_owns_uncovered_criterion",
+            AsyncMock(return_value=True),
+        ):
+            self._run(
+                project, _stamp_no_findings_refractory(task, self._make_session())
+            )
+
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "A direction with uncovered criteria must NOT auto-complete via "
+            f"exhaustion, got status={direction.get('status')!r}"
+        )
+        assert direction.get("status") == "active", (
+            f"Direction must remain active when exhaustion is gated on uncovered "
+            f"criteria, got status={direction.get('status')!r}"
         )
 
     def test_no_findings_auto_completion_reconciles_gap_staffing(self):

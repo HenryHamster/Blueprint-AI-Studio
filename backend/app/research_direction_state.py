@@ -314,6 +314,21 @@ async def _maybe_autocomplete_exhausted_direction(
     if not _should_autocomplete_exhausted(d, exhausted=exhausted):
         return False
 
+    # Gate exhaustion auto-complete on criterion coverage: a direction that owns
+    # uncovered acceptance criteria must not retire via exhaustion — the criteria
+    # must be satisfied first. Fail-open (helper returns False on error / no
+    # criteria) preserves current behavior.
+    from app.acceptance_criteria import (  # noqa: PLC0415
+        direction_owns_uncovered_criterion,
+    )
+
+    if await direction_owns_uncovered_criterion(session, task.project_id, did):
+        logger.info(
+            f"[RESEARCH] Exhaustion auto-complete deferred for direction {did}: "
+            f"owns uncovered acceptance criteria (task {task.id})"
+        )
+        return False
+
     reason = _exhaustion_complete_reason(d)
     d["status"] = "completed"
     d["completed_at"] = _utcnow().isoformat()
