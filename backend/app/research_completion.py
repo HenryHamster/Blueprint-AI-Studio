@@ -284,6 +284,16 @@ _SPAWN_GATE_REASONS_SAMPLE_CAP = 5
 _SPAWN_GATE_REASON_MAX_LEN = 200
 _ADVERSARIAL_WHOLESALE_RETRY_KEY = "_adversarial_wholesale_retry_count"
 _ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
+# Declares which auto-complete code paths inside _stamp_no_findings_refractory
+# gate on criterion coverage before retiring a direction.
+# test_all_autocomplete_paths_gate_on_criterion_coverage in test_invariants.py
+# verifies structurally that all declared paths contain the gate call.
+_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
+    {
+        "exhaustion",  # _stamp_no_findings_refractory exhaustion complete (L840)
+        "proven_merge",  # _stamp_no_findings_refractory >=3-merge completion (L824)
+    }
+)
 # Targeted retry: used when the non-response cause is time-based (timeout/stall).
 # A reduced-manifest grader is spawned BEFORE falling back to the wholesale retry,
 # so the total grader budget is: initial + at most one targeted + at most one wholesale.

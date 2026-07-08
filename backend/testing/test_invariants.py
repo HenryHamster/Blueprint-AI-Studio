@@ -11638,6 +11638,78 @@ def test_all_autocomplete_paths_gate_on_criterion_coverage():
         "retiring a direction."
     )
 
+    # ── 4. Verify research_completion.py auto-complete paths ──────────────
+    rc_path = Path(__file__).resolve().parents[1] / "app" / "research_completion.py"
+    rc_source = rc_path.read_text(encoding="utf-8")
+    rc_tree = ast.parse(rc_source, filename=str(rc_path))
+
+    # 4a. Verify the module-level frozenset declaration exists
+    rc_frozenset_found = False
+    rc_frozenset_entries: set[str] = set()
+    for stmt in ast.iter_child_nodes(rc_tree):
+        target_name: str | None = None
+        value_node: ast.expr | None = None
+        if isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name) and t.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
+                    target_name = t.id
+                    value_node = stmt.value
+                    break
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            if stmt.target.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
+                target_name = stmt.target.id
+                value_node = stmt.value
+        if target_name is None:
+            continue
+        rc_frozenset_found = True
+        if isinstance(value_node, ast.Call):
+            if isinstance(value_node.func, ast.Name) and value_node.func.id == "frozenset":
+                container = value_node.args[0] if value_node.args else None
+                if isinstance(container, (ast.Set, ast.List, ast.Tuple)):
+                    for elt in container.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            rc_frozenset_entries.add(elt.value)
+        break
+
+    assert rc_frozenset_found, (
+        "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE frozenset is missing from "
+        "research_completion.py. This constant declares which auto-complete paths "
+        "are criterion-gated in _stamp_no_findings_refractory. Restore it."
+    )
+    assert rc_frozenset_entries >= {"exhaustion", "proven_merge"}, (
+        f"_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE in research_completion.py "
+        f"must contain at least {{'exhaustion', 'proven_merge'}}; found {rc_frozenset_entries}. "
+        "Restore the missing entries."
+    )
+
+    # 4b. Verify _stamp_no_findings_refractory calls the gate function
+    snfr_func: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(rc_tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_stamp_no_findings_refractory":
+            snfr_func = node
+            break
+
+    assert snfr_func is not None, (
+        "_stamp_no_findings_refractory not found in research_completion.py"
+    )
+
+    snfr_gated = False
+    for node in ast.walk(snfr_func):
+        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
+            snfr_gated = True
+            break
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            if _ast_called_name(node.value) == gate_func_name:
+                snfr_gated = True
+                break
+
+    assert snfr_gated, (
+        "_stamp_no_findings_refractory does not call "
+        "direction_owns_uncovered_criterion. The proven-merge and exhaustion "
+        "auto-complete paths in research_completion.py must gate on criterion "
+        "coverage before retiring a direction."
+    )
+
 
 def test_retire_direction_op_gates_on_criterion_coverage():
     """The retire_direction op in strategic_completion.py must gate on criterion coverage.
