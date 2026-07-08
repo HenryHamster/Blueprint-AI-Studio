@@ -209,7 +209,7 @@ import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extract
 import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner } from '../index.js';
 import { resetLlmTelemetry, getLlmTelemetry, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
-import { extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
+import { readClaudeMd, extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
 import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { expectCalledWith, expectNotCalledWith } from '../utils/typed-mock-call.js';
@@ -553,6 +553,50 @@ describe('viewport infra skip guidance in prompt', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
     expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+  });
+});
+
+// ── Prompt section ordering (prefix cache) ─────────────────────────────────
+describe('prompt section order puts claudeMd before acceptance evidence', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(readClaudeMd).mockReturnValue('Mock CLAUDE.md instructions for testing');
+  });
+
+  it('handleCreate puts ## Codebase Instructions before ## Acceptance Evidence', async () => {
+    const task = { title: 'Task', description: '' };
+    const payload = {
+      prompt: 'Do something',
+      acceptance_evidence: {
+        kind: 'named_test',
+        test_path: 'agent/src/handlers/standard.test.ts',
+      },
+    };
+    await handleCreate(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    const claudeMdIdx = prompt.indexOf('## Codebase Instructions');
+    const acceptanceIdx = prompt.indexOf('## Acceptance Evidence');
+    expect(claudeMdIdx).toBeGreaterThanOrEqual(0);
+    expect(acceptanceIdx).toBeGreaterThanOrEqual(0);
+    expect(claudeMdIdx).toBeLessThan(acceptanceIdx);
+  });
+
+  it('handleRefactor puts ## Codebase Instructions before ## Acceptance Evidence', async () => {
+    const task = { title: 'Refactor task', description: '' };
+    const payload = {
+      prompt: 'Improve it',
+      acceptance_evidence: {
+        kind: 'named_test',
+        test_path: 'agent/src/handlers/standard.test.ts',
+      },
+    };
+    await handleRefactor(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    const claudeMdIdx = prompt.indexOf('## Codebase Instructions');
+    const acceptanceIdx = prompt.indexOf('## Acceptance Evidence');
+    expect(claudeMdIdx).toBeGreaterThanOrEqual(0);
+    expect(acceptanceIdx).toBeGreaterThanOrEqual(0);
+    expect(claudeMdIdx).toBeLessThan(acceptanceIdx);
   });
 });
 

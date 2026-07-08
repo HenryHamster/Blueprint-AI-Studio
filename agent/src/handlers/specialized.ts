@@ -336,7 +336,7 @@ CRITICAL RULES:
   const migrateFetchBlock = `
 
 ${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
-  const finalMigratePrompt = migrateAcceptanceEvidenceNotice + migrateClaudeMdSection + migrateContextSection
+  const finalMigratePrompt = migrateClaudeMdSection + migrateAcceptanceEvidenceNotice + migrateContextSection
     + migratePlaybookSection + migrateRetryContext + migrateReservedGuidance + migratePrompt
     + migrateFirstTaskSection + migrateCodeChangeHelper + migrateFocusBlock + migrateGuidanceFooter
     + migratePromptSuffix + migrateFetchBlock;

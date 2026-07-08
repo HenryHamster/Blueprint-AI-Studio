@@ -16,6 +16,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, resolveBaseBranch, execFileAsync,
 } from '../index.js';
+import { setPromptSizeTelemetry } from '../telemetry.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH, GENERIC_PROBE_TIMEOUT, DECLARED_BUILD_TIMEOUT, TEST_RUNNER_TIMEOUT } from '../constants.js';
 import { resolveBuildConfig } from '../build-config.js';
@@ -952,6 +953,12 @@ export async function handleVerifyTests(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
+  // No direct Claude invocation at this handler level — record a zero-byte
+  // prompt so the task type reports a non-null prompt_size_bytes in its
+  // api_call_summary. (testFixLoop internally may invoke Claude for fix
+  // attempts with maxFixAttempts>0, but this handler always passes 0.)
+  setPromptSizeTelemetry(0, 0, []);
+
   // The PR head branch is what we verify; base_branch is the clone fallback /
   // merge target like every other pipeline task.
   const headBranch = validateBranchName(strVal(payload.branch), 'branch');
