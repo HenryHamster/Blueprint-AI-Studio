@@ -31,6 +31,7 @@ from app.digest_metrics import (
     compute_remediation_funnel,
     compute_trial_arm_accumulation,
     compute_trial_arm_accrual,
+    compute_trial_arm_cost_delta,
 )
 from app.sr_review_quality_metrics import (
     _stash_projected_task_fields,
@@ -1948,10 +1949,15 @@ async def test_digest_effort_model_efficiency_includes_cancelled_token_spend(
 ):
     """Cancelled terminal runs contribute spend to the efficiency rollup but do
     not count as landed PRs."""
+    from app.llm_cost_attribution import LLM_TOKEN_PRICING
+
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-opus-4-8")]
+    expected_total_cost = 1500 * input_rate + 1500 * output_rate
 
     db_session.add(
         make_task(
@@ -1991,8 +1997,12 @@ async def test_digest_effort_model_efficiency_includes_cancelled_token_spend(
     efficiency = data["effort_model_efficiency"]
     assert efficiency["totals"]["run_count"] == 2
     assert efficiency["totals"]["landed_count"] == 1
-    assert efficiency["totals"]["total_cost_usd"] == pytest.approx(0.135)
-    assert efficiency["totals"]["cost_per_merge"] == pytest.approx(0.135)
+    assert efficiency["totals"]["total_cost_usd"] == pytest.approx(
+        expected_total_cost
+    )
+    assert efficiency["totals"]["cost_per_merge"] == pytest.approx(
+        expected_total_cost
+    )
     by_effort = {row["effort"]: row for row in efficiency["by_effort"]}
     assert by_effort["high"]["run_count"] == 2
     assert by_effort["high"]["landed_count"] == 1
@@ -9864,6 +9874,412 @@ async def test_compute_trial_arm_accrual_window_days_param_respected(db_session)
     )
     assert widened["with_7d"] == 2
     assert widened["window_days"] == 14
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_cost_delta_uses_cache_aware_pricing(db_session):
+    """Per-arm cost deltas use the shared cache-aware LLM task pricing helper."""
+    from app.efficiency_snapshot import (
+        LLM_CACHE_READ_INPUT_PRICING,
+        LLM_TOKEN_PRICING,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provider, model = "deepseek", "deepseek-v4-flash"
+    input_rate, _output_rate = LLM_TOKEN_PRICING[(provider, model)]
+    cache_read_rate = LLM_CACHE_READ_INPUT_PRICING[(provider, model)]
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": True},
+                api_call_summary={
+                    "total_input_tokens": 1_000_000,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                    "total_cache_creation_input_tokens": 0,
+                    "total_cache_read_input_tokens": 1_000_000,
+                },
+                provider=provider,
+                model=model,
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": False},
+                api_call_summary={
+                    "total_input_tokens": 1_000_000,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+                provider=provider,
+                model=model,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await compute_trial_arm_cost_delta(
+        db_session, project_id=project.id, context_key="_trial_arm"
+    )
+
+    with_expected = round(1_000_000 * cache_read_rate, 6)
+    without_expected = round(1_000_000 * input_rate, 6)
+    assert result["with_avg_cost_usd"] == pytest.approx(with_expected)
+    assert result["without_avg_cost_usd"] == pytest.approx(without_expected)
+    assert result["cost_delta"] == pytest.approx(
+        round(with_expected - without_expected, 6)
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_cost_delta_prices_banked_retry_cache(db_session):
+    """Banked retry cache sub-counts are priced like shared per-attempt LLM cost."""
+    from app.efficiency_snapshot import (
+        LLM_CACHE_READ_INPUT_PRICING,
+        LLM_TOKEN_PRICING,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provider, model = "deepseek", "deepseek-v4-flash"
+    input_rate, _output_rate = LLM_TOKEN_PRICING[(provider, model)]
+    cache_read_rate = LLM_CACHE_READ_INPUT_PRICING[(provider, model)]
+    banked_input = 1_000_000
+    current_input = 500_000
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": True},
+                provider=provider,
+                model=model,
+                llm_input_tokens_banked_db=banked_input,
+                llm_output_tokens_banked_db=0,
+                llm_call_count_banked_db=1,
+                attempt_history_db=[
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "llm_input_tokens": banked_input,
+                        "llm_output_tokens": 0,
+                        "llm_call_count": 1,
+                        "llm_cache_creation_input_tokens": 0,
+                        "llm_cache_read_input_tokens": banked_input,
+                    }
+                ],
+                api_call_summary={
+                    "total_input_tokens": current_input,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": False},
+                provider=provider,
+                model=model,
+                llm_input_tokens_banked_db=banked_input,
+                llm_output_tokens_banked_db=0,
+                llm_call_count_banked_db=1,
+                attempt_history_db=[
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "llm_input_tokens": banked_input,
+                        "llm_output_tokens": 0,
+                        "llm_call_count": 1,
+                    }
+                ],
+                api_call_summary={
+                    "total_input_tokens": current_input,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await compute_trial_arm_cost_delta(
+        db_session, project_id=project.id, context_key="_trial_arm"
+    )
+
+    with_expected = round(
+        banked_input * cache_read_rate + current_input * input_rate,
+        6,
+    )
+    without_expected = round((banked_input + current_input) * input_rate, 6)
+    assert result["with_avg_cost_usd"] == pytest.approx(with_expected)
+    assert result["without_avg_cost_usd"] == pytest.approx(without_expected)
+    assert result["cost_delta"] == pytest.approx(
+        round(with_expected - without_expected, 6)
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_cost_delta_keeps_legacy_banked_scalar(db_session):
+    """Rows without attempt_history still price banked retry scalar tokens."""
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provider, model = "deepseek", "deepseek-v4-flash"
+    input_rate, _output_rate = LLM_TOKEN_PRICING[(provider, model)]
+    banked_input = 700_000
+    current_input = 300_000
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": True},
+                provider=provider,
+                model=model,
+                llm_input_tokens_banked_db=banked_input,
+                llm_output_tokens_banked_db=0,
+                api_call_summary={
+                    "total_input_tokens": current_input,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": False},
+                provider=provider,
+                model=model,
+                api_call_summary={
+                    "total_input_tokens": current_input,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await compute_trial_arm_cost_delta(
+        db_session, project_id=project.id, context_key="_trial_arm"
+    )
+
+    with_expected = round((banked_input + current_input) * input_rate, 6)
+    without_expected = round(current_input * input_rate, 6)
+    assert result["with_avg_cost_usd"] == pytest.approx(with_expected)
+    assert result["without_avg_cost_usd"] == pytest.approx(without_expected)
+    assert result["cost_delta"] == pytest.approx(
+        round(with_expected - without_expected, 6)
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_cost_delta_ignores_non_array_attempt_history(
+    db_session,
+):
+    """Malformed legacy attempt_history JSON falls back to banked scalar tokens."""
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provider, model = "deepseek", "deepseek-v4-flash"
+    input_rate, _output_rate = LLM_TOKEN_PRICING[(provider, model)]
+    banked_input = 700_000
+    current_input = 300_000
+    malformed_history_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"_trial_arm": True},
+        provider=provider,
+        model=model,
+        llm_input_tokens_banked_db=banked_input,
+        llm_output_tokens_banked_db=0,
+        api_call_summary={
+            "total_input_tokens": current_input,
+            "total_output_tokens": 0,
+            "llm_call_count": 1,
+        },
+    )
+    malformed_history_task.attempt_history_db = {"unexpected": "object"}
+
+    db_session.add_all(
+        [
+            malformed_history_task,
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": False},
+                provider=provider,
+                model=model,
+                api_call_summary={
+                    "total_input_tokens": current_input,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await compute_trial_arm_cost_delta(
+        db_session, project_id=project.id, context_key="_trial_arm"
+    )
+
+    with_expected = round((banked_input + current_input) * input_rate, 6)
+    without_expected = round(current_input * input_rate, 6)
+    assert result["with_avg_cost_usd"] == pytest.approx(with_expected)
+    assert result["without_avg_cost_usd"] == pytest.approx(without_expected)
+    assert result["cost_delta"] == pytest.approx(
+        round(with_expected - without_expected, 6)
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_cost_delta_averages_per_terminal_arm_task(
+    db_session,
+):
+    """Zero-token terminal arm tasks remain in the per-arm average denominator."""
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provider, model = "deepseek", "deepseek-v4-flash"
+    input_rate, _output_rate = LLM_TOKEN_PRICING[(provider, model)]
+    input_tokens = 1_000_000
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": True},
+                provider=provider,
+                model=model,
+                api_call_summary={
+                    "total_input_tokens": input_tokens,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": True},
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": False},
+                provider=provider,
+                model=model,
+                api_call_summary={
+                    "total_input_tokens": input_tokens,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await compute_trial_arm_cost_delta(
+        db_session, project_id=project.id, context_key="_trial_arm"
+    )
+
+    with_expected = round(input_tokens * input_rate / 2, 6)
+    without_expected = round(input_tokens * input_rate, 6)
+    assert result["with_avg_cost_usd"] == pytest.approx(with_expected)
+    assert result["without_avg_cost_usd"] == pytest.approx(without_expected)
+    assert result["cost_delta"] == pytest.approx(
+        round(with_expected - without_expected, 6)
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_arm_cost_delta_counts_distinct_unpriced_tasks(
+    db_session,
+):
+    """Multiple unpriced attempts on one task count as one unpriced task."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": True},
+                provider="unknown-provider",
+                model="unknown-model",
+                attempt_history_db=[
+                    {
+                        "provider": "unknown-provider",
+                        "model": "unknown-model-a",
+                        "llm_input_tokens": 1,
+                        "llm_output_tokens": 0,
+                        "llm_call_count": 1,
+                    },
+                    {
+                        "provider": "unknown-provider",
+                        "model": "unknown-model-b",
+                        "llm_input_tokens": 1,
+                        "llm_output_tokens": 0,
+                        "llm_call_count": 1,
+                    },
+                ],
+                api_call_summary={
+                    "total_input_tokens": 1,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                context={"_trial_arm": False},
+                provider="deepseek",
+                model="deepseek-v4-flash",
+                api_call_summary={
+                    "total_input_tokens": 1_000_000,
+                    "total_output_tokens": 0,
+                    "llm_call_count": 1,
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await compute_trial_arm_cost_delta(
+        db_session, project_id=project.id, context_key="_trial_arm"
+    )
+
+    assert result["with_avg_cost_usd"] is None
+    assert result["cost_delta"] is None
+    assert result["with_unpriced_task_count"] == 1
+    assert result["without_unpriced_task_count"] == 0
 
 
 @pytest.mark.asyncio

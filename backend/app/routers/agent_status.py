@@ -171,6 +171,12 @@ _PROVIDER_AUTH_ENDPOINT_MARKERS = {
         "api.deepseek.com",
         "deepseek",
     ),
+    "zai": (
+        "api.z.ai",
+        "z.ai",
+        "zai",
+        "glm",
+    ),
 }
 
 _PROVIDER_AUTH_STRONG_MARKERS = {
@@ -205,6 +211,14 @@ _PROVIDER_AUTH_STRONG_MARKERS = {
         "invalid x-api-key",
         "missing api key",
     ),
+    "zai": (
+        "invalid z.ai api key",
+        "invalid zai api key",
+        "api key not valid",
+        "x-api-key header is required",
+        "invalid x-api-key",
+        "missing api key",
+    ),
 }
 
 _PROVIDER_AUTH_GENERIC_MARKERS = (
@@ -221,6 +235,117 @@ _PROVIDER_AUTH_GENERIC_MARKERS = (
     "token invalid",
     "token revoked",
 )
+
+_PROVIDER_API_KEY_QUOTA_MARKERS = (
+    "insufficient balance",
+    "insufficient_balance",
+    "insufficient quota",
+    "insufficient_quota",
+    "balance not enough",
+    "quota exceeded",
+    "exceeded your current quota",
+    "api usage exhausted",
+    "usage_not_included",
+    "usage not included",
+    "payment required",
+    "rate_limit",
+    "rate limit",
+    "too many requests",
+    "429",
+)
+
+_PROVIDER_API_KEY_CONTEXTUAL_QUOTA_MARKERS = (
+    "overloaded",
+    "resource exhausted",
+    "concurrency limit",
+    "provider capacity",
+    "service capacity",
+    "server capacity",
+    "at capacity",
+    "capacity exceeded",
+    "temporarily unavailable",
+    "service unavailable",
+)
+
+_PROVIDER_AUTH_CONTEXTUAL_MARKERS = {
+    "openai": (
+        "invalid api key",
+        "invalid authentication",
+        "invalid authentication credentials",
+        "you didn't provide an api key",
+        "missing api key",
+    ),
+}
+
+_PROVIDER_API_KEY_CONTEXT_MARKERS = {
+    "openai": (
+        "api.openai.com",
+        "openai api error",
+        "error from openai",
+    ),
+    "deepseek": (
+        "api.deepseek.com",
+        "deepseek api error",
+        "error from deepseek",
+    ),
+    "zai": (
+        "api.z.ai",
+        "z.ai api error",
+        "zai api error",
+        "error from z.ai",
+        "error from zai",
+    ),
+}
+
+
+def _has_provider_endpoint_context(provider: str, text: str) -> bool:
+    return any(
+        marker in text for marker in _PROVIDER_AUTH_ENDPOINT_MARKERS.get(provider, ())
+    )
+
+
+def _has_provider_api_key_context(provider: str, text: str) -> bool:
+    return any(
+        marker in text for marker in _PROVIDER_API_KEY_CONTEXT_MARKERS.get(provider, ())
+    )
+
+
+def _has_provider_api_key_quota_marker(
+    provider: str, text: str, *, trusted_provider_context: bool = False
+) -> bool:
+    if any(marker in text for marker in _PROVIDER_API_KEY_QUOTA_MARKERS):
+        return True
+    return (
+        trusted_provider_context or _has_provider_api_key_context(provider, text)
+    ) and any(
+        marker in text for marker in _PROVIDER_API_KEY_CONTEXTUAL_QUOTA_MARKERS
+    )
+
+
+def _has_provider_auth_strong_marker(
+    provider: str, text: str, *, trusted_provider_context: bool = False
+) -> bool:
+    if any(marker in text for marker in _PROVIDER_AUTH_STRONG_MARKERS.get(provider, ())):
+        return True
+
+    if (
+        trusted_provider_context or _has_provider_api_key_context(provider, text)
+    ) and any(
+        marker in text for marker in _PROVIDER_AUTH_CONTEXTUAL_MARKERS.get(provider, ())
+    ):
+        return True
+
+    if provider == "deepseek" and "authentication fails" in text:
+        return trusted_provider_context or any(
+            marker in text
+            for marker in (
+                "api.deepseek.com",
+                "wrong api key",
+                "401",
+            )
+        )
+
+    return False
 
 
 def record_task_result(
@@ -306,14 +431,53 @@ def _is_task_llm_auth_hard_disable(
         if classified == "auth_failure":
             if report_provider and report_provider != provider:
                 return False
+            auth_mode = str(
+                report.get("auth_mode")
+                or (task.context or {}).get("llm_auth_mode")
+                or ""
+            ).strip().lower()
+            if auth_mode == "api_key":
+                report_text_parts = []
+                stderr_tail = report.get("stderr_tail")
+                if isinstance(stderr_tail, str):
+                    report_text_parts.append(stderr_tail)
+                provider_errors = report.get("provider_errors")
+                if isinstance(provider_errors, list):
+                    for entry in provider_errors:
+                        if isinstance(entry, dict):
+                            msg = entry.get("message")
+                            code = entry.get("code")
+                            if isinstance(msg, str):
+                                report_text_parts.append(msg)
+                            if isinstance(code, str):
+                                report_text_parts.append(code)
+                report_text = "\n".join(report_text_parts).lower()
+                if _has_provider_api_key_quota_marker(
+                    provider,
+                    report_text,
+                    trusted_provider_context=report_provider == provider,
+                ):
+                    return False
+                return _has_provider_auth_strong_marker(
+                    provider,
+                    report_text,
+                    trusted_provider_context=report_provider == provider,
+                )
             return True
 
     combined = (logs or "").lower()
     if not combined:
         return False
 
-    strong_markers = _PROVIDER_AUTH_STRONG_MARKERS.get(provider, ())
-    if any(marker in combined for marker in strong_markers):
+    auth_mode = str(
+        (task.context or {}).get("llm_auth_mode") or getattr(task, "auth_mode", "") or ""
+    ).strip().lower()
+    if auth_mode == "api_key":
+        if _has_provider_api_key_quota_marker(provider, combined):
+            return False
+        return _has_provider_auth_strong_marker(provider, combined)
+
+    if _has_provider_auth_strong_marker(provider, combined):
         return True
 
     if any(marker in combined for marker in _GITHUB_AUTH_FAILURE_MARKERS):

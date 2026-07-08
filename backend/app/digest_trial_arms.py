@@ -14,7 +14,7 @@ import uuid  # referenced in the string type annotations below
 from datetime import timedelta
 from typing import Dict, Any
 
-from sqlalchemy import Integer, and_, case, func
+from sqlalchemy import Integer, and_, case, func, literal_column, or_, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -310,22 +310,44 @@ async def compute_trial_arm_cost_delta(
 ) -> Dict[str, Any]:
     """Per-arm average LLM cost delta (with - without) over the trial's whole life.
 
-    Groups terminal tasks by (arm, provider, model), sums banked + current-attempt
-    tokens, applies LLM_TOKEN_PRICING, and returns per-arm averages and their delta.
+    Groups terminal current-attempt tokens and banked retry attempt-history
+    tokens by (arm, provider, model), applies cache-aware LLM pricing, and
+    returns per-arm terminal-task averages and their delta.
 
     Returns ``{"with_avg_cost_usd": float|None, "without_avg_cost_usd": float|None,
     "cost_delta": float|None}`` where ``cost_delta = with_avg - without_avg``
     (negative means the WITH arm is cheaper).  Fields are ``None`` when an arm
-    has no tasks or no priced token data.
+    has no tasks, no priced token data, or unpriced token-bearing LLM attempts.
     """
-    from app.llm_cost_attribution import (
+    from app.llm_cost_attribution import (  # avoid circular at module load
         LLM_TOKEN_PRICING,
-    )  # avoid circular at module load
+        _price_llm_attempt,
+    )
 
     _assign_key = assignment_key if assignment_key else context_key
     _has_assignment = _assign_key != context_key
 
-    if resolve_dialect_name(session) == "sqlite":
+    dialect_name = resolve_dialect_name(session)
+
+    def _nonnegative_int(expr):
+        casted = func.coalesce(func.cast(expr, Integer), 0)
+        return case((casted > 0, casted), else_=0)
+
+    def _bounded_cache_exprs(input_expr, cache_creation_expr, cache_read_expr):
+        bounded_read = case(
+            (cache_read_expr > input_expr, input_expr),
+            else_=cache_read_expr,
+        )
+        bounded_creation = case(
+            (
+                cache_creation_expr + bounded_read > input_expr,
+                input_expr - bounded_read,
+            ),
+            else_=cache_creation_expr,
+        )
+        return bounded_creation, bounded_read
+
+    if dialect_name == "sqlite":
         _primary_expr = func.json_extract(Task.context, f"$.{_assign_key}")
         _fallback_expr = func.json_extract(Task.context, f"$.{context_key}")
         arm_expr = (
@@ -333,20 +355,49 @@ async def compute_trial_arm_cost_delta(
             if _has_assignment
             else _primary_expr
         )
-        input_tokens_expr = func.coalesce(
-            func.cast(
-                func.json_extract(Task.api_call_summary, "$.total_input_tokens"),
-                Integer,
-            ),
-            0,
-        ) + func.coalesce(Task.llm_input_tokens_banked_db, 0)
-        output_tokens_expr = func.coalesce(
-            func.cast(
-                func.json_extract(Task.api_call_summary, "$.total_output_tokens"),
-                Integer,
-            ),
-            0,
-        ) + func.coalesce(Task.llm_output_tokens_banked_db, 0)
+        current_input_expr = _nonnegative_int(
+            func.json_extract(Task.api_call_summary, "$.total_input_tokens")
+        )
+        current_output_expr = _nonnegative_int(
+            func.json_extract(Task.api_call_summary, "$.total_output_tokens")
+        )
+        current_cache_creation_expr = _nonnegative_int(
+            func.json_extract(
+                Task.api_call_summary,
+                "$.total_cache_creation_input_tokens",
+            )
+        )
+        current_cache_read_expr = _nonnegative_int(
+            func.json_extract(
+                Task.api_call_summary,
+                "$.total_cache_read_input_tokens",
+            )
+        )
+        history_len_expr = func.coalesce(
+            func.json_array_length(Task.attempt_history_db), 0
+        )
+        banked_attempt = (
+            func.json_each(Task.attempt_history_db)
+            .table_valued("key", "value")
+            .alias("banked_attempt")
+        )
+        banked_value = banked_attempt.c.value
+        banked_provider_raw = func.nullif(
+            func.json_extract(banked_value, "$.provider"), ""
+        )
+        banked_model_raw = func.nullif(func.json_extract(banked_value, "$.model"), "")
+        banked_input_expr = _nonnegative_int(
+            func.json_extract(banked_value, "$.llm_input_tokens")
+        )
+        banked_output_expr = _nonnegative_int(
+            func.json_extract(banked_value, "$.llm_output_tokens")
+        )
+        banked_cache_creation_expr = _nonnegative_int(
+            func.json_extract(banked_value, "$.llm_cache_creation_input_tokens")
+        )
+        banked_cache_read_expr = _nonnegative_int(
+            func.json_extract(banked_value, "$.llm_cache_read_input_tokens")
+        )
     else:
         _primary_expr = Task.context[_assign_key].astext
         _fallback_expr = Task.context[context_key].astext
@@ -355,12 +406,104 @@ async def compute_trial_arm_cost_delta(
             if _has_assignment
             else _primary_expr
         )
-        input_tokens_expr = func.coalesce(
-            func.cast(Task.api_call_summary["total_input_tokens"].astext, Integer), 0
-        ) + func.coalesce(Task.llm_input_tokens_banked_db, 0)
-        output_tokens_expr = func.coalesce(
-            func.cast(Task.api_call_summary["total_output_tokens"].astext, Integer), 0
-        ) + func.coalesce(Task.llm_output_tokens_banked_db, 0)
+        current_input_expr = _nonnegative_int(
+            Task.api_call_summary["total_input_tokens"].astext
+        )
+        current_output_expr = _nonnegative_int(
+            Task.api_call_summary["total_output_tokens"].astext
+        )
+        current_cache_creation_expr = _nonnegative_int(
+            Task.api_call_summary["total_cache_creation_input_tokens"].astext
+        )
+        current_cache_read_expr = _nonnegative_int(
+            Task.api_call_summary["total_cache_read_input_tokens"].astext
+        )
+        history_array_expr = case(
+            (
+                func.jsonb_typeof(Task.attempt_history_db) == "array",
+                Task.attempt_history_db,
+            ),
+            else_=literal_column("'[]'::jsonb"),
+        )
+        history_len_expr = func.coalesce(func.jsonb_array_length(history_array_expr), 0)
+        banked_attempt = (
+            func.jsonb_array_elements(history_array_expr)
+            .table_valued("value")
+            .lateral("banked_attempt")
+        )
+        banked_value = banked_attempt.c.value
+        banked_provider_raw = func.nullif(banked_value.op("->>")("provider"), "")
+        banked_model_raw = func.nullif(banked_value.op("->>")("model"), "")
+        banked_input_expr = _nonnegative_int(
+            banked_value.op("->>")("llm_input_tokens")
+        )
+        banked_output_expr = _nonnegative_int(
+            banked_value.op("->>")("llm_output_tokens")
+        )
+        banked_cache_creation_expr = _nonnegative_int(
+            banked_value.op("->>")("llm_cache_creation_input_tokens")
+        )
+        banked_cache_read_expr = _nonnegative_int(
+            banked_value.op("->>")("llm_cache_read_input_tokens")
+        )
+
+    has_banked_history_expr = history_len_expr > 0
+    current_input_for_pricing_expr = current_input_expr + case(
+        (has_banked_history_expr, 0),
+        else_=_nonnegative_int(Task.llm_input_tokens_banked_db),
+    )
+    current_output_for_pricing_expr = current_output_expr + case(
+        (has_banked_history_expr, 0),
+        else_=_nonnegative_int(Task.llm_output_tokens_banked_db),
+    )
+
+    current_cache_creation_expr, current_cache_read_expr = _bounded_cache_exprs(
+        current_input_for_pricing_expr,
+        current_cache_creation_expr,
+        current_cache_read_expr,
+    )
+    current_token_bearing_expr = case(
+        (
+            or_(
+                current_input_for_pricing_expr > 0,
+                current_output_for_pricing_expr > 0,
+            ),
+            1,
+        ),
+        else_=0,
+    )
+
+    banked_cache_creation_expr, banked_cache_read_expr = _bounded_cache_exprs(
+        banked_input_expr,
+        banked_cache_creation_expr,
+        banked_cache_read_expr,
+    )
+    banked_token_bearing_expr = case(
+        (or_(banked_input_expr > 0, banked_output_expr > 0), 1),
+        else_=0,
+    )
+    banked_provider_expr = case(
+        (
+            and_(banked_provider_raw.is_not(None), banked_model_raw.is_not(None)),
+            banked_provider_raw,
+        ),
+        (
+            and_(banked_provider_raw.is_(None), banked_model_raw.is_(None)),
+            Task.provider,
+        ),
+        else_=None,
+    )
+    banked_model_expr = case(
+        (
+            and_(banked_provider_raw.is_not(None), banked_model_raw.is_not(None)),
+            banked_model_raw,
+        ),
+        (
+            and_(banked_provider_raw.is_(None), banked_model_raw.is_(None)),
+            Task.model,
+        ),
+        else_=None,
+    )
 
     filters = [
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
@@ -369,41 +512,159 @@ async def compute_trial_arm_cost_delta(
     if project_id is not None:
         filters.append(Task.project_id == project_id)
 
-    stmt = (
+    task_count_stmt = select(arm_expr, func.count()).where(*filters).group_by(arm_expr)
+    task_count_rows = (await session.execute(task_count_stmt)).all()
+
+    with_task_count = without_task_count = 0
+    for arm_val, cnt in task_count_rows:
+        if _json_truthy(arm_val):
+            with_task_count += int(cnt)
+        else:
+            without_task_count += int(cnt)
+
+    current_stmt = (
         select(
             arm_expr,
             Task.provider,
             Task.model,
-            func.sum(input_tokens_expr),
-            func.sum(output_tokens_expr),
-            func.count(),
+            func.sum(current_input_for_pricing_expr),
+            func.sum(current_output_for_pricing_expr),
+            func.sum(current_cache_creation_expr),
+            func.sum(current_cache_read_expr),
+            func.sum(current_token_bearing_expr),
         )
         .where(*filters)
         .group_by(arm_expr, Task.provider, Task.model)
     )
-    rows = (await session.execute(stmt)).all()
+    current_rows = (await session.execute(current_stmt)).all()
 
-    with_cost = with_n = 0.0
-    without_cost = without_n = 0.0
-    for arm_val, provider, model, in_tok, out_tok, cnt in rows:
-        cnt = int(cnt)
-        in_tok = int(in_tok or 0)
-        out_tok = int(out_tok or 0)
-        cost = 0.0
-        if provider and model:
-            pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
-            if pricing:
-                in_rate, out_rate = pricing
-                cost = in_tok * in_rate + out_tok * out_rate
-        if _json_truthy(arm_val):
-            with_cost += cost
-            with_n += cnt
-        else:
-            without_cost += cost
-            without_n += cnt
+    banked_stmt = (
+        select(
+            arm_expr,
+            banked_provider_expr,
+            banked_model_expr,
+            func.sum(banked_input_expr),
+            func.sum(banked_output_expr),
+            func.sum(banked_cache_creation_expr),
+            func.sum(banked_cache_read_expr),
+            func.sum(banked_token_bearing_expr),
+        )
+        .select_from(Task)
+        .join(banked_attempt, true())
+        .where(*filters, has_banked_history_expr)
+        .group_by(arm_expr, banked_provider_expr, banked_model_expr)
+    )
+    banked_rows = (await session.execute(banked_stmt)).all()
 
-    with_avg = round(with_cost / with_n, 6) if with_n > 0 else None
-    without_avg = round(without_cost / without_n, 6) if without_n > 0 else None
+    current_unpriced_stmt = (
+        select(
+            arm_expr,
+            Task.id,
+            Task.provider,
+            Task.model,
+            current_token_bearing_expr,
+        )
+        .where(*filters, current_token_bearing_expr > 0)
+    )
+    current_unpriced_rows = (await session.execute(current_unpriced_stmt)).all()
+
+    banked_unpriced_stmt = (
+        select(
+            arm_expr,
+            Task.id,
+            banked_provider_expr,
+            banked_model_expr,
+            banked_token_bearing_expr,
+        )
+        .select_from(Task)
+        .join(banked_attempt, true())
+        .where(*filters, has_banked_history_expr, banked_token_bearing_expr > 0)
+    )
+    banked_unpriced_rows = (await session.execute(banked_unpriced_stmt)).all()
+
+    with_cost = without_cost = 0.0
+    with_priced_token_rows = without_priced_token_rows = 0
+    with_unpriced_task_ids: set[str] = set()
+    without_unpriced_task_ids: set[str] = set()
+
+    def _has_pricing(provider: Any, model: Any) -> bool:
+        if not provider or not model:
+            return False
+        return (str(provider).lower(), str(model).lower()) in LLM_TOKEN_PRICING
+
+    def _mark_unpriced_task_rows(rows) -> None:
+        for arm_val, task_id, provider, model, token_bearing_count in rows:
+            if int(token_bearing_count or 0) <= 0 or _has_pricing(provider, model):
+                continue
+            if _json_truthy(arm_val):
+                with_unpriced_task_ids.add(str(task_id))
+            else:
+                without_unpriced_task_ids.add(str(task_id))
+
+    def _accumulate_attempt_rows(rows) -> None:
+        nonlocal with_cost, without_cost
+        nonlocal with_priced_token_rows, without_priced_token_rows
+
+        for (
+            arm_val,
+            provider,
+            model,
+            in_tok,
+            out_tok,
+            cache_creation,
+            cache_read,
+            token_bearing_count,
+        ) in rows:
+            token_bearing_count = int(token_bearing_count or 0)
+            if token_bearing_count <= 0:
+                continue
+            in_tok = int(in_tok or 0)
+            out_tok = int(out_tok or 0)
+            cache_creation = int(cache_creation or 0)
+            cache_read = int(cache_read or 0)
+            cost: float | None = None
+            if provider and model:
+                pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
+                if pricing:
+                    in_rate, out_rate = pricing
+                    cost = _price_llm_attempt(
+                        in_tok,
+                        out_tok,
+                        cache_creation,
+                        cache_read,
+                        in_rate,
+                        out_rate,
+                        provider=provider,
+                        model=model,
+                    )
+            if _json_truthy(arm_val):
+                if cost is not None:
+                    with_cost += cost
+                    with_priced_token_rows += token_bearing_count
+            else:
+                if cost is not None:
+                    without_cost += cost
+                    without_priced_token_rows += token_bearing_count
+
+    _accumulate_attempt_rows(current_rows)
+    _accumulate_attempt_rows(banked_rows)
+    _mark_unpriced_task_rows(current_unpriced_rows)
+    _mark_unpriced_task_rows(banked_unpriced_rows)
+
+    with_avg = (
+        round(with_cost / with_task_count, 6)
+        if with_task_count > 0
+        and with_priced_token_rows > 0
+        and not with_unpriced_task_ids
+        else None
+    )
+    without_avg = (
+        round(without_cost / without_task_count, 6)
+        if without_task_count > 0
+        and without_priced_token_rows > 0
+        and not without_unpriced_task_ids
+        else None
+    )
     cost_delta = (
         round(with_avg - without_avg, 6)
         if with_avg is not None and without_avg is not None
@@ -413,4 +674,6 @@ async def compute_trial_arm_cost_delta(
         "with_avg_cost_usd": with_avg,
         "without_avg_cost_usd": without_avg,
         "cost_delta": cost_delta,
+        "with_unpriced_task_count": len(with_unpriced_task_ids),
+        "without_unpriced_task_count": len(without_unpriced_task_ids),
     }

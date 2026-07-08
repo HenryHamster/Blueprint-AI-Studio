@@ -10446,6 +10446,294 @@ def test_llm_auth_hard_disable_accepts_anthropic_oauth_org_not_allowed():
     )
 
 
+def test_llm_auth_hard_disable_rejects_api_key_generic_auth_report():
+    task = Task(
+        context={
+            "llm_provider": "deepseek",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "deepseek-account",
+            "agent_error_report": {
+                "provider": "deepseek",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": "HTTP 401 Unauthorized from api.deepseek.com",
+            },
+        }
+    )
+
+    assert not _is_task_llm_auth_hard_disable(
+        task,
+        "DeepSeek authentication failed: HTTP 401 Unauthorized from api.deepseek.com",
+    )
+
+
+def test_llm_auth_hard_disable_accepts_api_key_explicit_invalid_key():
+    task = Task(
+        context={
+            "llm_provider": "zai",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "zai-account",
+            "agent_error_report": {
+                "provider": "zai",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": "invalid z.ai api key",
+            },
+        }
+    )
+
+    assert _is_task_llm_auth_hard_disable(task, "invalid z.ai api key")
+
+
+def test_llm_auth_hard_disable_accepts_deepseek_authentication_fails_wrong_key():
+    task = Task(
+        context={
+            "llm_provider": "deepseek",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "deepseek-account",
+            "agent_error_report": {
+                "provider": "deepseek",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": (
+                    "401 - Authentication Fails. Cause: Authentication fails "
+                    "due to the wrong API key."
+                ),
+            },
+        }
+    )
+
+    assert _is_task_llm_auth_hard_disable(task, "DeepSeek authentication fails")
+
+
+def test_llm_auth_hard_disable_rejects_deepseek_balance_authentication_report():
+    task = Task(
+        context={
+            "llm_provider": "deepseek",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "deepseek-account",
+            "agent_error_report": {
+                "provider": "deepseek",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": (
+                    "HTTP 401 Unauthorized from api.deepseek.com: "
+                    "authentication fails: insufficient_balance"
+                ),
+            },
+        }
+    )
+
+    assert not _is_task_llm_auth_hard_disable(
+        task,
+        "HTTP 401 Unauthorized from api.deepseek.com: "
+        "authentication fails: insufficient_balance",
+    )
+
+
+def test_llm_auth_hard_disable_rejects_openai_api_key_quota_report():
+    task = Task(
+        context={
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "openai-account",
+            "agent_error_report": {
+                "provider": "openai",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": (
+                    "You exceeded your current quota, please check your plan "
+                    "and billing details."
+                ),
+            },
+        }
+    )
+
+    assert not _is_task_llm_auth_hard_disable(
+        task,
+        "OpenAI API error: You exceeded your current quota, please check your "
+        "plan and billing details.",
+    )
+
+
+def test_llm_auth_hard_disable_accepts_openai_api_key_invalid_authentication():
+    task = Task(
+        context={
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "openai-account",
+            "agent_error_report": {
+                "provider": "openai",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": (
+                    "Error code: 401 - invalid authentication credentials"
+                ),
+            },
+        }
+    )
+
+    assert _is_task_llm_auth_hard_disable(
+        task,
+        "OpenAI API error: invalid authentication credentials",
+    )
+
+
+def test_llm_auth_hard_disable_accepts_openai_api_key_missing_key():
+    task = Task(
+        context={
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "openai-account",
+            "agent_error_report": {
+                "provider": "openai",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": "You didn't provide an API key.",
+            },
+        }
+    )
+
+    assert _is_task_llm_auth_hard_disable(
+        task,
+        "OpenAI API error: You didn't provide an API key.",
+    )
+
+
+def test_llm_auth_hard_disable_rejects_openai_api_key_generic_logs_only():
+    task = Task(
+        context={
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "openai-account",
+        }
+    )
+
+    assert not _is_task_llm_auth_hard_disable(
+        task,
+        "unit test expected invalid api key response from our app",
+    )
+    assert not _is_task_llm_auth_hard_disable(
+        task,
+        "unit test expected OpenAI invalid api key response from our app",
+    )
+
+
+def test_llm_auth_hard_disable_accepts_openai_api_key_api_error_logs_only():
+    task = Task(
+        context={
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "openai-account",
+        }
+    )
+
+    assert _is_task_llm_auth_hard_disable(
+        task,
+        "OpenAI API error: invalid authentication credentials",
+    )
+
+
+def test_llm_auth_hard_disable_rejects_structured_report_model_output_openai_logs():
+    task = Task(
+        context={
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "openai-account",
+            "agent_error_report": {
+                "provider": "openai",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": True,
+                "result_event_seen": False,
+                "stderr_tail": "provider process exited 1",
+            },
+        }
+    )
+
+    assert not _is_task_llm_auth_hard_disable(
+        task,
+        "unit test expected OpenAI invalid api key response from our app",
+    )
+
+
+def test_llm_auth_hard_disable_rejects_structured_report_model_output_deepseek_logs():
+    task = Task(
+        context={
+            "llm_provider": "deepseek",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "deepseek-account",
+            "agent_error_report": {
+                "provider": "deepseek",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": True,
+                "result_event_seen": False,
+                "stderr_tail": "provider process exited 1",
+            },
+        }
+    )
+
+    assert not _is_task_llm_auth_hard_disable(
+        task,
+        "task output says authentication fails due to api key in docs",
+    )
+
+
+def test_llm_auth_hard_disable_rejects_deepseek_capacity_authentication_report():
+    task = Task(
+        context={
+            "llm_provider": "deepseek",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "deepseek-account",
+            "agent_error_report": {
+                "provider": "deepseek",
+                "auth_mode": "api_key",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": (
+                    "api.deepseek.com overloaded: authentication fails"
+                ),
+            },
+        }
+    )
+
+    assert not _is_task_llm_auth_hard_disable(
+        task,
+        "api.deepseek.com overloaded: authentication fails",
+    )
+
+
+def test_llm_auth_hard_disable_rejects_api_key_quota_logs_only():
+    task = Task(
+        context={
+            "llm_provider": "deepseek",
+            "llm_auth_mode": "api_key",
+            "llm_account_id": "deepseek-account",
+        }
+    )
+
+    assert not _is_task_llm_auth_hard_disable(
+        task,
+        "HTTP 401 Unauthorized from api.deepseek.com: insufficient balance",
+    )
+
+
 @pytest.mark.asyncio
 async def test_external_api_permanent_auth_failure_does_not_requeue(
     client: AsyncClient, db_session, mocker

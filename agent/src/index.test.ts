@@ -1606,6 +1606,23 @@ describe('matchesRateLimit', () => {
     expect(matchesRateLimit('server is overloaded')).toBe(false);
   });
 
+  it('detects provider-specific API-key capacity bodies', () => {
+    expect(matchesRateLimit(
+      'api.deepseek.com overloaded: authentication fails',
+      'deepseek',
+      'api_key',
+    )).toBe(true);
+    expect(matchesRateLimit('api.z.ai service capacity exceeded', 'zai', 'api_key')).toBe(true);
+    expect(matchesRateLimit('OpenAI API error: model is temporarily unavailable', 'openai', 'api_key')).toBe(true);
+  });
+
+  it('does not detect generic API-key capacity words without provider context', () => {
+    expect(matchesRateLimit('unit test prints service unavailable', 'openai', 'api_key')).toBe(false);
+    expect(matchesRateLimit('unit test expected OpenAI service unavailable response', 'openai', 'api_key')).toBe(false);
+    expect(matchesRateLimit('unit test expected gpt-5 temporarily unavailable response', 'openai', 'api_key')).toBe(false);
+    expect(matchesRateLimit('docs mention GLM service unavailable fallback', 'zai', 'api_key')).toBe(false);
+  });
+
   it('returns false for an empty string', () => {
     expect(matchesRateLimit('')).toBe(false);
   });
@@ -1628,6 +1645,22 @@ describe('matchesRateLimit', () => {
 
   it('detects DeepSeek API-key rate limits when provider/auth are supplied', () => {
     expect(matchesRateLimit('Too many requests: rate_limit exceeded', 'deepseek', 'api_key')).toBe(true);
+  });
+
+  it('detects DeepSeek balance/quota bodies even when they include auth-ish text', () => {
+    expect(matchesRateLimit(
+      'HTTP 401 Unauthorized from api.deepseek.com: authentication fails: insufficient_balance',
+      'deepseek',
+      'api_key',
+    )).toBe(true);
+  });
+
+  it('detects Z.AI balance/quota bodies even when they include auth-ish text', () => {
+    expect(matchesRateLimit(
+      'HTTP 401 Unauthorized from api.z.ai: authentication_failed: insufficient balance',
+      'zai',
+      'api_key',
+    )).toBe(true);
   });
 
   it('detects Gemini API-key quota metric bodies', () => {

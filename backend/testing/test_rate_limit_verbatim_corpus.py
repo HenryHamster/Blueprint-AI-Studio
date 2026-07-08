@@ -166,10 +166,41 @@ GEMINI_CASES = [
     ),
 ]
 
+DEEPSEEK_ZAI_CASES = [
+    (
+        LLMProviderName.DEEPSEEK,
+        LLMAuthMode.API_KEY,
+        "HTTP 401 Unauthorized from api.deepseek.com: authentication fails: insufficient_balance",
+        "quota_exhausted",
+        None,
+    ),
+    (
+        LLMProviderName.DEEPSEEK,
+        LLMAuthMode.API_KEY,
+        '{"error":{"type":"rate_limit","message":"Too many requests"}}',
+        "rate_limit",
+        None,
+    ),
+    (
+        LLMProviderName.ZAI,
+        LLMAuthMode.API_KEY,
+        "HTTP 401 Unauthorized from api.z.ai: authentication_failed: insufficient balance",
+        "quota_exhausted",
+        None,
+    ),
+    (
+        LLMProviderName.ZAI,
+        LLMAuthMode.API_KEY,
+        '{"error":{"code":429,"message":"rate_limit exceeded"}}',
+        "rate_limit",
+        None,
+    ),
+]
+
 
 @pytest.mark.parametrize(
     "provider,auth_mode,text,expected_kind,expected_retry",
-    OPENAI_CASES + GEMINI_CASES,
+    OPENAI_CASES + GEMINI_CASES + DEEPSEEK_ZAI_CASES,
 )
 def test_classify_rate_limit_signal_verbatim(
     provider, auth_mode, text, expected_kind, expected_retry
