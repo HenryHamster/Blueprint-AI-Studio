@@ -332,8 +332,8 @@ async def _maybe_autocomplete_exhausted_direction(
 
     # Gate exhaustion auto-complete on criterion coverage: a direction that owns
     # uncovered acceptance criteria must not retire via exhaustion — the criteria
-    # must be satisfied first. Fail-open (helper returns False on error / no
-    # criteria) preserves current behavior.
+    # must be satisfied first. Fail-closed (helper returns True on error)
+    # defers auto-completion until the query succeeds.
     from app.acceptance_criteria import (  # noqa: PLC0415
         direction_owns_uncovered_criterion,
     )
@@ -1002,9 +1002,9 @@ async def apply_post_spawn_state(
                         # Gate the PROVEN-merge SUCCESS route on outcome
                         # coverage: a saturated direction must not retire
                         # declaring success while an acceptance criterion it
-                        # owns is still uncovered. Fail-open (helper returns
-                        # False) preserves current behavior for directions that
-                        # own no criteria or on any query error. When gated, the
+                        # owns is still uncovered. Fail-closed (helper returns
+                        # True) blocks completion for directions that own
+                        # uncovered criteria or on any query error. When gated, the
                         # direction simply stays active — do NOT fall through to
                         # the exhaustion route, which declares deadlock (not
                         # success), not an unmet-but-productive outcome.

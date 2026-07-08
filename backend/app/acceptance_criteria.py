@@ -507,10 +507,11 @@ async def direction_owns_uncovered_criterion(
       * Only ``status == "active"`` criteria are weighed; coverage is computed
         from each criterion's evidence via :func:`compute_criterion_coverage`.
 
-    Fail-open: returns ``False`` (do NOT block completion) when the direction
-    owns no keys, there is no open version, there are no active owned criteria,
-    all owned active criteria are covered, or the query raises. A transient DB
-    error must never permanently strand every saturated direction.
+    Fail-closed: returns ``True`` (block completion) when the query raises,
+    so a transient DB error defers retirement rather than permanently stranding
+    the direction. Returns ``False`` (do NOT block completion) only when the
+    direction owns no keys, there is no open version, there are no active owned
+    criteria, or all owned active criteria are covered.
     """
     try:
         from app.directions_repo import get_direction_row  # noqa: PLC0415
@@ -553,12 +554,13 @@ async def direction_owns_uncovered_criterion(
     except Exception:
         logger.warning(
             "direction_owns_uncovered_criterion: coverage query failed for "
-            "direction %s (project %s); failing open (not blocking completion)",
+            "direction %s (project %s); failing closed (blocking completion "
+            "until the query succeeds)",
             direction_id,
             project_id,
             exc_info=True,
         )
-        return False
+        return True
 
 
 async def record_task_merge_evidence(

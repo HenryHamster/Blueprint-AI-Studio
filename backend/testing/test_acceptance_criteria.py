@@ -5122,8 +5122,8 @@ async def test_owns_uncovered_false_when_only_criterion_retracted(db_session):
 
 
 @pytest.mark.asyncio
-async def test_owns_uncovered_fails_open_on_query_error(db_session, mocker):
-    """A raised coverage query is swallowed → False (never blocks completion)."""
+async def test_owns_uncovered_fails_closed_on_query_error(db_session, mocker):
+    """A raised coverage query is swallowed → True (blocks completion)."""
     project = await _make_project(db_session)
     version = await _make_version(db_session, project)
     criterion = await ac.create_criterion(
@@ -5138,7 +5138,7 @@ async def test_owns_uncovered_fails_open_on_query_error(db_session, mocker):
     )
     assert (
         await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-boom")
-        is False
+        is True
     )
 
 

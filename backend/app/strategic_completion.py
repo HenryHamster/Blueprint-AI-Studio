@@ -5603,8 +5603,8 @@ async def _handle_strategic_completion(
                 # acceptance criterion must not be retired by the strategist.
                 # The exhaust/proven-merge auto-complete paths enforce the same
                 # gate; retire_direction is the strategist-authored path and must
-                # match.  Fail-open: the helper returns False when the direction
-                # owns no criteria or the query errors, preserving current behavior.
+                # match.  Fail-closed: the helper returns True on query errors,
+                # blocking completion until resolved.
                 from app.acceptance_criteria import (  # noqa: PLC0415
                     direction_owns_uncovered_criterion,
                 )

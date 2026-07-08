@@ -762,8 +762,10 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     # apply_post_spawn_state). The coverage query is async, but the completion
     # decision runs inside the SYNCHRONOUS with_directions_locked closure below,
     # so we resolve the verdict here (outside the lock) and thread the boolean
-    # in. Fail-open: the helper returns False when the direction owns no criteria
-    # or the query errors, preserving current behavior.
+    # in. Fail-closed: the helper returns True on query errors (blocking
+    # completion until resolved) and False only when the direction owns no keys,
+    # no open version, no active owned criteria, or all owned active criteria
+    # are covered.
     from app.acceptance_criteria import (  # noqa: PLC0415
         direction_owns_uncovered_criterion,
     )

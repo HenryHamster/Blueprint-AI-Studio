@@ -15249,14 +15249,15 @@ async def test_no_findings_proven_direction_owning_no_criteria_completes(db_sess
 
 
 @_pytest.mark.asyncio
-async def test_no_findings_proven_direction_fails_open_on_coverage_error(
+async def test_criterion_gate_query_error_defers_autocomplete(
     db_session, mocker
 ):
-    """Site 2: if the coverage query raises, the gate fails open — the saturated
-    proven direction completes rather than being permanently stranded."""
+    """Site 2 (_stamp_no_findings_refractory): when the coverage query raises,
+    the gate must fail closed — deferring retirement rather than allowing
+    auto-complete on a transient error."""
     from app.research_completion import _stamp_no_findings_refractory
 
-    direction_id = "d-cov-failopen"
+    direction_id = "d-cov-failclosed"
     project, task, _ = await _setup_saturated_proven_direction(
         db_session, direction_id=direction_id, criterion_keys=["placeholder"]
     )
@@ -15278,7 +15279,8 @@ async def test_no_findings_proven_direction_fails_open_on_coverage_error(
     db_session.add(row)
     await db_session.commit()
 
-    # Force the coverage resolution to raise; the helper must swallow it (fail-open).
+    # Force the coverage resolution to raise; the helper must swallow it and
+    # return True (fail-closed), deferring retirement.
     mocker.patch(
         "app.release_version.current_open_version",
         new=AsyncMock(side_effect=RuntimeError("transient DB error")),
@@ -15288,11 +15290,13 @@ async def test_no_findings_proven_direction_fails_open_on_coverage_error(
 
     await db_session.refresh(project)
     target = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target.get("status") == "completed", (
-        "A coverage-query error must fail open (complete), never deadlock the "
-        "saturated direction forever"
+    assert target.get("status") == "active", (
+        "A coverage-query error must fail closed (defer), never auto-complete "
+        "a saturated direction on a transient failure"
     )
-    assert target.get("auto_completed") is True
+    assert target.get("auto_completed") is not True
+    # Refractory stamp still applied even though completion was withheld.
+    assert target.get("possibly_saturated") is True
 
 
 @_pytest.mark.asyncio
