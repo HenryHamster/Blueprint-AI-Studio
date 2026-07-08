@@ -11577,10 +11577,15 @@ def test_all_autocomplete_paths_gate_on_criterion_coverage():
         "research_direction_state.py. This constant declares which auto-complete paths "
         "are criterion-gated. Restore it."
     )
-    assert frozenset_entries >= {"exhaustion", "proven_merge"}, (
+    assert frozenset_entries >= {
+        "exhaustion",
+        "proven_merge",
+        "no_findings",
+        "strategist_retire",
+    }, (
         f"_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE must contain at least "
-        f"{{'exhaustion', 'proven_merge'}}; found {frozenset_entries}. "
-        "Restore the missing entries."
+        f"{{'exhaustion', 'proven_merge', 'no_findings', 'strategist_retire'}}; "
+        f"found {frozenset_entries}. Restore the missing entries."
     )
 
     # ── 2. Verify exhaustion path: _maybe_autocomplete_exhausted_direction ─
@@ -11676,10 +11681,16 @@ def test_all_autocomplete_paths_gate_on_criterion_coverage():
         "research_completion.py. This constant declares which auto-complete paths "
         "are criterion-gated in _stamp_no_findings_refractory. Restore it."
     )
-    assert rc_frozenset_entries >= {"exhaustion", "proven_merge"}, (
+    assert rc_frozenset_entries >= {
+        "exhaustion",
+        "proven_merge",
+        "no_findings",
+        "strategist_retire",
+    }, (
         f"_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE in research_completion.py "
-        f"must contain at least {{'exhaustion', 'proven_merge'}}; found {rc_frozenset_entries}. "
-        "Restore the missing entries."
+        f"must contain at least "
+        f"{{'exhaustion', 'proven_merge', 'no_findings', 'strategist_retire'}}; "
+        f"found {rc_frozenset_entries}. Restore the missing entries."
     )
 
     # 4b. Verify _stamp_no_findings_refractory calls the gate function
@@ -11707,6 +11718,37 @@ def test_all_autocomplete_paths_gate_on_criterion_coverage():
         "_stamp_no_findings_refractory does not call "
         "direction_owns_uncovered_criterion. The proven-merge and exhaustion "
         "auto-complete paths in research_completion.py must gate on criterion "
+        "coverage before retiring a direction."
+    )
+
+    # ── 5. Verify strategist retire path: _handle_strategic_completion ──────
+    sc_path = Path(__file__).resolve().parents[1] / "app" / "strategic_completion.py"
+    sc_source = sc_path.read_text(encoding="utf-8")
+    sc_tree = ast.parse(sc_source, filename=str(sc_path))
+
+    handler_func: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(sc_tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_strategic_completion":
+            handler_func = node
+            break
+
+    assert handler_func is not None, (
+        "_handle_strategic_completion not found in strategic_completion.py"
+    )
+
+    handler_gated = False
+    for node in ast.walk(handler_func):
+        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
+            handler_gated = True
+            break
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            if _ast_called_name(node.value) == gate_func_name:
+                handler_gated = True
+                break
+
+    assert handler_gated, (
+        "_handle_strategic_completion does not call direction_owns_uncovered_criterion. "
+        "The strategist-authored retire_direction path must gate on criterion "
         "coverage before retiring a direction."
     )
 

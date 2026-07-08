@@ -285,13 +285,17 @@ _SPAWN_GATE_REASON_MAX_LEN = 200
 _ADVERSARIAL_WHOLESALE_RETRY_KEY = "_adversarial_wholesale_retry_count"
 _ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
 # Declares which auto-complete code paths inside _stamp_no_findings_refractory
-# gate on criterion coverage before retiring a direction.
+# gate on criterion coverage before retiring a direction, plus the
+# strategist-authored retire_direction path in strategic_completion.py.
+# This frozenset MUST match the one in research_direction_state.py.
 # test_all_autocomplete_paths_gate_on_criterion_coverage in test_invariants.py
 # verifies structurally that all declared paths contain the gate call.
 _AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
     {
         "exhaustion",  # _stamp_no_findings_refractory exhaustion complete (L840)
         "proven_merge",  # _stamp_no_findings_refractory >=3-merge completion (L824)
+        "no_findings",  # _stamp_no_findings_refractory overall site (research_completion.py)
+        "strategist_retire",  # _handle_strategic_completion retire_direction op (strategic_completion.py)
     }
 )
 # Targeted retry: used when the non-response cause is time-based (timeout/stall).

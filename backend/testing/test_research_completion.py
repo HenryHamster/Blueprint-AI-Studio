@@ -15402,6 +15402,159 @@ async def test_no_findings_exhausted_direction_with_uncovered_criterion_stays_ac
     assert target.get("possibly_saturated") is True
 
 
+@_pytest.mark.asyncio
+async def test_direction_autocomplete_gate_blocks_then_records_coverage_for_owned_criterion(
+    db_session,
+):
+    """End-to-end: gate blocks auto-complete when criterion is uncovered, then
+    a proven-verdict merge records coverage, and the gate lifts.
+
+    This test proves the full lifecycle against a REAL uncovered criterion (no
+    mocks on the coverage helper):
+
+    1. A saturated, >=3-merge direction owns an uncovered acceptance criterion.
+       Auto-complete via _stamp_no_findings_refractory is DEFERRED — the
+       direction stays active.
+
+    2. A proven-verdict task merge (naming that same criterion) calls
+       record_task_merge_evidence, which records task_merge + reachability
+       evidence rows.  compute_criterion_coverage now returns 'covered'.
+
+    3. Re-driving auto-complete after the criterion is covered now SUCCEEDS —
+       the direction reaches status='completed'.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.models import Direction
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-e2e-gate-cover"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row's criterion_keys at the real (uncovered) criterion.
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    # ── Phase (a): uncovered criterion → gate blocks auto-complete ──────────
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "Phase (a): direction owning an uncovered criterion must NOT auto-complete; "
+        f"expected status='active', got {target.get('status')!r}"
+    )
+    assert target.get("auto_completed") is not True, (
+        "Phase (a): auto_completed must NOT be set when gated on uncovered criterion"
+    )
+
+    # ── Phase (b): proven-verdict merge → record coverage ───────────────────
+    from app.acceptance_criteria import (
+        record_task_merge_evidence,
+        compute_criterion_coverage,
+        get_evidence_for_criterion,
+    )
+
+    # Build a proven-verdict task that carries the criterion.
+    merge_task = _Task(
+        project_id=project.id,
+        title="Proven-merge task for coverage",
+        payloads=[{"type": "create", "prompt": "record coverage"}],
+        context={
+            "direction_id": direction_id,
+            "review_loop": {"pr_number": 42},
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test ran green under verified merge verdict",
+                "proof_ref": (
+                    "testing/test_research_completion.py::"
+                    "test_direction_autocomplete_gate_blocks_then_records_coverage_for_owned_criterion"
+                ),
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(merge_task)
+    await db_session.commit()
+    await db_session.refresh(merge_task)
+
+    recorded = await record_task_merge_evidence(db_session, merge_task, project.id)
+    assert recorded == 2, (
+        f"Phase (b): expected 2 evidence rows (task_merge + reachability), got {recorded}"
+    )
+
+    # Verify the evidence rows exist and coverage is now 'covered'.
+    evidence = await get_evidence_for_criterion(db_session, criterion.id)
+    coverage = compute_criterion_coverage(evidence)
+    assert coverage == "covered", (
+        f"Phase (b): expected coverage='covered' after proven-verdict merge, "
+        f"got {coverage!r}. Evidence rows: {len(evidence)}"
+    )
+
+    # Confirm a proven task_merge row exists.
+    proven_merges = [
+        e for e in evidence
+        if e.source_kind == "task_merge" and (e.detail or {}).get("proven") is True
+    ]
+    assert len(proven_merges) >= 1, (
+        "Phase (b): expected at least one proven task_merge evidence row"
+    )
+
+    # ── Phase (c): criterion now covered → auto-complete succeeds ───────────
+    # Re-drive auto-complete: the gate must now allow retirement.
+    task2 = _Task(
+        project_id=project.id,
+        title="Research: retry after coverage recorded",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [project.directions[0]],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    await _stamp_no_findings_refractory(task2, db_session)
+
+    await db_session.refresh(project)
+    target2 = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target2.get("status") == "completed", (
+        "Phase (c): direction whose criterion is now covered must auto-complete; "
+        f"expected status='completed', got {target2.get('status')!r}"
+    )
+    assert target2.get("auto_completed") is True, (
+        "Phase (c): auto_completed must be True when criterion coverage is satisfied"
+    )
+    assert "verified" in (target2.get("auto_completed_reason") or ""), (
+        "Phase (c): auto-complete reason must mention 'verified' (proven-merge route)"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Site 1 (apply_post_spawn_state): proven-route criterion-coverage gate.
 #
