@@ -41,6 +41,8 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+_MISSING_CRITERION_KEYS = object()
+
 
 def _coerce_project_id(project_id) -> uuid.UUID:
     if isinstance(project_id, uuid.UUID):
@@ -64,6 +66,71 @@ def _promoted_fields(direction: Dict[str, Any]) -> Dict[str, Any]:
         "priority": str(priority)[:16] if priority is not None else None,
         "text": text if text else None,
     }
+
+
+def _coerce_criterion_keys(direction: Dict[str, Any]):
+    if "criterion_keys" not in direction:
+        return _MISSING_CRITERION_KEYS
+    raw = direction.get("criterion_keys")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.warning(
+            "[directions_repo] ignoring malformed criterion_keys for direction %s",
+            direction.get("id"),
+        )
+        return _MISSING_CRITERION_KEYS
+    keys = [
+        str(item).strip()
+        for item in raw
+        if isinstance(item, str) and str(item).strip()
+    ]
+    return list(dict.fromkeys(keys))
+
+
+async def _guard_explicit_criterion_keys(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_key: str,
+    criterion_keys,
+):
+    if criterion_keys is _MISSING_CRITERION_KEYS or not criterion_keys:
+        return criterion_keys
+    from app.direction_referential_guard import (
+        check_criterion_key_write,
+        load_version_criterion_key_sets,
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        logger.warning(
+            "[directions_repo] preserving existing criterion_keys for direction %s: "
+            "no open release version to validate explicit keys",
+            direction_key,
+        )
+        return _MISSING_CRITERION_KEYS
+
+    active_keys, inactive_keys = await load_version_criterion_key_sets(
+        session, project_id, open_version.id
+    )
+    valid: list[str] = []
+    rejected: dict[str, list[str]] = {}
+    for key in criterion_keys:
+        classification, _ = check_criterion_key_write(
+            key, active_keys, inactive_keys
+        )
+        if classification is None:
+            valid.append(key)
+        else:
+            rejected.setdefault(classification, []).append(key)
+    if rejected:
+        logger.warning(
+            "[directions_repo] scrubbed invalid criterion_keys for direction %s: %s",
+            direction_key,
+            rejected,
+        )
+    return valid
 
 
 async def list_directions(
@@ -152,20 +219,27 @@ async def upsert_direction(
     ).scalar_one_or_none()
     # Snapshot status before any mutation so the event trail sees the old value.
     prior_status_snapshot = existing.status if existing is not None else None
+    criterion_keys = _coerce_criterion_keys(direction)
+    criterion_keys = await _guard_explicit_criterion_keys(
+        session, pid, str(direction_key), criterion_keys
+    )
     if existing is None:
-        session.add(
-            Direction(
-                project_id=pid,
-                direction_key=str(direction_key)[:128],
-                data=dict(direction),
-                **promoted,
-            )
+        row_kwargs = dict(
+            project_id=pid,
+            direction_key=str(direction_key)[:128],
+            data=dict(direction),
+            **promoted,
         )
+        if criterion_keys is not _MISSING_CRITERION_KEYS:
+            row_kwargs["criterion_keys"] = criterion_keys
+        session.add(Direction(**row_kwargs))
     else:
         existing.data = dict(direction)
         existing.status = promoted["status"]
         existing.priority = promoted["priority"]
         existing.text = promoted["text"]
+        if criterion_keys is not _MISSING_CRITERION_KEYS:
+            existing.criterion_keys = criterion_keys
         existing.updated_at = _utcnow()
         session.add(existing)
     # Best-effort lifecycle event — prior_status_snapshot captures the old status

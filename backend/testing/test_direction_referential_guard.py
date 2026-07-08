@@ -111,6 +111,7 @@ def test_criterion_keys_write_sites_are_enumerated():
 
     # Files where Direction.criterion_keys is assigned (updated as new writers land).
     KNOWN_GUARDED_WRITERS = {
+        "directions_repo.py",                    # dual-write sync of explicit direction criterion_keys
         "routers/admin_acceptance_criteria.py",  # operator link-direction endpoint
         "routers/admin_agent_ops.py",             # strategic set_acceptance_criteria op
     }

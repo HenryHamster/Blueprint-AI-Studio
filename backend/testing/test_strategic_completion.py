@@ -8405,6 +8405,88 @@ async def test_api_path_create_direction_persists_gap_id(client, db_session, moc
 
 
 @pytest.mark.asyncio
+async def test_api_path_create_direction_persists_criterion_keys(client, db_session):
+    """HTTP create_direction must persist criterion_keys onto the JSON snapshot
+    and normalized Direction row; downstream merge evidence reads the row."""
+    from app import strategic_cycle
+
+    project = Project(
+        name="CRITERIONLINK-CREATE-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-create-direction-map",
+        text="Mapped create_direction criterion",
+        created_by="test",
+    )
+    db_session.add(criterion)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-criterion-create",
+        payloads=[{"type": "strategic_review"}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-criterion-create", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Own the mapped create criterion",
+                "priority": "high",
+                "criterion_keys": [criterion.criterion_key],
+                "rationale": "link acceptance coverage",
+                "success_evidence": "Criterion evidence is recorded",
+                "retirement_condition": "Criterion is covered",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["criterion_keys"] == [criterion.criterion_key]
+    new_id = body["direction_id"]
+
+    await db_session.refresh(project)
+    created = next(d for d in project.directions if d.get("id") == new_id)
+    assert created.get("criterion_keys") == [criterion.criterion_key]
+
+    direction_row = (
+        await db_session.execute(
+            select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == new_id,
+            )
+        )
+    ).scalar_one()
+    assert direction_row.criterion_keys == [criterion.criterion_key]
+
+
+@pytest.mark.asyncio
 async def test_api_path_update_direction_sets_and_clears_gap_id(
     client, db_session, mocker
 ):
@@ -8489,6 +8571,117 @@ async def test_api_path_update_direction_sets_and_clears_gap_id(
     await db_session.refresh(project)
     d = next(d for d in project.directions if d.get("id") == "d-link")
     assert "gap_id" not in d
+
+
+@pytest.mark.asyncio
+async def test_api_path_update_direction_persists_and_clears_criterion_keys(
+    client, db_session
+):
+    """HTTP update_direction changes.criterion_keys must update both storage
+    surfaces and de-duplicate keys while preserving order."""
+    from app import strategic_cycle
+
+    direction_dict = {
+        "id": "d-criterion-update",
+        "text": "Existing mapped direction",
+        "status": "active",
+        "priority": "medium",
+        "notes": [],
+        "research_history": [],
+    }
+    project = Project(
+        name="CRITERIONLINK-UPDATE-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[dict(direction_dict)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-update-direction-map",
+        text="Mapped update_direction criterion",
+        created_by="test",
+    )
+    db_session.add(criterion)
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-criterion-update",
+        data=dict(direction_dict),
+        status="active",
+    )
+    db_session.add(direction)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-criterion-update",
+        payloads=[{"type": "strategic_review"}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-criterion-update", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-criterion-update",
+                "changes": {
+                    "criterion_keys": [
+                        criterion.criterion_key,
+                        criterion.criterion_key,
+                    ],
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["criterion_keys"] == [criterion.criterion_key]
+
+    await db_session.refresh(project)
+    d = next(d for d in project.directions if d.get("id") == "d-criterion-update")
+    assert d.get("criterion_keys") == [criterion.criterion_key]
+    await db_session.refresh(direction)
+    assert direction.criterion_keys == [criterion.criterion_key]
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-criterion-update",
+                "changes": {"criterion_keys": []},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["criterion_keys"] == []
+
+    await db_session.refresh(project)
+    d = next(d for d in project.directions if d.get("id") == "d-criterion-update")
+    assert d.get("criterion_keys") == []
+    await db_session.refresh(direction)
+    assert direction.criterion_keys == []
 
 
 @pytest.mark.asyncio

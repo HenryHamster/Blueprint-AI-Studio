@@ -194,6 +194,90 @@ def _cap_list(
     return lst
 
 
+def _coerce_criterion_keys_payload(raw: Any, field_name: str) -> list[str]:
+    if not isinstance(raw, list):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be a list of criterion_key strings",
+        )
+    keys: list[str] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field_name}[{idx}] must be a non-empty string",
+            )
+        keys.append(item.strip())
+    return list(dict.fromkeys(keys))
+
+
+async def _validate_criterion_keys_payload(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    raw: Any,
+    field_name: str,
+) -> list[str]:
+    keys = _coerce_criterion_keys_payload(raw, field_name)
+    if not keys:
+        return []
+
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    from app.direction_referential_guard import (
+        check_criterion_key_write,
+        load_version_criterion_key_sets,
+    )
+
+    active_keys, inactive_keys = await load_version_criterion_key_sets(
+        session, project_id, open_version.id
+    )
+    failures: dict[str, list[str]] = {}
+    for key in keys:
+        classification, _ = check_criterion_key_write(
+            key, active_keys, inactive_keys
+        )
+        if classification is not None:
+            failures.setdefault(classification, []).append(key)
+    if failures:
+        classification = "dangling" if "dangling" in failures else "inactive"
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "criterion_key_invalid",
+                "classification": classification,
+                "keys": failures[classification],
+                "active_criterion_keys": sorted(active_keys),
+            },
+        )
+    return keys
+
+
+async def _backfill_direction_merge_evidence_after_mapping(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_key: str,
+) -> None:
+    try:
+        from app import acceptance_criteria as ac
+
+        recorded = await ac.backfill_direction_merge_evidence(
+            session, project_id, direction_key
+        )
+        if recorded:
+            await session.commit()
+    except Exception:  # noqa: BLE001 - best-effort post-mapping repair
+        await session.rollback()
+        logger.warning(
+            "[STRATEGIC API] criterion_keys backfill failed for direction %s",
+            direction_key,
+            exc_info=True,
+        )
+
+
 class DesignDocUpdate(BaseModel):
     """Incremental design doc page update from an agent."""
 
@@ -1148,6 +1232,14 @@ async def strategic_operation(
                     status_code=409,
                 )
         _DIR_FIELD_MAX = 500
+        criterion_keys_supplied = "criterion_keys" in data
+        criterion_keys = (
+            await _validate_criterion_keys_payload(
+                session, project.id, data.get("criterion_keys"), "criterion_keys"
+            )
+            if criterion_keys_supplied
+            else []
+        )
         new_dir: dict = {
             "id": f"d-{uuid.uuid4().hex[:8]}",
             "text": text,
@@ -1196,6 +1288,8 @@ async def strategic_operation(
                 "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
             },
         }
+        if criterion_keys_supplied:
+            new_dir["criterion_keys"] = criterion_keys
         if staged_create:
             new_dir["staged_for_version"] = staged_for_version
             new_dir["staged_at"] = _utcnow().isoformat()
@@ -1321,6 +1415,10 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        if criterion_keys_supplied and criterion_keys:
+            await _backfill_direction_merge_evidence_after_mapping(
+                session, project.id, new_dir["id"]
+            )
         await _emit_updated(
             STRATEGIC_KIND_DIRECTIONS,
             changed_direction_ids=[new_dir["id"]],
@@ -1341,6 +1439,8 @@ async def strategic_operation(
             resp_body["retired_grounding"] = retired_grounding
         if staged_create:
             resp_body["staged_for_version"] = staged_for_version
+        if criterion_keys_supplied:
+            resp_body["criterion_keys"] = criterion_keys
         return _resp(resp_body)
 
     elif payload.op == "update_direction":
@@ -1361,6 +1461,17 @@ async def strategic_operation(
         _blk = await _challenge_gate("update_direction", direction_id=str(dir_id))
         if _blk is not None:
             return _blk
+        criterion_keys_supplied = "criterion_keys" in changes
+        criterion_keys = (
+            await _validate_criterion_keys_payload(
+                session,
+                project.id,
+                changes.get("criterion_keys"),
+                "changes.criterion_keys",
+            )
+            if criterion_keys_supplied
+            else []
+        )
         directions = list(project.directions or [])
         updated = False
         # Re-ground reconciliation: capture the direction's prior gap_id BEFORE
@@ -1499,6 +1610,8 @@ async def strategic_operation(
                             status_code=400,
                             detail="conflicts_with must be a list of direction ID strings",
                         )
+                if criterion_keys_supplied:
+                    d["criterion_keys"] = criterion_keys
                 # Handle success_evidence and retirement_condition in context
                 _DIR_FIELD_MAX = 500
                 if "success_evidence" in changes or "retirement_condition" in changes:
@@ -1654,6 +1767,10 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        if criterion_keys_supplied and criterion_keys:
+            await _backfill_direction_merge_evidence_after_mapping(
+                session, project.id, str(dir_id)
+            )
         await _emit_updated(
             STRATEGIC_KIND_DIRECTIONS,
             changed_direction_ids=[dir_id],
@@ -1668,6 +1785,7 @@ async def strategic_operation(
                 "grounding_verdict": (_updated_dir.get("context") or {}).get(
                     "grounding_verdict"
                 ),
+                **({"criterion_keys": criterion_keys} if criterion_keys_supplied else {}),
             }
         )
 
