@@ -792,6 +792,31 @@ POOL_PAYOFF_COST_TOLERANCE_PCT = 5.0
 # payoff transition.
 POOL_PAYOFF_PROVEN_MIN_WARM_STARTS = 5
 
+# ---------------------------------------------------------------------------
+# Provider routing A/B verdict (direction d-cf39cb40)
+# ---------------------------------------------------------------------------
+# Verdict states for the DeepSeek-vs-Anthropic routing A/B: is routing
+# low/medium-effort tasks to DeepSeek cutting cost without regressing quality
+# (verified-merge rate)?
+
+PROVIDER_ROUTING_ADOPT = "ADOPT"
+PROVIDER_ROUTING_REJECT = "REJECT"
+PROVIDER_ROUTING_INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+# Minimum PR-eligible tasks per provider before a verdict can be issued.
+PROVIDER_ROUTING_MIN_PR_ELIGIBLE_TASKS = 20
+
+# Cost-ratio threshold: DeepSeek cost-per-merge must be strictly below this
+# fraction of Anthropic's to count as meaningfully cheaper.  0.90 = at least
+# 10 % cheaper.  Below 1.0 the raw direction is "cheaper"; the 0.90 bar
+# filters out near-parity noise so the verdict is actionable.
+PROVIDER_ROUTING_COST_RATIO_THRESHOLD = 0.90
+
+# Maximum allowable verified-merge-rate regression in *percentage points*.
+# DeepSeek's verified_landed_rate may be at most this many points below
+# Anthropic's.  -5.0 means "5 percentage points lower is acceptable."
+PROVIDER_ROUTING_QUALITY_FLOOR_PCT = -5.0
+
 
 def compute_pool_payoff_verdict(
     origin_breakdown: Dict[str, Any] | None,
@@ -901,6 +926,145 @@ def compute_pool_payoff_verdict(
         POOL_PAYOFF_PROVEN,
         "Keep the pool — it is serving warm starts without regressing cost per "
         "merged PR. Consider widening scope.",
+    )
+
+
+def compute_provider_routing_verdict(
+    by_model_rows: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Synthesize the DeepSeek-vs-Anthropic routing A/B verdict.
+
+    Takes the ``by_model`` rows from :func:`compute_effort_model_efficiency`
+    (each row carries ``provider``, ``model``, ``run_count``,
+    ``pr_eligible_run_count``, ``verified_landed_count``,
+    ``verified_landed_rate``, ``total_cost_usd``, ``cost_per_merge``) and
+    aggregates by provider, then classifies the routing payoff.
+
+    Returns ``{state, supporting, recommended_action}`` where ``state`` is one of
+    the ``PROVIDER_ROUTING_*`` constants and ``supporting`` carries the per-provider
+    numbers the classification was read off.
+
+    Classification (checked in order):
+
+    * ``INSUFFICIENT_DATA`` — fewer than the minimum PR-eligible tasks on either
+      provider side.  Not enough signal to judge; keep measuring.
+    * ``REJECT`` — verified-merge rate on DeepSeek is materially below the
+      Anthropic baseline (rate delta below the quality floor), OR DeepSeek
+      cost-per-merge is not meaningfully cheaper than Anthropic.
+    * ``ADOPT`` — DeepSeek is cheaper AND verified-merge rate is within the
+      quality guardrail.  The routing is paying off.
+    """
+    # -- aggregate by provider ------------------------------------------------
+    _deepseek: Dict[str, Any] = {
+        "run_count": 0,
+        "pr_eligible_run_count": 0,
+        "verified_landed_count": 0,
+        "total_cost_usd": 0.0,
+    }
+    _anthropic: Dict[str, Any] = {
+        "run_count": 0,
+        "pr_eligible_run_count": 0,
+        "verified_landed_count": 0,
+        "total_cost_usd": 0.0,
+    }
+
+    for row in by_model_rows:
+        provider = str(row.get("provider") or "").lower()
+        if provider == "deepseek":
+            b = _deepseek
+        elif provider == "anthropic":
+            b = _anthropic
+        else:
+            continue
+        b["run_count"] += int(row.get("run_count", 0))
+        b["pr_eligible_run_count"] += int(row.get("pr_eligible_run_count", 0))
+        b["verified_landed_count"] += int(row.get("verified_landed_count", 0))
+        b["total_cost_usd"] += float(row.get("total_cost_usd", 0))
+
+    # -- derived metrics ------------------------------------------------------
+    def _cost_per_merge(b: Dict[str, Any]) -> float | None:
+        v = b["verified_landed_count"]
+        return round(b["total_cost_usd"] / v, 6) if v else None
+
+    def _verified_rate(b: Dict[str, Any]) -> float | None:
+        p = b["pr_eligible_run_count"]
+        return round(b["verified_landed_count"] / p, 4) if p else None
+
+    ds_cpm = _cost_per_merge(_deepseek)
+    an_cpm = _cost_per_merge(_anthropic)
+    ds_rate = _verified_rate(_deepseek)
+    an_rate = _verified_rate(_anthropic)
+
+    cost_ratio: float | None = (
+        round(ds_cpm / an_cpm, 4)
+        if (ds_cpm is not None and an_cpm is not None and an_cpm > 0)
+        else None
+    )
+    rate_delta_pct: float | None = (
+        round((ds_rate - an_rate) * 100, 2)
+        if (ds_rate is not None and an_rate is not None)
+        else None
+    )
+
+    supporting: Dict[str, Any] = {
+        "deepseek_run_count": _deepseek["run_count"],
+        "deepseek_pr_eligible_run_count": _deepseek["pr_eligible_run_count"],
+        "deepseek_verified_landed_count": _deepseek["verified_landed_count"],
+        "deepseek_verified_landed_rate": ds_rate,
+        "deepseek_cost_per_merge": ds_cpm,
+        "deepseek_total_cost_usd": round(_deepseek["total_cost_usd"], 6),
+        "anthropic_run_count": _anthropic["run_count"],
+        "anthropic_pr_eligible_run_count": _anthropic["pr_eligible_run_count"],
+        "anthropic_verified_landed_count": _anthropic["verified_landed_count"],
+        "anthropic_verified_landed_rate": an_rate,
+        "anthropic_cost_per_merge": an_cpm,
+        "anthropic_total_cost_usd": round(_anthropic["total_cost_usd"], 6),
+        "cost_ratio": cost_ratio,
+        "verified_rate_delta_pct": rate_delta_pct,
+    }
+
+    def _result(state: str, recommended_action: str) -> Dict[str, Any]:
+        return {
+            "state": state,
+            "supporting": supporting,
+            "recommended_action": recommended_action,
+        }
+
+    # -- classify -------------------------------------------------------------
+    if (
+        _deepseek["pr_eligible_run_count"] < PROVIDER_ROUTING_MIN_PR_ELIGIBLE_TASKS
+        or _anthropic["pr_eligible_run_count"] < PROVIDER_ROUTING_MIN_PR_ELIGIBLE_TASKS
+    ):
+        return _result(
+            PROVIDER_ROUTING_INSUFFICIENT_DATA,
+            "Keep measuring — not enough PR-eligible tasks per provider to judge "
+            "routing payoff.",
+        )
+
+    # Quality regression: DeepSeek verified rate materially below Anthropic.
+    if (
+        rate_delta_pct is not None
+        and rate_delta_pct < PROVIDER_ROUTING_QUALITY_FLOOR_PCT
+    ):
+        return _result(
+            PROVIDER_ROUTING_REJECT,
+            "Reject DeepSeek routing — verified-merge rate regressed materially "
+            "below the Anthropic baseline.",
+        )
+
+    # Cost not meaningfully cheaper.
+    if cost_ratio is None or cost_ratio >= PROVIDER_ROUTING_COST_RATIO_THRESHOLD:
+        return _result(
+            PROVIDER_ROUTING_REJECT,
+            "Reject DeepSeek routing — cost per merge is not meaningfully lower "
+            "than Anthropic.",
+        )
+
+    # Cheaper AND quality held → adopt.
+    return _result(
+        PROVIDER_ROUTING_ADOPT,
+        "Adopt DeepSeek routing for low/medium-effort tasks — cost is lower with "
+        "no quality regression.",
     )
 
 
@@ -2283,6 +2447,12 @@ async def compute_current_axes(
     lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
 
+    # Provider routing A/B verdict (direction d-cf39cb40): derive from the
+    # per-model efficiency breakdown so the verdict carries BOTH cost ratio AND
+    # verified-merge-rate delta — the two halves of the A/B guardrail.
+    _effort_model = compute_effort_model_efficiency(tasks)
+    provider_routing_verdict = compute_provider_routing_verdict(_effort_model["by_model"])
+
     # Deploy-scoped boundary: the earliest snapshot captured under the current
     # serving SHA, so panel_review_effectiveness can be computed for
     # post-deployment traffic only. None when the SHA is unknown or this is the
@@ -2421,6 +2591,10 @@ async def compute_current_axes(
         "panel_review_recommended_sample_rate": compute_recommended_challenger_sample_rate(
             _peff
         ),
+        # Provider routing A/B verdict (direction d-cf39cb40): DeepSeek vs
+        # Anthropic cost ratio + verified-merge-rate delta, persisted in the
+        # daily snapshot so the A/B is machine-checkable on the deployed instance.
+        "provider_routing_verdict": provider_routing_verdict,
     }
 
 
@@ -3329,6 +3503,10 @@ async def read_baseline_with_drift(
         "panel_review_effectiveness_post_deploy": latest.get(
             "panel_review_effectiveness_post_deploy"
         ),
+        # Provider routing A/B verdict (direction d-cf39cb40): DeepSeek-vs-Anthropic
+        # cost ratio + verified-merge-rate delta, persisted in the daily snapshot and
+        # surfaced here from the latest snapshot so the A/B is machine-checkable.
+        "provider_routing_verdict": latest.get("provider_routing_verdict"),
         # Recommended sample_rate for the challenger gate, computed on-the-fly from
         # the latest snapshot's panel_review_effectiveness so operators always see a
         # fresh recommendation without waiting for the next daily snapshot write.

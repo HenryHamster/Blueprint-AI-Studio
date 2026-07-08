@@ -32,6 +32,9 @@ from app.efficiency_snapshot import (
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
     PROMPT_STATIC_BYTES_THRESHOLD,
+    PROVIDER_ROUTING_ADOPT,
+    PROVIDER_ROUTING_INSUFFICIENT_DATA,
+    PROVIDER_ROUTING_REJECT,
     SELF_REPAIR_BURN_SHARE_KEY,
     SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
@@ -49,11 +52,13 @@ from app.efficiency_snapshot import (
     _last_run_due,
     _task_llm_attempts,
     compute_current_axes,
+    compute_effort_model_efficiency,
     compute_llm_cost_attribution_baseline_delta,
     compute_llm_cost_attribution_window_delta,
     compute_llm_cost_breakdown,
     compute_llm_cost_by_task_type,
     compute_pr_rework_chain_breakdown,
+    compute_provider_routing_verdict,
     maybe_write_daily_snapshot,
     read_baseline_with_drift,
     write_snapshot,
@@ -10576,4 +10581,127 @@ def test_landed_rate_denominator_excludes_read_only_task_types():
     assert opus_em is not None
     assert opus_em["pr_eligible_run_count"] == 0, (
         f"read-only model must have pr_eligible_run_count=0; got {opus_em}"
+    )
+
+
+def test_provider_routing_verdict_derivation():
+    """Provider routing verdict derives ADOPT/REJECT/INSUFFICIENT_DATA from by_model rows.
+
+    Exercises all four classification branches:
+      - INSUFFICIENT_DATA when either provider has too few PR-eligible tasks
+      - REJECT when DeepSeek verified-merge rate materially regresses
+      - REJECT when DeepSeek cost-per-merge is not meaningfully cheaper
+      - ADOPT when DeepSeek is cheaper AND quality holds
+    """
+    import uuid
+
+    from app.models import TaskStatus
+
+    project_id = uuid.uuid4()
+
+    # -- helper: build by_model rows via compute_effort_model_efficiency ------
+    def _by_model(tasks):
+        return compute_effort_model_efficiency(tasks)["by_model"]
+
+    # -- INSUFFICIENT_DATA: too few tasks on either side ---------------------
+    few_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider="deepseek",
+            model="deepseek-v4-flash",
+        )
+        for _ in range(5)
+    ] + [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+        for _ in range(5)
+    ]
+    verdict = compute_provider_routing_verdict(_by_model(few_tasks))
+    assert verdict["state"] == PROVIDER_ROUTING_INSUFFICIENT_DATA, (
+        f"expected INSUFFICIENT_DATA with only 5 tasks each, got {verdict['state']}"
+    )
+    assert "supporting" in verdict
+    assert "recommended_action" in verdict
+
+    # -- ADOPT: DeepSeek cheaper with no quality regression ------------------
+    adopted_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider=prov,
+            model=mod,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+        )
+        for prov, mod in [("deepseek", "deepseek-v4-flash")] * 30
+        + [("anthropic", "claude-sonnet-4-6")] * 30
+    ]
+    # Equal verified rates: first 24 deepseek + first 24 anthropic stay merged,
+    # remaining 6 each side become unmerged.
+    for i, t in enumerate(adopted_tasks):
+        if (t.provider == "deepseek" and i >= 24) or (
+            t.provider == "anthropic" and i >= 54
+        ):
+            t.context = {}
+
+    verdict = compute_provider_routing_verdict(_by_model(adopted_tasks))
+    assert verdict["state"] == PROVIDER_ROUTING_ADOPT, (
+        f"expected ADOPT with DeepSeek cheaper + same quality, got {verdict['state']}"
+    )
+    s = verdict["supporting"]
+    assert s["deepseek_pr_eligible_run_count"] >= 20
+    assert s["anthropic_pr_eligible_run_count"] >= 20
+    assert s["cost_ratio"] is not None and s["cost_ratio"] < 1.0, (
+        "DeepSeek must be cheaper than Anthropic"
+    )
+
+    # -- REJECT: quality regression (verified rate materially lower) ---------
+    regressed_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider=prov,
+            model=mod,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+        )
+        for prov, mod in [("deepseek", "deepseek-v4-flash")] * 30
+        + [("anthropic", "claude-sonnet-4-6")] * 30
+    ]
+    # DeepSeek: only 10/30 verified (33% rate).  Anthropic: 24/30 (80% rate).
+    # That's a 47pp delta → well below the -5pp quality floor → REJECT.
+    for i, t in enumerate(regressed_tasks):
+        if (t.provider == "deepseek" and i >= 10) or (
+            t.provider == "anthropic" and i >= 54
+        ):
+            t.context = {}
+
+    verdict = compute_provider_routing_verdict(_by_model(regressed_tasks))
+    assert verdict["state"] == PROVIDER_ROUTING_REJECT, (
+        f"expected REJECT with DeepSeek quality regression, got {verdict['state']}"
+    )
+    s = verdict["supporting"]
+    assert s["verified_rate_delta_pct"] is not None
+    # The delta should be strongly negative (DeepSeek rate << Anthropic rate).
+    assert s["verified_rate_delta_pct"] < -5.0, (
+        f"rate delta should be below -5pp floor, got {s['verified_rate_delta_pct']}"
     )

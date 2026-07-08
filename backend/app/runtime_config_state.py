@@ -1508,6 +1508,31 @@ def _ensure_route_defaults(
     return entry
 
 
+def _validate_deepseek_routing_invariant(config: Dict[str, Any]) -> list[str]:
+    """Return warnings when DeepSeek is not first for low/medium-effort categories.
+
+    Categories _default, initiative, build, and ops route low/medium-effort
+    tasks and should prefer DeepSeek as the primary provider. This invariant
+    guards against silent regression in the provider ordering, which matters
+    when ``provider_selection_mode`` is ``"preferred"`` (the default).
+    """
+    warnings: list[str] = []
+    cat_routing = config.get("category_routing", {})
+    deepseek_first = {"_default", "initiative", "build", "ops"}
+    for category in sorted(deepseek_first):
+        entry = cat_routing.get(category)
+        if not isinstance(entry, dict):
+            continue
+        providers = entry.get("providers")
+        if not isinstance(providers, list) or not providers:
+            continue
+        if providers[0] != "deepseek":
+            warnings.append(
+                f"category_routing.{category}: expected DeepSeek first, got {providers[0]}"
+            )
+    return warnings
+
+
 def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
     """Add provider defaults introduced after the settings-bag migration.
 
@@ -1596,6 +1621,12 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
         "exclusive",
     ):
         config["provider_selection_mode"] = runtime_config["provider_selection_mode"]
+
+    routing_warnings = _validate_deepseek_routing_invariant(config)
+    if routing_warnings:
+        logger.warning(
+            "DeepSeek routing invariant violated: %s", "; ".join(routing_warnings)
+        )
 
 
 def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
