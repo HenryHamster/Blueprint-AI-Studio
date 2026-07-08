@@ -29,6 +29,8 @@ Optional environment variables:
                                       floor 60)
     BLUEPRINT_RUNNER_MAX_AUTH_FAILURES Consecutive heartbeat 401s before the runner exits
                                       non-zero (revoked token; default: 20, 0 disables)
+    BLUEPRINT_RUNNER_MAX_NETWORK_FAILURES Consecutive heartbeat network errors before the
+                                      runner exits non-zero (default: 20, 0 disables)
     BLUEPRINT_RUNNER_WORKSPACE_ROOT   Parent directory for per-task agent workspaces
                                       (default: <tmp>/blueprint-agent-workspaces)
     BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
@@ -60,6 +62,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import random
 import time
 import urllib.error
 import urllib.request
@@ -839,6 +842,7 @@ def _heartbeat_loop(
     telemetry: "_TelemetryState | None" = None,
     workspace_root: str | None = None,
     max_auth_failures: int = 0,
+    max_network_failures: int = 0,
     caps: "iso.Capabilities | None" = None,
     agent_image: str | None = None,
 ) -> None:
@@ -854,6 +858,7 @@ def _heartbeat_loop(
     # which build each device runs. Best-effort: None when git/the repo is absent.
     version = _runner_version()
     consecutive_401 = 0
+    consecutive_network_failures = 0
     while not _shutdown_event.is_set():
         try:
             with lock:
@@ -945,6 +950,7 @@ def _heartbeat_loop(
             status, _ = _post(url, token, body)
             if status in (200, 204):
                 consecutive_401 = 0
+                consecutive_network_failures = 0
             elif status == 401:
                 consecutive_401 += 1
                 print(
@@ -961,9 +967,22 @@ def _heartbeat_loop(
             else:
                 print(f"[runner] heartbeat warning: HTTP {status}", flush=True)
         except Exception as exc:
-            print(f"[runner] heartbeat error: {exc}", flush=True)
-        # Sleep in 1s increments so shutdown propagates quickly
-        for _ in range(30):
+            consecutive_network_failures += 1
+            print(
+                f"[runner] heartbeat error ({consecutive_network_failures} consecutive): {exc}",
+                flush=True,
+            )
+            if max_network_failures and consecutive_network_failures >= max_network_failures:
+                _die(
+                    f"heartbeat failed with network error for {consecutive_network_failures} "
+                    "consecutive attempts — network appears wedged. Exiting non-zero so "
+                    "the operator/supervisor notices instead of looping silently."
+                )
+        # Sleep in 1s increments so shutdown propagates quickly; add per-runner
+        # jitter (±20 % of the 30 s interval) to prevent thundering-herd on restart.
+        jitter = random.uniform(-6, 6)
+        interval = int(30 + jitter)
+        for _ in range(max(1, interval)):
             if _shutdown_event.is_set():
                 break
             time.sleep(1)
@@ -2209,6 +2228,7 @@ def main() -> None:
         "BLUEPRINT_RUNNER_AGENT_MAX_SECONDS", 14400.0, minimum=60.0
     )
     max_auth_failures = _env_int("BLUEPRINT_RUNNER_MAX_AUTH_FAILURES", 20, minimum=0)
+    max_network_failures = _env_int("BLUEPRINT_RUNNER_MAX_NETWORK_FAILURES", 20, minimum=0)
 
     # Prod agent container image (agent/Dockerfile). The default agent backend is bwrap
     # (host toolchain); the docker backend is used only on an explicit opt-in:
@@ -2393,6 +2413,7 @@ def main() -> None:
             "telemetry": telemetry,
             "workspace_root": workspace_root,
             "max_auth_failures": max_auth_failures,
+            "max_network_failures": max_network_failures,
             # Docker advertisement leg: advertise (read-only) agent work on a
             # docker+image box even without bwrap.
             "caps": caps,

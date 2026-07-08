@@ -7,8 +7,9 @@ fleet-no-healthy-runner, and the compute require-local hold warning.
 ``from app.alert_dispatch import ...`` callers keep working unchanged.
 
 Pure leaf module — depends only on ``app.alert_policy``, ``app.broadcast``,
-``app.notification``, ``app.shared_state``, ``app.time_utils``, and
-``app.models``.
+``app.shared_state``, ``app.time_utils``, and ``app.models``. External webhook
+delivery is deferred to ``app.notification_dispatch.dispatch_external_notification``
+(imported lazily at each call site to keep this a leaf).
 """
 
 import logging
@@ -21,7 +22,6 @@ from sqlmodel import select
 from app.alert_policy import create_project_alert_if_allowed
 from app.broadcast import broadcast_to_project
 from app.models import Alert, AlertSeverity
-from app.notification import _send_webhook_notification
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -267,15 +267,38 @@ async def _maybe_escalate_runner_deactivated_alert(
             "title": alert.title,
         },
     )
-    await _send_webhook_notification(
-        "RUNNER_OUTAGE_ESCALATED",
-        alert.title,
-        (
-            f"Runner {runner_label} has been offline for {age_str} "
-            f"(threshold: {hours}h). Immediate action required — bring the "
-            f"runner back online or retarget its work."
-        ),
-    )
+    # Re-page through the operator-configured, retry-capable, SSRF-guarded
+    # webhook (dispatch_external_notification) rather than the env-var-only
+    # PIPELINE_WEBHOOK_URL path (_send_webhook_notification), which has no retry
+    # semantics and points at a different endpoint. Fire-and-forget so an
+    # escalation-dispatch failure never aborts the stale-runner sweep.
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_OUTAGE_ESCALATED",
+                {
+                    "runner_id": str(runner_id),
+                    "runner_label": runner_label,
+                    "offline_duration": age_str,
+                    "offline_duration_seconds": int(age_seconds),
+                    "threshold_hours": hours,
+                    "title": alert.title,
+                    "detail": (
+                        f"Runner {runner_label} has been offline for {age_str} "
+                        f"(threshold: {hours}h). Immediate action required — bring "
+                        f"the runner back online or retarget its work."
+                    ),
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning(
+            "[NOTIFY] RUNNER_OUTAGE_ESCALATED dispatch setup failed: %s", _ne
+        )
     logger.warning(
         "[RUNNERS] Escalated runner-deactivated alert for %s (%s): offline %s",
         runner_label,
@@ -951,6 +974,28 @@ async def _maybe_create_runner_low_disk_alert(
             "event_type": alert.event_type,
         },
     )
+    # Mirror the deactivated/degraded/fleet helpers: fire-and-forget the external
+    # webhook dispatch on the newly-created path only (not dedup hits) so the
+    # operator's configured, retry-capable webhook receives the capacity warning.
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_LOW_DISK",
+                {
+                    "runner_id": str(runner_id),
+                    "runner_label": runner_label,
+                    "disk_free_bytes": disk_free_bytes,
+                    "threshold_bytes": threshold_bytes,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_LOW_DISK dispatch setup failed: %s", _ne)
     return True
 
 

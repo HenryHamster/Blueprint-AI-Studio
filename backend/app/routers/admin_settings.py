@@ -330,6 +330,11 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "MERGE_UNVERIFIED",
                 "SPEND_HOLD_CREATED",
                 "SPEND_HOLD_EXPIRING",
+                "RUNNER_DEACTIVATED",
+                "RUNNER_DEGRADED",
+                "RUNNER_FLEET_OFFLINE",
+                "RUNNER_LOW_DISK",
+                "RUNNER_OUTAGE_ESCALATED",
             ],
         ),
         "throttle_seconds": config.get("throttle_seconds", 30),
@@ -739,6 +744,11 @@ async def get_settings(
                         "MERGE_UNVERIFIED",
                         "SPEND_HOLD_CREATED",
                         "SPEND_HOLD_EXPIRING",
+                        "RUNNER_DEACTIVATED",
+                        "RUNNER_DEGRADED",
+                        "RUNNER_FLEET_OFFLINE",
+                        "RUNNER_LOW_DISK",
+                        "RUNNER_OUTAGE_ESCALATED",
                     ],
                     "throttle_seconds": 30,
                 },
@@ -2948,6 +2958,15 @@ async def _apply_settings(
                 # Both are operator-actionable, so they join the default-on list.
                 "SPEND_HOLD_CREATED",
                 "SPEND_HOLD_EXPIRING",
+                # Runner-health fleet incidents dispatched by runner_health_alerts.
+                # These are operator-actionable outages (a runner or the whole
+                # fleet is down, out of disk, or an outage has aged past the
+                # re-page threshold), so they join the default-on list below.
+                "RUNNER_DEACTIVATED",
+                "RUNNER_DEGRADED",
+                "RUNNER_FLEET_OFFLINE",
+                "RUNNER_LOW_DISK",
+                "RUNNER_OUTAGE_ESCALATED",
             ]
         )
         enabled_events = val.get(
@@ -2963,6 +2982,11 @@ async def _apply_settings(
                 "MERGE_UNVERIFIED",
                 "SPEND_HOLD_CREATED",
                 "SPEND_HOLD_EXPIRING",
+                "RUNNER_DEACTIVATED",
+                "RUNNER_DEGRADED",
+                "RUNNER_FLEET_OFFLINE",
+                "RUNNER_LOW_DISK",
+                "RUNNER_OUTAGE_ESCALATED",
             ],
         )
         if not isinstance(enabled_events, list):
@@ -3400,6 +3424,11 @@ async def _apply_settings(
                                 "MERGE_UNVERIFIED",
                                 "SPEND_HOLD_CREATED",
                                 "SPEND_HOLD_EXPIRING",
+                                "RUNNER_DEACTIVATED",
+                                "RUNNER_DEGRADED",
+                                "RUNNER_FLEET_OFFLINE",
+                                "RUNNER_LOW_DISK",
+                                "RUNNER_OUTAGE_ESCALATED",
                             ],
                             "throttle_seconds": 30,
                         },

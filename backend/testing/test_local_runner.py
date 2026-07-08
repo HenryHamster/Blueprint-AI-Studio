@@ -7,6 +7,7 @@ Covers the four new surfaces:
   * orchestrator runner routing helpers (app.orchestrator)
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
@@ -3504,7 +3505,8 @@ class TestRunnerDeathEscalation:
         with patch(
             "app.runner_health_alerts.broadcast_to_project", new=AsyncMock()
         ), patch(
-            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
+            "app.notification_dispatch.dispatch_external_notification",
+            new=AsyncMock(),
         ) as webhook:
             escalated = await alert_dispatch._maybe_escalate_runner_deactivated_alert(
                 db_session,
@@ -3512,12 +3514,19 @@ class TestRunnerDeathEscalation:
                 runner_id=runner.id,
                 hostname=runner.hostname,
             )
+            # Re-page is fire-and-forget via asyncio.ensure_future; yield so the
+            # scheduled dispatch task runs before we assert on it.
+            await asyncio.sleep(0)
         assert escalated is True
         await db_session.refresh(alert)
         assert alert.severity == AlertSeverity.ERROR
         assert "escalated outage" in alert.title
+        # Escalation now routes through the operator-configured, retry-capable
+        # dispatch_external_notification path — NOT the env-var-only
+        # _send_webhook_notification (PIPELINE_WEBHOOK_URL) path.
         webhook.assert_awaited_once()
-        assert webhook.await_args.args[0] == "RUNNER_OUTAGE_ESCALATED"
+        assert webhook.await_args.args[1] == "RUNNER_OUTAGE_ESCALATED"
+        assert webhook.await_args.args[0] == project.id
 
     @pytest.mark.asyncio
     async def test_skips_escalation_if_acknowledged(self, db_session):
@@ -3532,13 +3541,15 @@ class TestRunnerDeathEscalation:
         db_session.add(alert)
         await db_session.commit()
         with patch(
-            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
+            "app.notification_dispatch.dispatch_external_notification",
+            new=AsyncMock(),
         ) as webhook:
             escalated = await alert_dispatch._maybe_escalate_runner_deactivated_alert(
                 db_session,
                 project_id=project.id,
                 runner_id=runner.id,
             )
+            await asyncio.sleep(0)
         assert escalated is False
         webhook.assert_not_awaited()
 
@@ -3561,13 +3572,15 @@ class TestRunnerDeathEscalation:
         )
         await db_session.commit()
         with patch(
-            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
+            "app.notification_dispatch.dispatch_external_notification",
+            new=AsyncMock(),
         ) as webhook:
             escalated = await alert_dispatch._maybe_escalate_runner_deactivated_alert(
                 db_session,
                 project_id=project.id,
                 runner_id=runner.id,
             )
+            await asyncio.sleep(0)
         assert escalated is False
         webhook.assert_not_awaited()
 
@@ -3583,11 +3596,13 @@ class TestRunnerDeathEscalation:
         with patch(
             "app.runner_health_alerts.broadcast_to_project", new=AsyncMock()
         ), patch(
-            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
+            "app.notification_dispatch.dispatch_external_notification",
+            new=AsyncMock(),
         ) as webhook:
             await orch._sweep_runner_deactivated_escalations(db_session)
+            await asyncio.sleep(0)
         webhook.assert_awaited_once()
-        assert webhook.await_args.args[0] == "RUNNER_OUTAGE_ESCALATED"
+        assert webhook.await_args.args[1] == "RUNNER_OUTAGE_ESCALATED"
 
     @pytest.mark.asyncio
     async def test_sweep_skips_active_runner(self, db_session):
@@ -3599,9 +3614,11 @@ class TestRunnerDeathEscalation:
         )
         await self._seed_alert(db_session, project.id, runner.id, age_hours=5)
         with patch(
-            "app.runner_health_alerts._send_webhook_notification", new=AsyncMock()
+            "app.notification_dispatch.dispatch_external_notification",
+            new=AsyncMock(),
         ) as webhook:
             await orch._sweep_runner_deactivated_escalations(db_session)
+            await asyncio.sleep(0)
         webhook.assert_not_awaited()
 
     @pytest.mark.asyncio

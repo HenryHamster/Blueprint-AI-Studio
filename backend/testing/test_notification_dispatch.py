@@ -103,6 +103,74 @@ async def test_dispatch_increments_dispatched_and_delivered_on_success():
 
 
 @pytest.mark.asyncio
+async def test_dispatched_runner_events_are_deliverable():
+    """Every runner-health event, when present in enabled_events, is actually
+    POSTed through the operator-configured webhook.
+
+    Regression guard for the silent-drop bug: the runner-health event types
+    (RUNNER_DEACTIVATED/RUNNER_DEGRADED/RUNNER_FLEET_OFFLINE/RUNNER_LOW_DISK and
+    the RUNNER_OUTAGE_ESCALATED re-page) were not in the allowlist / any default
+    enabled_events list, so dispatch_external_notification returned early and the
+    external page never reached a destination. Now that they are allowlisted and
+    default-on, an enabled runner event must deliver with its event_type and
+    payload intact.
+    """
+    runner_events = [
+        "RUNNER_DEACTIVATED",
+        "RUNNER_DEGRADED",
+        "RUNNER_FLEET_OFFLINE",
+        "RUNNER_LOW_DISK",
+        "RUNNER_OUTAGE_ESCALATED",
+    ]
+    for event in runner_events:
+        _reset_stats()
+        deliver = AsyncMock(return_value=200)
+        with (
+            patch(
+                "app.shared_state.runtime_config",
+                _make_runtime_config(enabled_events=runner_events),
+            ),
+            patch("app.notification_dispatch._attempt_delivery", new=deliver),
+        ):
+            await dispatch_external_notification(
+                uuid.uuid4(),
+                event,
+                {"runner_id": "abc123", "runner_label": "runner abc123", "title": "t"},
+            )
+        stats = get_notification_stats()
+        assert stats["total_dispatched"] == 1, f"{event} not dispatched"
+        assert stats["total_delivered"] == 1, f"{event} not delivered"
+        assert stats["total_failed"] == 0, f"{event} failed"
+        # The POST body carries the runner event_type and payload through unchanged.
+        assert deliver.await_count == 1, f"{event} not POSTed"
+        _url, body = deliver.await_args.args
+        assert body["event_type"] == event
+        assert body["payload"]["runner_id"] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_runner_event_dropped_when_not_enabled():
+    """A runner-health event NOT in enabled_events is still gated out (no POST),
+    confirming the deliverability above is driven by the allowlist, not a
+    blanket always-deliver change."""
+    _reset_stats()
+    deliver = AsyncMock(return_value=200)
+    with (
+        patch(
+            "app.shared_state.runtime_config",
+            _make_runtime_config(enabled_events=["TASK_FAILED"]),
+        ),
+        patch("app.notification_dispatch._attempt_delivery", new=deliver),
+    ):
+        await dispatch_external_notification(
+            uuid.uuid4(), "RUNNER_DEACTIVATED", {"runner_id": "abc"}
+        )
+    stats = get_notification_stats()
+    assert stats["total_dispatched"] == 0
+    assert deliver.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_dispatch_enqueues_retry_on_502():
     _reset_stats()
     with (

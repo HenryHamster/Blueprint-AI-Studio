@@ -9305,6 +9305,35 @@ class TestNotificationConfigSettings:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
+    async def test_patch_notification_config_runner_events_are_valid(
+        self, client: AsyncClient
+    ):
+        """The five runner-health event types are accepted by PATCH validation
+        so an operator can opt in (previously the allowlist rejected them as
+        unknown events, silently blocking every runner-health external page)."""
+        runner_events = [
+            "RUNNER_DEACTIVATED",
+            "RUNNER_DEGRADED",
+            "RUNNER_FLEET_OFFLINE",
+            "RUNNER_LOW_DISK",
+            "RUNNER_OUTAGE_ESCALATED",
+        ]
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "notification_config": {
+                    "webhook_url": "https://hooks.example.com/x",
+                    "enabled_events": ["TASK_FAILED", *runner_events],
+                    "throttle_seconds": 30,
+                }
+            },
+        )
+        assert resp.status_code == 200
+        nc = resp.json()["notification_config"]
+        for event in runner_events:
+            assert event in nc["enabled_events"]
+
+    @pytest.mark.asyncio
     async def test_get_settings_non_admin_returns_403(self, override_get_session):
         """Non-admin caller is blocked with 403 from GET /api/admin/settings."""
         from app.main import app as _app

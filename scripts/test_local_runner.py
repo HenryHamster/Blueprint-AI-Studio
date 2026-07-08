@@ -2340,6 +2340,54 @@ class TestHeartbeat401Streak(unittest.TestCase):
         self.assertEqual(exits, [], "streak reset by the 200 must not trigger an exit")
 
 
+class TestHeartbeatJitterAndNetworkFailureEscalation(unittest.TestCase):
+    """Heartbeat loop: jitter spreads restarts; network failure streak escalates."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_heartbeat_jitter_and_network_failure_escalation(self):
+        """Jitter spreads sleep intervals; consecutive network errors trigger _die."""
+        jitter_calls = []
+        exits = []
+
+        def fake_post(url, token, body, **kwargs):
+            raise RuntimeError("Network error: [Errno -2] Name or service not known")
+
+        def fake_exit(code):
+            exits.append(code)
+            local_runner._shutdown_event.set()
+            raise SystemExit(code)
+
+        def fake_uniform(a, b):
+            jitter_calls.append((a, b))
+            return 3.0  # deterministic jitter for test
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch("os._exit", fake_exit), \
+             patch("time.sleep", lambda s: None), \
+             patch("random.uniform", fake_uniform):
+            with self.assertRaises(SystemExit):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    max_network_failures=3,
+                )
+
+        # _die must have been called exactly once with exit code 1
+        self.assertEqual(exits, [1], "network failure streak must exit non-zero")
+
+        # Jitter: random.uniform must have been called with the ±6s window on each
+        # sleep cycle so runners don't thundering-herd on orchestrator restart.
+        self.assertGreater(len(jitter_calls), 0, "random.uniform never called — jitter not applied")
+        for args in jitter_calls:
+            self.assertEqual(args, (-6, 6), f"jitter window wrong: got {args}, want (-6, 6)")
+
+
 class TestComputePollRetryAfter(unittest.TestCase):
     def setUp(self):
         local_runner._shutdown_event.clear()

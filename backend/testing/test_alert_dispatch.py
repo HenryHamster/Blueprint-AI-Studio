@@ -550,7 +550,6 @@ async def test_runner_escalation_cadence_survives_restart(db_session, mocker):
     use last_escalated_at — NOT last_seen_at — to decide when to first re-page.
     """
     mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.runner_health_alerts._send_webhook_notification", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,

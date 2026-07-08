@@ -25,6 +25,11 @@ const EVENT_OPTIONS: { key: string; label: string; description: string; defaultO
   { key: 'DIRECTION_BURN_PAUSE', label: 'Direction Burn Pause', description: 'When a direction is auto-paused for accumulating non-merging finished tasks beyond the safe rolling-window threshold', defaultOn: true },
   { key: 'account_model_regression_quarantined', label: 'Account/Model Regression Quarantined', description: 'When a provider/model pair is auto-quarantined due to detected regression in success rate', defaultOn: true },
   { key: 'MERGE_UNVERIFIED', label: 'Merged Without Test Verification', description: 'When a no-CI repo merges a PR without running tests (UNVERIFIED-merge fallback)', defaultOn: true },
+  { key: 'RUNNER_DEACTIVATED', label: 'Runner Deactivated', description: 'When a self-hosted fleet runner goes offline (stops sending heartbeats)', defaultOn: true },
+  { key: 'RUNNER_DEGRADED', label: 'Runner Degraded', description: 'When a self-hosted fleet runner accumulates repeated consecutive job failures', defaultOn: true },
+  { key: 'RUNNER_FLEET_OFFLINE', label: 'Fleet Offline', description: 'When an entire self-hosted fleet has no healthy runner available', defaultOn: true },
+  { key: 'RUNNER_LOW_DISK', label: 'Runner Low Disk', description: 'When a self-hosted fleet runner reports free disk below the safe threshold', defaultOn: true },
+  { key: 'RUNNER_OUTAGE_ESCALATED', label: 'Runner Outage Escalated', description: 'When a runner outage ages past the escalation threshold and is re-paged', defaultOn: true },
 ];
 
 interface SettingsNotificationsSectionProps {
