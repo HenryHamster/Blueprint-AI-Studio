@@ -11637,3 +11637,55 @@ def test_all_autocomplete_paths_gate_on_criterion_coverage():
         "The proven-merge auto-complete path must gate on criterion coverage before "
         "retiring a direction."
     )
+
+
+def test_retire_direction_op_gates_on_criterion_coverage():
+    """The retire_direction op in strategic_completion.py must gate on criterion coverage.
+
+    Regression guard: the retire_direction handler in
+    ``_handle_strategic_completion`` must call
+    ``direction_owns_uncovered_criterion`` before setting a direction's
+    status to ``"retired"``.  This is the strategist-authored retirement
+    path (distinct from the exhaust / proven-merge auto-complete paths
+    already covered by
+    ``test_all_autocomplete_paths_gate_on_criterion_coverage``).
+
+    Removing the gate from ``_handle_strategic_completion`` causes this
+    test to fail.
+    """
+    import ast
+    from pathlib import Path
+
+    sc_path = Path(__file__).resolve().parents[1] / "app" / "strategic_completion.py"
+    source = sc_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(sc_path))
+
+    gate_func_name = "direction_owns_uncovered_criterion"
+
+    # ── 1. Find _handle_strategic_completion ─────────────────────────────
+    handler_func: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_strategic_completion":
+            handler_func = node
+            break
+
+    assert handler_func is not None, (
+        "_handle_strategic_completion not found in strategic_completion.py"
+    )
+
+    # ── 2. Verify it calls direction_owns_uncovered_criterion ────────────
+    handler_gated = False
+    for node in ast.walk(handler_func):
+        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
+            handler_gated = True
+            break
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            if _ast_called_name(node.value) == gate_func_name:
+                handler_gated = True
+                break
+
+    assert handler_gated, (
+        "_handle_strategic_completion does not call direction_owns_uncovered_criterion. "
+        "The retire_direction op must gate on criterion coverage before retiring a "
+        "direction."
+    )

@@ -953,12 +953,15 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
     prefix += scopeLines.join('\n') + '\n';
   }
 
-  // Acceptance Evidence — the proof a planned task declared at plan time that
-  // would show its claim is true. The backend validates the declaration and
-  // stamps it onto this child task's context.acceptance_evidence (closed shape:
-  // kind ∈ {test, behavior, artifact}, descriptor, optional selector). Presence
-  // gated: when absent the prompt is byte-identical to today. This names the
-  // proof to AIM for; it does NOT gate merge.
+  // Acceptance Evidence — the proof a task declared at spawn time that would
+  // show its claim is true. The declaration can originate at plan time (from
+  // the parent direction's planning step) or at research time (from a
+  // criterion-carrying finding's acceptance_evidence field, injected via
+  // criterion_keys). The backend validates the declaration and stamps it onto
+  // this child task's context.acceptance_evidence (closed shape: kind ∈ {test,
+  // behavior, artifact}, descriptor, optional selector). Presence gated: when
+  // absent the prompt is byte-identical to today. This names the proof to AIM
+  // for; it does NOT gate merge.
   const acceptanceEvidence = taskContext?.acceptance_evidence as Record<string, unknown> | undefined;
   if (acceptanceEvidence && typeof acceptanceEvidence === 'object') {
     const kind = strVal(acceptanceEvidence.kind);
@@ -966,7 +969,7 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
     if (kind || descriptor) {
       const aeLines: string[] = ['## Acceptance Evidence'];
       aeLines.push(
-        'This task declared, at plan time, the proof that would show its claim is true. Aim to produce it — this is the evidence the work should demonstrate, not a merge gate.',
+        'This task declared, at spawn time, the proof that would show its claim is true. Aim to produce it — this is the evidence the work should demonstrate, not a merge gate.',
       );
       const kindLabels: Record<string, string> = {
         test: 'test (a named test or selector exercising the seam end-to-end)',

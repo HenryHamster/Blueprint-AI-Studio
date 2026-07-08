@@ -5599,6 +5599,27 @@ async def _handle_strategic_completion(
                         why or "challenge rejected this retire_direction",
                     )
                     continue
+                # Gate on criterion coverage: a direction that owns an uncovered
+                # acceptance criterion must not be retired by the strategist.
+                # The exhaust/proven-merge auto-complete paths enforce the same
+                # gate; retire_direction is the strategist-authored path and must
+                # match.  Fail-open: the helper returns False when the direction
+                # owns no criteria or the query errors, preserving current behavior.
+                from app.acceptance_criteria import (  # noqa: PLC0415
+                    direction_owns_uncovered_criterion,
+                )
+
+                _owns_uncovered = await direction_owns_uncovered_criterion(
+                    session, project.id, str(dir_id)
+                )
+                if _owns_uncovered:
+                    logger.info(
+                        "[STRATEGIC] Task %s: retire_direction blocked for %s — "
+                        "direction owns uncovered acceptance criteria",
+                        task.id,
+                        dir_id,
+                    )
+                    continue
                 for d in directions:
                     if d.get("id") == dir_id:
                         d["status"] = "retired"
