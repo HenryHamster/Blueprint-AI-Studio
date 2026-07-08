@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'fs';
+import { readFileSync, readdirSync, statSync, existsSync, writeFileSync } from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 /**
  * Guard: full-replacement vi.mock factories must cover all runtime exports of
@@ -17,16 +17,43 @@ import { fileURLToPath } from 'url';
  *    no matching key in the helper factory will fail here.
  *
  * 2. Inline mock scanner (fs text scan): Every .test.{ts,tsx} file under
- *    src/ is scanned for vi.mock() factories that fully replace the firebase,
- *    api, usePoller, or strategicStateApi modules. Factories that delegate to
+ *    src/ is scanned for vi.mock() factories that fully replace ANY real module
+ *    under src/ — auto-discovered by resolving the mock specifier to a real
+ *    source file, not a hardcoded tail allowlist. Factories that delegate to
  *    the matching known complete helper for the mocked module tail, or that
  *    use importOriginal/importActual, are treated as safe and skipped. Current
  *    legacy api full-replacement sites are allowlisted only while the file
  *    still contains the baseline single api mock; any additional api mock in
- *    those files is scanned here.
+ *    those files is scanned here. Existing intentionally-partial full-replacement
+ *    mocks of other src modules are grandfathered by an explicit baseline
+ *    (mock-factory-export-coverage.baseline.json) so auto-discovery fails only
+ *    on a NEWLY-added real export missing from a mock (or an export dropped from
+ *    a factory) — not on the large set of pre-existing partial mocks. Regenerate
+ *    the baseline after intentionally changing a mock with:
+ *      DUMP_MOCK_COVERAGE_BASELINE=1 npx vitest run src/test/mock-factory-export-coverage.test.ts
+ *    then replace the JSON file with the printed object (keeping the _readme key).
  */
 
 const SRC_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+// Grandfathering baseline for the auto-discovering inline scanner:
+// relTestFile -> vi.mock spec -> real exports the factory currently omits.
+// Kept as a sibling JSON data file (config-as-JSON convention). Regenerate with
+// DUMP_MOCK_COVERAGE_BASELINE=1 (see file header). The '_readme' key is
+// documentation-only; lookups are always by "dir/file.test.tsx" paths.
+const BASELINE_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'mock-factory-export-coverage.baseline.json');
+
+function loadBaseline(): Record<string, Record<string, string[]>> {
+  const raw = JSON.parse(readFileSync(BASELINE_PATH, 'utf-8')) as Record<string, unknown>;
+  const baseline: Record<string, Record<string, string[]>> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === '_readme') continue;
+    baseline[key] = value as Record<string, string[]>;
+  }
+  return baseline;
+}
+
+const BASELINE = loadBaseline();
 
 // ---------------------------------------------------------------------------
 // fs utilities
@@ -63,7 +90,54 @@ function extractRuntimeExportsFromText(filePath: string): Set<string> {
   const re = /^export\s+(?:async\s+)?(?:function|const|let|class)\s+(\w+)/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(src)) !== null) names.add(m[1]);
+  // export { a, b as c } [from '...']  — value re-exports; skip `export type {`
+  const braceRe = /^export\s+(?!type\b)\{([^}]*)\}/gm;
+  while ((m = braceRe.exec(src)) !== null) {
+    for (const raw of m[1].split(',')) {
+      const part = raw.trim();
+      if (!part || /^type\b/.test(part)) continue; // inline `type X` specifier
+      const asMatch = /\bas\s+([A-Za-z_$][\w$]*)\s*$/.exec(part);
+      const name = asMatch ? asMatch[1] : part;
+      if (/^[A-Za-z_$][\w$]*$/.test(name)) names.add(name);
+    }
+  }
   return names;
+}
+
+// ---------------------------------------------------------------------------
+// Auto-discovery: resolve a vi.mock specifier to a real src module + load its
+// runtime exports (dynamic import authoritative — captures `export { a } from`
+// re-exports a text regex misses — with a text fallback).
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a relative vi.mock specifier to a real source file under src/, or null
+ * when it is a node builtin / bare dependency / non-existent path (those are
+ * legitimately partially mocked and out of scope for coverage enforcement).
+ */
+function resolveRealSrcModule(testFile: string, spec: string): string | null {
+  if (!spec.startsWith('.')) return null; // bare dep / node builtin
+  const base = path.resolve(path.dirname(testFile), spec);
+  const exts = ['.ts', '.tsx'];
+  const candidates: string[] = [];
+  for (const ext of exts) if (base.endsWith(ext)) candidates.push(base);
+  for (const ext of exts) candidates.push(base + ext);
+  for (const ext of exts) candidates.push(path.join(base, 'index' + ext));
+  for (const candidate of candidates) {
+    const rel = path.relative(SRC_DIR, candidate);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) continue; // outside src/
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+async function loadRuntimeExportsForPath(tsPath: string): Promise<Set<string>> {
+  try {
+    const mod = (await import(/* @vite-ignore */ pathToFileURL(tsPath).href)) as Record<string, unknown>;
+    const keys = Object.keys(mod).filter(k => k !== 'default' && k !== '__esModule');
+    if (keys.length > 0) return new Set(keys);
+  } catch { /* fall through to text extraction */ }
+  return extractRuntimeExportsFromText(tsPath);
 }
 
 // ---------------------------------------------------------------------------
@@ -77,9 +151,6 @@ const SAFE_FACTORY_HELPER_MODULES_BY_TAIL = new Map([
   ['strategicStateApi', 'test/strategic-state-api-mock-complete'],
   ['useEfficiencySnapshot', 'test/useEfficiencySnapshot-mock-complete'],
 ]);
-
-// The module "tails" (final path segment) that the inline scanner guards.
-const GUARDED_TAILS = new Set(['api', 'firebase', 'usePoller', 'strategicStateApi', 'useEfficiencySnapshot']);
 
 // Current legacy api full-replacement mocks are allowed so the guard can block
 // new inline api factories without forcing a large migration in this change.
@@ -185,6 +256,7 @@ const LEGACY_API_MOCK_FILES = new Set([
 interface InlineMockFinding {
   file: string;
   moduleSpec: string;
+  resolvedPath: string;
   factoryKeys: Set<string>;
 }
 
@@ -788,8 +860,13 @@ function findInlineMockFindings(filePath: string): InlineMockFinding[] {
 
   while ((m = mockRe.exec(src)) !== null) {
     const moduleSpec = m[1];
+    // Auto-discovery: only real modules under src/ are in scope. Node builtins
+    // and bare deps (recharts, @dnd-kit/*, react, ...) resolve to null and are
+    // skipped — those are legitimately partially mocked.
+    const resolvedPath = resolveRealSrcModule(filePath, moduleSpec);
+    if (!resolvedPath) continue;
+
     const tail = moduleSpec.split('/').pop() ?? '';
-    if (!GUARDED_TAILS.has(tail)) continue;
     if (tail === 'api' && isLegacyApiMock(filePath)) {
       const apiMockCount = countMockCalls(src, '../api');
       if (apiMockCount === 1) continue;
@@ -800,11 +877,12 @@ function findInlineMockFindings(filePath: string): InlineMockFinding[] {
     const endIdx = findFactoryBodyEnd(afterComma);
     const factoryBody = afterComma.slice(0, endIdx);
 
-    // Check for safe patterns
+    // Check for safe patterns (helper delegation for the 5 helper-backed tails;
+    // importOriginal/importActual/spread for any module)
     if (hasSafeFactoryDelegation(filePath, factoryBody, tail)) continue;
 
     const factoryKeys = extractTopLevelKeys(factoryBody);
-    findings.push({ file: filePath, moduleSpec, factoryKeys });
+    findings.push({ file: filePath, moduleSpec, resolvedPath, factoryKeys });
   }
 
   return findings;
@@ -893,25 +971,51 @@ describe('mock-factory-export-coverage', () => {
       );
     }
 
+    // Live map used to regenerate the grandfathering baseline
+    // (relTestFile -> moduleSpec -> currently-omitted exports).
+    const liveMissing: Record<string, Record<string, string[]>> = {};
+    // Cache real-module exports across test files that mock the same module.
+    const exportsByPath = new Map<string, Set<string>>();
+
     for (const file of testFiles) {
       const mockFindings = findInlineMockFindings(file);
       for (const finding of mockFindings) {
-        const tail = finding.moduleSpec.split('/').pop() ?? '';
-        const sourceExports = runtimeExportsByTail.get(tail);
-        if (!sourceExports) continue; // Module not loaded — skip
+        let sourceExports = exportsByPath.get(finding.resolvedPath);
+        if (!sourceExports) {
+          sourceExports = await loadRuntimeExportsForPath(finding.resolvedPath);
+          exportsByPath.set(finding.resolvedPath, sourceExports);
+        }
 
-        const missing = [...sourceExports].filter(
-          name => !finding.factoryKeys.has(name),
-        );
-        if (missing.length > 0) {
-          const rel = path.relative(SRC_DIR, finding.file);
+        const rel = path.relative(SRC_DIR, finding.file).replaceAll(path.sep, '/');
+        const missingAll = [...sourceExports].filter(name => !finding.factoryKeys.has(name)).sort();
+        if (missingAll.length > 0) {
+          (liveMissing[rel] ??= {})[finding.moduleSpec] = missingAll;
+        }
+
+        // Grandfather pre-existing partial mocks; fail only on NEW drift — a real
+        // export missing from the factory that is not in the baseline (either a
+        // newly-added real export, or an export dropped from the factory).
+        const baselineAllowed = new Set(BASELINE[rel]?.[finding.moduleSpec] ?? []);
+        const newlyMissing = missingAll.filter(name => !baselineAllowed.has(name));
+        if (newlyMissing.length > 0) {
           failures.push(
-            `src/${rel} :: vi.mock("${finding.moduleSpec}") missing: [${missing.join(', ')}]. ` +
-            'Either add the missing exports to the inline factory or use the complete helper ' +
-            '(e.g. createFirebaseMock / createPollerMock / createStrategicStateApiMock).',
+            `src/${rel} :: vi.mock("${finding.moduleSpec}") missing real export(s): ` +
+            `[${newlyMissing.join(', ')}]. The real module exposes these but the mock factory ` +
+            'does not, so a caller relying on them would hit undefined. Either add them to the ' +
+            'inline factory, delegate to the complete helper (e.g. createFirebaseMock / ' +
+            'createPollerMock / createStrategicStateApiMock), or — if the omission is intentional — ' +
+            'regenerate the baseline with DUMP_MOCK_COVERAGE_BASELINE=1.',
           );
         }
       }
+    }
+
+    if (process.env.DUMP_MOCK_COVERAGE_BASELINE) {
+      // Regeneration mode: write the current omitted-export map so it can be
+      // reviewed and committed as the new baseline. (console output is captured
+      // under the happy-dom worker, so write to a file instead.)
+      writeFileSync(process.env.DUMP_MOCK_COVERAGE_BASELINE, JSON.stringify(liveMissing, null, 2) + '\n');
+      return; // dump run: do not assert
     }
 
     expect(failures, `\n${failures.join('\n')}`).toHaveLength(0);
@@ -1015,5 +1119,51 @@ describe('mock-factory-export-coverage helpers', () => {
       return createApiMock();
     }`;
     expect(hasSafeFactoryDelegation(componentTestFile, body, 'firebase')).toBe(false);
+  });
+});
+
+describe('mock-factory-export-coverage auto-discovery', () => {
+  const componentTestFile = path.join(SRC_DIR, 'components/example.test.tsx');
+
+  it('resolveRealSrcModule maps a relative spec (no ext) to a real .ts source', () => {
+    expect(resolveRealSrcModule(componentTestFile, '../api')).toBe(path.join(SRC_DIR, 'api.ts'));
+    expect(resolveRealSrcModule(componentTestFile, '../firebase')).toBe(path.join(SRC_DIR, 'firebase.ts'));
+    expect(resolveRealSrcModule(componentTestFile, '../hooks/usePoller')).toBe(path.join(SRC_DIR, 'hooks/usePoller.ts'));
+  });
+
+  it('resolveRealSrcModule resolves a component spec to its .tsx source', () => {
+    expect(resolveRealSrcModule(componentTestFile, './TaskCard')).toBe(path.join(SRC_DIR, 'components/TaskCard.tsx'));
+  });
+
+  it('resolveRealSrcModule skips node builtins and bare dependencies (partial mocks are legitimate)', () => {
+    for (const spec of ['fs', 'recharts', '@dnd-kit/core', '@dnd-kit/sortable', 'react']) {
+      expect(resolveRealSrcModule(componentTestFile, spec)).toBeNull();
+    }
+  });
+
+  it('resolveRealSrcModule returns null for a relative path with no matching source', () => {
+    expect(resolveRealSrcModule(componentTestFile, './does-not-exist-module')).toBeNull();
+    // A relative path escaping src/ is not a real src module.
+    expect(resolveRealSrcModule(componentTestFile, '../../package')).toBeNull();
+  });
+
+  it('extractRuntimeExportsFromText captures value re-exports (export { a } from ...) but skips types', () => {
+    // TaskCard.tsx re-exports SrBadge et al via `export { ... } from './SrBadges'`,
+    // which the decl-only regex would miss — the enhanced brace matcher catches them.
+    const names = extractRuntimeExportsFromText(path.join(SRC_DIR, 'components/TaskCard.tsx'));
+    expect(names.has('SrBadge')).toBe(true);
+    expect(names.has('isSafeUrl')).toBe(true);
+    // `export type { Task } from '../types/task'` must NOT be treated as a runtime export.
+    expect(names.has('Task')).toBe(false);
+  });
+
+  it('auto-discovery flags a new un-mirrored full-replacement mock of a real module', async () => {
+    // Simulate the scan for a synthetic finding: a mock of a real multi-export
+    // module that only stubs one export, with no baseline grandfathering.
+    const real = await loadRuntimeExportsForPath(path.join(SRC_DIR, 'hooks/usePoller.ts'));
+    const factoryKeys = new Set(['usePoller']); // omits the other real exports
+    const missing = [...real].filter(name => !factoryKeys.has(name));
+    // usePoller.ts exports more than just usePoller, so the incomplete mock is drift.
+    expect(missing.length).toBeGreaterThan(0);
   });
 });

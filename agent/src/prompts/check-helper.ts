@@ -165,7 +165,16 @@ function buildImpactedTestBlock(taskId: string): string {
     # bounded under the sanctioned Postgres harness so an impacted-test failure
     # blocks ./pr open instead of leaking to the promotion suite.
     IMPACTED_TEST_CAP=8
-    _it_all=$(printf '%s\\n' "$CHANGED" | python3 backend/testing/impacted_tests.py 2>/dev/null || true)
+    _it_stderr_f=$(mktemp /tmp/check_impacted_XXXXXX)
+    _it_all=$(printf '%s\\n' "$CHANGED" | python3 backend/testing/impacted_tests.py 2>"$_it_stderr_f")
+    _it_rc=$?
+    if [ "$_it_rc" -ne 0 ]; then
+      echo "[check] impacted-test resolver: crashed (exit $_it_rc) — stderr follows:" >&2
+      cat "$_it_stderr_f" >&2
+      echo "[check] impacted-test resolver: crash surfaced as gate failure" >&2
+      FAILED+=("impacted-test resolver crash")
+    fi
+    rm -f "$_it_stderr_f"
     if [ -n "$_it_all" ]; then
       _it_count=$(printf '%s\\n' "$_it_all" | grep -c '^' || true)
       if [ "$_it_count" -gt "$IMPACTED_TEST_CAP" ]; then

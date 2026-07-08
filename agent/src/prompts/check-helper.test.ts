@@ -1276,6 +1276,28 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     const { execSync } = await import('child_process');
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
+
+  it('resolver crash is surfaced as a gate failure — not silently swallowed', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'impacted-crash',
+      workBranch: 'blueprint/impacted-crash',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+    // The old silent-swallow pattern must be gone.
+    expect(script).not.toContain('python3 backend/testing/impacted_tests.py 2>/dev/null || true');
+    // Crash detection: capture exit code and surface non-zero exits as failures.
+    expect(script).toContain('_it_rc=$?');
+    expect(script).toContain('if [ "$_it_rc" -ne 0 ]');
+    expect(script).toContain('FAILED+=("impacted-test resolver crash")');
+    // A crash prints stderr content so operators can diagnose.
+    expect(script).toContain('cat "$_it_stderr_f"');
+  });
 });
 
 // ── npm_ci_if_lock_changed — lockfile-hash install guard ─────────────────────

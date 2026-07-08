@@ -1,0 +1,45 @@
+{
+  "_readme": [
+    "Grandfathering baseline for src/test/mock-factory-export-coverage.test.ts (tier-2 auto-discovery).",
+    "Maps relTestFile -> vi.mock spec -> real exports the full-replacement factory currently omits.",
+    "Lets existing intentionally-partial mocks (e.g. stubbing a child component but not its helper",
+    "exports) stay green, while a NEWLY-added real export or an export dropped from a factory fails.",
+    "Regenerate after intentionally changing a mock:",
+    "  DUMP_MOCK_COVERAGE_BASELINE=/tmp/live.json npx vitest run src/test/mock-factory-export-coverage.test.ts",
+    "then replace this file with /tmp/live.json's contents (keep this _readme key)."
+  ],
+  "components/KanbanBoard.test.tsx": {
+    "./TaskCard": [
+      "ResearchFindings",
+      "ResolvedReferenceLink",
+      "SrBadge",
+      "SrDisallowedBadge",
+      "SrDivergenceBadge",
+      "StatusBadge",
+      "TaskTypeBadge",
+      "getHeartbeatStatus",
+      "isResolvableStorageUri",
+      "isSafeUrl",
+      "linkifyStatusMessage",
+      "useDurationStats",
+      "useElapsedTime"
+    ]
+  },
+  "components/KanbanColumn.test.tsx": {
+    "./TaskCard": [
+      "ResearchFindings",
+      "ResolvedReferenceLink",
+      "SrBadge",
+      "SrDisallowedBadge",
+      "SrDivergenceBadge",
+      "StatusBadge",
+      "TaskTypeBadge",
+      "getHeartbeatStatus",
+      "isResolvableStorageUri",
+      "isSafeUrl",
+      "linkifyStatusMessage",
+      "useDurationStats",
+      "useElapsedTime"
+    ]
+  }
+}

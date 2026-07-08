@@ -10704,6 +10704,83 @@ def _find_test_funcs_matching(content: str, pattern: re.Pattern) -> list[str]:
 
 _API_URL_RE = re.compile(r'["\'](/api/[a-z][^"\'\s?#{]*)["\']')
 
+_TEST_FUNC_DEF_RE = re.compile(r"^(?:async )?def (test_\w+)", re.MULTILINE)
+
+
+def _validate_route_contract_registry(
+    testing_dir: Path,
+    registry: dict,
+) -> list[str]:
+    """Return a list of rot errors for a route-contract ownership registry.
+
+    Each entry is validated against the test files in ``testing_dir``:
+    * the owner file must exist;
+    * the ``search_pattern`` must be a valid regex;
+    * the ``search_pattern`` must match inside the body of at least one real
+      ``test_*`` function in the owner file — a match only in a comment,
+      docstring, or unrelated top-level line means the owning contract test was
+      renamed/deleted and is reported;
+    * every ``exempt_tests`` name must exist as a ``test_*`` function somewhere
+      in ``testing_dir`` (a dangling exemption is dead config).
+
+    Returns an empty list when the registry is fully valid.
+    """
+    all_test_funcs: set[str] = set()
+    for test_file in testing_dir.glob("test_*.py"):
+        all_test_funcs.update(_TEST_FUNC_DEF_RE.findall(test_file.read_text()))
+
+    errors: list[str] = []
+    for endpoint, config in registry.items():
+        owner_file: str = config["owner"]
+        search_pattern: str = config["search_pattern"]
+
+        owner_path = testing_dir / owner_file
+        if not owner_path.exists():
+            errors.append(
+                f"Endpoint '{endpoint}': owner file '{owner_file}' does not exist "
+                f"at {owner_path}"
+            )
+            continue
+
+        owner_content = owner_path.read_text()
+        try:
+            compiled = re.compile(search_pattern)
+        except re.error as exc:
+            errors.append(
+                f"Endpoint '{endpoint}': invalid search_pattern regex: {exc}"
+            )
+            continue
+
+        # Require the pattern to match inside a real test_* function body, not
+        # merely anywhere in the file (a comment/docstring/import line).
+        owning_funcs = _find_test_funcs_matching(owner_content, compiled)
+        if not owning_funcs:
+            if compiled.search(owner_content):
+                errors.append(
+                    f"Endpoint '{endpoint}': search_pattern matches owner file "
+                    f"'{owner_file}' but not inside any test_* function body "
+                    f"(only in a comment/docstring/unrelated line). The owning "
+                    f"contract test appears to have been renamed or deleted. "
+                    f"Pattern: {search_pattern}"
+                )
+            else:
+                errors.append(
+                    f"Endpoint '{endpoint}': search_pattern does not match any "
+                    f"content in owner file '{owner_file}'. Pattern: {search_pattern}"
+                )
+
+        # Every declared exemption must name a real test_* function; a stale
+        # name silently widens the ownership gate.
+        errors.extend(
+            f"Endpoint '{endpoint}': exempt_tests names '{exempt_name}', "
+            f"which is not a test_* function anywhere in backend/testing. "
+            f"Remove the stale exemption or fix the name."
+            for exempt_name in config.get("exempt_tests", [])
+            if exempt_name not in all_test_funcs
+        )
+
+    return errors
+
 
 def _find_unregistered_duplicated_contracts(
     testing_dir: Path,
@@ -10807,11 +10884,19 @@ class TestRouteContractOwnership:
         )
 
     def test_route_contract_owners_are_valid(self):
-        """Each endpoint's owner file must exist and contain the search_pattern.
+        """Each endpoint's owner file must exist and own a real contract test.
 
         This meta-integrity check prevents silent rot: a stale/typo'd owner file
         path or a drifted search_pattern that no longer matches its endpoint
         is caught at merge time.
+
+        Rot-prevention tightening: the search_pattern must match inside the body
+        of at least one real ``test_*`` function in the owner file — a match in a
+        comment, docstring, or an unrelated top-level line is NOT enough, so a
+        deleted/renamed owner contract test is caught. Every name listed in an
+        entry's ``exempt_tests`` must also exist as a ``test_*`` function
+        somewhere in backend/testing; a dangling exemption is dead config that
+        silently widens the gate.
         """
         import json
 
@@ -10820,34 +10905,7 @@ class TestRouteContractOwnership:
             registry = json.load(f)
 
         testing_dir = BACKEND_ROOT / "testing"
-        errors: list[str] = []
-
-        for endpoint, config in registry.items():
-            owner_file: str = config["owner"]
-            search_pattern: str = config["search_pattern"]
-
-            owner_path = testing_dir / owner_file
-            if not owner_path.exists():
-                errors.append(
-                    f"Endpoint '{endpoint}': owner file '{owner_file}' does not exist "
-                    f"at {owner_path}"
-                )
-                continue
-
-            owner_content = owner_path.read_text()
-            try:
-                compiled = re.compile(search_pattern)
-            except re.error as exc:
-                errors.append(
-                    f"Endpoint '{endpoint}': invalid search_pattern regex: {exc}"
-                )
-                continue
-
-            if not compiled.search(owner_content):
-                errors.append(
-                    f"Endpoint '{endpoint}': search_pattern does not match any content "
-                    f"in owner file '{owner_file}'. Pattern: {search_pattern}"
-                )
+        errors = _validate_route_contract_registry(testing_dir, registry)
 
         assert not errors, (
             "Route contract ownership registry has invalid entries:\n"
@@ -10907,6 +10965,180 @@ class TestRouteContractOwnership:
             f"Expected '{endpoint_url}' (asserted in test_alpha.py and test_beta.py) "
             f"to be flagged as an unregistered duplicate contract, but "
             f"_find_unregistered_duplicated_contracts returned: {violations}"
+        )
+
+    def test_validate_registry_accepts_pattern_inside_test_function(self):
+        """A pattern that matches inside a real test_* body is valid (no errors)."""
+        import tempfile
+
+        owner_src = (
+            "async def test_widgets_contract(client):\n"
+            '    r = await client.get("/api/admin/widgets")\n'
+            '    assert r.json()["widgets"] == []\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert errors == [], (
+            f"Expected no errors for a pattern matched inside a test_* function, "
+            f"got: {errors}"
+        )
+
+    def test_validate_registry_rejects_missing_owner_file(self):
+        """A registered owner file that does not exist is reported."""
+        import tempfile
+
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_does_not_exist.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            errors = _validate_route_contract_registry(Path(tmpdir), registry)
+
+        assert any("does not exist" in e for e in errors), (
+            f"Expected a missing-owner-file error, got: {errors}"
+        )
+
+    def test_validate_registry_rejects_pattern_only_in_comment(self):
+        """A pattern that matches only in a comment/docstring — not inside any
+        test_* function body — is caught as a renamed/deleted owner contract.
+
+        This is the core rot-prevention tightening: the old check accepted a
+        match anywhere in the file, so deleting the real contract test while
+        leaving a stray mention would pass silently.
+        """
+        import tempfile
+
+        # The endpoint string appears only in a module docstring / comment, and
+        # the sole test_* function does NOT reference it (its contract was
+        # renamed away).
+        owner_src = (
+            '"""Tests once covered /api/admin/widgets response shape."""\n'
+            "\n"
+            "# TODO: /api/admin/widgets contract lives here\n"
+            "async def test_unrelated(client):\n"
+            '    r = await client.get("/api/admin/other")\n'
+            '    assert r.status_code == 200\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert any("not inside any test_* function body" in e for e in errors), (
+            f"Expected a comment-only match to be rejected (renamed/deleted owner "
+            f"test), got: {errors}"
+        )
+
+    def test_validate_registry_rejects_pattern_matching_nowhere(self):
+        """A pattern that matches nothing in the owner file is reported as a
+        drifted pattern (distinct from the comment-only case)."""
+        import tempfile
+
+        owner_src = (
+            "async def test_something(client):\n"
+            '    r = await client.get("/api/admin/other")\n'
+            '    assert r.status_code == 200\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert any("does not match any" in e for e in errors), (
+            f"Expected a drifted-pattern error, got: {errors}"
+        )
+
+    def test_validate_registry_rejects_dangling_exempt_test(self):
+        """An exempt_tests name that is not a real test_* function anywhere in
+        the testing dir is reported as a stale exemption."""
+        import tempfile
+
+        owner_src = (
+            "async def test_widgets_contract(client):\n"
+            '    r = await client.get("/api/admin/widgets")\n'
+            '    assert r.json()["widgets"] == []\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": ["test_this_was_deleted_long_ago"],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert any(
+            "test_this_was_deleted_long_ago" in e and "stale exemption" in e
+            for e in errors
+        ), f"Expected a stale-exemption error, got: {errors}"
+
+    def test_validate_registry_accepts_exempt_test_in_other_file(self):
+        """A function-scoped exemption may live in a DIFFERENT test file; it is
+        valid as long as the name exists as a test_* function somewhere in the
+        testing dir (matching the real registry's cross-file exemptions)."""
+        import tempfile
+
+        owner_src = (
+            "async def test_widgets_contract(client):\n"
+            '    r = await client.get("/api/admin/widgets")\n'
+            '    assert r.json()["widgets"] == []\n'
+        )
+        other_src = (
+            "async def test_widgets_from_other_angle(client):\n"
+            '    r = await client.get("/api/admin/widgets")\n'
+            '    assert r.json()["count"] == 0\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": ["test_widgets_from_other_angle"],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+            (tmpdir_path / "test_widgets_other.py").write_text(other_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert errors == [], (
+            f"Expected a cross-file exemption naming a real test_* function to be "
+            f"valid, got: {errors}"
         )
 
 

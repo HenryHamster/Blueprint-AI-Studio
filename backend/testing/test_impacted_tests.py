@@ -429,6 +429,58 @@ def test_live_surface_manifest_is_valid_and_registers_websocket_sentinel():
     assert "backend/testing/test_websocket_emitter_inventory.py" in selected
 
 
+def test_indirectly_reached_module_via_two_hop_chain(tmp_path):
+    """A two-hop chain (test -> intermediate -> changed leaf) selects the test.
+
+    Fixture: ``core.py`` (changed) <- ``service.py`` <- ``router.py``.
+    The test file imports only ``app.routers.router``, not ``app.core`` or
+    ``app.service``.  Changing ``core.py`` must select the test because:
+      hop 1: core.py -> service.py (service imports core)
+      hop 2: service.py -> routers/router.py (router imports service)
+    The one-hop implementation misses hop 2 and would return [].
+    """
+    root = str(tmp_path)
+    _make_tree(root)
+    # Bottom of the chain: the module being changed.
+    _write(root, "backend/app/core.py", "def logic(): pass\n")
+    # Middle hop: imports core.
+    _write(
+        root,
+        "backend/app/service.py",
+        "from app.core import logic\n\ndef svc(): return logic()\n",
+    )
+    # Top hop: imports service only.
+    _write(
+        root,
+        "backend/app/routers/router.py",
+        "from app.service import svc\n\ndef route(): return svc()\n",
+    )
+    # Test file references only the router — not core or service.
+    _write(
+        root,
+        "backend/testing/test_router.py",
+        "from app.routers import router\n\ndef test_x(): assert router.route()\n",
+    )
+    result = impacted_tests.resolve_impacted(["backend/app/core.py"], root)
+    assert "backend/testing/test_router.py" in result
+
+
+def test_depth_bound_terminates_on_circular_import(tmp_path):
+    """Mutual imports (a cycle) must not cause an infinite loop.
+
+    ``mod_a`` imports ``mod_b``, ``mod_b`` imports ``mod_a``.  No test
+    references either, so the result is empty, but the resolver must return
+    in finite time rather than looping forever.
+    """
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(root, "backend/app/mod_a.py", "from app.mod_b import b\n\ndef a(): return b()\n")
+    _write(root, "backend/app/mod_b.py", "from app.mod_a import a\n\ndef b(): return None\n")
+    # No test references either module — result is empty, and we must not hang.
+    result = impacted_tests.resolve_impacted(["backend/app/mod_a.py"], root)
+    assert result == []
+
+
 def test_main_reads_stdin_and_writes_stdout(tmp_path, monkeypatch, capsys):
     root = str(tmp_path)
     _make_tree(root)

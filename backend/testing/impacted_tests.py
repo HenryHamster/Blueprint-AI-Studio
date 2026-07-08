@@ -65,6 +65,11 @@ import os
 import re
 import sys
 
+# Maximum BFS depth for transitive importer expansion. The ``seen_mods`` dedup
+# set already guarantees termination on cyclic graphs; this cap bounds scan cost
+# on pathologically deep chains (e.g. a 20-layer abstraction stack).
+MAX_HOPS = 6
+
 # Repo root is two levels up from this file (backend/testing -> repo root).
 _DEFAULT_REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
@@ -287,14 +292,24 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
             changed_modules.append(dotted)
 
     if changed_modules and os.path.isdir(testing_dir):
-        # One-hop expansion: app modules that import a changed module are also
-        # relevant — tests referencing the importer are indirectly impacted.
+        # Transitive closure (BFS, bounded by MAX_HOPS): app modules that
+        # import a changed module — directly or indirectly — are also relevant.
+        # ``seen_mods`` provides dedup and guarantees termination even without
+        # the cap; the cap bounds scan cost on pathologically deep or cyclic
+        # import graphs.
         seen_mods: "set[str]" = set(changed_modules)
-        for mod in list(changed_modules):
-            for importer in _find_app_importers(mod, repo_root):
-                if importer not in seen_mods:
-                    seen_mods.add(importer)
-                    changed_modules.append(importer)
+        frontier = list(changed_modules)
+        for _ in range(MAX_HOPS):
+            if not frontier:
+                break
+            next_frontier: "list[str]" = []
+            for mod in frontier:
+                for importer in _find_app_importers(mod, repo_root):
+                    if importer not in seen_mods:
+                        seen_mods.add(importer)
+                        changed_modules.append(importer)
+                        next_frontier.append(importer)
+            frontier = next_frontier
         pattern_sets = [module_reference_patterns(mod) for mod in changed_modules]
         for name in os.listdir(testing_dir):
             if not (name.startswith("test_") and name.endswith(".py")):
