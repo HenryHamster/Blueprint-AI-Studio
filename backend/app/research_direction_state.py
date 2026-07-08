@@ -86,8 +86,8 @@ _CHALLENGE_AGREEMENT_BUCKETS = (
 # verifies structurally that both paths contain the gate call.
 _AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
     {
-        "exhaustion",  # _maybe_autocomplete_exhausted_direction (L285)
-        "proven_merge",  # apply_post_spawn_state >=3-merge completion (L970)
+        "exhaustion",  # _maybe_autocomplete_exhausted_direction
+        "proven_merge",  # apply_post_spawn_state >=3-merge completion
     }
 )
 
