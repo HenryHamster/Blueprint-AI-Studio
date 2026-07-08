@@ -8,6 +8,17 @@
 const SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC =
   'lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`, `go.sum`), generated outputs, `.gitignore`, sibling test files (`.test.*`/`.spec.*`)';
 
+// Shared cross-file consistency check instruction used in create and fix task focuses.
+// Extracted to a single source of truth so examples and recording format stay consistent
+// without drift between the two copies.
+const CROSS_FILE_CONSISTENCY_FOCUS =
+  '**Cross-file consistency** — when the diff touches multiple files, identify the dominant ' +
+  "pattern introduced or modified (e.g., 'added null guard before .map calls', 'switched " +
+  "timestamps to UTC-aware', 'added try/except around external HTTP call'). Enumerate every " +
+  'touched file and attest that the pattern is applied consistently. If the pattern is ' +
+  'inconsistently applied across files, record under `correctness` with `passed: false` ' +
+  'and the issue: "pattern X inconsistently applied: present in [files], missing/divergent in [files]".';
+
 // Builds the migrate-task self-review focus block. Defaults reproduce
 // Blueprint's own layout byte-for-byte (`backend/app/main.py` /
 // `EXPECTED_SCHEMA_REVISION`) so existing content tests stay valid. Callers on
@@ -93,12 +104,7 @@ the declared scope. Apply these additional checks before \`./done\`:
    modified file outside \`related_files\` and outside the allowlist is off-scope —
    record under \`scope-drift\` with \`passed: false\` and list the off-scope files
    (e.g. "modified files outside declared scope: backend/app/foo.py — declared related_files: [agent/src/baz.ts]").
-3. **Cross-file consistency** — when the diff touches multiple files, identify the dominant
-   pattern introduced or modified (e.g., 'added null guard before .map calls', 'switched
-   timestamps to UTC-aware', 'added try/except around external HTTP call'). Enumerate every
-   touched file and attest that the pattern is applied consistently. If the pattern is
-   inconsistently applied across files, record under \`correctness\` with \`passed: false\`
-   and the issue: "pattern X inconsistently applied: present in [files], missing/divergent in [files]".
+3. ${CROSS_FILE_CONSISTENCY_FOCUS}
 4. **Caller compatibility** — grep for callers of any function or export you
    added or modified; confirm their call sites still compile and behave correctly.
 `;
@@ -155,7 +161,7 @@ failing, and scope creep into unrelated files. Apply these additional checks:
    as \`_self_review_outcome\` in context) is reference material, not a template to copy.
    Write to \`/tmp/self_review_<YOUR_task_id>.json\` using the CURRENT task ID from the
    ORCHESTRATOR env — never a prior task's ID.
-5. **Cross-file consistency** — when the diff touches multiple files, identify the dominant pattern introduced or modified (e.g., 'added null guard before .map calls', 'switched timestamps to UTC-aware', 'added try/except around external HTTP call'). Enumerate every touched file and attest that the pattern is applied consistently. If the pattern is inconsistently applied across files, record under \`correctness\` with \`passed: false\` and the issue: \`"pattern X inconsistently applied: present in [files], missing/divergent in [files]"\`.
+5. ${CROSS_FILE_CONSISTENCY_FOCUS}
 `;
 
 export const DOCS_TASK_FOCUS = `

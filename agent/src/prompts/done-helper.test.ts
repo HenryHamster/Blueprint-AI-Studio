@@ -283,8 +283,9 @@ describe('writeDoneHelper — thinning categories gate', () => {
     const doneScript = capturedScripts['/tmp/workspace/done'];
     expect(doneScript).toBeDefined();
     // The anchor-detection block must be present inside the reasoning gate
-    expect(doneScript).toContain('_HAS_ANCHOR=0');
-    expect(doneScript).toContain('[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+');
+    // (batched python3 call with compiled regex instead of per-category bash grep loop)
+    expect(doneScript).toContain('anchor_re = re.compile');
+    expect(doneScript).toContain('anchor_re.search');
     // Short reasoning without anchor still fails
     expect(doneScript).toContain('MISSING_REASONING');
     expect(doneScript).toContain('exit 1');

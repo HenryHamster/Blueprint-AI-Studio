@@ -15,7 +15,7 @@ export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'):
       'You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.',
       '1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.',
       '2. Decompose into substantial subtasks. Prefer fewer, larger subtasks over many tiny ones.',
-      '3. Identify dependencies between subtasks — which must complete before others can start.',
+      '3. Identify dependencies between subtasks — only order true producer→consumer relationships. Minimize unnecessary dependencies so independent subtasks can run in parallel; each dependency you add serializes work that could have been concurrent.',
       '4. Write clear, self-contained prompts for each subtask.',
       'Output EXACTLY one JSON block as the VERY LAST thing in your response:',
       'GREENFIELD MODE — this repository is empty or near-empty (only config/scaffolding, no real source).',
