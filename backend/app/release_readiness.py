@@ -76,6 +76,37 @@ _V22_LIVE_VERIFICATION_SOURCE_ID = "live_verification_backfill:v22"
 _V22_BACKFILL_VERSION_NUMBER = 22
 _V22_BACKFILL_SEVERITY = "low"
 
+# The exact count of v22 carried low-severity findings that were fixed in
+# d2cf1ebb8 / PR #13245.  The backfill count guard compares the resolved
+# count against this constant and warns on mismatch — a self-reported-vs-expected
+# data-integrity check in the same spirit as the metrics-integrity sweep.
+_V22_EXPECTED_LOW_SEVERITY_COUNT = 13
+
+# Module-level guard state observable by tests.  Updated at the end of each
+# backfill_v22_carried_findings_resolved call against a v22 version; reset
+# between tests via _reset_v22_backfill_guard_for_tests().
+_v22_backfill_guard_state: dict[str, object] = {}
+
+
+def get_v22_backfill_guard_state() -> dict[str, object]:
+    """Snapshot of the most recent v22 backfill count-guard check (for tests)."""
+    return dict(_v22_backfill_guard_state)
+
+
+def _reset_v22_backfill_guard_for_tests() -> None:
+    """Test helper — clear the process-local v22 backfill guard state."""
+    global _v22_backfill_guard_state
+    _v22_backfill_guard_state = {}
+
+
+def _v22_count_diverges(
+    resolved_count: int,
+    expected_count: int = _V22_EXPECTED_LOW_SEVERITY_COUNT,
+) -> bool:
+    """True when the resolved low-severity count diverges from the expected count."""
+    return resolved_count != expected_count
+
+
 # Resolution states a ledger row may carry.  A high/medium carried finding counts
 # as resolved-for-requalification when its ledger row is in EITHER of these.
 _RESOLVED_LEDGER_STATES = frozenset({"resolved", "stale"})
@@ -1650,6 +1681,27 @@ async def backfill_v22_carried_findings_resolved(
                     "note": _V22_BACKFILL_NOTE,
                 },
             )
+
+    # Count guard: detect divergence between the number of low-severity
+    # findings actually resolved and the expected constant (13), then log a
+    # warning when they differ.  Non-fatal — the backfill still completes and
+    # returns the actual count.  This is a data-integrity self-check in the
+    # same spirit as the metrics-integrity sweep: a self-reported number that
+    # diverges from an expected constant is a signal worth investigating.
+    expected = _V22_EXPECTED_LOW_SEVERITY_COUNT
+    match = count == expected
+    _v22_backfill_guard_state.update(
+        expected=expected, resolved=count, match=match
+    )
+    if not match:
+        logger.warning(
+            "V22_BACKFILL_COUNT_DIVERGENCE: resolved %d low-severity findings, "
+            "but expected %d — self-reported vs expected mismatch.  "
+            "The v22 audit-finding inventory may have changed or the seed data "
+            "may be inconsistent.",
+            count,
+            expected,
+        )
 
     return count
 
