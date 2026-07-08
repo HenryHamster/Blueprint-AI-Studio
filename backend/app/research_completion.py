@@ -242,6 +242,7 @@ _RESEARCH_SPAWN_COUNTED_IDS_MAX = 200
 # so strategic review can tell "the cited code is unambiguously gone" — the
 # strongest truthfulness signal — apart from a merely deferred finding.
 _REPRODUCE_REJECTED_DROP_REASON = "reproduce_on_head_absent"
+_CRITERION_EVIDENCE_REJECTED_DROP_REASON = "criterion_evidence_missing"
 
 _FINDING_CHALLENGE_HISTORY_KEY = "finding_challenge_records"
 _FINDING_CHALLENGE_RECORD_KEY = "finding_challenge"
@@ -3222,6 +3223,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # (a retry loop), and they are excluded from the surviving-finding success
     # signal so the cycle scores neutral, never a spurious success/failure.
     _reproduce_rejected: list[dict] = []
+    # Findings rejected because they belong to a criterion-carrying direction but
+    # lack acceptance_evidence:{kind:named_test}. Hard rejection (not deferred) —
+    # the finding cannot close the criterion coverage loop without a named-test
+    # proof declaration.
+    _criterion_evidence_rejected: list[dict] = []
     # compute_experiment findings whose authored launch contract was incomplete
     # or malformed — deferred loudly rather than spawning a broken compute job.
     _compute_contract_deferred: list[dict] = []
@@ -4395,25 +4401,33 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             normalize_acceptance_evidence(finding.get("acceptance_evidence"))
         )
 
-        # Warn when a criterion-carrying finding omits acceptance_evidence.
-        # The spawned task inherits criterion_ids from the direction, but
-        # without a named_test declaration the acceptance pipeline records 0
-        # proven-verdict rows, leaving criterion coverage perpetually
-        # uncovered. This is an authoring-time annotation (non-blocking) so
-        # the spawn still proceeds; the warning surfaces in the child task
-        # context and is visible to reviewers and dashboards.
-        if not finding.get("acceptance_evidence"):
-            _warn_eff_dir_id = direction_id or parent_direction_id
-            _warn_criterion_ids = _direction_criterion_cache.get(
-                _warn_eff_dir_id or "", []
+        # Reject criterion-carrying findings that lack named_test acceptance
+        # evidence. The spawned task inherits criterion_ids from the direction,
+        # but without a named_test declaration the acceptance pipeline records 0
+        # proven-verdict rows, leaving criterion coverage perpetually uncovered.
+        # PR #13528 added a non-blocking provenance warning here; the direction's
+        # retirement condition requires a hard rejection so the spawn is blocked
+        # and the finding never becomes work that cannot close the coverage loop.
+        _crit_eff_dir_id = direction_id or parent_direction_id
+        _crit_criterion_ids = _direction_criterion_cache.get(
+            _crit_eff_dir_id or "", []
+        )
+        if _crit_criterion_ids:
+            _has_named_test = (
+                _payload_acceptance_evidence is not None
+                and _payload_acceptance_evidence.get("kind") == "named_test"
             )
-            if _warn_criterion_ids:
-                _merge_provenance_warnings(
-                    finding,
-                    {
-                        "criterion_carrying_finding_missing_acceptance_evidence": True
-                    },
+            if not _has_named_test:
+                _criterion_evidence_rejected.append(finding)
+                logger.warning(
+                    "[RESEARCH] Rejecting finding %r (task %s): criterion-carrying "
+                    "direction %s but finding lacks acceptance_evidence:{kind:named_test}; "
+                    "not spawning.",
+                    finding.get("title") or finding.get("description", "")[:60],
+                    task.id,
+                    _crit_eff_dir_id,
                 )
+                continue
 
         if task_type == "compute_experiment":
             # Build + validate the compute_experiment payload from the launch
@@ -4897,6 +4911,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         [(f, "low_actionability") for f in _low_actionability_deferred]
         + [(f, "degradation_gate") for f in _degradation_gate_deferred]
         + [(f, _REPRODUCE_REJECTED_DROP_REASON) for f in _reproduce_rejected]
+        + [
+            (f, _CRITERION_EVIDENCE_REJECTED_DROP_REASON)
+            for f in _criterion_evidence_rejected
+        ]
     )
     if _finding_challenge_enabled(CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY):
         _memo_candidates.extend(
@@ -5050,6 +5068,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         or _spawned_memo_ids
         or _finding_give_up
         or _reproduce_rejected
+        or _criterion_evidence_rejected
         or _spawn_gate_challenged_count
         or _spawn_gate_manifest_excluded_count
     ):
@@ -5067,6 +5086,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # rejected this cycle. Excluded from deferred_findings (no retry) and
             # from the surviving-finding signal (neutral, not success/failure).
             ctx["research_reproduce_rejected"] = len(_reproduce_rejected)
+        if _criterion_evidence_rejected:
+            # Machine-readable count of findings the criterion-evidence gate
+            # rejected this cycle. Follows the same pattern as reproduce_rejected:
+            # excluded from deferred_findings (no retry) and from the surviving-
+            # finding signal (neutral).
+            ctx["research_criterion_evidence_rejected"] = len(
+                _criterion_evidence_rejected
+            )
         if _spawn_gate_challenged_count:
             if _spawn_gate_healthy_cycle:
                 for _retry_key in (

@@ -9093,14 +9093,15 @@ class TestAcceptanceEvidencePropagation:
         }
 
     @_pytest.mark.asyncio
-    async def test_criterion_carrying_finding_without_acceptance_evidence_gets_provenance_warning(
+    async def test_criterion_carrying_finding_without_named_test_is_rejected(
         self, db_session, mocker
     ):
-        """When a direction carries criterion_keys and a finding omits
-        acceptance_evidence, the spawn loop must attach a provenance warning
-        so reviewers and dashboards can see that the criterion coverage loop
-        is unclosed. The spawn still proceeds (non-blocking authoring-time
-        warning)."""
+        """When a direction carries criterion_keys and a finding lacks
+        acceptance_evidence:{kind:named_test}, the spawn loop must REJECT
+        the finding (hard rejection — no child task spawned). The previous
+        non-blocking provenance warning is replaced by a hard gate that
+        blocks the spawn so uncovered criterion-carrying findings never
+        become work that cannot close the criterion coverage loop."""
         from app.models import Direction as _Direction, ReleaseVersion
         from app import acceptance_criteria as _ac
         from test_autonomous_research import (
@@ -9109,13 +9110,13 @@ class TestAcceptanceEvidencePropagation:
             _patch_research_externals,
         )
 
-        direction_id = "d-crit-warn-01"
+        direction_id = "d-crit-reject-01"
         direction_data = _active_direction(
-            direction_id, "Criterion warning direction"
+            direction_id, "Criterion rejection direction"
         )
         project = _Project(
-            name="CritWarn Project",
-            user_id="test-user-crit-warn",
+            name="CritReject Project",
+            user_id="test-user-crit-reject",
             autonomous_enabled=True,
             directions=[direction_data],
         )
@@ -9149,7 +9150,7 @@ class TestAcceptanceEvidencePropagation:
 
         task = _Task(
             project_id=project.id,
-            title="Research: Criterion warning direction",
+            title="Research: Criterion rejection direction",
             payloads=[
                 {
                     "type": "research",
@@ -9167,7 +9168,7 @@ class TestAcceptanceEvidencePropagation:
         await db_session.refresh(task)
 
         finding = _make_finding(
-            title="Missing acceptance evidence",
+            title="Missing named_test evidence",
             direction_id=direction_id,
         )
         # Explicitly ensure no acceptance_evidence key is present.
@@ -9194,16 +9195,138 @@ class TestAcceptanceEvidencePropagation:
             .scalars()
             .all()
         )
-        assert len(children) == 1, "expected exactly one spawned child task"
-        child = children[0]
-        pw = (child.context or {}).get("_provenance_warnings")
-        assert isinstance(pw, dict), (
-            "child context must carry _provenance_warnings when the finding is "
-            f"criterion-carrying but omits acceptance_evidence; got {pw!r}"
+        # The finding lacks named_test evidence on a criterion-carrying direction
+        # → hard rejection: zero implementation child tasks spawned. A memo task
+        # records the rejection reason but is not an implementation task.
+        impl_children = [
+            c for c in children
+            if (c.first_payload or {}).get("type") != "memo"
+        ]
+        assert len(impl_children) == 0, (
+            "expected zero implementation children for criterion-carrying finding "
+            f"without named_test evidence; got {len(impl_children)}"
         )
-        assert pw.get("criterion_carrying_finding_missing_acceptance_evidence") is True, (
-            "provenance warning must signal missing acceptance_evidence for "
-            f"criterion-carrying finding; got {pw!r}"
+        # The rejection count is recorded in the research task context.
+        rejected = (task.context or {}).get("research_criterion_evidence_rejected")
+        assert rejected == 1, (
+            "expected research_criterion_evidence_rejected=1 in task context; "
+            f"got {rejected!r}"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_criterion_carrying_finding_with_named_test_evidence_spawns(
+        self, db_session, mocker
+    ):
+        """When a direction carries criterion_keys and a finding declares
+        acceptance_evidence:{kind:named_test}, the spawn loop must let the
+        finding through — the named_test declaration is sufficient proof."""
+        from app.models import Direction as _Direction, ReleaseVersion
+        from app import acceptance_criteria as _ac
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _patch_research_externals,
+        )
+
+        direction_id = "d-crit-spawn-01"
+        direction_data = _active_direction(
+            direction_id, "Criterion spawn direction"
+        )
+        project = _Project(
+            name="CritSpawn Project",
+            user_id="test-user-crit-spawn",
+            autonomous_enabled=True,
+            directions=[direction_data],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        version = ReleaseVersion(
+            project_id=project.id, version_number=1, status="open"
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        criterion = await _ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text="All endpoints documented",
+            created_by="strategist",
+        )
+
+        dir_row = _Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            data=direction_data,
+            status="active",
+            criterion_keys=[criterion.criterion_key],
+        )
+        db_session.add(dir_row)
+        await db_session.commit()
+
+        task = _Task(
+            project_id=project.id,
+            title="Research: Criterion spawn direction",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [direction_data],
+                    "base_branch": "main",
+                }
+            ],
+            context={"research_depth": 0, "direction_id": direction_id},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        finding = _make_finding(
+            title="Has named_test evidence",
+            direction_id=direction_id,
+        )
+        finding["acceptance_evidence"] = {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        }
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1, (
+            "expected exactly one spawned child task for finding with "
+            f"named_test evidence; got {len(children)}"
+        )
+        # Verify the acceptance evidence was forwarded to the child.
+        child = children[0]
+        assert child.first_payload.get("acceptance_evidence") == {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        }, (
+            "child payload must carry the named_test acceptance_evidence; "
+            f"got {child.first_payload.get('acceptance_evidence')!r}"
         )
 
 
@@ -15881,6 +16004,10 @@ async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker
         "risk": "low",
         "type": "improvement",
         "direction_id": direction_id,
+        "acceptance_evidence": {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        },
     }
     _patch_research_externals(mocker)
     mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
@@ -16024,6 +16151,10 @@ async def test_criterion_ids_propagated_from_finding_direction(db_session, mocke
         "risk": "low",
         "type": "improvement",
         "direction_id": child_dir_id,
+        "acceptance_evidence": {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        },
     }
     _patch_research_externals(mocker)
     mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
