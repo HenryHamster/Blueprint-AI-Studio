@@ -9092,6 +9092,120 @@ class TestAcceptanceEvidencePropagation:
             "description": "endpoint scopes audit to the open candidate",
         }
 
+    @_pytest.mark.asyncio
+    async def test_criterion_carrying_finding_without_acceptance_evidence_gets_provenance_warning(
+        self, db_session, mocker
+    ):
+        """When a direction carries criterion_keys and a finding omits
+        acceptance_evidence, the spawn loop must attach a provenance warning
+        so reviewers and dashboards can see that the criterion coverage loop
+        is unclosed. The spawn still proceeds (non-blocking authoring-time
+        warning)."""
+        from app.models import Direction as _Direction, ReleaseVersion
+        from app import acceptance_criteria as _ac
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _patch_research_externals,
+        )
+
+        direction_id = "d-crit-warn-01"
+        direction_data = _active_direction(
+            direction_id, "Criterion warning direction"
+        )
+        project = _Project(
+            name="CritWarn Project",
+            user_id="test-user-crit-warn",
+            autonomous_enabled=True,
+            directions=[direction_data],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        version = ReleaseVersion(
+            project_id=project.id, version_number=1, status="open"
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        criterion = await _ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text="All endpoints documented",
+            created_by="strategist",
+        )
+
+        dir_row = _Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            data=direction_data,
+            status="active",
+            criterion_keys=[criterion.criterion_key],
+        )
+        db_session.add(dir_row)
+        await db_session.commit()
+
+        task = _Task(
+            project_id=project.id,
+            title="Research: Criterion warning direction",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [direction_data],
+                    "base_branch": "main",
+                }
+            ],
+            context={"research_depth": 0, "direction_id": direction_id},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        finding = _make_finding(
+            title="Missing acceptance evidence",
+            direction_id=direction_id,
+        )
+        # Explicitly ensure no acceptance_evidence key is present.
+        finding.pop("acceptance_evidence", None)
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1, "expected exactly one spawned child task"
+        child = children[0]
+        pw = (child.context or {}).get("_provenance_warnings")
+        assert isinstance(pw, dict), (
+            "child context must carry _provenance_warnings when the finding is "
+            f"criterion-carrying but omits acceptance_evidence; got {pw!r}"
+        )
+        assert pw.get("criterion_carrying_finding_missing_acceptance_evidence") is True, (
+            "provenance warning must signal missing acceptance_evidence for "
+            f"criterion-carrying finding; got {pw!r}"
+        )
+
 
 # ── Shared capability vocabulary: off-registry advisory marking ───────────────
 # A declared prerequisite / provides_capability capability ref that is NOT in the

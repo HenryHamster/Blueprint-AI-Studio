@@ -4395,6 +4395,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             normalize_acceptance_evidence(finding.get("acceptance_evidence"))
         )
 
+        # Warn when a criterion-carrying finding omits acceptance_evidence.
+        # The spawned task inherits criterion_ids from the direction, but
+        # without a named_test declaration the acceptance pipeline records 0
+        # proven-verdict rows, leaving criterion coverage perpetually
+        # uncovered. This is an authoring-time annotation (non-blocking) so
+        # the spawn still proceeds; the warning surfaces in the child task
+        # context and is visible to reviewers and dashboards.
+        if not finding.get("acceptance_evidence"):
+            _warn_eff_dir_id = direction_id or parent_direction_id
+            _warn_criterion_ids = _direction_criterion_cache.get(
+                _warn_eff_dir_id or "", []
+            )
+            if _warn_criterion_ids:
+                _merge_provenance_warnings(
+                    finding,
+                    {
+                        "criterion_carrying_finding_missing_acceptance_evidence": True
+                    },
+                )
+
         if task_type == "compute_experiment":
             # Build + validate the compute_experiment payload from the launch
             # contract authored above (already validated non-empty command /
