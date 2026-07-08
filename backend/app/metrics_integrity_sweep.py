@@ -2338,6 +2338,99 @@ async def check_undeclared_test_cochange_coverage_split(
 
 
 @register_check(
+    "acceptance_window_fraction_recompute",
+    "Recompute acceptance_window_fraction over the current open version's write-task "
+    "merge window and report it alongside the per-bucket and undeclared-reason split. "
+    "This is the operator-visible artifact proving whether inferred_test_cochange lifts "
+    "the fraction off zero on real data — or, if it stays zero, the reason split IS the "
+    "documented reframe. Reports metrics only; never flags.",
+)
+async def check_acceptance_window_fraction_recompute(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Observe-only: live recompute of acceptance_window_fraction + breakdown.
+
+    For each of the first ``max_projects`` projects with an open version, calls
+    :func:`release_qualifier._compute_acceptance_window_aggregate` — the SAME code
+    path the qualification verdict uses — and reports the recomputed fraction and
+    the per-bucket / undeclared-reason breakdown. ``self_reported`` carries the
+    verified numerator, ``ground_truth`` the write-task denominator, and ``delta``
+    the count of undeclared merges that the ``inferred_test_cochange`` bucket did
+    NOT rescue (bare undeclared), so operators see the recompute against real data.
+    Never flags: a genuinely-zero fraction is reported (not a violation), with the
+    reason split explaining exactly why.
+    """
+    from app.acceptance_gate import (
+        ACCEPTANCE_AGGREGATE_BUCKETS,
+        _UNDECLARED_REASON_KEYS,
+    )
+    from app.models import Project
+    from app.release_qualifier import _compute_acceptance_window_aggregate
+    from app.release_version import current_open_version
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="acceptance_window_fraction_recompute",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for (project_id,) in projects:
+        pid = str(project_id)
+        open_version = await current_open_version(ctx.session, project_id)
+        if open_version is None:
+            results.append(
+                CheckResult(
+                    check="acceptance_window_fraction_recompute",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open version",
+                )
+            )
+            continue
+
+        agg = await _compute_acceptance_window_aggregate(ctx.session, open_version)
+        write_total = int(agg.get("acceptance_window_write_total") or 0)
+        verified = int(agg.get("acceptance_window_verified") or 0)
+        fraction = agg.get("acceptance_window_fraction")
+        buckets = agg.get("acceptance_window_buckets") or {}
+        reasons = agg.get("acceptance_window_undeclared_reasons") or {}
+        undeclared = int(buckets.get("undeclared") or 0)
+
+        frac_str = "None" if fraction is None else f"{fraction:.3f}"
+        bucket_str = ", ".join(
+            f"{name}={buckets.get(name, 0)}" for name in ACCEPTANCE_AGGREGATE_BUCKETS
+        )
+        reason_str = ", ".join(
+            f"{name}={reasons.get(name, 0)}" for name in _UNDECLARED_REASON_KEYS
+        )
+        results.append(
+            CheckResult(
+                check="acceptance_window_fraction_recompute",
+                status=CheckStatus.OK,
+                self_reported=verified,
+                ground_truth=write_total,
+                delta=undeclared,
+                subject=pid,
+                detail=(
+                    f"acceptance_window_fraction={frac_str} "
+                    f"(verified {verified}/{write_total}); "
+                    f"buckets: {bucket_str}; undeclared_reasons: {reason_str}"
+                ),
+            )
+        )
+
+    return results
+
+
+@register_check(
     "sr_catch_rate_cache_freshness",
     "Check that design_doc['sr_catch_rate_trends']['computed_at'] is within the "
     "staleness window so operators see current catch-rate trends.",

@@ -29384,6 +29384,123 @@ async def test_acceptance_window_fraction_counts_inferred_test_cochange(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_acceptance_window_fraction_nonzero_with_inferred_cochange(db_session):
+    """Named retirement proof: the inferred_test_cochange bucket lifts the window
+    fraction strictly off zero, and the additive breakdown is exact and total.
+
+    Builds a synthetic write-task merge window mixing (1) a genuine CI-verified
+    test+production co-change (the only verified merge), and the three distinct
+    undeclared reasons: (2) a benign-unverified fall-open whose diff DID co-change
+    a test + production file — proving CI-verification gates inference so it stays
+    undeclared as ``not_ci_verified``; (3) a CI-verified merge with no
+    ``_pr_changed_files`` context (``no_changed_files_context``); and (4) a
+    CI-verified production-only diff (``no_test_prod_cochange``). Asserts:
+      (a) fraction is strictly non-zero (the inferred_test_cochange contribution),
+      (b) per-bucket counts sum to the write-task population and the undeclared
+          reason split sums to the undeclared bucket exactly, and
+      (c) all pre-existing acceptance_window_* invariants still hold.
+    """
+    from app.acceptance_gate import (
+        ACCEPTANCE_AGGREGATE_BUCKETS,
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        _UNDECLARED_REASON_KEYS,
+        acceptance_window_sub_scores_violations,
+        classify_merged_acceptance_context,
+        classify_undeclared_reason,
+    )
+
+    project, version = await _make_project_and_version(db_session)
+
+    # (1) Verified CI + test + production diff → inferred_test_cochange (verified).
+    inferred_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "_pr_changed_files": [
+            "backend/app/release_qualifier.py",
+            "backend/testing/test_release_qualifier.py",
+        ],
+    }
+    assert CODE_ACCEPTANCE_VERDICT_KEY not in inferred_ctx
+    assert classify_merged_acceptance_context(inferred_ctx) == "inferred_test_cochange"
+
+    # (2) Benign-unverified fall-open, even WITH a test+prod diff → not_ci_verified.
+    not_verified_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "review_loop": {"unverified_merge_reason": "no_detectable_test_command"},
+        "_pr_changed_files": [
+            "backend/app/release_qualifier.py",
+            "backend/testing/test_release_qualifier.py",
+        ],
+    }
+    assert classify_merged_acceptance_context(not_verified_ctx) == "undeclared"
+    assert classify_undeclared_reason(not_verified_ctx) == "not_ci_verified"
+
+    # (3) Verified CI but no changed-files context recorded → no_changed_files_context.
+    no_files_ctx = {"pr_merged": True, "landed_on_integration": True}
+    assert classify_merged_acceptance_context(no_files_ctx) == "undeclared"
+    assert classify_undeclared_reason(no_files_ctx) == "no_changed_files_context"
+
+    # (4) Verified CI, production-only diff → no_test_prod_cochange.
+    prod_only_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "_pr_changed_files": ["backend/app/release_qualifier.py"],
+    }
+    assert classify_merged_acceptance_context(prod_only_ctx) == "undeclared"
+    assert classify_undeclared_reason(prod_only_ctx) == "no_test_prod_cochange"
+
+    for title, ctx in (
+        ("inferred", inferred_ctx),
+        ("not-verified", not_verified_ctx),
+        ("no-files", no_files_ctx),
+        ("prod-only", prod_only_ctx),
+    ):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=title,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                context=ctx,
+            )
+        )
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    # (a) Strictly non-zero: exactly one of four write merges is verified (0.25).
+    assert agg["acceptance_window_total"] == 4
+    assert agg["acceptance_window_verified"] == 1
+    assert agg["acceptance_window_fraction"] == pytest.approx(0.25)
+    assert agg["acceptance_window_fraction"] > 0
+
+    # (b) Per-bucket counts are exact and partition the write-task population.
+    buckets = agg["acceptance_window_buckets"]
+    assert set(buckets.keys()) == set(ACCEPTANCE_AGGREGATE_BUCKETS)
+    assert buckets["inferred_test_cochange"] == 1
+    assert buckets["undeclared"] == 3
+    assert sum(buckets.values()) == agg["acceptance_window_total"]
+    # verified numerator is exactly the three verified buckets.
+    assert (
+        buckets["proven"]
+        + buckets["satisfied_unproven"]
+        + buckets["inferred_test_cochange"]
+    ) == agg["acceptance_window_verified"]
+
+    # The undeclared reason split is exact and sums to the undeclared bucket.
+    reasons = agg["acceptance_window_undeclared_reasons"]
+    assert set(reasons.keys()) == set(_UNDECLARED_REASON_KEYS)
+    assert reasons["not_ci_verified"] == 1
+    assert reasons["no_changed_files_context"] == 1
+    assert reasons["no_test_prod_cochange"] == 1
+    assert sum(reasons.values()) == buckets["undeclared"]
+
+    # (c) The additive nested keys do not break the sub-scores invariant guard.
+    assert acceptance_window_sub_scores_violations(agg) == []
+
+
+@pytest.mark.asyncio
 async def test_acceptance_window_aggregate_fraction_none_when_empty(db_session):
     """When no tasks land in the version window, fraction is None (not 0 or NaN)."""
     _project, version = await _make_project_and_version(db_session)

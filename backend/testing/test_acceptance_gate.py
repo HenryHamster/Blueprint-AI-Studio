@@ -26,6 +26,7 @@ from app.acceptance_gate import (
     acceptance_was_declared,
     classify_merged_acceptance,
     classify_merged_acceptance_context,
+    classify_undeclared_reason,
     coerce_number,
     criterion_met,
     evaluate_code_acceptance,
@@ -781,6 +782,55 @@ def test_benign_unverified_test_cochange_is_not_inferred():
         unverified_reason="no_detectable_test_command",
     )
     assert classify_merged_acceptance_context(ctx) == "undeclared"
+
+
+def test_classify_undeclared_reason_not_ci_verified():
+    """A benign fall-open (CI did not run) → not_ci_verified, even with a test+prod diff."""
+    ctx = _inferred_ctx(
+        [
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason="no_detectable_test_command",
+    )
+    assert classify_merged_acceptance_context(ctx) == "undeclared"
+    assert classify_undeclared_reason(ctx) == "not_ci_verified"
+
+
+def test_classify_undeclared_reason_no_changed_files_context():
+    """CI-verified but no _pr_changed_files list recorded → no_changed_files_context."""
+    ctx = _inferred_ctx(None)
+    assert classify_merged_acceptance_context(ctx) == "undeclared"
+    assert classify_undeclared_reason(ctx) == "no_changed_files_context"
+
+
+def test_classify_undeclared_reason_no_test_prod_cochange():
+    """CI-verified with a prod-only changed-files list → no_test_prod_cochange."""
+    ctx = _inferred_ctx(
+        [
+            "backend/app/acceptance_gate.py",
+            "backend/app/release_qualifier.py",
+        ]
+    )
+    assert classify_merged_acceptance_context(ctx) == "undeclared"
+    assert classify_undeclared_reason(ctx) == "no_test_prod_cochange"
+
+
+def test_classify_undeclared_reason_partitions_undeclared_bucket():
+    """The three reasons are exhaustive over the undeclared branch's inputs."""
+    from app.acceptance_gate import _UNDECLARED_REASON_KEYS
+
+    reasons = {
+        classify_undeclared_reason(
+            _inferred_ctx(
+                ["backend/app/x.py", "backend/testing/test_x.py"],
+                unverified_reason="no_detectable_test_command",
+            )
+        ),
+        classify_undeclared_reason(_inferred_ctx(None)),
+        classify_undeclared_reason(_inferred_ctx(["backend/app/x.py"])),
+    }
+    assert reasons == set(_UNDECLARED_REASON_KEYS)
 
 
 def test_degraded_unverified_test_cochange_stays_degraded():

@@ -84,7 +84,10 @@ from app.failure_classification import (
     classify_failure,
 )
 from app.acceptance_gate import (
+    ACCEPTANCE_AGGREGATE_BUCKETS,
+    _UNDECLARED_REASON_KEYS,
     classify_merged_acceptance_context,
+    classify_undeclared_reason,
 )
 from app.acceptance_criteria import get_version_coverage_summary
 from app.landed_signal import landed_signal_predicate
@@ -2720,8 +2723,16 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_fraction": float|None,  # None when write-task total == 0
         "acceptance_window_write_total": int,      # same as acceptance_window_total (explicit alias)
         "acceptance_window_total_all_merges": int, # all landed merges regardless of type (observability)
+        "acceptance_window_buckets": dict,         # per-bucket counts over the write-task window (sums to write_total)
+        "acceptance_window_undeclared_reasons": dict, # split of the undeclared bucket by reason (sums to buckets["undeclared"])
         "acceptance_window_inferred_test_cochange": int,  # verified merges credited via inferred_test_cochange
       }
+
+    The two nested breakdowns are purely additive: ``acceptance_window_buckets``
+    keys the 7 canonical ``ACCEPTANCE_AGGREGATE_BUCKETS`` and makes the fraction
+    auditable (verified == proven + satisfied_unproven + inferred_test_cochange),
+    while ``acceptance_window_undeclared_reasons`` explains why the remaining
+    undeclared merges did not infer coverage. No existing key changes type or value.
     """
 
     since = version.opened_at
@@ -2744,24 +2755,32 @@ async def _compute_acceptance_window_aggregate(
         if (task.first_payload or {}).get("type") in WRITE_TASK_TYPES
     ]
     total = len(rows_write)
-    write_buckets = [
-        classify_merged_acceptance_context(task.context or {}) for task in rows_write
-    ]
-    verified = sum(
-        1
-        for bucket in write_buckets
-        if bucket in {"proven", "satisfied_unproven", "inferred_test_cochange"}
+    # Single classification pass: tally every write-task merge into its acceptance
+    # bucket, and for each undeclared merge additionally record WHY it stayed
+    # undeclared. Both breakdowns are additive observability — the scalar
+    # ``verified`` is derived from the three verified buckets so its value and the
+    # invariant contract are byte-for-byte unchanged from the prior ``sum(...)``.
+    buckets: dict[str, int] = dict.fromkeys(ACCEPTANCE_AGGREGATE_BUCKETS, 0)
+    undeclared_reasons: dict[str, int] = dict.fromkeys(_UNDECLARED_REASON_KEYS, 0)
+    for task in rows_write:
+        ctx = task.context or {}
+        bucket = classify_merged_acceptance_context(ctx)
+        buckets[bucket] += 1
+        if bucket == "undeclared":
+            undeclared_reasons[classify_undeclared_reason(ctx)] += 1
+    verified = (
+        buckets["proven"]
+        + buckets["satisfied_unproven"]
+        + buckets["inferred_test_cochange"]
     )
-    inferred_test_cochange = sum(
-        1 for bucket in write_buckets if bucket == "inferred_test_cochange"
-    )
+    inferred_test_cochange = buckets["inferred_test_cochange"]
     # Per-task audit trail for inferred_test_cochange merges, capped so the
     # evidence detail stays bounded in storage regardless of window size.
     _INFERRED_TASK_ID_CAP = 100
     inferred_task_ids: list[str] = [
         str(task.id)
-        for task, bucket in zip(rows_write, write_buckets)
-        if bucket == "inferred_test_cochange"
+        for task in rows_write
+        if classify_merged_acceptance_context(task.context or {}) == "inferred_test_cochange"
     ][:_INFERRED_TASK_ID_CAP]
     fraction = (verified / total) if total > 0 else None
     return {
@@ -2770,11 +2789,16 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_fraction": fraction,
         "acceptance_window_write_total": total,
         "acceptance_window_total_all_merges": total_all_merges,
+        # Additive nested breakdowns (None-safe on legacy rows that lack them):
+        # per-bucket counts over the write-task window, and the undeclared reason
+        # split. Sum(buckets) == total; sum(undeclared_reasons) == buckets["undeclared"].
+        "acceptance_window_buckets": buckets,
+        "acceptance_window_undeclared_reasons": undeclared_reasons,
         # Additive audit breakdown: how many verified merges were credited via the
         # inferred test-cochange path (undeclared merge, CI-verified, test+prod
         # co-change) rather than an explicit proven/satisfied declaration. Consumed
         # by acceptance_criteria.record_acceptance_window_coverage_evidence for the
-        # evidence detail; no score impact.
+        # evidence detail; no score impact. Equals buckets["inferred_test_cochange"].
         "acceptance_window_inferred_test_cochange": inferred_test_cochange,
         # Per-merge audit trail: task IDs of the inferred_test_cochange merges so
         # operators can trace which specific merges were counted without SQL.

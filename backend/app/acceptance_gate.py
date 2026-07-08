@@ -619,6 +619,42 @@ def classify_merged_acceptance_context(context: Mapping[str, Any] | None) -> str
     return "malformed"
 
 
+# The three mutually-exclusive reasons an already-``undeclared`` merge stayed
+# undeclared, partitioning the ``undeclared`` bucket for operator-visible audit.
+_UNDECLARED_REASON_KEYS: tuple[str, ...] = (
+    "not_ci_verified",
+    "no_changed_files_context",
+    "no_test_prod_cochange",
+)
+
+
+def classify_undeclared_reason(context: Mapping[str, Any] | None) -> str:
+    """Sub-classify an ``undeclared`` merge context into WHY it stayed undeclared.
+
+    Precondition: ``classify_merged_acceptance_context(context) == "undeclared"``.
+    The three reasons mirror the undeclared branch of
+    :func:`classify_merged_acceptance_context` EXACTLY, so the split partitions
+    the undeclared bucket perfectly:
+
+      * ``not_ci_verified`` — the merge was not CI-verified (benign fall-open),
+        so test presence is moot and co-change can never be inferred.
+      * ``no_changed_files_context`` — CI-verified, but no ``_pr_changed_files``
+        list was recorded, so co-change cannot be inferred from the context.
+      * ``no_test_prod_cochange`` — CI-verified with a changed-files list, but it
+        did not co-change BOTH a test file and a non-test production file.
+
+    Pure and read-only; never raises. On a context that is NOT actually
+    undeclared the return value is meaningless (callers must gate on the bucket
+    first), but the function still returns one of the three keys deterministically.
+    """
+    if _context_merge_verification_status(context) != "verified":
+        return "not_ci_verified"
+    changed = (context or {}).get("_pr_changed_files")
+    if not isinstance(changed, list):
+        return "no_changed_files_context"
+    return "no_test_prod_cochange"
+
+
 def acceptance_counts_as_verified_context(
     context: Mapping[str, Any] | None,
 ) -> bool:

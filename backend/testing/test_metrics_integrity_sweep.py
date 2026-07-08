@@ -171,6 +171,7 @@ def test_registry_contains_initial_checks():
         "sr_catch_rate_cache_freshness",
         "acceptance_window_sub_scores_invariant",
         "undeclared_test_cochange_coverage_split",
+        "acceptance_window_fraction_recompute",
         "evidence_claim_reconciliation",
         "saturated_direction_with_nonmerge_productivity",
         "capability_claim_reconciliation",
@@ -573,6 +574,88 @@ async def test_undeclared_test_cochange_coverage_split():
         assert "bare-undeclared" in result.detail
 
     await engine.dispose()
+
+
+# --- Check: acceptance_window_fraction_recompute -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_fraction_recompute_reports_nonzero(db):
+    """Observe-only recompute reports a non-zero fraction + reason split on real data."""
+    project = await _project(db)
+    version, _criterion = await _open_version_with_criterion(
+        db, project, text="acceptance window recompute"
+    )
+
+    # One inferred_test_cochange (verified) + two undeclared reasons in the window.
+    inferred = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "landed_on_integration": True,
+            "pr_merged": True,
+            "_pr_changed_files": [
+                "backend/app/release_qualifier.py",
+                "backend/testing/test_release_qualifier.py",
+            ],
+        },
+    )
+    prod_only = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "landed_on_integration": True,
+            "pr_merged": True,
+            "_pr_changed_files": ["backend/app/release_qualifier.py"],
+        },
+    )
+    no_files = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={"landed_on_integration": True, "pr_merged": True},
+    )
+    db.add_all([inferred, prod_only, no_files])
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_fraction_recompute(ctx)
+
+    pid = str(project.id)
+    mine = [r for r in results if r.subject == pid]
+    assert len(mine) == 1, f"expected one result for {pid}, got {results}"
+    result = mine[0]
+    assert result.check == "acceptance_window_fraction_recompute"
+    assert result.status == CheckStatus.OK  # observe-only, never flagged
+    # verified=1 numerator, write_total=3 denominator, undeclared (bare) delta=2.
+    assert result.self_reported == 1
+    assert result.ground_truth == 3
+    assert result.delta == 2
+    # The recomputed fraction is surfaced non-zero, with the reason split visible.
+    assert "acceptance_window_fraction=0.333" in result.detail
+    assert "inferred_test_cochange=1" in result.detail
+    assert "no_test_prod_cochange=1" in result.detail
+    assert "no_changed_files_context=1" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_fraction_recompute_skips_without_open_version(db):
+    """No open version → SKIPPED, never a flag."""
+    project = await _project(db)
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_fraction_recompute(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert not mine[0].flagged
 
 
 # --- Check: playbook_confirmation_integrity ---------------------------------
@@ -2151,6 +2234,35 @@ def test_acceptance_window_violations_consistent_fields_no_violations():
         "acceptance_window_total_all_merges": 6,
         "acceptance_window_fraction": 2 / 4,  # 0.5
         "acceptance_window_total": 4,
+    }
+    assert acceptance_window_sub_scores_violations(sub_scores) == []
+
+
+def test_acceptance_window_violations_ignores_additive_breakdown_keys():
+    """The additive nested breakdown keys never trip the sub-scores invariant."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    sub_scores = {
+        "acceptance_window_verified": 1,
+        "acceptance_window_write_total": 4,
+        "acceptance_window_total_all_merges": 4,
+        "acceptance_window_fraction": 1 / 4,
+        "acceptance_window_total": 4,
+        # New additive nested keys — must be inert to the invariant guard.
+        "acceptance_window_buckets": {
+            "proven": 0,
+            "satisfied_unproven": 0,
+            "inferred_test_cochange": 1,
+            "declared_unsatisfied": 0,
+            "undeclared": 3,
+            "merged_unverified_degraded": 0,
+            "malformed": 0,
+        },
+        "acceptance_window_undeclared_reasons": {
+            "not_ci_verified": 1,
+            "no_changed_files_context": 1,
+            "no_test_prod_cochange": 1,
+        },
     }
     assert acceptance_window_sub_scores_violations(sub_scores) == []
 
