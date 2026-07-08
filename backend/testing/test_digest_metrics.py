@@ -37,11 +37,22 @@ from app.digest_metrics import (
     compute_trial_arm_accumulation,
 )
 from app.failure_classification import ALL_FAILURE_CLASSES
+from app.llm_cost_attribution import LLM_TOKEN_PRICING
 from app.sr_review_quality_metrics import (
     compute_review_quality_metrics,
     compute_sr_prediction_accuracy,
 )
 from testing.factories import make_project, make_task, _utcnow
+
+
+def _priced_llm_cost(
+    provider: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> float:
+    input_rate, output_rate = LLM_TOKEN_PRICING[(provider, model)]
+    return input_tokens * input_rate + output_tokens * output_rate
 
 
 def test_compute_failure_grouping_respects_persisted_verdict():
@@ -1883,16 +1894,16 @@ def test_cost_economics_includes_llm_dollar_companions():
     expected_vm_cost = round(SPOT_RATE * 1800, 2)
     assert result_no_tokens["total_spot_cost_usd"] == pytest.approx(expected_vm_cost)
 
-    # Task with priced tokens: anthropic/claude-opus-4-8, 1000 in + 2000 out.
-    # LLM cost = 1000*15e-6 + 2000*75e-6 = 0.015 + 0.15 = 0.165
+    provider, model = "anthropic", "claude-opus-4-8"
+    # Task with priced tokens; expected costs derive from the shared pricing table.
     merged_task = make_task(
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "create"}],
         vm_spot=True,
         vm_provisioned_at=now - timedelta(hours=1),
         vm_stopped_at=now - timedelta(minutes=30),
-        provider="anthropic",
-        model="claude-opus-4-8",
+        provider=provider,
+        model=model,
         context={"pr_merged": True},
         api_call_summary={
             "total_input_tokens": 1000,
@@ -1906,8 +1917,8 @@ def test_cost_economics_includes_llm_dollar_companions():
         vm_spot=True,
         vm_provisioned_at=now - timedelta(hours=1),
         vm_stopped_at=now - timedelta(minutes=30),
-        provider="anthropic",
-        model="claude-opus-4-8",
+        provider=provider,
+        model=model,
         context={},
         api_call_summary={
             "total_input_tokens": 500,
@@ -1922,9 +1933,8 @@ def test_cost_economics_includes_llm_dollar_companions():
         now=now,
         daily_cost_ceiling_usd=0.0,
     )
-    # Total LLM cost = merged (0.165) + unmerged (0.5*15e-6 + 1000*75e-6 = 0.0825).
-    expected_merged_llm = 1000 * 15e-6 + 2000 * 75e-6  # 0.165
-    expected_unmerged_llm = 500 * 15e-6 + 1000 * 75e-6  # 0.0825
+    expected_merged_llm = _priced_llm_cost(provider, model, 1000, 2000)
+    expected_unmerged_llm = _priced_llm_cost(provider, model, 500, 1000)
     expected_total_llm = expected_merged_llm + expected_unmerged_llm
     assert result["total_llm_cost_usd"] == pytest.approx(expected_total_llm, rel=1e-4)
     # LLM share = LLM / (VM + LLM); VM is spot * 2 tasks * 1800s each.
@@ -4459,8 +4469,18 @@ def _eff_task(
 def test_effort_model_efficiency_aggregates_by_effort_and_model():
     """Per-effort and per-model rows carry honest run/landed/cost numbers, and
     cost is priced with the shared LLM_TOKEN_PRICING table."""
+    opus_landed_cost = _priced_llm_cost(
+        "anthropic", "claude-opus-4-8", 1000, 2000
+    )
+    opus_unlanded_cost = _priced_llm_cost(
+        "anthropic", "claude-opus-4-8", 1000, 1000
+    )
+    sonnet_landed_cost = _priced_llm_cost(
+        "anthropic", "claude-sonnet-4-6", 2000, 1000
+    )
+    high_cost = opus_landed_cost + opus_unlanded_cost
+
     tasks = [
-        # high/opus, landed: 1000*15e-6 + 2000*75e-6 = 0.165
         _eff_task(
             effort="high",
             model="claude-opus-4-8",
@@ -4468,7 +4488,6 @@ def test_effort_model_efficiency_aggregates_by_effort_and_model():
             output_tokens=2000,
             landed=True,
         ),
-        # high/opus, NOT landed: 1000*15e-6 + 1000*75e-6 = 0.09
         _eff_task(
             effort="high",
             model="claude-opus-4-8",
@@ -4476,7 +4495,6 @@ def test_effort_model_efficiency_aggregates_by_effort_and_model():
             output_tokens=1000,
             landed=False,
         ),
-        # medium/sonnet, landed: 2000*3e-6 + 1000*15e-6 = 0.021
         _eff_task(
             effort="medium",
             model="claude-sonnet-4-6",
@@ -4496,34 +4514,37 @@ def test_effort_model_efficiency_aggregates_by_effort_and_model():
     assert high["run_count"] == 2
     assert high["landed_count"] == 1
     assert high["landed_rate"] == 0.5
-    assert high["total_cost_usd"] == pytest.approx(0.255)
+    assert high["total_cost_usd"] == pytest.approx(high_cost)
     # cost_per_merge = priced cost / landed PRs.
-    assert high["cost_per_merge"] == pytest.approx(0.255)
+    assert high["cost_per_merge"] == pytest.approx(high_cost)
     assert high["input_tokens"] == 2000
     assert high["output_tokens"] == 3000
 
     medium = by_effort["medium"]
     assert medium["run_count"] == 1
     assert medium["landed_rate"] == 1.0
-    assert medium["cost_per_merge"] == pytest.approx(0.021)
+    assert medium["cost_per_merge"] == pytest.approx(sonnet_landed_cost)
 
     by_model = {(r["provider"], r["model"]): r for r in result["by_model"]}
     opus = by_model[("anthropic", "claude-opus-4-8")]
     assert opus["run_count"] == 2 and opus["priced"] is True
-    assert opus["total_cost_usd"] == pytest.approx(0.255)
-    # by_model is sorted by cost desc — opus (0.255) before sonnet (0.021).
+    assert opus["total_cost_usd"] == pytest.approx(high_cost)
     assert result["by_model"][0]["model"] == "claude-opus-4-8"
 
     totals = result["totals"]
     assert totals["run_count"] == 3
     assert totals["landed_count"] == 2
-    assert totals["total_cost_usd"] == pytest.approx(0.276)
+    assert totals["total_cost_usd"] == pytest.approx(high_cost + sonnet_landed_cost)
     assert totals["unpriced_coverage_fraction"] == 1.0
 
 
 def test_effort_model_efficiency_cancelled_runs_add_spend_not_landings():
     """Cancelled terminal runs can burn tokens, so they must add spend/run count
     without inflating landed/merge counts."""
+    completed_cost = _priced_llm_cost("anthropic", "claude-opus-4-8", 1000, 1000)
+    cancelled_cost = _priced_llm_cost("anthropic", "claude-opus-4-8", 500, 500)
+    expected_total = completed_cost + cancelled_cost
+
     tasks = [
         _eff_task(
             effort="high",
@@ -4549,14 +4570,13 @@ def test_effort_model_efficiency_cancelled_runs_add_spend_not_landings():
     assert high["run_count"] == 2
     assert high["landed_count"] == 1
     assert high["landed_rate"] == 0.5
-    # 1000*15e-6 + 1000*75e-6 + 500*15e-6 + 500*75e-6
-    assert high["total_cost_usd"] == pytest.approx(0.135)
-    assert high["cost_per_merge"] == pytest.approx(0.135)
+    assert high["total_cost_usd"] == pytest.approx(expected_total)
+    assert high["cost_per_merge"] == pytest.approx(expected_total)
 
     totals = result["totals"]
     assert totals["run_count"] == 2
     assert totals["landed_count"] == 1
-    assert totals["total_cost_usd"] == pytest.approx(0.135)
+    assert totals["total_cost_usd"] == pytest.approx(expected_total)
 
 
 def test_effort_model_efficiency_reconciles_with_llm_cost_breakdown():
@@ -4622,18 +4642,23 @@ def test_effort_model_efficiency_splits_retried_task_across_attempt_models():
     """A task that retried on a different model attributes each attempt's tokens
     and cost to that attempt's own model, while run/landed counts stay per-task
     (credited once per distinct model bucket, never once per attempt)."""
+    sonnet_current_cost = _priced_llm_cost(
+        "anthropic", "claude-sonnet-4-6", 2000, 1000
+    )
+    opus_retry_cost = _priced_llm_cost("anthropic", "claude-opus-4-8", 1000, 2000)
+
     tasks = [
         _eff_task(
             effort="high",
             model="claude-sonnet-4-6",  # final attempt ran on sonnet
-            input_tokens=2000,  # sonnet: 2000*3e-6 + 1000*15e-6 = 0.021
+            input_tokens=2000,
             output_tokens=1000,
             landed=True,
             attempt_history=[
                 {
                     "provider": "anthropic",
                     "model": "claude-opus-4-8",  # earlier attempt ran on opus
-                    "llm_input_tokens": 1000,  # opus: 1000*15e-6 + 2000*75e-6 = 0.165
+                    "llm_input_tokens": 1000,
                     "llm_output_tokens": 2000,
                     "llm_call_count": 3,
                 }
@@ -4647,9 +4672,9 @@ def test_effort_model_efficiency_splits_retried_task_across_attempt_models():
     opus = by_model[("anthropic", "claude-opus-4-8")]
     sonnet = by_model[("anthropic", "claude-sonnet-4-6")]
     # Each attempt priced at its OWN model's rate.
-    assert opus["total_cost_usd"] == pytest.approx(0.165)
+    assert opus["total_cost_usd"] == pytest.approx(opus_retry_cost)
     assert opus["input_tokens"] == 1000 and opus["output_tokens"] == 2000
-    assert sonnet["total_cost_usd"] == pytest.approx(0.021)
+    assert sonnet["total_cost_usd"] == pytest.approx(sonnet_current_cost)
     assert sonnet["input_tokens"] == 2000 and sonnet["output_tokens"] == 1000
     # Run count credited ONCE per distinct model bucket, not once per attempt.
     assert opus["run_count"] == 1 and sonnet["run_count"] == 1
@@ -4659,7 +4684,9 @@ def test_effort_model_efficiency_splits_retried_task_across_attempt_models():
     high = {r["effort"]: r for r in result["by_effort"]}["high"]
     assert high["run_count"] == 1
     assert high["landed_count"] == 1
-    assert high["total_cost_usd"] == pytest.approx(0.165 + 0.021)
+    assert high["total_cost_usd"] == pytest.approx(
+        opus_retry_cost + sonnet_current_cost
+    )
     # resolved_models exposes both models the high tier actually ran on.
     resolved = {r["model"] for r in high["resolved_models"]}
     assert resolved == {"claude-opus-4-8", "claude-sonnet-4-6"}
@@ -4667,7 +4694,9 @@ def test_effort_model_efficiency_splits_retried_task_across_attempt_models():
     totals = result["totals"]
     assert totals["run_count"] == 1  # one task, not two attempts
     assert totals["landed_count"] == 1
-    assert totals["total_cost_usd"] == pytest.approx(0.165 + 0.021)
+    assert totals["total_cost_usd"] == pytest.approx(
+        opus_retry_cost + sonnet_current_cost
+    )
 
 
 def test_effort_model_efficiency_cost_per_merge_uses_verified_merge():
@@ -4677,8 +4706,11 @@ def test_effort_model_efficiency_cost_per_merge_uses_verified_merge():
     from app.ci_resolution import DEGRADED_UNVERIFIED_REASONS
 
     degraded_reason = next(iter(DEGRADED_UNVERIFIED_REASONS))
+    verified_cost = _priced_llm_cost("anthropic", "claude-opus-4-8", 1000, 2000)
+    degraded_cost = _priced_llm_cost("anthropic", "claude-opus-4-8", 1000, 1000)
+    total_cost = verified_cost + degraded_cost
     tasks = [
-        # Verified merge: no fall-open reason. opus: 0.165
+        # Verified merge: no fall-open reason.
         _eff_task(
             effort="high",
             model="claude-opus-4-8",
@@ -4686,7 +4718,7 @@ def test_effort_model_efficiency_cost_per_merge_uses_verified_merge():
             output_tokens=2000,
             landed=True,
         ),
-        # Degraded fall-open merge: landed but NOT verified. opus: 0.09
+        # Degraded fall-open merge: landed but NOT verified.
         _eff_task(
             effort="high",
             model="claude-opus-4-8",
@@ -4705,26 +4737,28 @@ def test_effort_model_efficiency_cost_per_merge_uses_verified_merge():
     assert high["landed_rate"] == 1.0
     assert high["verified_landed_count"] == 1
     assert high["verified_landed_rate"] == 0.5
-    # cost_per_merge divides total cost (0.165 + 0.09 = 0.255) by VERIFIED count (1).
-    assert high["total_cost_usd"] == pytest.approx(0.255)
-    assert high["cost_per_merge"] == pytest.approx(0.255)
+    # cost_per_merge divides total cost by VERIFIED count (1).
+    assert high["total_cost_usd"] == pytest.approx(total_cost)
+    assert high["cost_per_merge"] == pytest.approx(total_cost)
 
     by_model = {(r["provider"], r["model"]): r for r in result["by_model"]}
     opus = by_model[("anthropic", "claude-opus-4-8")]
     assert opus["landed_count"] == 2
     assert opus["verified_landed_count"] == 1
-    assert opus["cost_per_merge"] == pytest.approx(0.255)
+    assert opus["cost_per_merge"] == pytest.approx(total_cost)
 
     totals = result["totals"]
     assert totals["landed_count"] == 2
     assert totals["verified_landed_count"] == 1
     assert totals["verified_landed_rate"] == 0.5
-    assert totals["cost_per_merge"] == pytest.approx(0.255)
+    assert totals["cost_per_merge"] == pytest.approx(total_cost)
 
 
 def test_effort_model_efficiency_unpriced_combo_not_folded_into_priced():
     """An unpriced (provider, model) combo contributes 0 cost, is counted as a
     run/token bearer, and is surfaced in unpriced_combos — never folded in."""
+    priced_total = _priced_llm_cost("anthropic", "claude-opus-4-8", 1000, 1000)
+
     tasks = [
         _eff_task(
             effort="high",
@@ -4756,7 +4790,7 @@ def test_effort_model_efficiency_unpriced_combo_not_folded_into_priced():
     assert low["run_count"] == 1
     assert low["input_tokens"] == 5000
     # Totals: only the opus task's cost is folded in (the mystery model adds 0).
-    assert result["totals"]["total_cost_usd"] == pytest.approx(0.09)
+    assert result["totals"]["total_cost_usd"] == pytest.approx(priced_total)
     assert result["totals"]["unpriced_coverage_fraction"] == 0.5
 
 

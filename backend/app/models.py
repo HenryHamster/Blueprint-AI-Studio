@@ -1659,7 +1659,7 @@ def get_task_current_attempt_cache_input_tokens(task: Task) -> tuple[int, int]:
     Reads the two optional cumulative counters the agent forwards on heartbeat
     (``total_cache_creation_input_tokens`` / ``total_cache_read_input_tokens``)
     out of ``api_call_summary``. ``total_input_tokens`` remains the INCLUSIVE sum
-    of all three Anthropic input classes, so these are sub-counts of it. Returns
+    of all provider-reported input classes, so these are sub-counts of it. Returns
     ``(0, 0)`` when the summary carries no breakdown (older agents / pre-tracking
     rows) so callers fall back to pricing the full inclusive input total at the
     base rate.

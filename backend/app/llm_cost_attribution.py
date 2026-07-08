@@ -23,38 +23,30 @@ from app.models import (
 # LLM token pricing table: (provider, model) -> (input_$/token, output_$/token).
 # Per-token rates = per-million-token rate / 1_000_000.
 #
-# Sources (retrieved 2026-05):
-#   Anthropic — https://www.anthropic.com/pricing#api
-#   OpenAI    — https://openai.com/api/pricing
-#   Gemini    — https://ai.google.dev/gemini-api/docs/pricing
-#   Z.AI      — https://docs.z.ai/guides/overview/pricing
-#   DeepSeek  — https://api-docs.deepseek.com/quick_start/pricing
-#
-# Gemini tasks estimate token counts from prompt/result char lengths (4 chars ≈ 1 token)
-# since the Gemini CLI outputMode='text' path has no structured usage block. The estimates
-# are populated via recordLlmTokens() before any exit path in agent/src/index.ts so
-# timeout and kill cases are covered. Gemini pricing entries below price those estimates.
+# Sources: Anthropic, OpenAI, Gemini, Z.AI, and DeepSeek API pricing pages
+# refreshed during provider-cost updates. Gemini CLI token counts are estimated
+# from prompt/result chars upstream before exit paths.
 LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     # Anthropic
     # TEMPORARY model (limited availability ~2 weeks from 2026-06-09). Keep
     # this pricing row after retirement so historical fable runs stay priced
     # in cost dashboards. ($10/$50 per MTok list, platform.claude.com 2026-06.)
     ("anthropic", "claude-fable-5"): (10e-6, 50e-6),
-    ("anthropic", "claude-opus-4-8"): (15e-6, 75e-6),
-    ("anthropic", "claude-opus-4-7"): (15e-6, 75e-6),
-    ("anthropic", "claude-opus-4-6"): (15e-6, 75e-6),
+    ("anthropic", "claude-opus-4-8"): (5e-6, 25e-6),
+    ("anthropic", "claude-opus-4-7"): (5e-6, 25e-6),
+    ("anthropic", "claude-opus-4-6"): (5e-6, 25e-6),
     ("anthropic", "claude-sonnet-4-6"): (3e-6, 15e-6),
-    ("anthropic", "claude-haiku-4-5-20251001"): (0.8e-6, 4e-6),
+    ("anthropic", "claude-haiku-4-5-20251001"): (1e-6, 5e-6),
     # OpenAI (developers.openai.com/api/docs/pricing, refreshed 2026-06 at
     # gpt-5.5 launch — 5.4-generation rates dropped at the same time).
     ("openai", "gpt-5.5"): (5e-6, 30e-6),
     ("openai", "gpt-5.4"): (2.5e-6, 15e-6),
     ("openai", "gpt-5.4-mini"): (0.75e-6, 4.5e-6),
-    ("openai", "gpt-5.3-codex"): (3e-6, 12e-6),
+    ("openai", "gpt-5.3-codex"): (1.75e-6, 14e-6),
     # gpt-5.3-codex-spark is ChatGPT-Pro-only with no separately published API
     # rate; priced at the gpt-5.3-codex rate as the closest GA equivalent
     # (openai.com/api/pricing, 2026-05).
-    ("openai", "gpt-5.3-codex-spark"): (3e-6, 12e-6),
+    ("openai", "gpt-5.3-codex-spark"): (1.75e-6, 14e-6),
     # gpt-5.2 pre-dates the 5.3 generation (openai.com/api/pricing, 2026-05).
     ("openai", "gpt-5.2"): (2e-6, 8e-6),
     # Gemini GA models (ai.google.dev/gemini-api/docs/pricing, 2026-05)
@@ -73,10 +65,8 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("deepseek", "deepseek-v4-pro"): (0.435e-6, 0.87e-6),
 }
 
-# Provider/model combos priced at a proxy rate (closest GA equivalent or published
-# rate) because the exact model/variant has no separately published API pricing.
-# These combos are priced and contribute to cost normally, but are flagged as
-# approximate in the cost breakdown so operators know the rate is estimated.
+# Provider/model combos priced at a proxy rate because the exact variant has no
+# separately published API pricing.
 LLM_APPROXIMATE_PRICED: set[tuple[str, str]] = {
     ("openai", "gpt-5.3-codex-spark"),  # ChatGPT-Pro-only variant
     ("gemini", "gemini-3.1-pro-preview"),  # Preview variant
@@ -84,19 +74,46 @@ LLM_APPROXIMATE_PRICED: set[tuple[str, str]] = {
     ("gemini", "gemini-3.1-flash-lite-preview"),  # Preview variant
 }
 
-# Anthropic prompt-cache input-token pricing, expressed as multipliers on the
-# base (uncached) input rate for whichever (provider, model) the attempt ran on:
-#   * cache-read input replays an already-written prefix at ~0.1x the base rate.
-#   * cache-creation (5-minute write) costs ~1.25x the base input rate.
-# Output tokens are unaffected. total_input_tokens is the INCLUSIVE input total,
-# so the uncached remainder is (total - cache_creation - cache_read). Sources:
-# anthropic.com/pricing#api (prompt caching), retrieved 2026-06.
+# Prompt-cache pricing; input totals are inclusive of cache sub-counts.
 CACHE_READ_INPUT_RATE_MULTIPLIER = 0.1
 CACHE_CREATION_INPUT_RATE_MULTIPLIER = 1.25
 
-# Key written into the compact attribution block for the self-repair token burn share.
-# Must match the key read by efficiency_snapshot consumers (snapshot reader, alerting).
+# Provider/model cache-read rates; writes/misses use the base input rate.
+LLM_CACHE_READ_INPUT_PRICING: dict[tuple[str, str], float] = {
+    ("openai", "gpt-5.5"): 0.50e-6,
+    ("openai", "gpt-5.4"): 0.25e-6,
+    ("openai", "gpt-5.4-mini"): 0.075e-6,
+    # Historical/proxy OpenAI entries retain the pricing table's existing base
+    # rates and use the same 0.1x cached-input relationship.
+    ("openai", "gpt-5.3-codex"): 0.175e-6,
+    ("openai", "gpt-5.3-codex-spark"): 0.175e-6,
+    ("openai", "gpt-5.2"): 0.20e-6,
+    ("deepseek", "deepseek-v4-flash"): 0.0028e-6,
+    ("deepseek", "deepseek-v4-pro"): 0.003625e-6,
+    ("zai", "glm-5.2"): 0.26e-6,
+}
+
+# Key read by efficiency_snapshot consumers.
 SELF_REPAIR_BURN_SHARE_KEY = "self_repair_burn_share"
+
+
+def _bounded_cache_input_counts(
+    input_tokens: int,
+    cache_creation_input_tokens: int,
+    cache_read_input_tokens: int,
+) -> tuple[int, int]:
+    """Return cache sub-counts that cannot exceed the inclusive input total."""
+    total = max(0, int(input_tokens))
+    cc = max(0, int(cache_creation_input_tokens))
+    cr = max(0, int(cache_read_input_tokens))
+    if cc + cr <= total:
+        return cc, cr
+
+    # Prefer preserving cache-read tokens when malformed telemetry overflows the
+    # inclusive total because read tokens usually have the largest discount.
+    cr = min(cr, total)
+    cc = min(cc, total - cr)
+    return cc, cr
 
 
 def _price_llm_attempt(
@@ -108,29 +125,35 @@ def _price_llm_attempt(
     output_rate: float,
     *,
     provider: str | None = None,
+    model: str | None = None,
 ) -> float:
-    """Price one attempt's tokens, charging Anthropic cache classes truthfully.
+    """Price one attempt's tokens, charging provider cache classes truthfully.
 
     ``input_tokens`` is the INCLUSIVE input total (uncached + cache-creation +
-    cache-read). Anthropic's cache-creation/read multipliers apply only to
-    Anthropic rows; other providers keep the inclusive input priced at the base
-    rate until provider-specific cache pricing is modeled. When the attempt
-    carries no cache breakdown the sub-counts are ``0``, so this reduces to
-    ``input_tokens * input_rate + output_tokens * output_rate`` — byte-for-byte
-    the legacy valuation, which is the required fallback for pre-tracking rows.
+    cache-read). When the attempt carries no cache breakdown the sub-counts are
+    ``0``, so this reduces to ``input_tokens * input_rate + output_tokens *
+    output_rate`` — byte-for-byte the legacy valuation, which is the required
+    fallback for pre-tracking rows.
     """
     provider_key = (provider or "").lower()
+    model_key = (model or "").lower()
+    cc, cr = _bounded_cache_input_counts(
+        input_tokens, cache_creation_input_tokens, cache_read_input_tokens
+    )
     if provider_key == "anthropic":
-        cc = max(0, int(cache_creation_input_tokens))
-        cr = max(0, int(cache_read_input_tokens))
+        cache_creation_rate = input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
+        cache_read_rate = input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+    elif (provider_key, model_key) in LLM_CACHE_READ_INPUT_PRICING:
+        cache_creation_rate = input_rate
+        cache_read_rate = LLM_CACHE_READ_INPUT_PRICING[(provider_key, model_key)]
     else:
-        cc = 0
-        cr = 0
+        cache_creation_rate = input_rate
+        cache_read_rate = input_rate
     uncached = max(0, int(input_tokens) - cc - cr)
     return (
         uncached * input_rate
-        + cc * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
-        + cr * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+        + cc * cache_creation_rate
+        + cr * cache_read_rate
         + output_tokens * output_rate
     )
 
@@ -161,6 +184,7 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> float | None:
                         input_rate,
                         output_rate,
                         provider=provider,
+                        model=model,
                     )
         if is_merged_completion(t):
             merged += 1
@@ -199,13 +223,16 @@ def _task_llm_attempts(
     cache_read)`` rows.
 
     ``input`` is the INCLUSIVE input total; ``cache_creation`` / ``cache_read``
-    are its two Anthropic cache sub-counts (``0`` for attempts that predate cache
+    are provider-reported cache sub-counts (``0`` for attempts that predate cache
     tracking, which makes the pricing helper fall back to the base input rate).
     """
     history = task.attempt_history or []
     if not history:
         input_tokens, output_tokens, call_count = get_task_total_llm_totals(task)
         cache_creation, cache_read = get_task_current_attempt_cache_input_tokens(task)
+        cache_creation, cache_read = _bounded_cache_input_counts(
+            input_tokens, cache_creation, cache_read
+        )
         return (
             [
                 (
@@ -233,24 +260,34 @@ def _task_llm_attempts(
         # Blending across sources manufactures chimera combos; degrade instead.
         return None, None
 
-    attempts = [
-        (
-            *_resolve_pair(attempt),
-            _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens")),
-            _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens")),
-            _llm_attempt_nonnegative_int(attempt.get("llm_call_count")),
+    attempts = []
+    for attempt in history:
+        input_tokens = _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens"))
+        cache_creation, cache_read = _bounded_cache_input_counts(
+            input_tokens,
             _llm_attempt_nonnegative_int(
                 attempt.get("llm_cache_creation_input_tokens")
             ),
             _llm_attempt_nonnegative_int(attempt.get("llm_cache_read_input_tokens")),
         )
-        for attempt in history
-    ]
+        attempts.append(
+            (
+                *_resolve_pair(attempt),
+                input_tokens,
+                _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens")),
+                _llm_attempt_nonnegative_int(attempt.get("llm_call_count")),
+                cache_creation,
+                cache_read,
+            )
+        )
     current_input, current_output, current_calls = get_task_current_attempt_llm_totals(
         task
     )
     if current_input > 0 or current_output > 0:
         current_cc, current_cr = get_task_current_attempt_cache_input_tokens(task)
+        current_cc, current_cr = _bounded_cache_input_counts(
+            current_input, current_cc, current_cr
+        )
         attempts.append(
             (
                 task.provider,
@@ -386,6 +423,7 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
                     input_rate,
                     output_rate,
                     provider=provider,
+                    model=model,
                 )
                 priced_combos.add(key)
                 task_had_priced = True
@@ -635,6 +673,7 @@ def _task_llm_cost(task: Task) -> tuple[float, bool]:
                 input_rate,
                 output_rate,
                 provider=key[0],
+                model=key[1],
             )
         else:
             any_unpriced = True
@@ -898,6 +937,7 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
                     input_rate,
                     output_rate,
                     provider=provider,
+                    model=model,
                 )
             else:
                 cost = 0.0
