@@ -772,9 +772,23 @@ machine for `[runner] reaping overdue task`.
 
 **Low-disk advisory in Fleet panel**
 The runner reports disk usage each heartbeat. A `low_disk` flag appears when the
-workspace volume has < 2 GiB free. Clean up completed task workspaces:
+workspace volume has < 2 GiB free.
+
+Per-task agent workspaces are now **auto-removed when each task finishes** (the
+reaper rmtree's the task's workspace directory), so they no longer accumulate
+under normal operation. To keep finished workspaces for post-mortem debugging,
+set `BLUEPRINT_RUNNER_KEEP_WORKSPACES=1` — but remember to clean them up
+manually, since that opts out of auto-clean:
 ```bash
 rm -rf /tmp/blueprint-agent-workspaces/*/
+```
+
+As an extra safety net, set `BLUEPRINT_RUNNER_MIN_DISK_BYTES` (bytes) to make the
+runner stop claiming new agent tasks while free space on the workspace filesystem
+is below that threshold, instead of starting work that dies mid-run on a full disk:
+```bash
+# Refuse new agent work when < 2 GiB free
+BLUEPRINT_RUNNER_MIN_DISK_BYTES=2147483648 blueprint-runner run
 ```
 
 ---

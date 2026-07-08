@@ -2348,6 +2348,16 @@ describe('getTaskTypeHints', () => {
     expect(result).not.toContain('(main)');
   });
 
+  it('names a rolling integration promotionTarget (automain) as the promotion branch, not an LTS branch', () => {
+    const result = getTaskTypeHints(undefined, 'automain')['release_audit'];
+    expect(result).toContain('promotion/integration branch (automain)');
+    expect(result).toContain("automain's standards");
+    // automain is a rolling integration/rollup branch, not an LTS branch —
+    // the dynamic hint must not describe it as one.
+    expect(result).not.toContain('LTS branch');
+    expect(result).not.toMatch(/LTS/);
+  });
+
   it('substitutes non-main promotionTarget like release/v2 into release_audit hint', () => {
     const result = getTaskTypeHints(undefined, 'release/v2')['release_audit'];
     expect(result).toContain('(release/v2)');

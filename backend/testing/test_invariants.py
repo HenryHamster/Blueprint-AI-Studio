@@ -10593,6 +10593,100 @@ def test_string_patch_target_scanner_self_tests():
         assert _collect_app_patch_targets(tmpdir_path) == {}
 
 
+# Redundant ``create=True`` patches currently in the suite (target already exists
+# at module top level). ``create=True`` is legitimate ONLY when the attribute is
+# absent; these are grandfathered so this invariant fails only on NEWLY-accreted
+# redundancy. A queued refactor drops the flags below — prune the matching entry
+# here as each one lands (leftover entries are harmless: the check is subset-only).
+_KNOWN_REDUNDANT_CREATE_TRUE: "frozenset[str]" = frozenset({
+    "test_admin_routers.py::app.routers.admin_digest._runtime_config",
+    "test_c5_approval_gate_invariant.py::app.ci_completion._post_merge_summary",
+    "test_c5_approval_gate_invariant.py::app.review_pipeline.broadcast_to_project",
+    "test_evaluating.py::app.services.broadcast_to_project",
+    "test_release_stall_alerts.py::app.release_promotion._notify_operator",
+    "test_warm_vm_integration.py::app.broadcast.broadcast_to_project",
+})
+
+
+def test_redundant_create_true_patches_flagged():
+    """A ``create=True`` patch whose target now EXISTS at module top level is
+    redundant and must be flagged at the standalone merge gate.
+
+    ``create=True`` fabricates an attribute mock deems absent; once the real
+    attribute exists the flag is a no-op that silently suppresses the
+    ``AttributeError`` a later rename/removal of that symbol would raise — the
+    exact drift that ``test_string_patch_targets_resolve`` catches, except that
+    invariant deliberately skips ``create=True`` patches. This keeps redundant
+    ``create=True`` from re-accreting: any ``create=True`` ``app.*`` target that
+    resolves at module top level fails unless grandfathered in
+    ``_KNOWN_REDUNDANT_CREATE_TRUE``.
+    """
+    from testing import impacted_tests
+
+    testing_dir = Path(__file__).resolve().parent
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+
+    pairs = impacted_tests.collect_create_true_patch_targets(str(testing_dir))
+
+    module_cache: dict[str, "set[str] | None"] = {}
+    offenders: list[str] = []
+    for test_file, target in pairs:
+        last_dot = target.rfind(".")
+        if last_dot == -1:
+            continue
+        module_dotted = target[:last_dot]
+        attr = target[last_dot + 1:]
+
+        if module_dotted not in module_cache:
+            module_cache[module_dotted] = _app_module_top_level_names(
+                app_dir, module_dotted
+            )
+
+        top_level = module_cache[module_dotted]
+        if top_level is None:
+            continue  # nested-import pattern — create=True is legitimate
+        if attr in top_level and f"{test_file}::{target}" not in _KNOWN_REDUNDANT_CREATE_TRUE:
+            offenders.append(
+                f"  {test_file}: '{target}' — '{attr}' already exists in {module_dotted}"
+            )
+
+    assert not offenders, (
+        f"Redundant create=True patch(es) detected ({len(offenders)}):\n"
+        + "\n".join(sorted(offenders))
+        + "\n\ncreate=True is a no-op when the attribute exists and silently masks "
+        "future renames/removals of that symbol. Fix: drop the create=True keyword "
+        "so the patch resolves against the real attribute (and is then covered by "
+        "test_string_patch_targets_resolve)."
+    )
+
+
+def test_redundant_create_true_scanner_self_test():
+    """Self-test: the create=True collector returns create=True targets and only those.
+
+    Guards the invariant above from going vacuous — proves detection is live by
+    constructing a file with one create=True patch and one plain patch and
+    asserting only the former is returned.
+    """
+    import textwrap
+    import tempfile
+    from testing import impacted_tests
+
+    src = textwrap.dedent("""
+        def test_thing(mocker):
+            mocker.patch("app.some_module.exists", create=True)
+            mocker.patch("app.some_module.plain")
+            mocker.patch("backend.app.other.sym", create=True)
+    """)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "test_synthetic.py").write_text(src)
+        pairs = impacted_tests.collect_create_true_patch_targets(tmpdir)
+
+    assert pairs == [
+        ("test_synthetic.py", "app.other.sym"),
+        ("test_synthetic.py", "app.some_module.exists"),
+    ]
+
+
 # ── Route Contract Ownership ────────────────────────────────────────────────
 
 

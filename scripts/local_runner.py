@@ -33,6 +33,12 @@ Optional environment variables:
                                       runner exits non-zero (default: 20, 0 disables)
     BLUEPRINT_RUNNER_WORKSPACE_ROOT   Parent directory for per-task agent workspaces
                                       (default: <tmp>/blueprint-agent-workspaces)
+    BLUEPRINT_RUNNER_KEEP_WORKSPACES  Keep per-task workspaces after a task exits
+                                      (1/true/yes) for post-mortem debugging; default
+                                      is to auto-remove them so disk does not fill up.
+    BLUEPRINT_RUNNER_MIN_DISK_BYTES   Low-disk guard: stop claiming new agent work when
+                                      free space on the workspace filesystem is below this
+                                      many bytes (default: 0 = disabled)
     BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
     BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
     BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
@@ -477,12 +483,12 @@ def _find_agent_binary() -> str:
     sys.exit(1)
 
 
-def _agent_workspace_for_task(task_id: str) -> str:
-    """Return a per-task workspace path for an agent subprocess.
+def _agent_workspace_path(task_id: str) -> str:
+    """Compute the per-task workspace path for *task_id* WITHOUT creating it.
 
-    The node agent defaults to /tmp/workspace when AGENT_WORKSPACE is absent.
-    A persistent local runner may execute multiple tasks across one machine
-    session, so each task gets a stable isolated workspace directory.
+    Split out from ``_agent_workspace_for_task`` so cleanup can derive the same
+    directory to remove after a task exits, without the side effect of re-creating
+    it via ``os.makedirs``.
     """
     root = os.environ.get("BLUEPRINT_RUNNER_WORKSPACE_ROOT", "").strip()
     if not root:
@@ -490,9 +496,63 @@ def _agent_workspace_for_task(task_id: str) -> str:
     safe_task_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in task_id)
     if not safe_task_id:
         safe_task_id = "unknown"
-    workspace = os.path.abspath(os.path.join(root, safe_task_id))
+    return os.path.abspath(os.path.join(root, safe_task_id))
+
+
+def _agent_workspace_for_task(task_id: str) -> str:
+    """Return a per-task workspace path for an agent subprocess.
+
+    The node agent defaults to /tmp/workspace when AGENT_WORKSPACE is absent.
+    A persistent local runner may execute multiple tasks across one machine
+    session, so each task gets a stable isolated workspace directory.
+    """
+    workspace = _agent_workspace_path(task_id)
     os.makedirs(workspace, exist_ok=True)
     return workspace
+
+
+def _cleanup_agent_workspace(task_id: str) -> None:
+    """Best-effort removal of a finished task's per-task workspace.
+
+    Unlike compute-job scratch dirs (rmtree'd after each job), per-task agent
+    workspaces are never reused once the agent exits. Leaving them behind on a
+    long-lived runner silently exhausts disk, which then trips the disk-based
+    degraded-runner health path and takes the runner offline. Reap the workspace
+    when the agent finishes. Set BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 to retain
+    them for post-mortem debugging.
+    """
+    if os.environ.get("BLUEPRINT_RUNNER_KEEP_WORKSPACES", "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        return
+    try:
+        shutil.rmtree(_agent_workspace_path(task_id), ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001 — cleanup is strictly best-effort
+        print(f"[runner] workspace cleanup error for task {task_id}: {exc}", flush=True)
+
+
+def _min_free_disk_bytes() -> int:
+    """Low-disk guard threshold in bytes (0 disables the guard).
+
+    Read from BLUEPRINT_RUNNER_MIN_DISK_BYTES. When free space on the workspace
+    filesystem drops below this, the agent poll loop stops claiming new tasks so
+    a nearly-full disk fails fast instead of starting work that will die mid-run.
+    """
+    raw = os.environ.get("BLUEPRINT_RUNNER_MIN_DISK_BYTES", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _disk_below_min(root: str | None, min_free_bytes: int) -> bool:
+    """True iff *root*'s free space is known and below *min_free_bytes* (>0)."""
+    if min_free_bytes <= 0:
+        return False
+    free = _disk_free_bytes(root)
+    return free is not None and free < min_free_bytes
 
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -563,6 +623,23 @@ _RUNNER_HEARTBEAT_INTERVAL = 30.0
 # v1 cap on durable artifact uploads. The runner skips (does not fail) any run
 # whose artifact dir exceeds this; the backend mirrors the cap and 413s.
 _RUNNER_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB
+
+# Durable-retry policy for TERMINAL compute-job reports and artifact uploads.
+# These POSTs carry the measured result_metrics / final exec_status and the run's
+# debugging artifacts; a single transient network blip at job end would silently
+# lose them, turning a job that actually ran into a spurious
+# compute_unmeasured_criterion. Terminal reports and uploads therefore retry with
+# capped exponential backoff. Interim "running" heartbeats are NOT retried — the
+# next heartbeat re-sends them.
+_REPORT_TERMINAL_STATUSES = frozenset({"succeeded", "failed"})
+_REPORT_MAX_RETRIES = 4
+_REPORT_RETRY_BASE_SLEEP = 2.0
+_REPORT_RETRY_MAX_SLEEP = 30.0
+
+
+def _report_retry_sleep(attempt: int) -> float:
+    """Capped exponential backoff (seconds) for the terminal-report retry loop."""
+    return min(_REPORT_RETRY_BASE_SLEEP * (2 ** attempt), _REPORT_RETRY_MAX_SLEEP)
 
 
 class _BoundedDedupLog:
@@ -786,6 +863,10 @@ def _reap_loop(
                         else:
                             telemetry.record_failure()
                     print(f"[DONE] task_id={tid} exit_code={code}", flush=True)
+                    # Reap the per-task workspace so stale dirs don't accumulate
+                    # and silently exhaust the runner's disk (unlike compute-job
+                    # scratch dirs, these are never otherwise removed).
+                    _cleanup_agent_workspace(tid)
 
                 # Wall-clock deadline: an agent that never exits (wedged tool, runaway
                 # loop) must not hold a capacity permit forever. Mirror the compute
@@ -823,6 +904,8 @@ def _reap_loop(
                 _release_capacity(capacity)
                 if telemetry is not None:
                     telemetry.record_failure()
+                # Terminated overdue agent is done too — reap its workspace.
+                _cleanup_agent_workspace(tid)
         except Exception as exc:  # noqa: BLE001 — never let the reaper thread die silently
             print(f"[runner] reap loop error (continuing): {exc}", flush=True)
         time.sleep(2)
@@ -1200,7 +1283,15 @@ def _report_compute_job(
     result_metrics: dict | None = None,
     command_log: dict | None = None,
 ) -> bool:
-    """POST a status report for a compute job. Returns cancel_requested."""
+    """POST a status report for a compute job. Returns cancel_requested.
+
+    Terminal reports (``succeeded``/``failed``) carry the measured
+    ``result_metrics`` and the job's final status, so a single transient network
+    failure on this POST would silently lose the metric and spuriously mark the
+    criterion unmeasured. Terminal reports therefore retry transient failures
+    (network errors, 429, and 5xx) with capped exponential backoff; interim
+    ``running`` heartbeats are sent once, since the next heartbeat re-sends them.
+    """
     url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/report"
     body: dict = {"exec_status": exec_status}
     if exit_code is not None:
@@ -1209,14 +1300,35 @@ def _report_compute_job(
         body["result_metrics"] = result_metrics
     if command_log is not None:
         body["command_log"] = command_log
-    try:
-        status, resp = _post(url, token, body)
-        if status == 404:
-            return True  # job gone, treat as cancel
-        if isinstance(resp, dict):
-            return bool(resp.get("cancel_requested", False))
-    except Exception as exc:
-        print(f"[compute] report error for job {job_id}: {exc}", flush=True)
+
+    durable = exec_status in _REPORT_TERMINAL_STATUSES
+    max_attempts = (_REPORT_MAX_RETRIES + 1) if durable else 1
+    for attempt in range(max_attempts):
+        last = attempt == max_attempts - 1
+        try:
+            status, resp = _post(url, token, body)
+            if status == 404:
+                return True  # job gone, treat as cancel
+            # 2xx (accepted) or a permanent 4xx, or no retries left: settle now.
+            if 200 <= status < 300 or last or not (status == 429 or status >= 500):
+                if isinstance(resp, dict):
+                    return bool(resp.get("cancel_requested", False))
+                return False
+            print(
+                f"[compute] report HTTP {status} for job {job_id}; "
+                f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
+                flush=True,
+            )
+        except Exception as exc:
+            if last:
+                print(f"[compute] report error for job {job_id}: {exc}", flush=True)
+                return False
+            print(
+                f"[compute] report error for job {job_id}: {exc}; "
+                f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
+                flush=True,
+            )
+        time.sleep(_report_retry_sleep(attempt))
     return False
 
 
@@ -1309,33 +1421,63 @@ def _upload_artifact(orchestrator_url: str, token: str, job_id: str, artifact_di
             file_content_type="application/gzip",
         )
         url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/artifact"
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": content_type,
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                if resp.status in (200, 201, 204):
+        # Retry transient failures (network errors, 5xx) with the same capped
+        # backoff as the terminal report — a blip here otherwise drops the run's
+        # debugging artifacts even though the job succeeded.
+        for attempt in range(_REPORT_MAX_RETRIES + 1):
+            last = attempt == _REPORT_MAX_RETRIES
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": content_type,
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    if resp.status in (200, 201, 204):
+                        print(
+                            f"[compute] uploaded {file_count} artifact file(s) "
+                            f"({total_bytes} bytes) for job {job_id}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[compute] artifact upload warning: HTTP {resp.status} for job {job_id}",
+                            flush=True,
+                        )
+                return
+            except urllib.error.HTTPError as exc:
+                if exc.code >= 500 and not last:
                     print(
-                        f"[compute] uploaded {file_count} artifact file(s) "
-                        f"({total_bytes} bytes) for job {job_id}",
+                        f"[compute] artifact upload HTTP {exc.code} for job {job_id}; "
+                        f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
                         flush=True,
                     )
-                else:
+                    time.sleep(_report_retry_sleep(attempt))
+                    continue
+                print(
+                    f"[compute] artifact upload failed (HTTP {exc.code}) for job {job_id}",
+                    flush=True,
+                )
+                return
+            except Exception as exc:
+                if not last:
                     print(
-                        f"[compute] artifact upload warning: HTTP {resp.status} for job {job_id}",
+                        f"[compute] artifact upload network error for job {job_id}: {exc}; "
+                        f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
                         flush=True,
                     )
-        except urllib.error.HTTPError as exc:
-            print(f"[compute] artifact upload failed (HTTP {exc.code}) for job {job_id}", flush=True)
-        except Exception as exc:
-            print(f"[compute] artifact upload network error for job {job_id}: {exc}", flush=True)
+                    time.sleep(_report_retry_sleep(attempt))
+                    continue
+                print(
+                    f"[compute] artifact upload network error for job {job_id}: {exc}",
+                    flush=True,
+                )
+                return
     except Exception as exc:  # noqa: BLE001 — upload is strictly best-effort
         print(f"[compute] artifact upload unexpected error for job {job_id}: {exc}", flush=True)
 
@@ -2453,6 +2595,7 @@ def main() -> None:
 
     poll_interval = base_poll_interval
     next_task_url = f"{orchestrator_url}/api/runner/next-task"
+    min_free_disk = _min_free_disk_bytes()
 
     # An agent sandbox exists iff bwrap can be built OR a docker+image backend is
     # available. When agent_image is None this is exactly caps.bwrap_ok (unchanged).
@@ -2480,6 +2623,19 @@ def main() -> None:
                 continue
 
             if not _try_acquire_capacity(agent_capacity):
+                time.sleep(poll_interval)
+                continue
+
+            # Low-disk guard: don't claim new agent work when the workspace
+            # filesystem is nearly full — starting a task that dies mid-run wastes
+            # a claim and can wedge the disk further. Disabled by default (0).
+            if _disk_below_min(workspace_root, min_free_disk):
+                _release_capacity(agent_capacity)
+                print(
+                    f"[runner] low disk on {workspace_root} "
+                    f"(< {min_free_disk} bytes free) — not claiming agent work this cycle.",
+                    flush=True,
+                )
                 time.sleep(poll_interval)
                 continue
 

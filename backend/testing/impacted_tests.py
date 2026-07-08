@@ -377,6 +377,65 @@ def collect_first_party_patch_targets(testing_dir: str) -> "list[str]":
     return sorted(targets)
 
 
+def collect_create_true_patch_targets(testing_dir: str) -> "list[tuple[str, str]]":
+    """Return sorted ``(test_file, target)`` pairs for ``create=True`` patch calls.
+
+    The inverse of :func:`collect_first_party_patch_targets`: scans every
+    ``test_*.py`` under *testing_dir* using AST for ``patch("app.*", ...,
+    create=True)`` calls. ``create=True`` tells mock to fabricate an attribute it
+    deems absent at module level; once the real attribute exists the flag is a
+    no-op that silently suppresses the ``AttributeError`` a later rename/removal
+    of that symbol would raise — voiding the drift protection the string-target
+    invariant provides (which itself skips ``create=True`` patches).
+
+    Used by the merge-gate invariant ``test_redundant_create_true_patches_flagged``
+    to flag redundant ``create=True`` whose target now resolves at module top
+    level. Targets are normalized to ``app.*`` form (the ``backend.`` prefix is
+    stripped); pairs are deduplicated and sorted.
+    """
+    pairs: "set[tuple[str, str]]" = set()
+    if not os.path.isdir(testing_dir):
+        return []
+    for fname in os.listdir(testing_dir):
+        if not (fname.startswith("test_") and fname.endswith(".py")):
+            continue
+        fpath = os.path.join(testing_dir, fname)
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+            tree = ast.parse(source, filename=fname)
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            is_patch = (isinstance(func, ast.Attribute) and func.attr == "patch") or (
+                isinstance(func, ast.Name) and func.id == "patch"
+            )
+            if not is_patch:
+                continue
+            if not any(
+                kw.arg == "create"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            ):
+                continue
+            if not node.args:
+                continue
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant) or not isinstance(
+                first_arg.value, str
+            ):
+                continue
+            raw = first_arg.value
+            normalized = raw[len("backend."):] if raw.startswith("backend.") else raw
+            if normalized.startswith("app.") and "." in normalized[4:]:
+                pairs.add((fname, normalized))
+    return sorted(pairs)
+
+
 def _read_changed(paths_argv, stdin) -> "list[str]":
     """Positional args if any, else the newline-delimited STDIN payload."""
     if paths_argv:

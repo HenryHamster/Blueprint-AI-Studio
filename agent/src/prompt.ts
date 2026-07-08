@@ -308,8 +308,8 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
   }
 
   if (promotionTarget) {
-    const lts = promotionTarget;
-    hints['release_audit'] = `You are running on the LTS branch (${lts}) and reviewing the incoming diff against ${lts}'s standards. Run \`git diff <diff_range>\` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.`;
+    const target = promotionTarget;
+    hints['release_audit'] = `You are running on the promotion/integration branch (${target}) and reviewing the incoming diff against ${target}'s standards. Run \`git diff <diff_range>\` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.`;
   }
 
   return hints;

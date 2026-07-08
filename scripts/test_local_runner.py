@@ -235,6 +235,84 @@ class TestAgentWorkspace(unittest.TestCase):
             self.assertTrue(workspace.endswith("task_abc_123"))
             self.assertTrue(os.path.isdir(workspace))
 
+    def test_workspace_path_does_not_create_dir(self):
+        """_agent_workspace_path computes the same path but has no side effect."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                path = local_runner._agent_workspace_path("task/abc:123")
+                created = local_runner._agent_workspace_for_task("task/abc:123")
+            self.assertEqual(path, created)
+            self.assertTrue(path.endswith("task_abc_123"))
+
+    def test_cleanup_removes_per_task_workspace(self):
+        """Auto-clean: a finished task's workspace dir is rmtree'd, not left behind."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir},
+                            clear=False):
+                os.environ.pop("BLUEPRINT_RUNNER_KEEP_WORKSPACES", None)
+                workspace = local_runner._agent_workspace_for_task("task-xyz")
+                # Simulate leftover scratch content the agent produced.
+                with open(os.path.join(workspace, "big.log"), "w") as fh:
+                    fh.write("x" * 1024)
+                self.assertTrue(os.path.isdir(workspace))
+
+                local_runner._cleanup_agent_workspace("task-xyz")
+
+            self.assertFalse(os.path.exists(workspace))
+
+    def test_cleanup_respects_keep_workspaces_opt_out(self):
+        """BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 retains the dir for debugging."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {
+                "BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir,
+                "BLUEPRINT_RUNNER_KEEP_WORKSPACES": "1",
+            }):
+                workspace = local_runner._agent_workspace_for_task("task-keep")
+                local_runner._cleanup_agent_workspace("task-keep")
+            self.assertTrue(os.path.isdir(workspace))
+
+    def test_cleanup_missing_workspace_is_noop(self):
+        """Cleaning a workspace that was never created must not raise."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                os.environ.pop("BLUEPRINT_RUNNER_KEEP_WORKSPACES", None)
+                local_runner._cleanup_agent_workspace("never-made")  # no raise
+
+
+class TestLowDiskGuard(unittest.TestCase):
+    def test_min_free_disk_bytes_parses_env(self):
+        with patch.dict(os.environ, {"BLUEPRINT_RUNNER_MIN_DISK_BYTES": "2048"}):
+            self.assertEqual(local_runner._min_free_disk_bytes(), 2048)
+
+    def test_min_free_disk_bytes_defaults_and_rejects_garbage(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BLUEPRINT_RUNNER_MIN_DISK_BYTES", None)
+            self.assertEqual(local_runner._min_free_disk_bytes(), 0)
+        with patch.dict(os.environ, {"BLUEPRINT_RUNNER_MIN_DISK_BYTES": "notanint"}):
+            self.assertEqual(local_runner._min_free_disk_bytes(), 0)
+
+    def test_guard_disabled_when_threshold_zero(self):
+        # Even with a tiny reported free space, threshold 0 never guards.
+        with patch.object(local_runner, "_disk_free_bytes", return_value=1):
+            self.assertFalse(local_runner._disk_below_min("/some/root", 0))
+
+    def test_guard_trips_below_threshold(self):
+        with patch.object(local_runner, "_disk_free_bytes", return_value=500):
+            self.assertTrue(local_runner._disk_below_min("/some/root", 1000))
+
+    def test_guard_ok_at_or_above_threshold(self):
+        with patch.object(local_runner, "_disk_free_bytes", return_value=1500):
+            self.assertFalse(local_runner._disk_below_min("/some/root", 1000))
+
+    def test_guard_ignores_unknown_free_space(self):
+        # Unknown free space (None) must not falsely trip the guard.
+        with patch.object(local_runner, "_disk_free_bytes", return_value=None):
+            self.assertFalse(local_runner._disk_below_min("/some/root", 1000))
+
 
 # ── Startup summary ───────────────────────────────────────────────────────────
 
@@ -481,6 +559,36 @@ class TestReaperLoop(unittest.TestCase):
         self.assertNotIn("task-done", active_tasks)
         self.assertTrue(capacity.acquire(blocking=False))
 
+    def test_reap_cleans_up_finished_workspace(self):
+        """A reaped agent's per-task workspace is removed (auto-clean wiring)."""
+        import tempfile
+
+        done_proc = MagicMock()
+        done_proc.poll.return_value = 0
+        done_proc.returncode = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                os.environ.pop("BLUEPRINT_RUNNER_KEEP_WORKSPACES", None)
+                workspace = local_runner._agent_workspace_for_task("task-done")
+                self.assertTrue(os.path.isdir(workspace))
+
+                active_tasks = {"task-done": done_proc}
+                lock = threading.Lock()
+
+                def stop_after_sleep(secs):
+                    local_runner._shutdown_event.set()
+
+                local_runner._shutdown_event.clear()
+                try:
+                    with patch("time.sleep", stop_after_sleep):
+                        local_runner._reap_loop(active_tasks, lock)
+                finally:
+                    local_runner._shutdown_event.clear()
+
+                self.assertNotIn("task-done", active_tasks)
+                self.assertFalse(os.path.exists(workspace))
+
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
@@ -580,6 +688,105 @@ class TestComputeJobReport(unittest.TestCase):
             )
 
         self.assertFalse(result)
+
+    def test_running_report_does_not_retry_transient_failure(self):
+        """Interim 'running' heartbeats are single-shot — no retry, no sleep."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            raise RuntimeError("boom")
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-run",
+                exec_status="running",
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(calls["n"], 1)
+        mock_sleep.assert_not_called()
+
+    def test_terminal_report_retries_network_error_then_succeeds(self):
+        """A transient network blip on the terminal metric report is retried, not lost."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("transient network error")
+            return 200, {"cancel_requested": False}
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-metrics",
+                exec_status="succeeded", exit_code=0,
+                result_metrics={"loss": 0.5},
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(calls["n"], 3)  # failed twice, succeeded on the third
+        self.assertEqual(mock_sleep.call_count, 2)  # one backoff per retry
+
+    def test_terminal_report_retries_5xx_then_gives_up(self):
+        """Terminal report retries a 5xx up to the cap, then settles without raising."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            return 503, None
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-5xx",
+                exec_status="failed", exit_code=1,
+            )
+
+        self.assertFalse(result)
+        # 1 initial attempt + _REPORT_MAX_RETRIES retries.
+        self.assertEqual(calls["n"], local_runner._REPORT_MAX_RETRIES + 1)
+        self.assertEqual(mock_sleep.call_count, local_runner._REPORT_MAX_RETRIES)
+
+    def test_terminal_report_does_not_retry_permanent_4xx(self):
+        """A permanent 4xx (e.g. 400) is not retried — retrying can't fix it."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            return 400, {"detail": "bad request"}
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-400",
+                exec_status="succeeded", exit_code=0,
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(calls["n"], 1)
+        mock_sleep.assert_not_called()
+
+    def test_terminal_report_404_still_short_circuits(self):
+        """A 404 on a terminal report means the job is gone — cancel, no retry."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            return 404, None
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-gone",
+                exec_status="failed", exit_code=1,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(calls["n"], 1)
+        mock_sleep.assert_not_called()
 
 
 # ── Compute job worker ────────────────────────────────────────────────────────
@@ -1819,11 +2026,64 @@ class TestArtifactUpload(unittest.TestCase):
             with patch(
                 "urllib.request.urlopen",
                 side_effect=urllib.error.HTTPError("u", 500, "err", {}, None),
-            ):
-                # Must NOT raise.
+            ), patch("time.sleep"):
+                # Must NOT raise even after exhausting retries.
                 local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
+
+    def test_upload_retries_5xx_up_to_cap(self):
+        """A 5xx artifact upload is retried up to the cap before giving up."""
+        import tempfile
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "f.txt", b"data")
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.HTTPError("u", 503, "err", {}, None),
+            ) as mock_urlopen, patch("time.sleep") as mock_sleep:
+                local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+
+        self.assertEqual(
+            mock_urlopen.call_count, local_runner._REPORT_MAX_RETRIES + 1
+        )
+        self.assertEqual(mock_sleep.call_count, local_runner._REPORT_MAX_RETRIES)
+
+    def test_upload_retries_network_error_then_succeeds(self):
+        """A transient network blip on upload is retried instead of dropping artifacts."""
+        import tempfile
+        import urllib.error
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise urllib.error.URLError("conn reset")
+            return _Resp()
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "f.txt", b"data")
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                    patch("time.sleep") as mock_sleep:
+                local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+
+        self.assertEqual(calls["n"], 2)  # failed once, uploaded on retry
+        self.assertEqual(mock_sleep.call_count, 1)
 
 
 class TestBoundedDedupLog(unittest.TestCase):
