@@ -776,6 +776,27 @@ async def _maybe_create_local_runner_hold_alert(
         "alert_created",
         {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
     )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                task.project_id,
+                "RUNNER_LOCAL_HOLD",
+                {
+                    "task_id": str(task.id),
+                    "task_title": task.title or str(task.id)[:8],
+                    "held_seconds": held_seconds,
+                    "held_duration": held_str,
+                    "timeout_seconds": timeout_seconds,
+                    "remaining_duration": remaining_str,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_LOCAL_HOLD dispatch setup failed: %s", _ne)
     return True
 
 

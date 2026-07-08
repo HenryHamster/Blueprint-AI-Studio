@@ -33959,3 +33959,85 @@ async def test_full_suite_drift_sentinel_sweep_uses_build_config(db_session, moc
     )
     assert result is True
     gate_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_record_v22_live_verification_evidence_records_evidence_row(db_session):
+    """Integration coverage: record_v22_live_verification_evidence writes a
+    CriterionEvidence row for criterion c-dd953d8c on a v22 version.
+
+    Verifies the function correctly records an evidence row against the
+    live-verification criterion — not just that it is CALLED (wiring invariant).
+    """
+    from app import release_readiness as rr
+    from app import release_version as rv
+    from app.acceptance_criteria import get_evidence_for_criterion
+
+    # Create project + v22 version (the function only operates on version 22).
+    project = Project(
+        name="V22-Live-Verify-Test",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=22)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create the live-verification criterion c-dd953d8c on this version.
+    criterion = await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-dd953d8c",
+        text="v22 live-verification claim audit",
+    )
+
+    # --- Happy path: record evidence ---
+    recorded = await rr.record_v22_live_verification_evidence(
+        db_session, project.id, version
+    )
+    assert recorded == 1, "Expected 1 new evidence row written"
+
+    # Verify the evidence row was persisted with correct source_kind and source_id.
+    evidence_rows = await get_evidence_for_criterion(db_session, criterion.id)
+    matched = [
+        e
+        for e in evidence_rows
+        if e.source_kind == "audit_finding_backfill"
+        and e.source_id == "live_verification_backfill:v22"
+    ]
+    assert len(matched) == 1, (
+        f"Expected exactly 1 live-verification evidence row, found {len(matched)}"
+    )
+    row = matched[0]
+    assert row.detail == {
+        "claims_verified": 5,
+        "verification_date": "2026-07-07",
+        "note": (
+            "Five v22 promotion-gated live-verification claims "
+            "(direction d-fd9c793d) code-verified PASS in direction notes."
+        ),
+    }
+
+    # --- Idempotency: second call is a no-op ---
+    recorded2 = await rr.record_v22_live_verification_evidence(
+        db_session, project.id, version
+    )
+    assert recorded2 == 0, "Expected 0 on idempotent second call — evidence already recorded"
+
+    # --- Wrong version guard: returns 0 for non-v22 versions ---
+    version_v23 = await rv.open_version(db_session, project.id, version_number=23)
+    await db_session.commit()
+    await db_session.refresh(version_v23)
+
+    recorded3 = await rr.record_v22_live_verification_evidence(
+        db_session, project.id, version_v23
+    )
+    assert recorded3 == 0, "Expected 0 for non-v22 version — version guard must reject"

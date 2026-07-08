@@ -15,10 +15,12 @@ import pytest
 from sqlmodel import select as sql_select
 
 from app.alert_dispatch import (
+    _LOCAL_RUNNER_HOLD_ALERT_TITLE,
     _MIGRATION_SLOT_CONTENTION_ALERT_TITLE,
     _UNVERIFIED_REASON_LABELS,
     _fmt_duration_seconds,
     _maybe_create_blocked_escalation_alert,
+    _maybe_create_local_runner_hold_alert,
     _maybe_create_migration_slot_contention_alert,
     _maybe_create_pool_payoff_alert,
     _maybe_create_runner_deactivated_alert,
@@ -1224,3 +1226,147 @@ async def test_fleet_no_healthy_runner_check_integration(db_session, mocker):
 
     await db_session.refresh(alerts[0])
     assert alerts[0].dismissed_at is not None, "fleet alert must auto-resolve when healthy runner appears"
+
+
+# ── local-runner hold alert external notification dispatch ────────────────────
+
+
+async def _hold_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title == _LOCAL_RUNNER_HOLD_ALERT_TITLE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_local_runner_hold_alert_dispatches_external_notification(
+    db_session, mocker
+):
+    """_maybe_create_local_runner_hold_alert dispatches via the external notification path.
+
+    All other runner health alerts (RUNNER_DEACTIVATED, RUNNER_DEGRADED,
+    FLEET_NO_HEALTHY, RUNNER_LOW_DISK) dispatch through the retry-capable
+    external notification path. The hold alert previously only broadcast to
+    the WebSocket UI — this test guards that it now also pages operators
+    through their configured notification channels.
+    """
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    dispatch = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(project_id=project.id, title="compute-experiment-task")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    created = await _maybe_create_local_runner_hold_alert(
+        task,
+        db_session,
+        held_seconds=900,
+        timeout_seconds=21600,
+    )
+    await db_session.commit()
+
+    assert created is True
+
+    # Verify the alert row was created with the expected fields.
+    alerts = await _hold_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].task_id == task.id
+    assert "900s" in alerts[0].message or "15m" in alerts[0].message
+
+    # Fire-and-forget via ensure_future — let the scheduled task run.
+    import asyncio
+
+    await asyncio.sleep(0)
+    dispatch.assert_awaited_once()
+    args, _kwargs = dispatch.call_args
+    assert args[1] == "RUNNER_LOCAL_HOLD"
+    assert args[2]["task_id"] == str(task.id)
+    assert args[2]["held_seconds"] == 900
+    assert args[2]["timeout_seconds"] == 21600
+
+
+@pytest.mark.asyncio
+async def test_local_runner_hold_alert_dedups_same_task(db_session, mocker):
+    """Repeated sweep passes for the same held task do not create duplicate alerts."""
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    first = await _maybe_create_local_runner_hold_alert(
+        task, db_session, held_seconds=900, timeout_seconds=21600
+    )
+    await db_session.commit()
+    assert first is True
+
+    second = await _maybe_create_local_runner_hold_alert(
+        task, db_session, held_seconds=1200, timeout_seconds=21600
+    )
+    await db_session.commit()
+    assert second is False  # deduped on (task_id, title, dismissed_at IS NULL)
+
+    alerts = await _hold_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_local_runner_hold_alert_handles_notification_failure(
+    db_session, mocker
+):
+    """Alert is still created when the notification dispatch raises.
+
+    The fire-and-forget dispatch_external_notification call is best-effort;
+    a failure to page the operator must not prevent the alert row from being
+    written — the WebSocket broadcast and the alert row are the primary
+    reliability path.
+    """
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        side_effect=RuntimeError("webhook unreachable"),
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(project_id=project.id, title="failing-notify-task")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    created = await _maybe_create_local_runner_hold_alert(
+        task,
+        db_session,
+        held_seconds=600,
+        timeout_seconds=21600,
+    )
+    await db_session.commit()
+
+    # Alert MUST still be created even though the notification failed.
+    assert created is True
+
+    alerts = await _hold_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].task_id == task.id

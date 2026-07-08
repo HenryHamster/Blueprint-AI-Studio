@@ -335,6 +335,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "RUNNER_FLEET_OFFLINE",
                 "RUNNER_LOW_DISK",
                 "RUNNER_OUTAGE_ESCALATED",
+                "RUNNER_LOCAL_HOLD",
             ],
         ),
         "throttle_seconds": config.get("throttle_seconds", 30),
@@ -2967,6 +2968,7 @@ async def _apply_settings(
                 "RUNNER_FLEET_OFFLINE",
                 "RUNNER_LOW_DISK",
                 "RUNNER_OUTAGE_ESCALATED",
+                "RUNNER_LOCAL_HOLD",
             ]
         )
         enabled_events = val.get(
@@ -2987,6 +2989,7 @@ async def _apply_settings(
                 "RUNNER_FLEET_OFFLINE",
                 "RUNNER_LOW_DISK",
                 "RUNNER_OUTAGE_ESCALATED",
+                "RUNNER_LOCAL_HOLD",
             ],
         )
         if not isinstance(enabled_events, list):
@@ -3429,6 +3432,7 @@ async def _apply_settings(
                                 "RUNNER_FLEET_OFFLINE",
                                 "RUNNER_LOW_DISK",
                                 "RUNNER_OUTAGE_ESCALATED",
+                                "RUNNER_LOCAL_HOLD",
                             ],
                             "throttle_seconds": 30,
                         },

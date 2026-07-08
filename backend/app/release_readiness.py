@@ -1767,7 +1767,7 @@ async def record_v22_live_verification_evidence(
             ),
         },
     )
-    await session.commit()
+    # record_evidence commits its own session — no redundant outer commit needed.
     return 1
 
 
