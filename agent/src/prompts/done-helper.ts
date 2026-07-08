@@ -30,7 +30,7 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 #       USE ./blocked INSTEAD when the failure requires introducing a
 #       new bug or precondition (missing package, infra gap, agent
 #       can't even start the work). --warn-out-of-scope is for issues
-#       that already existed on main BEFORE this PR.
+#       that already existed on the base branch BEFORE this PR.
 #
 #   ./done --already-done "<reason>"           # no-op / already-satisfied exit:
 #       AFFIRMATIVELY signal that the task's deliverable ALREADY EXISTS on
