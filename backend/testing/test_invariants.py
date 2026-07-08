@@ -11323,6 +11323,64 @@ def test_mock_patch_targets_resolve():
     )
 
 
+def test_acceptance_window_evidence_call_site_wired():
+    """release_qualifier_sweep.py must import and call record_acceptance_window_coverage_evidence.
+
+    This invariant guards that the acceptance-window evidence recording function
+    stays wired into the sweep hot path. A rename or accidental deletion would
+    silently break coverage re-scoring without this tripwire.
+    """
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    sweep_path = app_dir / "release_qualifier_sweep.py"
+    criteria_path = app_dir / "acceptance_criteria.py"
+
+    sweep_source = sweep_path.read_text(encoding="utf-8")
+    criteria_source = criteria_path.read_text(encoding="utf-8")
+
+    func_name = "record_acceptance_window_coverage_evidence"
+
+    # Confirm the function is defined in acceptance_criteria.py
+    assert f"def {func_name}" in criteria_source, (
+        f"'{func_name}' is no longer defined in acceptance_criteria.py. "
+        "Either restore the function or update this invariant to match the new name."
+    )
+
+    # Confirm it is imported in release_qualifier_sweep.py
+    sweep_tree = ast.parse(sweep_source, filename=str(sweep_path))
+    imported_names: set[str] = set()
+    for node in ast.walk(sweep_tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "app.acceptance_criteria":
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name)
+
+    assert func_name in imported_names, (
+        f"release_qualifier_sweep.py does not import '{func_name}' from "
+        "app.acceptance_criteria. The acceptance-window evidence recording "
+        "call site may be broken — restore the import."
+    )
+
+    # Confirm it is actually called in release_qualifier_sweep.py
+    called = False
+    for node in ast.walk(sweep_tree):
+        if isinstance(node, ast.Call):
+            name = _ast_called_name(node)
+            if name == func_name:
+                called = True
+                break
+        # Also handle `await record_acceptance_window_coverage_evidence(...)`
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            name = _ast_called_name(node.value)
+            if name == func_name:
+                called = True
+                break
+
+    assert called, (
+        f"release_qualifier_sweep.py imports '{func_name}' but never calls it. "
+        "The acceptance-window evidence re-scoring sweep is effectively disabled — "
+        "restore the call site."
+    )
+
+
 def test_metrics_integrity_sweep_wired_in_reaper():
     """sweep_metrics_integrity must be imported from reaper_sweeps and called in reaper.py."""
     import ast

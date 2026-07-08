@@ -4220,22 +4220,22 @@ async def test_acceptance_window_recompute_records_covering_evidence(db_session)
 
     # Two inferred_test_cochange merges (verified numerator) + one prod-only
     # undeclared merge (denominator only). verified=2, write_total=3.
-    db_session.add(
-        _make_inferred_cochange_task(
-            project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
-        )
+    inferred_task_a = _make_inferred_cochange_task(
+        project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
     )
-    db_session.add(
-        _make_inferred_cochange_task(
-            project, version, changed_files=["testing/test_b.py", "app/b.py"], seconds=2
-        )
+    inferred_task_b = _make_inferred_cochange_task(
+        project, version, changed_files=["testing/test_b.py", "app/b.py"], seconds=2
     )
+    db_session.add(inferred_task_a)
+    db_session.add(inferred_task_b)
     db_session.add(
         _make_inferred_cochange_task(
             project, version, changed_files=["app/c.py"], seconds=3
         )
     )
     await db_session.commit()
+    await db_session.refresh(inferred_task_a)
+    await db_session.refresh(inferred_task_b)
 
     # Before: no evidence, criterion uncovered.
     summary_before = await ac.get_version_coverage_summary(db_session, version.id)
@@ -4253,6 +4253,12 @@ async def test_acceptance_window_recompute_records_covering_evidence(db_session)
     assert row.detail["acceptance_window_write_total"] == 3
     assert row.detail["acceptance_window_inferred_test_cochange"] == 2
     assert row.detail["acceptance_window_fraction"] == pytest.approx(2 / 3)
+    # Per-merge audit trail: task IDs of the inferred_test_cochange merges must
+    # appear in the evidence detail so operators can trace which merges counted.
+    assert set(row.detail["inferred_test_cochange_task_ids"]) == {
+        str(inferred_task_a.id),
+        str(inferred_task_b.id),
+    }
 
     # After: the criterion flips to covered.
     summary_after = await ac.get_version_coverage_summary(db_session, version.id)

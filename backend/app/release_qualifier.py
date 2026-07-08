@@ -2755,6 +2755,14 @@ async def _compute_acceptance_window_aggregate(
     inferred_test_cochange = sum(
         1 for bucket in write_buckets if bucket == "inferred_test_cochange"
     )
+    # Per-task audit trail for inferred_test_cochange merges, capped so the
+    # evidence detail stays bounded in storage regardless of window size.
+    _INFERRED_TASK_ID_CAP = 100
+    inferred_task_ids: list[str] = [
+        str(task.id)
+        for task, bucket in zip(rows_write, write_buckets)
+        if bucket == "inferred_test_cochange"
+    ][:_INFERRED_TASK_ID_CAP]
     fraction = (verified / total) if total > 0 else None
     return {
         "acceptance_window_total": total,
@@ -2768,6 +2776,9 @@ async def _compute_acceptance_window_aggregate(
         # by acceptance_criteria.record_acceptance_window_coverage_evidence for the
         # evidence detail; no score impact.
         "acceptance_window_inferred_test_cochange": inferred_test_cochange,
+        # Per-merge audit trail: task IDs of the inferred_test_cochange merges so
+        # operators can trace which specific merges were counted without SQL.
+        "acceptance_window_inferred_test_cochange_task_ids": inferred_task_ids,
     }
 
 

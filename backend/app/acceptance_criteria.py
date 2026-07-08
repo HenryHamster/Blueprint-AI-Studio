@@ -967,6 +967,9 @@ async def record_acceptance_window_coverage_evidence(
             "acceptance_window_inferred_test_cochange": int(
                 aggregate.get("acceptance_window_inferred_test_cochange") or 0
             ),
+            "inferred_test_cochange_task_ids": list(
+                aggregate.get("acceptance_window_inferred_test_cochange_task_ids") or []
+            ),
         }
         # Stable per-version source_id so the dedup unique index makes repeated
         # reconcile/qualify sweeps a no-op (idempotency contract).
