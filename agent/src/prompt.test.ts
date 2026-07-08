@@ -2310,6 +2310,24 @@ describe('getTaskTypeHints', () => {
     expect(hint).toContain('./done --indeterminate');
   });
 
+  it('fix hint separates code-review fix and defect reproduction into two labeled branches', () => {
+    const hint = TASK_TYPE_HINTS['fix'];
+    // Two distinct labeled branches
+    expect(hint).toContain('Code-review fix');
+    expect(hint).toContain('Defect reproduction');
+    // Code-review branch (common case) is front-loaded before defect reproduction
+    const codeReviewIdx = hint.indexOf('Code-review fix');
+    const defectIdx = hint.indexOf('Defect reproduction');
+    expect(codeReviewIdx).toBeGreaterThan(-1);
+    expect(defectIdx).toBeGreaterThan(-1);
+    expect(codeReviewIdx).toBeLessThan(defectIdx);
+    // Code-review branch has the end-to-end flow inline (no reproduce-first noise)
+    const codeReviewSection = hint.substring(codeReviewIdx, defectIdx);
+    expect(codeReviewSection).toContain('./check');
+    expect(codeReviewSection).toContain('./pr open');
+    expect(codeReviewSection).toContain('./done');
+  });
+
   it('investigate hint asks for the canonical reproduce verdict, not free-text only', () => {
     const hint = TASK_TYPE_HINTS['investigate'];
     expect(hint).toContain('reproduce-on-HEAD verdict');

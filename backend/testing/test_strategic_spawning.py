@@ -9831,6 +9831,9 @@ async def test_post_promote_handoff_hint_fires_on_fresh_version(
     assert "PROMOTED" in suffix
     assert "do NOT" in suffix
     assert "new_version_goal" in suffix
+    # Setup and retirement are independent — the hint must signal they can run in parallel.
+    assert "concurrent" in suffix
+    assert "parallel" in suffix
 
 
 @pytest.mark.asyncio
