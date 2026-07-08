@@ -2041,6 +2041,38 @@ def _external_api_subtype_from_message(combined: str) -> str:
     if _provider_model_config_rejection(combined):
         return EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
 
+    # Provider quota / rate exhaustion / capacity (non-auth upstream limits).
+    # Check this before generic auth because some OpenAI-compatible gateways pair
+    # 401-ish wording with balance/quota text; those should cooldown/retry rather
+    # than hard-disable a still-valid key.
+    if any(
+        kw in combined
+        for kw in (
+            "overloaded",
+            "rate limit",
+            "429",
+            "too many requests",
+            "context_length_exceeded",
+            "token limit exceeded",
+            "quota exceeded",
+            "insufficient quota",
+            "insufficient_quota",
+            "insufficient balance",
+            "insufficient_balance",
+            "balance not enough",
+            "api usage exhausted",
+            "usage_not_included",
+            "provider capacity",
+            "service capacity",
+            "server capacity",
+            "at capacity",
+            "capacity exceeded",
+            "concurrency limit",
+            "resource exhausted",
+        )
+    ):
+        return EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+
     # Provider auth — token/credential failures from any upstream API.
     # `oauth_org_not_allowed` is the Anthropic 403 raised when an org has
     # disabled OAuth for Claude Code; matched by its specific token (NOT bare
@@ -2095,22 +2127,6 @@ def _external_api_subtype_from_message(combined: str) -> str:
     # GitHub rate limits.
     if any(gh_kw in combined for gh_kw in ("github", "api.github.com")) and any(
         kw in combined for kw in ("rate limit", "429", "too many requests")
-    ):
-        return EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
-
-    # Provider quota / rate exhaustion / capacity (non-auth upstream limits).
-    if any(
-        kw in combined
-        for kw in (
-            "overloaded",
-            "rate limit",
-            "429",
-            "too many requests",
-            "context_length_exceeded",
-            "token limit exceeded",
-            "quota exceeded",
-            "resource exhausted",
-        )
     ):
         return EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
 

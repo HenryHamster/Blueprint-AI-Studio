@@ -26,6 +26,7 @@ from app.efficiency_snapshot import (
     DESIGN_DOC_KEY,
     FORMAT_COMPLIANCE_KEY,
     FORMAT_COMPLIANCE_RATE_KEY,
+    LLM_CACHE_READ_INPUT_PRICING,
     LLM_TOKEN_PRICING,
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
@@ -1538,8 +1539,9 @@ async def test_llm_cost_prices_cache_classes_separately(db_session):
     assert row["total_cost_usd"] == pytest.approx(expected)
 
 
-def test_llm_cost_prices_non_anthropic_cache_subcounts_at_base_rate():
-    input_rate, output_rate = LLM_TOKEN_PRICING[("deepseek", "deepseek-v4-flash")]
+def _assert_provider_specific_cache_read_pricing(provider: str, model: str):
+    input_rate, output_rate = LLM_TOKEN_PRICING[(provider, model)]
+    cache_read_rate = LLM_CACHE_READ_INPUT_PRICING[(provider, model)]
     task = make_task(
         status=TaskStatus.COMPLETED,
         context={"pr_merged": True},
@@ -1550,18 +1552,18 @@ def test_llm_cost_prices_non_anthropic_cache_subcounts_at_base_rate():
             "total_cache_creation_input_tokens": 200,
             "total_cache_read_input_tokens": 300,
         },
-        provider="deepseek",
-        model="deepseek-v4-flash",
+        provider=provider,
+        model=model,
     )
 
-    expected = round(1000 * input_rate + 400 * output_rate, 6)
-    anthropic_cache_math = round(
+    expected = round(
         500 * input_rate
-        + 200 * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
-        + 300 * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+        + 200 * input_rate
+        + 300 * cache_read_rate
         + 400 * output_rate,
         6,
     )
+    legacy_full_input = round(1000 * input_rate + 400 * output_rate, 6)
 
     breakdown = compute_llm_cost_breakdown([task])
     totals = breakdown["totals"]
@@ -1571,7 +1573,61 @@ def test_llm_cost_prices_non_anthropic_cache_subcounts_at_base_rate():
     assert totals["total_cache_read_input_tokens"] == 300
     assert totals["total_cost_usd"] == pytest.approx(expected)
     assert row["total_cost_usd"] == pytest.approx(expected)
-    assert totals["total_cost_usd"] != pytest.approx(anthropic_cache_math)
+    assert totals["total_cost_usd"] < legacy_full_input
+
+
+def test_llm_cost_prices_deepseek_cache_read_at_cache_hit_rate():
+    _assert_provider_specific_cache_read_pricing(
+        "deepseek", "deepseek-v4-flash"
+    )
+
+
+def test_llm_cost_prices_zai_glm_cached_input_at_cached_input_rate():
+    _assert_provider_specific_cache_read_pricing("zai", "glm-5.2")
+
+
+def test_llm_cost_prices_openai_cached_input_at_cached_input_rate():
+    _assert_provider_specific_cache_read_pricing("openai", "gpt-5.4-mini")
+
+
+def test_llm_cost_bounds_malformed_cache_subcounts_to_total_input_for_pricing():
+    input_rate, _output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "llm_call_count": 1,
+            "total_input_tokens": 100,
+            "total_output_tokens": 0,
+            "total_cache_creation_input_tokens": 80,
+            "total_cache_read_input_tokens": 80,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    # The raw cache subcounts are malformed because 80 + 80 > 100 inclusive
+    # input tokens. Pricing preserves cache-read first, then clamps creation
+    # tokens to the remaining input total: 80 read + 20 creation + 0 uncached.
+    expected = round(
+        20 * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
+        + 80 * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER,
+        6,
+    )
+    unbounded = round(
+        80 * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
+        + 80 * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER,
+        6,
+    )
+
+    breakdown = compute_llm_cost_breakdown([task])
+    totals = breakdown["totals"]
+
+    assert totals["total_input_tokens"] == 100
+    assert totals["total_cache_creation_input_tokens"] == 20
+    assert totals["total_cache_read_input_tokens"] == 80
+    assert totals["total_cost_usd"] == pytest.approx(expected)
+    assert totals["total_cost_usd"] != pytest.approx(unbounded)
 
 
 @pytest.mark.asyncio
@@ -6125,6 +6181,58 @@ async def test_compute_project_window_spend_usd_sums_llm_cost(db_session):
     in_rate, out_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
     expected = round(1000 * in_rate + 500 * out_rate, 6)
     assert total == expected, f"Expected LLM cost {expected}, got {total}"
+
+
+@pytest.mark.asyncio
+async def test_compute_project_window_spend_usd_uses_cache_aware_llm_pricing(
+    db_session,
+):
+    """Project-window spend must reconcile with the shared cache-aware LLM helper."""
+    from app.efficiency_snapshot import compute_project_window_spend_usd
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provider, model = "zai", "glm-5.2"
+    input_rate, output_rate = LLM_TOKEN_PRICING[(provider, model)]
+    cache_read_rate = LLM_CACHE_READ_INPUT_PRICING[(provider, model)]
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        vm_provisioned_at=None,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 100,
+            "llm_call_count": 3,
+            "total_cache_creation_input_tokens": 0,
+            "total_cache_read_input_tokens": 700,
+        },
+        provider=provider,
+        model=model,
+        created_at=_utcnow(),
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    total = await compute_project_window_spend_usd(
+        db_session, project.id, window_hours=24
+    )
+
+    expected = round(
+        300 * input_rate + 700 * cache_read_rate + 100 * output_rate,
+        6,
+    )
+    shared_breakdown_total = compute_llm_cost_breakdown([task])["totals"][
+        "total_cost_usd"
+    ]
+    legacy_full_input = round(1000 * input_rate + 100 * output_rate, 6)
+
+    assert total == pytest.approx(expected)
+    assert total == pytest.approx(shared_breakdown_total)
+    assert total < legacy_full_input
 
 
 @pytest.mark.asyncio

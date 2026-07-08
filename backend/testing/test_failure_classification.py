@@ -2353,6 +2353,14 @@ class TestExternalApiSubtypeFromMessage:
             == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
         )
 
+    def test_provider_quota_balance_preempts_generic_unauthorized(self):
+        assert (
+            _external_api_subtype_from_message(
+                "HTTP 401 Unauthorized from api.deepseek.com: insufficient balance"
+            )
+            == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+        )
+
     def test_github_pr_create(self):
         assert (
             _external_api_subtype_from_message(
@@ -2378,6 +2386,14 @@ class TestExternalApiSubtypeFromMessage:
     def test_provider_quota_overloaded(self):
         assert (
             _external_api_subtype_from_message("Error: Overloaded")
+            == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+        )
+
+    def test_provider_quota_capacity_preempts_generic_auth(self):
+        assert (
+            _external_api_subtype_from_message(
+                "api.deepseek.com overloaded: authentication fails"
+            )
             == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
         )
 

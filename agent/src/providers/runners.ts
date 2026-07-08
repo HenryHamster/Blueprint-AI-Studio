@@ -18,6 +18,7 @@ import {
 } from '../index.js';
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper, retryPostShellFn } from '../prompt.js';
 import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn } from '../token-file.js';
+import { normalizeProviderTokenUsage } from './usage.js';
 
 export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai' | 'deepseek';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
@@ -65,6 +66,9 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
     ],
     api_key: [
       'quota exceeded. check your plan and billing',
+      'insufficient_quota',
+      'usage_not_included',
+      'you exceeded your current quota',
       'rate limit reached for',
       'please try again in',
     ],
@@ -104,6 +108,9 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
       'api error: 429',
       'status 429',
       'quota exceeded',
+      'insufficient balance',
+      'insufficient_balance',
+      'insufficient quota',
       'api usage exhausted',
     ],
   },
@@ -116,10 +123,34 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
       'api error: 429',
       'status 429',
       'quota exceeded',
+      'insufficient balance',
+      'insufficient_balance',
+      'insufficient quota',
+      'balance not enough',
       'api usage exhausted',
-      'concurrency limit',
     ],
   },
+} as const;
+
+const API_KEY_CAPACITY_PATTERNS = [
+  'overloaded',
+  'resource exhausted',
+  'concurrency limit',
+  'provider capacity',
+  'service capacity',
+  'server capacity',
+  'at capacity',
+  'capacity exceeded',
+  'temporarily unavailable',
+  'service unavailable',
+] as const;
+
+const RATE_LIMIT_PROVIDER_CONTEXT_PATTERNS: Readonly<Record<ProviderName, readonly string[]>> = {
+  anthropic: ['api.anthropic.com'],
+  openai: ['api.openai.com', 'openai api error', 'error from openai'],
+  gemini: ['generativelanguage.googleapis.com', 'aiplatform.googleapis.com', 'gemini'],
+  zai: ['api.z.ai', 'z.ai api error', 'zai api error', 'error from z.ai', 'error from zai'],
+  deepseek: ['api.deepseek.com', 'deepseek api error', 'error from deepseek'],
 } as const;
 
 function normalizeProvider(raw: string | undefined): ProviderName {
@@ -196,9 +227,21 @@ function getRateLimitPatterns(provider: ProviderName, authMode: AuthMode): reado
 
 const STRUCTURED_429_PATTERNS = ['"api_error_status":429', '"error":"rate_limit"'] as const;
 
+function hasRateLimitProviderContext(text: string, provider: ProviderName): boolean {
+  return RATE_LIMIT_PROVIDER_CONTEXT_PATTERNS[provider].some(p => text.includes(p));
+}
+
 export function matchesRateLimit(text: string, provider: ProviderName = PROVIDER, authMode: AuthMode = AUTH_MODE): boolean {
   const lower = text.toLowerCase();
   if (getRateLimitPatterns(provider, authMode).some(p => lower.includes(p))) return true;
+  if (
+    authMode === 'api_key'
+    && (provider === 'openai' || provider === 'zai' || provider === 'deepseek')
+    && hasRateLimitProviderContext(lower, provider)
+    && API_KEY_CAPACITY_PATTERNS.some(p => lower.includes(p))
+  ) {
+    return true;
+  }
   return STRUCTURED_429_PATTERNS.some(p => text.includes(p));
 }
 
@@ -1335,11 +1378,15 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               const usage = (obj as { result?: string; usage?: Record<string, unknown> }).usage;
               if (!isNested && usage && typeof usage === 'object') {
-                const cacheCreationTokens = Number(usage.cache_creation_input_tokens ?? 0);
-                const cacheReadTokens = Number(usage.cache_read_input_tokens ?? 0);
-                const inputTokens = Number(usage.input_tokens ?? 0) + cacheCreationTokens + cacheReadTokens;
-                const outputTokens = Number(usage.output_tokens ?? 0);
-                recordLlmTokens(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens);
+                const normalizedUsage = normalizeProviderTokenUsage(usage);
+                if (normalizedUsage) {
+                  recordLlmTokens(
+                    normalizedUsage.inputTokens,
+                    normalizedUsage.outputTokens,
+                    normalizedUsage.cacheCreationTokens,
+                    normalizedUsage.cacheReadTokens,
+                  );
+                }
               }
               // num_turns is a top-level field on the Claude Code stream-json result
               // event (sibling of `usage`, not inside it).
@@ -1520,11 +1567,15 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               resultEventSeen = true;  // run report: codex terminal turn event
               const usage = obj.usage as Record<string, unknown> | undefined;
               if (usage && typeof usage === 'object') {
-                const cacheCreationTokens = Number(usage.cache_creation_input_tokens ?? 0);
-                const cacheReadTokens = Number(usage.cache_read_input_tokens ?? 0);
-                const inputTokens = Number(usage.input_tokens ?? 0) + cacheCreationTokens + cacheReadTokens;
-                const outputTokens = Number(usage.output_tokens ?? 0);
-                recordLlmTokens(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens);
+                const normalizedUsage = normalizeProviderTokenUsage(usage);
+                if (normalizedUsage) {
+                  recordLlmTokens(
+                    normalizedUsage.inputTokens,
+                    normalizedUsage.outputTokens,
+                    normalizedUsage.cacheCreationTokens,
+                    normalizedUsage.cacheReadTokens,
+                  );
+                }
               }
               // Codex CLI event shape is provider-specific: num_turns may be inside
               // `usage` or at the top level depending on the CLI version. Check both.
@@ -1797,15 +1848,15 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
     throw new VmConfigMissingError(`${runner.displayName} provider config file missing on VM (boot/retarget materialization lost) — ${snippet}`);
   }
-  if (exitCode !== 0 && matchesAuthFailure(combined, runner.provider)) {
-    recordRunErrorReport(exitCode, 'auth_failure');
-    const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
-    throw new AuthFailureError(`${runner.displayName} authentication failed — ${snippet}`);
-  }
   if (sawConfirmedRateLimit) {
     recordRunErrorReport(exitCode, 'rate_limit');
     const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
     throw new RateLimitError(`${runner.displayName} API usage exhausted — ${snippet}`);
+  }
+  if (exitCode !== 0 && matchesAuthFailure(combined, runner.provider)) {
+    recordRunErrorReport(exitCode, 'auth_failure');
+    const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
+    throw new AuthFailureError(`${runner.displayName} authentication failed — ${snippet}`);
   }
 
   // No agent-side matcher fired — record the unclassified run report (the

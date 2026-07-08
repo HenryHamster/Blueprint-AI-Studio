@@ -57,6 +57,7 @@ from app.models import (
 )
 from app.llm_cost_attribution import (
     CACHE_CREATION_INPUT_RATE_MULTIPLIER,  # noqa: F401 — re-exported for callers
+    LLM_CACHE_READ_INPUT_PRICING,  # noqa: F401 — re-exported for callers
     CACHE_READ_INPUT_RATE_MULTIPLIER,  # noqa: F401 — re-exported for callers
     LLM_TOKEN_PRICING,
     SELF_REPAIR_BURN_SHARE_KEY,
@@ -270,6 +271,8 @@ _SNAPSHOT_HISTORY_MAX = 365
 # v10: prompt_static_bytes axis added — source character count of the dominant static
 #      prompt sections (SHARED_LIFECYCLE_REMAINDER + assembleFailureGuidanceBlocks
 #      constants in agent/src/prompt.ts) as a leading indicator for token budget growth.
+# v11: LLM spend axes became provider-cache-aware and pricing rows were refreshed
+#      for current Opus/Haiku/OpenAI Codex proxy rates.
 METRIC_DEF_VERSION = "v11"
 
 
@@ -1441,6 +1444,8 @@ def compute_effort_model_efficiency(
                     cache_read,
                     input_rate,
                     output_rate,
+                    provider=provider,
+                    model=model,
                 )
                 priced_model_keys.add(key)
             else:
@@ -3946,13 +3951,8 @@ async def compute_project_window_spend_usd(
         # long-running tasks cannot bypass the spend ceiling.
         stopped_at = now if (t.vm_provisioned_at and not t.vm_stopped_at) else None
         total += get_task_total_vm_cost_usd(t, stopped_at=stopped_at)
-        input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
-        if input_tokens or output_tokens:
-            key = ((t.provider or "").lower(), (t.model or "").lower())
-            pricing = LLM_TOKEN_PRICING.get(key)
-            if pricing:
-                in_rate, out_rate = pricing
-                total += input_tokens * in_rate + output_tokens * out_rate
+        llm_cost, _any_unpriced = _task_llm_cost(t)
+        total += llm_cost
     return round(total, 6)
 
 

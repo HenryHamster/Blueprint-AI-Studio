@@ -55,7 +55,7 @@ export function recordLlmCallStart(): void {
 
 /** Add the input/output token totals reported by a single CLI result event.
  *
- *  `inputTokens` is the INCLUSIVE sum of all three Anthropic input-token
+ *  `inputTokens` is the INCLUSIVE sum of provider-reported input-token
  *  classes (uncached + cache-creation + cache-read) so total_input_tokens stays
  *  backward-compatible. The optional `cacheCreationTokens` / `cacheReadTokens`
  *  break out the two cache classes into their own counters so the backend can

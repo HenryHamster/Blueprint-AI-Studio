@@ -24,6 +24,7 @@
  */
 
 import { STRATEGIC_OPS_REGISTRY } from '../handlers/strategic-ops-registry.js';
+import { normalizeProviderTokenUsage, type ProviderTokenUsage } from './usage.js';
 
 export type ResidentEventKind = 'text' | 'tool' | 'tool_result' | 'result' | 'error' | 'system' | 'other';
 
@@ -132,12 +133,7 @@ export function describeToolResult(
  * downstream telemetry stays backward-compatible, with the two cache classes
  * broken out for true-rate pricing.
  */
-export interface ResidentTokenUsage {
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
-}
+export type ResidentTokenUsage = ProviderTokenUsage;
 
 export interface ResidentStreamEvent {
   kind: ResidentEventKind;
@@ -179,13 +175,7 @@ export interface ResidentStreamEvent {
 export function extractResultUsage(obj: Record<string, unknown>): ResidentTokenUsage | undefined {
   const usage = obj.usage;
   if (!usage || typeof usage !== 'object') return undefined;
-  const u = usage as Record<string, unknown>;
-  const cacheCreationTokens = Number(u.cache_creation_input_tokens ?? 0) || 0;
-  const cacheReadTokens = Number(u.cache_read_input_tokens ?? 0) || 0;
-  const inputTokens = (Number(u.input_tokens ?? 0) || 0) + cacheCreationTokens + cacheReadTokens;
-  const outputTokens = Number(u.output_tokens ?? 0) || 0;
-  if (inputTokens <= 0 && outputTokens <= 0) return undefined;
-  return { inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens };
+  return normalizeProviderTokenUsage(usage as Record<string, unknown>);
 }
 
 /**
