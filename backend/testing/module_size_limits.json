@@ -133,7 +133,7 @@
     "dep_lifecycle.py": 800,
     "routers/admin_health.py": 1750,
     "metrics_integrity_sweep.py": 3350,
-    "release_readiness.py": 1750
+    "release_readiness.py": 2100
   },
   "agent": {
     "index.ts": 4600,

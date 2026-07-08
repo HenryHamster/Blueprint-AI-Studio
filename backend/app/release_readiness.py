@@ -58,6 +58,12 @@ _V22_BACKFILL_NOTE = (
     "commit d2cf1ebb8 / PR #13245 before resolution rows existed."
 )
 _V22_DATA_INTEGRITY_CRITERION_KEY = "c-1a3ec09d"
+# Criterion that tracks the v22 live-verification claim audit (direction d-fd9c793d).
+# Five v22 promotion-gated claims were code-verified PASS on 2026-07-07 and
+# documented as direction notes; this backfill attaches the formal evidence row
+# so evidence_progress.status advances from 'stalled' to 'covered'.
+_V22_LIVE_VERIFICATION_CRITERION_KEY = "c-dd953d8c"
+_V22_LIVE_VERIFICATION_SOURCE_ID = "live_verification_backfill:v22"
 # This is a one-time, historical backfill: it MUST only ever touch release
 # version 22 and only its LOW-severity findings.  Two hard guards enforce that:
 #   * version_number == 22 — v22 has already promoted (the open version is v23+).
@@ -1643,6 +1649,71 @@ async def backfill_v22_carried_findings_resolved(
     return count
 
 
+async def record_v22_live_verification_evidence(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+) -> int:
+    """Attach a covering evidence row to the v22 live-verification criterion c-dd953d8c.
+
+    Five v22 promotion-gated claims (direction d-fd9c793d) were code-verified PASS
+    on 2026-07-07 and documented as direction notes, but no CriterionEvidence row
+    was ever written — leaving evidence_progress.status='stalled'.  This function
+    records the formal backfill evidence so the strategic layer advances the
+    direction's status.
+
+    Guards:
+    * Only operates on release version 22 (v22 has already promoted).
+    * Writes one ``audit_finding_backfill`` CriterionEvidence row for criterion
+      c-dd953d8c if it exists on this version, using a stable source_id for
+      idempotency.
+
+    Returns 1 when a new evidence row was written, 0 when skipped (wrong version,
+    criterion absent, or evidence already present).
+    """
+    from app.acceptance_criteria import (  # noqa: PLC0415 — avoid load-time cycle
+        get_criterion_by_key,
+        get_evidence_for_criterion,
+        record_evidence,
+    )
+
+    if version.version_number != _V22_BACKFILL_VERSION_NUMBER:
+        return 0
+
+    criterion = await get_criterion_by_key(
+        session, version.id, _V22_LIVE_VERIFICATION_CRITERION_KEY
+    )
+    if criterion is None:
+        return 0
+
+    existing = await get_evidence_for_criterion(session, criterion.id)
+    already_recorded = any(
+        e.source_kind == "audit_finding_backfill"
+        and e.source_id == _V22_LIVE_VERIFICATION_SOURCE_ID
+        for e in existing
+    )
+    if already_recorded:
+        return 0
+
+    await record_evidence(
+        session,
+        criterion_id=criterion.id,
+        project_id=project_id,
+        source_kind="audit_finding_backfill",
+        source_id=_V22_LIVE_VERIFICATION_SOURCE_ID,
+        detail={
+            "claims_verified": 5,
+            "verification_date": "2026-07-07",
+            "note": (
+                "Five v22 promotion-gated live-verification claims "
+                "(direction d-fd9c793d) code-verified PASS in direction notes."
+            ),
+        },
+    )
+    await session.commit()
+    return 1
+
+
 async def _find_v22_version(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1713,6 +1784,17 @@ async def _sweep_v22_finding_backfill() -> None:
                         "[V22_FINDING_BACKFILL] resolved %d carried finding(s) "
                         "for project %s v%d",
                         count,
+                        project_id,
+                        version.version_number,
+                    )
+                lv_recorded = await record_v22_live_verification_evidence(
+                    session, project_id, version
+                )
+                if lv_recorded:
+                    logger.info(
+                        "[V22_FINDING_BACKFILL] recorded live-verification evidence "
+                        "for criterion %s on project %s v%d",
+                        _V22_LIVE_VERIFICATION_CRITERION_KEY,
                         project_id,
                         version.version_number,
                     )

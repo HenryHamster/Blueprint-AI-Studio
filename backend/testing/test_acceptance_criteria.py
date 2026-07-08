@@ -4740,6 +4740,110 @@ async def test_backfill_v22_is_idempotent(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_record_v22_live_verification_evidence_attaches_row(db_session):
+    """record_v22_live_verification_evidence writes a covering evidence row for c-dd953d8c."""
+    from app.release_readiness import (
+        record_v22_live_verification_evidence,
+        _V22_LIVE_VERIFICATION_CRITERION_KEY,
+        _V22_LIVE_VERIFICATION_SOURCE_ID,
+    )
+
+    project = await _make_project(db_session, "V22LiveVerifEvidence")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_LIVE_VERIFICATION_CRITERION_KEY,
+        text="Live-verification: v22 promotion-gated claims verified PASS",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    recorded = await record_v22_live_verification_evidence(
+        db_session, project.id, version
+    )
+    assert recorded == 1
+
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 1
+    ev = evidence_rows[0]
+    assert ev.source_kind == "audit_finding_backfill"
+    assert ev.source_id == _V22_LIVE_VERIFICATION_SOURCE_ID
+    assert ev.detail["claims_verified"] == 5
+
+    coverage = ac.compute_criterion_coverage(evidence_rows)
+    assert coverage == "covered", f"expected 'covered'; got {coverage!r}"
+
+
+@pytest.mark.asyncio
+async def test_record_v22_live_verification_evidence_idempotent(db_session):
+    """record_v22_live_verification_evidence is a no-op when row already exists."""
+    from app.release_readiness import (
+        record_v22_live_verification_evidence,
+        _V22_LIVE_VERIFICATION_CRITERION_KEY,
+    )
+
+    project = await _make_project(db_session, "V22LiveVerifIdempotent")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_LIVE_VERIFICATION_CRITERION_KEY,
+        text="Live-verification: v22 promotion-gated claims verified PASS",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    first = await record_v22_live_verification_evidence(db_session, project.id, version)
+    second = await record_v22_live_verification_evidence(db_session, project.id, version)
+
+    assert first == 1
+    assert second == 0
+
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 1, (
+        f"expected exactly 1 evidence row after re-run; got {len(evidence_rows)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_v22_live_verification_evidence_wrong_version(db_session):
+    """record_v22_live_verification_evidence is a no-op for non-v22 versions."""
+    from app.release_readiness import (
+        record_v22_live_verification_evidence,
+        _V22_LIVE_VERIFICATION_CRITERION_KEY,
+    )
+
+    project = await _make_project(db_session, "V22LiveVerifWrongVer")
+    version = await _make_release_version(db_session, project, 23, status="open")
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_LIVE_VERIFICATION_CRITERION_KEY,
+        text="Live-verification: v22 promotion-gated claims verified PASS",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    recorded = await record_v22_live_verification_evidence(
+        db_session, project.id, version
+    )
+    assert recorded == 0
+
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 0
+
+
 # ---------------------------------------------------------------------------
 # direction_owns_uncovered_criterion — proven-merge completion coverage gate
 # ---------------------------------------------------------------------------
