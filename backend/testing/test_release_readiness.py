@@ -729,3 +729,108 @@ async def test_v22_backfill_count_match_does_not_enroll(db_session):
     assert len(items) == 0, (
         f"expected 0 divergence items when count matches; got {len(items)}"
     )
+
+
+@pytest.mark.asyncio
+async def test_v22_backfill_records_criterion_evidence_for_data_integrity(
+    db_session,
+):
+    """Named acceptance test: backfill records CriterionEvidence for c-1a3ec09d.
+
+    When the data-integrity criterion c-1a3ec09d exists on the v22 version,
+    calling backfill_v22_carried_findings_resolved must write exactly one
+    CriterionEvidence row with source_kind='audit_finding_backfill' and
+    source_id='d2cf1ebb8', proving the backfill covers the data-integrity
+    criterion.
+    """
+    from app.models import CriterionEvidence, VersionAcceptanceCriterion
+    from app.release_readiness import (
+        _V22_BACKFILL_RESOLVING_REF,
+        _V22_DATA_INTEGRITY_CRITERION_KEY,
+        _reset_v22_backfill_guard_for_tests,
+        backfill_v22_carried_findings_resolved,
+    )
+    from testing.test_acceptance_criteria import (
+        _make_project,
+        _make_release_version,
+        _make_v22_low_severity_findings,
+        _seed_v22_verdict,
+    )
+
+    _reset_v22_backfill_guard_for_tests()
+
+    project = await _make_project(db_session, "V22CriterionEvidence")
+    version = await _make_release_version(
+        db_session, project, 22, status="promoted"
+    )
+
+    # Seed the criterion the backfill targets.
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_DATA_INTEGRITY_CRITERION_KEY,
+        text="Data integrity: carried audit findings resolved",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    findings = _make_v22_low_severity_findings(13)
+    await _seed_v22_verdict(
+        db_session, project, version, findings, sha="cafebabe" + "0" * 32
+    )
+
+    count = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+    assert count == 13
+
+    # Query the CriterionEvidence written by the backfill.
+    from sqlmodel import select as _sel
+
+    evidence_rows = list(
+        (
+            await db_session.execute(
+                _sel(CriterionEvidence).where(
+                    CriterionEvidence.criterion_id == criterion.id,
+                    CriterionEvidence.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(evidence_rows) == 1, (
+        f"expected 1 CriterionEvidence row; got {len(evidence_rows)}"
+    )
+    ev = evidence_rows[0]
+    assert ev.source_kind == "audit_finding_backfill", (
+        f"expected source_kind='audit_finding_backfill'; got {ev.source_kind!r}"
+    )
+    assert ev.source_id == _V22_BACKFILL_RESOLVING_REF, (
+        f"expected source_id={_V22_BACKFILL_RESOLVING_REF!r}; got {ev.source_id!r}"
+    )
+    assert ev.detail is not None
+    assert ev.detail["finding_count"] == 13, (
+        f"expected finding_count=13; got {ev.detail['finding_count']}"
+    )
+
+    # Evidence must survive a second backfill call (idempotent — no duplicate).
+    await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+    evidence_after = list(
+        (
+            await db_session.execute(
+                _sel(CriterionEvidence).where(
+                    CriterionEvidence.criterion_id == criterion.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(evidence_after) == 1, (
+        f"idempotent: second call must not duplicate; got {len(evidence_after)} rows"
+    )

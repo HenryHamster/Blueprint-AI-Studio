@@ -1592,6 +1592,53 @@ async def compute_goal_coverage_drift_signal(
 # --------------------------------------------------------------------------- #
 
 
+async def _attach_v22_data_integrity_criterion_evidence(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+    finding_count: int,
+) -> bool:
+    """Attach CriterionEvidence to c-1a3ec09d for the v22 backfill (dedup-guarded).
+
+    Returns True when a new evidence row was written; False when the criterion
+    is absent or the evidence was already recorded.
+    """
+    from app.acceptance_criteria import (  # noqa: PLC0415 — avoid load-time cycle
+        get_criterion_by_key,
+        get_evidence_for_criterion,
+        record_evidence,
+    )
+
+    criterion = await get_criterion_by_key(
+        session, version.id, _V22_DATA_INTEGRITY_CRITERION_KEY
+    )
+    if criterion is None:
+        return False
+
+    existing = await get_evidence_for_criterion(session, criterion.id)
+    already_recorded = any(
+        e.source_kind == "audit_finding_backfill"
+        and e.source_id == _V22_BACKFILL_RESOLVING_REF
+        for e in existing
+    )
+    if already_recorded:
+        return False
+
+    await record_evidence(
+        session,
+        criterion_id=criterion.id,
+        project_id=project_id,
+        source_kind="audit_finding_backfill",
+        source_id=_V22_BACKFILL_RESOLVING_REF,
+        detail={
+            "resolving_ref": _V22_BACKFILL_RESOLVING_REF,
+            "finding_count": finding_count,
+            "note": _V22_BACKFILL_NOTE,
+        },
+    )
+    return True
+
+
 async def backfill_v22_carried_findings_resolved(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1623,12 +1670,6 @@ async def backfill_v22_carried_findings_resolved(
     Returns the number of low-severity resolution rows written (0 when the
     version is not v22 or it carries no low-severity findings).
     """
-    from app.acceptance_criteria import (  # noqa: PLC0415 — avoid load-time cycle
-        get_criterion_by_key,
-        get_evidence_for_criterion,
-        record_evidence,
-    )
-
     # Guard 1: only ever operate on release version 22.
     if version.version_number != _V22_BACKFILL_VERSION_NUMBER:
         return 0
@@ -1667,29 +1708,9 @@ async def backfill_v22_carried_findings_resolved(
 
     # Attach summary evidence to the data-integrity criterion if present on this
     # version.  Dedup-guarded so repeated ticks do not append duplicate rows.
-    criterion = await get_criterion_by_key(
-        session, version.id, _V22_DATA_INTEGRITY_CRITERION_KEY
+    await _attach_v22_data_integrity_criterion_evidence(
+        session, project_id, version, count
     )
-    if criterion is not None:
-        existing = await get_evidence_for_criterion(session, criterion.id)
-        already_recorded = any(
-            e.source_kind == "audit_finding_backfill"
-            and e.source_id == _V22_BACKFILL_RESOLVING_REF
-            for e in existing
-        )
-        if not already_recorded:
-            await record_evidence(
-                session,
-                criterion_id=criterion.id,
-                project_id=project_id,
-                source_kind="audit_finding_backfill",
-                source_id=_V22_BACKFILL_RESOLVING_REF,
-                detail={
-                    "resolving_ref": _V22_BACKFILL_RESOLVING_REF,
-                    "finding_count": count,
-                    "note": _V22_BACKFILL_NOTE,
-                },
-            )
 
     # Count guard: detect divergence between the number of low-severity
     # findings actually resolved and the expected constant (13), then log a
