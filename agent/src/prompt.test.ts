@@ -92,6 +92,7 @@ import {
 } from './prompt.js';
 import { getReadOnlyTaskTypes, getWriteTaskTypes } from './taskCapabilities.js';
 import { handlers } from './handlers/index.js';
+import { buildThinkerPrompt, type ThinkerPromptParams } from './prompts/thinker.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
 describe('formatPlaybook', () => {
@@ -5467,5 +5468,53 @@ describe('writePlaybookHelper live token resolution', () => {
     // Conditional keys omitted exactly as the old jq `if $br == "" then {}` did.
     expect('branch' in parsed).toBe(false);
     expect('head_sha' in parsed).toBe(false);
+  });
+});
+
+// ── thinker prompt contains criterion-coverage retirement warning ─────────────
+describe('thinker prompt contains criterion-coverage retirement warning', () => {
+  it('includes criterion-coverage check before retirement guidance in Section 3 (Moves)', () => {
+    const params: ThinkerPromptParams = {
+      contextPrefix: '',
+      projectName: 'Test Project',
+      clockHeader: 'Clock: 2026-05-04',
+      isSelfRepo: false,
+      userStateLine: 'User last active: today',
+      packerMetaSection: '',
+      strategicContext: '',
+      problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
+      problemModelRecovery: 'empty',
+      reflectionSection: '## What you previously said was hard\n_(no prior)_',
+      selfImprovementBlock: '',
+      runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
+      designDocJson: '',
+      visionJson: '',
+      outcomeSection: '',
+      previousDecisionOutcomes: '',
+      pastRetirementCritiquesSection: '',
+      retiredDirectionsSummarySection: '',
+      dirSummaryText: 'No active directions.',
+      dirHealthSummary: 'Active: 0/10 slots.',
+      userPausedSection: '',
+      rejectedProposalsSection: '',
+      operatorOverridesSection: '',
+      portfolioCompositionText: 'No active directions — portfolio is empty.',
+      modelHealthSection: '',
+      systemMaturitySection: '',
+      driftSection: '',
+      recentWorkSection: '',
+      feedbackSection: '',
+      questionSection: '',
+      threadSection: '',
+      taskId: 'test-task-999',
+      versionPhaseSection: '',
+      memoCitationsSection: '',
+      efficiencySnapshotSection: '',
+    };
+    const prompt = buildThinkerPrompt(params);
+    expect(prompt).toContain('Criterion-coverage check before retirement');
+    expect(prompt).toContain('direction_owns_uncovered_criterion');
+    expect(prompt).toContain('retract the orphaned criterion via Section 8');
+    expect(prompt).toContain('Do NOT retire a criterion-carrying direction without first addressing its criterion');
   });
 });
