@@ -59,6 +59,7 @@ yields no sentinels rather than crashing the gate.
 """
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -318,6 +319,62 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
     impacted |= _surface_sentinels(changed_list, repo_root)
 
     return sorted(impacted)
+
+
+def collect_first_party_patch_targets(testing_dir: str) -> "list[str]":
+    """Return sorted, deduplicated first-party mock.patch() string targets from tests.
+
+    Scans every ``test_*.py`` under *testing_dir* using AST to find
+    ``patch("app.*")`` calls. Excludes calls that carry ``create=True`` (those
+    intentionally name attributes that don't exist at module level). Returns the
+    unique targets sorted alphabetically, normalized to the ``app.*`` form (the
+    ``backend.`` prefix is stripped).
+
+    Used by the merge-gate invariant ``test_mock_patch_targets_resolve`` to
+    verify that every patched attribute still exists in its host module at PR time
+    rather than only at promotion-PR full-matrix time.
+    """
+    targets: "set[str]" = set()
+    if not os.path.isdir(testing_dir):
+        return []
+    for fname in os.listdir(testing_dir):
+        if not (fname.startswith("test_") and fname.endswith(".py")):
+            continue
+        fpath = os.path.join(testing_dir, fname)
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+            tree = ast.parse(source, filename=fname)
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            is_patch = (isinstance(func, ast.Attribute) and func.attr == "patch") or (
+                isinstance(func, ast.Name) and func.id == "patch"
+            )
+            if not is_patch:
+                continue
+            if any(
+                kw.arg == "create"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            ):
+                continue
+            if not node.args:
+                continue
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant) or not isinstance(
+                first_arg.value, str
+            ):
+                continue
+            raw = first_arg.value
+            normalized = raw[len("backend."):] if raw.startswith("backend.") else raw
+            if normalized.startswith("app.") and "." in normalized[4:]:
+                targets.add(normalized)
+    return sorted(targets)
 
 
 def _read_changed(paths_argv, stdin) -> "list[str]":

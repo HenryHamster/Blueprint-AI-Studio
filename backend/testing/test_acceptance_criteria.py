@@ -4425,6 +4425,111 @@ async def test_acceptance_window_recompute_is_idempotent(db_session):
     assert len(await ac.get_evidence_for_criterion(db_session, criterion.id)) == 1
 
 
+def test_large_pr_changed_files_not_silently_misclassified():
+    """A >50-file PR must not be silently misclassified when its test (or
+    production) paths fall beyond the 50-entry truncation window.
+
+    Regression guard for the silent-truncation bug: ``_pr_changed_files`` is
+    capped at 50 entries when stamped onto task context, but the acceptance
+    classifier and the ``named_test`` gate treated that list as complete, so a
+    dropped test path could flip ``inferred_test_cochange`` to ``undeclared`` or
+    a would-be proof to a merge that fails closed with no signal the input was
+    incomplete. ``stamp_changed_files_signal`` carries a non-lossy full-list
+    summary so classification is truncation-proof.
+    """
+    from app.acceptance_gate import (
+        REVIEW_LOOP_KEY,
+        classify_merged_acceptance_context,
+        evaluate_code_acceptance,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    # 55 production files, then the sole test file — the test path lands beyond
+    # the 50-entry truncation window.
+    prod_files = [f"backend/app/module_{i}.py" for i in range(55)]
+    test_file = "backend/testing/test_module_54.py"
+    changed_files = [*prod_files, test_file]
+
+    signal = stamp_changed_files_signal(changed_files)
+    # The stored list is genuinely truncated (the lossy window is real), yet the
+    # full-list summary preserves the acceptance-relevant signal.
+    assert len(signal["_pr_changed_files"]) == 50
+    assert test_file not in signal["_pr_changed_files"]
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    verified_ctx = {
+        LANDED_SIGNAL_KEY: True,
+        LANDED_ON_INTEGRATION_KEY: True,
+        **signal,
+    }
+    # With the non-lossy summary the genuine test co-change is credited...
+    assert (
+        classify_merged_acceptance_context(verified_ctx) == "inferred_test_cochange"
+    )
+
+    # ...whereas the old lossy behavior (bare truncated list, no summary) would
+    # have silently demoted the identical merge to "undeclared".
+    lossy_ctx = {
+        LANDED_SIGNAL_KEY: True,
+        LANDED_ON_INTEGRATION_KEY: True,
+        "_pr_changed_files": changed_files[:50],
+    }
+    assert classify_merged_acceptance_context(lossy_ctx) == "undeclared"
+
+    # named_test: the declared test shipped beyond the truncation point. Its
+    # absence from the stored list must be treated as indeterminate (crediting
+    # soft) rather than a definitive "test not added" that records
+    # satisfied=False and blocks the large merge from crediting as success.
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "large change",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": test_file,
+                },
+            }
+        ],
+        context={REVIEW_LOOP_KEY: {}, **signal},
+        status=TaskStatus.COMPLETED,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True, "truncated named_test must not block success"
+    assert verdict.proven is False, "cannot machine-prove a truncated-away test"
+    assert "truncat" in verdict.reason.lower()
+
+    # Control: without truncation the named_test gate is unaffected — a present,
+    # verified test with a production seam still proves.
+    small_signal = stamp_changed_files_signal(
+        ["backend/app/module_0.py", test_file]
+    )
+    assert "_pr_changed_files_truncated" not in small_signal
+    small_task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "small change",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": test_file,
+                },
+            }
+        ],
+        context={REVIEW_LOOP_KEY: {}, **small_signal},
+        status=TaskStatus.COMPLETED,
+    )
+    small_verdict = evaluate_code_acceptance(small_task)
+    assert small_verdict.satisfied is True
+    assert small_verdict.proven is True
+
+
 # ---------------------------------------------------------------------------
 # v22 carried-finding backfill
 # ---------------------------------------------------------------------------

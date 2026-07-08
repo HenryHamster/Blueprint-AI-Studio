@@ -10608,6 +10608,41 @@ def _find_test_funcs_matching(content: str, pattern: re.Pattern) -> list[str]:
     return offending
 
 
+_API_URL_RE = re.compile(r'["\'](/api/[a-z][^"\'\s?#{]*)["\']')
+
+
+def _find_unregistered_duplicated_contracts(
+    testing_dir: Path,
+    registry: dict,
+) -> list[tuple[str, list[str]]]:
+    """Return (url, [file_names]) for API URLs asserted in 2+ test files but not registered.
+
+    Scans test_*.py files for literal API URL strings and groups them by the set
+    of files whose test functions reference each URL.  URLs already covered by a
+    registry search_pattern are excluded — only unregistered cross-file duplicates
+    are returned so callers can fail fast when a new contradiction appears.
+    """
+    registered_patterns = [
+        re.compile(cfg["search_pattern"]) for cfg in registry.values()
+    ]
+
+    url_files: dict[str, list[str]] = {}
+    for test_file in sorted(testing_dir.glob("test_*.py")):
+        content = test_file.read_text()
+        seen: set[str] = set(_API_URL_RE.findall(content))
+        for url in seen:
+            url_files.setdefault(url, []).append(test_file.name)
+
+    violations: list[tuple[str, list[str]]] = []
+    for url, files in url_files.items():
+        if len(files) < 2:
+            continue
+        if any(pat.search(url) for pat in registered_patterns):
+            continue
+        violations.append((url, sorted(files)))
+    return violations
+
+
 class TestRouteContractOwnership:
     """Standalone guard: each endpoint's response-shape contract must live in
     exactly one owner test file (declared in route_contract_owners.json).
@@ -10746,6 +10781,40 @@ class TestRouteContractOwnership:
             "more than one test file, or lower the threshold with justification."
         )
 
+    def test_unregistered_endpoint_with_multiple_contract_assertions_fails(self):
+        """Verify _find_unregistered_duplicated_contracts catches cross-file violations.
+
+        Creates two synthetic test files that both assert the same unregistered API
+        endpoint, then confirms the helper returns that endpoint as a violation.
+        The registry is kept empty so the endpoint is definitely unregistered.
+        """
+        import tempfile
+
+        endpoint_url = "/api/admin/fake-widgets"
+        src_a = (
+            f'async def test_get_widgets(client):\n'
+            f'    r = await client.get("{endpoint_url}")\n'
+            f'    assert r.json()["widgets"]\n'
+        )
+        src_b = (
+            f'async def test_widget_list(client):\n'
+            f'    r = await client.get("{endpoint_url}")\n'
+            f'    assert r.json()["count"] == 0\n'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_alpha.py").write_text(src_a)
+            (tmpdir_path / "test_beta.py").write_text(src_b)
+
+            violations = _find_unregistered_duplicated_contracts(tmpdir_path, {})
+
+        assert any(endpoint_url in url for url, _ in violations), (
+            f"Expected '{endpoint_url}' (asserted in test_alpha.py and test_beta.py) "
+            f"to be flagged as an unregistered duplicate contract, but "
+            f"_find_unregistered_duplicated_contracts returned: {violations}"
+        )
+
 
 def test_no_deprecated_datetime_utcnow_calls():
     """No app/ file may call datetime.utcnow() — use _utcnow() from app.time_utils instead.
@@ -10870,4 +10939,59 @@ def test_orchestrator_health_vocab_guard_catches_injected_fake_type():
     assert unknown == {"__nonexistent_type__"}, (
         "Guard logic failed to detect the injected fake type '__nonexistent_type__'. "
         "The standing vocab check would silently pass on real drift."
+    )
+
+
+def test_mock_patch_targets_resolve():
+    """Every first-party mock.patch() string target in the test suite must resolve.
+
+    Uses ``impacted_tests.collect_first_party_patch_targets`` (production API) to
+    enumerate every ``patch("app.*")`` call across ``backend/testing/test_*.py``,
+    then resolves each to the module file it references (via the same AST-based
+    top-level-name check as ``_app_module_top_level_names``). A renamed or removed
+    attribute only surfaces at test-run time when the impacted-test selector
+    happens to include the patching file; this static check closes that gap at the
+    standalone merge gate.
+
+    ``create=True`` patches and targets whose module path does not map to a file
+    on disk (nested-import patterns such as ``app.storage.storage.Client``) are
+    excluded rather than flagged.
+    """
+    from testing import impacted_tests
+
+    testing_dir = Path(__file__).resolve().parent
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+
+    targets = impacted_tests.collect_first_party_patch_targets(str(testing_dir))
+
+    module_cache: dict[str, "set[str] | None"] = {}
+    failures: list[str] = []
+
+    for target in targets:
+        last_dot = target.rfind(".")
+        if last_dot == -1:
+            continue
+        module_dotted = target[:last_dot]
+        attr = target[last_dot + 1:]
+
+        if module_dotted not in module_cache:
+            module_cache[module_dotted] = _app_module_top_level_names(
+                app_dir, module_dotted
+            )
+
+        top_level = module_cache[module_dotted]
+        if top_level is None:
+            continue  # nested import pattern — not statically checkable
+        if attr not in top_level:
+            failures.append(
+                f"  '{target}' — '{attr}' not defined in {module_dotted}"
+            )
+
+    assert not failures, (
+        f"Stale mock-patch target(s) detected ({len(failures)} of {len(targets)}).\n"
+        "A renamed/removed attribute only fails at test run time when the "
+        "impacted-test selector happens to include the patching file.\n"
+        "Fix: update the patch target string to the current module.attribute path.\n\n"
+        + "\n".join(sorted(failures)[:50])
+        + ("" if len(failures) <= 50 else f"\n... and {len(failures) - 50} more")
     )

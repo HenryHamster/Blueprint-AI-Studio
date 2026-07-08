@@ -4655,3 +4655,42 @@ class UiLoadTimingSample(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
+
+
+class NotificationDeadLetter(SQLModel, table=True):
+    """Durable record of an external notification that failed to deliver.
+
+    The webhook retry queue is a bounded in-memory deque: entries are lost on
+    orchestrator restart, the oldest is silently evicted when the queue is
+    full, and a notification that exhausts its retries just disappears. When
+    either terminal outcome occurs, a row is written here so the failed
+    escalation is operator-visible and re-drivable instead of vanishing.
+
+    ``reason`` is ``"exhausted"`` (all retry attempts used up) or
+    ``"evicted"`` (dropped from the full retry queue to make room). ``payload``
+    and ``body`` preserve the original notification so it can be re-driven.
+    """
+
+    __tablename__ = "notification_dead_letter"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    event_type: str = Field(sa_column=Column(String(128), nullable=False))
+    reason: str = Field(sa_column=Column(String(16), nullable=False))
+    attempts: int = Field(default=0, sa_column=Column(Integer, nullable=False))
+    last_status: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    webhook_url: str = Field(default="", sa_column=Column(String(2048), nullable=False))
+    payload: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    body: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )

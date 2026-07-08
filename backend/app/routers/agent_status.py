@@ -91,6 +91,7 @@ from app.artifact_prerequisites import (
 )
 from app.landed_signal import merge_verification_status as _merge_verification_status
 from app.acceptance_gate import record_artifact_consumptions_for_task
+from app.acceptance_gate import stamp_changed_files_signal
 from app.time_utils import _utcnow, exponential_backoff, set_retry_after
 from app.agent_status_spawn import (
     _recover_poisoned_session,
@@ -1455,7 +1456,10 @@ async def update_agent_status(
                 ):
                     ctx = dict(task.context or {})
                     if payload.changed_files:
-                        ctx["_pr_changed_files"] = payload.changed_files[:50]
+                        # Non-lossy summary over the full list so a >50-file PR is
+                        # never silently misclassified by the acceptance classifier
+                        # (see acceptance_gate.stamp_changed_files_signal).
+                        ctx.update(stamp_changed_files_signal(payload.changed_files))
                         related = (
                             ctx.get("related_files")
                             or task.first_payload.get("related_files")
@@ -1508,7 +1512,11 @@ async def update_agent_status(
             ):
                 ctx = dict(task.context or {})
                 if payload.changed_files:
-                    ctx["_pr_changed_files"] = payload.changed_files[:50]
+                    # Truncating _pr_changed_files to 50 entries silently drops
+                    # paths the acceptance classifier treats as complete; carry
+                    # the non-lossy full-list summary so a >50-file PR is never
+                    # misclassified (see acceptance_gate.stamp_changed_files_signal).
+                    ctx.update(stamp_changed_files_signal(payload.changed_files))
                     related = (
                         ctx.get("related_files")
                         or task.first_payload.get("related_files")

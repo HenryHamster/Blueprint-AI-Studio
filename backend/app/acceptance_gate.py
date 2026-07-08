@@ -171,6 +171,29 @@ def _changed_files(task: Task) -> list[str]:
     return [p for p in raw if isinstance(p, str) and p.strip()]
 
 
+def stamp_changed_files_signal(paths: list[str]) -> dict[str, Any]:
+    """Non-lossy acceptance signal for a PR's changed-file paths.
+
+    ``_pr_changed_files`` is truncated to 50 entries when stamped onto task
+    context, but the acceptance classifier and the ``named_test`` gate treat that
+    list as complete. A >50-file PR could drop every test path (or the declared
+    test file) beyond index 50 and be silently misclassified — flipping
+    ``inferred_test_cochange`` to ``undeclared`` or a would-be proof to a merge
+    that fails closed. Compute the acceptance-relevant summary over the FULL list
+    here (whether any test path and any production path shipped, and whether the
+    stored list was truncated) so downstream classification is truncation-proof.
+    """
+    str_paths = [p for p in paths if isinstance(p, str) and p.strip()]
+    signal: dict[str, Any] = {
+        "_pr_changed_files": str_paths[:50],
+        "_pr_changed_files_has_test": any(_is_test_path(p) for p in str_paths),
+        "_pr_changed_files_has_prod": any(not _is_test_path(p) for p in str_paths),
+    }
+    if len(str_paths) > 50:
+        signal["_pr_changed_files_truncated"] = True
+    return signal
+
+
 def _is_test_path(path: str) -> bool:
     """Whether ``path`` names a test file (under a tests/testing dir or by name)."""
     return _looks_like_test_file(path)
@@ -213,7 +236,10 @@ def _merge_was_test_verified(task: Task) -> bool:
 
 
 def _evaluate_named_test(
-    evidence: AcceptanceEvidence, changed: list[str], verified: bool
+    evidence: AcceptanceEvidence,
+    changed: list[str],
+    verified: bool,
+    truncated: bool = False,
 ) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``named_test`` acceptance declaration.
 
@@ -225,10 +251,27 @@ def _evaluate_named_test(
     the changed seam, and an always-true assertion added in isolation is exactly
     that shape. Trivial / placeholder test references are already rejected
     fail-closed at declaration time by ``AcceptanceEvidence`` validation.
+
+    ``truncated`` marks that the changed-file list was capped (a >50-file PR): the
+    declared test may have shipped beyond the truncation point, so its absence
+    from ``changed`` is indeterminate rather than proof it was never added.
+    Recording ``satisfied=False`` there would penalize a large PR for a data
+    artifact and block its merge from crediting as success, so instead the merge
+    is credited soft (``satisfied=True, proven=False``) — the specific test could
+    not be machine-verified from the truncated input.
     """
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
     if not test_present:
+        if truncated:
+            return AcceptanceGateVerdict(
+                True,
+                True,
+                evidence.kind,
+                f"declared named_test {declared_path!r} could not be confirmed "
+                "among the PR's changed files because the changed-file list was "
+                "truncated (>50 files) — crediting soft without machine proof",
+            )
         return AcceptanceGateVerdict(
             True,
             False,
@@ -400,9 +443,10 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
 
     changed = _changed_files(task)
     verified = _merge_was_test_verified(task)
+    truncated = bool((task.context or {}).get("_pr_changed_files_truncated"))
 
     if evidence.kind == "named_test":
-        return _evaluate_named_test(evidence, changed, verified)
+        return _evaluate_named_test(evidence, changed, verified, truncated)
 
     if evidence.kind == "downstream_artifact":
         return _evaluate_downstream_artifact(evidence, changed)
@@ -547,11 +591,22 @@ def classify_merged_acceptance_context(context: Mapping[str, Any] | None) -> str
         # satisfied_unproven. A benign/degraded fall-open (CI did not actually
         # run) does NOT qualify — test presence is moot without verification.
         if _context_merge_verification_status(context) == "verified":
-            changed = (context or {}).get("_pr_changed_files")
+            ctx = context or {}
+            changed = ctx.get("_pr_changed_files")
             if isinstance(changed, list):
-                str_paths = [p for p in changed if isinstance(p, str) and p.strip()]
-                has_test = any(_is_test_path(p) for p in str_paths)
-                has_prod = any(not _is_test_path(p) for p in str_paths)
+                # Prefer the non-lossy full-list summary (stamped by
+                # stamp_changed_files_signal) so a >50-file PR whose test or
+                # production paths fall beyond the truncation point is not
+                # silently demoted to "undeclared". Legacy rows lack the summary
+                # and fall back to scanning the (possibly truncated) list.
+                has_test = ctx.get("_pr_changed_files_has_test")
+                has_prod = ctx.get("_pr_changed_files_has_prod")
+                if not isinstance(has_test, bool) or not isinstance(has_prod, bool):
+                    str_paths = [
+                        p for p in changed if isinstance(p, str) and p.strip()
+                    ]
+                    has_test = any(_is_test_path(p) for p in str_paths)
+                    has_prod = any(not _is_test_path(p) for p in str_paths)
                 if has_test and has_prod:
                     return "inferred_test_cochange"
         return "undeclared"

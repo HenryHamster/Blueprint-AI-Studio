@@ -542,6 +542,100 @@ def test_enqueue_retry_logs_on_maxlen_eviction(caplog):
     assert len(nd._retry_queue) == nd._RETRY_QUEUE_MAXLEN
 
 
+@pytest.mark.asyncio
+async def test_exhausted_or_evicted_notification_writes_dead_letter(db_session):
+    """A notification that exhausts its retries OR is evicted from the full
+    in-memory queue must leave a durable, re-drivable NotificationDeadLetter
+    row instead of silently vanishing."""
+    from app.models import NotificationDeadLetter
+    from sqlmodel import select as _select
+
+    _reset_stats()
+    pid = uuid.uuid4()
+
+    # --- Exhausted path: a final-attempt retry that keeps failing (503) ---
+    nd._retry_queue.append(
+        _RetryEntry(
+            project_id=pid,
+            event_type="exhausted_event",
+            payload={"k": "v"},
+            body={"event_type": "exhausted_event"},
+            attempts=len(_RETRY_DELAYS) - 1,  # last attempt — next failure exhausts
+            next_retry_at=time.monotonic() - 1,  # due now
+            webhook_url="https://dest.example.com/hook",
+        )
+    )
+    with patch(
+        "app.notification_dispatch._attempt_delivery", new=AsyncMock(return_value=503)
+    ):
+        await nd._drain_retry_queue("https://dest.example.com/hook")
+
+    exhausted = (
+        (
+            await db_session.execute(
+                _select(NotificationDeadLetter).where(
+                    NotificationDeadLetter.project_id == str(pid),
+                    NotificationDeadLetter.reason == "exhausted",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(exhausted) == 1
+    row = exhausted[0]
+    assert row.event_type == "exhausted_event"
+    assert row.last_status == 503
+    assert row.attempts == len(_RETRY_DELAYS)  # attempts+1, all attempts used
+    assert row.payload == {"k": "v"}
+    assert row.webhook_url == "https://dest.example.com/hook"
+    assert len(nd._retry_queue) == 0  # exhausted entry not re-queued
+
+    # --- Evicted path: overflowing the bounded queue drops the oldest entry ---
+    nd._retry_queue.clear()
+    for i in range(nd._RETRY_QUEUE_MAXLEN):
+        nd._retry_queue.append(
+            _RetryEntry(
+                project_id=pid,
+                event_type=f"filler_{i}",
+                payload={},
+                body={},
+                attempts=0,
+                next_retry_at=time.monotonic() + 9999,
+                webhook_url="https://h",
+            )
+        )
+    # Enqueuing one more entry evicts the oldest (filler_0) — it must be dead-lettered.
+    await nd._enqueue_retry_durable(
+        _RetryEntry(
+            project_id=pid,
+            event_type="overflow",
+            payload={"o": 1},
+            body={},
+            attempts=0,
+            next_retry_at=time.monotonic() + 9999,
+            webhook_url="https://h",
+        )
+    )
+
+    evicted = (
+        (
+            await db_session.execute(
+                _select(NotificationDeadLetter).where(
+                    NotificationDeadLetter.project_id == str(pid),
+                    NotificationDeadLetter.reason == "evicted",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(evicted) == 1
+    assert evicted[0].event_type == "filler_0"
+    # The bounded queue stays capped after the overflow append.
+    assert len(nd._retry_queue) == nd._RETRY_QUEUE_MAXLEN
+
+
 # ---------------------------------------------------------------------------
 # get_notification_stats
 # ---------------------------------------------------------------------------
