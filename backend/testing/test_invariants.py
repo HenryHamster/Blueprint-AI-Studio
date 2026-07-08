@@ -11517,3 +11517,123 @@ def test_v22_live_verification_evidence_wired_in_sweep():
         "The live-verification evidence backfill is effectively disabled — "
         "restore the call site."
     )
+
+
+def test_all_autocomplete_paths_gate_on_criterion_coverage():
+    """All direction auto-complete paths must gate on criterion coverage.
+
+    Regression guard: a direction that owns an uncovered acceptance criterion
+    must not auto-complete through any path — exhaustion (saturated / dedup
+    deadlock / already-fixed deadlock) or proven-merge (>=3 verified merges).
+    This invariant verifies structurally that every auto-complete code path in
+    research_direction_state.py checks ``direction_owns_uncovered_criterion``
+    before retiring a direction.
+
+    The module-level frozenset ``_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE``
+    declares the gated paths. Removing the gate from either function, or removing
+    the frozenset declaration, causes this test to fail.
+    """
+    import ast
+    from pathlib import Path
+
+    rds_path = Path(__file__).resolve().parents[1] / "app" / "research_direction_state.py"
+    source = rds_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(rds_path))
+
+    gate_func_name = "direction_owns_uncovered_criterion"
+
+    # ── 1. Verify the module-level frozenset declaration exists ───────────
+    frozenset_found = False
+    frozenset_entries: set[str] = set()
+    for stmt in ast.iter_child_nodes(tree):
+        target_name: str | None = None
+        value_node: ast.expr | None = None
+        if isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name) and t.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
+                    target_name = t.id
+                    value_node = stmt.value
+                    break
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            if stmt.target.id == "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE":
+                target_name = stmt.target.id
+                value_node = stmt.value
+        if target_name is None:
+            continue
+        frozenset_found = True
+        # Extract the declared path names from the frozenset literal
+        if isinstance(value_node, ast.Call):
+            # frozenset({...}) or frozenset([...])
+            if isinstance(value_node.func, ast.Name) and value_node.func.id == "frozenset":
+                container = value_node.args[0] if value_node.args else None
+                if isinstance(container, (ast.Set, ast.List, ast.Tuple)):
+                    for elt in container.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            frozenset_entries.add(elt.value)
+        break
+
+    assert frozenset_found, (
+        "_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE frozenset is missing from "
+        "research_direction_state.py. This constant declares which auto-complete paths "
+        "are criterion-gated. Restore it."
+    )
+    assert frozenset_entries >= {"exhaustion", "proven_merge"}, (
+        f"_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE must contain at least "
+        f"{{'exhaustion', 'proven_merge'}}; found {frozenset_entries}. "
+        "Restore the missing entries."
+    )
+
+    # ── 2. Verify exhaustion path: _maybe_autocomplete_exhausted_direction ─
+    exhaustion_func: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_maybe_autocomplete_exhausted_direction":
+            exhaustion_func = node
+            break
+
+    assert exhaustion_func is not None, (
+        "_maybe_autocomplete_exhausted_direction not found in research_direction_state.py"
+    )
+
+    exhaustion_gated = False
+    for node in ast.walk(exhaustion_func):
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            if _ast_called_name(node.value) == gate_func_name:
+                exhaustion_gated = True
+                break
+        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
+            exhaustion_gated = True
+            break
+
+    assert exhaustion_gated, (
+        "_maybe_autocomplete_exhausted_direction does not call "
+        "direction_owns_uncovered_criterion. The exhaustion auto-complete path "
+        "(saturated / dedup-deadlock / already-fixed-deadlock) must gate on "
+        "criterion coverage before retiring a direction."
+    )
+
+    # ── 3. Verify proven-merge path: apply_post_spawn_state ───────────────
+    proven_func: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "apply_post_spawn_state":
+            proven_func = node
+            break
+
+    assert proven_func is not None, (
+        "apply_post_spawn_state not found in research_direction_state.py"
+    )
+
+    proven_gated = False
+    for node in ast.walk(proven_func):
+        if isinstance(node, ast.Call) and _ast_called_name(node) == gate_func_name:
+            proven_gated = True
+            break
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            if _ast_called_name(node.value) == gate_func_name:
+                proven_gated = True
+                break
+
+    assert proven_gated, (
+        "apply_post_spawn_state does not call direction_owns_uncovered_criterion. "
+        "The proven-merge auto-complete path must gate on criterion coverage before "
+        "retiring a direction."
+    )

@@ -4322,6 +4322,31 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _combined_suffix = (
                 _combined_suffix + ("\n" if _combined_suffix else "") + type_suffix
             )
+        # When the direction carries active acceptance criteria, inject a
+        # criterion_keys warning into the spawned task's prompt_suffix so the
+        # implementing agent knows findings must declare named_test evidence.
+        # Without this upfront signal the research agent unknowingly omits the
+        # evidence field and the spawn loop hard-rejects the finding, wasting
+        # one full research cycle per occurrence.
+        _suffix_crit_dir_id = direction_id or _parent_direction_id
+        _suffix_criterion_ids = _direction_criterion_cache.get(
+            _suffix_crit_dir_id or "", []
+        )
+        if _suffix_criterion_ids:
+            _criterion_suffix = (
+                "\n\nCRITICAL: This direction has active acceptance criteria. "
+                "Every finding must declare acceptance_evidence with "
+                "kind 'named_test' and a test_path naming the test that "
+                "verifies the change. Findings without this evidence are "
+                "rejected at spawn time.\n"
+                'Include in each finding:\n'
+                '  acceptance_evidence: {kind: "named_test", test_path: "path/to/test.py"}'
+            )
+            _combined_suffix = (
+                _combined_suffix + _criterion_suffix
+                if _combined_suffix
+                else _criterion_suffix.lstrip("\n")
+            )
         # Scope-aware effort override for implementation task types: the scope
         # (calibrated through history/heuristic/low-confidence/retry) drives the
         # baseline effort — small→low, medium→medium, large→high — replacing

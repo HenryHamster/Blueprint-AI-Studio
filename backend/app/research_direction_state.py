@@ -75,6 +75,22 @@ _CHALLENGE_AGREEMENT_BUCKETS = (
     CHALLENGE_INDETERMINATE,
 )
 
+# ── Criterion-coverage gate: auto-complete paths ──────────────────────────
+# Directions auto-complete through two paths: exhaustion (saturated / dedup
+# deadlock / already-fixed deadlock) and proven-merge (>=3 verified merges).
+# Both paths must call direction_owns_uncovered_criterion before retiring a
+# direction — a criterion-carrying direction with an uncovered criterion must
+# not reach success_evidence_met, saturated, or deadlock completion. This
+# frozenset declares the gated paths; the invariant test
+# test_all_autocomplete_paths_gate_on_criterion_coverage in test_invariants.py
+# verifies structurally that both paths contain the gate call.
+_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
+    {
+        "exhaustion",  # _maybe_autocomplete_exhausted_direction (L285)
+        "proven_merge",  # apply_post_spawn_state >=3-merge completion (L970)
+    }
+)
+
 
 def _empty_finding_challenge_summary() -> dict:
     return {

@@ -9450,6 +9450,127 @@ class TestAcceptanceEvidencePropagation:
             f"got {child.first_payload.get('acceptance_evidence')!r}"
         )
 
+    @_pytest.mark.asyncio
+    async def test_criterion_keys_warning_injected_into_research_context(
+        self, db_session, mocker
+    ):
+        """When a direction carries active criterion_keys and a finding is
+        spawned, the child task's prompt_suffix must include a criterion_keys
+        warning so the implementing agent knows to declare named_test
+        acceptance evidence in its output. Without this upfront signal the
+        agent wastes a full research cycle before the rejection gate fires."""
+        from app.models import Direction as _Direction, ReleaseVersion
+        from app import acceptance_criteria as _ac
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _patch_research_externals,
+        )
+
+        direction_id = "d-crit-warn-01"
+        direction_data = _active_direction(
+            direction_id, "Criterion warning direction"
+        )
+        project = _Project(
+            name="CritWarn Project",
+            user_id="test-user-crit-warn",
+            autonomous_enabled=True,
+            directions=[direction_data],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        version = ReleaseVersion(
+            project_id=project.id, version_number=1, status="open"
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        criterion = await _ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text="All endpoints documented",
+            created_by="strategist",
+        )
+
+        dir_row = _Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            data=direction_data,
+            status="active",
+            criterion_keys=[criterion.criterion_key],
+        )
+        db_session.add(dir_row)
+        await db_session.commit()
+
+        task = _Task(
+            project_id=project.id,
+            title="Research: Criterion warning direction",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [direction_data],
+                    "base_branch": "main",
+                }
+            ],
+            context={"research_depth": 0, "direction_id": direction_id},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        finding = _make_finding(
+            title="Finding with named_test for warning injection",
+            direction_id=direction_id,
+        )
+        finding["acceptance_evidence"] = {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        }
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1, (
+            "expected exactly one spawned child task; "
+            f"got {len(children)}"
+        )
+        child = children[0]
+        prompt_suffix = child.first_payload.get("prompt_suffix") or ""
+        assert "acceptance_evidence" in prompt_suffix, (
+            "child prompt_suffix must contain criterion_keys warning "
+            "about acceptance_evidence requirement; "
+            f"got {prompt_suffix!r}"
+        )
+        assert "named_test" in prompt_suffix, (
+            "child prompt_suffix must mention named_test evidence kind; "
+            f"got {prompt_suffix!r}"
+        )
+
+
 
 # ── Shared capability vocabulary: off-registry advisory marking ───────────────
 # A declared prerequisite / provides_capability capability ref that is NOT in the
