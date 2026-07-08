@@ -779,6 +779,51 @@ async def _maybe_create_local_runner_hold_alert(
     return True
 
 
+async def _resolve_local_runner_hold_alert(
+    session: AsyncSession,
+    task_id: "uuid.UUID",
+) -> int:
+    """Dismiss any open compute-hold alert when a held task finally dispatches.
+
+    The companion to :func:`_maybe_create_local_runner_hold_alert`. Called from
+    the runner-dispatch path when a ``require-local`` compute task that was held
+    >15 min is successfully pinned to a runner: the WARNING alert that flagged
+    the stranded hold no longer describes a real condition, so it is resolved —
+    mirroring how :func:`_resolve_runner_deactivated_alert` and
+    :func:`_resolve_runner_degraded_alert` dismiss their alerts on recovery.
+
+    Looks the open alert up by ``(task_id, title, dismissed_at IS NULL)`` (the
+    same compound key the create path uses for dedup), stamps ``dismissed_at``,
+    commits its own row, and broadcasts ``alert_dismissed``. Only open
+    (``dismissed_at IS NULL``) alerts are touched, so this is a safe idempotent
+    no-op when none exists. Returns the number of alerts dismissed (0 or 1 in
+    practice). Best-effort: a resolve failure must never abort the dispatch that
+    triggered it.
+    """
+    result = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task_id,
+            Alert.title == _LOCAL_RUNNER_HOLD_ALERT_TITLE,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(alert.project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE = "runner.fleet_no_healthy"
 
 

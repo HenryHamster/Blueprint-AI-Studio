@@ -6,6 +6,8 @@ Covers the graceful side of ``require_local_runner``:
     require-local project can never wedge forever when the operator's hardware
     stays offline.
   * ``_try_runner_dispatch`` clearing a stale hold stamp on the pin path.
+  * ``_resolve_local_runner_hold_alert`` — dismissing the hold alert when the
+    held task finally dispatches.
 
 The hold-stamping side (keeping the task QUEUED instead of provisioning it in
 the cloud) lives inline in the orchestrator dispatch loop, which is not unit
@@ -15,6 +17,7 @@ compute_jobs defense-in-depth rejection that other modules own.
 
 import uuid
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlmodel import select
@@ -450,3 +453,92 @@ class TestHoldStrategicLocalRunnerTask:
         assert (
             task.context or {}
         ).get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY) is not None
+
+
+class TestResolveLocalRunnerHoldAlert:
+    """_resolve_local_runner_hold_alert — dismissing the companion hold alert
+    when a held require-local compute task is finally pinned to a runner."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_dismisses_open_hold_alert(self, db_session, mocker):
+        """Seed an open hold alert, call resolve, verify dismissed_at is set and
+        alert_dismissed is broadcast."""
+        from app.alert_dispatch import (
+            _LOCAL_RUNNER_HOLD_ALERT_TITLE,
+            _resolve_local_runner_hold_alert,
+        )
+
+        bcast = mocker.patch(
+            "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+        )
+
+        project = await _make_project(db_session)
+        task = await _make_held_task(db_session, project.id, held_ago_seconds=120)
+
+        # Seed an open hold alert as _maybe_create_local_runner_hold_alert would.
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title=_LOCAL_RUNNER_HOLD_ALERT_TITLE,
+            message="A require-local compute experiment has been waiting...",
+            domain="core",
+            task_id=task.id,
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+
+        assert alert.dismissed_at is None
+
+        dismissed = await _resolve_local_runner_hold_alert(db_session, task.id)
+        assert dismissed == 1
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is not None, "alert must be dismissed"
+
+        # Broadcast fires alert_dismissed once.
+        dismiss_calls = [
+            c for c in bcast.call_args_list if c.args[1] == "alert_dismissed"
+        ]
+        assert len(dismiss_calls) == 1
+        assert dismiss_calls[0].args[2]["alert_id"] == str(alert.id)
+        assert dismiss_calls[0].args[2]["title"] == _LOCAL_RUNNER_HOLD_ALERT_TITLE
+
+    @pytest.mark.asyncio
+    async def test_resolve_is_noop_without_open_alert(self, db_session):
+        """_resolve_local_runner_hold_alert returns 0 when no open hold alert exists."""
+        from app.alert_dispatch import _resolve_local_runner_hold_alert
+
+        project = await _make_project(db_session)
+        task = await _make_held_task(db_session, project.id, held_ago_seconds=120)
+
+        dismissed = await _resolve_local_runner_hold_alert(db_session, task.id)
+        assert dismissed == 0
+
+    @pytest.mark.asyncio
+    async def test_resolve_is_idempotent(self, db_session):
+        """Second resolve call is a no-op — returns 0 when alert is already dismissed."""
+        from app.alert_dispatch import (
+            _LOCAL_RUNNER_HOLD_ALERT_TITLE,
+            _resolve_local_runner_hold_alert,
+        )
+
+        project = await _make_project(db_session)
+        task = await _make_held_task(db_session, project.id, held_ago_seconds=120)
+
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title=_LOCAL_RUNNER_HOLD_ALERT_TITLE,
+            message="A require-local compute experiment has been waiting...",
+            domain="core",
+            task_id=task.id,
+        )
+        db_session.add(alert)
+        await db_session.commit()
+
+        first = await _resolve_local_runner_hold_alert(db_session, task.id)
+        second = await _resolve_local_runner_hold_alert(db_session, task.id)
+
+        assert first == 1
+        assert second == 0, "second resolve is a no-op — alert already dismissed"

@@ -402,6 +402,17 @@ async def _try_runner_dispatch(
         task_type,
         runner.id,
     )
+    # If this task was held >15 min waiting for a runner, the hold alert that
+    # flagged the stall is now stale — dismiss it. Best-effort: a resolve
+    # failure must never abort a successful dispatch.
+    try:
+        from app.alert_dispatch import _resolve_local_runner_hold_alert
+
+        await _resolve_local_runner_hold_alert(session, task.id)
+    except Exception:
+        logger.exception(
+            "[RUNNERS] Failed to dismiss hold alert for task %s (non-fatal)", task.id
+        )
     return True
 
 
@@ -927,6 +938,17 @@ async def _dispatch_compute_experiment_directly(
     if runner is not None:
         runner_pins_this_cycle[runner.id] = (
             runner_pins_this_cycle.get(runner.id, 0) + 1
+        )
+    # If this task was held >15 min waiting for a runner, the hold alert that
+    # flagged the stall is now stale — dismiss it. Best-effort: a resolve
+    # failure must never abort a successful dispatch.
+    try:
+        from app.alert_dispatch import _resolve_local_runner_hold_alert
+
+        await _resolve_local_runner_hold_alert(session, task.id)
+    except Exception:
+        logger.exception(
+            "[RUNNERS] Failed to dismiss hold alert for task %s (non-fatal)", task.id
         )
 
     # ── Park the task on the job-terminal wake (releases its slot now) ─────────
