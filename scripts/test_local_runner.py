@@ -314,6 +314,32 @@ class TestLowDiskGuard(unittest.TestCase):
             self.assertFalse(local_runner._disk_below_min("/some/root", 1000))
 
 
+# ── Stale workspace cleanup ────────────────────────────────────────────────────
+
+class TestStaleWorkspaceCleanup(unittest.TestCase):
+    def test_stale_workspace_cleanup_removes_old_dirs(self):
+        """Cleanup removes workspace dirs not matching any active task id."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                stale_a = os.path.join(tmpdir, "task_stale_1")
+                stale_b = os.path.join(tmpdir, "task_stale_2")
+                active_dir = os.path.join(tmpdir, "task_active_1")
+                for d in (stale_a, stale_b, active_dir):
+                    os.makedirs(d)
+
+                # "task/active:1" sanitizes to "task_active_1" — matching active_dir
+                removed = local_runner._cleanup_stale_workspaces(
+                    {"task/active:1"}, max_age_seconds=0
+                )
+
+                self.assertEqual(removed, 2)
+                self.assertFalse(os.path.isdir(stale_a))
+                self.assertFalse(os.path.isdir(stale_b))
+                self.assertTrue(os.path.isdir(active_dir))
+
+
 # ── Startup summary ───────────────────────────────────────────────────────────
 
 class TestStartupSummary(unittest.TestCase):
@@ -3161,6 +3187,49 @@ class TestCredentialPersistence(unittest.TestCase):
     def test_save_and_load_roundtrip(self):
         local_runner._save_runner_token("tok-abc123-test")
         self.assertEqual(local_runner._load_runner_token(), "tok-abc123-test")
+
+    def test_save_load_runner_token_roundtrip(self):
+        """Comprehensive save/load roundtrip verifying credential persistence,
+        directory permissions (0700), and file permissions (0600).
+
+        Exercises the hardened _save_runner_token which now chmods the credential
+        directory, and the cross-module agreement with blueprint_runner._credential_dir.
+        """
+        import blueprint_runner as br
+
+        # Verify the two modules agree on the credential directory (shared contract).
+        self.assertEqual(
+            local_runner._credential_dir(),
+            br._credential_dir(),
+            "local_runner._credential_dir() and blueprint_runner._credential_dir() "
+            "must agree so the runner writes and the launcher reads from the same place.",
+        )
+
+        # Save a token and reload it — the basic round-trip.
+        token = "tok-roundtrip-verify-123"
+        local_runner._save_runner_token(token)
+        self.assertEqual(local_runner._load_runner_token(), token)
+
+        # Credential directory must be 0700 (hardened by the production change).
+        cred_dir = local_runner._credential_dir()
+        dir_mode = os.stat(cred_dir).st_mode & 0o777
+        self.assertEqual(dir_mode, 0o700,
+                        f"credential dir must be 0700, got {oct(dir_mode)}")
+
+        # Token file must be 0600.
+        path = local_runner._credential_path()
+        file_mode = os.stat(path).st_mode & 0o777
+        self.assertEqual(file_mode, 0o600,
+                        f"token file must be 0600, got {oct(file_mode)}")
+
+        # Overwrite with a new token and verify the latest value.
+        local_runner._save_runner_token("updated-token")
+        self.assertEqual(local_runner._load_runner_token(), "updated-token")
+
+        # The credential dir permissions must survive the overwrite.
+        dir_mode2 = os.stat(cred_dir).st_mode & 0o777
+        self.assertEqual(dir_mode2, 0o700,
+                        f"credential dir permissions must survive overwrite, got {oct(dir_mode2)}")
 
     def test_file_permissions_0600(self):
         local_runner._save_runner_token("tok-secret")

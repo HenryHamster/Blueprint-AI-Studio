@@ -218,6 +218,10 @@ def _save_runner_token(token: str) -> None:
     path = _credential_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            os.chmod(os.path.dirname(path), 0o700)
+        except OSError:
+            pass
         fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
         try:
             os.write(fd, token.encode())
@@ -839,6 +843,7 @@ def _reap_loop(
     thread (a dead reaper would leak capacity permits forever); the ``main()``
     supervisor makes an actually-dead thread fatal.
     """
+    _cleanup_tick = 0
     while not _shutdown_event.is_set():
         try:
             now = time.monotonic()
@@ -906,6 +911,15 @@ def _reap_loop(
                     telemetry.record_failure()
                 # Terminated overdue agent is done too — reap its workspace.
                 _cleanup_agent_workspace(tid)
+
+            # Periodic stale workspace cleanup (every ~60 s).
+            _cleanup_tick += 1
+            if _cleanup_tick % 30 == 0:
+                with lock:
+                    active_ids = set(active_tasks.keys())
+                removed = _cleanup_stale_workspaces(active_ids)
+                if removed:
+                    print(f"[runner] cleaned up {removed} stale workspace(s)", flush=True)
         except Exception as exc:  # noqa: BLE001 — never let the reaper thread die silently
             print(f"[runner] reap loop error (continuing): {exc}", flush=True)
         time.sleep(2)
@@ -2004,6 +2018,36 @@ def _workspace_writable(root: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def _cleanup_stale_workspaces(active_task_ids: set, max_age_seconds: float = 300) -> int:
+    """Remove per-task workspace dirs that are not in *active_task_ids* and older than *max_age_seconds*."""
+    root = _workspace_root()
+    if not os.path.isdir(root):
+        return 0
+    active_dirs: set[str] = set()
+    for tid in active_task_ids:
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in tid)
+        if safe:
+            active_dirs.add(safe)
+    now = time.time()
+    removed = 0
+    try:
+        for name in os.listdir(root):
+            if name in active_dirs:
+                continue
+            dirpath = os.path.join(root, name)
+            if not os.path.isdir(dirpath):
+                continue
+            try:
+                if (now - os.stat(dirpath).st_mtime) >= max_age_seconds:
+                    shutil.rmtree(dirpath, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return removed
 
 
 def _compute_backend_summary(caps: "iso.Capabilities") -> str:

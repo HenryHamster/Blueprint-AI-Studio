@@ -587,6 +587,11 @@ class RenderUnitTests(unittest.TestCase):
                 {"@PYTHON@": "/usr/bin/python3"},  # @LOCAL_RUNNER@ etc. left unsubstituted
             )
 
+    def test_missing_template_raises_filenotfounderror(self):
+        """render_unit raises FileNotFoundError when the template path does not exist."""
+        with self.assertRaises(FileNotFoundError):
+            br.render_unit("/nonexistent/template.service", {"@TOKEN@": "value"})
+
 
 class InstallTests(unittest.TestCase):
     def setUp(self):
@@ -731,6 +736,104 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(any("daemon-reload" in " ".join(c) for c in calls))
         self.assertFalse(any("enable" in " ".join(c) for c in calls))
 
+    def test_missing_template_returns_nonzero(self):
+        """do_install returns rc=1 when the unit template file is absent."""
+        run = _systemctl_recorder()
+        patches = self._patch_paths()
+        # Patch the module-level template constant to a nonexistent path so
+        # do_install's os.path.isfile check returns False.
+        patches.append(patch.object(br, "_USER_SERVICE_TEMPLATE",
+                                     "/nonexistent/template.service"))
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(system=False, token=None, url="https://o", _run=run)
+            self.assertEqual(rc, 1)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_unit_write_oserror_returns_nonzero(self):
+        """do_install returns rc=1 when writing the unit file raises OSError."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        patches = self._patch_paths()
+        patches.append(patch.object(br, "_write_env_file", return_value=None))
+        for p in patches:
+            p.start()
+        try:
+            # Only fail on the unit_path write, allowing template and env writes.
+            real_open = open
+            def selective_open(path, *args, **kwargs):
+                if isinstance(path, str) and path == self.unit_path:
+                    raise OSError("disk full")
+                return real_open(path, *args, **kwargs)
+
+            with patch("builtins.open", side_effect=selective_open):
+                rc = br.do_install(
+                    system=False, token="t", url="https://o", _run=run
+                )
+            self.assertEqual(rc, 1)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_write_env_file_chmod_failure_not_fatal(self):
+        """_write_env_file survives os.chmod failures (both dir and file)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env_path = os.path.join(tmpdir, "runner.env")
+            # Cause both chmod calls to raise OSError — must not propagate.
+            with patch("os.chmod", side_effect=OSError("permission denied")):
+                br._write_env_file(env_path, url="https://o.example", token="my-tok")
+            # File must still exist and contain the expected content.
+            self.assertTrue(os.path.isfile(env_path))
+            content = Path(env_path).read_text()
+            self.assertIn("BLUEPRINT_ORCHESTRATOR_URL=https://o.example", content)
+            self.assertIn("BLUEPRINT_RUNNER_TOKEN=my-tok", content)
+
+    def test_install_user_honors_sudo_user(self):
+        """_install_user returns SUDO_USER when set, taking precedence over USER."""
+        with patch.dict("os.environ", {
+            "SUDO_USER": "realop",
+            "USER": "root",
+        }):
+            self.assertEqual(br._install_user(), "realop")
+
+    def test_install_user_falls_back_to_user(self):
+        """_install_user returns USER when SUDO_USER is not set."""
+        with patch.dict("os.environ", {"USER": "agent"}, clear=True):
+            self.assertEqual(br._install_user(), "agent")
+
+    def test_systemd_available_rejects_dbus_failure_in_stderr(self):
+        """_systemd_available returns False when stderr contains D-Bus failure."""
+        def fake_run(argv, capture_output=True, text=True):
+            return MagicMock(
+                returncode=1,
+                stdout="degraded",
+                stderr="Failed to connect to bus: No such file or directory",
+            )
+
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"):
+            self.assertFalse(br._systemd_available(system=False, _run=fake_run))
+
+    def test_systemd_available_rejects_dbus_get_error_in_stderr(self):
+        """_systemd_available returns False for 'Failed to get D-Bus' in stderr."""
+        def fake_run(argv, capture_output=True, text=True):
+            return MagicMock(
+                returncode=1,
+                stdout="",
+                stderr="Failed to get D-Bus connection: Connection refused",
+            )
+
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"):
+            self.assertFalse(br._systemd_available(system=True, _run=fake_run))
+
+    def test_systemd_available_false_when_systemctl_absent(self):
+        """_systemd_available returns False when systemctl is not on PATH."""
+        with patch.object(br.shutil, "which", return_value=None):
+            self.assertFalse(br._systemd_available(system=False))
+
 
 class UninstallTests(unittest.TestCase):
     def setUp(self):
@@ -764,6 +867,27 @@ class UninstallTests(unittest.TestCase):
             rc = br.do_uninstall(system=False, _run=run)
         self.assertEqual(rc, 0)
         self.assertFalse(any("daemon-reload" in " ".join(c) for c in calls))
+
+    def test_uninstall_without_systemctl_removes_file_only(self):
+        """When systemctl is absent, do_uninstall still removes the unit file
+        but skips systemctl calls entirely."""
+        Path(self.unit_path).write_text("[Unit]\n")
+        with patch.object(br, "_user_unit_path", return_value=self.unit_path), \
+             patch.object(br.shutil, "which", return_value=None):
+            rc = br.do_uninstall(system=False)
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(self.unit_path))
+
+    def test_uninstall_remove_failure_returns_nonzero(self):
+        """When os.remove raises OSError, do_uninstall returns rc=1."""
+        Path(self.unit_path).write_text("[Unit]\n")
+        with patch.object(br, "_user_unit_path", return_value=self.unit_path), \
+             patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch("os.remove", side_effect=OSError("permission denied")):
+            rc = br.do_uninstall(system=False)
+        self.assertEqual(rc, 1)
+        # The unit file must still exist (removal failed).
+        self.assertTrue(os.path.isfile(self.unit_path))
 
 
 class InstallUninstallMainRoutingTests(unittest.TestCase):
@@ -877,6 +1001,65 @@ class OrchestratorUrlCrossLanguageGuardTests(unittest.TestCase):
             "Keep them identical: a mismatch makes the enroll dialog omit --url "
             "while the launcher falls back to a stale URL, so runners never connect.",
         )
+
+
+class CredentialDirTests(unittest.TestCase):
+    def test_credential_dir_honors_env_override(self):
+        """_credential_dir returns BLUEPRINT_CREDENTIAL_DIR when set in env."""
+        with patch.dict("os.environ", {"BLUEPRINT_CREDENTIAL_DIR": "/custom/cred/path"}):
+            self.assertEqual(br._credential_dir(), "/custom/cred/path")
+
+    def test_credential_dir_defaults_to_dot_blueprint(self):
+        """_credential_dir returns ~/.blueprint when BLUEPRINT_CREDENTIAL_DIR is not set."""
+        with patch.dict("os.environ", {}, clear=True):
+            result = br._credential_dir()
+            self.assertTrue(result.endswith(".blueprint"),
+                           f"expected path ending with .blueprint, got {result!r}")
+
+    def test_load_persisted_token_returns_none_on_oserror(self):
+        """_load_persisted_token returns None when file open raises OSError."""
+        with patch("builtins.open", side_effect=OSError("permission denied")):
+            self.assertIsNone(br._load_persisted_token())
+
+    def test_load_persisted_token_returns_none_on_empty_file(self):
+        """_load_persisted_token returns None when the file is empty or whitespace-only."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "runner_token")
+            Path(token_path).write_text("   \n")
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                self.assertIsNone(br._load_persisted_token())
+
+    def test_load_persisted_token_reads_valid_token(self):
+        """_load_persisted_token returns the stripped token content."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "runner_token")
+            Path(token_path).write_text("my-persisted-token\n")
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                self.assertEqual(br._load_persisted_token(), "my-persisted-token")
+
+
+class PrintNoSystemdGuidanceTests(unittest.TestCase):
+    def test_output_includes_actionable_guidance(self):
+        """_print_no_systemd_guidance writes a nohup fallback to stderr."""
+        import io
+        fake_stderr = io.StringIO()
+        with patch.object(br.sys, "stderr", fake_stderr):
+            br._print_no_systemd_guidance(system=False)
+        output = fake_stderr.getvalue()
+        self.assertIn("no reachable systemd manager", output)
+        self.assertIn("install --user", output)
+        self.assertIn("nohup", output)
+
+    def test_system_scope_mentions_system_flag(self):
+        """For --system scope, the guidance references --system."""
+        import io
+        fake_stderr = io.StringIO()
+        with patch.object(br.sys, "stderr", fake_stderr):
+            br._print_no_systemd_guidance(system=True)
+        output = fake_stderr.getvalue()
+        self.assertIn("install --system", output)
 
 
 if __name__ == "__main__":

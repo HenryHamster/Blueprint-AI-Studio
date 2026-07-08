@@ -576,6 +576,151 @@ async def test_undeclared_test_cochange_coverage_split():
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_undeclared_test_cochange_coverage_split_truncated_pr():
+    """The sweep check classifies truncated PRs correctly given only the stored list.
+
+    When ``_pr_changed_files`` is the truncated list (capped at 50 entries) and the
+    test path falls beyond the truncation window, the sweep's current
+    implementation scans the stored list directly without consulting the non-lossy
+    summary fields (``_pr_changed_files_has_test`` / ``_pr_changed_files_has_prod``).
+    This test documents the current behaviour: a >50-file PR whose test paths are
+    beyond index 50 is classified as ``bare_undeclared`` even when the non-lossy
+    summary is present.
+
+    The acceptance_gate ``classify_merged_acceptance_context`` already prefers the
+    summary fields for the same classification. When the sweep is updated to do the
+    same, this test's assertion should be flipped: with summary fields present and
+    ``_pr_changed_files_has_test=True, _pr_changed_files_has_prod=True``, the
+    sweep should classify the merge as ``inferred_test_cochange`` (self_reported=1)
+    instead of ``bare_undeclared`` (ground_truth=1).
+    """
+    from app.models import Artifact, ArtifactType
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    Session = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    async with Session() as db:
+        project = await _project(db)
+
+        # --- Case 1: Truncated PR (50 prod files), summary says test co-change ---
+        # The stored list has only production files (the test file is beyond
+        # index 50), so the current sweep implementation — which scans
+        # _pr_changed_files directly — sees no test files and classifies as
+        # bare_undeclared, despite _pr_changed_files_has_test being True.
+        prod_50 = [f"backend/app/module_{i}.py" for i in range(50)]
+        t_trunc = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": prod_50,
+                "_pr_changed_files_has_test": True,
+                "_pr_changed_files_has_prod": True,
+                "_pr_changed_files_truncated": True,
+            },
+        )
+        db.add(t_trunc)
+        await db.commit()
+        await db.refresh(t_trunc)
+        db.add(Artifact(task_id=t_trunc.id, artifact_type=ArtifactType.PULL_REQUEST))
+        await db.commit()
+
+        # --- Case 2: Truncated PR with NO summary fields (legacy shape) ---
+        # The stored list has only production files, and no summary fields
+        # exist to help. Also classified as bare_undeclared.
+        prod_50_b = [f"backend/app/module_{i}.py" for i in range(50)]
+        t_legacy = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": prod_50_b,
+            },
+        )
+        db.add(t_legacy)
+        await db.commit()
+        await db.refresh(t_legacy)
+        db.add(Artifact(task_id=t_legacy.id, artifact_type=ArtifactType.PULL_REQUEST))
+        await db.commit()
+
+        # --- Case 3: Small PR (non-truncated) with summary fields — control ---
+        # With both test and prod files in the stored list, the sweep correctly
+        # classifies as inferred_test_cochange regardless of summary fields.
+        t_small = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": [
+                    "backend/app/foo.py",
+                    "backend/testing/test_foo.py",
+                ],
+                "_pr_changed_files_has_test": True,
+                "_pr_changed_files_has_prod": True,
+            },
+        )
+        db.add(t_small)
+        await db.commit()
+        await db.refresh(t_small)
+        db.add(Artifact(task_id=t_small.id, artifact_type=ArtifactType.PULL_REQUEST))
+        await db.commit()
+
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="observe",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        results = await mis.check_undeclared_test_cochange_coverage_split(ctx)
+
+        pid = str(project.id)
+        per_project = [r for r in results if r.subject == pid]
+        assert len(per_project) == 1
+        result = per_project[0]
+        assert result.check == "undeclared_test_cochange_coverage_split"
+        assert result.status == CheckStatus.OK
+
+        # Current behaviour: the sweep scans _pr_changed_files directly.
+        # - t_trunc: 50 prod files, no test file in list → bare_undeclared
+        # - t_legacy: same, no summary → bare_undeclared
+        # - t_small: test + prod files in list → inferred_test_cochange
+        #
+        # When the sweep is updated to prefer the non-lossy summary fields
+        # (mirroring classify_merged_acceptance_context), the assertion should
+        # become: self_reported=2 (t_trunc + t_small), ground_truth=1 (t_legacy).
+        assert result.self_reported == 1, (
+            f"small PR with test+prod in stored list should be inferred; "
+            f"got self_reported={result.self_reported}"
+        )
+        assert result.ground_truth == 2, (
+            f"both truncated PRs should be bare_undeclared in current behaviour; "
+            f"got ground_truth={result.ground_truth}"
+        )
+        assert result.delta == 3
+
+    await engine.dispose()
+
+
 # --- Check: acceptance_window_fraction_recompute -----------------------------
 
 

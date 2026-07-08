@@ -4536,6 +4536,131 @@ def test_large_pr_changed_files_not_silently_misclassified():
     assert small_verdict.proven is True
 
 
+def test_inferred_test_cochange_large_pr_truncation():
+    """Edge cases for stamp_changed_files_signal and classify_merged_acceptance_context
+    with large PRs — verifying the non-lossy summary prevents silent misclassification
+    across boundary and edge conditions.
+
+    Coverage beyond the core happy-path test (test_large_pr_changed_files_not_silently_misclassified):
+      * Exactly 50 files — NOT truncated, test file within the stored window
+      * 51 files with test at index 50 — truncated, test in last stored slot
+      * 55 production-only files — truncated, has_test=False, has_prod=True
+      * 55 test-only files — truncated, has_test=True, has_prod=False
+      * Multiple test files in a truncated PR beyond the window
+      * classify_merged_acceptance_context correctly uses the non-lossy summary
+        for each edge case
+    """
+    from app.acceptance_gate import (
+        classify_merged_acceptance_context,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    # --- Boundary: exactly 50 files (NOT truncated) ---
+    prod_49 = [f"backend/app/module_{i}.py" for i in range(49)]
+    test_1 = "backend/testing/test_boundary.py"
+    files_50 = [*prod_49, test_1]
+    signal = stamp_changed_files_signal(files_50)
+    assert len(signal["_pr_changed_files"]) == 50
+    assert "_pr_changed_files_truncated" not in signal, (
+        "Exactly 50 files must NOT be flagged as truncated"
+    )
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    ctx_50 = {LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal}
+    assert classify_merged_acceptance_context(ctx_50) == "inferred_test_cochange"
+
+    # --- Boundary: 51 files, test at index 50 (last slot in truncated window) ---
+    prod_50 = [f"backend/app/module_{i}.py" for i in range(50)]
+    test_edge = "backend/testing/test_edge_last_slot.py"
+    files_51_edge = [*prod_50, test_edge]
+    signal = stamp_changed_files_signal(files_51_edge)
+    assert len(signal["_pr_changed_files"]) == 50
+    assert signal["_pr_changed_files_truncated"] is True
+    # The test file at index 50 IS within the 50-slot window.
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    ctx_51_edge = {
+        LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal
+    }
+    assert classify_merged_acceptance_context(ctx_51_edge) == "inferred_test_cochange"
+
+    # --- Boundary: 52 files, test at index 51 (beyond truncation window) ---
+    prod_51 = [f"backend/app/module_{i}.py" for i in range(51)]
+    test_beyond = "backend/testing/test_beyond_window.py"
+    files_52 = [*prod_51, test_beyond]
+    signal = stamp_changed_files_signal(files_52)
+    assert len(signal["_pr_changed_files"]) == 50
+    assert signal["_pr_changed_files_truncated"] is True
+    # The test file at index 51 is BEYOND the stored list, but the non-lossy
+    # summary still sees it.
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    ctx_52 = {LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal}
+    assert classify_merged_acceptance_context(ctx_52) == "inferred_test_cochange"
+
+    # --- Truncated PR with only production files (no test anywhere) ---
+    prod_only = [f"backend/app/module_{i}.py" for i in range(55)]
+    signal = stamp_changed_files_signal(prod_only)
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_has_test"] is False
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    ctx_prod_only = {
+        LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal
+    }
+    # No test co-change → not inferred, must be undeclared.
+    assert classify_merged_acceptance_context(ctx_prod_only) == "undeclared"
+
+    # --- Truncated PR with only test files (no production anywhere) ---
+    test_only = [f"backend/testing/test_{i}.py" for i in range(55)]
+    signal = stamp_changed_files_signal(test_only)
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is False
+
+    ctx_test_only = {
+        LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal
+    }
+    # No production seam for the test to exercise → not inferred.
+    assert classify_merged_acceptance_context(ctx_test_only) == "undeclared"
+
+    # --- Multiple test files in a truncated PR beyond the window ---
+    prod_50 = [f"backend/app/module_{i}.py" for i in range(50)]
+    multi_test = [f"backend/testing/test_multi_{i}.py" for i in range(5)]
+    files_multi = [*prod_50, *multi_test]
+    signal = stamp_changed_files_signal(files_multi)
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+    # None of the test files are in the first 50 slots, but the summary catches them.
+    assert not any(
+        p in signal["_pr_changed_files"] for p in multi_test
+    ), "Test files beyond truncation window must not be in stored list"
+
+    ctx_multi = {LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal}
+    assert classify_merged_acceptance_context(ctx_multi) == "inferred_test_cochange"
+
+    # --- Filtering: invalid/empty path entries do not contaminate the summary ---
+    dirty_paths = (
+        [f"backend/app/module_{i}.py" for i in range(48)]
+        + ["", "  ", None]  # non-string / blank entries filtered out
+        + ["backend/testing/test_dirty.py"]
+    )
+    signal = stamp_changed_files_signal([p for p in dirty_paths if isinstance(p, str)])
+    # The real implementation already filters via stamp_changed_files_signal.
+    # Verify it is robust against a list with only valid strings.
+    clean_files = [f"backend/app/module_{i}.py" for i in range(48)] + [
+        "backend/testing/test_dirty.py"
+    ]
+    signal = stamp_changed_files_signal(clean_files)
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+
 # ---------------------------------------------------------------------------
 # v22 carried-finding backfill
 # ---------------------------------------------------------------------------

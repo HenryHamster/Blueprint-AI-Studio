@@ -144,15 +144,6 @@ def resolve_url(cli_url: str | None) -> str:
     return DEFAULT_ORCHESTRATOR_URL
 
 
-def _credential_dir() -> str:
-    """Directory for the persisted runner credential file.
-
-    Defaults to ``~/.blueprint/``. Override via ``BLUEPRINT_CREDENTIAL_DIR`` for
-    testing or non-standard installs. Must agree with local_runner._credential_dir().
-    """
-    return os.environ.get("BLUEPRINT_CREDENTIAL_DIR", "").strip() or os.path.expanduser("~/.blueprint")
-
-
 def _load_persisted_token() -> str | None:
     """Read the persisted runner token from the credential dir's runner_token file.
 
