@@ -60,7 +60,11 @@ and planned capabilities are NEVER flagged), and
 ``merged_pr_count_consistency`` (recomputes merged-PR counts with the canonical
 rollup-aware definition — excluding rollup-parent task ids — and flags any project
 where the naive count (used by llm_cost_per_merged_pr and merge_rate totals)
-exceeds the canonical count; the delta is the rollup double-count).
+exceeds the canonical count; the delta is the rollup double-count), and
+``criterion_evidence_count_integrity`` (independently counts CriterionEvidence
+rows per criterion with a direct COUNT(*) and flags any criterion whose
+self-reported evidence_count from get_version_coverage_summary diverges from
+the actual row count; the delta is the silent miscount).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -82,6 +86,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Awaitable, Callable, Deque, Dict, List, cast
 
+from sqlalchemy import func
 from sqlmodel import or_, select
 
 from app.time_utils import _utcnow
@@ -3125,4 +3130,142 @@ async def check_merged_pr_count_consistency(ctx: SweepContext) -> List[CheckResu
             )
         ]
 
+    return results
+
+
+@register_check(
+    "criterion_evidence_count_integrity",
+    "Independently count CriterionEvidence rows per criterion with a direct "
+    "COUNT(*) and flag any criterion whose self-reported evidence_count from "
+    "get_version_coverage_summary diverges from the actual row count.",
+)
+async def check_criterion_evidence_count_integrity(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: a direct ``COUNT(*)`` of ``CriterionEvidence`` rows per criterion.
+
+    The self-reported ``evidence_count`` in :func:`get_version_coverage_summary`
+    comes from an outer join + Python-side grouping (``len(evidence)``).
+    This check independently counts rows with a direct ``CriterionEvidence`` query
+    and flags any divergence — a divergence means the outer join or grouping logic
+    silently dropped, duplicated, or miscounted evidence rows.
+
+    Bounded to ``ctx.max_projects`` projects; returns SKIPPED for projects with
+    no open version or no criteria. Flag-only: never mutates the audited
+    evidence rows in any mode.
+    """
+    from app.acceptance_criteria import (
+        get_criteria_for_version,
+        get_version_coverage_summary,
+    )
+    from app.models import CriterionEvidence, Project
+    from app.release_version import current_open_version
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="criterion_evidence_count_integrity",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for (project_id,) in projects:
+        pid = str(project_id)
+        open_version = await current_open_version(ctx.session, project_id)
+        if open_version is None:
+            results.append(
+                CheckResult(
+                    check="criterion_evidence_count_integrity",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open version",
+                )
+            )
+            continue
+
+        criteria = await get_criteria_for_version(ctx.session, open_version.id)
+        if not criteria:
+            results.append(
+                CheckResult(
+                    check="criterion_evidence_count_integrity",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no criteria on open version",
+                )
+            )
+            continue
+
+        # Self-reported evidence counts from the summary (outer join + Python grouping).
+        summary = await get_version_coverage_summary(ctx.session, open_version.id)
+        summary_by_key: dict[str, int] = {}
+        for c_summary in summary.get("criteria", []):
+            summary_by_key[c_summary["criterion_key"]] = c_summary["evidence_count"]
+
+        # Independently count CriterionEvidence rows per criterion (ground truth).
+        flagged_criteria: list[str] = []
+        ok_count = 0
+        for criterion in criteria:
+            self_reported = summary_by_key.get(criterion.criterion_key, 0)
+            # Direct COUNT(*) — the simplest possible ground truth.
+            ground_truth = (
+                await ctx.session.execute(
+                    select(func.count())
+                    .select_from(CriterionEvidence)
+                    .where(CriterionEvidence.criterion_id == criterion.id)
+                )
+            ).scalar() or 0
+
+            if self_reported != ground_truth:
+                flagged_criteria.append(criterion.criterion_key)
+                results.append(
+                    CheckResult(
+                        check="criterion_evidence_count_integrity",
+                        status=CheckStatus.FLAGGED,
+                        self_reported=self_reported,
+                        ground_truth=ground_truth,
+                        delta=abs(ground_truth - self_reported),
+                        severity="warn",
+                        subject=pid,
+                        detail=(
+                            f"criterion {criterion.criterion_key}: self-reported "
+                            f"evidence_count={self_reported} but actual "
+                            f"CriterionEvidence row count={ground_truth} "
+                            f"(delta={abs(ground_truth - self_reported)})"
+                        ),
+                    )
+                )
+            else:
+                ok_count += 1
+
+        if not flagged_criteria and ok_count > 0:
+            results.append(
+                CheckResult(
+                    check="criterion_evidence_count_integrity",
+                    status=CheckStatus.OK,
+                    self_reported=ok_count,
+                    ground_truth=ok_count,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"all {ok_count} criteria have matching evidence counts "
+                        "(summary matches independent COUNT(*))"
+                    ),
+                )
+            )
+
+    if not results:
+        return [
+            CheckResult(
+                check="criterion_evidence_count_integrity",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no criteria with evidence to audit across all projects",
+            )
+        ]
     return results
