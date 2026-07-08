@@ -11447,3 +11447,73 @@ def test_v22_finding_backfill_wired_in_orchestrator():
         "_sweep_v22_finding_backfill is imported but never called in orchestrator.py. "
         "The v22 finding backfill must be invoked on a cadence in the orchestrator loop."
     )
+
+
+def test_v22_live_verification_evidence_wired_in_sweep():
+    """record_v22_live_verification_evidence must be called inside _sweep_v22_finding_backfill.
+
+    The existing wiring test only checks that _sweep_v22_finding_backfill is
+    imported and called in orchestrator.py — it does NOT verify the call to
+    record_v22_live_verification_evidence inside that function.  This test
+    guards the inner call site so a rename or accidental deletion inside
+    _sweep_v22_finding_backfill does not silently break the live-verification
+    evidence backfill.
+    """
+    import ast
+    from pathlib import Path
+
+    rr_path = Path(__file__).resolve().parents[1] / "app" / "release_readiness.py"
+    source = rr_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(rr_path))
+
+    func_name = "record_v22_live_verification_evidence"
+
+    # Confirm the function is defined in release_readiness.py
+    func_defined = False
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == func_name
+        ):
+            func_defined = True
+            break
+
+    assert func_defined, (
+        f"'{func_name}' is no longer defined in release_readiness.py. "
+        "Either restore the function or update this invariant to match the new name."
+    )
+
+    # Find the _sweep_v22_finding_backfill async function definition
+    sweep_func: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_sweep_v22_finding_backfill":
+            sweep_func = node
+            break
+
+    assert sweep_func is not None, (
+        "_sweep_v22_finding_backfill is no longer defined in release_readiness.py. "
+        "Either restore the function or update this invariant."
+    )
+
+    # Walk the function body to find calls to record_v22_live_verification_evidence
+    called = False
+    for node in ast.walk(sweep_func):
+        # Direct call: record_v22_live_verification_evidence(...)
+        if isinstance(node, ast.Call):
+            name = _ast_called_name(node)
+            if name == func_name:
+                called = True
+                break
+        # Await-wrapped call: await record_v22_live_verification_evidence(...)
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            name = _ast_called_name(node.value)
+            if name == func_name:
+                called = True
+                break
+
+    assert called, (
+        f"'{func_name}' is not called inside "
+        "_sweep_v22_finding_backfill in release_readiness.py. "
+        "The live-verification evidence backfill is effectively disabled — "
+        "restore the call site."
+    )

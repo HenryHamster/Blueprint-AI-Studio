@@ -1807,7 +1807,13 @@ async def _sweep_v22_finding_backfill() -> None:
     has already promoted, and never touches later versions.  Idempotent:
     ``backfill_v22_carried_findings_resolved`` upserts ledger rows and
     dedup-guards its evidence write, so successive ticks are cheap no-ops once
-    all findings are resolved.  Called every 600 s from the leader loop.
+    all findings are resolved.
+
+    Also records live-verification evidence via
+    ``record_v22_live_verification_evidence`` for criterion c-dd953d8c on every
+    project that carries a v22 release version, resolving the stalled
+    evidence_progress for direction d-fd9c793d.  Called every 600 s from the
+    leader loop.
     """
     from app import services
     from app.models import Project
