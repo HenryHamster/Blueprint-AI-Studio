@@ -10995,3 +10995,71 @@ def test_mock_patch_targets_resolve():
         + "\n".join(sorted(failures)[:50])
         + ("" if len(failures) <= 50 else f"\n... and {len(failures) - 50} more")
     )
+
+
+def test_metrics_integrity_sweep_wired_in_reaper():
+    """sweep_metrics_integrity must be imported from reaper_sweeps and called in reaper.py."""
+    import ast
+    from pathlib import Path
+
+    reaper_path = Path(__file__).resolve().parents[1] / "app" / "reaper.py"
+    source = reaper_path.read_text()
+    tree = ast.parse(source)
+
+    # Verify import
+    imported = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "app.reaper_sweeps":
+            for alias in node.names:
+                if alias.name == "sweep_metrics_integrity":
+                    imported = True
+    assert imported, (
+        "sweep_metrics_integrity is not imported from app.reaper_sweeps in reaper.py. "
+        "The metrics-integrity sweep must be wired in reaper.py."
+    )
+
+    # Verify call site
+    called = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "sweep_metrics_integrity"
+        for node in ast.walk(tree)
+    )
+    assert called, (
+        "sweep_metrics_integrity is imported but never called in reaper.py. "
+        "The metrics-integrity sweep must be invoked in the reaper service loop."
+    )
+
+
+def test_v22_finding_backfill_wired_in_orchestrator():
+    """_sweep_v22_finding_backfill must be imported and called inside orchestrator.py."""
+    import ast
+    from pathlib import Path
+
+    orch_path = Path(__file__).resolve().parents[1] / "app" / "orchestrator.py"
+    source = orch_path.read_text()
+    tree = ast.parse(source)
+
+    # Verify inline import from release_readiness
+    imported = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "app.release_readiness"
+        and any(alias.name == "_sweep_v22_finding_backfill" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    assert imported, (
+        "_sweep_v22_finding_backfill is not imported from app.release_readiness in orchestrator.py. "
+        "The v22 finding backfill must be wired into the orchestrator cadence loop."
+    )
+
+    # Verify call site
+    called = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_sweep_v22_finding_backfill"
+        for node in ast.walk(tree)
+    )
+    assert called, (
+        "_sweep_v22_finding_backfill is imported but never called in orchestrator.py. "
+        "The v22 finding backfill must be invoked on a cadence in the orchestrator loop."
+    )
