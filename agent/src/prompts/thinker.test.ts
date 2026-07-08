@@ -1155,6 +1155,167 @@ describe('runThinkerWithGate validateParsedValue guard', () => {
   });
 });
 
+// ── runThinkerWithGate currentPurpose injection ──────────────────────────────
+//
+// The repair reopenPrompt and focused retry prompt now receive the operator-set
+// durable intent.purpose so that a fresh repair session (no prior conversation)
+// has a ground-truth value to echo rather than producing a schema placeholder.
+// Tests here verify the instruction block is included/preserved correctly.
+
+describe('runThinkerWithGate currentPurpose injection', () => {
+  const mockRunClaudeCode = vi.mocked(runClaudeCode);
+  const mockPersistAndPostStatus = vi.mocked(persistAndPostStatus);
+
+  const taskId = 'test-task-123';
+  const problemModelPath = `/tmp/problem_model_${taskId}.json`;
+  const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
+  const ws = null;
+  const statusRef = { value: '' };
+
+  const durablePurpose = 'Make Blueprint handle any project well: autonomous adaptation with no hardcoded workflows.';
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    fsMockState.presentFiles.clear();
+    fsMockState.fileContents.clear();
+    mockRunClaudeCode.mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    mockPersistAndPostStatus.mockResolvedValue(undefined);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockImplementation(
+      (path: string) => fsMockState.presentFiles.has(path),
+    );
+    vi.mocked(fs.readFileSync as (path: string, encoding?: string) => string).mockImplementation(
+      (path: string) => fsMockState.fileContents.get(path) || '',
+    );
+    vi.mocked(fs.writeFileSync as (path: string, data: string) => void).mockImplementation(
+      (path: string, data: string) => {
+        if (typeof path === 'string') {
+          fsMockState.presentFiles.add(path);
+          if (typeof data === 'string') {
+            fsMockState.fileContents.set(path, data);
+          }
+        }
+      },
+    );
+  });
+
+  it('repair_reopenPrompt_includes_injected_purpose_when_currentPurpose_provided', async () => {
+    // The repair reopen prompt must include the currentPurpose preservation
+    // instruction so the fresh repair session has the ground-truth value.
+    fsMockState.presentFiles.add(runningUpdatePath);
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: JSON.stringify({ intent: { purpose: durablePurpose }, gaps: [] }),
+        lastResultText: JSON.stringify({ intent: { purpose: durablePurpose }, gaps: [] }),
+      });
+
+    await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, [], durablePurpose);
+
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    const reopenPrompt = mockRunClaudeCode.mock.calls[1][0];
+
+    // The injected preservation instruction must be present and contain the exact purpose string.
+    expect(reopenPrompt).toContain('operator-set durable intent.purpose');
+    expect(reopenPrompt).toContain(durablePurpose);
+    expect(reopenPrompt).toContain('do NOT substitute it with');
+    // The repair must succeed — the echoed purpose passes validateParsedValue.
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
+  });
+
+  it('repair_reopenPrompt_omits_purpose_block_when_currentPurpose_is_undefined', async () => {
+    // Backward compat: when currentPurpose is undefined (existing callers),
+    // the reopen prompt must NOT contain the purpose preservation block.
+    fsMockState.presentFiles.add(runningUpdatePath);
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"intent":{"purpose":"repaired"},"gaps":[]}',
+        lastResultText: '{"intent":{"purpose":"repaired"},"gaps":[]}',
+      });
+
+    // Pass undefined explicitly to simulate callers that don't set the new parameter.
+    await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, [], undefined);
+
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    const reopenPrompt = mockRunClaudeCode.mock.calls[1][0];
+
+    // Must NOT contain the purpose preservation block.
+    expect(reopenPrompt).not.toContain('operator-set durable intent.purpose');
+    expect(reopenPrompt).not.toContain('do NOT substitute it with');
+  });
+
+  it('focused_retry_prompt_includes_purpose_when_currentPurpose_provided', async () => {
+    // The focused retry prompt must also include the purpose preservation
+    // instruction when currentPurpose is provided and the problem_model file is missing.
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'still not parseable', lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'retry output', lastResultText: '' });
+
+    await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, [], durablePurpose);
+
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(3);
+
+    // The focused retry prompt is the 3rd call (indices: 0=thinker, 1=repair, 2=focused retry).
+    const retryPrompt = mockRunClaudeCode.mock.calls[2][0];
+
+    // Must include the injected purpose.
+    expect(retryPrompt).toContain('operator-set durable intent.purpose');
+    expect(retryPrompt).toContain(durablePurpose);
+  });
+
+  it('repair_with_valid_purpose_echoes_it_and_passes_validateParsedValue', async () => {
+    // End-to-end happy path: repair session receives the currentPurpose,
+    // echoes it back, validateParsedValue accepts it, file is written.
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
+
+    const problemModelWithPurpose = JSON.stringify({ intent: { purpose: durablePurpose }, gaps: [] });
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: problemModelWithPurpose,
+        lastResultText: problemModelWithPurpose,
+      });
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, [], durablePurpose);
+
+    expect(result).toEqual({ ok: true, analysisText: 'analysis without JSON' });
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
+
+    const writtenContent = fsMockState.fileContents.get(problemModelPath);
+    expect(writtenContent).toContain(durablePurpose);
+  });
+
+  it('repair_still_rejects_placeholder_even_when_currentPurpose_injected', async () => {
+    // The injected purpose provides ground truth, but if the repair session
+    // ignores it and still echoes a placeholder, validateParsedValue must
+    // still reject it (defense in depth — the instruction is a prompt-level
+    // fix; the guard is the code-level backstop).
+    fsMockState.presentFiles.add(runningUpdatePath);
+    mockRunClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
+      // Repair session ignores the injected purpose and produces a placeholder.
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"intent":{"purpose":"..."},"gaps":[]}',
+        lastResultText: '{"intent":{"purpose":"..."},"gaps":[]}',
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'focused retry output', lastResultText: '' });
+
+    await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, [], durablePurpose);
+
+    // Should reach the focused retry (3 calls) because the placeholder was rejected.
+    expect(mockRunClaudeCode).toHaveBeenCalledTimes(3);
+    // The problem_model file must NOT be written with the placeholder content.
+    expect(fsMockState.presentFiles.has(problemModelPath)).toBe(false);
+  });
+});
+
 describe('buildThinkerPrompt on_automain annotation', () => {
   const base: ThinkerPromptParams = {
     contextPrefix: '',

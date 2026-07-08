@@ -118,6 +118,7 @@ AXIS_LANE_COST_PER_MERGED_PR = "lane_cost_per_merged_pr"
 AXIS_LANE_WARM_RESUME_RATE = "lane_warm_resume_rate"
 AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 AXIS_PROMPT_STATIC_BYTES = "prompt_static_bytes"
+AXIS_LLM_CACHE_HIT_RATE = "llm_cache_hit_rate"
 
 # Guard threshold for prompt_static_bytes: alert when static prompt size exceeds
 # this many source characters. Set well above the current measured value (~31k chars)
@@ -148,6 +149,7 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_LANE_WARM_RESUME_RATE,
     AXIS_CHECKPOINT_LOSS_RATE,
     AXIS_PROMPT_STATIC_BYTES,
+    AXIS_LLM_CACHE_HIT_RATE,
 )
 
 # ---------------------------------------------------------------------------
@@ -193,6 +195,9 @@ AXIS_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_PROMPT_STATIC_BYTES: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_LLM_CACHE_HIT_RATE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
 }
@@ -2181,6 +2186,33 @@ _TASK_TYPE_FOCUS_CONST_NAMES: tuple[str, ...] = (
 )
 
 
+def _compute_llm_cache_hit_rate(tasks: list[Task]) -> float | None:
+    """LLM prompt cache hit fraction: cache-read input tokens / total input tokens.
+
+    Computed from the same per-attempt token data as
+    :func:`compute_llm_cost_breakdown` so the two stay consistent.
+    Returns ``None`` when there are no input tokens in the window.
+    """
+    total_input = 0
+    total_cache_read = 0
+    for t in tasks:
+        for (
+            _provider,
+            _model,
+            input_tokens,
+            _output_tokens,
+            _call_count,
+            _cache_creation,
+            cache_read,
+        ) in _task_llm_attempts(t):
+            if input_tokens > 0:
+                total_input += int(input_tokens)
+                total_cache_read += int(cache_read)
+    if total_input <= 0:
+        return None
+    return round(total_cache_read / total_input, 4)
+
+
 def _compute_prompt_static_bytes() -> int | None:
     """Sum the source character lengths of all static code-change prompt sections.
 
@@ -2307,6 +2339,7 @@ async def compute_current_axes(
         AXIS_LANE_WARM_RESUME_RATE: _compute_lane_warm_resume_rate(lanes),
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
         AXIS_PROMPT_STATIC_BYTES: _compute_prompt_static_bytes(),
+        AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],

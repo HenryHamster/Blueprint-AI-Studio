@@ -437,6 +437,12 @@ export async function handleStrategic(
     const problemModelJson = problemModel && Object.keys(problemModel).length > 0
       ? JSON.stringify(problemModel, null, 2)
       : '';
+    // Extract the operator-set durable intent.purpose so it can be threaded
+    // into the thinker's repair/reopen prompt — without it, a repair session
+    // that runs fresh (no prior conversation) has no source-of-truth for the
+    // purpose string and may echo a schema placeholder, exhausting retries.
+    const intent = problemModel?.intent as Record<string, unknown> | undefined;
+    const currentPurpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : undefined;
 
     // ── Problem-model size/health signal (soft) ──
     // Computed by the backend from the DURABLE pre-trim model (honest counts).
@@ -840,6 +846,7 @@ prompts, schemas, tools, or orchestration.` : '';
 
     const thinkerGateResult = await runThinkerWithGate(
       thinkerPromptWithSuffix, taskId, ws, statusRef, model, effort, disallowedTools,
+      currentPurpose,
     );
     if (!thinkerGateResult.ok) return;
     const analysisText = thinkerGateResult.analysisText;

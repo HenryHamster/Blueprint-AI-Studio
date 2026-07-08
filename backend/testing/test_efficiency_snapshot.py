@@ -15,6 +15,7 @@ from app.efficiency_snapshot import (
     AXIS_COST_PER_MERGED_PR,
     AXIS_LANE_COST_PER_MERGED_PR,
     AXIS_LANE_WARM_RESUME_RATE,
+    AXIS_LLM_CACHE_HIT_RATE,
     AXIS_LLM_COST_PER_MERGED_PR,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
@@ -157,6 +158,43 @@ async def test_compute_current_axes_values(db_session):
     assert axes[AXIS_VM_REUSE_RATE] == 0.5
     assert axes[AXIS_MEDIAN_API_CALLS_PER_TASK] == 60.0
     assert axes[AXIS_MEDIAN_REVIEW_ITERATIONS] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_includes_llm_cache_hit_rate(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two tasks: one with 30% cache hit rate, one with no cache hits.
+    # total: 300 cache-read / 2000 input = 0.15
+    db_session.add(
+        _make_merged_task(
+            project.id,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "total_cache_read_input_tokens": 300,
+                "llm_call_count": 5,
+            },
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert AXIS_LLM_CACHE_HIT_RATE in axes
+    # 300 cache-read from second task / (1000 + 1000) total input = 0.15
+    assert axes[AXIS_LLM_CACHE_HIT_RATE] == 0.15
 
 
 @pytest.mark.asyncio
@@ -5410,6 +5448,64 @@ def test_compact_attribution_passes_through_prompt_size_bytes():
     create_row = by_type["create"]
     assert create_row["total_prompt_size_bytes"] == 200000
     assert create_row["mean_prompt_size_bytes"] == 200000
+
+
+def test_by_task_type_includes_mean_section_sizes():
+    """compute_llm_cost_by_task_type includes mean_section_sizes per task type.
+
+    Sections present in multiple tasks are averaged correctly; sections present
+    in only one task get that task's value as the mean (denominator = 1, not
+    total bucket task count).
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 4,
+            "prompt_section_sizes": [
+                {"name": "claude_md", "bytes": 30000},
+                {"name": "playbook", "bytes": 10000},
+            ],
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    task2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 2,
+            "prompt_section_sizes": [
+                {"name": "claude_md", "bytes": 50000},
+                {"name": "task", "bytes": 20000},
+            ],
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task1, task2])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["create"]
+
+    assert row["mean_section_sizes"] is not None
+    # claude_md reported by both tasks: (30000 + 50000) / 2 == 40000
+    assert row["mean_section_sizes"]["claude_md"] == 40000
+    # playbook reported by task1 only: 10000 / 1 == 10000
+    assert row["mean_section_sizes"]["playbook"] == 10000
+    # task reported by task2 only: 20000 / 1 == 20000
+    assert row["mean_section_sizes"]["task"] == 20000
 
 
 @pytest.mark.asyncio

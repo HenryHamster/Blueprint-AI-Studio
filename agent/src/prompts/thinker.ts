@@ -590,6 +590,7 @@ export async function runThinkerWithGate(
   model: string | undefined,
   effort: string | undefined,
   disallowedTools: string[],
+  currentPurpose?: string,
 ): Promise<{ ok: true; analysisText: string; newVersionGoal?: string } | { ok: false }> {
   const problemModelPath = `/tmp/problem_model_${taskId}.json`;
   const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
@@ -732,6 +733,12 @@ export async function runThinkerWithGate(
         lastResultText: thinkerResult.lastResultText,
       },
       reopenPrompt: [
+        ...(currentPurpose
+          ? [
+              `CRITICAL: The operator-set durable intent.purpose for this project is: "${currentPurpose}". In your problem_model JSON output, set intent.purpose to exactly this string — do NOT substitute it with "...", "&lt;...&gt;", or an empty string. This value is authoritative; the prior analysis below may omit it, but your output MUST include it.`,
+              '',
+            ]
+          : []),
         'Your strategic run completed cleanly, but the required problem_model JSON was not parseable.',
         'IMPORTANT: this is a FRESH session — you do NOT have the previous conversation.',
         'Your previous analysis output is reproduced verbatim below.',
@@ -782,6 +789,12 @@ export async function runThinkerWithGate(
     // JSON is usually emitted before the final summary text.
     const priorOutput = (problemModelRepair?.retry?.allOutput || thinkerResult.allOutput).slice(-80_000);
     const retryPrompt = [
+      ...(currentPurpose
+        ? [
+            `CRITICAL: The operator-set durable intent.purpose for this project is: "${currentPurpose}". In your problem_model JSON output, set intent.purpose to exactly this string — do NOT substitute it with "...", "&lt;...&gt;", or an empty string. This value is authoritative; the prior analysis below may omit it, but your output MUST include it.`,
+            '',
+          ]
+        : []),
       'Your previous strategic analysis completed but the required handoff files',
       'were not written to disk. IMPORTANT: this is a FRESH session — you do NOT',
       'have the previous conversation. Your previous analysis output is reproduced',
