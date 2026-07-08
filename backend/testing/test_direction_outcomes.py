@@ -3206,6 +3206,76 @@ async def test_decomposition_quality_ignores_infra_failures_in_merge_rate(
 
 
 @pytest.mark.asyncio
+async def test_subtask_merge_rate_counts_scope_overflow_in_denominator(
+    db_session: AsyncSession,
+):
+    """SCOPE_OVERFLOW subtask failures stay in the merge-rate denominator.
+
+    SCOPE_OVERFLOW lives in INFRA_CLASSES for retry/budget routing, but it is a
+    scope-quality signal — a plan that cut its subtasks too large is exactly the
+    decomposition failure this metric exists to detect. It must therefore be
+    counted in the denominator (mirroring
+    spawn_calibration._effective_scope_denominator), unlike a true-infra
+    RATE_LIMIT failure which is excluded.
+    """
+    direction_id = "d-decomp-overflow"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    plan = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "plan"}],
+        title="plan-overflow",
+    )
+    await _create_child_task(
+        db_session,
+        plan.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "_pr_changed_files": ["a.py"]},
+        title="merged",
+    )
+    await _create_child_task(
+        db_session,
+        plan.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "SCOPE_OVERFLOW"},
+        title="overflow",
+    )
+    # A true-infra failure must stay excluded so the assertion isolates the
+    # SCOPE_OVERFLOW behavior.
+    await _create_child_task(
+        db_session,
+        plan.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "RATE_LIMIT"},
+        title="infra",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    dq = project.directions[0]["research_history"][0]["decomposition_quality"]
+    # merged=1, SCOPE_OVERFLOW counted (1), RATE_LIMIT excluded → denom=2 → 1/2
+    assert dq[0]["subtask_merge_rate"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_decomposition_quality_records_failed_plan_with_zero_subtasks(
     db_session: AsyncSession,
 ):

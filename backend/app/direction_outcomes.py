@@ -2396,12 +2396,18 @@ async def _update_direction_research_outcomes(
             by_parent.setdefault(st.parent_task_id, []).append(st)
         for plan_id, sts in by_parent.items():
             merged_ct = sum(1 for st in sts if is_merged_completion(st))
+            # SCOPE_OVERFLOW stays in the denominator even though it lives in
+            # INFRA_CLASSES: it is a scope-quality signal (subtasks cut too
+            # large), which is exactly what subtask_merge_rate exists to detect.
+            # Mirrors spawn_calibration._effective_scope_denominator, which keeps
+            # SCOPE_OVERFLOW and excludes only non-overflow infra fails.
             failed_nc = sum(
                 1
                 for st in sts
                 if _counts_as_failure(st)
                 and (
-                    _classify_failure(st) not in INFRA_CLASSES
+                    (fc := _classify_failure(st)) not in INFRA_CLASSES
+                    or fc == SCOPE_OVERFLOW
                     or _is_review_cap_exhausted(st)
                 )
             )

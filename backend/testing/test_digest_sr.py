@@ -371,6 +371,124 @@ async def test_digest_sr_disallowed_blind_spot_rate_basic(
 
 
 @pytest.mark.asyncio
+async def test_sr_skip_rate_excludes_pre_self_review_failures(
+    client: AsyncClient, db_session
+):
+    """Tasks that failed before reaching self-review (no _self_review_outcome key)
+    are excluded from both the numerator and denominator of self_review_skip_rate."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 2 tasks that reached SR and skipped it (counted as skips)
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={"_self_review_outcome": _sr_skipped_envelope_unknown_verdict()},
+            )
+        )
+    # 3 tasks that reached SR with a valid outcome (counted as non-skips)
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={"_self_review_outcome": _sr_valid_outcome()},
+            )
+        )
+    # 4 code-change tasks that FAILED before reaching SR — no _self_review_outcome key.
+    # These must be excluded from the denominator entirely.
+    for _ in range(4):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create"}],
+                context={"some_other_key": "value"},
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    skip_rate = response.json()["self_review_skip_rate"]
+    assert skip_rate is not None
+    # Only the 5 tasks that reached SR count; the 4 pre-SR failures are excluded.
+    assert skip_rate["sample_size"] == 5
+    assert skip_rate["skipped_count"] == 2
+    assert skip_rate["overall_rate"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_sr_disallowed_blind_spot_rate_excludes_pre_self_review_failures(
+    client: AsyncClient, db_session
+):
+    """Tasks that failed before reaching self-review (no _self_review_outcome key)
+    are excluded from sr_disallowed_blind_spot_rate's denominator."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 2 tasks with violations
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        **_sr_valid_outcome(),
+                        "_filtered_blind_spots_count": 1,
+                    }
+                },
+            )
+        )
+    # 3 tasks without violations
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        **_sr_valid_outcome(),
+                        "_filtered_blind_spots_count": 0,
+                    }
+                },
+            )
+        )
+    # 4 code-change tasks that FAILED before reaching SR — no _self_review_outcome key.
+    # These must NOT inflate the denominator.
+    for _ in range(4):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create"}],
+                context={"some_other_key": "value"},
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    rate = response.json()["sr_disallowed_blind_spot_rate"]
+    assert rate is not None
+    # Only the 5 tasks that reached SR count; the 4 pre-SR failures are excluded.
+    assert rate["sample_size"] == 5
+    assert rate["violation_count"] == 2
+    assert rate["overall_rate"] == 0.4
+
+
+@pytest.mark.asyncio
 async def test_digest_fresh_reviewer_effectiveness_empty(client: AsyncClient):
     """No tasks → fresh_reviewer_effectiveness present with zero sample_size and null rates."""
     response = await client.get("/api/admin/digest")

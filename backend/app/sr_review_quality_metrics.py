@@ -137,11 +137,18 @@ def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None"
     """Share of code-change tasks (create/fix/refactor/migrate) where the
     self-review JSON was missing or invalid. Detects the bash ./done
     fallback envelope. Returns None when sample size < 5.
+
+    Denominator is restricted to code-change tasks that actually reached the
+    self-review step (i.e. ``"_self_review_outcome" in task.context``). Tasks
+    that failed before self-review have no such key and are excluded so they do
+    not silently deflate the rate.
     """
     code_change_tasks: List[Task] = []
     for t in terminal_tasks:
         ttype = (t.first_payload or {}).get("type")
-        if ttype in _SR_CODE_CHANGE_TYPES:
+        if ttype in _SR_CODE_CHANGE_TYPES and "_self_review_outcome" in (
+            t.context or {}
+        ):
             code_change_tasks.append(t)
 
     if len(code_change_tasks) < 5:
@@ -188,11 +195,18 @@ def _compute_sr_disallowed_blind_spot_rate(
     """Share of code-change tasks where the agent emitted at least one disallowed
     blind-spot phrase (captured as ``_filtered_blind_spots_count > 0`` by
     ``filter_disallowed_blind_spots``). Returns None when sample size < 5.
+
+    Denominator is restricted to code-change tasks that actually reached the
+    self-review step (i.e. ``"_self_review_outcome" in task.context``). Tasks
+    that failed before self-review have no such key and are excluded so they do
+    not silently deflate the rate.
     """
     code_change_tasks: List[Task] = []
     for t in terminal_tasks:
         ttype = (t.first_payload or {}).get("type")
-        if ttype in _SR_CODE_CHANGE_TYPES:
+        if ttype in _SR_CODE_CHANGE_TYPES and "_self_review_outcome" in (
+            t.context or {}
+        ):
             code_change_tasks.append(t)
 
     if len(code_change_tasks) < 5:
