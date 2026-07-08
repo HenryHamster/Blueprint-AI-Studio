@@ -748,7 +748,12 @@ Key points:
 
 **Runner shows `stale` or `offline` in Fleet panel**
 ```bash
-# On the runner machine:
+# On the runner machine — first triage step: check the on-box liveness file.
+# Its mtime is the last time the runner process wrote anything; its contents
+# show the last known state even if the process is dead (OOM, SIGKILL).
+cat ~/.blueprint/status.json
+
+# Verify connectivity and token validity with the live check:
 blueprint-runner check --token <token>
 # Observe orchestrator reachability and token validity lines
 ```

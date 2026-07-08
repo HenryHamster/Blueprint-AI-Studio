@@ -23,6 +23,7 @@ const sampleAlerts: Alert[] = [
     task_id: 'task-1234',
     created_at: '2026-05-06T00:00:00Z',
     dismissed_at: null,
+    acknowledged_at: null,
   },
   {
     id: 'alert-2',
@@ -33,6 +34,7 @@ const sampleAlerts: Alert[] = [
     task_id: null,
     created_at: '2026-05-06T00:01:00Z',
     dismissed_at: null,
+    acknowledged_at: null,
   },
 ];
 

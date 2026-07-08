@@ -560,7 +560,8 @@ class RenderUnitTests(unittest.TestCase):
         # No leftover @…@ placeholder survives.
         self.assertEqual(re.findall(r"@[A-Z_]+@", text), [])
         # Hardening directives are preserved from the template.
-        for directive in ("Restart=on-failure", "RestartSec=5", "KillSignal=SIGTERM",
+        for directive in ("Restart=on-failure", "RestartSec=5", "StartLimitIntervalSec=60",
+                          "StartLimitBurst=3", "KillSignal=SIGTERM",
                           "TimeoutStopSec=30", "WantedBy=default.target"):
             self.assertIn(directive, text)
 
@@ -579,6 +580,10 @@ class RenderUnitTests(unittest.TestCase):
         self.assertIn("WantedBy=multi-user.target", text)
         self.assertEqual(re.findall(r"@[A-Z_]+@", text), [])
         self.assertIn("KillSignal=SIGTERM", text)
+        self.assertIn("StartLimitIntervalSec=60", text)
+        self.assertIn("StartLimitBurst=3", text)
+        # Comment block documents crash-loop guard recovery.
+        self.assertIn("systemctl reset-failed", text)
 
     def test_leftover_placeholder_raises(self):
         with self.assertRaises(ValueError):

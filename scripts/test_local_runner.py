@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 # Add scripts dir to path so we can import local_runner directly
 sys.path.insert(0, str(Path(__file__).parent))
+import blueprint_runner as br
 import local_runner
 import runner_isolation as iso
 
@@ -3494,6 +3495,413 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
             warning_lines,
             f"Did not expect mismatch warning when values match. Got: {warning_lines}",
         )
+
+
+class BlueprintRunnerInstallTests(unittest.TestCase):
+    """Acceptance-evidence tests: the install path operators rely on for onboarding
+    a new device renders a valid systemd unit with real host paths and the crash-loop
+    burst cap. These tests import and exercise ``blueprint_runner`` (not local_runner)
+    — the launcher that wraps the runner as a systemd service."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="bp_install_test_")
+        self.unit_path = os.path.join(self.tmp, "blueprint-runner.service")
+        self.env_path = os.path.join(self.tmp, "runner.env")
+        # The template file MUST exist at the real path — render_unit reads it.
+        # Both templates live at well-known paths relative to this test file.
+        self._user_template = br._USER_SERVICE_TEMPLATE
+        self._system_template = br._SYSTEM_SERVICE_TEMPLATE
+        self.assertTrue(
+            os.path.isfile(self._user_template),
+            f"user template missing: {self._user_template}",
+        )
+        self.assertTrue(
+            os.path.isfile(self._system_template),
+            f"system template missing: {self._system_template}",
+        )
+
+    def tearDown(self):
+        import shutil as _sh
+        _sh.rmtree(self.tmp, ignore_errors=True)
+
+    def test_install_renders_unit_with_real_paths(self):
+        """Acceptance evidence: the --user install flow renders the real template
+        with resolved host paths, writes it to the user unit path, and preserves the
+        crash-loop burst cap directives (StartLimitIntervalSec / StartLimitBurst)."""
+        calls = []
+        from scripts.test_blueprint_runner import _systemctl_recorder
+        run = _systemctl_recorder(record=calls)
+
+        patches = [
+            patch.object(br, "_user_unit_path", return_value=self.unit_path),
+            patch.object(br, "_env_file_path", return_value=self.env_path),
+            patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(
+                system=False,
+                token="acceptance-token",
+                url="https://orch.acceptance.example",
+                _run=run,
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(rc, 0, "install must return 0 when all steps succeed")
+
+        # The unit was written and contains real resolved paths (not @TOKENS@).
+        unit_text = Path(self.unit_path).read_text()
+        self.assertIn(sys.executable, unit_text,
+                      "rendered unit must contain the real Python path")
+        self.assertIn(br._LOCAL_RUNNER, unit_text,
+                      "rendered unit must contain the real local_runner.py path")
+        self.assertTrue(
+            br._LOCAL_RUNNER.endswith("local_runner.py"),
+            f"_LOCAL_RUNNER should point at local_runner.py, got {br._LOCAL_RUNNER}",
+        )
+        # No leftover @…@ template placeholders.
+        import re
+        leftover = re.findall(r"@[A-Z_]+@", unit_text)
+        self.assertEqual(leftover, [], f"leftover placeholders: {leftover}")
+
+        # Crash-loop guard directives from the updated service template are present.
+        self.assertIn("StartLimitIntervalSec=60", unit_text,
+                      "burst-cap interval must be in rendered unit")
+        self.assertIn("StartLimitBurst=3", unit_text,
+                      "burst count must be in rendered unit")
+        self.assertIn("RestartSec=5", unit_text)
+        self.assertIn("Restart=on-failure", unit_text)
+
+        # The comment block documents crash-loop recovery.
+        self.assertIn("reset-failed", unit_text,
+                      "comment block must mention reset-failed recovery")
+
+        # The token is in the env file, NOT baked into the unit.
+        self.assertNotIn("acceptance-token", unit_text,
+                         "token must never appear in the rendered unit")
+        env_text = Path(self.env_path).read_text()
+        self.assertIn("BLUEPRINT_RUNNER_TOKEN=acceptance-token", env_text)
+
+        # systemctl commands were issued.
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(any("daemon-reload" in j for j in joined),
+                        "daemon-reload must be called during install")
+        self.assertTrue(
+            any("enable --now blueprint-runner.service" in j for j in joined),
+            "enable --now must be called during install",
+        )
+
+    def test_system_install_renders_unit_with_burst_cap(self):
+        """System install path also includes the crash-loop guard in the
+        rendered unit."""
+        calls = []
+        from scripts.test_blueprint_runner import _systemctl_recorder
+        run = _systemctl_recorder(record=calls)
+
+        sys_unit = os.path.join(self.tmp, "etc-system", "blueprint-runner.service")
+        patches = [
+            patch.object(br, "_system_unit_path", return_value=sys_unit),
+            patch.object(br, "_env_file_path", return_value=self.env_path),
+            patch.object(br, "_install_user", return_value="testop"),
+            patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(
+                system=True, token=None, url="https://o.example", _run=run,
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(rc, 0)
+        unit_text = Path(sys_unit).read_text()
+        self.assertIn("StartLimitIntervalSec=60", unit_text)
+        self.assertIn("StartLimitBurst=3", unit_text)
+        self.assertIn("reset-failed", unit_text)
+        self.assertIn("User=testop", unit_text)
+        self.assertIn("WantedBy=multi-user.target", unit_text)
+
+    def test_uninstall_stops_and_removes_unit(self):
+        """Uninstall disables, stops, and removes a present unit file, leaving
+        credentials untouched."""
+        unit = os.path.join(self.tmp, "installed.service")
+        Path(unit).write_text("[Unit]\n")
+        calls = []
+        from scripts.test_blueprint_runner import _systemctl_recorder
+        run = _systemctl_recorder(record=calls)
+
+        with patch.object(br, "_user_unit_path", return_value=unit), \
+             patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"):
+            rc = br.do_uninstall(system=False, _run=run)
+
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(unit), "unit file must be removed")
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(
+            any("disable --now blueprint-runner.service" in j for j in joined),
+        )
+        self.assertTrue(any("daemon-reload" in j for j in joined))
+
+    def test_resolve_token_falls_back_to_persisted_file(self):
+        """resolve_token() reads the persisted token file when CLI and env are absent."""
+        token_path = os.path.join(self.tmp, "runner_token")
+        with open(token_path, "w") as f:
+            f.write("persisted-acceptance-token\n")
+
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "_credential_dir", return_value=self.tmp):
+            self.assertEqual(br.resolve_token(None), "persisted-acceptance-token")
+
+
+class TestStatusJson(unittest.TestCase):
+    """On-box status.json liveness file: write, read, permissions, no-secrets."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_cred_dir = os.environ.get("BLUEPRINT_CREDENTIAL_DIR")
+        os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self._tmpdir
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        if self._orig_cred_dir is None:
+            os.environ.pop("BLUEPRINT_CREDENTIAL_DIR", None)
+        else:
+            os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self._orig_cred_dir
+
+    def _status_path(self):
+        return os.path.join(self._tmpdir, "status.json")
+
+    def test_write_and_read_round_trip(self):
+        """Write status.json with known fields, read it back, verify all keys."""
+        caps = _bwrap_caps()
+        local_runner._write_status_json(
+            runner_id="test-box",
+            last_heartbeat_status="ok",
+            active_task_ids=["task-1", "task-2"],
+            active_compute_job_ids=["job-a"],
+            caps=caps,
+            agent_backend="bwrap",
+            compute_backend="bwrap",
+        )
+        path = self._status_path()
+        self.assertTrue(os.path.exists(path))
+
+        with open(path) as f:
+            data = json.loads(f.read())
+
+        self.assertEqual(data["runner_id"], "test-box")
+        self.assertEqual(data["last_heartbeat_status"], "ok")
+        self.assertEqual(data["active_task_ids"], ["task-1", "task-2"])
+        self.assertEqual(data["active_compute_job_ids"], ["job-a"])
+        self.assertTrue(data["bwrap_ok"])
+        self.assertFalse(data["docker_usable"])
+        self.assertEqual(data["agent_backend"], "bwrap")
+        self.assertEqual(data["compute_backend"], "bwrap")
+        # last_heartbeat_at must be a plausible ISO UTC string
+        self.assertIn("T", data["last_heartbeat_at"])
+        self.assertIn("Z", data["last_heartbeat_at"])
+
+    def test_atomic_write_no_partial_file(self):
+        """tempfile + rename leaves no .tmp artifact in the credential dir."""
+        local_runner._write_status_json(
+            runner_id="box",
+            last_heartbeat_status="ok",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+        tmp_files = [f for f in os.listdir(self._tmpdir) if f.endswith(".tmp")]
+        self.assertEqual(len(tmp_files), 0, f"stale .tmp files: {tmp_files}")
+
+    def test_permissions_are_0644(self):
+        """status.json must be world-readable (0644), not 0600 like the token."""
+        local_runner._write_status_json(
+            runner_id="box",
+            last_heartbeat_status="ok",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+        path = self._status_path()
+        mode = os.stat(path).st_mode & 0o777
+        self.assertEqual(mode, 0o644, f"Expected 0644 but got {oct(mode)}")
+
+    def test_no_secrets_in_file(self):
+        """status.json must NOT contain the token or any secret-like field."""
+        local_runner._write_status_json(
+            runner_id="box",
+            last_heartbeat_status="ok",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+        path = self._status_path()
+        with open(path) as f:
+            text = f.read()
+        data = json.loads(text)
+        for key in data:
+            self.assertNotIn("token", key.lower(), f"secret-like key '{key}' in status.json")
+            self.assertNotIn("secret", key.lower(), f"secret-like key '{key}' in status.json")
+            self.assertNotIn("password", key.lower(), f"secret-like key '{key}' in status.json")
+        # No sensitive string values
+        self.assertNotIn("blpr_", text)
+
+    def test_caps_none_writes_null_fields(self):
+        """When caps is None, capability fields serialize as null — all keys present."""
+        local_runner._write_status_json(
+            runner_id="box",
+            last_heartbeat_status="ok",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+            caps=None,
+            agent_backend=None,
+            compute_backend=None,
+        )
+        path = self._status_path()
+        with open(path) as f:
+            data = json.loads(f.read())
+        self.assertIsNone(data["bwrap_ok"])
+        self.assertIsNone(data["docker_usable"])
+        self.assertIsNone(data["agent_backend"])
+        self.assertIsNone(data["compute_backend"])
+
+    def test_heartbeat_ok_path_writes_status(self):
+        """After a successful heartbeat POST, status.json is written with 'ok'."""
+        posted_bodies = []
+        status_writes = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        orig_write = local_runner._write_status_json
+
+        def capturing_write(**kw):
+            status_writes.append(kw)
+            return orig_write(**kw)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_write_status_json", capturing_write), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True), \
+                 patch.object(local_runner, "_hostname", return_value="test-host"):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(status_writes), 1)
+        self.assertEqual(status_writes[0]["last_heartbeat_status"], "ok")
+        self.assertEqual(status_writes[0]["runner_id"], "test-host")
+        self.assertEqual(status_writes[0]["active_task_ids"], [])
+        self.assertEqual(status_writes[0]["active_compute_job_ids"], [])
+
+    def test_heartbeat_error_path_writes_status(self):
+        """After a heartbeat POST returns non-2xx, status.json records the error."""
+        status_writes = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 503, {}
+
+        orig_write = local_runner._write_status_json
+
+        def capturing_write(**kw):
+            status_writes.append(kw)
+            return orig_write(**kw)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_write_status_json", capturing_write), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(status_writes), 1)
+        self.assertIn("error", status_writes[0]["last_heartbeat_status"])
+        self.assertIn("503", status_writes[0]["last_heartbeat_status"])
+
+    def test_heartbeat_exception_path_writes_status(self):
+        """When _post raises (network error), status.json records the exception."""
+        status_writes = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            raise RuntimeError("connection refused")
+
+        orig_write = local_runner._write_status_json
+
+        def capturing_write(**kw):
+            status_writes.append(kw)
+            return orig_write(**kw)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_write_status_json", capturing_write), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(status_writes), 1)
+        self.assertIn("error", status_writes[0]["last_heartbeat_status"])
+        self.assertIn("connection refused", status_writes[0]["last_heartbeat_status"])
+
+    def test_die_writes_final_status(self):
+        """_die() writes a status.json with the fatal reason before os._exit."""
+        status_writes = []
+
+        def capturing_write(**kw):
+            status_writes.append(kw)
+
+        def fake_exit(code):
+            raise SystemExit(code)
+
+        with patch.object(local_runner, "_write_status_json", capturing_write), \
+             patch.object(local_runner, "_hostname", return_value="dying-box"), \
+             patch.object(local_runner.os, "_exit", fake_exit):
+            try:
+                local_runner._die("OOM killer struck", code=137)
+            except SystemExit:
+                pass
+
+        self.assertEqual(len(status_writes), 1)
+        self.assertEqual(status_writes[0]["runner_id"], "dying-box")
+        self.assertIn("fatal", status_writes[0]["last_heartbeat_status"])
+        self.assertIn("OOM killer struck", status_writes[0]["last_heartbeat_status"])
+        self.assertEqual(status_writes[0]["active_task_ids"], [])
+        self.assertEqual(status_writes[0]["active_compute_job_ids"], [])
 
 
 if __name__ == "__main__":

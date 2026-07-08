@@ -187,8 +187,21 @@ def _die(reason: str, code: int = 1) -> None:
     would only unwind the calling thread and leave the process silently degraded.
     A non-zero exit surfaces in systemd/journalctl and lets the process supervisor
     restart the runner.
+
+    Before exiting, write a minimal status.json so a post-mortem on-box inspection
+    shows the fatal condition — the operator can ``cat ~/.blueprint/status.json``
+    and see what killed the runner without needing journalctl access.
     """
     print(f"[runner] FATAL: {reason}", file=sys.stderr, flush=True)
+    try:
+        _write_status_json(
+            runner_id=_hostname(),
+            last_heartbeat_status=f"fatal: {reason[:120]}",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+    except Exception:
+        pass  # best-effort only — must not block the exit
     os._exit(code)
 
 
@@ -248,6 +261,63 @@ def _load_runner_token() -> str | None:
         return token or None
     except OSError:
         return None
+
+
+def _write_status_json(
+    runner_id: str | None,
+    last_heartbeat_status: str,
+    active_task_ids: list,
+    active_compute_job_ids: list,
+    *,
+    caps: "iso.Capabilities | None" = None,
+    agent_backend: str | None = None,
+    compute_backend: str | None = None,
+) -> None:
+    """Write a compact on-box status file so an operator can triage an offline runner.
+
+    The file is written atomically (temp file + rename, 0o644) to
+    ``~/.blueprint/status.json`` (respects ``BLUEPRINT_CREDENTIAL_DIR``).  It
+    contains no secrets — only the runner identity, liveness, active work, and
+    detected isolation capabilities.  An operator can ``cat`` it to answer "when did
+    it last heartbeat?" or "what was it working on?" even when the process is dead.
+
+    Called from the heartbeat loop after every POST (success or failure) so the
+    file's mtime is the last time the process wrote anything, and from ``_die()``
+    to leave a post-mortem snapshot of the fatal condition.
+    """
+    path = os.path.join(_credential_dir(), "status.json")
+    last_heartbeat_at = _utc_now_iso()
+    payload: dict = {
+        "runner_id": runner_id,
+        "last_heartbeat_at": last_heartbeat_at,
+        "last_heartbeat_status": last_heartbeat_status,
+        "active_task_ids": list(active_task_ids),
+        "active_compute_job_ids": list(active_compute_job_ids),
+    }
+    if caps is not None:
+        payload["bwrap_ok"] = caps.bwrap_ok
+        payload["docker_usable"] = caps.docker_usable
+        payload["agent_backend"] = agent_backend
+        payload["compute_backend"] = compute_backend
+    else:
+        payload["bwrap_ok"] = None
+        payload["docker_usable"] = None
+        payload["agent_backend"] = None
+        payload["compute_backend"] = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+        try:
+            os.write(fd, json.dumps(payload, sort_keys=True).encode())
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o644)
+        os.rename(tmp_path, path)
+    except Exception as exc:
+        print(
+            f"[runner] WARNING: could not write status.json to {path}: {exc}",
+            flush=True,
+        )
 
 
 def _hostname() -> str | None:
@@ -1048,12 +1118,30 @@ def _heartbeat_loop(
             if status in (200, 204):
                 consecutive_401 = 0
                 consecutive_network_failures = 0
+                _write_status_json(
+                    runner_id=hostname,
+                    last_heartbeat_status="ok",
+                    active_task_ids=task_ids,
+                    active_compute_job_ids=compute_job_ids,
+                    caps=caps,
+                    agent_backend=agent_backend,
+                    compute_backend=compute_backend,
+                )
             elif status == 401:
                 consecutive_401 += 1
                 print(
                     f"[runner] heartbeat 401 ({consecutive_401} consecutive) — token "
                     "rejected; will re-arm if the row was merely inactive.",
                     flush=True,
+                )
+                _write_status_json(
+                    runner_id=hostname,
+                    last_heartbeat_status=f"error: 401 ({consecutive_401} consecutive)",
+                    active_task_ids=task_ids,
+                    active_compute_job_ids=compute_job_ids,
+                    caps=caps,
+                    agent_backend=agent_backend,
+                    compute_backend=compute_backend,
                 )
                 if max_auth_failures and consecutive_401 >= max_auth_failures:
                     _die(
@@ -1063,11 +1151,29 @@ def _heartbeat_loop(
                     )
             else:
                 print(f"[runner] heartbeat warning: HTTP {status}", flush=True)
+                _write_status_json(
+                    runner_id=hostname,
+                    last_heartbeat_status=f"error: HTTP {status}",
+                    active_task_ids=task_ids,
+                    active_compute_job_ids=compute_job_ids,
+                    caps=caps,
+                    agent_backend=agent_backend,
+                    compute_backend=compute_backend,
+                )
         except Exception as exc:
             consecutive_network_failures += 1
             print(
                 f"[runner] heartbeat error ({consecutive_network_failures} consecutive): {exc}",
                 flush=True,
+            )
+            _write_status_json(
+                runner_id=hostname,
+                last_heartbeat_status=f"error: {exc}",
+                active_task_ids=[],
+                active_compute_job_ids=[],
+                caps=caps,
+                agent_backend=agent_backend,
+                compute_backend=compute_backend,
             )
             if max_network_failures and consecutive_network_failures >= max_network_failures:
                 _die(
