@@ -325,7 +325,7 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(prScript).toContain('mandatory test gate');
   });
 
-  it('does not generate test gate when promotionTarget does not match baseBranch', async () => {
+  it('self-repo keeps the test gate even when promotionTarget does not match baseBranch', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers({
       taskId: 'test-task-feat',

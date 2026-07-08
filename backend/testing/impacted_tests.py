@@ -207,6 +207,17 @@ def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]
     merge gate (mirroring the module's "robust on partial trees" contract).
     """
     manifest_path = os.path.join(repo_root, _SURFACE_MANIFEST_REL)
+    if not os.path.isfile(manifest_path) and repo_root == _DEFAULT_REPO_ROOT:
+        # Docker test harness: the backend tree is copied with app/ and
+        # testing/ as siblings and no enclosing backend/ directory, so the
+        # dev-checkout-relative _SURFACE_MANIFEST_REL does not resolve. The
+        # manifest is co-located with this module; fall back to it — but only
+        # for the DEFAULT root, so hermetic fixture roots stay strictly
+        # self-contained (a fixture without a manifest must compile to []).
+        manifest_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "drift_sentinel_surfaces.json",
+        )
     try:
         with open(manifest_path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -238,6 +249,26 @@ def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]
     return compiled
 
 
+def _sentinel_exists(sentinel: str, repo_root: str) -> bool:
+    """Whether a registered sentinel exists on disk (harness-layout aware).
+
+    Checks ``<repo_root>/<sentinel>`` first (dev checkout / CI workspace). For
+    the DEFAULT root only, also checks the sentinel as a sibling of this module:
+    the Docker test harness copies the backend tree with testing/ next to app/
+    and no enclosing backend/ directory. Hermetic fixture roots keep the strict
+    repo_root-only check.
+    """
+    if os.path.isfile(os.path.join(repo_root, sentinel)):
+        return True
+    if repo_root == _DEFAULT_REPO_ROOT and sentinel.startswith("backend/testing/"):
+        sibling = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            sentinel[len("backend/testing/"):],
+        )
+        return os.path.isfile(sibling)
+    return False
+
+
 def _surface_sentinels(changed_paths, repo_root: str) -> "set[str]":
     """Drift sentinels whose surface glob matches any changed path (on-disk only).
 
@@ -259,7 +290,7 @@ def _surface_sentinels(changed_paths, repo_root: str) -> "set[str]":
             for sentinel in sentinels:
                 if sentinel in selected:
                     continue
-                if os.path.isfile(os.path.join(repo_root, sentinel)):
+                if _sentinel_exists(sentinel, repo_root):
                     selected.add(sentinel)
     return selected
 

@@ -330,6 +330,10 @@ async def _load_recent_tasks(
                 # must be loaded so the access doesn't trip raiseload=True.
                 Task.llm_account_id,
                 Task.format_compliance_summary,
+                # parent_task_id: read by _rollup_parent_ids so merged-PR
+                # metrics can exclude rollup parents without tripping
+                # raiseload=True.
+                Task.parent_task_id,
                 # payloads: required so task.first_payload can be read without
                 # triggering an async lazy-load (used by compute_llm_cost_by_task_type
                 # and compute_effort_model_efficiency when called from this path).

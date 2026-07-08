@@ -162,7 +162,7 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
         allowlist=(
             BranchLiteralAllowEntry(
                 path="prompts/review-prompt.ts",
-                line=308,
+                line=330,
                 pattern="fallback-main",
                 rationale=(
                     "buildRollupReviewGuidance is downstream of resolveBaseBranch; the "
@@ -171,7 +171,7 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
             ),
             BranchLiteralAllowEntry(
                 path="prompts/review-prompt.ts",
-                line=121,
+                line=122,
                 pattern="fallback-main",
                 rationale=(
                     "Local-variable defensive default downstream of resolveBaseBranch; "

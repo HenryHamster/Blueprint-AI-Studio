@@ -42,8 +42,14 @@ def _make_code_task_with_evidence(
     context: dict = {}
     if changed_files is not None:
         context["_pr_changed_files"] = changed_files
+    # The merge gate always stamps review_loop; an unverified merge carries
+    # unverified_merge_reason inside it. An empty dict = gate ran and the merge
+    # was test-verified — an ABSENT review_loop is fail-closed NOT-verified
+    # (see _merge_was_test_verified), so the verified case must stamp the dict.
     if unverified_reason is not None:
         context[REVIEW_LOOP_KEY] = {UNVERIFIED_MERGE_REASON_KEY: unverified_reason}
+    else:
+        context[REVIEW_LOOP_KEY] = {}
     return Task(
         project_id=uuid.uuid4(),
         title="code task",

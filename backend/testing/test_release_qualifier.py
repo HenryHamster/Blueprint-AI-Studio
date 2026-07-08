@@ -18451,7 +18451,9 @@ async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mo
     )
     await db_session.commit()
 
-    assert count == 1
+    # The sweep return counts FINALIZED versions only — a re-drive spawn is
+    # deliberately not a finalization; the spawn itself is asserted below.
+    assert count == 0
     await db_session.refresh(version)
     # Stale verdict overwritten — qualification started.
     assert version.last_qualification["status"] == "pending"
@@ -18691,8 +18693,10 @@ async def test_auto_stale_writes_stale_rows_when_head_advanced(db_session, mocke
     # itself (via the shared factory) — all writes including the operator
     # notification should be committed by the production code, not by this test.
 
-    # Auto-stale writes a ledger row; re-drive fires in the same cycle → count=1.
-    assert count == 1
+    # Auto-stale writes a ledger row and the re-drive fires in the same cycle,
+    # but the sweep return counts FINALIZED versions only (a re-drive spawn is
+    # not a finalization) — the spawn is asserted below via status "pending".
+    assert count == 0
 
     # Stale ledger row was written for the finding.
     ledger_rows = list(
@@ -18842,8 +18846,9 @@ async def test_requalification_durable_across_multiple_not_promoted_rounds(
     )
     await db_session.commit()
 
-    # auto-stale wrote a row + re-drive spawned fresh qual → count=1.
-    assert count1 == 1
+    # auto-stale wrote a row + re-drive spawned fresh qual; the sweep return
+    # counts FINALIZED versions only, so the spawn is asserted below instead.
+    assert count1 == 0
 
     rows_r1 = list(
         (
@@ -18888,7 +18893,9 @@ async def test_requalification_durable_across_multiple_not_promoted_rounds(
     )
     await db_session.commit()
 
-    assert count2 == 1
+    # Finalized-only return semantics — round-2 re-drive spawn asserted via
+    # the ledger rows below.
+    assert count2 == 0
 
     rows_r2 = list(
         (
@@ -19114,7 +19121,8 @@ async def test_auto_stale_idempotent_skips_existing_ledger_rows(db_session, mock
     await db_session.commit()
 
     # Re-drive fires (finding already resolved) → version moves to pending.
-    assert count == 1
+    # Finalized-only return semantics: the re-drive spawn is not counted.
+    assert count == 0
 
     # Existing 'resolved' row was NOT overwritten by auto-stale.
     ledger_rows = list(
@@ -19206,7 +19214,8 @@ async def test_auto_stale_clears_keyless_challenger_independent_blocker(
     assert ledger_rows[0].state == "stale"
 
     # Re-drive fired: version moved to pending (fresh qualification spawned).
-    assert count == 1
+    # Finalized-only return semantics: the re-drive spawn is not counted.
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -19327,7 +19336,8 @@ async def test_keyless_blocker_on_current_head_spawns_bounded_requalification(
     # HEAD == candidate_sha. This is bounded: the stale not_promoted record is
     # overwritten with a pending qualification, so the next sweep sees an
     # in-flight/current qualification instead of repeatedly spawning.
-    assert count == 1
+    # Finalized-only return semantics: the re-drive spawn is not counted.
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
     assert version.last_qualification["candidate_sha"] == current_sha
@@ -19495,7 +19505,9 @@ async def test_keyless_blocker_consumed_marker_does_not_block_new_head(
     )
     await db_session.refresh(version)
 
-    assert result == 1
+    # Finalized-only return semantics: the re-drive spawn is not counted; the
+    # spawn_mock await and pending status are the authoritative assertions.
+    assert result == 0
     assert spawn_mock.await_count == 1
     assert version.last_qualification["status"] == "pending"
     assert version.last_qualification["candidate_sha"] == new_sha
@@ -19654,8 +19666,9 @@ async def test_auto_stale_file_anchored_finding_staled_when_file_changed(
     assert ledger_rows[0].finding_key == "FILE_CHANGED_FINDING"
     assert ledger_rows[0].state == "stale"
 
-    # Re-drive fired: fresh qualification spawned.
-    assert count == 1
+    # Re-drive fired: fresh qualification spawned. Finalized-only return
+    # semantics: the spawn is not counted.
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -19696,7 +19709,9 @@ async def test_redrive_requalifies_zero_gating_ready_version(db_session, mocker)
     )
     await db_session.commit()
 
-    assert count == 1
+    # The sweep return counts FINALIZED versions only — a re-drive spawn is
+    # deliberately not a finalization; the spawn itself is asserted below.
+    assert count == 0
     await db_session.refresh(version)
     # Stale verdict overwritten — qualification started.
     assert version.last_qualification["status"] == "pending"
@@ -19757,9 +19772,10 @@ async def test_full_requalification_flow_not_promoted_to_promoted(db_session, mo
     )
     await db_session.commit()
 
-    # Exactly one action: auto-stale wrote a stale row, re-drive spawned a new
-    # qualification (count=1).
-    assert count == 1
+    # Auto-stale wrote a stale row and the re-drive spawned a new qualification;
+    # finalized-only return semantics means the spawn is not counted here — the
+    # ledger row and pending status below are the authoritative assertions.
+    assert count == 0
 
     # Stale ledger row written for the gating finding.
     ledger_rows = (

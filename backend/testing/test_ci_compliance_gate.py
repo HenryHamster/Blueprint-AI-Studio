@@ -327,9 +327,6 @@ def test_cap_bump_resolves_orchestrator_runner_dispatch_breach():
     grows orchestrator_runner_dispatch.py past its cap will fail here even before
     the CI invariant suite runs.
     """
-    repo_root = os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "..")
-    )
     json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
     data = csl.load_limits(json_path)
     backend_caps = data.get("backend", {})
@@ -339,8 +336,14 @@ def test_cap_bump_resolves_orchestrator_runner_dispatch_breach():
         f"{target_rel} must have a cap entry in module_size_limits.json"
     )
 
-    backend_root = csl.resolve_section_root("backend", repo_root, use_env_overrides=False)
-    assert backend_root is not None, "backend/app must exist in the repo tree"
+    # Resolve app/ as testing/'s sibling (same as test_invariants._check_module):
+    # in the Docker test harness only the backend tree is present, so the
+    # dev-checkout layout <repo>/backend/app that resolve_section_root assumes
+    # does not exist there.
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
 
     target_path = os.path.join(backend_root, target_rel)
     assert os.path.isfile(target_path), f"{target_path} must exist on disk"

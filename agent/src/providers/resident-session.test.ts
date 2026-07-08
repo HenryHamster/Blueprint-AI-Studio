@@ -23,6 +23,7 @@ vi.mock('../index.js', () => ({
 
 vi.mock('../token-file.js', () => ({
   writeAgentTokenFile: vi.fn(),
+  jsonFieldShellFn: vi.fn(() => ''),
 }));
 
 vi.mock('../constants.js', () => ({

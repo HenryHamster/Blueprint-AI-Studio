@@ -7202,13 +7202,15 @@ class TestCrossBaseCodeDependencyPolicy:
         dependent = self._dependent("refactor", ["backend/app/new_structure.py"])
         assert is_genuine_code_dependency(dependent, dep) is False
 
-    def test_transforming_dependent_modify_dependent_without_files_is_genuine(self):
+    def test_transforming_dependent_fix_dependent_without_files_is_genuine(self):
         from app.orchestrator_health import is_genuine_code_dependency
 
-        # A modify dependent with no declared files against a code-producing dep
-        # cannot disprove overlap, so it's treated as genuine (hold rather than risk).
+        # A fix dependent with no declared files against a code-producing dep
+        # cannot disprove overlap, so it's treated as genuine (hold rather than
+        # risk). ("modify" was retired from the task-type vocabulary; fix and
+        # refactor are the output-transforming types.)
         dep = self._dep("create", ["backend/app/foo.py"])
-        dependent = self._dependent("modify", [])  # no files declared
+        dependent = self._dependent("fix", [])  # no files declared
         assert is_genuine_code_dependency(dependent, dep) is True
 
     def test_transforming_dependent_fix_with_dependency_having_no_files_is_genuine(

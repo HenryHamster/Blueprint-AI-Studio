@@ -537,7 +537,10 @@ async def test_digest_fresh_reviewer_effectiveness_approval_rate_lift(
                 },
             )
         )
-    # 2 tasks without fresh-reviewer: both rejected on first attempt
+    # 2 tasks without fresh-reviewer: both rejected on first attempt. The
+    # baseline population is tasks where NO reviewer pass ran at all (no
+    # _self_review_outcome key) — a clean-reviewed task (outcome present but
+    # zero findings) is deliberately excluded from the baseline.
     for _ in range(2):
         db_session.add(
             make_task(
@@ -546,11 +549,6 @@ async def test_digest_fresh_reviewer_effectiveness_approval_rate_lift(
                 payloads=[{"type": "fix"}],
                 context={
                     "_first_attempt_succeeded": False,
-                    "_self_review_outcome": {
-                        "verdict": "pass",
-                        "check_results": {},
-                        "blind_spots": [],
-                    },
                 },
             )
         )

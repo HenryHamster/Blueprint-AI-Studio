@@ -365,7 +365,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
-  const executionEvidenceSection = formatExecutionEvidenceForSrPrompt();
+  const executionEvidenceSection = formatExecutionEvidenceForSrPrompt({
+    blueprintSelfRepo: !buildConfig?.directories?.length && isBlueprintSelfRepo(owner, repo),
+  });
   const projectCtxForSr = task.project_context as Record<string, unknown> | undefined;
   const srCategories = (projectCtxForSr?.self_review_catch_rate as { categories?: Record<string, { false_positive_rate?: number; precision?: number; sr_flag_sample_size?: number; severity_calibration?: Record<string, unknown>; precision_recall_quadrant?: string; precision_delta?: number; recall_delta?: number }> } | null | undefined)?.categories;
   const loosenHintSection = formatHighFpRateLoosenHintForSrPrompt(srCategories);

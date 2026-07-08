@@ -412,13 +412,18 @@ def test_live_surface_manifest_is_valid_and_registers_websocket_sentinel():
     manifest = impacted_tests._load_surface_manifest(repo_root)
     assert manifest, "live drift_sentinel_surfaces.json compiled to no surfaces"
     all_sentinels: set[str] = set()
+    # In the Docker test harness the backend tree is copied with testing/ as a
+    # sibling of app/ (no backend/ prefix), so a sentinel's repo-relative path
+    # also resolves as a sibling of this test file.
+    _here = os.path.dirname(os.path.abspath(__file__))
     for _regex, sentinels in manifest:
         for sentinel in sentinels:
             all_sentinels.add(sentinel)
             assert sentinel.startswith("backend/testing/"), sentinel
-            assert os.path.isfile(os.path.join(repo_root, sentinel)), (
-                f"registered sentinel missing on disk: {sentinel}"
-            )
+            sibling = os.path.join(_here, sentinel[len("backend/testing/"):])
+            assert os.path.isfile(os.path.join(repo_root, sentinel)) or os.path.isfile(
+                sibling
+            ), f"registered sentinel missing on disk: {sentinel}"
     assert "backend/testing/test_websocket_emitter_inventory.py" in all_sentinels, (
         "reference websocket emitter inventory sentinel must be registered"
     )

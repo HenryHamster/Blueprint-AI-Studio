@@ -88,9 +88,21 @@ def _acct(**kw) -> dict:
 
 @pytest.fixture(autouse=True)
 def _autoclean_pool_state():
-    """Clear all shared in-memory pool state before every test in this module."""
+    """Clear all shared in-memory pool state before AND after every test.
+
+    The after-clear matters as much as the before-clear: this module's last
+    test would otherwise leak seeded/blocked accounts into whichever module
+    pytest collects next in the same process, where the pool-wide rate-limit
+    correlation reclassifies genuine CODE_ERRORs as RATE_LIMIT
+    (TestClassifyFailure / TestFailureClassification shard failures).
+    """
     from app.failure_classification import _account_failure_log
 
+    _max_plan_pools.clear()
+    _account_by_id.clear()
+    _pending_cap_persists.clear()
+    _account_failure_log.clear()
+    yield
     _max_plan_pools.clear()
     _account_by_id.clear()
     _pending_cap_persists.clear()

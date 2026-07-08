@@ -23,6 +23,7 @@ vi.mock('../api', () => ({
     return new Response(JSON.stringify({ messages: [] }), { status: 200 });
   }),
   API_BASE_URL: 'http://localhost:8000',
+  MESSAGE_CONTENT_MAX: 20000,
   authHeaders: vi.fn(async () => ({ 'Authorization': 'Bearer test', 'Content-Type': 'application/json' })),
 }));
 

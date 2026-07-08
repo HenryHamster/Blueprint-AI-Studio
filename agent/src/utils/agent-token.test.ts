@@ -6,6 +6,7 @@ import { expectCalledWith } from './typed-mock-call.js';
 // shelling out to git. Only the symbols agent-token.ts imports need to exist.
 vi.mock('../token-file.js', () => ({
   writeGithubTokenFile: vi.fn(),
+  jsonFieldShellFn: vi.fn(() => ''),
 }));
 vi.mock('../git-credential.js', () => ({
   writeGitTokenFile: vi.fn(),

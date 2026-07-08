@@ -3315,6 +3315,14 @@ class TestRunnerDegradedAlert:
         )
         runner.consecutive_job_failures = 5
         db_session.add(runner)
+        # Second healthy runner keeps the fleet-no-healthy aggregate alert
+        # (RUNNER_FLEET_OFFLINE) out of frame — this test pins the per-runner
+        # degraded alert only.
+        await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(seconds=10),
+        )
         await db_session.commit()
 
         with patch(
@@ -3350,6 +3358,12 @@ class TestRunnerDegradedAlert:
         )
         runner.consecutive_job_failures = 4
         db_session.add(runner)
+        # Healthy sibling keeps the fleet-no-healthy aggregate alert silent.
+        await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(seconds=10),
+        )
         await db_session.commit()
 
         with patch(
@@ -3444,6 +3458,14 @@ class TestRunnerDegradedAlert:
         )
         runner.consecutive_job_failures = 10
         db_session.add(runner)
+        # Healthy sibling keeps the fleet-no-healthy aggregate alert
+        # (RUNNER_FLEET_OFFLINE) silent so notify.assert_not_called() pins the
+        # degraded sweep specifically.
+        await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(seconds=10),
+        )
         await db_session.commit()
 
         with patch(

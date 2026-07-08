@@ -514,6 +514,11 @@ async def _compute_digest(
             Task.llm_output_tokens_banked_db,
             Task.llm_call_count_banked_db,
             Task.format_compliance_summary,
+            # parent_task_id: read by _rollup_parent_ids (via
+            # compute_effort_model_efficiency and _cost_and_merges) so
+            # merged-PR metrics can exclude rollup parents without tripping
+            # raiseload=True.
+            Task.parent_task_id,
         ]
         if include_status_log:
             # SQLite path: no SQL-side projection, so load both columns directly.
