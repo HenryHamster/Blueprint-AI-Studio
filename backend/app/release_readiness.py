@@ -25,6 +25,7 @@ consumer over-claims on a thin sample.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import uuid
 from datetime import timedelta
@@ -81,6 +82,14 @@ _V22_BACKFILL_SEVERITY = "low"
 # count against this constant and warns on mismatch — a self-reported-vs-expected
 # data-integrity check in the same spirit as the metrics-integrity sweep.
 _V22_EXPECTED_LOW_SEVERITY_COUNT = 13
+
+# Evergreen-backlog provenance and finding key for count-divergence enrollment.
+# When the backfill's self-check detects a mismatch between the resolved count
+# and the expected constant, an actionable EvergreenBacklogItem is enrolled
+# (deduped, best-effort) so the signal reaches the triage surface instead of
+# living only in an unmonitored log line.
+_V22_BACKFILL_PROVENANCE = "v22_backfill"
+_V22_BACKFILL_COUNT_DIVERGENCE_KEY = "v22_backfill_count_divergence"
 
 # Module-level guard state observable by tests.  Updated at the end of each
 # backfill_v22_carried_findings_resolved call against a v22 version; reset
@@ -1702,6 +1711,33 @@ async def backfill_v22_carried_findings_resolved(
             count,
             expected,
         )
+        # Best-effort enrollment so the divergence signal reaches the triage
+        # surface via the evergreen backlog instead of living only in a log
+        # line.  Failure to enroll must never abort the backfill or the
+        # return — this is a flag-only observation, not a mutating action.
+        try:
+            from app.evergreen_backlog import enroll_backlog_item  # noqa: PLC0415
+            await enroll_backlog_item(
+                session,
+                project_id=project_id,
+                finding_key=_V22_BACKFILL_COUNT_DIVERGENCE_KEY,
+                title="v22 backfill count divergence",
+                detail=(
+                    f"v22 backfill resolved {count} low-severity findings, "
+                    f"but expected {expected}. The v22 audit-finding inventory "
+                    f"may have changed or the seed data may be inconsistent."
+                ),
+                provenance=_V22_BACKFILL_PROVENANCE,
+            )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "Failed to enroll evergreen backlog item for v22 backfill "
+                "count divergence (project %s)",
+                project_id,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
 
     return count
 

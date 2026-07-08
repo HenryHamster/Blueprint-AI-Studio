@@ -557,3 +557,175 @@ class TestChallengeRefutedRate:
 
         # Verify the correct calculation: 10 / (5+4+3 + 3+4+3 + 2+2+4) = 10/30
         assert rate == pytest.approx(10 / 30, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# v22 backfill count-divergence → evergreen enrollment (DB-backed)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_v22_backfill_count_divergence_enrolls_deduped_finding(db_session):
+    """When the v22 backfill count diverges from 13, enroll a deduped evergreen item.
+
+    Seeds 7 low-severity findings (not 13), calls the backfill, and asserts:
+    - An EvergreenBacklogItem row exists with the expected finding_key + provenance.
+    - A second backfill call does NOT create a duplicate row (dedup on finding_key).
+    - The backfill still returns the actual resolved count and the guard state
+      reflects the mismatch.
+    """
+    from app.models import EvergreenBacklogItem
+    from app.release_readiness import (
+        _V22_BACKFILL_COUNT_DIVERGENCE_KEY,
+        _V22_BACKFILL_PROVENANCE,
+        _reset_v22_backfill_guard_for_tests,
+        backfill_v22_carried_findings_resolved,
+        get_v22_backfill_guard_state,
+    )
+    from testing.test_acceptance_criteria import (
+        _make_project,
+        _make_release_version,
+        _make_v22_low_severity_findings,
+        _seed_v22_verdict,
+    )
+
+    _reset_v22_backfill_guard_for_tests()
+
+    project = await _make_project(db_session, "V22DivergenceEnroll")
+    version = await _make_release_version(
+        db_session, project, 22, status="promoted"
+    )
+
+    # Seed only 7 findings — diverges from the expected 13.
+    findings = _make_v22_low_severity_findings(7)
+    await _seed_v22_verdict(
+        db_session, project, version, findings, sha="e" * 40
+    )
+
+    count = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+
+    # The backfill must return the actual resolved count.
+    assert count == 7, f"expected 7 resolution rows; got {count}"
+
+    # Guard state must reflect the mismatch.
+    guard = get_v22_backfill_guard_state()
+    assert guard["expected"] == 13
+    assert guard["resolved"] == 7
+    assert guard["match"] is False
+
+    # An EvergreenBacklogItem must be enrolled with the expected key + provenance.
+    from sqlmodel import select as _sel
+    items = list(
+        (
+            await db_session.execute(
+                _sel(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == project.id,
+                    EvergreenBacklogItem.finding_key
+                    == _V22_BACKFILL_COUNT_DIVERGENCE_KEY,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(items) == 1, (
+        f"expected 1 enrolled item; got {len(items)}"
+    )
+    item = items[0]
+    assert item.provenance == _V22_BACKFILL_PROVENANCE, (
+        f"expected provenance={_V22_BACKFILL_PROVENANCE!r}; "
+        f"got {item.provenance!r}"
+    )
+    assert item.status == "enrolled"
+    assert "v22 backfill count divergence" == (item.title or "")
+    assert item.detail is not None
+    assert "7" in item.detail
+    assert "13" in item.detail
+
+    # A second backfill call must NOT create a duplicate row.
+    await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+    items_after = list(
+        (
+            await db_session.execute(
+                _sel(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == project.id,
+                    EvergreenBacklogItem.finding_key
+                    == _V22_BACKFILL_COUNT_DIVERGENCE_KEY,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(items_after) == 1, (
+        f"second backfill call must not duplicate; got {len(items_after)} rows"
+    )
+
+
+@pytest.mark.asyncio
+async def test_v22_backfill_count_match_does_not_enroll(db_session):
+    """When the v22 backfill resolves exactly 13 findings, no enrollment occurs.
+
+    The canonical count of 13 matches _V22_EXPECTED_LOW_SEVERITY_COUNT,
+    so the divergence block never executes and no EvergreenBacklogItem
+    with the divergence finding_key is enrolled.
+    """
+    from app.models import EvergreenBacklogItem
+    from app.release_readiness import (
+        _V22_BACKFILL_COUNT_DIVERGENCE_KEY,
+        _reset_v22_backfill_guard_for_tests,
+        backfill_v22_carried_findings_resolved,
+        get_v22_backfill_guard_state,
+    )
+    from testing.test_acceptance_criteria import (
+        _make_project,
+        _make_release_version,
+        _make_v22_low_severity_findings,
+        _seed_v22_verdict,
+    )
+
+    _reset_v22_backfill_guard_for_tests()
+
+    project = await _make_project(db_session, "V22MatchNoEnroll")
+    version = await _make_release_version(
+        db_session, project, 22, status="promoted"
+    )
+
+    # Seed the canonical 13 findings.
+    findings = _make_v22_low_severity_findings(13)
+    await _seed_v22_verdict(
+        db_session, project, version, findings, sha="d" * 40
+    )
+
+    count = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+
+    assert count == 13
+
+    # Guard state must reflect a match.
+    guard = get_v22_backfill_guard_state()
+    assert guard["match"] is True
+
+    # No EvergreenBacklogItem with the divergence key must exist.
+    from sqlmodel import select as _sel
+    items = list(
+        (
+            await db_session.execute(
+                _sel(EvergreenBacklogItem).where(
+                    EvergreenBacklogItem.project_id == project.id,
+                    EvergreenBacklogItem.finding_key
+                    == _V22_BACKFILL_COUNT_DIVERGENCE_KEY,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(items) == 0, (
+        f"expected 0 divergence items when count matches; got {len(items)}"
+    )
