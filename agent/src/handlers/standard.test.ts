@@ -207,6 +207,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance } from './standard.js';
 import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner } from '../index.js';
+import { resetLlmTelemetry, getLlmTelemetry } from '../telemetry.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -4858,5 +4859,34 @@ describe('resolveVisualAcceptance', () => {
   it('returns undefined when acceptance_evidence is a string (not an object)', () => {
     const payload = { acceptance_evidence: 'visual' };
     expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+});
+
+describe('prompt size telemetry', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetLlmTelemetry();
+  });
+
+  it('records prompt size telemetry in the standard handler', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const telemetry = getLlmTelemetry();
+
+    // prompt_size_bytes must be the real assembled-prompt byte length — positive
+    expect(telemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_sizes).not.toBeNull();
+    // 'prompt_body' must NOT appear as a section (the whole prompt is not a component of itself)
+    expect((telemetry.prompt_section_sizes ?? []).map(s => s.name)).not.toContain('prompt_body');
+    // Component sections summed must not exceed the total (no double-counting)
+    const sectionSum = (telemetry.prompt_section_sizes ?? []).reduce((s, e) => s + e.bytes, 0);
+    expect(sectionSum).toBeLessThanOrEqual(telemetry.prompt_size_bytes ?? 0);
+    // Top 3 sections should have named entries with positive byte counts
+    expect((telemetry.prompt_section_sizes ?? []).length).toBeGreaterThan(0);
+    for (const s of (telemetry.prompt_section_sizes ?? [])) {
+      expect(s.bytes).toBeGreaterThan(0);
+      expect(typeof s.name).toBe('string');
+    }
   });
 });

@@ -31,6 +31,7 @@ import {
   getProviderRunner, setCurrentPromptFingerprint, sendHeartbeatSync,
   resolveBaseBranch, resolveTaskBranchNamespace,
 } from '../index.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
@@ -809,6 +810,51 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     _heartbeatOpts.had_diagnostics_after_edit = hadDiagnosticsAfterEdit;
   }
   sendHeartbeatSync(taskId, statusRef.value, _heartbeatOpts);
+
+  // ── Prompt-size telemetry ──────────────────────────────────────────────────
+  // Record the assembled prompt's byte size and top-3 section breakdown so
+  // getLlmTelemetry() reports prompt bulk for standard-handler runs the same
+  // way it already does for plan/research. Group logically distinct sections;
+  // the builder caps output at 3 largest, so fine granularity is harmless.
+  const corePromptBody = buildPrompt({ contextPrefix, parentCtx, rawPrompt });
+  const srFeedbackBlock = loosenHintSection
+    + coFailurePairsSection
+    + severityCalibrationHintSection
+    + precisionRecallQuadrantHintSection
+    + executionEvidenceSection;
+  const guidanceFooter = PLAYBOOK_GUIDANCE
+    + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n`
+    + assembleFailureGuidanceBlocks()
+    + VIEWPORT_INFRA_SKIP_GUIDANCE;
+  const taskNotices = acceptanceEvidenceNotice + provenanceNotice;
+  const taskGuidance = taskTypeHint + firstTaskSection + taskTypeFocusBlock;
+  const promptSuffixBlock = promptSuffix + prTitlePrefixNote;
+  const fetchToolBlock = `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const promptedTelemetry = buildPromptSizeTelemetry(finalPromptWithTree, [
+    ['claude_md', claudeMdPrefix],
+    ['playbook', playbookSection],
+    ['retry_context', retryContext],
+    ['task_notices', taskNotices],
+    ['core_prompt', corePromptBody],
+    ['reserved_revision', reservedRevisionGuidance],
+    ['task_guidance', taskGuidance],
+    ['code_change_helper', buildCodeChangeHelperGuidance({ buildConfig, owner, repo })],
+    ['sr_feedback', srFeedbackBlock],
+    ['guidance_footer', guidanceFooter],
+    ['fetch_tool_guidance', fetchToolBlock],
+    ['prompt_suffix', promptSuffixBlock],
+    ['file_tree', fileTree],
+    ['repo_map', repoMap],
+    ['analysis', analysisContext],
+    ['prereq_knowledge', prerequisiteKnowledgeSection],
+    ['prereq_artifacts', prerequisiteArtifactSection],
+  ]);
+  setPromptSizeTelemetry(
+    promptedTelemetry.prompt_size_bytes,
+    promptedTelemetry.prompt_section_count,
+    promptedTelemetry.prompt_section_sizes,
+  );
+
   // Record HEAD before Claude runs so we can detect commits Claude made (e.g. before rebasing)
   const baseCommit = git(['rev-parse', 'HEAD']);
 

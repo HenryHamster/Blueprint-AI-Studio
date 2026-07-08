@@ -69,9 +69,10 @@ describe('writeDoneHelper — self-review fallback', () => {
     // Verify that it always includes self_review_outcome in payload
     expect(doneScript).toContain('"self_review_outcome": json.loads(self_review_raw)');
 
-    // Without regressingCategories, the gate is absent
-    expect(doneScript).not.toContain('REGRESSING_CATS=');
-    expect(doneScript).toContain('# No regressing categories for this task type');
+    // REGRESSING_CATS is always defined (empty when not configured)
+    expect(doneScript).toContain('REGRESSING_CATS=()');
+    // The combined gate infrastructure is present (no-op when empty)
+    expect(doneScript).toContain('MISSING_REASONING=()');
   });
 
   it('generates ./done script with PR URL shape validation', async () => {
@@ -151,8 +152,10 @@ describe('writeDoneHelper — regressingCategories edge cases', () => {
 
     const doneScript = capturedScripts['/tmp/workspace/done'];
     expect(doneScript).toBeDefined();
-    expect(doneScript).not.toContain('REGRESSING_CATS=');
-    expect(doneScript).toContain('# No regressing categories for this task type');
+    // REGRESSING_CATS is always defined (empty when no categories configured)
+    expect(doneScript).toContain('REGRESSING_CATS=()');
+    // The combined gate runs but regressing check is a no-op with empty array
+    expect(doneScript).toContain('MISSING_REASONING');
   });
 
   it('generates ./done with single regressing category in the gate', async () => {
@@ -264,8 +267,10 @@ describe('writeDoneHelper — thinning categories gate', () => {
 
     const doneScript = capturedScripts['/tmp/workspace/done'];
     expect(doneScript).toBeDefined();
-    expect(doneScript).not.toContain('REGRESSING_CATS=');
-    expect(doneScript).toContain('# No regressing categories for this task type');
+    // REGRESSING_CATS is always defined (empty when no categories configured)
+    expect(doneScript).toContain('REGRESSING_CATS=()');
+    // The combined gate runs but regressing check is a no-op with empty array
+    expect(doneScript).toContain('MISSING_REASONING');
   });
 
   it('generates ./done with anchor-exception in reasoning gate so short file:line reasoning passes', async () => {

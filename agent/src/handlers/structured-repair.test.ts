@@ -6,6 +6,7 @@ vi.mock('../index.js', () => ({
 }));
 
 vi.mock('../telemetry.js', () => ({
+  buildPromptSizeTelemetry: vi.fn(),
   getLlmTelemetry: vi.fn(),
   recordFormatRepairTokens: vi.fn(),
 }));

@@ -278,6 +278,7 @@ const {
     'fmtScalar',
   ] satisfies StrategicSectionsExportKey[],
     TELEMETRY_EXPORT_NAMES: [
+    'buildPromptSizeTelemetry',
     'computePromptFingerprint',
     'errorFingerprint',
     'estimateTokensFromChars',
@@ -523,6 +524,7 @@ vi.mock('./strategic-sections.js', () => ({
 
 vi.mock('../telemetry.js', () => ({
   ...Object.fromEntries(TELEMETRY_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  buildPromptSizeTelemetry: vi.fn(),
   recordFormatMiss: vi.fn(),
   recordFormatRepairAttempt: vi.fn(),
   recordFormatRepairSuccess: vi.fn(),
