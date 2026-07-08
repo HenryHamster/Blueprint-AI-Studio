@@ -950,6 +950,9 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
     writeCodeChangeHelpers(cfg);
     const blocked = capturedScripts['/tmp/workspace/blocked'];
     expect(blocked).toBeDefined();
+    expect(blocked).toContain('_json_str()');
+    expect(blocked).toContain('PAYLOAD=$(printf');
+    expect(blocked).not.toContain('PAYLOAD=$(jq -n');
     expect(blocked).toContain('--needs-task');
     expect(blocked).toContain('--needs-pr');
     expect(blocked).toContain('--needs-capability');
@@ -1004,7 +1007,7 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
   });
 
   // needs exec bit: runs a generated bash helper + PATH-resolved curl stub (mode 0o755)
-  it.skipIf(!SUPPORTS_EXEC_BIT)('absent-need path is byte-for-byte the legacy payload (no blocked_need key)', async () => {
+  it.skipIf(!SUPPORTS_EXEC_BIT)('absent-need path preserves the legacy payload shape', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers(cfg);
     const { exit, payload } = await runBlocked(['just a reason']);
@@ -1380,6 +1383,9 @@ describe('writeCodeChangeHelpers — lifecycle helpers use live token file', () 
     expect(failScript).toBeDefined();
     expect(failScript).toContain('_load_agent_token');
     expect(failScript).toContain('_load_agent_token()');
+    expect(failScript).toContain('_json_str()');
+    expect(failScript).toContain('PAYLOAD=$(printf');
+    expect(failScript).not.toContain('PAYLOAD=$(jq -n');
     // Must not use the stale env snapshot as the ONLY token source.
     expect(failScript).not.toContain('TOKEN="${AGENT_API_TOKEN:?');
     // Env fallback must still exist inside the function (one-shot agents).
@@ -1393,6 +1399,9 @@ describe('writeCodeChangeHelpers — lifecycle helpers use live token file', () 
     expect(blockedScript).toBeDefined();
     expect(blockedScript).toContain('_load_agent_token');
     expect(blockedScript).toContain('_load_agent_token()');
+    expect(blockedScript).toContain('_json_str()');
+    expect(blockedScript).toContain('PAYLOAD=$(printf');
+    expect(blockedScript).not.toContain('PAYLOAD=$(jq -n');
     expect(blockedScript).not.toContain('TOKEN="${AGENT_API_TOKEN:?');
     expect(blockedScript).toContain('AGENT_API_TOKEN');
   });

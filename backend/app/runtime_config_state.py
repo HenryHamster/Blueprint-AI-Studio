@@ -474,7 +474,8 @@ runtime_config: Dict = {
     # the whole group. Every task type listed here falls under the matching
     # category_routing block; unlisted types resolve via category_routing["_default"].
     "task_type_categories": {
-        "strategic": ["strategic_review", "design_doc_update", "research", "plan"],
+        "strategic": ["strategic_review", "design_doc_update"],
+        "initiative": ["research", "plan"],
         "build": ["create", "refactor", "migrate"],
         "review": ["review", "qa", "security_audit", "perf", "debug", "fix"],
         "ops": ["docs", "deps", "smoketest"],
@@ -485,23 +486,27 @@ runtime_config: Dict = {
     # concrete settings bag (including model).
     "category_routing": {
         "_default": {
-            "providers": ["zai", "anthropic", "openai", "gemini"],
+            "providers": ["deepseek", "anthropic", "openai", "gemini"],
             "effort": "medium",
         },
         "strategic": {
-            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "providers": ["zai", "anthropic", "deepseek", "openai", "gemini"],
             "effort": "max",
         },
+        "initiative": {
+            "providers": ["deepseek", "anthropic", "openai", "gemini"],
+            "effort": "medium",
+        },
         "build": {
-            "providers": ["zai", "anthropic", "openai", "gemini"],
+            "providers": ["deepseek", "anthropic", "openai", "gemini"],
             "effort": "medium",
         },
         "review": {
-            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "providers": ["anthropic", "deepseek", "openai", "gemini"],
             "effort": "high",
         },
         "ops": {
-            "providers": ["deepseek", "anthropic", "zai", "openai", "gemini"],
+            "providers": ["deepseek", "anthropic", "openai", "gemini"],
             "effort": "low",
         },
     },
@@ -570,7 +575,7 @@ runtime_config: Dict = {
             # prose — terse output saves tokens without losing debug signal.
             # review (high) gets medium so review comments can explain.
             # strategic (max) gets high because the prose *is* the deliverable
-            # (design docs, research, plans).
+            # (design docs and strategic reviews).
             "low": {
                 "model": "gpt-5.4-mini",
                 "reasoning_effort": "low",
@@ -1450,11 +1455,31 @@ def _insert_provider_once(providers: list[Any], provider: str, index: int) -> No
     providers.insert(max(0, min(index, len(providers))), provider)
 
 
+def _remove_provider(providers: list[Any], provider: str) -> None:
+    providers[:] = [candidate for candidate in providers if candidate != provider]
+
+
+def _move_provider_once(providers: list[Any], provider: str, index: int) -> None:
+    _remove_provider(providers, provider)
+    providers.insert(max(0, min(index, len(providers))), provider)
+
+
 def _insert_provider_after(
     providers: list[Any], provider: str, after_provider: str
 ) -> None:
     if provider in providers:
         return
+    try:
+        index = providers.index(after_provider) + 1
+    except ValueError:
+        index = len(providers)
+    providers.insert(index, provider)
+
+
+def _move_provider_after(
+    providers: list[Any], provider: str, after_provider: str
+) -> None:
+    _remove_provider(providers, provider)
     try:
         index = providers.index(after_provider) + 1
     except ValueError:
@@ -1486,10 +1511,36 @@ def _ensure_route_defaults(
 def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
     """Add provider defaults introduced after the settings-bag migration.
 
-    This is intentionally additive. Existing provider order is preserved unless
-    a new provider is absent, so a future operator patch does not fight this
-    backfill on every DB->memory sync.
+    Explicit single-provider routes are preserved. Multi-provider broad routes
+    are normalized to keep high-volume work off GLM by default after upgrade.
     """
+    categories = config.setdefault("task_type_categories", {})
+    if isinstance(categories, dict):
+        default_categories = runtime_config.get("task_type_categories", {})
+        if isinstance(default_categories, dict):
+            for category, members in default_categories.items():
+                if isinstance(members, list):
+                    categories.setdefault(category, list(members))
+
+        strategic_members = categories.get("strategic")
+        if isinstance(strategic_members, list):
+            categories["strategic"] = [
+                member
+                for member in strategic_members
+                if member not in ("research", "plan")
+            ]
+
+        initiative_members = categories.setdefault("initiative", [])
+        if isinstance(initiative_members, list):
+            for task_type in ("research", "plan"):
+                present_elsewhere = any(
+                    isinstance(members, list) and task_type in members
+                    for members in categories.values()
+                    if members is not initiative_members
+                )
+                if not present_elsewhere and task_type not in initiative_members:
+                    initiative_members.append(task_type)
+
     tier_map = config.setdefault("provider_tier_model_map", {})
     if isinstance(tier_map, dict):
         for provider in ("zai", "deepseek"):
@@ -1519,20 +1570,25 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
 
     category_routing = config.setdefault("category_routing", {})
     if isinstance(category_routing, dict):
-        for category in ("_default", "strategic", "build", "review", "ops"):
+        for category in ("_default", "strategic", "initiative", "build", "review", "ops"):
             route = _ensure_route_defaults(category_routing, category)
             providers = route.get("providers")
             if not isinstance(providers, list):
                 continue
             if len(providers) <= 1:
                 continue
-            if category in ("_default", "build"):
-                _insert_provider_once(providers, "zai", 0)
+            if category == "strategic":
+                _move_provider_once(providers, "zai", 0)
+                _move_provider_after(providers, "deepseek", "anthropic")
+            elif category == "review":
+                _remove_provider(providers, "zai")
+                _move_provider_after(providers, "deepseek", "anthropic")
             elif category == "ops":
-                _insert_provider_once(providers, "deepseek", 0)
-                _insert_provider_after(providers, "zai", "anthropic")
-            elif category in ("strategic", "review"):
-                _insert_provider_after(providers, "zai", "anthropic")
+                _remove_provider(providers, "zai")
+                _move_provider_once(providers, "deepseek", 0)
+            else:
+                _remove_provider(providers, "zai")
+                _move_provider_once(providers, "deepseek", 0)
 
     if config.get("provider_selection_mode") not in (
         "balanced",
@@ -1601,7 +1657,7 @@ def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
         if "_default" not in cat_routing:
             default_providers = (
                 legacy_pref.get("_default") if isinstance(legacy_pref, dict) else None
-            ) or ["zai", "anthropic", "openai", "gemini"]
+            ) or ["deepseek", "anthropic", "openai", "gemini"]
             cat_routing["_default"] = {
                 "providers": list(default_providers),
                 "effort": default_effort,

@@ -2,7 +2,7 @@ import fs from 'fs';
 import { WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { SHELL_CMD_RE } from '../shell-safety.js';
-import { agentTokenShellFn } from '../token-file.js';
+import { agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
 import { writeCheckHelper } from './check-helper.js';
 import { writeDoneHelper } from './done-helper.js';
 import { writePrHelper } from './pr-helper.js';
@@ -314,6 +314,7 @@ function writeFailHelper(cfg: CodeChangeHelperConfig): void {
   // requirements). Posts FAILED with the reason. Wrapper sees the marker
   // and exits cleanly without trying its own fallback push.
   const agentTokenFn = agentTokenShellFn();
+  const jsonStrFn = jsonStrShellFn();
   const script = `#!/bin/bash
 # ./fail "reason" — mark task FAILED with an operator-readable reason.
 # Use when the task can't be completed cleanly: scope is wrong, blocker
@@ -322,6 +323,7 @@ function writeFailHelper(cfg: CodeChangeHelperConfig): void {
 
 set -uo pipefail
 ${agentTokenFn}
+${jsonStrFn}
 REASON="\${1:?Usage: ./fail \\"<reason>\\"}"
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
@@ -333,8 +335,8 @@ if [ -f /tmp/fail_${cfg.taskId} ]; then
   exit 0
 fi
 
-PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "$REASON" \\
-  '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "agent_self_failed"}')
+PAYLOAD=$(printf '{"task_id":%s,"status":"FAILED","artifact_type":"ERROR_LOG","logs":%s,"failure_category":"agent_self_failed"}' \\
+  "$(_json_str "$TASK")" "$(_json_str "$REASON")")
 POSTED=0
 for attempt in 1 2 3 4 5; do
   HTTP=$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/fail_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
@@ -376,6 +378,7 @@ function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
   // chain, and the strategic agent gets a ProjectMessage so it can decide
   // whether to spawn a precondition-fix direction.
   const agentTokenFn = agentTokenShellFn();
+  const jsonStrFn = jsonStrShellFn();
   const script = `#!/bin/bash
 # ./blocked "<reason>" — mark task BLOCKED_PRECONDITION (no retry burn).
 #
@@ -402,6 +405,7 @@ function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
 
 set -uo pipefail
 ${agentTokenFn}
+${jsonStrFn}
 
 # Optional structured prerequisite flags. When given, the blocker carries a
 # normalized machine-resolvable need ({kind, ref}) alongside the free-text
@@ -451,12 +455,11 @@ fi
 # takes (normalize_agent_failure_category vs the BLOCKER:-prefix
 # fast-path in _classify_failure_class).
 if [ -n "$NEED_KIND" ] && [ -n "$NEED_REF" ]; then
-  PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "BLOCKER: $REASON" \\
-    --arg nk "$NEED_KIND" --arg nr "$NEED_REF" \\
-    '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "BLOCKED_PRECONDITION", blocked_need: {kind: $nk, ref: $nr}}')
+  PAYLOAD=$(printf '{"task_id":%s,"status":"FAILED","artifact_type":"ERROR_LOG","logs":%s,"failure_category":"BLOCKED_PRECONDITION","blocked_need":{"kind":%s,"ref":%s}}' \\
+    "$(_json_str "$TASK")" "$(_json_str "BLOCKER: $REASON")" "$(_json_str "$NEED_KIND")" "$(_json_str "$NEED_REF")")
 else
-  PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "BLOCKER: $REASON" \\
-    '{task_id: $tid, status: "FAILED", artifact_type: "ERROR_LOG", logs: $r, failure_category: "BLOCKED_PRECONDITION"}')
+  PAYLOAD=$(printf '{"task_id":%s,"status":"FAILED","artifact_type":"ERROR_LOG","logs":%s,"failure_category":"BLOCKED_PRECONDITION"}' \\
+    "$(_json_str "$TASK")" "$(_json_str "BLOCKER: $REASON")")
 fi
 POSTED=0
 for attempt in 1 2 3 4 5; do

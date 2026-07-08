@@ -13,6 +13,7 @@ import {
   ensureGithubTokenFileEnv,
   writeGithubTokenFile,
   githubTokenShellFn,
+  jsonStrShellFn,
 } from './token-file.js';
 
 // Isolate every test from the real home dir: each run points token files at
@@ -119,12 +120,30 @@ describe('agentTokenShellFn', () => {
     // Reads the live file fresh...
     expect(fn).toContain('[ -s "${AGENT_TOKEN_FILE}" ]');
     expect(fn).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
+    // Rejects placeholder/non-JWT file contents so the env fallback can recover.
+    expect(fn).toContain('_agent_token_looks_like_jwt()');
+    expect(fn).toContain('! _agent_token_looks_like_jwt "$TOKEN"');
+    expect(fn).toContain('ignoring invalid AGENT_TOKEN_FILE contents');
     // ...and falls back to the env snapshot for one-shot agents.
     expect(fn).toContain('TOKEN="${AGENT_API_TOKEN:-}"');
     // Fails loud only when BOTH sources are empty.
     expect(fn).toContain('no agent token available');
     // Must never echo the token value.
     expect(fn).not.toContain('echo "$TOKEN"');
+  });
+});
+
+describe('jsonStrShellFn', () => {
+  it('emits a jq-free JSON string encoder with a fail-loud fallback', () => {
+    const fn = jsonStrShellFn();
+    expect(fn).toContain('_json_str()');
+    expect(fn).toContain('command -v python3');
+    expect(fn).toContain('json.dumps');
+    expect(fn).toContain('command -v node');
+    expect(fn).toContain('JSON.stringify');
+    expect(fn).toContain('no JSON string encoder available');
+    expect(fn).toContain('_json_str "" >/dev/null || exit 1');
+    expect(fn).not.toContain('jq -');
   });
 });
 

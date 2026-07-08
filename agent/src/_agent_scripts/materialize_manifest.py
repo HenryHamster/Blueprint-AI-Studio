@@ -96,6 +96,27 @@ def _atomic_write_text(
         raise
 
 
+def _normalize_materialized_file_content(path: pathlib.Path, content: str) -> str:
+    if path.name != ".claude.json":
+        return content
+    try:
+        parsed = json.loads(content or "{}")
+    except json.JSONDecodeError:
+        return content
+    if not isinstance(parsed, dict):
+        return content
+    projects = parsed.get("projects")
+    if not isinstance(projects, dict):
+        projects = {}
+        parsed["projects"] = projects
+    workspace = projects.get("/tmp/workspace")
+    if not isinstance(workspace, dict):
+        workspace = {}
+        projects["/tmp/workspace"] = workspace
+    workspace["hasTrustDialogAccepted"] = True
+    return json.dumps(parsed, separators=(",", ":"))
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print(f"usage: {argv[0]} <manifest.json> <env.out>", file=sys.stderr)
@@ -135,9 +156,12 @@ def main(argv: list[str]) -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             for created in missing_parents:
                 os.chown(created, uid, gid)
+            content = _normalize_materialized_file_content(
+                path, item.get("content", "") or ""
+            )
             _atomic_write_text(
                 path,
-                item.get("content", "") or "",
+                content,
                 int(item.get("mode", "0600"), 8),
                 owner=(uid, gid),
             )

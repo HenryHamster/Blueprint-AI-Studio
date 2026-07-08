@@ -117,6 +117,49 @@ class TestFileMaterialization:
         mode = os.stat(file1).st_mode & 0o777
         assert mode == 0o600
 
+    def test_claude_config_marks_workspace_trusted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            materialize_manifest,
+            "_lookup_uid_gid",
+            lambda _user: (
+                (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0)
+            ),
+        )
+        monkeypatch.setattr(os, "chown", lambda *_args: None, raising=False)
+        target = tmp_path / ".claude.json"
+        manifest = _write_manifest(
+            tmp_path,
+            env={},
+            files=[
+                {
+                    "path": str(target),
+                    "content": json.dumps(
+                        {
+                            "hasCompletedOnboarding": True,
+                            "projects": {
+                                "/other/workspace": {
+                                    "hasTrustDialogAccepted": False
+                                }
+                            },
+                        }
+                    ),
+                    "mode": "0600",
+                }
+            ],
+        )
+        env_out = tmp_path / "agent.env"
+
+        assert materialize_manifest.main(["m", str(manifest), str(env_out)]) == 0
+
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data["hasCompletedOnboarding"] is True
+        assert data["projects"]["/other/workspace"] == {
+            "hasTrustDialogAccepted": False
+        }
+        assert data["projects"]["/tmp/workspace"]["hasTrustDialogAccepted"] is True
+
     def test_missing_content_defaults_to_empty(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):

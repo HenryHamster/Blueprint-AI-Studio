@@ -5,7 +5,7 @@ import { WORKSPACE } from './index.js';
 import type { BuildConfig } from './index.js';
 import { isReadOnlyTaskType } from './taskCapabilities.js';
 import { parseBackendTimestamp } from './utils/time.js';
-import { agentTokenShellFn } from './token-file.js';
+import { agentTokenShellFn, jsonStrShellFn } from './token-file.js';
 
 // ── Re-exports from sub-modules (facade) ────────────────────────────────────
 // The bulky helpers have been split out into prompts/* modules so that small
@@ -690,6 +690,7 @@ KEY="$2"
 VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
+${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
 ${retryPostShellFn()}
@@ -703,11 +704,16 @@ elif [ "$OP" = "set" ]; then
   # the entry. Absent (non-git workspace) => omitted => backend keeps it legacy.
   BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
   HEAD_SHA=$(git rev-parse --short HEAD 2>/dev/null || true)
-  jq -n --arg tid "$TASK" --arg k "$KEY" --arg v "$VALUE" --arg br "$BRANCH" --arg sha "$HEAD_SHA" \\
-    '{task_id: $tid, op: "set", key: $k, value: $v}
-       + (if $br == "" then {} else {branch: $br} end)
-       + (if $sha == "" then {} else {head_sha: $sha} end)' | \\
-    _post_with_retry "$API/api/agent/playbook" "playbook set"
+  PAYLOAD=$(printf '{"task_id":%s,"op":"set","key":%s,"value":%s' \\
+    "$(_json_str "$TASK")" "$(_json_str "$KEY")" "$(_json_str "$VALUE")")
+  if [ -n "$BRANCH" ]; then
+    PAYLOAD="\${PAYLOAD},\\"branch\\":$(_json_str "$BRANCH")"
+  fi
+  if [ -n "$HEAD_SHA" ]; then
+    PAYLOAD="\${PAYLOAD},\\"head_sha\\":$(_json_str "$HEAD_SHA")"
+  fi
+  PAYLOAD="\${PAYLOAD}}"
+  printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/playbook" "playbook set"
 elif [ "$OP" = "list" ]; then
   printf '{"task_id":"%s","op":"list"}' "$TASK" | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
@@ -742,6 +748,7 @@ export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKS
 OP="\${1:?Usage: messages send|resolve ...}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
+${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
 ${retryPostShellFn()}
@@ -755,17 +762,17 @@ if [ "$OP" = "send" ]; then
   fi
   [ -n "$CONTENT" ] || { echo "Error: send requires message content" >&2; exit 1; }
   IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
-  PAYLOAD=$(jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" --arg k "$IDEM_KEY" \\
-    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c, idempotency_key: $k}}') || {
+  PAYLOAD=$(printf '{"task_id":%s,"op":"create_message","data":{"type":%s,"content":%s,"idempotency_key":%s}}' \\
+    "$(_json_str "$TASK")" "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")") || {
     echo "[ERROR] send: failed to serialize message payload" >&2; exit 1
   }
   printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/strategic" "messages $OP"
 elif [ "$OP" = "resolve" ]; then
   MSG_ID="\${2:?resolve requires <message-id>}"
   RESOLUTION="\${3:-Addressed}"
-  jq -n --arg tid "$TASK" --arg mid "$MSG_ID" --arg r "$RESOLUTION" \\
-    '{task_id: $tid, op: "resolve_message", data: {message_id: $mid, resolution: $r}}' | \\
-    _post_with_retry "$API/api/agent/strategic" "messages $OP"
+  PAYLOAD=$(printf '{"task_id":%s,"op":"resolve_message","data":{"message_id":%s,"resolution":%s}}' \\
+    "$(_json_str "$TASK")" "$(_json_str "$MSG_ID")" "$(_json_str "$RESOLUTION")")
+  printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/strategic" "messages $OP"
 else
   echo "Unknown op: $OP. Use send or resolve." >&2; exit 1
 fi

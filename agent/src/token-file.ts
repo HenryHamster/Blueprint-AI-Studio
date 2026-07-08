@@ -153,6 +153,32 @@ export function writeGithubTokenFile(token: string): boolean {
 }
 
 /**
+ * Bash function for generated helpers that need to build JSON request bodies
+ * without assuming `jq` exists on the VM.
+ *
+ * The exact encoder uses python3 when present, then node. If neither is
+ * available, fail loudly rather than silently emitting invalid JSON.
+ */
+export function jsonStrShellFn(): string {
+  return [
+    '# Encode one shell value as a JSON string literal without requiring jq.',
+    '_json_str() {',
+    '  if command -v python3 >/dev/null 2>&1; then',
+    "    printf '%s' \"${1-}\" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))'",
+    '    return $?',
+    '  fi',
+    '  if command -v node >/dev/null 2>&1; then',
+    "    printf '%s' \"${1-}\" | node -e 'const fs=require(\"fs\"); process.stdout.write(JSON.stringify(fs.readFileSync(0,\"utf8\")));'",
+    '    return $?',
+    '  fi',
+    '  echo "[ERROR] no JSON string encoder available (python3/node missing)" >&2',
+    '  return 1',
+    '}',
+    '_json_str "" >/dev/null || exit 1',
+  ].join('\n');
+}
+
+/**
  * Bash functions, emitted into helper scripts that need a fresh GitHub
  * installation token before a git push or GitHub API call.
  *
@@ -219,10 +245,20 @@ export function agentTokenShellFn(): string {
     '# long-lived resident session authenticates with the ROTATED token, not the',
     '# stale spawn-time env snapshot. Falls back to AGENT_API_TOKEN when the file',
     '# is unset/empty. Re-callable after a 401 to re-read a rotated token.',
+    '_agent_token_looks_like_jwt() {',
+    '  case "${1:-}" in',
+    '    *.*.*) return 0 ;;',
+    '    *) return 1 ;;',
+    '  esac',
+    '}',
     '_load_agent_token() {',
     '  if [ -n "${AGENT_TOKEN_FILE:-}" ] && [ -s "${AGENT_TOKEN_FILE}" ]; then',
     '    TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)',
     '  else',
+    '    TOKEN=""',
+    '  fi',
+    '  if [ -n "$TOKEN" ] && ! _agent_token_looks_like_jwt "$TOKEN"; then',
+    '    echo "[WARN] ignoring invalid AGENT_TOKEN_FILE contents; falling back to AGENT_API_TOKEN" >&2',
     '    TOKEN=""',
     '  fi',
     '  [ -n "$TOKEN" ] || TOKEN="${AGENT_API_TOKEN:-}"',

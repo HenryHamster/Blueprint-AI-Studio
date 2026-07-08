@@ -5040,10 +5040,12 @@ describe('writeMessagesHelper stdin-based send', () => {
     expect(script).toContain('Error: send requires message content');
   });
 
-  it('captures jq-built payload into PAYLOAD variable and fails loud on jq errors', () => {
+  it('builds payload into PAYLOAD without requiring jq', () => {
     writeMessagesHelper('task-stdin-test');
     const script = capturedScripts['/tmp/workspace/messages'];
-    expect(script).toContain('PAYLOAD=$(jq -n');
+    expect(script).toContain('_json_str()');
+    expect(script).toContain('PAYLOAD=$(printf');
+    expect(script).not.toContain('PAYLOAD=$(jq -n');
     expect(script).toContain('[ERROR] send: failed to serialize message payload');
     // Sends the PAYLOAD (not raw jq pipe) via _post_with_retry
     expect(script).toContain('printf \'%s\' "$PAYLOAD" | _post_with_retry');
@@ -5215,6 +5217,9 @@ describe('writePlaybookHelper live token resolution', () => {
     expect(script).toContain('TOKEN="${AGENT_API_TOKEN:-}"');
     expect(script).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
     expect(script).toContain('-H "X-Agent-Token: $TOKEN"');
+    expect(script).toContain('_json_str()');
+    expect(script).toContain('PAYLOAD=$(printf');
+    expect(script).not.toContain('jq -n --arg tid "$TASK"');
 
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
