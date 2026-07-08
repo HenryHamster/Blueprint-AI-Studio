@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin import _get_user_project_with_role
-from app.auth import create_runner_token, hash_runner_token, get_current_user
+from app.auth import create_runner_token, hash_runner_token, get_current_user, require_admin
 from app.database import get_session
 from app.models import LocalRunner, Task, TaskStatus, _utcnow
 from app.task_capabilities import STRATEGIC_TASK_TYPES, TaskType
@@ -524,3 +524,76 @@ async def delete_runner(
         "status": "deleted",
         "released_unpulled_pins": released_pins,
     }
+
+
+@router.get("/fleet/runners/health-summary")
+async def fleet_runners_health_summary(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Fleet-wide runner-health summary across every project.
+
+    Returns aggregate counts (total, connected, degraded, stale, offline,
+    low-disk) plus a per-project breakdown that reuses ``_runner_health()`` so
+    the fleet view and the per-project runner list can never diverge. Guarded
+    with ``require_admin`` — the same decorator as the other fleet-wide admin
+    endpoints in ``admin_health.py``.
+    """
+    now = _utcnow()
+
+    result = await session.execute(
+        select(LocalRunner).where(LocalRunner.status != "deleted")
+    )
+    all_runners = result.scalars().all()
+
+    per_project: Dict[str, List[LocalRunner]] = {}
+    for runner in all_runners:
+        pid = str(runner.project_id)
+        per_project.setdefault(pid, []).append(runner)
+
+    fleet = {
+        "total": 0,
+        "connected": 0,
+        "degraded": 0,
+        "stale": 0,
+        "offline": 0,
+        "low_disk": 0,
+    }
+    per_project_entries: List[Dict[str, Any]] = []
+
+    for pid, project_runners in sorted(per_project.items()):
+        entry: Dict[str, Any] = {
+            "project_id": pid,
+            "total": 0,
+            "connected": 0,
+            "degraded": 0,
+            "stale": 0,
+            "offline": 0,
+            "low_disk": 0,
+            "runners": [],
+        }
+        for runner in project_runners:
+            view = _runner_view(runner)
+            entry["runners"].append(view)
+            entry["total"] += 1
+            status = view["health"]["device_status"]
+            if status == "connected":
+                entry["connected"] += 1
+            elif status == "degraded":
+                entry["degraded"] += 1
+            elif status == "stale":
+                entry["stale"] += 1
+            elif status == "offline":
+                entry["offline"] += 1
+            if view["health"].get("disk_low"):
+                entry["low_disk"] += 1
+
+        for key in ("total", "connected", "degraded", "stale", "offline", "low_disk"):
+            fleet[key] += entry[key]
+
+        per_project_entries.append(entry)
+
+    fleet["per_project"] = per_project_entries
+    fleet["generated_at"] = now.isoformat()
+    fleet["project_count"] = len(per_project_entries)
+    return fleet

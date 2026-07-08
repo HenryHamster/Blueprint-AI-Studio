@@ -4016,6 +4016,38 @@ export async function fetchFleetUtilization(): Promise<FleetUtilizationResponse>
   return res.json();
 }
 
+// ── Fleet-wide runner-health summary ───────────────────────────────────────────
+
+/** Per-project runner-health breakdown in the fleet summary. */
+export interface FleetHealthProjectEntry {
+  project_id: string;
+  total: number;
+  connected: number;
+  degraded: number;
+  stale: number;
+  offline: number;
+  low_disk: number;
+  runners: FleetRunner[];
+}
+
+export interface FleetHealthSummaryResponse {
+  total: number;
+  connected: number;
+  degraded: number;
+  stale: number;
+  offline: number;
+  low_disk: number;
+  per_project: FleetHealthProjectEntry[];
+  project_count: number;
+  generated_at: string;
+}
+
+export async function fetchFleetHealthSummary(): Promise<FleetHealthSummaryResponse> {
+  const res = await apiFetch('/api/admin/fleet/runners/health-summary');
+  if (!res.ok) throw new Error(`fleet-health-summary fetch failed: ${res.status}`);
+  return res.json();
+}
+
 export interface StrategicRefreshMarker {
   requested_at?: string;
   reason?: string;
@@ -4632,6 +4664,59 @@ export async function resolveCompletionDebt(
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     throw new Error(data.detail || `Failed to resolve completion debt: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** A dead-lettered notification that exhausted retries or was evicted from the queue. */
+export interface DeadLetterEntry {
+  id: string;
+  project_id: string;
+  event_type: string;
+  reason: string;
+  attempts: number;
+  last_status: number | null;
+  webhook_url: string;
+  payload: Record<string, unknown>;
+  body: Record<string, unknown>;
+  created_at: string;
+}
+
+/** List dead-lettered notifications for a project (newest first). */
+export async function fetchDeadLetters(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<DeadLetterEntry[]> {
+  const res = await apiFetch(
+    `/api/admin/notification-dispatch/dead-letters?project_id=${encodeURIComponent(projectId)}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to fetch dead letters: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Re-drive one or more dead-lettered notifications through the retry queue. */
+export async function redriveDeadLetters(
+  projectId: string,
+  ids: string[],
+): Promise<{ redriven: number; errors: Array<{ id: string; error: string }> }> {
+  const res = await apiFetch(
+    '/api/admin/notification-dispatch/dead-letters/redrive',
+    {
+      method: 'POST',
+      body: JSON.stringify({ project_id: projectId, ids }),
+      headers: { 'Content-Type': 'application/json' },
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to redrive dead letters: ${res.status}`);
   }
   return res.json();
 }

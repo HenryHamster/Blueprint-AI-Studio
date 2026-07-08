@@ -243,6 +243,69 @@ def get_notification_stats(project_id: Any = None) -> dict:
     }
 
 
+async def list_dead_letters(session: AsyncSession, project_id: Any) -> list[dict]:
+    """List NotificationDeadLetter rows for a project, newest first.
+
+    Returns a list of dicts with id, project_id, event_type, reason, attempts,
+    last_status, webhook_url, payload, body, and created_at for each row.
+    """
+    from sqlmodel import select as _dl_select
+
+    result = await session.execute(
+        _dl_select(NotificationDeadLetter)
+        .where(NotificationDeadLetter.project_id == str(project_id))
+        .order_by(NotificationDeadLetter.created_at.desc())
+    )
+    rows = result.scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "project_id": r.project_id,
+            "event_type": r.event_type,
+            "reason": r.reason,
+            "attempts": r.attempts,
+            "last_status": r.last_status,
+            "webhook_url": r.webhook_url,
+            "payload": r.payload,
+            "body": r.body,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]
+
+
+async def redrive_dead_letter(session: AsyncSession, dead_letter_id: str, project_id: str) -> dict:
+    """Re-enqueue a dead-lettered notification and delete the row.
+
+    Loads the NotificationDeadLetter row, reconstructs a _RetryEntry from its
+    preserved payload/body, schedules it for immediate retry via
+    ``_enqueue_retry_durable``, then deletes the row so it is not replayed twice.
+
+    Validates that the row belongs to ``project_id`` — raises ``ValueError``
+    (caller should translate to 404) when the row does not exist or belongs to a
+    different project, so an attacker who knows a dead-letter UUID cannot redrive
+    (and delete) a row from a project they are not a member of.
+    """
+    row = await session.get(NotificationDeadLetter, uuid.UUID(dead_letter_id))
+    if row is None:
+        raise ValueError("dead letter not found")
+    if str(row.project_id) != str(project_id):
+        raise ValueError("dead letter not found")
+    entry = _RetryEntry(
+        project_id=row.project_id,
+        event_type=row.event_type,
+        payload=row.payload or {},
+        body=row.body or {},
+        attempts=0,
+        next_retry_at=time.monotonic(),
+        webhook_url=row.webhook_url or "",
+    )
+    await _enqueue_retry_durable(entry)
+    await session.delete(row)
+    await session.commit()
+    return {"status": "redriven", "id": dead_letter_id}
+
+
 async def _attempt_delivery(webhook_url: str, body: dict) -> int:
     """POST body to webhook_url. Returns HTTP status code, or 0 on network/timeout error.
 

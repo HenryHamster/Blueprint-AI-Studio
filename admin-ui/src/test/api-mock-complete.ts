@@ -97,6 +97,7 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     fetchKnowledgeDocuments: vi.fn(),
     fetchKnowledgeDocument: vi.fn(),
     fetchFleetUtilization: vi.fn(),
+    fetchFleetHealthSummary: vi.fn(),
     fetchLaneBaselines: vi.fn(),
     fetchEvergreenFillObservability: vi.fn(),
     fetchEvergreenBacklog: vi.fn(),
@@ -120,6 +121,8 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     revokeFleetRunner: vi.fn(),
     resetTaskIterationCap: vi.fn(),
     triggerTaskRollup: vi.fn(),
+    fetchDeadLetters: vi.fn(),
+    redriveDeadLetters: vi.fn(),
   };
   return { ...base, ...overrides };
 }

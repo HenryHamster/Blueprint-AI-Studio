@@ -548,6 +548,67 @@ async def get_notification_dispatch_stats(
     return _nd.get_notification_stats(project_id=pid)
 
 
+class _DeadLetterRedriveRequest(BaseModel):
+    project_id: str
+    ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
+@router.get("/notification-dispatch/dead-letters")
+async def list_dead_letters(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """List dead-lettered notifications for a project (newest first)."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
+    rows = await _nd.list_dead_letters(session, project_id=pid)
+    # Mask webhook_url for non-admin callers — webhook URLs embed auth tokens
+    # (Slack, Discord, PagerDuty) and must not leak to non-admin project members.
+    # This matches the pattern in admin_settings._build_notification_config_response.
+    if current_user.get("role") != "admin":
+        for r in rows:
+            r["webhook_url"] = ""
+    return rows
+
+
+@router.post("/notification-dispatch/dead-letters/redrive")
+async def redrive_dead_letters(
+    payload: _DeadLetterRedriveRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Re-drive one or more dead-lettered notifications through the retry queue.
+
+    Each re-driven entry is re-enqueued with a fresh attempt count; on success
+    the dead-letter row is deleted so it cannot be replayed twice. Returns the
+    count of entries successfully re-driven.
+    """
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
+
+    redriven = 0
+    errors: list[dict] = []
+    for dl_id in payload.ids:
+        try:
+            uuid.UUID(dl_id)
+        except (ValueError, TypeError):
+            errors.append({"id": dl_id, "error": "invalid id format"})
+            continue
+        try:
+            await _nd.redrive_dead_letter(session, dead_letter_id=dl_id, project_id=str(pid))
+            redriven += 1
+        except ValueError:
+            errors.append({"id": dl_id, "error": "not found"})
+    return {"redriven": redriven, "errors": errors}
+
+
 # ── Project Message Endpoints ─────────────────────────────────────────────────
 
 

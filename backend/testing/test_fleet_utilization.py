@@ -1,14 +1,21 @@
-"""Unit tests for the global fleet-utilization signal.
+"""Unit tests for the global fleet-utilization signal and fleet-wide runner-health summary.
 
 Covers the pure formatter and occupancy helpers plus the capacity/cooled
 aggregation in ``get_fleet_utilization_snapshot`` (``session=None`` path — no
 DB). The DB-derived ``active_now`` / ``util_now`` are exercised via the pure
 occupancy helper rather than a live session so these stay standalone.
+
+The fleet-wide runner-health summary endpoint
+(``GET /api/admin/fleet/runners/health-summary``) is exercised with
+in-memory LocalRunner rows through the async test client, verifying that
+mixed healthy/degraded/offline/low-disk runners across >=2 projects roll up
+correctly in the aggregate counts.
 """
 
 from datetime import datetime, timedelta
 
 import pytest
+import uuid
 
 from app import max_plan_pool
 from app.fleet_utilization import (
@@ -16,8 +23,10 @@ from app.fleet_utilization import (
     get_fleet_utilization_snapshot,
 )
 from app.max_plan_pool import _account_by_id, _max_plan_pools
-from app.models import TaskStatus
+from app.models import LocalRunner, Project, ProjectMember, TaskStatus, _utcnow
 from app.strategic_spawning import _format_fleet_utilization_axis
+
+TEST_USER_ID = "test-user-fleet-health"
 
 
 @pytest.fixture(autouse=True)
@@ -489,3 +498,276 @@ def test_format_omits_vm_segment_when_no_vm_cap():
         }
     )
     assert "vm" not in line
+
+
+# ── Fleet-wide runner-health summary endpoint ──────────────────────────────────
+
+
+def _make_health_runner(
+    *,
+    project_id: uuid.UUID,
+    hostname: str = "test-runner",
+    status: str = "active",
+    last_seen_at_offset_sec: int = 30,
+    consecutive_job_failures: int = 0,
+    last_successful_job_at_offset_sec: int | None = 60,
+    disk_free_bytes: int | None = None,
+    extra_caps: dict | None = None,
+) -> LocalRunner:
+    """Build an in-memory LocalRunner for fleet-health aggregate tests."""
+    now = _utcnow()
+    caps = {"task_types": "all", "max_concurrent": 2}
+    if disk_free_bytes is not None:
+        caps["disk_free_bytes"] = disk_free_bytes
+    if extra_caps:
+        caps.update(extra_caps)
+    return LocalRunner(
+        project_id=project_id,
+        token_hash="a" * 64,
+        hostname=hostname,
+        status=status,
+        last_seen_at=now - timedelta(seconds=last_seen_at_offset_sec),
+        consecutive_job_failures=consecutive_job_failures,
+        last_successful_job_at=(
+            now - timedelta(seconds=last_successful_job_at_offset_sec)
+            if last_successful_job_at_offset_sec is not None
+            else None
+        ),
+        capabilities=caps,
+    )
+
+
+async def _setup_project_with_owner(session) -> Project:
+    """Create a project with the test user as owner, return the project."""
+    project = Project(name="Fleet Health Test Project", user_id=TEST_USER_ID)
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+    await session.commit()
+    return project
+
+
+class TestFleetRunnersHealthSummary:
+    @pytest.mark.asyncio
+    async def test_empty_fleet_returns_zero_counts(self, client, db_session):
+        """No runners → total=0, all status counts are zero."""
+        resp = await client.get("/api/admin/fleet/runners/health-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 0
+        assert data["connected"] == 0
+        assert data["degraded"] == 0
+        assert data["stale"] == 0
+        assert data["offline"] == 0
+        assert data["low_disk"] == 0
+        assert data["project_count"] == 0
+        assert data["per_project"] == []
+        assert "generated_at" in data
+
+    @pytest.mark.asyncio
+    async def test_all_healthy_runners_single_project(self, client, db_session):
+        """Three healthy runners in one project → connected=3."""
+        project = await _setup_project_with_owner(db_session)
+        now = _utcnow()
+        for i in range(3):
+            runner = LocalRunner(
+                project_id=project.id,
+                token_hash=f"{i:064x}",
+                hostname=f"host-{i}",
+                status="active",
+                last_seen_at=now - timedelta(seconds=30),
+                consecutive_job_failures=0,
+                last_successful_job_at=now - timedelta(seconds=60),
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+            db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/fleet/runners/health-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 3
+        assert data["connected"] == 3
+        assert data["degraded"] == 0
+        assert data["stale"] == 0
+        assert data["offline"] == 0
+        assert data["low_disk"] == 0
+        assert data["project_count"] == 1
+        assert len(data["per_project"]) == 1
+        assert data["per_project"][0]["total"] == 3
+        assert data["per_project"][0]["connected"] == 3
+
+    @pytest.mark.asyncio
+    async def test_mixed_health_across_two_projects(self, client, db_session):
+        """Healthy + degraded + low-disk runners across two projects roll up."""
+        p1 = await _setup_project_with_owner(db_session)
+        p2 = Project(name="Second Project", user_id=TEST_USER_ID)
+        db_session.add(p2)
+        await db_session.commit()
+        await db_session.refresh(p2)
+        db_session.add(ProjectMember(project_id=p2.id, user_id=TEST_USER_ID, role="owner"))
+        await db_session.commit()
+
+        now = _utcnow()
+
+        # Project 1: 1 connected, 1 degraded (3 failures), 1 low-disk
+        db_session.add(
+            LocalRunner(
+                project_id=p1.id, token_hash="b" * 64, hostname="p1-ok",
+                status="active", last_seen_at=now - timedelta(seconds=30),
+                consecutive_job_failures=0,
+                last_successful_job_at=now - timedelta(seconds=60),
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+        )
+        db_session.add(
+            LocalRunner(
+                project_id=p1.id, token_hash="c" * 64, hostname="p1-degraded",
+                status="active", last_seen_at=now - timedelta(seconds=30),
+                consecutive_job_failures=3,  # >= threshold
+                last_successful_job_at=now - timedelta(seconds=60),
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+        )
+        db_session.add(
+            LocalRunner(
+                project_id=p1.id, token_hash="d" * 64, hostname="p1-lowdisk",
+                status="active", last_seen_at=now - timedelta(seconds=30),
+                consecutive_job_failures=0,
+                last_successful_job_at=now - timedelta(seconds=60),
+                capabilities={"task_types": "all", "max_concurrent": 2, "disk_free_bytes": 1024 * 1024},  # 1 MiB << 2 GiB
+            )
+        )
+
+        # Project 2: 1 stale, 1 offline
+        db_session.add(
+            LocalRunner(
+                project_id=p2.id, token_hash="e" * 64, hostname="p2-stale",
+                status="active", last_seen_at=now - timedelta(seconds=600),  # > 300s
+                consecutive_job_failures=0, last_successful_job_at=None,
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+        )
+        db_session.add(
+            LocalRunner(
+                project_id=p2.id, token_hash="f" * 64, hostname="p2-offline",
+                status="inactive", last_seen_at=None,
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+        )
+
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/fleet/runners/health-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        # Fleet aggregate
+        assert data["total"] == 5
+        assert data["connected"] == 2  # p1-ok + p1-lowdisk (low disk doesn't change status)
+        assert data["degraded"] == 1  # p1-degraded
+        assert data["stale"] == 1  # p2-stale
+        assert data["offline"] == 1  # p2-offline
+        assert data["low_disk"] == 1  # p1-lowdisk
+        assert data["project_count"] == 2
+        assert len(data["per_project"]) == 2
+
+        # Per-project assertions
+        p1_entry = next(e for e in data["per_project"] if e["project_id"] == str(p1.id))
+        assert p1_entry["total"] == 3
+        assert p1_entry["connected"] == 2
+        assert p1_entry["degraded"] == 1
+        assert p1_entry["offline"] == 0
+        assert p1_entry["low_disk"] == 1
+
+        p2_entry = next(e for e in data["per_project"] if e["project_id"] == str(p2.id))
+        assert p2_entry["total"] == 2
+        assert p2_entry["connected"] == 0
+        assert p2_entry["stale"] == 1
+        assert p2_entry["offline"] == 1
+
+    @pytest.mark.asyncio
+    async def test_skips_deleted_runners(self, client, db_session):
+        """Deleted runners are excluded from the fleet summary."""
+        project = await _setup_project_with_owner(db_session)
+        now = _utcnow()
+
+        db_session.add(
+            LocalRunner(
+                project_id=project.id, token_hash="g" * 64, hostname="active",
+                status="active", last_seen_at=now - timedelta(seconds=30),
+                consecutive_job_failures=0,
+                last_successful_job_at=now - timedelta(seconds=60),
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+        )
+        db_session.add(
+            LocalRunner(
+                project_id=project.id, token_hash="h" * 64, hostname="deleted",
+                status="deleted", last_seen_at=None,
+                capabilities={"task_types": "all", "max_concurrent": 2},
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/fleet/runners/health-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["project_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_success_stale_while_working_marks_degraded(self, client, db_session):
+        """Runner live with active work, no recent success, some failures → degraded."""
+        project = await _setup_project_with_owner(db_session)
+        now = _utcnow()
+
+        # Runner with active work, 1 failure, stale success (>30 min)
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash="i" * 64,
+            hostname="busy-failing",
+            status="active",
+            last_seen_at=now - timedelta(seconds=30),
+            consecutive_job_failures=1,
+            last_successful_job_at=now - timedelta(seconds=3600),  # 1 hour ago > 30 min
+            capabilities={"task_types": "all", "max_concurrent": 2, "active_task_ids": ["task-1"]},
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/fleet/runners/health-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["degraded"] == 1
+        assert data["connected"] == 0
+
+    @pytest.mark.asyncio
+    async def test_per_project_runners_include_health(self, client, db_session):
+        """Each runner entry in the per-project list includes its health dict."""
+        project = await _setup_project_with_owner(db_session)
+        now = _utcnow()
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash="j" * 64,
+            hostname="health-check",
+            status="active",
+            last_seen_at=now - timedelta(seconds=30),
+            consecutive_job_failures=0,
+            last_successful_job_at=now - timedelta(seconds=60),
+            capabilities={"task_types": "all", "max_concurrent": 2, "disk_free_bytes": 50 * 1024**3},
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/fleet/runners/health-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["per_project"][0]["runners"]) == 1
+        r = data["per_project"][0]["runners"][0]
+        assert r["hostname"] == "health-check"
+        assert "health" in r
+        assert r["health"]["device_status"] == "connected"
+        assert r["health"]["disk_low"] is False
+        assert r["health"]["degraded"] is False

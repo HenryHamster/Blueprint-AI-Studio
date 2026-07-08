@@ -9308,12 +9308,13 @@ class TestNotificationConfigSettings:
     async def test_patch_notification_config_runner_events_are_valid(
         self, client: AsyncClient
     ):
-        """The five runner-health event types are accepted by PATCH validation
+        """The runner-health event types are accepted by PATCH validation
         so an operator can opt in (previously the allowlist rejected them as
         unknown events, silently blocking every runner-health external page)."""
         runner_events = [
             "RUNNER_DEACTIVATED",
             "RUNNER_DEGRADED",
+            "RUNNER_DEGRADED_ESCALATED",
             "RUNNER_FLEET_OFFLINE",
             "RUNNER_LOW_DISK",
             "RUNNER_OUTAGE_ESCALATED",

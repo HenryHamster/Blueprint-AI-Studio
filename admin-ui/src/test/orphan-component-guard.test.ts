@@ -21,6 +21,12 @@ const ORPHAN_ALLOWLIST = new Set<string>([
   // into the intentional Runtime/Project deep-monitoring surfaces.
   'MetricsDashboard.tsx',
   'LaneDiagPanel.tsx',
+  // New fleet-health dashboard card — wired into the operator dashboard by a
+  // follow-up consumer (DashboardHome or FleetDetailDrawer). Allowlisted here
+  // so the API endpoint and component can land together without blocking on
+  // the dashboard wiring, which requires a parallel useProjectMetrics hook
+  // update.
+  'FleetHealthCard.tsx',
 ]);
 
 // ---------------------------------------------------------------------------

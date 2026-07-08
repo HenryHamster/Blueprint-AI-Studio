@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
-import { Bell, Send } from 'lucide-react';
-import { API_BASE_URL, apiFetch, authHeaders } from '../api';
+import { useEffect, useRef, useState } from 'react';
+import { Bell, RefreshCw, Send } from 'lucide-react';
+import { API_BASE_URL, apiFetch, authHeaders, fetchDeadLetters, redriveDeadLetters } from '../api';
+import type { DeadLetterEntry } from '../api';
 
 export interface NotificationConfig {
   webhook_url: string;
@@ -27,6 +28,7 @@ const EVENT_OPTIONS: { key: string; label: string; description: string; defaultO
   { key: 'MERGE_UNVERIFIED', label: 'Merged Without Test Verification', description: 'When a no-CI repo merges a PR without running tests (UNVERIFIED-merge fallback)', defaultOn: true },
   { key: 'RUNNER_DEACTIVATED', label: 'Runner Deactivated', description: 'When a self-hosted fleet runner goes offline (stops sending heartbeats)', defaultOn: true },
   { key: 'RUNNER_DEGRADED', label: 'Runner Degraded', description: 'When a self-hosted fleet runner accumulates repeated consecutive job failures', defaultOn: true },
+  { key: 'RUNNER_DEGRADED_ESCALATED', label: 'Runner Degraded Escalated', description: 'When a degraded-runner alert ages past the escalation threshold and is re-paged', defaultOn: true },
   { key: 'RUNNER_FLEET_OFFLINE', label: 'Fleet Offline', description: 'When an entire self-hosted fleet has no healthy runner available', defaultOn: true },
   { key: 'RUNNER_LOW_DISK', label: 'Runner Low Disk', description: 'When a self-hosted fleet runner reports free disk below the safe threshold', defaultOn: true },
   { key: 'RUNNER_OUTAGE_ESCALATED', label: 'Runner Outage Escalated', description: 'When a runner outage ages past the escalation threshold and is re-paged', defaultOn: true },
@@ -212,6 +214,125 @@ function WebhookDeliveryHealthCard({
   );
 }
 
+function DeadLetterPanel({
+  webhookUrl,
+  selectedProjectId,
+}: {
+  webhookUrl: string;
+  selectedProjectId: string;
+}) {
+  const [deadLetters, setDeadLetters] = useState<DeadLetterEntry[] | null>(null);
+  const [deadLettersError, setDeadLettersError] = useState<string>('');
+  const [redrivingIds, setRedrivingIds] = useState<Set<string>>(new Set());
+  const [redriveError, setRedriveError] = useState<string>('');
+
+  const hasWebhookUrl = webhookUrl.trim().length > 0;
+  const loading = deadLetters === null && deadLettersError === '' && hasWebhookUrl;
+  const mountedRef = useRef(true);
+
+  const reloadDeadLetters = () => {
+    if (!hasWebhookUrl) return;
+    fetchDeadLetters(selectedProjectId)
+      .then(data => {
+        if (!mountedRef.current) return;
+        setDeadLetters(data);
+        setDeadLettersError('');
+      })
+      .catch(e => {
+        if (!mountedRef.current) return;
+        setDeadLetters(null);
+        setDeadLettersError(e instanceof Error ? e.message : 'Failed to load dead letters');
+      });
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    if (!hasWebhookUrl) {
+      return;
+    }
+    reloadDeadLetters();
+    return () => { mountedRef.current = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasWebhookUrl, selectedProjectId]);
+
+  const handleRedrive = async (id: string) => {
+    setRedrivingIds(prev => new Set(prev).add(id));
+    setRedriveError('');
+    try {
+      await redriveDeadLetters(selectedProjectId, [id]);
+      // Reload the list to reflect the removed entry
+      reloadDeadLetters();
+    } catch (e) {
+      setRedriveError(e instanceof Error ? e.message : 'Redrive failed');
+    } finally {
+      setRedrivingIds(prev => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  };
+
+  if (!hasWebhookUrl) return null;
+
+  if (loading) {
+    return (
+      <div className="mt-3 rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-ui-md text-neutral-500">
+        Loading dead-lettered notifications...
+      </div>
+    );
+  }
+
+  if (deadLettersError) {
+    return (
+      <div className="mt-3 rounded-lg border border-red-500/30 bg-red-950/20 px-3 py-2 text-ui-md text-red-300">
+        Failed to load dead letters: {deadLettersError}
+      </div>
+    );
+  }
+
+  if (!deadLetters || deadLetters.length === 0) return null;
+
+  return (
+    <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="h-2.5 w-2.5 rounded-full bg-amber-400" />
+        <span className="text-ui-md font-medium text-amber-200">
+          {deadLetters.length} dead-lettered notification{deadLetters.length !== 1 ? 's' : ''}
+        </span>
+      </div>
+      {redriveError && (
+        <p className="text-ui-md text-red-400 mb-2">{redriveError}</p>
+      )}
+      <div className="space-y-1.5 max-h-64 overflow-y-auto">
+        {deadLetters.map(dl => (
+          <div
+            key={dl.id}
+            className="flex items-center justify-between gap-2 rounded bg-neutral-900/60 px-2 py-1.5"
+          >
+            <div className="min-w-0">
+              <div className="text-xs text-neutral-300 truncate">{dl.event_type}</div>
+              <div className="text-ui-md text-neutral-500">
+                {dl.reason}
+                {dl.last_status != null ? ` · HTTP ${dl.last_status}` : ''}
+                {dl.attempts > 0 ? ` · ${dl.attempts} attempt${dl.attempts !== 1 ? 's' : ''}` : ''}
+              </div>
+            </div>
+            <button
+              onClick={() => handleRedrive(dl.id)}
+              disabled={redrivingIds.has(dl.id)}
+              className="flex items-center gap-1 shrink-0 min-h-[44px] bg-neutral-700 hover:bg-neutral-600 disabled:opacity-30 disabled:cursor-not-allowed text-neutral-200 text-xs py-1 px-2 rounded transition-colors border border-neutral-600"
+            >
+              <RefreshCw className={`w-3 h-3 ${redrivingIds.has(dl.id) ? 'animate-spin' : ''}`} />
+              Re-drive
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
   return (
     // reason: notification event toggle switch; h-5 w-9 is standard toggle knob, not a tap target
@@ -350,6 +471,13 @@ export function SettingsNotificationsSection({
         {selectedProjectId && (
           <WebhookDeliveryHealthCard
             key={selectedProjectId}
+            webhookUrl={webhookUrl}
+            selectedProjectId={selectedProjectId}
+          />
+        )}
+        {selectedProjectId && (
+          <DeadLetterPanel
+            key={`dead-${selectedProjectId}`}
             webhookUrl={webhookUrl}
             selectedProjectId={selectedProjectId}
           />
