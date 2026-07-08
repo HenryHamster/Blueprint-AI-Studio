@@ -432,32 +432,54 @@ describe('buildContextPrefix rejection patterns', () => {
 
 // ── buildContextPrefix — self-review calibration wiring ──────────────────────
 describe('buildContextPrefix self-review calibration', () => {
+  // Use categories/for_task_type shape — what formatProjectContext reads.
+  // by_task_type is only consumed by formatSelfReviewCalibrationSection (called directly).
   const srSource = {
-    by_task_type: {
-      qa: { 'test-coverage': { miss_rate: 0.7, below_floor: true } },
-      docs: { documentation: { miss_rate: 0.7, below_floor: true } },
-      deps: { correctness: { miss_rate: 0.7, below_floor: true } },
-    },
+    categories: { 'test-coverage': { miss_rate: 0.7 } },
   };
 
-  // The calibration section only renders inside the formatProjectContext block,
-  // which is gated on at least one array-valued project_context key (hasData).
+  // The Self-Review Blind Spots section renders inside formatProjectContext
+  // when self_review_catch_rate.categories has entries with miss_rate > 0.
+  // Requires at least one array-valued project_context key (hasData) to trigger
+  // formatProjectContext at all.
   for (const type of ['qa', 'docs', 'deps']) {
-    it(`renders the calibration section for review-gated type '${type}'`, () => {
+    it(`renders the blind-spots section for review-gated type '${type}'`, () => {
       const prefix = buildContextPrefix({
         payloads: [{ type }],
         project_context: { open_prs: ['Some PR'], self_review_catch_rate: srSource },
       });
-      expect(prefix).toContain('## Self-review calibration');
+      expect(prefix).toContain('### Self-Review Blind Spots');
     });
   }
 
-  it('omits the calibration section for non-code-change task types', () => {
+  it('omits the blind-spots section when categories are absent from self_review_catch_rate', () => {
     const prefix = buildContextPrefix({
       payloads: [{ type: 'research' }],
-      project_context: { open_prs: ['Some PR'], self_review_catch_rate: srSource },
+      project_context: { open_prs: ['Some PR'], self_review_catch_rate: { by_task_type: {} } },
     });
+    expect(prefix).not.toContain('### Self-Review Blind Spots');
+  });
+
+  // Regression guard: SR catch-rate signal must appear exactly once.
+  // Before this refactor, buildContextPrefix rendered it twice for review-gated
+  // task types: once via formatProjectContext (### Self-Review Blind Spots) and
+  // once via a direct formatSelfReviewCalibrationSection call (## Self-review
+  // calibration). The direct call has been removed; only the richer block remains.
+  it('test_sr_catch_rate_not_double_rendered', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix' }],
+      project_context: {
+        open_prs: ['Some PR'],
+        self_review_catch_rate: { categories: { correctness: { miss_rate: 0.7 } } },
+      },
+    });
+    // Richer block from formatProjectContext must be present
+    expect(prefix).toContain('### Self-Review Blind Spots');
+    // Redundant thin block must not appear
     expect(prefix).not.toContain('## Self-review calibration');
+    // Confirm the heading appears exactly once (no double-render)
+    const occurrences = (prefix.match(/Self-Review Blind Spots/g) ?? []).length;
+    expect(occurrences).toBe(1);
   });
 
   // repo_overview rendering

@@ -1052,9 +1052,10 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
   non-zero on failure with the actual error tail; fix and re-run until
   green. If your changes don't touch admin-ui/, agent/, or backend/,
   \`./check\` returns PASS without running anything — that's expected
-  for pure-docs tasks. For \`admin-ui/\` changes this includes the
-  browser-mode \`npm run test:viewport\` gate, not the jsdom-only
-  \`npm run test:run\` suite.
+  for pure-docs tasks. For \`admin-ui/\` changes this includes both
+  the happy-dom unit suite via \`npx vitest run\` (equivalently
+  \`npm run test:run\`) on every invocation AND the browser-mode
+  \`npm run test:viewport\` gate (scoped to changed components).
 - \`./check test\` — same plus a **lightweight standalone backend test
   pass** (~10 invariant/contract files, ~30s). This VM is 8 GB; the FULL Docker
   + Postgres pytest suite OOMs (exit 137) here. CI runs the full suite

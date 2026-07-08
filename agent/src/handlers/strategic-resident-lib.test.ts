@@ -426,6 +426,16 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     { key: 'code:backend', kind: 'code', label: 'code/backend', hint: 'read a module under backend/' },
   ];
 
+  it('test_resident_prompt_states_running_update_file_path', () => {
+    const p = buildAutonomousPrompt(focus, [], [], false);
+    // set-running-update requires a file path, not inline markdown
+    expect(p).toContain('set-running-update');
+    expect(p).toContain('FILE PATH');
+    expect(p).toContain('/tmp/running_update.md');
+    expect(p).toContain('reads the file');
+    expect(p).toContain('passing markdown as argv fails');
+  });
+
   it('renders the work-unit contract and the TICK-VERDICT vocabulary', () => {
     const p = buildAutonomousPrompt(focus, [], [], false);
     // Work-unit contract, not "ONE small step".

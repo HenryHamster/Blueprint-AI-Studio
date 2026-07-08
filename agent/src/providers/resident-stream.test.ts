@@ -80,10 +80,29 @@ describe('isMessageSend', () => {
     expect(isMessageSend('cd /x && ./messages send \'done\'')).toBe(true);
   });
 
+  it('also detects ./strategic create-message (double-post guard)', () => {
+    expect(isMessageSend('./strategic create-message \'{"type":"NOTE","content":"hi"}\'')).toBe(true);
+    expect(isMessageSend('cd /ws && strategic create-message \'{}\'')).toBe(true);
+  });
+
   it('does not count resolve / unrelated commands', () => {
     expect(isMessageSend('./messages resolve abc123 \'fixed\'')).toBe(false);
     expect(isMessageSend('./strategic spawn-task \'{}\'')).toBe(false);
+    expect(isMessageSend('./strategic resolve-message ref-1 \'done\'')).toBe(false);
     expect(isMessageSend(undefined)).toBe(false);
+  });
+});
+
+describe('test_message_ops_not_lease_renewing_mutations', () => {
+  it('create-message and resolve-message do not count as lease-renewing mutations', () => {
+    // Posting a message is operator communication, not a strategic-state mutation;
+    // using it must never renew the authority lease (dead-man's-switch contract).
+    expect(isStrategicMutation('./strategic create-message \'{"type":"NOTE","content":"hi"}\'')).toBe(false);
+    expect(isStrategicMutation('./strategic resolve-message ref-abc \'resolved\'')).toBe(false);
+    // Confirm that real strategic mutations still trigger the lease renewal.
+    expect(isStrategicMutation('./strategic create-direction \'{}\'')).toBe(true);
+    expect(isStrategicMutation('./strategic spawn-task \'{}\'')).toBe(true);
+    expect(isStrategicMutation('./strategic set-problem-model /tmp/pm.json')).toBe(true);
   });
 });
 
