@@ -903,23 +903,23 @@ class TestPerTypeFailureRate:
         assert fix_n >= 3
         assert fix_rate == 1.0
 
-    def test_backward_compat_old_entries_included(self):
-        """Entries without task_type (3-tuple legacy) count toward any type query."""
+    def test_empty_type_rows_excluded(self):
+        """Entries without task_type (3-tuple legacy) or empty type are excluded from per-type queries."""
         from app.shared_state import get_task_type_failure_rate
         import app.shared_state as ss
         from app.time_utils import _utcnow
 
         ts = _utcnow().isoformat()
-        # Old-format entries (no type field) — treated as matching any type
+        # Old-format entries (no type field) and empty type should NOT be included
         ss.deploy_monitoring["task_results"].extend(
             [
-                (ts, "failure", "CODE_ERROR"),  # legacy 3-tuple
-                (ts, "failure", "CODE_ERROR", ""),  # 4-tuple but empty type
+                (ts, "failure", "CODE_ERROR"),  # legacy 3-tuple — excluded
+                (ts, "failure", "CODE_ERROR", ""),  # 4-tuple but empty type — excluded
             ]
         )
         rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
-        assert sample_size == 2
-        assert rate == 1.0
+        assert sample_size == 0, "Empty-type rows should not be included in per-type queries"
+        assert rate == 0.0
 
     def test_empty_buffer_returns_zero(self):
         from app.shared_state import get_task_type_failure_rate

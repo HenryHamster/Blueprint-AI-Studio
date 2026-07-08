@@ -223,9 +223,15 @@ export function extractDeltaText(obj: Record<string, unknown>): string | undefin
   return undefined;
 }
 
+/** ./strategic aliases that post operator messages — NOT lease-renewing strategic
+ *  progress events. The resident uses `./messages send` for operator replies;
+ *  if it falls back to `./strategic create-message`, the reply is posted but
+ *  must not renew the authority/freshness lease as if strategic state changed. */
+const MESSAGE_OP_ALIASES = new Set(['create-message', 'resolve-message']);
+
 const STRATEGIC_MUTATING_VERBS = new Set(
   STRATEGIC_OPS_REGISTRY
-    .filter(e => e.cli && e.alias !== null)
+    .filter(e => e.cli && e.alias !== null && !MESSAGE_OP_ALIASES.has(e.alias))
     .map(e => e.alias as string),
 );
 
@@ -235,6 +241,10 @@ const STRATEGIC_MUTATING_VERBS = new Set(
  * lease-renewing "progress" event. Used by the session to set
  * `appliedStrategicOp` so the handler renews the authority lease only on real
  * progress (the dead-man's-switch contract), never bare liveness.
+ *
+ * Message-posting ops (`create-message`, `resolve-message`) are intentionally
+ * excluded: posting a reply is operator communication, not a strategic-state
+ * mutation, and must not renew the lease.
  */
 export function isStrategicMutation(command: string | undefined): boolean {
   if (!command) return false;
@@ -244,14 +254,18 @@ export function isStrategicMutation(command: string | undefined): boolean {
 }
 
 /**
- * True when a Bash command invokes `./messages send …` — the agent posting a
- * durable operator-facing reply (ProjectMessage, `from_type=strategic`). The
- * resident loop tracks this per turn so it only fires its own persistence
- * backstop when the agent did NOT already send the reply itself.
+ * True when a Bash command posts a durable operator-facing reply (ProjectMessage,
+ * `from_type=strategic`). The resident loop tracks this per turn so it only fires
+ * its own `persistReply` backstop when the agent did NOT already post the reply.
+ *
+ * Covers both the primary path (`./messages send …`) and the fallback
+ * (`./strategic create-message …`) so a resident that replies via the strategic
+ * script is not double-posted by the backstop.
  */
 export function isMessageSend(command: string | undefined): boolean {
   if (!command) return false;
-  return /(?:^|[\s;&|(])(?:\.\/)?messages\s+send\b/.test(command);
+  if (/(?:^|[\s;&|(])(?:\.\/)?messages\s+send\b/.test(command)) return true;
+  return /(?:^|[\s;&|(])(?:\.\/)?strategic\s+create-message\b/.test(command);
 }
 
 /**

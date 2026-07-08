@@ -39,12 +39,36 @@ Contract
 * Robust on partial trees: any listed path absent on disk is skipped (deletions),
   and the reverse-dep scan is skipped gracefully when ``backend/testing`` is
   absent.
+
+Drift-sentinel surfaces
+-----------------------
+Some test files are *drift sentinels*: they AST/rglob-scan a whole source tree
+(or a fixed source-file set) and diff it against a stored ``__fixtures__/*.json``
+snapshot — ``test_websocket_emitter_inventory.py`` walks the entire
+``backend/app`` tree, imports only ``backend/testing`` helpers, and never
+references any ``app.<module>``. The dotted-import reverse-dep scan above can
+NEVER select such a sentinel, so a drift-introducing change (a new emitter, a new
+``event_type``) merges green on the task PR and only breaks at the promotion-PR
+full matrix. To close that gap a committed manifest
+(``backend/testing/drift_sentinel_surfaces.json``) maps a SURFACE GLOB
+(``**`` = any depth, ``*`` = one path segment) to the sentinel test file(s) that
+guard it; ``resolve_impacted`` selects a registered sentinel whenever a changed
+path matches its surface glob (and the sentinel exists on disk). The manifest is
+data-only and the load is fail-open: a missing / unreadable / malformed manifest
+yields no sentinels rather than crashing the gate.
 """
 
 import argparse
+import ast
+import json
 import os
 import re
 import sys
+
+# Maximum BFS depth for transitive importer expansion. The ``seen_mods`` dedup
+# set already guarantees termination on cyclic graphs; this cap bounds scan cost
+# on pathologically deep chains (e.g. a 20-layer abstraction stack).
+MAX_HOPS = 6
 
 # Repo root is two levels up from this file (backend/testing -> repo root).
 _DEFAULT_REPO_ROOT = os.path.normpath(
@@ -56,6 +80,9 @@ _DEFAULT_REPO_ROOT = os.path.normpath(
 _APP_PY_RE = re.compile(r"^backend/app/(.+)\.py$")
 # A backend test file, by the pytest ``test_`` collection convention.
 _TEST_PY_RE = re.compile(r"^backend/testing/test_[A-Za-z0-9_]+\.py$")
+
+# The committed surface -> drift-sentinel manifest, relative to the repo root.
+_SURFACE_MANIFEST_REL = "backend/testing/drift_sentinel_surfaces.json"
 
 
 def app_module_for_path(repo_rel: str) -> "str | None":
@@ -107,17 +134,181 @@ def module_reference_patterns(dotted: str) -> "list[re.Pattern]":
     return pats
 
 
+def _find_app_importers(changed_module: str, repo_root: str) -> "list[str]":
+    """Return dotted names of app modules that directly import ``changed_module``.
+
+    Scans every ``backend/app/**/*.py`` file using the same reference patterns as
+    the test-file scan. Used to surface tests that exercise an indirectly-reached
+    module (e.g. a logic helper imported by a router that a test imports).
+    """
+    app_dir = os.path.join(repo_root, "backend", "app")
+    if not os.path.isdir(app_dir):
+        return []
+    patterns = module_reference_patterns(changed_module)
+    importers: "list[str]" = []
+    for dirpath, _dirs, filenames in os.walk(app_dir):
+        for fname in filenames:
+            if not fname.endswith(".py"):
+                continue
+            abs_path = os.path.join(dirpath, fname)
+            rel = os.path.relpath(abs_path, repo_root).replace(os.sep, "/")
+            importer = app_module_for_path(rel)
+            if importer is None or importer == changed_module:
+                continue
+            try:
+                with open(abs_path, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            if any(pat.search(content) for pat in patterns):
+                importers.append(importer)
+    return importers
+
+
+def _glob_to_regex(glob: str) -> "re.Pattern":
+    """Compile a repo-relative surface glob to an anchored regex.
+
+    Segment semantics match the manifest's documented convention:
+
+    * ``**/`` matches zero or more path segments (any depth, including none), so
+      ``backend/app/**/*.py`` matches both ``backend/app/foo.py`` and
+      ``backend/app/routers/agent.py``.
+    * a bare ``**`` matches anything, ``/`` included.
+    * ``*`` matches a single path segment (no ``/``).
+    * every other character is matched literally.
+    """
+    out: "list[str]" = []
+    i, n = 0, len(glob)
+    while i < n:
+        c = glob[i]
+        if c == "*":
+            if i + 1 < n and glob[i + 1] == "*":
+                if i + 2 < n and glob[i + 2] == "/":
+                    out.append(r"(?:.*/)?")  # '**/' -> optional any-depth dirs
+                    i += 3
+                else:
+                    out.append(r".*")  # bare '**'
+                    i += 2
+            else:
+                out.append(r"[^/]*")  # single-segment '*'
+                i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("^" + "".join(out) + "$")
+
+
+def _load_surface_manifest(repo_root: str) -> "list[tuple[re.Pattern, list[str]]]":
+    """Load and compile the drift-sentinel surface manifest (fail-open).
+
+    Returns a list of ``(compiled_glob, [sentinel_rel_path, ...])`` pairs. Any
+    problem — file absent, unreadable, invalid JSON, or a malformed/empty entry —
+    yields no pairs rather than raising, so a broken manifest can never crash the
+    merge gate (mirroring the module's "robust on partial trees" contract).
+    """
+    manifest_path = os.path.join(repo_root, _SURFACE_MANIFEST_REL)
+    if not os.path.isfile(manifest_path) and repo_root == _DEFAULT_REPO_ROOT:
+        # Docker test harness: the backend tree is copied with app/ and
+        # testing/ as siblings and no enclosing backend/ directory, so the
+        # dev-checkout-relative _SURFACE_MANIFEST_REL does not resolve. The
+        # manifest is co-located with this module; fall back to it — but only
+        # for the DEFAULT root, so hermetic fixture roots stay strictly
+        # self-contained (a fixture without a manifest must compile to []).
+        manifest_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "drift_sentinel_surfaces.json",
+        )
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    surfaces = data.get("surfaces")
+    if not isinstance(surfaces, list):
+        return []
+    compiled: "list[tuple[re.Pattern, list[str]]]" = []
+    for entry in surfaces:
+        if not isinstance(entry, dict):
+            continue
+        glob = entry.get("glob")
+        sentinels = entry.get("sentinels")
+        if not isinstance(glob, str) or not glob:
+            continue
+        if not isinstance(sentinels, list):
+            continue
+        paths = [s for s in sentinels if isinstance(s, str) and s]
+        if not paths:
+            continue
+        try:
+            regex = _glob_to_regex(glob)
+        except re.error:
+            continue
+        compiled.append((regex, paths))
+    return compiled
+
+
+def _sentinel_exists(sentinel: str, repo_root: str) -> bool:
+    """Whether a registered sentinel exists on disk (harness-layout aware).
+
+    Checks ``<repo_root>/<sentinel>`` first (dev checkout / CI workspace). For
+    the DEFAULT root only, also checks the sentinel as a sibling of this module:
+    the Docker test harness copies the backend tree with testing/ next to app/
+    and no enclosing backend/ directory. Hermetic fixture roots keep the strict
+    repo_root-only check.
+    """
+    if os.path.isfile(os.path.join(repo_root, sentinel)):
+        return True
+    if repo_root == _DEFAULT_REPO_ROOT and sentinel.startswith("backend/testing/"):
+        sibling = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            sentinel[len("backend/testing/"):],
+        )
+        return os.path.isfile(sibling)
+    return False
+
+
+def _surface_sentinels(changed_paths, repo_root: str) -> "set[str]":
+    """Drift sentinels whose surface glob matches any changed path (on-disk only).
+
+    A registered sentinel is added only if it exists as a file under ``repo_root``,
+    so a stale manifest entry (sentinel deleted/renamed) never selects a vanished
+    file — the same existence discipline the reverse-dep scan applies.
+    """
+    manifest = _load_surface_manifest(repo_root)
+    if not manifest:
+        return set()
+    selected: "set[str]" = set()
+    for raw in changed_paths:
+        path = raw.strip()
+        if not path:
+            continue
+        for regex, sentinels in manifest:
+            if not regex.match(path):
+                continue
+            for sentinel in sentinels:
+                if sentinel in selected:
+                    continue
+                if _sentinel_exists(sentinel, repo_root):
+                    selected.add(sentinel)
+    return selected
+
+
 def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
     """Compute the impacted ``backend/testing/test_*.py`` set (sorted, deduped).
 
     ``changed_paths`` is any iterable of repo-relative paths. ``repo_root`` roots
     the on-disk existence checks and the reverse-dep scan.
     """
+    # Materialize once: ``changed_paths`` may be a single-use iterable, and it is
+    # scanned both here and by the surface-glob sentinel pass below.
+    changed_list = list(changed_paths)
     testing_dir = os.path.join(repo_root, "backend", "testing")
     impacted: "set[str]" = set()
     changed_modules: "list[str]" = []
 
-    for raw in changed_paths:
+    for raw in changed_list:
         path = raw.strip()
         if not path:
             continue
@@ -132,6 +323,24 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
             changed_modules.append(dotted)
 
     if changed_modules and os.path.isdir(testing_dir):
+        # Transitive closure (BFS, bounded by MAX_HOPS): app modules that
+        # import a changed module — directly or indirectly — are also relevant.
+        # ``seen_mods`` provides dedup and guarantees termination even without
+        # the cap; the cap bounds scan cost on pathologically deep or cyclic
+        # import graphs.
+        seen_mods: "set[str]" = set(changed_modules)
+        frontier = list(changed_modules)
+        for _ in range(MAX_HOPS):
+            if not frontier:
+                break
+            next_frontier: "list[str]" = []
+            for mod in frontier:
+                for importer in _find_app_importers(mod, repo_root):
+                    if importer not in seen_mods:
+                        seen_mods.add(importer)
+                        changed_modules.append(importer)
+                        next_frontier.append(importer)
+            frontier = next_frontier
         pattern_sets = [module_reference_patterns(mod) for mod in changed_modules]
         for name in os.listdir(testing_dir):
             if not (name.startswith("test_") and name.endswith(".py")):
@@ -150,7 +359,127 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
                     impacted.add("backend/testing/" + name)
                     break
 
+    # Surface-glob drift sentinels: select whole-tree/fixed-set sentinels the
+    # dotted-import scan structurally cannot reach. Merged into the same set so
+    # dedup + stable-sort still hold.
+    impacted |= _surface_sentinels(changed_list, repo_root)
+
     return sorted(impacted)
+
+
+def collect_first_party_patch_targets(testing_dir: str) -> "list[str]":
+    """Return sorted, deduplicated first-party mock.patch() string targets from tests.
+
+    Scans every ``test_*.py`` under *testing_dir* using AST to find
+    ``patch("app.*")`` calls. Excludes calls that carry ``create=True`` (those
+    intentionally name attributes that don't exist at module level). Returns the
+    unique targets sorted alphabetically, normalized to the ``app.*`` form (the
+    ``backend.`` prefix is stripped).
+
+    Used by the merge-gate invariant ``test_mock_patch_targets_resolve`` to
+    verify that every patched attribute still exists in its host module at PR time
+    rather than only at promotion-PR full-matrix time.
+    """
+    targets: "set[str]" = set()
+    if not os.path.isdir(testing_dir):
+        return []
+    for fname in os.listdir(testing_dir):
+        if not (fname.startswith("test_") and fname.endswith(".py")):
+            continue
+        fpath = os.path.join(testing_dir, fname)
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+            tree = ast.parse(source, filename=fname)
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            is_patch = (isinstance(func, ast.Attribute) and func.attr == "patch") or (
+                isinstance(func, ast.Name) and func.id == "patch"
+            )
+            if not is_patch:
+                continue
+            if any(
+                kw.arg == "create"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            ):
+                continue
+            if not node.args:
+                continue
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant) or not isinstance(
+                first_arg.value, str
+            ):
+                continue
+            raw = first_arg.value
+            normalized = raw[len("backend."):] if raw.startswith("backend.") else raw
+            if normalized.startswith("app.") and "." in normalized[4:]:
+                targets.add(normalized)
+    return sorted(targets)
+
+
+def collect_create_true_patch_targets(testing_dir: str) -> "list[tuple[str, str]]":
+    """Return sorted ``(test_file, target)`` pairs for ``create=True`` patch calls.
+
+    The inverse of :func:`collect_first_party_patch_targets`: scans every
+    ``test_*.py`` under *testing_dir* using AST for ``patch("app.*", ...,
+    create=True)`` calls. ``create=True`` tells mock to fabricate an attribute it
+    deems absent at module level; once the real attribute exists the flag is a
+    no-op that silently suppresses the ``AttributeError`` a later rename/removal
+    of that symbol would raise — voiding the drift protection the string-target
+    invariant provides (which itself skips ``create=True`` patches).
+
+    Used by the merge-gate invariant ``test_redundant_create_true_patches_flagged``
+    to flag redundant ``create=True`` whose target now resolves at module top
+    level. Targets are normalized to ``app.*`` form (the ``backend.`` prefix is
+    stripped); pairs are deduplicated and sorted.
+    """
+    pairs: "set[tuple[str, str]]" = set()
+    if not os.path.isdir(testing_dir):
+        return []
+    for fname in os.listdir(testing_dir):
+        if not (fname.startswith("test_") and fname.endswith(".py")):
+            continue
+        fpath = os.path.join(testing_dir, fname)
+        try:
+            with open(fpath, encoding="utf-8", errors="replace") as fh:
+                source = fh.read()
+            tree = ast.parse(source, filename=fname)
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            is_patch = (isinstance(func, ast.Attribute) and func.attr == "patch") or (
+                isinstance(func, ast.Name) and func.id == "patch"
+            )
+            if not is_patch:
+                continue
+            if not any(
+                kw.arg == "create"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            ):
+                continue
+            if not node.args:
+                continue
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant) or not isinstance(
+                first_arg.value, str
+            ):
+                continue
+            raw = first_arg.value
+            normalized = raw[len("backend."):] if raw.startswith("backend.") else raw
+            if normalized.startswith("app.") and "." in normalized[4:]:
+                pairs.add((fname, normalized))
+    return sorted(pairs)
 
 
 def _read_changed(paths_argv, stdin) -> "list[str]":

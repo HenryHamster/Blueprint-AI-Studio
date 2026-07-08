@@ -68,8 +68,13 @@ def _build_task_response(
     task: Task,
     pr_url: str | None = None,
     error_summary: str | None = None,
+    children: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Build compact agent-visible task status response."""
+    """Build compact agent-visible task status response.
+
+    Includes the flat+children contract: each task item carries its direct
+    children inline via the children array (empty if no children).
+    """
     status_val = getattr(task.status, "value", str(task.status)) if task.status else None
     resp: dict[str, Any] = {
         "id": str(task.id),
@@ -80,6 +85,7 @@ def _build_task_response(
         "created_at": _iso(task.created_at),
         "updated_at": _iso(task.updated_at),
         "latest_status_message": task.latest_status_message,
+        "children": children if children is not None else [],
     }
 
     # Blocked / parked detail
@@ -148,7 +154,8 @@ async def _fetch_children(
 
     for child in child_rows:
         pr_url = child_pr_map.get(child.id) if child.status in _TERMINAL_STATUSES else None
-        child_dict = _build_task_response(child, pr_url=pr_url)
+        # Children of children are not fetched inline; grandchildren stay at the top level (flat contract)
+        child_dict = _build_task_response(child, pr_url=pr_url, children=[])
         if child.parent_task_id in result:
             result[child.parent_task_id].append(child_dict)
 
@@ -237,8 +244,7 @@ async def agent_get_task(
             error_summary = task.latest_status_message
 
     children_map = await _fetch_children([task.id], project_id, session)
-    data = _build_task_response(task, pr_url, error_summary)
-    data["children"] = children_map.get(task.id, [])
+    data = _build_task_response(task, pr_url, error_summary, children=children_map.get(task.id, []))
     return {"status": "success", "data": data}
 
 
@@ -329,8 +335,7 @@ async def agent_list_tasks(
     items = []
     for t in rows:
         pr_url = pr_map.get(t.id) if t.status in _TERMINAL_STATUSES else None
-        item = _build_task_response(t, pr_url=pr_url)
-        item["children"] = children_map.get(t.id, [])
+        item = _build_task_response(t, pr_url=pr_url, children=children_map.get(t.id, []))
         items.append(item)
 
     return {"status": "success", "data": items, "count": len(items)}

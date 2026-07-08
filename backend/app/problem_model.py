@@ -30,9 +30,12 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from app.evidence_primitive import EvidenceRef, EvidenceStatus, classify_evidence
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +240,19 @@ class Gap(BaseModel):
     name: str
     description: str = ""
     evidence: str = ""
+
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list)
+    """Structured, machine-checkable pointers at the evidence backing this gap,
+    alongside the unchanged free-text ``evidence`` narrative. Each ref names a
+    proof :class:`~app.evidence_primitive.ProofKind` and a ``ref`` (a
+    criterion_key / proof_ref / artifact_id / file-or-test path). Optional and
+    default-empty so every stored JSONB model and older agent payload validates
+    unchanged — ``ProblemModel`` uses ``extra="forbid"`` so the field must be
+    declared, but the empty default keeps back-compat round-trips byte-identical.
+    A plain proposed-wins field: it threads through :func:`_merge_gap` and
+    ``apply_agent_update`` with no extra merge logic. Kept small and bounded;
+    the standing evidence-reconciliation sweep re-verifies path-backed refs
+    against HEAD (see ``metrics_integrity_sweep.check_evidence_claim_reconciliation``)."""
 
     size: GapSize = "medium"
     priority: GapPriority = "medium"
@@ -571,6 +587,16 @@ class SelfReflectionEntry(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def gap_evidence_status(gap: Gap) -> EvidenceStatus:
+    """Derived evidence status for a gap, for prompt rendering and the sweep.
+
+    Thin wrapper over :func:`app.evidence_primitive.classify_evidence` on the
+    gap's ``evidence_refs``. Pure and stored-flag-only — it never re-verifies a
+    ref against ground truth; a caller that does so (the reconciliation sweep)
+    overrides the result to ``contradicted`` when a proven ref is disproved."""
+    return classify_evidence(gap.evidence_refs)
 
 
 def parse_problem_model(raw: dict | None) -> ProblemModel:
@@ -1221,6 +1247,155 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     return summary
 
 
+def _parse_iso_to_naive_utc(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 string into a naive-UTC datetime, or ``None``.
+
+    Returns ``None`` for empty, non-string, or unparseable input (a deferral's
+    ``hold_until`` may legitimately be a free-form milestone/version tag rather
+    than a date). Tz-aware inputs are converted to UTC and stripped so they
+    compare correctly against the naive-UTC ``now`` the callers pass."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _deferral_is_stale(deferral: GapDeferral, now: datetime | None) -> bool:
+    """Whether a gap's deferral has aged past its revisit point.
+
+    Two triggers, in order:
+
+    1. ``hold_until`` is a parseable timestamp in the past — the revisit the
+       strategist scheduled is overdue.
+    2. ``hold_until`` is absent/unparseable (a free-form milestone) AND
+       ``created_at`` is a parseable timestamp older than
+       :data:`DEFERRAL_STALE_GRACE_DAYS` — the deferral has simply lapsed.
+
+    Conservative on missing data: when ``now`` is unparseable, or neither
+    ``hold_until`` nor ``created_at`` yields a usable date, the deferral is NOT
+    considered stale (returns ``False``) so a gap is never archived on an
+    ambiguous signal."""
+    if now is None:
+        return False
+    hold_until = _parse_iso_to_naive_utc(deferral.hold_until)
+    if hold_until is not None:
+        return hold_until < now
+    created_at = _parse_iso_to_naive_utc(deferral.created_at)
+    if created_at is not None:
+        return created_at < now - timedelta(days=DEFERRAL_STALE_GRACE_DAYS)
+    return False
+
+
+def lifecycle_bound_problem_model(
+    model: ProblemModel, now_iso: str
+) -> dict[str, Any]:
+    """Auto-archive/drop terminal-ish state so the durable model self-bounds
+    toward its healthy thresholds without manual strategist compaction.
+
+    Pure backend pass — mutates ``model`` in place and returns a small summary
+    of what it changed (empty dict on no-op, so the caller keeps the
+    diff/output byte-identical when nothing was touched). Runs BEFORE the
+    :func:`gc_problem_model` 200-item/byte backstop in :func:`apply_agent_update`
+    and composes cleanly with it: this pass reduces terminal state at the
+    healthy thresholds, and gc remains the generous last-resort structural cap.
+
+    Three actions, each touching ONLY terminal-ish / reference-only state —
+    the same reference-only class gc already treats as evictable, applied
+    eagerly at the healthy threshold instead of only at the 200-item backstop:
+
+    1. **Aged-deferred gaps → archive.** Each ACTIVE gap that carries a
+       ``deferral``, has no ``active_moves``, and whose deferral has aged past
+       its revisit point (see :func:`_deferral_is_stale`) is marked
+       ``abandoned`` with ``closed=now_iso`` and a ``lifecycle_auto_archived``
+       history event, then moved into ``archived_gaps`` by
+       :func:`archive_closed_gaps`. A gap with ``active_moves``, a fresh/held
+       deferral, or no deferral at all is NEVER touched. Archived gaps stay
+       re-fetchable by id, so this is reversible.
+    2. **Terminal friction surplus → drop.** Bounds total friction toward
+       :data:`MODEL_SIZE_HEALTHY_FRICTION` by dropping terminal
+       (``resolved`` then ``mitigated``) friction oldest-first, only as far as
+       needed. ALL ``active`` friction is kept, so an all-active list is left
+       untouched (and may legitimately stay above the threshold).
+    3. **Stale planned capabilities surplus → drop.** Bounds capabilities
+       toward :data:`MODEL_SIZE_HEALTHY_CAPABILITIES` by dropping ``planned``
+       (never-built) capabilities oldest-first, only as far as needed. ALL
+       ``working``/``partial`` capabilities are kept.
+
+    Returns a dict like ``{"gaps_lifecycle_archived": ["g-x"],
+    "friction_lifecycle_evicted": ["f-y"],
+    "capabilities_lifecycle_evicted": ["cap-z"]}`` — only the keys that had
+    activity are present; an all-live model returns ``{}``.
+    """
+    summary: dict[str, Any] = {}
+    now = _parse_iso_to_naive_utc(now_iso)
+
+    # 1. Aged-deferred, unstaffed gaps → mark abandoned so archive_closed_gaps
+    #    moves them into archived_gaps (reversible, re-fetchable by id).
+    archived_gap_ids: list[str] = []
+    for gap in model.gaps:
+        if gap.status != "active" or gap.active_moves or gap.deferral is None:
+            continue
+        if not _deferral_is_stale(gap.deferral, now):
+            continue
+        gap.status = "abandoned"
+        gap.closed = now_iso
+        gap.history.append(
+            GapHistoryEvent(
+                ts=now_iso,
+                event="lifecycle_auto_archived",
+                note=(
+                    "auto-archived: deferral aged past revisit point "
+                    "(lifecycle-bound pass)"
+                ),
+            )
+        )
+        archived_gap_ids.append(gap.id)
+    if archived_gap_ids:
+        archive_closed_gaps(model)
+        summary["gaps_lifecycle_archived"] = archived_gap_ids
+
+    # 2. Terminal friction surplus → drop toward the healthy friction threshold,
+    #    resolved before mitigated, oldest-first. Active friction is never
+    #    dropped, so an all-active list stays untouched.
+    friction_overage = len(model.friction) - MODEL_SIZE_HEALTHY_FRICTION
+    if friction_overage > 0:
+        resolved = [i for i, f in enumerate(model.friction) if f.status == "resolved"]
+        mitigated = [i for i, f in enumerate(model.friction) if f.status == "mitigated"]
+        evict_idx = set((resolved + mitigated)[:friction_overage])
+        if evict_idx:
+            evicted_friction: list[str] = []
+            kept_friction: list[Friction] = []
+            for i, fric in enumerate(model.friction):
+                if i in evict_idx:
+                    evicted_friction.append(fric.id)
+                else:
+                    kept_friction.append(fric)
+            model.friction = kept_friction
+            summary["friction_lifecycle_evicted"] = evicted_friction
+
+    # 3. Stale planned capabilities surplus → drop toward the healthy capability
+    #    threshold, oldest-first. working/partial capabilities are never dropped.
+    cap_overage = len(model.capabilities) - MODEL_SIZE_HEALTHY_CAPABILITIES
+    if cap_overage > 0:
+        evicted_caps: list[str] = []
+        kept_caps: list[Capability] = []
+        for cap in model.capabilities:
+            if len(evicted_caps) < cap_overage and _is_evictable_capability(cap):
+                evicted_caps.append(cap.name)
+            else:
+                kept_caps.append(cap)
+        if evicted_caps:
+            model.capabilities = kept_caps
+            summary["capabilities_lifecycle_evicted"] = evicted_caps
+
+    return summary
+
+
 def append_revision_log(
     model: ProblemModel,
     summary: str,
@@ -1248,8 +1423,16 @@ def append_self_reflection(
 ) -> list[dict]:
     """Append a reflection entry to the project's self-reflection log,
     enforcing :data:`SELF_REFLECTION_LOG_MAX`. Returns the new list ready
-    for JSONB persistence."""
+    for JSONB persistence.
+
+    Deduplicates by cycle_task_id to prevent re-appending identical entries
+    when the strategic-completion handler is replayed from a saved payload."""
     log = list(log_raw or [])
+    # Dedup: skip if an entry with the same cycle_task_id already exists
+    if entry.cycle_task_id and any(
+        e.get("cycle_task_id") == entry.cycle_task_id for e in log
+    ):
+        return log
     log.append(entry.model_dump())
     if len(log) > SELF_REFLECTION_LOG_MAX:
         log = log[-SELF_REFLECTION_LOG_MAX:]
@@ -1275,6 +1458,23 @@ MODEL_SIZE_HEALTHY_BYTES = 40_000
 """At or below this many serialized bytes the byte dimension is ``healthy``.
 Set well under the 90KB PROBLEM_MODEL_BYTE_BUDGET to signal when the model
 is approaching the structural limit even if entry counts look healthy."""
+
+DEFERRAL_STALE_GRACE_DAYS = 30
+"""Grace window (days) before a deferred, unstaffed gap is auto-archived by
+:func:`lifecycle_bound_problem_model` when its deferral carries no usable
+``hold_until``.
+
+A gap's ``deferral`` is an explicit "real but intentionally not staffed this
+cycle" marker (see :class:`GapDeferral`). When the deferral names a
+``hold_until`` that has passed, the revisit is overdue and the gap is archived.
+When ``hold_until`` is absent or unparseable (a free-form milestone/version
+tag rather than a date), the fallback trigger is age: a deferral whose
+``created_at`` is older than this window has sat un-revisited long enough that
+the strategist has effectively let it lapse. Generous by design — 30 days is
+far longer than a strategic cycle, so a freshly-deferred gap is never touched;
+only a genuinely stale one is. Archival is reversible: the gap moves to
+``archived_gaps`` and stays re-fetchable by id, so a false positive costs a
+lookup, not data."""
 
 MODEL_SIZE_GROWING_MULTIPLIER = 1.5
 """A dimension at >= 1.5x its healthy threshold is at least ``growing``."""
@@ -1486,6 +1686,14 @@ def _diff_summary(diff: dict[str, Any]) -> str:
         parts.append(f"GC evicted {len(caps_evicted)} terminal capability(ies)")
     if friction_evicted := diff.get("friction_evicted"):
         parts.append(f"GC evicted {len(friction_evicted)} terminal friction")
+    if lc_gaps := diff.get("gaps_lifecycle_archived"):
+        parts.append(f"lifecycle-archived {len(lc_gaps)} aged-deferred gap(s)")
+    if lc_friction := diff.get("friction_lifecycle_evicted"):
+        parts.append(f"lifecycle-dropped {len(lc_friction)} terminal friction")
+    if lc_caps := diff.get("capabilities_lifecycle_evicted"):
+        parts.append(
+            f"lifecycle-dropped {len(lc_caps)} planned capability(ies)"
+        )
     return "; ".join(parts) if parts else "no structural changes"
 
 
@@ -2410,6 +2618,20 @@ def apply_agent_update(
             diff["capabilities_consolidated"] = consolidated
 
     archive_closed_gaps(proposed)
+
+    # Lifecycle-bound pass: eagerly archive/drop terminal-ish state (aged-deferred
+    # unstaffed gaps, terminal friction surplus, stale planned-capability surplus)
+    # toward the healthy thresholds, so the durable model self-bounds instead of
+    # relying on manual per-cycle compaction. Runs AFTER archival (so this cycle's
+    # closures are already settled) and BEFORE the gc_problem_model backstop, and
+    # touches ONLY the same reference-only/terminal class gc treats as evictable —
+    # just applied at the healthy threshold instead of the 200-item cap. Its
+    # summary folds into the diff exactly like gc's, so the actions are observable
+    # in the revision log; an all-live model returns {} and leaves the diff (and
+    # the serialized model) byte-identical.
+    lifecycle_summary = lifecycle_bound_problem_model(proposed, now_iso)
+    if lifecycle_summary:
+        diff.update(lifecycle_summary)
 
     # Carry the durable rejected-agent-edits ledger forward and append any new
     # overrides, capped — mirrors archived_gaps/revision_log preservation. The

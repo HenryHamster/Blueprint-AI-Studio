@@ -1439,9 +1439,11 @@ def compute_anomaly_adjustment_summary() -> Dict[str, Any]:
 # Both helpers below are READ-ONLY and observational: they make the patterns
 # measurable without changing resume or conflict-resolution behavior.
 
-# Code-change ("write") task types — the ones that produce a PR and can build a
-# foundation. Imported from sr_analytics_common to avoid re-literal drift.
-_WRITE_TASK_TYPES = frozenset(_SR_CODE_CHANGE_TYPES)
+# Write task types that produce a PR and can build a foundation. Includes both
+# SR code-change types (create, fix, refactor, migrate) and other PR-producing types
+# (qa, docs, deps) for comprehensive duplicate-foundation detection. SR analytics uses
+# _SR_CODE_CHANGE_TYPES (narrower scope); foundation convergence needs the full set.
+_WRITE_TASK_TYPES = frozenset(_SR_CODE_CHANGE_TYPES | {"qa", "docs", "deps"})
 # Two active write-tasks under DIFFERENT parents whose related-file sets overlap
 # by at least this Jaccard ratio are surfaced as a candidate duplicated
 # foundation. Deliberately conservative (strong overlap only) so the signal
@@ -3086,8 +3088,15 @@ def compute_digest_cost_economics(
         for ttype in _type_cost
         if _type_merges.get(ttype, 0) > 0
     }
+    # Compute median excluding the typeless bucket ("unknown") so retirement
+    # thresholds are based on real task types, not phantom untyped tasks.
+    _type_cpms_for_median = {
+        ttype: cpm for ttype, cpm in _type_cpms.items() if ttype != "unknown"
+    }
     median_cpm_by_type = (
-        round(statistics.median(list(_type_cpms.values())), 4) if _type_cpms else None
+        round(statistics.median(list(_type_cpms_for_median.values())), 4)
+        if _type_cpms_for_median
+        else None
     )
     cost_per_merge_by_type = {
         ttype: {
@@ -3106,11 +3115,12 @@ def compute_digest_cost_economics(
     }
 
     # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window.
-    # Sum the VERIFIED merge count (excludes unverified-degraded fall-open merges) so the headline pipeline
-    # rate stays consistent with the per-direction acceptance/conversion rates, which already use the verified
-    # count. Fall back to raw prs_merged when the verified key is absent (legacy/partial direction dicts).
+    # Sum the RAW merge count (operator-accepted merges) matching the per-direction acceptance_rate convention
+    # used by digest_direction_progress and direction_metrics, which both divide raw prs_merged by
+    # raw (merged + rejected). Unverified-degraded merges are counted because the per-direction rates
+    # count them — this metric reports raw operator-acceptance outcomes consistently.
     _pipeline_total_merged_d = sum(
-        (d.get("verified_prs_merged", d.get("prs_merged")) or 0)
+        d.get("prs_merged") or 0
         for d in direction_progress_list
     )
     _pipeline_total_rejected_d = sum(
@@ -3123,8 +3133,11 @@ def compute_digest_cost_economics(
         else None
     )
     # Conversion rate denominator is PR-eligible tasks (excludes research/audit/
-    # memo/investigate types that never open a PR), matching the per-direction
-    # conversion_rate so the headline figure is not diluted by non-PR work.
+    # memo/investigate types that never open a PR), consistent with the per-direction
+    # denominator. NOTE: the numerator uses raw prs_merged (same as acceptance_rate above),
+    # which diverges from the per-direction conversion_rate that uses verified_prs_merged
+    # (digest_direction_progress.py:914-915). Pipeline conversion_rate is intentionally
+    # raw to report operator-observable outcomes; the per-direction rate is verification-aware.
     _pipeline_total_eligible_d = sum(
         d.get("pr_eligible_tasks_created") or 0 for d in direction_progress_list
     )

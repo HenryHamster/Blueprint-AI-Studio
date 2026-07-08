@@ -908,6 +908,7 @@ async def build_strategic_runtime_summary(
             "location": operator_status["location"],
             "status_reason": operator_status["reason"],
             "strategic_runner_count": len(strategic_runners),
+            "readiness_capable_runner_count": len(readiness_capable_runners),
             "live_runner_count": live_runner_count,
             "eligible_live_count": eligible_live_count,
             "stale_runner_count": stale_runner_count,

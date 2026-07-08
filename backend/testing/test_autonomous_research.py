@@ -3563,6 +3563,49 @@ async def test_spawn_periodic_task_enforce_mode_uses_runtime_categories(
         _shared_state.runtime_config["autonomous_periodic_tasks"] = original_periodic
 
 
+@pytest.mark.asyncio
+async def test_periodic_spawn_fails_closed_on_budget_snapshot_error_in_enforce_mode(
+    db_session, mocker
+):
+    """Periodic spawn fails CLOSED (blocks spawn) on budget snapshot error when mode==enforce."""
+    project = Project(
+        name="Periodic Budget Error",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-periodic-budget-error")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_periodic = _shared_state.runtime_config.get("autonomous_periodic_tasks")
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _shared_state.runtime_config["autonomous_periodic_tasks"] = {
+        **(original_periodic or {}),
+        "review": {"enabled": True, "interval_hours": 1},
+    }
+
+    # Mock the budget snapshot computation to raise an exception
+    mocker.patch(
+        "app.autonomous_research.compute_autonomous_spawn_budget_snapshot",
+        side_effect=Exception("Database connection failed"),
+    )
+
+    try:
+        await _spawn_periodic_task(project, "review", db_session)
+
+        # Verify no task was spawned (failed closed)
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert len(result.scalars().all()) == 0, "Expected no task to be spawned when snapshot fails in enforce mode"
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config["autonomous_periodic_tasks"] = original_periodic
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. _handle_research_completion — Depth Guard
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7864,15 +7907,20 @@ async def test_stage_dropout_breakdown(db_session):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _opened_pr type-awareness — review/fix tasks must NOT be misclassified
+# tasks_completed_no_pr type-awareness — review/fix/panel_review children that
+# are ATTACHED to a real (open) PR are NOT genuine no-CODE no-ops.  They carry a
+# pr_number (context/payload) even without a PULL_REQUEST artifact of their own,
+# so they must be EXCLUDED from the no-op bucket.  (This is the no-op gate; the
+# separate _opened_pr type-skip for the merge-VOLUME metrics is unchanged.)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_review_task_with_pr_number_counts_as_no_pr(db_session):
     """A completed review task with pr_number in payload and no PULL_REQUEST artifact
-    must be counted as tasks_completed_no_pr, not as having opened a PR.
-    ReviewPayload.pr_number is the PR under review, not one opened by the task.
+    is ATTACHED to a real (open) PR, so it must NOT be counted as a no-CODE no-op.
+    ReviewPayload.pr_number is the PR under review — a real PR association that
+    disqualifies the child from tasks_completed_no_pr.
     """
     direction_id = "d-openedpr001"
     direction = _active_direction(direction_id, "Opened-PR classification test")
@@ -7933,9 +7981,10 @@ async def test_review_task_with_pr_number_counts_as_no_pr(db_session):
     d = next(x for x in dirs if x.get("id") == direction_id)
     entry = d["research_history"][0]
 
-    # review task with pr_number but no artifact → no-PR completion
-    assert entry.get("tasks_completed_no_pr") == 1, (
-        f"Review task with pr_number but no PULL_REQUEST artifact should count as "
+    # review task attached to an open PR (pr_number in payload) → NOT a no-CODE
+    # no-op, so it is excluded from tasks_completed_no_pr.
+    assert entry.get("tasks_completed_no_pr") == 0, (
+        f"Review task attached to a real PR (pr_number in payload) should NOT count as "
         f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
         f"entry={entry}"
     )
@@ -8023,8 +8072,9 @@ async def test_create_task_with_pr_artifact_does_not_count_as_no_pr(db_session):
 @pytest.mark.asyncio
 async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
     """A completed fix task with pr_number in payload and no PULL_REQUEST artifact
-    must be counted as tasks_completed_no_pr.
-    Fix tasks iterate an existing PR rather than opening a new one.
+    pushed code onto an existing open PR, so it must NOT be counted as a no-CODE
+    no-op. Fix tasks iterate an existing PR — a real PR association that
+    disqualifies the child from tasks_completed_no_pr even without its own artifact.
     """
     direction_id = "d-openedpr003"
     direction = _active_direction(direction_id, "Fix-task PR classification")
@@ -8084,9 +8134,10 @@ async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
     d = next(x for x in dirs if x.get("id") == direction_id)
     entry = d["research_history"][0]
 
-    # fix task with pr_number but no PULL_REQUEST artifact → no-PR completion
-    assert entry.get("tasks_completed_no_pr") == 1, (
-        f"Fix task with pr_number but no PULL_REQUEST artifact should count as "
+    # fix task attached to an open PR (pr_number in payload) → churned code onto
+    # a real PR, so it is excluded from tasks_completed_no_pr.
+    assert entry.get("tasks_completed_no_pr") == 0, (
+        f"Fix task attached to a real PR (pr_number in payload) should NOT count as "
         f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
         f"entry={entry}"
     )
@@ -8094,9 +8145,10 @@ async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
 
 @pytest.mark.asyncio
 async def test_panel_review_task_with_pr_number_counts_as_no_pr(db_session):
-    """A completed panel_review task with pr_number in payload and no PULL_REQUEST artifact
-    must be counted as tasks_completed_no_pr, not as having opened a PR.
-    PanelReviewPayload.pr_number is the PR under review (input), not one opened by the task.
+    """A completed panel_review task with pr_number in payload and no PULL_REQUEST
+    artifact is ATTACHED to a real (open) PR, so it must NOT be counted as a
+    no-CODE no-op. PanelReviewPayload.pr_number is the PR under review (input) —
+    a real PR association that disqualifies the child from tasks_completed_no_pr.
     """
     direction_id = "d-openedpr004"
     direction = _active_direction(direction_id, "Panel-review PR classification")
@@ -8156,9 +8208,10 @@ async def test_panel_review_task_with_pr_number_counts_as_no_pr(db_session):
     d = next(x for x in dirs if x.get("id") == direction_id)
     entry = d["research_history"][0]
 
-    # panel_review task with pr_number but no PULL_REQUEST artifact → no-PR completion
-    assert entry.get("tasks_completed_no_pr") == 1, (
-        f"Panel_review task with pr_number but no PULL_REQUEST artifact should count as "
+    # panel_review task attached to an open PR (pr_number in payload) → NOT a
+    # no-CODE no-op, so it is excluded from tasks_completed_no_pr.
+    assert entry.get("tasks_completed_no_pr") == 0, (
+        f"Panel_review task attached to a real PR (pr_number in payload) should NOT count as "
         f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
         f"entry={entry}"
     )
@@ -10667,7 +10720,9 @@ def test_fold_evicted_preserves_scope_and_decomposition():
 
     dq = agg["decomposition_quality"]
     assert dq["total_decompositions"] == 3
-    assert dq["subtask_count_sum"] == 11  # 4 + 2 + 5
+    # The middle plan has subtask_merge_rate=None, so it is excluded from the
+    # weighted-average denominator: only the numeric-rate plans count (4 + 5).
+    assert dq["subtask_count_sum"] == 9  # 4 + 5 (None-rate plan excluded)
     assert dq["cross_module_count_sum"] == 3  # 1 + 0 + 2
     # Only entries with a non-null rate contribute: 0.5*4 + 0.8*5 = 6.0
     assert dq["subtask_merge_rate_weighted_sum"] == pytest.approx(6.0)
@@ -16230,6 +16285,266 @@ async def test_no_findings_completion_stamps_saturation_and_refractory(
     assert refractory_dt > _utcnow(), (
         "refractory_until must be in the future after a no-findings completion"
     )
+
+
+async def _map_direction_to_criterion(db_session, project, direction_id, *, covered):
+    """Attach an open-version acceptance criterion to a Direction ORM row.
+
+    Returns the criterion_key. When *covered* is False the criterion has no
+    evidence (coverage='uncovered'); when True a reachability evidence row makes
+    it 'covered'. The gate helper reads criterion_keys off the Direction row, so
+    a row must exist even though apply_post_spawn_state operates on the in-memory
+    project.directions blob.
+    """
+    from app import acceptance_criteria as ac
+    from app.models import (
+        CriterionEvidence,
+        Direction,
+        ReleaseVersion,
+        VersionAcceptanceCriterion,
+    )
+
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Owned acceptance outcome"
+    )
+    if covered:
+        db_session.add(
+            CriterionEvidence(
+                criterion_id=criterion.id,
+                project_id=project.id,
+                source_kind="reachability",
+                source_id="pr-x",
+            )
+        )
+        await db_session.commit()
+
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            status="active",
+            data={"id": direction_id},
+            criterion_keys=[criterion.criterion_key],
+        )
+    )
+    await db_session.commit()
+    _ = VersionAcceptanceCriterion  # imported for symmetry / readability
+    return criterion.criterion_key
+
+
+@pytest.mark.asyncio
+async def test_apply_post_spawn_state_gated_when_owned_criterion_uncovered(
+    db_session, mocker
+):
+    """Site 1 (apply_post_spawn_state): a saturated, >=3-merge direction that OWNS
+    an uncovered active criterion must NOT auto-complete on the proven-merge route.
+
+    Mirrors the all-deduped harness of the proven-completion test below, but maps
+    the direction to an uncovered acceptance criterion — the gate must withhold
+    success completion and leave the direction active."""
+    direction_id = "d-site1-uncovered"
+    direction = {
+        **_active_direction(direction_id, "Saturated proven, uncovered criterion"),
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "tasks_created": 1, "prs_merged": 1},
+            {"timestamp": "2026-01-02T00:00:00", "tasks_created": 0, "prs_merged": 1},
+            {"timestamp": "2026-01-03T00:00:00", "tasks_created": 1, "prs_merged": 1},
+        ],
+    }
+    project = Project(
+        name="Site1 Uncovered Gate",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _map_direction_to_criterion(
+        db_session, project, direction_id, covered=False
+    )
+
+    dup_title = "Fix exhausted finding"
+    dup_desc = "Already addressed"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+    existing = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "direction_id": direction_id},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix the exhausted finding",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new=AsyncMock(return_value=None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    target = next(
+        (d for d in (project.directions or []) if d.get("id") == direction_id), None
+    )
+    assert target is not None
+    assert target.get("status") == "active", (
+        "Site 1 must withhold proven-merge success completion while an owned "
+        "criterion is uncovered; direction should stay active"
+    )
+    assert target.get("auto_completed") is not True
+
+
+@pytest.mark.asyncio
+async def test_apply_post_spawn_state_completes_when_owned_criterion_covered(
+    db_session, mocker
+):
+    """Site 1: when the owned criterion IS covered, the saturated proven direction
+    still auto-completes exactly as before the gate."""
+    direction_id = "d-site1-covered"
+    direction = {
+        **_active_direction(direction_id, "Saturated proven, covered criterion"),
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "tasks_created": 1, "prs_merged": 1},
+            {"timestamp": "2026-01-02T00:00:00", "tasks_created": 0, "prs_merged": 1},
+            {"timestamp": "2026-01-03T00:00:00", "tasks_created": 1, "prs_merged": 1},
+        ],
+    }
+    project = Project(
+        name="Site1 Covered Gate",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _map_direction_to_criterion(db_session, project, direction_id, covered=True)
+
+    dup_title = "Fix exhausted finding"
+    dup_desc = "Already addressed"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+    existing = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "direction_id": direction_id},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix the exhausted finding",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new=AsyncMock(return_value=None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    target = next(
+        (d for d in (project.directions or []) if d.get("id") == direction_id), None
+    )
+    assert target is not None
+    assert target.get("status") == "completed", (
+        "Site 1 must still auto-complete a saturated proven direction whose owned "
+        "criterion is covered"
+    )
+    assert target.get("auto_completed") is True
 
 
 @pytest.mark.asyncio

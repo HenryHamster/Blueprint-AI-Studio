@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
+from app.deploy_identity import project_is_deploy_repo
 from app.models import Alert, AlertSeverity, Project, _utcnow
 
 
@@ -113,11 +114,13 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "cost.spend_hold": AlertEventPolicy("cost.spend_hold"),
     "capacity.quota_exhausted": AlertEventPolicy("capacity.quota_exhausted"),
     "capacity.all_accounts_blocked": AlertEventPolicy("capacity.all_accounts_blocked"),
-    # A self-hosted fleet runner missing its heartbeat window is a portable
-    # operator incident (any project can enroll operator hardware), so it lives
-    # in the always-on ``core`` domain — no per-project opt-in — and pushes the
-    # webhook like PIPELINE_HALTED / CIRCUIT_BREAKER_OPEN.
+    # Self-hosted fleet runner health incidents: portable operator incidents
+    # (any project can enroll operator hardware), always-on ``core`` domain.
+    # ``runner.deactivated`` fires when the runner misses its heartbeat window
+    # (offline / dead); ``runner.degraded`` fires when the runner heartbeats
+    # normally but fails every job it claims (connected but broken).
     "runner.deactivated": AlertEventPolicy("runner.deactivated"),
+    "runner.degraded": AlertEventPolicy("runner.degraded"),
     "deployment.halted": AlertEventPolicy("deployment.halted"),
     "deployment.rollback_recommended": AlertEventPolicy(
         "deployment.rollback_recommended"
@@ -258,7 +261,7 @@ def project_alert_domain_enabled(project: Project | None, domain: str) -> bool:
     configured = _configured_alert_domains(project)
     if domain in configured:
         return bool(configured[domain].get("enabled", False))
-    return bool(getattr(project, "is_self_repo", False)) and domain in SELF_REPO_DEFAULT_DOMAINS
+    return project_is_deploy_repo(project) and domain in SELF_REPO_DEFAULT_DOMAINS
 
 
 def should_emit_project_alert(
@@ -451,8 +454,7 @@ def serialize_project_alert_domains(project: Project) -> dict[str, Any]:
     for domain, meta in sorted(ALERT_DOMAIN_DEFINITIONS.items()):
         configured_value = configured.get(domain)
         default_enabled = domain == CORE_ALERT_DOMAIN or (
-            bool(getattr(project, "is_self_repo", False))
-            and domain in SELF_REPO_DEFAULT_DOMAINS
+            project_is_deploy_repo(project) and domain in SELF_REPO_DEFAULT_DOMAINS
         )
         enabled = (
             bool(configured_value.get("enabled"))

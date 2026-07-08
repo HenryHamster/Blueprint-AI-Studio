@@ -8,7 +8,7 @@ import { formatProjectContext } from './project-context.js';
 // (self-review calibration + first-review rejection patterns) are only
 // meaningful for reviewed code work, so both render for exactly these types.
 // Cannot import the Python frozenset cross-language; kept as a mirrored literal.
-const REVIEW_GATED_TASK_TYPES = ['create', 'fix', 'refactor', 'migrate', 'qa', 'docs', 'deps'];
+export const REVIEW_GATED_TASK_TYPES = ['create', 'fix', 'refactor', 'migrate', 'qa', 'docs', 'deps'];
 
 // Utility task types that should receive only durable operator steering
 // (user_purpose + constraints) and NOT the rolling agent current_focus narrative.
@@ -512,13 +512,6 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
         (taskContext?.related_files as string[] | undefined) ||
         [];
       prefix += formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length, opts) + '\n\n';
-      if (REVIEW_GATED_TASK_TYPES.includes(taskType)) {
-        prefix += formatSelfReviewCalibrationSection(
-          (projectCtx.self_review_catch_rate as SRCatchRateSource | undefined) ||
-          (projectCtx.sr_catch_rate_trends as SRCatchRateSource | undefined),
-          taskType,
-        );
-      }
     }
     // Per-type rejection patterns ship as an object (not an array), so they
     // render independently of the hasData array check above.

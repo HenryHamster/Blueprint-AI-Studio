@@ -407,6 +407,19 @@ async def reconcile_backfill(
         project_id, current_user["user_id"], session, "member"
     )
 
+    # Metric-derived acceptance-window coverage: re-score the version's
+    # acceptance-window aggregate and, when it is genuinely non-zero, record
+    # covering evidence for the criteria that track that metric. Best-effort and
+    # idempotent — runs on every reconcile so an operator can force it manually.
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    window_evidence = 0
+    if open_version is not None:
+        window_evidence = await ac.record_acceptance_window_coverage_evidence(
+            session, open_version
+        )
+
     if body.direction_key is not None:
         # Backfill a single direction.
         rows = await ac.backfill_direction_merge_evidence(
@@ -416,6 +429,7 @@ async def reconcile_backfill(
             "status": "ok",
             "results": [{"direction_key": body.direction_key, "evidence_recorded": rows}],
             "total_evidence_recorded": rows,
+            "acceptance_window_evidence_recorded": window_evidence,
         }
 
     # Backfill all directions in the project.
@@ -438,13 +452,16 @@ async def reconcile_backfill(
             results.append({"direction_key": dk, "evidence_recorded": recorded})
 
     logger.info(
-        "[AC] reconcile-backfill: project=%s directions=%d total_recorded=%d",
+        "[AC] reconcile-backfill: project=%s directions=%d total_recorded=%d "
+        "acceptance_window_evidence=%d",
         project_id,
         len(direction_keys),
         total,
+        window_evidence,
     )
     return {
         "status": "ok",
         "results": results,
         "total_evidence_recorded": total,
+        "acceptance_window_evidence_recorded": window_evidence,
     }

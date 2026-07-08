@@ -344,6 +344,7 @@ async def compute_direction_progress(
         _entry_generalized_terminal_outcomes,
         _fallback_outcome_kind_breakdown,
         _merge_outcome_kind_breakdown,
+        canonical_cost_per_merged_pr,
     )
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
     from app.direction_outcomes import synthesize_prompt_quality_patterns
@@ -1196,9 +1197,9 @@ async def compute_direction_progress(
                     "cost_by_status": cost_by_status or None,
                     "cost_by_type": cost_by_type or None,
                     "cost_by_provider_model": cost_by_provider_model or None,
-                    "cost_per_merged_pr": round(dir_cost / autonomous_prs_merged, 4)
-                    if autonomous_prs_merged > 0
-                    else None,
+                    "cost_per_merged_pr": canonical_cost_per_merged_pr(
+                        dir_cost, prs_merged
+                    ),
                     "scope_breakdown": dir_scope_agg or None,
                     "taxonomy_summary": dir_taxonomy_summary or None,
                     "stage_dropout": dir_stage_dropout or None,

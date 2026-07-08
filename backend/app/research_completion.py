@@ -230,6 +230,13 @@ MEMO_SPAWN_CAP_PER_CYCLE = 5
 # deferral. Findings beyond this ceiling are deferred to the next cycle.
 _MAX_FINDINGS_PER_CYCLE = 15
 
+# Trailing cap for the durable spawn-count idempotency ledger persisted in
+# project.vision. Only the most recent IDs can plausibly be replayed by a
+# post-commit re-run, so an unbounded list would grow forever inside the
+# JSONB for no dedup benefit. Matches the sibling durable-history caps
+# (rejected_proposals=30, *_DURABLE_MAX=200) — see the review note.
+_RESEARCH_SPAWN_COUNTED_IDS_MAX = 200
+
 # Drop reason stamped on the memo a reproduce-on-HEAD rejection spawns. Distinct
 # from the capacity/quality drop reasons (low_actionability / degradation_gate)
 # so strategic review can tell "the cited code is unambiguously gone" — the
@@ -740,17 +747,34 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
 
     _auto_complete_info: list[dict] = []
 
+    # Gate the PROVEN-merge SUCCESS route on outcome coverage (same policy as
+    # apply_post_spawn_state). The coverage query is async, but the completion
+    # decision runs inside the SYNCHRONOUS with_directions_locked closure below,
+    # so we resolve the verdict here (outside the lock) and thread the boolean
+    # in. Fail-open: the helper returns False when the direction owns no criteria
+    # or the query errors, preserving current behavior.
+    from app.acceptance_criteria import (  # noqa: PLC0415
+        direction_owns_uncovered_criterion,
+    )
+
+    _owns_uncovered = await direction_owns_uncovered_criterion(
+        session, task.project_id, direction_id
+    )
+
     def _apply_no_findings_refractory(dirs: list) -> None:
         target = next((d for d in dirs if d.get("id") == direction_id), None)
         if not target:
             return
+        _task_id_str = str(task.id)
         target["last_researched_at"] = now_iso
         target["last_cycle_productive"] = False
-        new_consec = int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
-        target["consecutive_unproductive_cycles"] = new_consec
-        # Only mark saturated after 3+ consecutive unproductive cycles, consistent
-        # with _compute_saturation's history-based threshold.
-        target["possibly_saturated"] = new_consec >= 3
+        if target.get("_last_productivity_task_id") != _task_id_str:
+            target["_last_productivity_task_id"] = _task_id_str
+            new_consec = int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
+            target["consecutive_unproductive_cycles"] = new_consec
+            # Only mark saturated after 3+ consecutive unproductive cycles, consistent
+            # with _compute_saturation's history-based threshold.
+            target["possibly_saturated"] = new_consec >= 3
         stamp_direction_refractory(target)
 
         # Auto-complete the most exhausted directions (those producing zero
@@ -779,7 +803,13 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 ) - int(agg.get("total_stranded_prs_merged", 0) or 0),
             )
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
-            if total_merged >= 3:
+            # Gated: a saturated direction with >= 3 verified merges whose owned
+            # acceptance outcome is still uncovered is withheld from the SUCCESS
+            # route — AND must not slip through the exhaustion route either
+            # (that declares deadlock, which a productive-but-unmet direction is
+            # not). It stays active. The < 3 exhaustion fallback is unaffected.
+            _proven_gated = total_merged >= 3 and _owns_uncovered
+            if total_merged >= 3 and not _owns_uncovered:
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
                 target["auto_completed"] = True
@@ -795,7 +825,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                         "total_cycles": total_cycles,
                     }
                 )
-            elif _should_autocomplete_exhausted(target):
+            elif not _proven_gated and _should_autocomplete_exhausted(target):
                 reason = _exhaustion_complete_reason(target)
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
@@ -923,6 +953,26 @@ _NON_SPAWNING_FINDING_TYPES = frozenset(
         "note",
     }
 )
+
+def _compute_direction_productivity(
+    direction_id: str,
+    tasks_by_dir: dict[str, int],
+    current_direction_id: str | None,
+    has_non_spawn_findings: bool,
+) -> bool:
+    """Return True when a direction's research cycle should be credited productive.
+
+    A cycle is productive when it spawns >=1 child task for that direction OR
+    when it produces non-spawning findings (verification/metadata types such as
+    design_doc_observation, direction_note, or direction_proposal) for the
+    current direction.  Crediting verification-only cycles prevents live-verification
+    sweeps and concluded design/research cycles from incurring the longer unproductive
+    refractory window.
+    """
+    if tasks_by_dir.get(direction_id, 0) > 0:
+        return True
+    return has_non_spawn_findings and direction_id == current_direction_id
+
 
 # Research findings only seed a reproduce-on-HEAD verdict when the finding is an
 # explicit defect claim. Other finding types (feature/improvement/refactor/etc.)
@@ -1387,8 +1437,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # immediately tripped the modulo-6 gate for the next strategic_review.
     project_obj = await session.get(Project, task.project_id)
 
+    _task_id_str = str(task.id)
+
     def _increment_research_spawn_count(vision: dict) -> None:
+        # Idempotency guard: on post-commit replay the three-verdict guard
+        # below still passes (all verdicts are None on the initial pass), so
+        # we track counted task IDs to prevent double-incrementing.
+        counted = vision.get("_research_spawn_counted_ids") or []
+        if _task_id_str in counted:
+            return
         vision["_research_spawn_count"] = (vision.get("_research_spawn_count") or 0) + 1
+        vision["_research_spawn_counted_ids"] = (counted + [_task_id_str])[
+            -_RESEARCH_SPAWN_COUNTED_IDS_MAX:
+        ]
 
     # Only on the FIRST pass — a re-entrant resume after grading or a
     # per-finding challenge must not re-count the cycle (verdict already
@@ -5702,6 +5763,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         flag_modified(task, "context")
         session.add(task)
 
+    # Adjust the surviving-findings signal to exclude children cancelled during
+    # prerequisite wiring (escalated-to-parent or co-deferred-shelved). These
+    # tasks were counted in _surviving_findings at spawn time but never actually
+    # ran; leaving them in the signal causes the saturation detector to see
+    # tasks_created>=1 on a cycle that produced no real work, preventing
+    # auto-completion for stuck directions.
+    _prereq_cancelled_count = sum(
+        1
+        for ct in child_tasks
+        if ct.status == TaskStatus.CANCELLED
+        and (
+            (ct.context or {}).get("prerequisite_escalated_to_parent")
+            or (ct.context or {}).get(CO_DEFERRED_SHELVED)
+        )
+    )
+    if _prereq_cancelled_count:
+        _record_research_survival_signal(
+            task, surviving=max(0, _surviving_findings - _prereq_cancelled_count)
+        )
+
     # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
     # by cochange/path clustering, run them serially rather than in parallel.
     # Each sibling's base branch otherwise picks up partial sibling-merged
@@ -5827,11 +5908,27 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         touched_dir_ids.add(current_direction_id)
     if touched_dir_ids:
 
+        _productivity_task_id = str(task.id)
+        # Verification-only cycles produce non-spawning findings (design_doc_observation,
+        # direction_note, direction_proposal, etc.) with zero child tasks.  These are still
+        # productive — the agent confirmed system state or updated direction metadata.
+        # direction_proposals and direction_notes were split out of findings at line 1761.
+        _has_non_spawn_findings = bool(
+            direction_proposals
+            or direction_notes
+            or any(f.get("type") in _NON_SPAWNING_FINDING_TYPES for f in findings)
+        )
+
         def _update_productivity(dirs: list) -> None:
             for d in dirs:
                 did = d.get("id")
                 if did in touched_dir_ids:
-                    productive = tasks_by_dir.get(did, 0) > 0
+                    if d.get("_last_productivity_task_id") == _productivity_task_id:
+                        continue
+                    d["_last_productivity_task_id"] = _productivity_task_id
+                    productive = _compute_direction_productivity(
+                        did, tasks_by_dir, current_direction_id, _has_non_spawn_findings
+                    )
                     d["last_cycle_productive"] = productive
                     if productive:
                         d["consecutive_unproductive_cycles"] = 0
@@ -5941,6 +6038,15 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             return
         _found = True
         history = target.get("research_history", [])
+        # Guard against duplicate task_ids on post-commit retry: if this task_id
+        # is already in the history, skip the append to ensure idempotency.
+        existing_task_ids = {e.get("task_id") for e in history}
+        agg = target.get("history_aggregate") or {}
+        for _ev in (agg.get("evicted_findings") or []):
+            if _ev.get("task_id"):
+                existing_task_ids.add(_ev.get("task_id"))
+        if entry.get("task_id") in existing_task_ids:
+            return
         new_history = [*history, entry]
         # Share the existing eviction/aggregate rule: keep last 10, aggregate older entries
         if len(new_history) > 10:

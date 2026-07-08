@@ -1,5 +1,54 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+// ── Type-safe mock export names ────────────────────────────────────────────────
+// Ensures that renaming/removing an export in the mocked module causes tsc to
+// fail at compile time. Each type assertion verifies the array only contains
+// valid export keys from the actual module.
+const {
+  INDEX_MOCK_EXPORTS,
+  WORKSPACE_PREP_MOCK_EXPORTS,
+  PROMPT_MOCK_EXPORTS,
+  BUILD_CONFIG_MOCK_EXPORTS,
+  TELEMETRY_MOCK_EXPORTS,
+  CODE_CHANGE_MOCK_EXPORTS,
+} = vi.hoisted(() => {
+  type IndexExportKey = keyof typeof import('../index.js');
+  type WorkspacePrepExportKey = keyof typeof import('../workspacePrep.js');
+  type PromptExportKey = keyof typeof import('../prompt.js');
+  type BuildConfigExportKey = keyof typeof import('../build-config.js');
+  type TelemetryExportKey = keyof typeof import('../telemetry.js');
+  type CodeChangeExportKey = keyof typeof import('./code-change.js');
+
+  return {
+    INDEX_MOCK_EXPORTS: [
+      'WORKSPACE', 'sendLog', 'log', 'getAgentToken', 'apiPost', 'apiGet',
+      'persistAndPostStatus', 'readHandlerOutput', 'validateBranchName', 'git',
+      'gitAsync', 'setupWorkspace', 'runClaudeCode', 'cloneWithRetry',
+      'sendHeartbeatSync', 'listOpenPullRequestsForBranch',
+    ] satisfies readonly IndexExportKey[],
+    WORKSPACE_PREP_MOCK_EXPORTS: [
+      'prepareWorkspaceForRole',
+    ] satisfies readonly WorkspacePrepExportKey[],
+    PROMPT_MOCK_EXPORTS: [
+      'getTaskTypeHints', 'readClaudeMd', 'buildContextPrefix', 'buildFileTree',
+      'discoverRelatedTests', 'configureAgentPermissions', 'writePlaybookHelper',
+      'writeMessagesHelper', 'writeCodeChangeHelpers', 'formatPlaybook', 'buildRetryContext',
+    ] satisfies readonly PromptExportKey[],
+    BUILD_CONFIG_MOCK_EXPORTS: [
+      'resolveBuildConfig',
+    ] satisfies readonly BuildConfigExportKey[],
+    TELEMETRY_MOCK_EXPORTS: [
+      'recordFormatMiss', 'recordFormatRepairAttempt', 'recordFormatRepairSuccess',
+    ] satisfies readonly TelemetryExportKey[],
+    CODE_CHANGE_MOCK_EXPORTS: [
+      'runCodeChangeTask',
+    ] satisfies readonly CodeChangeExportKey[],
+  };
+});
+
+// Used for type checking only; suppress "unused" warnings
+void INDEX_MOCK_EXPORTS; void WORKSPACE_PREP_MOCK_EXPORTS; void PROMPT_MOCK_EXPORTS; void BUILD_CONFIG_MOCK_EXPORTS; void TELEMETRY_MOCK_EXPORTS; void CODE_CHANGE_MOCK_EXPORTS;
+
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // 2026-05-04: handleMigrate no longer drives commit/rebase/push/PR via the
 // wrapper. apiPost('/api/agent/github/pull-requests', ...) and the

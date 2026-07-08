@@ -73,6 +73,7 @@ from app.llm_cost_attribution import (
     compute_llm_cost_by_task_type,
     compute_pr_rework_chain_breakdown,
 )
+from app.task_capabilities import is_pr_eligible_task_type
 from app.task_locking import project_lock
 from app.vm_cost_rates import idle_cost_usd
 
@@ -329,6 +330,10 @@ async def _load_recent_tasks(
                 # must be loaded so the access doesn't trip raiseload=True.
                 Task.llm_account_id,
                 Task.format_compliance_summary,
+                # parent_task_id: read by _rollup_parent_ids so merged-PR
+                # metrics can exclude rollup parents without tripping
+                # raiseload=True.
+                Task.parent_task_id,
                 # payloads: required so task.first_payload can be read without
                 # triggering an async lazy-load (used by compute_llm_cost_by_task_type
                 # and compute_effort_model_efficiency when called from this path).
@@ -426,13 +431,24 @@ def _compute_checkpoint_loss_rate(lanes: list[ImprovementLane]) -> float | None:
     return round(total_requeues / denominator, 4)
 
 
+def _rollup_parent_ids(tasks: list[Task]) -> frozenset:
+    """Return the set of task IDs that are parents of at least one other task.
+
+    Rollup parents get is_merged_completion=True alongside all their children
+    when the rollup lands, so counting them in merged-PR metrics double-counts
+    the landing. Callers exclude these IDs from merged/landed counts.
+    """
+    return frozenset(t.parent_task_id for t in tasks if t.parent_task_id is not None)
+
+
 def _cost_and_merges(tasks: list[Task]) -> tuple[float, int]:
     """Return (total task-attached VM cost, merged-PR count) over the window."""
     total_cost = 0.0
     merged = 0
+    parent_ids = _rollup_parent_ids(tasks)
     for t in tasks:
         total_cost += get_task_total_vm_cost_usd(t)
-        if is_merged_completion(t):
+        if is_merged_completion(t) and t.id not in parent_ids:
             merged += 1
     return total_cost, merged
 
@@ -1140,10 +1156,11 @@ def compute_vm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
         lambda: {"task_count": 0, "merged_count": 0, "cost_usd": 0.0}
     )
     total_cost = 0.0
+    parent_ids = _rollup_parent_ids(tasks)
 
     for t in tasks:
         task_type = (t.first_payload or {}).get("type") or "unspecified"
-        merged = is_merged_completion(t)
+        merged = is_merged_completion(t) and t.id not in parent_ids
         vm_cost = get_task_total_vm_cost_usd(t)
         b = buckets[task_type]
         b["task_count"] += 1
@@ -1218,6 +1235,10 @@ def _new_efficiency_bucket() -> Dict[str, Any]:
         # Verified landings only (is_verified_merge) — degraded fall-open merges
         # count in landed_count but NOT here, mirroring compute_llm_cost_breakdown.
         "verified_landed_count": 0,
+        # Tasks whose type can land a PR (evaluation_strategy=ci_and_review).
+        # landed_rate / verified_landed_rate divide by this, not run_count, so
+        # review/plan/research tasks that can never open a PR don't deflate the rate.
+        "pr_eligible_run_count": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "llm_call_count": 0,
@@ -1234,17 +1255,28 @@ def _finalize_efficiency_bucket(b: Dict[str, Any], **extra: Any) -> Dict[str, An
     run_count = int(b["run_count"])
     landed_count = int(b["landed_count"])
     verified_landed_count = int(b["verified_landed_count"])
+    pr_eligible_run_count = int(b["pr_eligible_run_count"])
     cost = round(float(b["cost_usd"]), 6)
     priceable = int(b["priced_run_count"]) + int(b["unpriced_run_count"])
     out: Dict[str, Any] = {
         "run_count": run_count,
+        # PR-eligible denominator: only tasks that can land a PR are counted.
+        # Review/plan/research tasks inflate run_count but can never contribute
+        # to the numerator, so landed_rate uses this narrower denominator.
+        "pr_eligible_run_count": pr_eligible_run_count,
         "landed_count": landed_count,
-        "landed_rate": round(landed_count / run_count, 4) if run_count else None,
+        "landed_rate": (
+            round(landed_count / pr_eligible_run_count, 4)
+            if pr_eligible_run_count
+            else None
+        ),
         # Verified payoff alongside the raw landed figures: degraded (no-CI
         # fall-open) merges are kept in landed_count/landed_rate but excluded here.
         "verified_landed_count": verified_landed_count,
         "verified_landed_rate": (
-            round(verified_landed_count / run_count, 4) if run_count else None
+            round(verified_landed_count / pr_eligible_run_count, 4)
+            if pr_eligible_run_count
+            else None
         ),
         "total_cost_usd": cost,
         # Cost-per-merge is the headline payoff number: priced LLM dollars spent
@@ -1340,6 +1372,11 @@ def compute_effort_model_efficiency(
     fallback_total = 0
     fallback_combos: Dict[tuple[str, str, str, str], int] = defaultdict(int)
 
+    # Rollup parents get is_merged_completion=True alongside all their children
+    # when a rollup lands; exclude them so each rollup counts as N child landings,
+    # not N+1.
+    _parent_ids = _rollup_parent_ids(tasks)
+
     def _accumulate_attempt(
         b: Dict[str, Any],
         input_tokens: int,
@@ -1360,8 +1397,8 @@ def compute_effort_model_efficiency(
             b["unpriced_run_count"] += 1
 
     for t in tasks:
-        landed = is_merged_completion(t)
-        verified = is_verified_merge(t)
+        landed = is_merged_completion(t) and t.id not in _parent_ids
+        verified = is_verified_merge(t) and t.id not in _parent_ids
         # Bucket by the EFFECTIVE routing effort the dispatcher resolves (the
         # tier that actually selected the model and drove cost), not just the
         # explicit payload effort that only scope-aware types carry. Read the
@@ -1453,8 +1490,13 @@ def compute_effort_model_efficiency(
         # Effort is a TASK-level attribute: credit its bucket and the grand total
         # once per task. Model buckets are credited once per distinct bucket the
         # task touched, so a multi-attempt/multi-model task never inflates counts.
+        task_type_str = first_payload.get("type") if first_payload else None
+        pr_eligible = is_pr_eligible_task_type(task_type_str or "")
         eff_bucket["run_count"] += 1
         totals["run_count"] += 1
+        if pr_eligible:
+            eff_bucket["pr_eligible_run_count"] += 1
+            totals["pr_eligible_run_count"] += 1
         if landed:
             eff_bucket["landed_count"] += 1
             totals["landed_count"] += 1
@@ -1464,14 +1506,18 @@ def compute_effort_model_efficiency(
         for key in credit_keys:
             mb = model_buckets[key]
             mb["run_count"] += 1
+            if pr_eligible:
+                mb["pr_eligible_run_count"] += 1
             if landed:
                 mb["landed_count"] += 1
             if verified:
                 mb["verified_landed_count"] += 1
             em = effort_models[effort].setdefault(
-                key, {"run_count": 0, "landed_count": 0}
+                key, {"run_count": 0, "landed_count": 0, "pr_eligible_run_count": 0}
             )
             em["run_count"] += 1
+            if pr_eligible:
+                em["pr_eligible_run_count"] += 1
             if landed:
                 em["landed_count"] += 1
 
@@ -1492,6 +1538,7 @@ def compute_effort_model_efficiency(
                 "provider": prov,
                 "model": mdl,
                 "run_count": int(v["run_count"]),
+                "pr_eligible_run_count": int(v.get("pr_eligible_run_count", 0)),
                 "landed_count": int(v["landed_count"]),
                 "priced": (prov, mdl) in priced_model_keys,
             }
@@ -1812,6 +1859,7 @@ def compute_panel_review_effectiveness(
         _task_llm_cost(t)[0]
         for t in tasks
         if (t.first_payload or {}).get("type") == "panel_review"
+        and (since_dt is None or t.updated_at is None or t.updated_at >= since_dt)
     )
     cost_per_challenge = round(panel_review_llm_cost / total, 4) if total > 0 else None
 
@@ -2119,20 +2167,33 @@ _PROMPT_STATIC_CONST_NAMES: tuple[str, ...] = (
 # static prompt footprint and are not template literals.
 _PROMPT_STATIC_PLAIN_CONST_NAMES: tuple[str, ...] = ("DEFAULT_TOOL_GUIDANCE",)
 
+# Template-literal constants from agent/src/prompts/task-type-focus.ts that
+# contribute to the static prompt footprint. MIGRATE_TASK_FOCUS is omitted
+# because it is a function-call assignment (buildMigrateTaskFocus()) rather than
+# a direct template literal and cannot be measured by _extract_ts_template_literal_length.
+_TASK_TYPE_FOCUS_CONST_NAMES: tuple[str, ...] = (
+    "REFACTOR_TASK_FOCUS",
+    "QA_TASK_FOCUS",
+    "CREATE_TASK_FOCUS",
+    "FIX_TASK_FOCUS",
+    "DOCS_TASK_FOCUS",
+    "DEPS_TASK_FOCUS",
+)
+
 
 def _compute_prompt_static_bytes() -> int | None:
     """Sum the source character lengths of all static code-change prompt sections.
 
     Reads agent/src/prompt.ts and measures the template-literal constants in
     _PROMPT_STATIC_CONST_NAMES plus the plain-string constants in
-    _PROMPT_STATIC_PLAIN_CONST_NAMES. Returns None when prompt.ts is unavailable
-    (production backend containers that do not mount agent/src) or when any
-    declared constant is absent from the source.
+    _PROMPT_STATIC_PLAIN_CONST_NAMES. Also reads agent/src/prompts/task-type-focus.ts
+    and measures the template-literal constants in _TASK_TYPE_FOCUS_CONST_NAMES.
+    Returns None when any source file is unavailable (production backend containers
+    that do not mount agent/src) or when any declared constant is absent.
 
-    Baseline (post-v16, 2026-06-20): ~16 420 bytes / ~4 678 tokens.
-    The 2026-06-19 experiment measured ~34 997 bytes before v16 prompt reductions
-    (SHARED_LIFECYCLE_REMAINDER cut from ~6 742 to ~1 712 tokens in PR #10960;
-    SIZE_GUARDRAIL_GUIDANCE cut from ~573 to ~266 tokens in PR #10956).
+    Baseline (post-v16, 2026-06-20): ~16 420 bytes / ~4 678 tokens from prompt.ts.
+    v11 adds task-type-focus.ts constants (~5 500 bytes), raising the combined
+    baseline to ~21 900 bytes.
     """
     agent_src = _find_agent_src()
     if agent_src is None:
@@ -2153,6 +2214,20 @@ def _compute_prompt_static_bytes() -> int | None:
         total += length
     for name in _PROMPT_STATIC_PLAIN_CONST_NAMES:
         length = _extract_ts_plain_string_length(src, name)
+        if length is None:
+            return None
+        total += length
+
+    task_type_focus_ts = os.path.join(agent_src, "prompts", "task-type-focus.ts")
+    if not os.path.exists(task_type_focus_ts):
+        return None
+    try:
+        with open(task_type_focus_ts, encoding="utf-8") as fh:
+            ttf_src = fh.read()
+    except OSError:
+        return None
+    for name in _TASK_TYPE_FOCUS_CONST_NAMES:
+        length = _extract_ts_template_literal_length(ttf_src, name)
         if length is None:
             return None
         total += length

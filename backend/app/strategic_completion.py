@@ -3365,7 +3365,10 @@ def record_retired_direction_memory(
         _bounded = str(outcome).strip()[:_RETIRED_OUTCOME_CHAR_CAP]
         if _bounded:
             entry["outcome"] = _bounded
-    existing = list(vision.get("_recently_retired_directions") or [])
+    existing = [
+        e for e in (vision.get("_recently_retired_directions") or [])
+        if not entry["id"] or e.get("id") != entry["id"]
+    ]
     existing.append(entry)
     vision["_recently_retired_directions"] = existing[-_RETIRED_MEMORY_CAP:]
 
@@ -3474,7 +3477,7 @@ def _retired_grounding_note(grounding: dict, block_reason: str) -> str:
 
 
 async def _check_direction_starvation(
-    project: Any, dirs_created: int, session: AsyncSession
+    project: Any, dirs_created: int, session: AsyncSession, task: Any = None
 ) -> None:
     """Detect consecutive strategic cycles with no direction creation despite active gaps.
 
@@ -3507,8 +3510,14 @@ async def _check_direction_starvation(
 
     vision = dict(project.vision or {})
     if dirs_created == 0 and has_gaps:
+        task_id_str = str(task.id) if task is not None else None
+        if task_id_str and vision.get("_direction_starvation_last_task_id") == task_id_str:
+            # Already processed this cycle on a prior run — skip to avoid double-counting.
+            return
         starvation_count = vision.get("_direction_starvation_count", 0) + 1
         vision["_direction_starvation_count"] = starvation_count
+        if task_id_str:
+            vision["_direction_starvation_last_task_id"] = task_id_str
 
         if starvation_count >= 5:
             # Auto-create a fallback direction as last resort
@@ -4014,6 +4023,22 @@ async def _maybe_retry_workday_auto_start(
         )
 
 
+def _merge_rejected_proposals(vision: dict, batch: list) -> None:
+    """Append batch entries to vision['rejected_proposals'], deduplicating by text.
+
+    Safe to call multiple times with the same batch (replay-idempotent): an entry
+    whose 'text' already exists in the list is silently skipped.  The list is
+    capped at 30 entries after merging.
+    """
+    _rp = list(vision.get("rejected_proposals") or [])
+    existing_texts = {e.get("text") for e in _rp}
+    for entry in batch:
+        if entry.get("text") not in existing_texts:
+            _rp.append(entry)
+            existing_texts.add(entry.get("text"))
+    vision["rejected_proposals"] = _rp[-30:]
+
+
 async def _handle_strategic_completion(
     task: Task,
     logs: str,
@@ -4275,7 +4300,7 @@ async def _handle_strategic_completion(
                 f"[STRATEGIC] Task {task.id}: applied {_ep_applied} "
                 f"evidence_progress verdict(s) to directions"
             )
-        await _check_direction_starvation(project, dirs_created, session)
+        await _check_direction_starvation(project, dirs_created, session, task=task)
         # Reset the consecutive-failure breaker on a successful cycle. The
         # counter is otherwise only cleared on a vision *write* (the
         # set-problem-model API path at admin_agent_ops and the legacy
@@ -5064,8 +5089,20 @@ async def _handle_strategic_completion(
                     else "medium"
                 )
                 _DIR_FIELD_MAX = 500
+                # Deterministic ID: same task + same text always produces the same
+                # direction ID, so a post-commit replay that re-parses direction_ops
+                # from agent stdout will find the already-committed direction and skip
+                # rather than appending a duplicate with a fresh random UUID.
+                _dir_id = f"d-{hashlib.sha256(f'{task.id}:{text}'.encode()).hexdigest()[:8]}"
+                if any(d.get("id") == _dir_id for d in directions):
+                    logger.info(
+                        "[STRATEGIC] Task %s: skipping create_direction replay — id %s already exists",
+                        task.id,
+                        _dir_id,
+                    )
+                    continue
                 new_dir = {
-                    "id": f"d-{uuid.uuid4().hex[:8]}",
+                    "id": _dir_id,
                     "text": text,
                     "status": "active",
                     "priority": priority,
@@ -5512,20 +5549,22 @@ async def _handle_strategic_completion(
                             )
 
                             _reset_outcome_detection_state(d)
-                        # Record rationale as a note
+                        # Record rationale as a note (dedup: skip if same text already present)
                         if rationale:
                             notes = d.get("notes", [])
-                            notes.append(
-                                {
-                                    "text": f"Strategic update: {rationale}",
-                                    "added_at": _utcnow().isoformat(),
-                                }
-                            )
-                            if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
-                                logger.warning(
-                                    f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                            note_text = f"Strategic update: {rationale}"
+                            if not any(n.get("text") == note_text for n in notes):
+                                notes.append(
+                                    {
+                                        "text": note_text,
+                                        "added_at": _utcnow().isoformat(),
+                                    }
                                 )
-                            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                                if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
+                                    logger.warning(
+                                        f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                                    )
+                                d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         if _gap_changed_fb or d.get("status") != _pre_status_fb:
                             _pending_gap_reconciles.append(
                                 (
@@ -5573,17 +5612,19 @@ async def _handle_strategic_completion(
                         )
                         if rationale:
                             notes = d.get("notes", [])
-                            notes.append(
-                                {
-                                    "text": f"Retired by strategic review: {rationale}",
-                                    "added_at": _utcnow().isoformat(),
-                                }
-                            )
-                            if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
-                                logger.warning(
-                                    f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                            note_text = f"Retired by strategic review: {rationale}"
+                            if not any(n.get("text") == note_text for n in notes):
+                                notes.append(
+                                    {
+                                        "text": note_text,
+                                        "added_at": _utcnow().isoformat(),
+                                    }
                                 )
-                            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                                if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
+                                    logger.warning(
+                                        f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                                    )
+                                d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         _delta_mutated[str(dir_id)] = d
                         ops_applied += 1
                         retires_applied += 1
@@ -5633,16 +5674,15 @@ async def _handle_strategic_completion(
                         d["staged_for_version"] = staged_for_version
                         d["staged_at"] = _utcnow().isoformat()
                         notes = d.get("notes", [])
-                        notes.append(
-                            {
-                                "text": (
-                                    f"Staged to begin after v{staged_for_version} promotes"
-                                    + (f": {rationale}" if rationale else "")
-                                ),
-                                "added_at": _utcnow().isoformat(),
-                            }
+                        note_text = (
+                            f"Staged to begin after v{staged_for_version} promotes"
+                            + (f": {rationale}" if rationale else "")
                         )
-                        d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                        if not any(n.get("text") == note_text for n in notes):
+                            notes.append(
+                                {"text": note_text, "added_at": _utcnow().isoformat()}
+                            )
+                            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         ctx = task.context or {}
                         task.context = {
                             **ctx,
@@ -5726,17 +5766,16 @@ async def _handle_strategic_completion(
                         )
                     )
                 notes = target.get("notes", [])
-                notes.append(
-                    {
-                        "text": (
-                            f"Approved by strategic review: {rationale}"
-                            if rationale
-                            else "Approved by strategic review"
-                        ),
-                        "added_at": _utcnow().isoformat(),
-                    }
+                note_text = (
+                    f"Approved by strategic review: {rationale}"
+                    if rationale
+                    else "Approved by strategic review"
                 )
-                target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                if not any(n.get("text") == note_text for n in notes):
+                    notes.append(
+                        {"text": note_text, "added_at": _utcnow().isoformat()}
+                    )
+                    target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                 ctx = task.context or {}
                 task.context = {
                     **ctx,
@@ -5918,13 +5957,12 @@ async def _handle_strategic_completion(
                 target.pop("staged_at", None)
                 if rationale:
                     notes = target.get("notes", [])
-                    notes.append(
-                        {
-                            "text": f"Reactivated by strategic op: {rationale}",
-                            "added_at": _utcnow().isoformat(),
-                        }
-                    )
-                    target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                    note_text = f"Reactivated by strategic op: {rationale}"
+                    if not any(n.get("text") == note_text for n in notes):
+                        notes.append(
+                            {"text": note_text, "added_at": _utcnow().isoformat()}
+                        )
+                        target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                 _gap_id_activate_fb = target.get("gap_id")
                 if _gap_id_activate_fb:
                     _pending_gap_reconciles.append(
@@ -6082,9 +6120,7 @@ async def _handle_strategic_completion(
             _rejected_batch = list(_pending_rejected_proposals)
 
             def _apply_rejected_proposals(vision: dict) -> None:
-                _rp = list(vision.get("rejected_proposals") or [])
-                _rp.extend(_rejected_batch)
-                vision["rejected_proposals"] = _rp[-30:]
+                _merge_rejected_proposals(vision, _rejected_batch)
 
             await with_vision_locked(
                 session, task.project_id, _apply_rejected_proposals
@@ -6167,7 +6203,7 @@ async def _handle_strategic_completion(
                 reason="strategic_review fallback path produced no vision",
             )
 
-    await _check_direction_starvation(project, dirs_created, session)
+    await _check_direction_starvation(project, dirs_created, session, task=task)
     session.add(project)
 
     # Deferred import of message/resolution caps — same STRATEGIC_* namespace

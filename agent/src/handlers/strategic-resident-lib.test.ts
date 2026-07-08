@@ -258,6 +258,14 @@ describe('buildBootstrapPrompt', () => {
     expect(p).toContain('heredoc or pipe');
   });
 
+  it('bootstrap_prompt_states_dispatched_work_runs_concurrently', () => {
+    const p = buildBootstrapPrompt(base);
+    expect(p).toContain('Dispatched work runs concurrently and independently');
+    expect(p).toContain('dispatching BOTH now is the DEFAULT');
+    expect(p).toContain('do not stage one behind the other');
+    expect(p).toContain('conflicts_with');
+  });
+
   it('includes canonical fetch guidance when provided', () => {
     const p = buildBootstrapPrompt({
       ...base,
@@ -418,6 +426,16 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     { key: 'code:backend', kind: 'code', label: 'code/backend', hint: 'read a module under backend/' },
   ];
 
+  it('test_resident_prompt_states_running_update_file_path', () => {
+    const p = buildAutonomousPrompt(focus, [], [], false);
+    // set-running-update requires a file path, not inline markdown
+    expect(p).toContain('set-running-update');
+    expect(p).toContain('FILE PATH');
+    expect(p).toContain('/tmp/running_update.md');
+    expect(p).toContain('reads the file');
+    expect(p).toContain('passing markdown as argv fails');
+  });
+
   it('renders the work-unit contract and the TICK-VERDICT vocabulary', () => {
     const p = buildAutonomousPrompt(focus, [], [], false);
     // Work-unit contract, not "ONE small step".
@@ -459,6 +477,17 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     expect(p).toContain('qualification [clear]');
     expect(p).toContain('Open leads');
     expect(p).toContain('code:backend: hardcoded model id');
+  });
+
+  it('includes pipeline-parallelism reminder: dispatched work runs concurrently', () => {
+    const p = buildAutonomousPrompt(focus, [], [], false);
+    // Reminder that dispatched work runs concurrently and independent work should be dispatched together
+    expect(p).toContain('Dispatched work runs concurrently');
+    expect(p).toContain('spawn_task, spawn_fix, or');
+    expect(p).toContain('pipeline regardless of your cadence');
+    expect(p).toContain('genuinely independent');
+    expect(p).toContain('dispatch BOTH now');
+    expect(p).toContain('staging one behind the other');
   });
 });
 

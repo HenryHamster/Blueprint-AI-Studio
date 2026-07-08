@@ -29,8 +29,16 @@ Optional environment variables:
                                       floor 60)
     BLUEPRINT_RUNNER_MAX_AUTH_FAILURES Consecutive heartbeat 401s before the runner exits
                                       non-zero (revoked token; default: 20, 0 disables)
+    BLUEPRINT_RUNNER_MAX_NETWORK_FAILURES Consecutive heartbeat network errors before the
+                                      runner exits non-zero (default: 20, 0 disables)
     BLUEPRINT_RUNNER_WORKSPACE_ROOT   Parent directory for per-task agent workspaces
                                       (default: <tmp>/blueprint-agent-workspaces)
+    BLUEPRINT_RUNNER_KEEP_WORKSPACES  Keep per-task workspaces after a task exits
+                                      (1/true/yes) for post-mortem debugging; default
+                                      is to auto-remove them so disk does not fill up.
+    BLUEPRINT_RUNNER_MIN_DISK_BYTES   Low-disk guard: stop claiming new agent work when
+                                      free space on the workspace filesystem is below this
+                                      many bytes (default: 0 = disabled)
     BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
     BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
     BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
@@ -60,6 +68,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import random
 import time
 import urllib.error
 import urllib.request
@@ -178,8 +187,21 @@ def _die(reason: str, code: int = 1) -> None:
     would only unwind the calling thread and leave the process silently degraded.
     A non-zero exit surfaces in systemd/journalctl and lets the process supervisor
     restart the runner.
+
+    Before exiting, write a minimal status.json so a post-mortem on-box inspection
+    shows the fatal condition — the operator can ``cat ~/.blueprint/status.json``
+    and see what killed the runner without needing journalctl access.
     """
     print(f"[runner] FATAL: {reason}", file=sys.stderr, flush=True)
+    try:
+        _write_status_json(
+            runner_id=_hostname(),
+            last_heartbeat_status=f"fatal: {reason[:120]}",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+    except Exception:
+        pass  # best-effort only — must not block the exit
     os._exit(code)
 
 
@@ -209,6 +231,10 @@ def _save_runner_token(token: str) -> None:
     path = _credential_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            os.chmod(os.path.dirname(path), 0o700)
+        except OSError:
+            pass
         fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
         try:
             os.write(fd, token.encode())
@@ -237,6 +263,63 @@ def _load_runner_token() -> str | None:
         return None
 
 
+def _write_status_json(
+    runner_id: str | None,
+    last_heartbeat_status: str,
+    active_task_ids: list,
+    active_compute_job_ids: list,
+    *,
+    caps: "iso.Capabilities | None" = None,
+    agent_backend: str | None = None,
+    compute_backend: str | None = None,
+) -> None:
+    """Write a compact on-box status file so an operator can triage an offline runner.
+
+    The file is written atomically (temp file + rename, 0o644) to
+    ``~/.blueprint/status.json`` (respects ``BLUEPRINT_CREDENTIAL_DIR``).  It
+    contains no secrets — only the runner identity, liveness, active work, and
+    detected isolation capabilities.  An operator can ``cat`` it to answer "when did
+    it last heartbeat?" or "what was it working on?" even when the process is dead.
+
+    Called from the heartbeat loop after every POST (success or failure) so the
+    file's mtime is the last time the process wrote anything, and from ``_die()``
+    to leave a post-mortem snapshot of the fatal condition.
+    """
+    path = os.path.join(_credential_dir(), "status.json")
+    last_heartbeat_at = _utc_now_iso()
+    payload: dict = {
+        "runner_id": runner_id,
+        "last_heartbeat_at": last_heartbeat_at,
+        "last_heartbeat_status": last_heartbeat_status,
+        "active_task_ids": list(active_task_ids),
+        "active_compute_job_ids": list(active_compute_job_ids),
+    }
+    if caps is not None:
+        payload["bwrap_ok"] = caps.bwrap_ok
+        payload["docker_usable"] = caps.docker_usable
+        payload["agent_backend"] = agent_backend
+        payload["compute_backend"] = compute_backend
+    else:
+        payload["bwrap_ok"] = None
+        payload["docker_usable"] = None
+        payload["agent_backend"] = None
+        payload["compute_backend"] = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+        try:
+            os.write(fd, json.dumps(payload, sort_keys=True).encode())
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o644)
+        os.rename(tmp_path, path)
+    except Exception as exc:
+        print(
+            f"[runner] WARNING: could not write status.json to {path}: {exc}",
+            flush=True,
+        )
+
+
 def _hostname() -> str | None:
     """Best-effort host name for this runner, sent on every heartbeat.
 
@@ -250,6 +333,33 @@ def _hostname() -> str | None:
     except OSError:
         return None
     return name or None
+
+
+def _runner_version() -> str | None:
+    """Best-effort runner version from ``git describe`` in the scripts directory.
+
+    Sent on every heartbeat so the operator's fleet view can see which build each
+    heterogeneous device is running (a stale runner is a common cause of a device
+    silently declining a task class). Returns a short version string (tag/sha,
+    ``-dirty`` when the working tree has uncommitted changes) or ``None`` on ANY
+    failure — git absent, not a repo, timeout — so a version probe never breaks a
+    heartbeat (the schema tolerates a missing version; old runners omit it).
+    """
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            cwd=scripts_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    version = result.stdout.strip()
+    return version or None
 
 
 def _node_runtime_ok() -> bool:
@@ -447,12 +557,12 @@ def _find_agent_binary() -> str:
     sys.exit(1)
 
 
-def _agent_workspace_for_task(task_id: str) -> str:
-    """Return a per-task workspace path for an agent subprocess.
+def _agent_workspace_path(task_id: str) -> str:
+    """Compute the per-task workspace path for *task_id* WITHOUT creating it.
 
-    The node agent defaults to /tmp/workspace when AGENT_WORKSPACE is absent.
-    A persistent local runner may execute multiple tasks across one machine
-    session, so each task gets a stable isolated workspace directory.
+    Split out from ``_agent_workspace_for_task`` so cleanup can derive the same
+    directory to remove after a task exits, without the side effect of re-creating
+    it via ``os.makedirs``.
     """
     root = os.environ.get("BLUEPRINT_RUNNER_WORKSPACE_ROOT", "").strip()
     if not root:
@@ -460,9 +570,63 @@ def _agent_workspace_for_task(task_id: str) -> str:
     safe_task_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in task_id)
     if not safe_task_id:
         safe_task_id = "unknown"
-    workspace = os.path.abspath(os.path.join(root, safe_task_id))
+    return os.path.abspath(os.path.join(root, safe_task_id))
+
+
+def _agent_workspace_for_task(task_id: str) -> str:
+    """Return a per-task workspace path for an agent subprocess.
+
+    The node agent defaults to /tmp/workspace when AGENT_WORKSPACE is absent.
+    A persistent local runner may execute multiple tasks across one machine
+    session, so each task gets a stable isolated workspace directory.
+    """
+    workspace = _agent_workspace_path(task_id)
     os.makedirs(workspace, exist_ok=True)
     return workspace
+
+
+def _cleanup_agent_workspace(task_id: str) -> None:
+    """Best-effort removal of a finished task's per-task workspace.
+
+    Unlike compute-job scratch dirs (rmtree'd after each job), per-task agent
+    workspaces are never reused once the agent exits. Leaving them behind on a
+    long-lived runner silently exhausts disk, which then trips the disk-based
+    degraded-runner health path and takes the runner offline. Reap the workspace
+    when the agent finishes. Set BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 to retain
+    them for post-mortem debugging.
+    """
+    if os.environ.get("BLUEPRINT_RUNNER_KEEP_WORKSPACES", "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        return
+    try:
+        shutil.rmtree(_agent_workspace_path(task_id), ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001 — cleanup is strictly best-effort
+        print(f"[runner] workspace cleanup error for task {task_id}: {exc}", flush=True)
+
+
+def _min_free_disk_bytes() -> int:
+    """Low-disk guard threshold in bytes (0 disables the guard).
+
+    Read from BLUEPRINT_RUNNER_MIN_DISK_BYTES. When free space on the workspace
+    filesystem drops below this, the agent poll loop stops claiming new tasks so
+    a nearly-full disk fails fast instead of starting work that will die mid-run.
+    """
+    raw = os.environ.get("BLUEPRINT_RUNNER_MIN_DISK_BYTES", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _disk_below_min(root: str | None, min_free_bytes: int) -> bool:
+    """True iff *root*'s free space is known and below *min_free_bytes* (>0)."""
+    if min_free_bytes <= 0:
+        return False
+    free = _disk_free_bytes(root)
+    return free is not None and free < min_free_bytes
 
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -533,6 +697,23 @@ _RUNNER_HEARTBEAT_INTERVAL = 30.0
 # v1 cap on durable artifact uploads. The runner skips (does not fail) any run
 # whose artifact dir exceeds this; the backend mirrors the cap and 413s.
 _RUNNER_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB
+
+# Durable-retry policy for TERMINAL compute-job reports and artifact uploads.
+# These POSTs carry the measured result_metrics / final exec_status and the run's
+# debugging artifacts; a single transient network blip at job end would silently
+# lose them, turning a job that actually ran into a spurious
+# compute_unmeasured_criterion. Terminal reports and uploads therefore retry with
+# capped exponential backoff. Interim "running" heartbeats are NOT retried — the
+# next heartbeat re-sends them.
+_REPORT_TERMINAL_STATUSES = frozenset({"succeeded", "failed"})
+_REPORT_MAX_RETRIES = 4
+_REPORT_RETRY_BASE_SLEEP = 2.0
+_REPORT_RETRY_MAX_SLEEP = 30.0
+
+
+def _report_retry_sleep(attempt: int) -> float:
+    """Capped exponential backoff (seconds) for the terminal-report retry loop."""
+    return min(_REPORT_RETRY_BASE_SLEEP * (2 ** attempt), _REPORT_RETRY_MAX_SLEEP)
 
 
 class _BoundedDedupLog:
@@ -732,6 +913,7 @@ def _reap_loop(
     thread (a dead reaper would leak capacity permits forever); the ``main()``
     supervisor makes an actually-dead thread fatal.
     """
+    _cleanup_tick = 0
     while not _shutdown_event.is_set():
         try:
             now = time.monotonic()
@@ -756,6 +938,10 @@ def _reap_loop(
                         else:
                             telemetry.record_failure()
                     print(f"[DONE] task_id={tid} exit_code={code}", flush=True)
+                    # Reap the per-task workspace so stale dirs don't accumulate
+                    # and silently exhaust the runner's disk (unlike compute-job
+                    # scratch dirs, these are never otherwise removed).
+                    _cleanup_agent_workspace(tid)
 
                 # Wall-clock deadline: an agent that never exits (wedged tool, runaway
                 # loop) must not hold a capacity permit forever. Mirror the compute
@@ -793,6 +979,17 @@ def _reap_loop(
                 _release_capacity(capacity)
                 if telemetry is not None:
                     telemetry.record_failure()
+                # Terminated overdue agent is done too — reap its workspace.
+                _cleanup_agent_workspace(tid)
+
+            # Periodic stale workspace cleanup (every ~60 s).
+            _cleanup_tick += 1
+            if _cleanup_tick % 30 == 0:
+                with lock:
+                    active_ids = set(active_tasks.keys())
+                removed = _cleanup_stale_workspaces(active_ids)
+                if removed:
+                    print(f"[runner] cleaned up {removed} stale workspace(s)", flush=True)
         except Exception as exc:  # noqa: BLE001 — never let the reaper thread die silently
             print(f"[runner] reap loop error (continuing): {exc}", flush=True)
         time.sleep(2)
@@ -812,6 +1009,7 @@ def _heartbeat_loop(
     telemetry: "_TelemetryState | None" = None,
     workspace_root: str | None = None,
     max_auth_failures: int = 0,
+    max_network_failures: int = 0,
     caps: "iso.Capabilities | None" = None,
     agent_image: str | None = None,
 ) -> None:
@@ -822,7 +1020,12 @@ def _heartbeat_loop(
     # is enrolled from the browser, which cannot know the host's name, so this is
     # the only place the hostname is populated).
     hostname = _hostname()
+    # Runner version is stable for the process lifetime — resolve it once (a git
+    # describe shell-out) and send it on every heartbeat so the fleet view can show
+    # which build each device runs. Best-effort: None when git/the repo is absent.
+    version = _runner_version()
     consecutive_401 = 0
+    consecutive_network_failures = 0
     while not _shutdown_event.is_set():
         try:
             with lock:
@@ -844,9 +1047,10 @@ def _heartbeat_loop(
             # If NEITHER leg is satisfiable, agent_available=False and the
             # orchestrator stops pinning agent tasks here. When agent_image is None
             # this collapses to the prior bwrap-only behavior (no regression).
+            agent_binary_present = _locate_agent_binary() is not None
             bwrap_agent_ok = (
                 agent_sandbox_ok
-                and _locate_agent_binary() is not None
+                and agent_binary_present
                 and _node_runtime_ok()
             )
             # A docker-only box (docker+image WITHOUT bwrap) advertises
@@ -876,12 +1080,32 @@ def _heartbeat_loop(
             last_success_at, consecutive_failures = (
                 telemetry.snapshot() if telemetry is not None else (None, 0)
             )
+            # Isolation-backend inventory + selected backends for per-device
+            # observability. Gated on caps: an old caller may pass caps=None, in
+            # which case these serialize as null (the schema tolerates them absent).
+            if caps is not None:
+                isolation_backends = iso.capabilities_inventory(caps)
+                agent_backend = iso.decide_agent_backend(
+                    caps, agent_binary_present=agent_binary_present,
+                    agent_image=agent_image,
+                )
+                compute_backend = iso.decide_compute_backend(
+                    caps, has_image=agent_image is not None
+                )
+            else:
+                isolation_backends = None
+                agent_backend = None
+                compute_backend = None
             body = {
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
                 "agent_available": agent_available,
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
+                "version": version,
+                "isolation_backends": isolation_backends,
+                "agent_backend": agent_backend,
+                "compute_backend": compute_backend,
                 # Health telemetry consumed by the orchestrator to spot a runner
                 # that is failing every job / running low on disk / idle-GPU.
                 "last_successful_job_at": last_success_at,
@@ -893,12 +1117,31 @@ def _heartbeat_loop(
             status, _ = _post(url, token, body)
             if status in (200, 204):
                 consecutive_401 = 0
+                consecutive_network_failures = 0
+                _write_status_json(
+                    runner_id=hostname,
+                    last_heartbeat_status="ok",
+                    active_task_ids=task_ids,
+                    active_compute_job_ids=compute_job_ids,
+                    caps=caps,
+                    agent_backend=agent_backend,
+                    compute_backend=compute_backend,
+                )
             elif status == 401:
                 consecutive_401 += 1
                 print(
                     f"[runner] heartbeat 401 ({consecutive_401} consecutive) — token "
                     "rejected; will re-arm if the row was merely inactive.",
                     flush=True,
+                )
+                _write_status_json(
+                    runner_id=hostname,
+                    last_heartbeat_status=f"error: 401 ({consecutive_401} consecutive)",
+                    active_task_ids=task_ids,
+                    active_compute_job_ids=compute_job_ids,
+                    caps=caps,
+                    agent_backend=agent_backend,
+                    compute_backend=compute_backend,
                 )
                 if max_auth_failures and consecutive_401 >= max_auth_failures:
                     _die(
@@ -908,10 +1151,41 @@ def _heartbeat_loop(
                     )
             else:
                 print(f"[runner] heartbeat warning: HTTP {status}", flush=True)
+                _write_status_json(
+                    runner_id=hostname,
+                    last_heartbeat_status=f"error: HTTP {status}",
+                    active_task_ids=task_ids,
+                    active_compute_job_ids=compute_job_ids,
+                    caps=caps,
+                    agent_backend=agent_backend,
+                    compute_backend=compute_backend,
+                )
         except Exception as exc:
-            print(f"[runner] heartbeat error: {exc}", flush=True)
-        # Sleep in 1s increments so shutdown propagates quickly
-        for _ in range(30):
+            consecutive_network_failures += 1
+            print(
+                f"[runner] heartbeat error ({consecutive_network_failures} consecutive): {exc}",
+                flush=True,
+            )
+            _write_status_json(
+                runner_id=hostname,
+                last_heartbeat_status=f"error: {exc}",
+                active_task_ids=[],
+                active_compute_job_ids=[],
+                caps=caps,
+                agent_backend=agent_backend,
+                compute_backend=compute_backend,
+            )
+            if max_network_failures and consecutive_network_failures >= max_network_failures:
+                _die(
+                    f"heartbeat failed with network error for {consecutive_network_failures} "
+                    "consecutive attempts — network appears wedged. Exiting non-zero so "
+                    "the operator/supervisor notices instead of looping silently."
+                )
+        # Sleep in 1s increments so shutdown propagates quickly; add per-runner
+        # jitter (±20 % of the 30 s interval) to prevent thundering-herd on restart.
+        jitter = random.uniform(-6, 6)
+        interval = int(30 + jitter)
+        for _ in range(max(1, interval)):
             if _shutdown_event.is_set():
                 break
             time.sleep(1)
@@ -1129,7 +1403,15 @@ def _report_compute_job(
     result_metrics: dict | None = None,
     command_log: dict | None = None,
 ) -> bool:
-    """POST a status report for a compute job. Returns cancel_requested."""
+    """POST a status report for a compute job. Returns cancel_requested.
+
+    Terminal reports (``succeeded``/``failed``) carry the measured
+    ``result_metrics`` and the job's final status, so a single transient network
+    failure on this POST would silently lose the metric and spuriously mark the
+    criterion unmeasured. Terminal reports therefore retry transient failures
+    (network errors, 429, and 5xx) with capped exponential backoff; interim
+    ``running`` heartbeats are sent once, since the next heartbeat re-sends them.
+    """
     url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/report"
     body: dict = {"exec_status": exec_status}
     if exit_code is not None:
@@ -1138,14 +1420,35 @@ def _report_compute_job(
         body["result_metrics"] = result_metrics
     if command_log is not None:
         body["command_log"] = command_log
-    try:
-        status, resp = _post(url, token, body)
-        if status == 404:
-            return True  # job gone, treat as cancel
-        if isinstance(resp, dict):
-            return bool(resp.get("cancel_requested", False))
-    except Exception as exc:
-        print(f"[compute] report error for job {job_id}: {exc}", flush=True)
+
+    durable = exec_status in _REPORT_TERMINAL_STATUSES
+    max_attempts = (_REPORT_MAX_RETRIES + 1) if durable else 1
+    for attempt in range(max_attempts):
+        last = attempt == max_attempts - 1
+        try:
+            status, resp = _post(url, token, body)
+            if status == 404:
+                return True  # job gone, treat as cancel
+            # 2xx (accepted) or a permanent 4xx, or no retries left: settle now.
+            if 200 <= status < 300 or last or not (status == 429 or status >= 500):
+                if isinstance(resp, dict):
+                    return bool(resp.get("cancel_requested", False))
+                return False
+            print(
+                f"[compute] report HTTP {status} for job {job_id}; "
+                f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
+                flush=True,
+            )
+        except Exception as exc:
+            if last:
+                print(f"[compute] report error for job {job_id}: {exc}", flush=True)
+                return False
+            print(
+                f"[compute] report error for job {job_id}: {exc}; "
+                f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
+                flush=True,
+            )
+        time.sleep(_report_retry_sleep(attempt))
     return False
 
 
@@ -1238,33 +1541,63 @@ def _upload_artifact(orchestrator_url: str, token: str, job_id: str, artifact_di
             file_content_type="application/gzip",
         )
         url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/artifact"
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": content_type,
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                if resp.status in (200, 201, 204):
+        # Retry transient failures (network errors, 5xx) with the same capped
+        # backoff as the terminal report — a blip here otherwise drops the run's
+        # debugging artifacts even though the job succeeded.
+        for attempt in range(_REPORT_MAX_RETRIES + 1):
+            last = attempt == _REPORT_MAX_RETRIES
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": content_type,
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    if resp.status in (200, 201, 204):
+                        print(
+                            f"[compute] uploaded {file_count} artifact file(s) "
+                            f"({total_bytes} bytes) for job {job_id}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[compute] artifact upload warning: HTTP {resp.status} for job {job_id}",
+                            flush=True,
+                        )
+                return
+            except urllib.error.HTTPError as exc:
+                if exc.code >= 500 and not last:
                     print(
-                        f"[compute] uploaded {file_count} artifact file(s) "
-                        f"({total_bytes} bytes) for job {job_id}",
+                        f"[compute] artifact upload HTTP {exc.code} for job {job_id}; "
+                        f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
                         flush=True,
                     )
-                else:
+                    time.sleep(_report_retry_sleep(attempt))
+                    continue
+                print(
+                    f"[compute] artifact upload failed (HTTP {exc.code}) for job {job_id}",
+                    flush=True,
+                )
+                return
+            except Exception as exc:
+                if not last:
                     print(
-                        f"[compute] artifact upload warning: HTTP {resp.status} for job {job_id}",
+                        f"[compute] artifact upload network error for job {job_id}: {exc}; "
+                        f"retry {attempt + 1}/{_REPORT_MAX_RETRIES}",
                         flush=True,
                     )
-        except urllib.error.HTTPError as exc:
-            print(f"[compute] artifact upload failed (HTTP {exc.code}) for job {job_id}", flush=True)
-        except Exception as exc:
-            print(f"[compute] artifact upload network error for job {job_id}: {exc}", flush=True)
+                    time.sleep(_report_retry_sleep(attempt))
+                    continue
+                print(
+                    f"[compute] artifact upload network error for job {job_id}: {exc}",
+                    flush=True,
+                )
+                return
     except Exception as exc:  # noqa: BLE001 — upload is strictly best-effort
         print(f"[compute] artifact upload unexpected error for job {job_id}: {exc}", flush=True)
 
@@ -1793,6 +2126,36 @@ def _workspace_writable(root: str) -> bool:
         return False
 
 
+def _cleanup_stale_workspaces(active_task_ids: set, max_age_seconds: float = 300) -> int:
+    """Remove per-task workspace dirs that are not in *active_task_ids* and older than *max_age_seconds*."""
+    root = _workspace_root()
+    if not os.path.isdir(root):
+        return 0
+    active_dirs: set[str] = set()
+    for tid in active_task_ids:
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in tid)
+        if safe:
+            active_dirs.add(safe)
+    now = time.time()
+    removed = 0
+    try:
+        for name in os.listdir(root):
+            if name in active_dirs:
+                continue
+            dirpath = os.path.join(root, name)
+            if not os.path.isdir(dirpath):
+                continue
+            try:
+                if (now - os.stat(dirpath).st_mtime) >= max_age_seconds:
+                    shutil.rmtree(dirpath, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return removed
+
+
 def _compute_backend_summary(caps: "iso.Capabilities") -> str:
     """Human summary of which compute backends this host can build."""
     parts: list[str] = []
@@ -1870,6 +2233,17 @@ def _preflight(
                 "agent_available": claimable[iso.CLASS_AGENT],
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
+                "version": _runner_version(),
+                # Isolation-backend inventory + selected backends so `--check`
+                # populates the fleet view the same way the running heartbeat does.
+                "isolation_backends": iso.capabilities_inventory(caps),
+                "agent_backend": iso.decide_agent_backend(
+                    caps, agent_binary_present=agent_binary is not None,
+                    agent_image=agent_image,
+                ),
+                "compute_backend": iso.decide_compute_backend(
+                    caps, has_image=agent_image is not None
+                ),
                 **gpu_caps,
             },
         )
@@ -2146,22 +2520,36 @@ def main() -> None:
         "BLUEPRINT_RUNNER_AGENT_MAX_SECONDS", 14400.0, minimum=60.0
     )
     max_auth_failures = _env_int("BLUEPRINT_RUNNER_MAX_AUTH_FAILURES", 20, minimum=0)
+    max_network_failures = _env_int("BLUEPRINT_RUNNER_MAX_NETWORK_FAILURES", 20, minimum=0)
 
-    # Prod agent container image (agent/Dockerfile). When set AND docker is usable,
-    # read-only agent task types run in this image (prod-parity, non-root) instead
-    # of bwrap. Empty → None → bwrap-only (unchanged). BLUEPRINT_AGENT_BACKEND=bwrap
-    # is an operator override that force-disables the docker agent backend.
+    # Prod agent container image (agent/Dockerfile). The default agent backend is bwrap
+    # (host toolchain); the docker backend is used only on an explicit opt-in:
+    #   BLUEPRINT_AGENT_BACKEND=docker   explicit docker selection
+    #   BLUEPRINT_AGENT_BACKEND=bwrap    force bwrap (override even if image is set)
+    #   BLUEPRINT_AGENT_BACKEND=auto     bwrap-first; docker only if image is set by
+    #                                    the operator (e.g. direct BLUEPRINT_AGENT_IMAGE
+    #                                    env, not auto-injected by blueprint-runner)
+    # blueprint-runner no longer auto-injects BLUEPRINT_AGENT_IMAGE — the launcher
+    # requires --docker-agent or BLUEPRINT_AGENT_BACKEND=docker to enable the docker
+    # path, so this env var is only present when the operator explicitly chose docker.
     agent_image = os.environ.get("BLUEPRINT_AGENT_IMAGE", "").strip() or None
     agent_backend_pref = (
         os.environ.get("BLUEPRINT_AGENT_BACKEND", "").strip().lower() or "auto"
     )
-    if agent_backend_pref == "bwrap" and agent_image is not None:
+    if agent_backend_pref == "bwrap":
+        if agent_image is not None:
+            print(
+                "[runner] BLUEPRINT_AGENT_BACKEND=bwrap — ignoring BLUEPRINT_AGENT_IMAGE "
+                "and using the host bwrap agent backend.",
+                flush=True,
+            )
+        agent_image = None
+    elif agent_backend_pref == "docker":
         print(
-            "[runner] BLUEPRINT_AGENT_BACKEND=bwrap — ignoring BLUEPRINT_AGENT_IMAGE "
-            "and using the host bwrap agent backend.",
+            "[runner] BLUEPRINT_AGENT_BACKEND=docker — docker agent path enabled.",
             flush=True,
         )
-        agent_image = None
+        # agent_image kept as-is; the fail-closed image-present check below applies.
 
     caps = _get_capabilities()
 
@@ -2317,6 +2705,7 @@ def main() -> None:
             "telemetry": telemetry,
             "workspace_root": workspace_root,
             "max_auth_failures": max_auth_failures,
+            "max_network_failures": max_network_failures,
             # Docker advertisement leg: advertise (read-only) agent work on a
             # docker+image box even without bwrap.
             "caps": caps,
@@ -2356,6 +2745,7 @@ def main() -> None:
 
     poll_interval = base_poll_interval
     next_task_url = f"{orchestrator_url}/api/runner/next-task"
+    min_free_disk = _min_free_disk_bytes()
 
     # An agent sandbox exists iff bwrap can be built OR a docker+image backend is
     # available. When agent_image is None this is exactly caps.bwrap_ok (unchanged).
@@ -2383,6 +2773,19 @@ def main() -> None:
                 continue
 
             if not _try_acquire_capacity(agent_capacity):
+                time.sleep(poll_interval)
+                continue
+
+            # Low-disk guard: don't claim new agent work when the workspace
+            # filesystem is nearly full — starting a task that dies mid-run wastes
+            # a claim and can wedge the disk further. Disabled by default (0).
+            if _disk_below_min(workspace_root, min_free_disk):
+                _release_capacity(agent_capacity)
+                print(
+                    f"[runner] low disk on {workspace_root} "
+                    f"(< {min_free_disk} bytes free) — not claiming agent work this cycle.",
+                    flush=True,
+                )
                 time.sleep(poll_interval)
                 continue
 

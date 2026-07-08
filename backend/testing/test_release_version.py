@@ -290,6 +290,7 @@ async def test_merged_window_ignores_post_terminal_updates(db_session):
     assert agg == {
         "proven": 0,
         "satisfied_unproven": 0,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 0,
         "undeclared": 0,
         "merged_unverified_degraded": 0,
@@ -650,6 +651,7 @@ async def test_acceptance_aggregate_classifies_each_bucket(db_session):
     assert agg == {
         "proven": 1,
         "satisfied_unproven": 1,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 1,
         "undeclared": 1,
         "merged_unverified_degraded": 1,
@@ -696,6 +698,7 @@ async def test_acceptance_aggregate_excludes_unlanded_and_non_completed(db_sessi
     assert agg == {
         "proven": 0,
         "satisfied_unproven": 0,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 1,
         "undeclared": 0,
         "merged_unverified_degraded": 0,
@@ -754,6 +757,7 @@ async def test_acceptance_aggregate_respects_since_window(db_session):
     assert agg == {
         "proven": 1,
         "satisfied_unproven": 0,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 0,
         "undeclared": 0,
         "merged_unverified_degraded": 0,
@@ -774,6 +778,7 @@ async def test_acceptance_aggregate_empty_window_zeros(db_session):
     assert agg == {
         "proven": 0,
         "satisfied_unproven": 0,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 0,
         "undeclared": 0,
         "merged_unverified_degraded": 0,
@@ -803,6 +808,7 @@ async def test_acceptance_aggregate_malformed_verdict_is_failsafe(db_session):
     assert agg == {
         "proven": 0,
         "satisfied_unproven": 0,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 0,
         "undeclared": 0,
         "merged_unverified_degraded": 0,
@@ -1325,6 +1331,7 @@ def test_to_phase_block_omits_acceptance_aggregate():
         "total": 6,
         "proven": 3,
         "satisfied_unproven": 1,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 1,
         "undeclared": 0,
         "merged_unverified_degraded": 1,

@@ -298,6 +298,72 @@ def reset_max_plan_pool():
     _account_by_id.update(orig_by_id)
 
 
+# ── Degraded-runner dispatch deprioritization ─────────────────────────────────
+
+
+def test_degraded_runner_deprioritized_in_dispatch():
+    """A degraded runner (consecutive_job_failures >= threshold) is sorted last
+    in _select_eligible_runner so healthy runners are always preferred.
+
+    The degraded runner must still appear as a fallback: when it is the only
+    candidate, it must be selected (preserving recovery opportunity).
+
+    Pre-fix: _load_active_runners_cache never loaded consecutive_job_failures,
+    so all runners looked equally healthy to the dispatcher.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    caps_all = {"task_types": "all"}
+
+    healthy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    degraded = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=_RUNNER_DEGRADED_FAILURE_THRESHOLD,
+    )
+
+    cache = {project_id: [degraded, healthy]}
+
+    # When both are available, the healthy runner wins.
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="create",
+        accelerator=None,
+        runner_pins_this_cycle={},
+    )
+    assert selected is not None
+    assert selected.id == healthy.id, (
+        "healthy runner must be preferred over degraded runner"
+    )
+
+    # When only the degraded runner is present, it must still be selected
+    # so it can receive a job and reset its failure streak.
+    cache_degraded_only = {project_id: [degraded]}
+    selected_fallback = _select_eligible_runner(
+        active_runners_cache=cache_degraded_only,
+        project_id=project_id,
+        task_type="create",
+        accelerator=None,
+        runner_pins_this_cycle={},
+    )
+    assert selected_fallback is not None
+    assert selected_fallback.id == degraded.id, (
+        "degraded runner must still be selected when it is the only candidate"
+    )
+
+
 # ── Fixture: reset circuit breaker state for a project ───────────────────────
 
 
@@ -7136,13 +7202,15 @@ class TestCrossBaseCodeDependencyPolicy:
         dependent = self._dependent("refactor", ["backend/app/new_structure.py"])
         assert is_genuine_code_dependency(dependent, dep) is False
 
-    def test_transforming_dependent_modify_dependent_without_files_is_genuine(self):
+    def test_transforming_dependent_fix_dependent_without_files_is_genuine(self):
         from app.orchestrator_health import is_genuine_code_dependency
 
-        # A modify dependent with no declared files against a code-producing dep
-        # cannot disprove overlap, so it's treated as genuine (hold rather than risk).
+        # A fix dependent with no declared files against a code-producing dep
+        # cannot disprove overlap, so it's treated as genuine (hold rather than
+        # risk). ("modify" was retired from the task-type vocabulary; fix and
+        # refactor are the output-transforming types.)
         dep = self._dep("create", ["backend/app/foo.py"])
-        dependent = self._dependent("modify", [])  # no files declared
+        dependent = self._dependent("fix", [])  # no files declared
         assert is_genuine_code_dependency(dependent, dep) is True
 
     def test_transforming_dependent_fix_with_dependency_having_no_files_is_genuine(
@@ -9745,3 +9813,61 @@ class TestRunnerDispatchExtractionContract:
         )
         assert orch._runner_active_work_count(busy) == 3
         assert rd._runner_active_work_count(busy) == 3
+
+
+@pytest.mark.asyncio
+async def test_held_require_local_compute_alerts_before_timeout(db_session, mocker):
+    """A compute_experiment held for require_local longer than the early-warning
+    threshold emits a WARNING alert before the 6h timeout while the task stays QUEUED.
+    A second sweep pass must not create a duplicate (dedup by title + task_id).
+    """
+    from sqlmodel import select
+    from app.models import Alert, AlertSeverity
+    from app.orchestrator_runner_dispatch import (
+        _fail_stale_local_runner_holds,
+        _LOCAL_RUNNER_HOLD_ALERT_SECONDS,
+    )
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="RequireLocal Compute Hold Alert", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Stamp the hold well past the early-warning threshold but under the 6h timeout.
+    held_since = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS + 60)
+    task = make_task(
+        project_id=project.id,
+        title="stranded compute",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_local_runner_since": held_since.isoformat()},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    failed_count = await _fail_stale_local_runner_holds(db_session)
+
+    # Task must remain QUEUED — the 6h timeout has not elapsed.
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    assert failed_count == 0
+
+    # A WARNING alert must have been created for the stranded hold.
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 early-warning alert, got {len(alerts)}"
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "local runner" in alert.title.lower()
+
+    # Re-running the sweep must not create a duplicate (title+task_id dedup).
+    await _fail_stale_local_runner_holds(db_session)
+    alerts2 = (
+        await db_session.execute(select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"

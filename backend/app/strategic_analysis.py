@@ -8,8 +8,9 @@ from datetime import timedelta
 from app.direction_metrics import (
     _entry_generalized_successes,
     _entry_generalized_terminal_outcomes,
+    canonical_cost_per_merged_pr,
 )
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import verified_merged_count, PR_INELIGIBLE_TASK_TYPES
 from app.time_utils import _utcnow
 
 # Directions whose cost_per_merged_pr exceeds median * multiplier are flagged
@@ -96,9 +97,6 @@ def _build_retired_directions_summary(
         total_merged = sum(h.get("prs_merged", 0) for h in history) + (
             agg.get("total_prs_merged") or 0
         )
-        verified_total_merged = sum(verified_merged_count(h) for h in history) + (
-            agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
-        )
         total_rejected = sum(h.get("prs_rejected", 0) for h in history) + (
             agg.get("total_prs_rejected") or 0
         )
@@ -116,15 +114,23 @@ def _build_retired_directions_summary(
         )
 
         # Estimated cost per merge — prefer recorded spend; fall back to proxy for
-        # legacy entries that predate exact attribution.
+        # legacy entries that predate exact attribution. Include evicted cycles
+        # folded into history_aggregate so lifetime cost is not truncated at the
+        # 10-cycle eviction window.
+        try:
+            agg_cost = max(
+                0.0, float(agg.get("total_estimated_cost_usd") or 0.0)
+            )
+        except (TypeError, ValueError):
+            agg_cost = 0.0
         estimated_cost_usd = round(
-            sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history), 2
+            sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history) + agg_cost, 2
         )
-        cost_per_merge = (
-            round(estimated_cost_usd / verified_total_merged, 2)
-            if verified_total_merged > 0 and estimated_cost_usd > 0
-            else None
-        )
+        # Use canonical_cost_per_merged_pr to enforce population consistency:
+        # denominator must be ALL merged PRs (raw total_merged), not verified-only.
+        cost_per_merge = canonical_cost_per_merged_pr(
+            estimated_cost_usd, total_merged
+        ) if estimated_cost_usd > 0 else None
 
         # Top failed approaches from research_context
         ctx = d.get("research_context", "")
@@ -321,12 +327,6 @@ def _build_outcome_evaluation(
         # outcome["merged"], difficulty, and the downstream selection trims.
         raw_merged = sum(h.get("prs_merged", 0) for h in window_history)
         verified_merged = sum(verified_merged_count(h) for h in window_history)
-        # For CPM, count only autonomous merges; legacy entries without the field
-        # are treated as all-autonomous (conservative fallback for old data).
-        autonomous_merged = sum(
-            h.get("autonomous_prs_merged", h.get("prs_merged", 0))
-            for h in window_history
-        )
         rejected = sum(h.get("prs_rejected", 0) for h in window_history)
         failed = sum(h.get("tasks_failed", 0) for h in window_history)
         failed_infra = sum(h.get("tasks_failed_infra", 0) for h in window_history)
@@ -419,10 +419,9 @@ def _build_outcome_evaluation(
         cost_budget_usd = d.get("cost_budget_usd")
         if estimated_cost_usd > 0:
             outcome["estimated_cost_usd"] = estimated_cost_usd
-            if autonomous_merged > 0:
-                outcome["cost_per_merged_pr"] = round(
-                    estimated_cost_usd / autonomous_merged, 2
-                )
+            cpm = canonical_cost_per_merged_pr(estimated_cost_usd, raw_merged)
+            if cpm is not None:
+                outcome["cost_per_merged_pr"] = cpm
         if isinstance(cost_budget_usd, (int, float)) and cost_budget_usd > 0:
             outcome["cost_budget_usd"] = cost_budget_usd
             if estimated_cost_usd > cost_budget_usd:
@@ -620,7 +619,38 @@ def _build_outcome_evaluation(
     total_cycles = sum(d["cycles"] for d in direction_outcomes)
     total_merged = sum(d["merged"] for d in direction_outcomes)
     total_failed = sum(d["failed"] for d in direction_outcomes)
-    success_rate = round(total_merged / max(total_merged + total_failed, 1), 2)
+    # Count only PR-eligible failed tasks in the success_rate denominator.
+    # PR-ineligible tasks (read-only audits, knowledge docs, etc.) can't produce
+    # merges, so they must not deflate success_rate when they fail.
+    total_failed_pr_ineligible = 0
+    for d in directions:
+        if d.get("status", "active") not in ("active", "expired", "paused"):
+            continue
+        history = d.get("research_history", [])
+        if window_from:
+            window_history = [h for h in history if (h.get("timestamp") or "") >= window_from]
+        else:
+            window_history = list(history)
+        for entry in window_history:
+            type_breakdown = entry.get("type_breakdown") or {}
+            for ttype in PR_INELIGIBLE_TASK_TYPES:
+                if ttype in type_breakdown:
+                    total_failed_pr_ineligible += (type_breakdown[ttype] or {}).get("failed", 0) or 0
+    # total_failed derives from each cycle's ``tasks_failed`` field, which counts
+    # only TaskStatus.FAILED (direction_outcomes.py). type_breakdown[*]['failed']
+    # is written via _counts_as_failure, which counts FAILED *plus* genuinely-
+    # cancelled tasks. The two counts therefore use DIFFERENT failure predicates
+    # over the same tasks, so total_failed_pr_ineligible can exceed the PR-
+    # ineligible contribution to total_failed by the number of genuinely-cancelled
+    # PR-ineligible tasks. Clamp the eligible failure count at zero so the
+    # subtraction can never go negative (which would otherwise drive success_rate
+    # above 1.0). Also clamp the emitted rate at 1.0 as belt-and-braces so an
+    # over-subtraction can never publish an impossible >1.0 success_rate into
+    # strategic outcome evaluation.
+    total_failed_pr_eligible = max(total_failed - total_failed_pr_ineligible, 0)
+    success_rate = round(
+        min(total_merged / max(total_merged + total_failed_pr_eligible, 1), 1.0), 2
+    )
     # Generalized success rate — code merges PLUS non-code evaluation successes.
     # Falls back to prs_merged for directions without the new field so legacy
     # data produces the same rate as the PR-based metric.

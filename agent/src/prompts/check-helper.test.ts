@@ -56,6 +56,10 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).toContain('touches agent/');
     expect(script).toContain('touches backend/');
     expect(script).toContain('admin-ui playwright chromium');
+    // The admin-ui typecheck runs on the agent VM (safe, no OOM); vite bundle
+    // is deferred to CI where it has room to breathe.
+    expect(script).toContain('run "admin-ui typecheck" bash -c \'cd admin-ui && npm run typecheck 2>&1\'');
+    expect(script).not.toContain('npm run build 2>&1'); // no vite build on agent VM
     // The agent vitest suite runs on every ./check (not behind `test`) for
     // agent-touching changes, routed through `run` so a failure lands in
     // FAILED and ./check fails closed.
@@ -1193,24 +1197,68 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     );
   });
 
-  it('the impacted-test gate is disabled at runtime off the promotion target (non-merge branch)', async () => {
+  it('the impacted-test gate always fires for the self-repo (no constant-false guard regardless of branch)', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
-    // A normal task branch: base != promotionTarget -> the merge-time gate's
-    // second operand compiles to "0", so neither the standalone run nor the
-    // impacted block executes (same guarding as the pre-existing smoke run).
+    // Self-repo with baseBranch !== promotionTarget: shouldRunBackendMergeGate
+    // returns true for isBlueprintSelfRepo, so the gate compiles to "1" — never "0".
     writeCheckHelper({
       taskId: 'impacted-off',
       workBranch: 'blueprint/impacted-off',
       baseBranch: 'main',
       owner: 'HenryHamster',
       repo: 'BlueprintAIStudio',
-      testsOnMainBranch: true,
+      testsOnMainBranch: false,
       promotionTarget: 'automain',
     });
     const script = capturedScripts['/tmp/workspace/.check-task'];
     expect(script).toBeDefined();
-    // The gate's generation-time operand is "0" -> the whole block is guarded off.
-    expect(script).toContain('[ "$WITH_TESTS" = "1" ] && [ "0" = "1" ]');
+    // Gate compiles to "1" — self-repo always gets the merge-time gate.
+    expect(script).toContain('[ "$WITH_TESTS" = "1" ] && [ "1" = "1" ]');
+    expect(script).not.toContain('[ "$WITH_TESTS" = "1" ] && [ "0" = "1" ]');
+  });
+
+  it('emits both backend test gates (smoke + impacted) on self-repo automain task PR (baseBranch=automain, promotionTarget=main)', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    // Self-repo automain task: baseBranch='automain', promotionTarget='main' — the
+    // old inline ternary evaluated to "0" so the gate never fired on these PRs.
+    // shouldRunBackendMergeGate returns true for isBlueprintSelfRepo regardless
+    // of the branch relationship, so the gate now compiles to "1".
+    writeCheckHelper({
+      taskId: 'impacted-automain',
+      workBranch: 'blueprint/task-automain',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: false,
+      promotionTarget: 'main',
+    });
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+    // Gate compiles to "1" — not a constant-false guard.
+    expect(script).toContain('[ "$WITH_TESTS" = "1" ] && [ "1" = "1" ]');
+    expect(script).not.toContain('[ "$WITH_TESTS" = "1" ] && [ "0" = "1" ]');
+    // Standalone smoke run is present.
+    expect(script).toContain('run "backend pytest" bash -c \'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200\'');
+    // Impacted-test gate is present.
+    expect(script).toContain('impacted-test merge-time gate');
+    expect(script).toContain('python3 backend/testing/impacted_tests.py');
+  });
+
+  it('generated ./check with self-repo automain+promotionTarget=main passes `bash -n` syntax check', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'impacted-automain-bashn',
+      workBranch: 'blueprint/task-automain-bashn',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: false,
+      promotionTarget: 'main',
+    });
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+    const { execSync } = await import('child_process');
+    execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
 
   it('generated ./check with the impacted-test gate passes `bash -n` syntax check', async () => {
@@ -1227,6 +1275,28 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     expect(script).toBeDefined();
     const { execSync } = await import('child_process');
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
+  });
+
+  it('resolver crash is surfaced as a gate failure — not silently swallowed', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'impacted-crash',
+      workBranch: 'blueprint/impacted-crash',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: true,
+    });
+    const script = capturedScripts['/tmp/workspace/.check-task'];
+    expect(script).toBeDefined();
+    // The old silent-swallow pattern must be gone.
+    expect(script).not.toContain('python3 backend/testing/impacted_tests.py 2>/dev/null || true');
+    // Crash detection: capture exit code and surface non-zero exits as failures.
+    expect(script).toContain('_it_rc=$?');
+    expect(script).toContain('if [ "$_it_rc" -ne 0 ]');
+    expect(script).toContain('FAILED+=("impacted-test resolver crash")');
+    // A crash prints stderr content so operators can diagnose.
+    expect(script).toContain('cat "$_it_stderr_f"');
   });
 });
 

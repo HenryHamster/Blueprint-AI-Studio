@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.direction_outcomes import (
+    _apply_cochange_to_doc,
     _counts_as_failure,
     _is_cascade_cancelled,
     _is_non_genuine_cancelled,
@@ -986,9 +987,10 @@ async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
 
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
-    # Even with tasks_created=0, the merge still counts in verified_prs_merged.
+    # Even with a single task_created, the merge still counts in verified_prs_merged.
+    # tasks_created reflects all child tasks created (1 in this case).
     assert entry["verified_prs_merged"] == 1
-    assert entry["tasks_created"] == 0
+    assert entry["tasks_created"] == 1
 
 
 def test_verified_merged_count_helper():
@@ -2204,6 +2206,72 @@ async def test_scope_breakdown_avg_expansion_ratio(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_avg_expansion_ratio_merged_counts_only_merged(db_session: AsyncSession):
+    """avg_expansion_ratio_merged must reflect only merged tasks, not all completed.
+
+    A merged task (pr_merged=True) and a non-merged completed task (no pr_merged,
+    i.e. a rejected/no-op completion) with different expansion ratios must produce:
+      - avg_expansion_ratio_merged == mean over the merged task only
+      - avg_expansion_ratio (general) == mean over both completed tasks
+    """
+    direction_id = "d-expand-merged-only"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    # Merged task: 1 related file, 4 changed files → ratio 4.0
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "scope": "small",
+            "related_files": ["a.py"],
+            "_pr_changed_files": ["a.py", "b.py", "c.py", "d.py"],
+        },
+        payloads=[{"type": "create"}],
+        title="merged-task",
+    )
+    # Non-merged completed task (rejected/no-op): 1 related file, 2 changed → ratio 2.0
+    # pr_merged absent → is_merged_completion returns False → must NOT count in _merged avg
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "scope": "small",
+            "related_files": ["x.py"],
+            "_pr_changed_files": ["x.py", "y.py"],
+        },
+        payloads=[{"type": "create"}],
+        title="non-merged-task",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    # _merged only counts the merged task (ratio 4.0)
+    assert sb["small"]["avg_expansion_ratio_merged"] == 4.0
+    # general avg_expansion_ratio covers both completed tasks: (4.0 + 2.0) / 2 = 3.0
+    assert sb["small"]["avg_expansion_ratio"] == 3.0
+
+
+@pytest.mark.asyncio
 async def test_expansion_ratio_excludes_test_files(db_session: AsyncSession):
     """Test files in _pr_changed_files must not inflate the expansion ratio.
 
@@ -2718,6 +2786,49 @@ def test_cochange_index_caps_total_files():
     assert len(idx) <= 200
 
 
+def test_apply_cochange_idempotent_same_pr_not_double_counted():
+    """Calling _apply_cochange_to_doc twice with the same pr_key leaves score at 1.0."""
+    doc: dict = {}
+    files = [["a.py", "b.py"]]
+    _apply_cochange_to_doc(doc, files, pr_keys=["pr-1"])
+    assert doc["cochange_index"]["a.py"]["b.py"] == pytest.approx(1.0, abs=0.01)
+    # Second call — same key, must be a no-op (no decay, no accumulation)
+    _apply_cochange_to_doc(doc, files, pr_keys=["pr-1"])
+    assert doc["cochange_index"]["a.py"]["b.py"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_apply_cochange_new_pr_still_accumulates():
+    """Different pr_keys accumulate; second call decays existing and adds new."""
+    doc: dict = {}
+    files = [["a.py", "b.py"]]
+    _apply_cochange_to_doc(doc, files, pr_keys=["pr-1"])
+    score_1 = doc["cochange_index"]["a.py"]["b.py"]
+    assert score_1 == pytest.approx(1.0, abs=0.01)
+    # Second call with a different key: decay existing (1.0 → 0.9) then +1.0 → 1.9
+    _apply_cochange_to_doc(doc, files, pr_keys=["pr-2"])
+    score_2 = doc["cochange_index"]["a.py"]["b.py"]
+    assert score_2 == pytest.approx(1.9, abs=0.01)
+
+
+def test_apply_cochange_applied_prs_persisted_in_doc():
+    """Applied PR keys are stored under cochange_applied_prs in the doc."""
+    doc: dict = {}
+    _apply_cochange_to_doc(doc, [["a.py", "b.py"]], pr_keys=["pr-abc"])
+    assert "cochange_applied_prs" in doc
+    assert "pr-abc" in doc["cochange_applied_prs"]
+
+
+def test_apply_cochange_no_keys_preserves_legacy_behavior():
+    """Without pr_keys, the function re-applies every call (legacy contract)."""
+    doc: dict = {}
+    files = [["a.py", "b.py"]]
+    _apply_cochange_to_doc(doc, files)  # pr_keys=None
+    _apply_cochange_to_doc(doc, files)  # pr_keys=None — should accumulate
+    # Second call decays 1.0 → 0.9 then adds 1.0 → 1.9
+    assert doc["cochange_index"]["a.py"]["b.py"] == pytest.approx(1.9, abs=0.01)
+    assert "cochange_applied_prs" not in doc
+
+
 @pytest.mark.asyncio
 async def test_cochange_index_updated_on_merged_pr(db_session: AsyncSession):
     """_update_direction_research_outcomes populates cochange_index from _pr_changed_files."""
@@ -2798,6 +2909,101 @@ async def test_cochange_index_not_updated_when_no_changed_files(
     # cochange_index should not exist or be empty
     idx = (project.design_doc or {}).get("cochange_index", {})
     assert idx == {}
+
+
+@pytest.mark.asyncio
+async def test_cochange_index_idempotent_on_refresh_replay(db_session: AsyncSession):
+    """Replaying _update_direction_research_outcomes with the same merged PRs must not
+    re-accumulate scores (no saturation toward 10) and must not apply spurious decay.
+    A genuinely new PR key still accumulates on the second call."""
+    direction_id = "d-cochange-idempotent"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    # First merged PR — its key is the child task id
+    child1 = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": ["app/models.py", "app/schemas.py"],
+        },
+        title="merged-pr-1",
+    )
+    await db_session.flush()
+
+    # First refresh: folds child1 in
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    idx_after_first = dict(
+        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+    )
+    score_after_first = idx_after_first.get("app/schemas.py", 0.0)
+    assert score_after_first == pytest.approx(1.0, abs=0.01), (
+        f"Expected score 1.0 after first refresh, got {score_after_first}"
+    )
+    applied_after_first = (project.design_doc or {}).get("cochange_applied_prs", [])
+    assert str(child1.id) in applied_after_first
+
+    # Second refresh with identical child set (simulates post-commit replay) —
+    # scores must be unchanged; no decay, no extra accumulation.
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    idx_after_replay = dict(
+        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+    )
+    score_after_replay = idx_after_replay.get("app/schemas.py", 0.0)
+    assert score_after_replay == pytest.approx(score_after_first, abs=0.01), (
+        f"Replay must not change score: was {score_after_first}, got {score_after_replay}"
+    )
+
+    # Now add a genuinely new PR — it must still accumulate
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": ["app/models.py", "app/schemas.py"],
+        },
+        title="merged-pr-2",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    idx_after_new_pr = dict(
+        (project.design_doc or {}).get("cochange_index", {}).get("app/models.py", {})
+    )
+    score_after_new_pr = idx_after_new_pr.get("app/schemas.py", 0.0)
+    # New PR increments by 1, previous score decayed once: ~1.0 * 0.9 + 1.0 = 1.9
+    assert score_after_new_pr > score_after_first, (
+        f"New PR should have added to score: was {score_after_first}, got {score_after_new_pr}"
+    )
 
 
 @pytest.mark.asyncio
@@ -2997,6 +3203,76 @@ async def test_decomposition_quality_ignores_infra_failures_in_merge_rate(
     dq = project.directions[0]["research_history"][0]["decomposition_quality"]
     # merged=1, failed_non_infra=0 → 1/1
     assert dq[0]["subtask_merge_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_subtask_merge_rate_counts_scope_overflow_in_denominator(
+    db_session: AsyncSession,
+):
+    """SCOPE_OVERFLOW subtask failures stay in the merge-rate denominator.
+
+    SCOPE_OVERFLOW lives in INFRA_CLASSES for retry/budget routing, but it is a
+    scope-quality signal — a plan that cut its subtasks too large is exactly the
+    decomposition failure this metric exists to detect. It must therefore be
+    counted in the denominator (mirroring
+    spawn_calibration._effective_scope_denominator), unlike a true-infra
+    RATE_LIMIT failure which is excluded.
+    """
+    direction_id = "d-decomp-overflow"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    plan = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "plan"}],
+        title="plan-overflow",
+    )
+    await _create_child_task(
+        db_session,
+        plan.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "_pr_changed_files": ["a.py"]},
+        title="merged",
+    )
+    await _create_child_task(
+        db_session,
+        plan.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "SCOPE_OVERFLOW"},
+        title="overflow",
+    )
+    # A true-infra failure must stay excluded so the assertion isolates the
+    # SCOPE_OVERFLOW behavior.
+    await _create_child_task(
+        db_session,
+        plan.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "RATE_LIMIT"},
+        title="infra",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    dq = project.directions[0]["research_history"][0]["decomposition_quality"]
+    # merged=1, SCOPE_OVERFLOW counted (1), RATE_LIMIT excluded → denom=2 → 1/2
+    assert dq[0]["subtask_merge_rate"] == 0.5
 
 
 @pytest.mark.asyncio
@@ -4513,6 +4789,7 @@ def test_fold_evicted_acceptance_aggregates_survive_eviction():
             "prs_merged": 4,
             "acceptance_proven_merged": 1,
             "acceptance_declared_merged": 3,
+            "acceptance_inferred_merged": 1,
             "acceptance_merged_write_total": 4,
         },
     ]
@@ -4520,6 +4797,7 @@ def test_fold_evicted_acceptance_aggregates_survive_eviction():
 
     assert agg["total_acceptance_proven_merged"] == 1
     assert agg["total_acceptance_declared_merged"] == 3
+    assert agg["total_acceptance_inferred_merged"] == 1
     assert agg["total_acceptance_merged_write_total"] == 4
 
 
@@ -5218,7 +5496,7 @@ async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
     project = await _create_project(db_session)
     research_task = await _make_research_task(db_session, project.id)
     rtid = str(research_task.id)
-    project.directions = [_make_direction(direction_id, rtid, tasks_created=6)]
+    project.directions = [_make_direction(direction_id, rtid, tasks_created=9)]
     db_session.add(project)
     await db_session.flush()
 
@@ -5284,6 +5562,43 @@ async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
         context={},
         title="failed",
     )
+    # (7) COMPLETED 'fix' child that pushed code onto an existing OPEN PR: it
+    #     carries context['review_loop']['pr_number'] but has NO PULL_REQUEST
+    #     artifact of its own, no merge/landed signal, and no pr_rejected.
+    #     _opened_pr() returns False for fix-type (the PR belongs to another
+    #     task), but this is NOT a no-CODE no-op — it must be EXCLUDED from
+    #     tasks_completed_no_pr.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        context={"review_loop": {"pr_number": 77}},
+        title="fix-pushed-code-to-open-pr",
+    )
+    # (8) COMPLETED 'review' child attached to an open PR via context['pr_number']
+    #     (fallback signal) — also excluded from the no-op bucket.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "review"}],
+        context={"pr_number": 88},
+        title="review-of-open-pr",
+    )
+    # (9) COMPLETED 'panel_review' child attached to an open PR via the payload
+    #     pr_number — excluded too.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "panel_review", "pr_number": 91}],
+        context={},
+        title="panel-review-of-open-pr",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -5294,12 +5609,15 @@ async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
     )
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
-    # Only child (1) qualifies.
+    # Only child (1) qualifies: the fix/review/panel_review children attached to
+    # open PRs (7-9) are NOT no-CODE no-ops even though _opened_pr is False.
     assert entry["tasks_completed_no_pr"] == 1
     # Sanity: the other completed children are still reflected in their buckets.
     assert entry["prs_merged"] == 1
     assert entry["prs_rejected"] == 1
-    assert entry["tasks_completed"] == 4
+    # The open-PR fix/review/panel_review children DID complete, so they are
+    # still part of tasks_completed (1 no-op + merged + rejected + opened-pr + 3).
+    assert entry["tasks_completed"] == 7
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5912,6 +6230,97 @@ async def test_declaration_coverage_none_when_no_merged_write_tasks(
     assert entry["acceptance_merged_write_total"] == 0
 
 
+@pytest.mark.asyncio
+async def test_acceptance_inferred_merged_counts_verified_test_cochange(
+    db_session: AsyncSession,
+):
+    """acceptance_inferred_merged counts undeclared WRITE merges upgraded to the
+    inferred_test_cochange bucket, and those merges still count as verified.
+
+    A verified-CI merge with no verdict but test + production co-change is
+    inferred (counted); a production-only undeclared merge stays undeclared (not
+    counted); a declared proven merge is proven (never inferred). All three are
+    verified merges, so verified_prs_merged credits all three while
+    acceptance_inferred_merged isolates only the inferred one.
+    """
+    direction_id = "d-inferred"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # (1) Undeclared + verified CI + test/prod co-change → inferred_test_cochange.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": [
+                "backend/app/direction_outcomes.py",
+                "backend/testing/test_direction_outcomes.py",
+            ],
+        },
+        title="inferred-cochange",
+    )
+    # (2) Undeclared, production-only diff → stays undeclared (NOT inferred).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": ["backend/app/direction_outcomes.py"],
+        },
+        title="bare-undeclared",
+    )
+    # (3) Declared proven named_test → proven (never inferred).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+            },
+        },
+        title="proven-named-test",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Only the genuine test-cochange merge is inferred.
+    assert entry["acceptance_inferred_merged"] == 1
+    # It did not leak into the declared or proven counts.
+    assert entry["acceptance_declared_merged"] == 1
+    assert entry["acceptance_proven_merged"] == 1
+    # All three merges are verified (inferred, undeclared, and proven buckets).
+    assert entry["prs_merged"] == 3
+    assert entry["verified_prs_merged"] == 3
+    assert entry["acceptance_merged_write_total"] == 3
+    # inferred + declared never exceeds the merged-write population.
+    assert acceptance_metric_invariant_violations(entry) == []
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Acceptance-evidence metric invariant guard
 #
@@ -6017,6 +6426,28 @@ _ACCEPT_SCENARIOS: dict[str, dict] = {
         "declared": False,
         "verified": True,
     },
+    # Undeclared write merge upgraded by inference: verified CI, NO verdict, but the
+    # PR co-changed a test file + a non-test production file → inferred_test_cochange.
+    # Counts as verified (verified_prs_merged / verified_write) but never
+    # declared/proven, and is recorded in the distinct acceptance_inferred_merged
+    # aggregate.
+    "inferred": {
+        "context": {
+            "pr_merged": True,
+            "_pr_changed_files": [
+                "backend/app/direction_outcomes.py",
+                "backend/testing/test_direction_outcomes.py",
+            ],
+        },
+        "type": "create",
+        "write": True,
+        "merged": True,
+        "proven": False,
+        "consumed": False,
+        "declared": False,
+        "verified": True,
+        "inferred": True,
+    },
     # Degraded-verification write merge: not verified, not declared, not proven.
     "degraded": {
         "context": {
@@ -6054,6 +6485,7 @@ def _expected_acceptance_aggregates(mix: list[str]) -> dict:
     declared = sum(1 for r in merged_write if r["declared"])
     proven = sum(1 for r in merged_write if r["proven"])
     consumed = sum(1 for r in merged_write if r.get("consumed"))
+    inferred = sum(1 for r in merged_write if r.get("inferred"))
     verified_write = sum(1 for r in merged_write if r["verified"])
     verified = sum(1 for r in merged if r["verified"])
     prs_merged = len(merged)
@@ -6062,6 +6494,7 @@ def _expected_acceptance_aggregates(mix: list[str]) -> dict:
         "acceptance_proven_merged": proven,
         "acceptance_consumed_merged": consumed,
         "acceptance_declared_merged": declared,
+        "acceptance_inferred_merged": inferred,
         "acceptance_verified_write_merged": verified_write,
         "acceptance_merged_write_total": mw,
         "verified_prs_merged": verified,
@@ -6115,6 +6548,7 @@ async def _run_mix(db_session: AsyncSession, direction_id: str, mix: list[str]) 
             "soft",
             "declared_unsat",
             "undeclared",
+            "inferred",
             "degraded",
             "readonly",
         ],
@@ -6134,6 +6568,8 @@ async def _run_mix(db_session: AsyncSession, direction_id: str, mix: list[str]) 
             "soft",
             "declared_unsat",
             "undeclared",
+            "inferred",
+            "inferred",
             "degraded",
             "readonly",
             "readonly",
@@ -6186,6 +6622,16 @@ async def test_acceptance_metric_invariants_hold_across_mixes(
         <= entry["acceptance_proven_merged"]
         <= entry["verified_prs_merged"]
         <= entry["prs_merged"]
+    )
+    # inferred_test_cochange is a subset of merged-write and disjoint from declared.
+    assert (
+        0
+        <= entry["acceptance_inferred_merged"]
+        <= entry["acceptance_merged_write_total"]
+    )
+    assert (
+        entry["acceptance_inferred_merged"] + entry["acceptance_declared_merged"]
+        <= entry["acceptance_merged_write_total"]
     )
 
 
@@ -6265,6 +6711,25 @@ def test_acceptance_metric_invariant_violations_detects_drift():
     # merged-write drifts above prs_merged.
     assert acceptance_metric_invariant_violations(
         {**clean, "acceptance_merged_write_total": 5}
+    )
+    # inferred drifts negative.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_inferred_merged": -1}
+    )
+    # inferred drifts above merged-write.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_inferred_merged": 4}
+    )
+    # inferred + declared drift above merged-write (they are disjoint subsets).
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_inferred_merged": 2}
+    )
+    # A consistent inferred subset (inferred + declared <= merged-write) is clean.
+    assert (
+        acceptance_metric_invariant_violations(
+            {**clean, "acceptance_inferred_merged": 1}
+        )
+        == []
     )
     # coverage no longer equals declared / merged-write.
     assert acceptance_metric_invariant_violations(
@@ -6347,13 +6812,13 @@ def test_stranded_reachable_metrics_allow_persisted_discounts():
 
     stranded_negative = {**valid, "stranded_prs_merged": -1}
     assert any(
-        "stranded (-1) is negative" == violation
+        violation == "stranded (-1) is negative"
         for violation in acceptance_metric_invariant_violations(stranded_negative)
     )
 
     reachable_too_high = {**valid, "reachable_prs_merged": 3}
     assert any(
-        "reachable (3) exceeds prs_merged (1)" == violation
+        violation == "reachable (3) exceeds prs_merged (1)"
         for violation in acceptance_metric_invariant_violations(reachable_too_high)
     )
 
@@ -7575,6 +8040,157 @@ async def test_spawn_gate_metrics_preserved_for_untagged_cycles(
     assert entry["research_spawn_gate_challenged_merged"] == 1
     assert entry["research_spawn_gate_challenged_merge_rate"] == 0.5
     assert entry["research_spawn_gate_unchallenged_spawned"] == 1
+    assert entry["research_spawn_gate_unchallenged_merged"] == 1
+    assert entry["research_spawn_gate_unchallenged_merge_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_spawn_gate_merge_rate_excludes_pr_ineligible(db_session: AsyncSession):
+    """Spawn-gate merge-rate denominators exclude PR-ineligible task types.
+
+    PR-ineligible children (research, web_research, design, plan, compute_experiment)
+    can never satisfy is_merged_completion, so including them in the spawn-gate
+    challenged/unchallenged denominators silently deflates both rates with never-merging
+    children. This is particularly harmful for challenged cohort: high-stakes findings
+    are more likely to be challenged AND route to a PR-ineligible plan child, so the
+    challenged cohort becomes enriched with never-merging children and its rate is
+    deflated harder — making the adversarial spawn gate look less effective than it is.
+
+    Fix: exclude PR-ineligible types from challenged_children and unchallenged_children
+    lists, mirroring the scope_breakdown filter already in place.
+    """
+    direction_id = "d-sg-pr-ineligible"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=6)
+    ]
+    await db_session.flush()
+
+    # Challenged PR-eligible task (create) that merges
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-create-merged",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+        payloads=[{"type": "create", "scope": "small"}],
+    )
+
+    # Challenged PR-eligible task (fix) that does NOT merge
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-fix-not-merged",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+        },
+        payloads=[{"type": "fix", "scope": "small"}],
+    )
+
+    # Challenged PR-ineligible task (plan) that should be EXCLUDED from spawn-gate denominator
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-plan-not-counted",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+        },
+        payloads=[{"type": "plan", "scope": "medium"}],
+    )
+
+    # Challenged PR-ineligible task (research) that should be EXCLUDED from spawn-gate denominator
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-research-not-counted",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+        },
+        payloads=[{"type": "research"}],
+    )
+
+    # Unchallenged PR-eligible task (create) that merges
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="unchallenged-create-merged",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": False,
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+        payloads=[{"type": "create", "scope": "small"}],
+    )
+
+    # Unchallenged PR-ineligible task (web_research) that should be EXCLUDED from spawn-gate denominator
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="unchallenged-web-research-not-counted",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": False,
+        },
+        payloads=[{"type": "web_research"}],
+    )
+
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Verify that PR-ineligible tasks are excluded from denominators:
+    # - challenged_spawned: 1 (only challenged-create-merged + challenged-fix-not-merged, NOT plan/research)
+    # - challenged_merged: 1 (only challenged-create-merged)
+    # - challenged_merge_rate: 1/1 = 1.0 (proof the plan/research are excluded)
+    assert entry["research_spawn_gate_challenged_spawned"] == 2, (
+        "challenged_spawned should count only PR-eligible children, "
+        "excluding plan and research"
+    )
+    assert entry["research_spawn_gate_challenged_merged"] == 1
+    assert entry["research_spawn_gate_challenged_merge_rate"] == 0.5, (
+        "challenged merge rate should be 1 merged / 2 spawned (create+fix), "
+        "excluding plan and research which can never merge"
+    )
+
+    # Verify unchallenged metrics also exclude PR-ineligible:
+    # - unchallenged_spawned: 1 (only unchallenged-create-merged, NOT web_research)
+    # - unchallenged_merged: 1 (only unchallenged-create-merged)
+    # - unchallenged_merge_rate: 1.0
+    assert entry["research_spawn_gate_unchallenged_spawned"] == 1, (
+        "unchallenged_spawned should count only PR-eligible children, "
+        "excluding web_research"
+    )
     assert entry["research_spawn_gate_unchallenged_merged"] == 1
     assert entry["research_spawn_gate_unchallenged_merge_rate"] == 1.0
 
@@ -8924,3 +9540,416 @@ def test_evicted_delta_field_lists_stay_in_sync():
                 f"breakdown['{kind}']['{status}']: aggregate={agg_bd[kind].get(status)!r}, "
                 f"snapshot={val!r} — fold must carry breakdown per kind/status"
             )
+
+
+# _fold_evicted_into_aggregate: estimated_cost_usd folding
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_estimated_cost_usd_folded_into_history_aggregate():
+    """estimated_cost_usd from evicted cycles accumulates in total_estimated_cost_usd.
+
+    Evicting a cycle with estimated_cost_usd=5.0 must produce
+    agg["total_estimated_cost_usd"]==5.0.  A second legacy entry without
+    the field contributes 0 (legacy-0 fallback).
+    """
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    evicted = [
+        {
+            "timestamp": "2025-01-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 1,
+            "estimated_cost_usd": 5.0,
+        },
+        {
+            # Legacy entry: no estimated_cost_usd key — contributes 0
+            "timestamp": "2025-02-01T00:00:00",
+            "tasks_created": 3,
+            "prs_merged": 2,
+        },
+    ]
+    agg = _fold_evicted_into_aggregate(None, evicted)
+
+    assert agg["total_estimated_cost_usd"] == 5.0
+
+
+def test_fold_evicted_estimated_cost_accumulates_on_prior_agg():
+    """Folding more cycles adds to a pre-existing total_estimated_cost_usd."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    prior = {
+        "total_cycles": 1,
+        "total_estimated_cost_usd": 3.0,
+    }
+    evicted = [
+        {
+            "timestamp": "2025-03-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 1,
+            "estimated_cost_usd": 2.0,
+        }
+    ]
+    agg = _fold_evicted_into_aggregate(prior, evicted)
+
+    assert agg["total_estimated_cost_usd"] == 5.0  # 3.0 + 2.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ComputeJob spend included in direction cost rollup
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_spend_included_in_direction_cost_rollup(
+    db_session: AsyncSession,
+):
+    """ComputeJob.final_cost_usd is folded into estimated_cost_usd.
+
+    A compute_experiment task's real spend lives on the ComputeJob ledger
+    while the monitoring task's VM cost is ~$0. Without folding ComputeJob
+    spend, the direction's estimated_cost_usd is silently deflated and the
+    cost-budget auto-pause gate never fires for compute-heavy directions.
+    """
+    from app.models import ComputeJob, ComputeJobStatus
+
+    direction_id = "d-compute-cost"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    # A compute_experiment child task with no VM cost (~$0 vm_runtime_cost_usd).
+    compute_child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"direction_id": direction_id},
+        payloads=[{"type": "compute_experiment"}],
+        title="compute-exp",
+    )
+
+    # A regular create child with a small VM cost.
+    regular_child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True, "direction_id": direction_id},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="regular-create",
+    )
+
+    # Attach a terminal ComputeJob with final_cost_usd to the compute child.
+    compute_job = ComputeJob(
+        project_id=project.id,
+        task_id=compute_child.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        final_cost_usd=3.75,
+    )
+    db_session.add(compute_job)
+
+    # Give the regular child a small vm_runtime_cost via attempt_history so
+    # cost_by_provider_model is non-empty from VM costs alone.
+    regular_child.attempt_history = [
+        {
+            "vm_runtime_cost_usd": 0.10,
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+        }
+    ]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    entry = project.directions[0]["research_history"][0]
+
+    # estimated_cost_usd must include both VM cost and ComputeJob spend.
+    assert "estimated_cost_usd" in entry
+    assert entry["estimated_cost_usd"] == pytest.approx(3.85, abs=0.001), (
+        f"expected estimated_cost_usd ≈ 3.85 (0.10 vm + 3.75 compute), "
+        f"got {entry['estimated_cost_usd']!r}"
+    )
+
+    # cost_by_provider_model must carry a 'compute|substrate' bucket.
+    cbpm = entry.get("cost_by_provider_model") or {}
+    assert "compute|substrate" in cbpm, (
+        f"cost_by_provider_model missing 'compute|substrate' bucket: {cbpm!r}"
+    )
+    assert cbpm["compute|substrate"] == pytest.approx(3.75, abs=0.001)
+
+    # Non-terminal ComputeJobs (still running) must NOT be counted.
+    from app.models import ComputeJobStatus as CJS
+
+    running_job = ComputeJob(
+        project_id=project.id,
+        task_id=compute_child.id,
+        backend="gcp",
+        status=CJS.RUNNING,
+        final_cost_usd=99.0,  # not yet finalized
+    )
+    db_session.add(running_job)
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry2 = project.directions[0]["research_history"][0]
+    # Running job's cost must not be included.
+    assert entry2["estimated_cost_usd"] == pytest.approx(3.85, abs=0.001), (
+        f"running ComputeJob should not inflate estimated_cost_usd, "
+        f"got {entry2['estimated_cost_usd']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tasks_merged_staging_only_counts_staged_not_landed_children(
+    db_session: AsyncSession,
+):
+    """tasks_merged_staging_only counts merges to staging-only, not landed on integration.
+
+    When a research task FAILED, we need to track how many of its children merged
+    to a staging/rollup branch but did NOT land on the integration branch. This is
+    distinct from children that fully landed on integration (landed_on_integration=True).
+
+    The metric should count children with:
+    - status == COMPLETED
+    - pr_merged=True (merged somewhere, possibly staging)
+    - NOT landed_on_integration (or marked as non-merge)
+
+    It should NOT count children that:
+    - Fully landed on integration (is_merged_completion returns True)
+    - Never merged at all
+    """
+    direction_id = "d-staging-only"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # Mark the research task as FAILED so staging-only should be counted
+    research_task.status = TaskStatus.FAILED
+    await db_session.flush()
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
+    await db_session.flush()
+
+    # Child 1: merged to staging only (pr_merged=True, landed_on_integration=False)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": False},
+        title="staging-only-1",
+    )
+
+    # Child 2: another staging-only merge (pr_merged=True, landed_on_integration=False)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": False},
+        title="staging-only-2",
+    )
+
+    # Child 3: fully landed on integration (should NOT count as staging-only)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        title="fully-landed",
+    )
+
+    # Child 4: never merged at all (should NOT count)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},  # no pr_merged
+        title="no-merge",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # tasks_merged_staging_only should count only the 2 staging-only merges
+    assert entry["stage_dropout"]["tasks_merged_staging_only"] == 2, (
+        f"expected 2 staging-only merges, got {entry['stage_dropout']['tasks_merged_staging_only']}"
+    )
+    # Verify prs_merged only counts fully-landed merges (not staging-only)
+    assert entry["prs_merged"] == 1, (
+        f"expected 1 fully-landed merge, got {entry['prs_merged']}"
+    )
+
+
+async def test_non_genuine_cancels_excluded_from_generalized_health_rate(
+    db_session: AsyncSession,
+):
+    """Verify non-genuine cancellations don't count against direction health_rate.
+
+    Non-genuine outcomes (cascade kills, superseded, cap-exhausted-after-approve,
+    REASSIGNED/SCOPE_EMPTY handoffs) must not count in generalized_health_rate
+    denominator or outcome_kind_breakdown per _is_non_genuine_cancelled contract.
+    """
+    project = await _create_project(db_session)
+    direction_id = "dir-123"
+
+    # Create a research task parent
+    research_task = Task(
+        project_id=project.id,
+        title="Research cycle",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(research_task)
+    await db_session.flush()
+
+    research_task_id = str(research_task.id)
+
+    # Create direction with research_history entry
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=0)]
+
+    # Child 1: SUCCESS (code merge) — should count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="successful-fix",
+    )
+
+    # Child 2: GENUINE FAILURE — should count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="failed-task",
+    )
+
+    # Child 3: NON-GENUINE CANCEL (cascade kill) — should NOT count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"_replaced_by_task_id": "another-task-id"},
+        latest_status_message="Parent requeued",
+        payloads=[{"type": "create", "scope": "small"}],
+        title="cascade-cancelled",
+    )
+
+    # Child 4: NON-GENUINE CANCEL (pr closed non-rejection) — should NOT count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_detail": "pr_closed_non_rejection"},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="pr-closed",
+    )
+
+    # Child 5: NON-GENUINE CANCEL (cap exhausted after approve) — should NOT count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_detail": "cap_exhausted_after_approve"},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="cap-exhausted",
+    )
+
+    # Child 6: NON-GENUINE CANCEL (SCOPE_EMPTY) — should NOT count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_category": "SCOPE_EMPTY"},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="scope-empty",
+    )
+
+    # Child 7: NEUTRAL outcome (read-only task with no findings) — should count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "research"}],
+        title="research-no-findings",
+    )
+
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Verify generalized_successes: only the merged code task counts as success
+    assert entry["generalized_successes"] == 1, (
+        f"expected 1 success (merged fix), got {entry['generalized_successes']}"
+    )
+
+    # Verify generalized_health_rate denominator:
+    # Should be: 1 success + 1 failure + 1 neutral = 3
+    # Should NOT include the 3 non-genuine cancels
+    outcome_kind_breakdown = entry.get("outcome_kind_breakdown", {})
+
+    # Sum all outcomes to verify the denominator
+    total_terminal_outcomes = sum(
+        count for kind_counts in outcome_kind_breakdown.values()
+        for count in kind_counts.values()
+    )
+    assert total_terminal_outcomes == 3, (
+        f"expected 3 terminal outcomes (1 success + 1 failure + 1 neutral), "
+        f"got {total_terminal_outcomes}. Breakdown: {outcome_kind_breakdown}"
+    )
+
+    # Verify health_rate: 1 success / 3 terminal = 0.333
+    expected_health_rate = round(1 / 3, 3)
+    assert entry["generalized_health_rate"] == expected_health_rate, (
+        f"expected health_rate {expected_health_rate}, "
+        f"got {entry['generalized_health_rate']}"
+    )

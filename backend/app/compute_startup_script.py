@@ -249,7 +249,21 @@ def build_agent_startup_script(
     # vs. systemctl/agent issues to the correct culprit.
     _send_beacon "PROVISION_PROGRESS: payload ready, entering diagnostics" "$AGENT_TOKEN"
 
-    # 5. Agent diagnostics — log baked-in code version for debugging
+    # 5a. Runtime dependency guard. jq is baked into the canonical Packer and
+    # Cloud Run agent images; this repairs stale/custom images before generated
+    # helpers fail later with "command not found".
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "PROVISION_DEP_REPAIR: jq missing; attempting apt install" >&2
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y jq
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+      LAST_STAGE_STDERR="jq missing after startup repair; stale or non-agent image"
+      false
+    fi
+
+    # 5b. Agent diagnostics — log baked-in code version for debugging
     echo "Agent source files:"
     ls -la /opt/agent/src/handlers/ 2>/dev/null || echo "  (no handlers directory)"
     head -1 /opt/agent/src/index.ts 2>/dev/null || echo "  (index.ts missing)"
@@ -484,7 +498,21 @@ def build_pool_agent_startup_script(
     AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2- | tr -d '"' || true)"
     _send_vm_beacon "$AGENT_TOKEN"
 
-    # 4. Agent diagnostics — log baked-in code version for debugging.
+    # 4a. Runtime dependency guard. jq is baked into the canonical Packer and
+    # Cloud Run agent images; this repairs stale/custom images before generated
+    # helpers fail later with "command not found".
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "POOL_PROVISION_DEP_REPAIR: jq missing; attempting apt install" >&2
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y jq
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "FATAL: jq missing after startup repair; stale or non-agent image" >&2
+      false
+    fi
+
+    # 4b. Agent diagnostics — log baked-in code version for debugging.
     echo "Agent source files:"
     ls -la /opt/agent/src/handlers/ 2>/dev/null || echo "  (no handlers directory)"
 

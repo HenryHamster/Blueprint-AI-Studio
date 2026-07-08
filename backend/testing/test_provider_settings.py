@@ -24,9 +24,14 @@ async def test_get_settings_includes_provider_scaffolding(client):
     # Categories ship with sensible defaults; user can move task types between them.
     assert "build" in body["task_type_categories"]
     assert "create" in body["task_type_categories"]["build"]
+    assert body["task_type_categories"]["strategic"] == [
+        "strategic_review",
+        "design_doc_update",
+    ]
+    assert body["task_type_categories"]["initiative"] == ["research", "plan"]
     # _default routing is the global allow-list + effort fallback.
     assert body["category_routing"]["_default"]["providers"] == [
-        "zai",
+        "deepseek",
         "anthropic",
         "openai",
         "gemini",
@@ -45,6 +50,8 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert (
         body["provider_settings_by_effort"]["openai"]["low"]["model"] == "gpt-5.4-mini"
     )
+    assert body["category_routing"]["strategic"]["providers"][0] == "zai"
+    assert "zai" not in body["category_routing"]["initiative"]["providers"]
     assert body["provider_settings_by_effort"]["deepseek"]["low"]["model"] == (
         "deepseek-v4-flash"
     )
@@ -74,10 +81,15 @@ async def test_get_provider_catalog_route_returns_provider_schema(client):
     assert body["providers"]["anthropic"]["settings_schema"]["type"] == "object"
 
 
-def test_migrate_legacy_provider_config_backfills_zai_and_deepseek_defaults():
+def test_migrate_legacy_provider_config_confines_zai_to_strategic_defaults():
     from app.runtime_config_state import _migrate_legacy_provider_config
 
     config = {
+        "task_type_categories": {
+            "strategic": ["strategic_review", "design_doc_update", "research", "plan"],
+            "build": ["create"],
+            "ops": ["docs"],
+        },
         "category_routing": {
             "_default": {
                 "providers": ["anthropic", "openai", "gemini"],
@@ -97,9 +109,20 @@ def test_migrate_legacy_provider_config_backfills_zai_and_deepseek_defaults():
 
     migrated = _migrate_legacy_provider_config(config)
 
-    assert migrated["category_routing"]["_default"]["providers"][0] == "zai"
+    assert migrated["task_type_categories"]["strategic"] == [
+        "strategic_review",
+        "design_doc_update",
+    ]
+    assert migrated["task_type_categories"]["initiative"] == ["research", "plan"]
+    assert migrated["category_routing"]["_default"]["providers"] == [
+        "deepseek",
+        "anthropic",
+        "openai",
+        "gemini",
+    ]
     assert migrated["category_routing"]["ops"]["providers"][0] == "deepseek"
-    assert "zai" in migrated["category_routing"]["ops"]["providers"]
+    assert "zai" not in migrated["category_routing"]["ops"]["providers"]
+    assert migrated["category_routing"]["strategic"]["providers"][0] == "zai"
     assert migrated["provider_selection_mode"] == "preferred"
     assert migrated["provider_tier_model_map"]["deepseek"]["haiku"] == (
         "deepseek-v4-flash"

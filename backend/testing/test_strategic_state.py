@@ -1238,6 +1238,70 @@ async def test_strategic_state_reports_strategic_runner_candidates(
 
 
 @pytest.mark.asyncio
+async def test_local_runner_readiness_metric_uses_matching_denominator(
+    client: AsyncClient, db_session
+):
+    """The local_strategic_ready metric denominator must equal readiness_capable_runner_count
+    (runners that handle the active task type), not strategic_runner_count (all strategic
+    runners). A runner that handles only some strategic task types cannot become eligible
+    for the numerator and must not inflate the denominator.
+    """
+    project = await _make_project(db_session)
+    # full-capable: handles both core strategic types → readiness-capable and live+eligible
+    full_runner = LocalRunner(
+        project_id=project.id,
+        token_hash="r1" * 32,
+        hostname="full-capable",
+        status="active",
+        last_seen_at=_utcnow(),
+        capabilities={
+            "task_types": ["design_doc_update", "strategic_review"],
+            "max_concurrent": 2,
+            "runner_preset": "strategic_local",
+            "workload": "strategic",
+            "agent_available": True,
+        },
+    )
+    # partial-capable: handles only one core type → strategic but NOT readiness-capable
+    partial_runner = LocalRunner(
+        project_id=project.id,
+        token_hash="r2" * 32,
+        hostname="partial-capable",
+        status="active",
+        last_seen_at=_utcnow(),
+        capabilities={
+            "task_types": ["design_doc_update"],
+            "max_concurrent": 2,
+            "runner_preset": "strategic_local",
+            "workload": "strategic",
+            "agent_available": True,
+        },
+    )
+    db_session.add_all([full_runner, partial_runner])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
+
+    # Both runners are strategic, only full_runner is readiness-capable
+    assert local_runner["strategic_runner_count"] == 2
+    assert local_runner["readiness_capable_runner_count"] == 1
+    assert local_runner["eligible_live_count"] == 1
+
+    # The metric denominator path must resolve to readiness_capable_runner_count (1),
+    # not strategic_runner_count (2) — the partial-capable runner cannot be eligible
+    # for the numerator and must not inflate the denominator.
+    metrics = {entry["id"]: entry for entry in data["work_session"]["curated_metrics"]}
+    ready_metric = metrics["runtime.local_strategic_ready"]
+    assert ready_metric["value"] == 1
+    denominator_path = ready_metric["definition"]["denominator"]["path"]
+    assert denominator_path == "runtime.local_runner.readiness_capable_runner_count"
+    assert _resolve_dotted_path(data, denominator_path) == 1
+
+
+@pytest.mark.asyncio
 async def test_strategic_state_counts_assigned_compute_jobs_in_runner_capacity(
     client: AsyncClient, db_session
 ):

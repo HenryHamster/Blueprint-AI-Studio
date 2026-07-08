@@ -7,6 +7,7 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
 import {
   formatBytes,
+  formatBackendInventory,
   runnerSetupSnippets,
   type RunnerSetupPreset,
   type RunnerSetupSnippetCommands,
@@ -451,7 +452,12 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     return () => { mountedRef.current = false; };
   }, []);
 
-  const load = useCallback(async () => {
+  // showLoading is opt-in so only the initial / projectId-change load surfaces
+  // the full-panel spinner; background polls and refreshSignal reloads refresh
+  // silently. Keeping setLoading(true) inside this callback (not in the effect
+  // body) also keeps the effects free of a synchronous setState.
+  const load = useCallback(async (showLoading = false) => {
+    if (showLoading && mountedRef.current) setLoading(true);
     try {
       const data = await listFleetRunners(projectId);
       if (mountedRef.current) { setRunners(data); setError(null); }
@@ -462,8 +468,18 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     }
   }, [projectId]);
 
-  useEffect(() => { setLoading(true); load(); }, [load]);
-  useEffect(() => { if (refreshSignal !== undefined) load(); }, [load, refreshSignal]);
+  // load() is invoked through an effect-local async function so the setState
+  // calls it performs land after an await (not synchronously in the effect
+  // body) — the shape react-hooks/set-state-in-effect requires.
+  useEffect(() => {
+    async function run() { await load(true); }
+    void run();
+  }, [load]);
+  useEffect(() => {
+    if (refreshSignal === undefined) return;
+    async function run() { await load(); }
+    void run();
+  }, [load, refreshSignal]);
 
   useEffect(() => {
     if (live === true) return;
@@ -613,7 +629,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           <button
-            onClick={load}
+            onClick={() => void load()}
             className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md border border-neutral-800 text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-[#151c25] hover:text-neutral-200 md:min-h-9 md:min-w-9"
             aria-label="Refresh runners"
             title="Refresh"
@@ -722,6 +738,9 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             const readiness = runnerReadiness(runner, runnerLive, slots);
             const workday = workdayReadinessLine(readiness, strategicRunner);
             const telemetry = telemetrySummary(runner);
+            const backends = formatBackendInventory(runner.capabilities);
+            const hasBackendInfo =
+              backends.available.length > 0 || backends.agentBackend !== null || backends.computeBackend !== null;
             return (
               <div
                 key={runner.id}
@@ -795,6 +814,32 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                       data-testid="fleet-runner-telemetry"
                     >
                       {telemetry.text}
+                    </div>
+                  )}
+                  {hasBackendInfo && (
+                    <div className="mt-0.5 flex flex-wrap items-center gap-1" data-testid="fleet-runner-backends">
+                      <span className="text-ui-md text-neutral-600">Backends:</span>
+                      {backends.available.map(name => {
+                        const selected = name === backends.agentBackend || name === backends.computeBackend;
+                        return (
+                          <span
+                            key={name}
+                            className={`rounded border px-1.5 py-0.5 text-xs ${
+                              selected
+                                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                                : 'border-neutral-700 bg-[#151c25] text-neutral-300'
+                            }`}
+                          >
+                            {name}
+                          </span>
+                        );
+                      })}
+                      {backends.agentBackend && (
+                        <span className="text-ui-md text-emerald-400/80">agent→{backends.agentBackend}</span>
+                      )}
+                      {backends.computeBackend && (
+                        <span className="text-ui-md text-emerald-400/80">compute→{backends.computeBackend}</span>
+                      )}
                     </div>
                   )}
                   <div className="mt-0.5 text-ui-md text-neutral-600">{readiness.detail}</div>

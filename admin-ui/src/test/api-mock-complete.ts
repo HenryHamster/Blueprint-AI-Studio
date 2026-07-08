@@ -1,9 +1,10 @@
 import { vi } from 'vitest';
 
 export function createApiMock(overrides: Record<string, unknown> = {}) {
-  return {
+  const base: Record<keyof typeof import('../api'), unknown> = {
     API_BASE_URL: '',
     COST_PER_VM_HR: 0.067,
+    MESSAGE_CONTENT_MAX: 20000,
     authHeaders: vi.fn(),
     authGet: vi.fn(),
     apiFetch: vi.fn(),
@@ -119,6 +120,6 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     revokeFleetRunner: vi.fn(),
     resetTaskIterationCap: vi.fn(),
     triggerTaskRollup: vi.fn(),
-    ...overrides,
   };
+  return { ...base, ...overrides };
 }

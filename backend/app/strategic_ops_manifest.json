@@ -100,7 +100,7 @@
     "alias": "create-message",
     "description": "Post a message to the operator (available to all agent types).",
     "cli": true,
-    "prompt": true,
+    "prompt": false,
     "internal_reason": null
   },
   {
@@ -108,7 +108,7 @@
     "alias": "resolve-message",
     "description": "Resolve an addressed operator message (available to all agent types).",
     "cli": true,
-    "prompt": true,
+    "prompt": false,
     "internal_reason": null
   },
   {

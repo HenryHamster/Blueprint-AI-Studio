@@ -4,6 +4,7 @@ import { act, createRef } from 'react';
 import { MessagesComposer } from './MessagesComposer';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
+import { MESSAGE_CONTENT_MAX } from '../api';
 
 async function renderComposer(
   root: Root,
@@ -13,6 +14,7 @@ async function renderComposer(
   chrome: 'full' | 'minimal' = 'full',
   strategicContext: StrategicContextDescriptorModel | null = null,
   onOpenCommandPalette?: () => void,
+  newContent = '',
 ) {
   const ref = createRef<HTMLTextAreaElement>();
   await act(async () => {
@@ -20,7 +22,7 @@ async function renderComposer(
       <MessagesComposer
         textareaRef={ref}
         newType={newType}
-        newContent=""
+        newContent={newContent}
         submitting={false}
         replyTo={null}
         lastArming={lastArming}
@@ -214,6 +216,45 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     expect(host!.textContent).toContain('Couldn’t wake the strategist');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('char counter hidden below 80% of MESSAGE_CONTENT_MAX', async () => {
+    const content = 'x'.repeat(Math.floor(MESSAGE_CONTENT_MAX * 0.79));
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'NOTE', null, false, 'full', null, undefined, content);
+    expect(host!.textContent).not.toContain(`/ ${MESSAGE_CONTENT_MAX.toLocaleString()}`);
+  });
+
+  test('char counter appears at >80% of MESSAGE_CONTENT_MAX', async () => {
+    const content = 'x'.repeat(Math.floor(MESSAGE_CONTENT_MAX * 0.85));
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'NOTE', null, false, 'full', null, undefined, content);
+    expect(host!.textContent).toContain(`/ ${MESSAGE_CONTENT_MAX.toLocaleString()}`);
+  });
+
+  test('send button disabled and counter shown in red when content exceeds MESSAGE_CONTENT_MAX', async () => {
+    const content = 'x'.repeat(MESSAGE_CONTENT_MAX + 1);
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'NOTE', null, false, 'full', null, undefined, content);
+    const sendBtn = host!.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
+    expect(sendBtn?.disabled).toBe(true);
+    const counterEl = Array.from(host!.querySelectorAll('p')).find(p =>
+      p.textContent?.includes(`/ ${MESSAGE_CONTENT_MAX.toLocaleString()}`)
+    );
+    expect(counterEl).not.toBeNull();
+    expect(counterEl?.className).toContain('text-red-400');
   });
 
   test('minimal chat composer context descriptor fits 375px without overflow', async () => {

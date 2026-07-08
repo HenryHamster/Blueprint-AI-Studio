@@ -23,6 +23,7 @@ fail-closed isolation preflight; this wrapper just makes the common path clean.
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import re
 import shutil
@@ -54,6 +55,12 @@ _LOCAL_RUNNER = os.path.join(_SCRIPT_DIR, "local_runner.py")
 # so the agent build context is scripts/../agent.
 _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
 _AGENT_DIR = os.path.join(_REPO_ROOT, "agent")
+
+# systemd unit templates (real, lintable files on disk — rendered, never hand-edited).
+SERVICE_UNIT_NAME = "blueprint-runner.service"
+_USER_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner.service")
+_SYSTEM_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner-system.service")
+_SYSTEM_WANTED_BY = "multi-user.target"
 
 
 @dataclass(frozen=True)
@@ -137,12 +144,30 @@ def resolve_url(cli_url: str | None) -> str:
     return DEFAULT_ORCHESTRATOR_URL
 
 
+def _load_persisted_token() -> str | None:
+    """Read the persisted runner token from the credential dir's runner_token file.
+
+    Honors the BLUEPRINT_CREDENTIAL_DIR env override so reader and writer
+    (local_runner._save_runner_token) always agree on the path.
+    Returns None if the file does not exist, is empty, or cannot be read.
+    """
+    try:
+        path = os.path.join(_credential_dir(), "runner_token")
+        with open(path) as f:
+            token = f.read().strip()
+        return token or None
+    except OSError:
+        return None
+
+
 def resolve_token(cli_token: str | None) -> str | None:
-    """Resolve the runner token: --token > BLUEPRINT_RUNNER_TOKEN, else None."""
+    """Resolve the runner token: --token > BLUEPRINT_RUNNER_TOKEN > persisted file."""
     if cli_token and cli_token.strip():
         return cli_token.strip()
     env_token = os.environ.get("BLUEPRINT_RUNNER_TOKEN", "").strip()
-    return env_token or None
+    if env_token:
+        return env_token
+    return _load_persisted_token()
 
 
 def resolve_agent_image_tag(cli_tag: str | None) -> str:
@@ -416,6 +441,323 @@ def _print_docker_agent_status(result: AgentImageResult) -> None:
     print(f"  {'docker-agent':<12}: [{mark}    ] {result.message}", flush=True)
 
 
+# ── install / uninstall (systemd service automation) ──────────────────────────
+#
+# `blueprint-runner install` renders the unit template with the REAL absolute
+# paths resolved on this host (this interpreter, this checkout's local_runner.py,
+# the ~/.blueprint credential dir), writes it to the correct systemd location,
+# enables it, and turns on boot persistence (linger for --user, multi-user.target
+# for --system). Every host interaction goes through an injectable ``_run`` so
+# tests never touch real systemd. Fail-closed: a missing template, an absent
+# systemd, or any non-zero systemctl step returns rc=1 with an actionable message
+# — the installer never claims success when a step failed.
+
+
+def _credential_dir() -> str:
+    """The Blueprint credential dir — mirrors local_runner._credential_dir().
+
+    Defaults to ``~/.blueprint`` and honors ``BLUEPRINT_CREDENTIAL_DIR`` so the
+    env file the service reads lands in the same place local_runner persists the
+    token to (``runner_token``).
+    """
+    return (
+        os.environ.get("BLUEPRINT_CREDENTIAL_DIR", "").strip()
+        or os.path.expanduser("~/.blueprint")
+    )
+
+
+def _env_file_path() -> str:
+    """Absolute path of the EnvironmentFile the installed unit loads."""
+    return os.path.join(_credential_dir(), "runner.env")
+
+
+def _user_unit_path() -> str:
+    return os.path.expanduser(f"~/.config/systemd/user/{SERVICE_UNIT_NAME}")
+
+
+def _system_unit_path() -> str:
+    return f"/etc/systemd/system/{SERVICE_UNIT_NAME}"
+
+
+def _install_user() -> str:
+    """The account the runner should run as.
+
+    ``SUDO_USER`` wins so ``sudo blueprint-runner install --system`` targets the
+    real operator, not root; otherwise the current user.
+    """
+    return (
+        os.environ.get("SUDO_USER", "").strip()
+        or os.environ.get("USER", "").strip()
+        or getpass.getuser()
+    )
+
+
+def render_unit(template_path: str, subs: dict[str, str]) -> str:
+    """Render a systemd unit template by literal ``@TOKEN@`` substitution.
+
+    Raises ``FileNotFoundError`` if the template is missing and ``ValueError`` if
+    any ``@…@`` placeholder is left unsubstituted — a rendered unit carrying a
+    leftover token is a silently-broken service, so fail loudly instead.
+    """
+    with open(template_path, encoding="utf-8") as fh:
+        text = fh.read()
+    for token, value in subs.items():
+        text = text.replace(token, value)
+    leftover = sorted(set(re.findall(r"@[A-Z_]+@", text)))
+    if leftover:
+        raise ValueError(
+            f"unsubstituted placeholder(s) {leftover} in unit rendered from {template_path}"
+        )
+    return text
+
+
+def _systemctl(args: list[str], *, system: bool, _run=subprocess.run):
+    """Run ``systemctl`` (system manager) or ``systemctl --user`` with *args*."""
+    argv = ["systemctl"] if system else ["systemctl", "--user"]
+    argv.extend(args)
+    return _run(argv, capture_output=True, text=True)
+
+
+def _systemd_available(*, system: bool, _run=subprocess.run) -> bool:
+    """Whether a systemd manager we can install into is reachable on this host.
+
+    ``systemctl [--user] is-system-running`` exits non-zero for degraded/starting
+    states but still prints a state word when the manager is reachable; only a
+    bus-connection failure (no user manager under this session, no system pid-1
+    systemd) means systemd is genuinely unavailable here.
+    """
+    if shutil.which("systemctl") is None:
+        return False
+    try:
+        result = _systemctl(["is-system-running"], system=system, _run=_run)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    stderr = getattr(result, "stderr", "") or ""
+    if isinstance(stderr, str) and (
+        "Failed to connect to bus" in stderr or "Failed to get D-Bus" in stderr
+    ):
+        return False
+    return True
+
+
+def _print_no_systemd_guidance(*, system: bool) -> None:
+    """Actionable fallback when systemd is absent — never crash, guide instead."""
+    scope = "--system" if system else "--user"
+    print(
+        f"ERROR: no reachable systemd manager for `install {scope}` on this host.",
+        file=sys.stderr,
+    )
+    print(
+        "  systemd was not detected (no `systemctl`, or no user/system manager "
+        "on this session — e.g. a bare container or a non-systemd init).",
+        file=sys.stderr,
+    )
+    print(
+        "  Run the runner under your own supervisor instead, e.g.:",
+        file=sys.stderr,
+    )
+    print(
+        f"    nohup {sys.executable} {_LOCAL_RUNNER} >~/blueprint-runner.log 2>&1 &",
+        file=sys.stderr,
+    )
+    print(
+        "  (or `blueprint-runner start --token <token>` in a tmux/screen session).",
+        file=sys.stderr,
+    )
+
+
+def _write_env_file(path: str, *, url: str, token: str | None) -> None:
+    """Seed the 0600 EnvironmentFile so the service has its config on first start.
+
+    The orchestrator URL is required (local_runner._require_env). The token is
+    written only when supplied — after the first successful start local_runner
+    persists it to ``runner_token`` and the service reads it from there, so we
+    prefer not to keep it here indefinitely, but seeding it makes a fresh install
+    connect on its very first boot with no manual step.
+    """
+    cred_dir = os.path.dirname(path)
+    os.makedirs(cred_dir, exist_ok=True)
+    try:
+        os.chmod(cred_dir, 0o700)
+    except OSError:
+        pass
+    lines = [
+        "# Written by `blueprint-runner install`. Mode 0600 — do not commit.\n",
+        f"BLUEPRINT_ORCHESTRATOR_URL={url}\n",
+    ]
+    if token:
+        lines.append(f"BLUEPRINT_RUNNER_TOKEN={token}\n")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def do_install(
+    *,
+    system: bool = False,
+    token: str | None = None,
+    url: str,
+    dry_run: bool = False,
+    _run=subprocess.run,
+) -> int:
+    """Render, install, enable, and persist the runner service. Returns rc."""
+    template = _SYSTEM_SERVICE_TEMPLATE if system else _USER_SERVICE_TEMPLATE
+    if not os.path.isfile(template):
+        print(f"ERROR: unit template not found: {template}", file=sys.stderr)
+        return 1
+
+    if not _systemd_available(system=system, _run=_run):
+        _print_no_systemd_guidance(system=system)
+        return 1
+
+    env_file = _env_file_path()
+    subs = {
+        "@PYTHON@": sys.executable,
+        "@LOCAL_RUNNER@": _LOCAL_RUNNER,
+        "@ENV_FILE@": env_file,
+    }
+    if system:
+        subs["@USER@"] = _install_user()
+        subs["@WANTED_BY@"] = _SYSTEM_WANTED_BY
+    try:
+        unit_text = render_unit(template, subs)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: could not render unit: {exc}", file=sys.stderr)
+        return 1
+
+    unit_path = _system_unit_path() if system else _user_unit_path()
+
+    if dry_run:
+        print(f"[dry-run] would seed env file: {env_file}", flush=True)
+        print(f"[dry-run] would write unit:    {unit_path}", flush=True)
+        print(f"[dry-run] would run: systemctl {'' if system else '--user '}"
+              f"daemon-reload / enable --now {SERVICE_UNIT_NAME}", flush=True)
+        if not system:
+            print(f"[dry-run] would run: loginctl enable-linger {_install_user()}", flush=True)
+        print("\n" + unit_text, flush=True)
+        return 0
+
+    _write_env_file(env_file, url=url, token=token)
+
+    try:
+        os.makedirs(os.path.dirname(unit_path), exist_ok=True)
+        with open(unit_path, "w", encoding="utf-8") as fh:
+            fh.write(unit_text)
+    except OSError as exc:
+        print(f"ERROR: could not write unit file {unit_path}: {exc}", file=sys.stderr)
+        return 1
+    print(f"[blueprint-runner] wrote unit: {unit_path}", flush=True)
+
+    for args, label in (
+        (["daemon-reload"], "daemon-reload"),
+        (["enable", "--now", SERVICE_UNIT_NAME], "enable --now"),
+    ):
+        result = _systemctl(args, system=system, _run=_run)
+        if getattr(result, "returncode", 1) != 0:
+            print(
+                f"ERROR: `systemctl {'' if system else '--user '}{label}` failed "
+                f"(rc={getattr(result, 'returncode', '?')}). "
+                f"{(getattr(result, 'stderr', '') or '').strip()}",
+                file=sys.stderr,
+            )
+            return 1
+
+    if not system:
+        # Linger so the user service survives logout/reboot with no login session.
+        # Boot persistence is the whole point of installing, so surface a failure
+        # loudly — but it is not fatal: the unit is already enabled and running,
+        # linger only governs starting before the operator logs in.
+        try:
+            linger = _run(
+                ["loginctl", "enable-linger", _install_user()],
+                capture_output=True,
+                text=True,
+            )
+            linger_rc = getattr(linger, "returncode", 1)
+        except (OSError, subprocess.SubprocessError) as exc:
+            linger_rc = 1
+            print(f"WARNING: loginctl enable-linger error: {exc}", file=sys.stderr)
+        if linger_rc != 0:
+            print(
+                "WARNING: `loginctl enable-linger` did not succeed — the runner is "
+                "installed and running, but may not start at boot until you log in. "
+                f"Retry: loginctl enable-linger {_install_user()}",
+                file=sys.stderr,
+            )
+
+    # Verify the unit actually came up — never claim success on a dead unit.
+    active = _systemctl(["is-active", SERVICE_UNIT_NAME], system=system, _run=_run)
+    enabled = _systemctl(["is-enabled", SERVICE_UNIT_NAME], system=system, _run=_run)
+    if getattr(active, "returncode", 1) != 0 or getattr(enabled, "returncode", 1) != 0:
+        print(
+            "ERROR: the unit did not come up active AND enabled after install "
+            f"(is-active rc={getattr(active, 'returncode', '?')}, "
+            f"is-enabled rc={getattr(enabled, 'returncode', '?')}). Inspect: "
+            f"journalctl {'' if system else '--user '}-u {SERVICE_UNIT_NAME} -n 50",
+            file=sys.stderr,
+        )
+        return 1
+
+    scope = "--system" if system else "--user"
+    follow = f"journalctl {'' if system else '--user '}-u {SERVICE_UNIT_NAME} -f"
+    print(
+        f"[blueprint-runner] installed and started ({scope}). "
+        f"The runner is active and enabled at boot.\n"
+        f"  Unit:   {unit_path}\n"
+        f"  Env:    {env_file}\n"
+        f"  Logs:   {follow}",
+        flush=True,
+    )
+    return 0
+
+
+def do_uninstall(*, system: bool = False, dry_run: bool = False, _run=subprocess.run) -> int:
+    """Stop, disable, and remove the runner unit. Idempotent; credentials kept."""
+    unit_path = _system_unit_path() if system else _user_unit_path()
+
+    if dry_run:
+        print(f"[dry-run] would run: systemctl {'' if system else '--user '}"
+              f"disable --now {SERVICE_UNIT_NAME}", flush=True)
+        print(f"[dry-run] would remove unit: {unit_path}", flush=True)
+        return 0
+
+    unit_present = os.path.isfile(unit_path)
+    if not unit_present:
+        print(
+            f"[blueprint-runner] nothing to uninstall — no unit at {unit_path}.",
+            flush=True,
+        )
+
+    # `disable --now` stops + disables. It is harmless (and idempotent) even if
+    # the unit is already gone, so run it regardless; we only care that a
+    # PRESENT unit is removed cleanly. Do NOT touch credential files.
+    if shutil.which("systemctl") is not None:
+        _systemctl(["disable", "--now", SERVICE_UNIT_NAME], system=system, _run=_run)
+
+    removed = False
+    if unit_present:
+        try:
+            os.remove(unit_path)
+            removed = True
+            print(f"[blueprint-runner] removed unit: {unit_path}", flush=True)
+        except OSError as exc:
+            print(f"ERROR: could not remove unit file {unit_path}: {exc}", file=sys.stderr)
+            return 1
+
+    if removed and shutil.which("systemctl") is not None:
+        _systemctl(["daemon-reload"], system=system, _run=_run)
+
+    print(
+        "[blueprint-runner] uninstall complete "
+        "(credential files under ~/.blueprint were left untouched).",
+        flush=True,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="blueprint-runner",
@@ -424,7 +766,9 @@ def build_parser() -> argparse.ArgumentParser:
             "you only need a token from the Blueprint console (Fleet -> Enroll runner)."
         ),
     )
-    sub = parser.add_subparsers(dest="command", metavar="{start,check}")
+    sub = parser.add_subparsers(
+        dest="command", metavar="{start,check,install,uninstall}"
+    )
     for name, help_text in (
         ("start", "Run the runner (blocks; Ctrl-C for graceful shutdown)."),
         ("check", "Run the preflight only and exit; claims no work."),
@@ -461,9 +805,74 @@ def build_parser() -> argparse.ArgumentParser:
             metavar="REF",
             help=(
                 "Pull this registry ref for the agent image instead of building "
-                "(retagged to --agent-image if they differ)."
+                "(retagged to --agent-image if they differ). Implies --docker-agent."
             ),
         )
+        sub_parser.add_argument(
+            "--docker-agent",
+            dest="docker_agent",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable the docker-agent path: ensure the prod agent image and pass it "
+                "to local_runner so read-only agent tasks run in the prod container. "
+                "Without this flag (the default) bwrap is used for all agent tasks. "
+                "Also enabled by BLUEPRINT_AGENT_BACKEND=docker env var, or implicitly "
+                "by --pull (pulling a registry image is inherently a docker opt-in)."
+            ),
+        )
+
+    install_parser = sub.add_parser(
+        "install",
+        help=(
+            "Install the runner as a durable systemd service (renders the unit, "
+            "enables it, and turns on boot persistence)."
+        ),
+    )
+    install_parser.add_argument(
+        "--token",
+        help="Runner token to seed into the env file (or set BLUEPRINT_RUNNER_TOKEN).",
+    )
+    install_parser.add_argument(
+        "--url",
+        help=f"Orchestrator base URL to bake into the env file (default: {DEFAULT_ORCHESTRATOR_URL}).",
+    )
+    install_parser.add_argument(
+        "--system",
+        action="store_true",
+        default=False,
+        help=(
+            "Install a system unit (/etc/systemd/system, WantedBy=multi-user.target, "
+            "User=$USER) instead of a systemd --user unit. Prefer this on shared boxes "
+            "(e.g. a DGX) where the runner should not depend on one operator's login. "
+            "Requires root (run under sudo)."
+        ),
+    )
+    install_parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Print the rendered unit and the commands that would run, without touching the host.",
+    )
+
+    uninstall_parser = sub.add_parser(
+        "uninstall",
+        help="Stop, disable, and remove the runner service (credential files are kept).",
+    )
+    uninstall_parser.add_argument(
+        "--system",
+        action="store_true",
+        default=False,
+        help="Uninstall the system unit instead of the --user unit (requires root).",
+    )
+    uninstall_parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Print the commands that would run, without touching the host.",
+    )
     return parser
 
 
@@ -474,6 +883,22 @@ def main(argv: list[str] | None = None) -> int:
     if not args.command:
         parser.print_help()
         return 2
+
+    if args.command == "uninstall":
+        return do_uninstall(
+            system=getattr(args, "system", False),
+            dry_run=getattr(args, "dry_run", False),
+        )
+
+    if args.command == "install":
+        # The token is OPTIONAL for install: if omitted, the service reads the
+        # persisted ~/.blueprint/runner_token written on the runner's first start.
+        return do_install(
+            system=getattr(args, "system", False),
+            token=resolve_token(getattr(args, "token", None)),
+            url=resolve_url(getattr(args, "url", None)),
+            dry_run=getattr(args, "dry_run", False),
+        )
 
     token = resolve_token(getattr(args, "token", None))
     if not token:
@@ -493,18 +918,32 @@ def main(argv: list[str] | None = None) -> int:
     _print_prereqs(prereqs, url)
     missing = [p for p in prereqs if not p.ok]
 
-    # Zero-config docker-agent path: ensure the prod agent image so read-only agent
-    # tasks run in the prod container. `check` probes (no side effects); `start`
-    # actually builds/pulls. Fail-closed — a None image leaves the docker-agent path
-    # OFF (bwrap-or-decline), preserving the pre-feature behavior.
-    tag = resolve_agent_image_tag(getattr(args, "agent_image", None))
-    image_result = ensure_agent_image(
-        tag=tag,
-        docker_usable=_docker_usable(),
-        build=getattr(args, "build_image", True),
-        pull_ref=getattr(args, "pull", None),
-        probe_only=(args.command == "check"),
+    # Docker-agent opt-in: explicit --docker-agent flag, BLUEPRINT_AGENT_BACKEND=docker,
+    # or --pull (pulling a registry image is inherently a docker operation). Without an
+    # explicit opt-in the docker-agent path stays OFF: bwrap handles all agent tasks.
+    # This is the deliberate bwrap-first preference: docker is never auto-enabled just
+    # because docker happens to be usable on the host.
+    docker_opted_in = (
+        getattr(args, "docker_agent", False)
+        or os.environ.get("BLUEPRINT_AGENT_BACKEND", "").strip().lower() == "docker"
+        or getattr(args, "pull", None) is not None
     )
+    if docker_opted_in:
+        tag = resolve_agent_image_tag(getattr(args, "agent_image", None))
+        image_result = ensure_agent_image(
+            tag=tag,
+            docker_usable=_docker_usable(),
+            build=getattr(args, "build_image", True),
+            pull_ref=getattr(args, "pull", None),
+            probe_only=(args.command == "check"),
+        )
+    else:
+        image_result = AgentImageResult(
+            None,
+            False,
+            "docker-agent path OFF (bwrap is default; pass --docker-agent or set "
+            "BLUEPRINT_AGENT_BACKEND=docker to enable the prod-image path).",
+        )
     _print_docker_agent_status(image_result)
 
     if args.command == "check":

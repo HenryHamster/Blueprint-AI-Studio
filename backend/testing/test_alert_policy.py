@@ -75,6 +75,43 @@ def test_self_repo_keeps_existing_domain_alert_defaults():
     assert decision.domain == DOMAIN_RELEASE_LIFECYCLE
 
 
+def test_deploy_identity_grants_default_domains_to_matching_repo(monkeypatch):
+    # A project that is NOT flagged is_self_repo but whose GitHub repo IS the
+    # stamped deploy identity gets the self-repo default domains — classification
+    # follows deploy identity, not the per-project boolean.
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+    project = make_project(
+        is_self_repo=False, github_owner="acme", github_repo="widget"
+    )
+
+    decision = should_emit_project_alert(
+        project,
+        "release.calcifying",
+        severity=AlertSeverity.WARNING,
+    )
+
+    assert decision.emit is True
+    assert decision.domain == DOMAIN_RELEASE_LIFECYCLE
+
+
+def test_deploy_identity_denies_default_domains_to_misset_self_repo(monkeypatch):
+    # is_self_repo misset True but the repo is NOT the deploy identity → the
+    # self-repo default domains are withheld (identity is authoritative).
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+    project = make_project(
+        is_self_repo=True, github_owner="other", github_repo="proj"
+    )
+
+    decision = should_emit_project_alert(
+        project,
+        "release.calcifying",
+        severity=AlertSeverity.WARNING,
+    )
+
+    assert decision.emit is False
+    assert decision.reason == f"domain_disabled:{DOMAIN_RELEASE_LIFECYCLE}"
+
+
 def test_non_alert_routes_do_not_create_durable_alerts():
     project = make_project(is_self_repo=True)
 

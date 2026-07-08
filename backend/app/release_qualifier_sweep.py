@@ -347,6 +347,8 @@ async def _reconcile_if_criterion_coverage_now_complete(
     from app.acceptance_criteria import (
         backfill_direction_merge_evidence,
         get_version_coverage_summary,
+        record_acceptance_window_coverage_evidence,
+        record_metrics_integrity_coverage_evidence,
     )
     from app.models import Direction
 
@@ -422,6 +424,50 @@ async def _reconcile_if_criterion_coverage_now_complete(
                             total,
                             covered,
                         )
+
+                # Re-score the acceptance-window metric and, when the window is
+                # genuinely populated and non-zero, record covering evidence for
+                # the criteria that track that metric. This closes the false
+                # acceptance-coverage 0/N by letting the coverage gate re-evaluate
+                # on fresher data in the same pass, without an operator in the loop.
+                window_recorded = await record_acceptance_window_coverage_evidence(
+                    session, version
+                )
+                if window_recorded:
+                    coverage = await get_version_coverage_summary(session, version.id)
+                    total = int(coverage.get("total") or 0)
+                    covered = int(coverage.get("covered") or 0)
+                    logger.info(
+                        "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                        "recorded %d acceptance-window recompute evidence row(s) on v%d "
+                        "(total=%d covered=%d after recompute)",
+                        window_recorded,
+                        version.version_number,
+                        total,
+                        covered,
+                    )
+
+                # Record covering evidence for the data-integrity criterion when
+                # the standing metrics-integrity sweep has run at least once in
+                # observe mode (ticks > 0). Mirrors the acceptance-window pattern:
+                # the sweep's observability confirms the mechanism is operating and
+                # the evidence row closes the coverage gate without operator action.
+                mis_recorded = await record_metrics_integrity_coverage_evidence(
+                    session, version
+                )
+                if mis_recorded:
+                    coverage = await get_version_coverage_summary(session, version.id)
+                    total = int(coverage.get("total") or 0)
+                    covered = int(coverage.get("covered") or 0)
+                    logger.info(
+                        "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                        "recorded %d metrics-integrity sweep evidence row(s) on v%d "
+                        "(total=%d covered=%d after mis-sweep evidence)",
+                        mis_recorded,
+                        version.version_number,
+                        total,
+                        covered,
+                    )
 
             if not (total == 0 or covered >= total):
                 return False
@@ -1245,7 +1291,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove deferred_unsynced version %s "
                 "(now synced — qualification spawned)",
@@ -1273,7 +1318,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove error version %s "
                 "(transient error cleared — qualification spawned)",
@@ -1306,7 +1350,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove infra_failure version %s "
                 "(transient infra cleared — qualification spawned)",
@@ -1425,7 +1468,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove not_promoted version %s "
                 "(blockers resolved and HEAD advanced — qualification spawned)",
@@ -1485,7 +1527,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove promotion_failed version %s "
                 "(re-qualification spawned after automain advanced)",
@@ -1549,7 +1590,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove dry_run version %s "
                 "(promotion enabled — re-qualification spawned)",

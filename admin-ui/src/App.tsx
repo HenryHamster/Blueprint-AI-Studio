@@ -371,6 +371,7 @@ export default function App() {
         task_id: null,
         created_at: new Date().toISOString(),
         dismissed_at: null,
+        acknowledged_at: null,
       });
     }
     if (allInCooldown && exhaustedZones.length === 0) {
@@ -383,6 +384,7 @@ export default function App() {
         task_id: null,
         created_at: new Date().toISOString(),
         dismissed_at: null,
+        acknowledged_at: null,
       });
     } else if (cooldownZones.length > 0 && exhaustedZones.length === 0) {
       alerts.push({
@@ -394,6 +396,7 @@ export default function App() {
         task_id: null,
         created_at: new Date().toISOString(),
         dismissed_at: null,
+        acknowledged_at: null,
       });
     }
     return alerts.filter(a => !dismissedZoneAlertIds.has(a.id));

@@ -91,6 +91,7 @@ from app.artifact_prerequisites import (
 )
 from app.landed_signal import merge_verification_status as _merge_verification_status
 from app.acceptance_gate import record_artifact_consumptions_for_task
+from app.acceptance_gate import stamp_changed_files_signal
 from app.time_utils import _utcnow, exponential_backoff, set_retry_after
 from app.agent_status_spawn import (
     _recover_poisoned_session,
@@ -1619,7 +1620,10 @@ async def update_agent_status(
                 ):
                     ctx = dict(task.context or {})
                     if payload.changed_files:
-                        ctx["_pr_changed_files"] = payload.changed_files[:50]
+                        # Non-lossy summary over the full list so a >50-file PR is
+                        # never silently misclassified by the acceptance classifier
+                        # (see acceptance_gate.stamp_changed_files_signal).
+                        ctx.update(stamp_changed_files_signal(payload.changed_files))
                         related = (
                             ctx.get("related_files")
                             or task.first_payload.get("related_files")
@@ -1672,7 +1676,11 @@ async def update_agent_status(
             ):
                 ctx = dict(task.context or {})
                 if payload.changed_files:
-                    ctx["_pr_changed_files"] = payload.changed_files[:50]
+                    # Truncating _pr_changed_files to 50 entries silently drops
+                    # paths the acceptance classifier treats as complete; carry
+                    # the non-lossy full-list summary so a >50-file PR is never
+                    # misclassified (see acceptance_gate.stamp_changed_files_signal).
+                    ctx.update(stamp_changed_files_signal(payload.changed_files))
                     related = (
                         ctx.get("related_files")
                         or task.first_payload.get("related_files")
@@ -1990,6 +1998,7 @@ async def update_agent_status(
                             # into task.context; pass them through so quota-exhausted accounts get
                             # the flat 24h cooldown and server-provided retry hints are honored.
                             _rl_ctx = task.context or {}
+                            _rl_task_type = (task.first_payload or {}).get("type") or None
                             await disable_account_model(
                                 acct_id,
                                 model,
@@ -1997,6 +2006,7 @@ async def update_agent_status(
                                     "rate_limit_retry_after_seconds"
                                 ),
                                 kind=_rl_ctx.get("rate_limit_kind") or "rate_limit",
+                                task_type=_rl_task_type,
                             )
                         # EXTERNAL_API: don't disable account (transient outage)
 
@@ -3262,7 +3272,8 @@ async def update_agent_status(
                     _acct_id_outcome = get_task_llm_account_id(task)
                     if _acct_id_outcome:
                         try:
-                            await record_task_outcome(_acct_id_outcome, success=False)
+                            _task_type_outcome = (task.first_payload or {}).get("type") or None
+                            await record_task_outcome(_acct_id_outcome, success=False, task_type=_task_type_outcome)
                         except Exception as _outcome_err:
                             logger.warning(
                                 f"[AGENT_STATUS] record_task_outcome failed for {_acct_id_outcome}: {_outcome_err}"

@@ -48,7 +48,19 @@ verified > merged or proven > declared), ``first_attempt_rate_denominator_covera
 ``_first_attempt_succeeded`` so the FA-rate denominator is representative), and
 ``sr_catch_rate_cache_freshness`` (checks that each project's persisted
 ``sr_catch_rate_trends`` cache is within the staleness window so operators see
-up-to-date catch-rate trends).
+up-to-date catch-rate trends), ``evidence_claim_reconciliation``
+(re-verifies structured gap ``evidence_refs`` against HEAD via the tri-state
+path helper and flags gaps whose path-backed proven evidence was definitely
+removed — contradicted — or whose evidence is absent while the gap claims
+closure; an indeterminate (None) check NEVER flags), and
+``capability_claim_reconciliation`` (re-verifies each working/partial capability's
+``backing_paths`` against HEAD via the same tri-state helper and flags capabilities
+whose EVERY declared backing path was definitely removed; indeterminate (None)
+and planned capabilities are NEVER flagged), and
+``merged_pr_count_consistency`` (recomputes merged-PR counts with the canonical
+rollup-aware definition — excluding rollup-parent task ids — and flags any project
+where the naive count (used by llm_cost_per_merged_pr and merge_rate totals)
+exceeds the canonical count; the delta is the rollup double-count).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -2060,6 +2072,365 @@ async def check_first_attempt_rate_denominator_coverage(
 
 
 @register_check(
+    "acceptance_window_sub_scores_invariant",
+    "Scan recent ReleaseVersion qualification verdicts and flag any that violate "
+    "the acceptance_window population invariants (verified <= write_total <= "
+    "total_all_merges; fraction == verified/write_total or None when write_total=0).",
+)
+async def check_acceptance_window_sub_scores_invariant(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: the ``acceptance_window_*`` fields recorded in
+    ``last_qualification["sub_scores"]`` must satisfy the population invariants
+    defined by ``acceptance_window_sub_scores_violations`` — the same invariants
+    the release-qualifier writes when it restricts the denominator to
+    WRITE_TASK_TYPES merges.
+
+    A violation means the numerator/denominator pair was written inconsistently
+    (e.g. the old mixed-population bug where the denominator counted ALL landed
+    merges while the numerator only counted write-task verified merges). Flag-only:
+    never mutates the verdict it audits. Verdicts that predate the
+    acceptance_window keys (legacy rows) are skipped, not falsely flagged.
+
+    Bounded to ``max_projects`` open ReleaseVersion rows.
+    """
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+    from app.models import ReleaseVersion
+
+    versions = (
+        await ctx.session.execute(
+            select(ReleaseVersion)
+            .where(ReleaseVersion.status == "open")
+            .limit(ctx.max_projects)
+        )
+    ).scalars().all()
+
+    if not versions:
+        return [
+            CheckResult(
+                check="acceptance_window_sub_scores_invariant",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no open ReleaseVersion rows to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for version in versions:
+        pid = str(version.project_id)
+        qual = version.last_qualification or {}
+        sub_scores = qual.get("sub_scores") or {}
+        violations = acceptance_window_sub_scores_violations(sub_scores)
+        if violations is None:
+            # Should never happen (helper always returns a list), but guard.
+            continue
+        # Skip when the new population keys are absent — covers both the zero-key
+        # case and the pre-fix 3-key schema (total/verified/fraction without the
+        # write_total/total_all_merges population keys).
+        from app.acceptance_gate import _ACCEPTANCE_WINDOW_POPULATION_KEYS
+
+        has_fields = any(k in sub_scores for k in _ACCEPTANCE_WINDOW_POPULATION_KEYS)
+        if not has_fields:
+            results.append(
+                CheckResult(
+                    check="acceptance_window_sub_scores_invariant",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail=(
+                        f"version {version.id}: last_qualification sub_scores "
+                        "lacks acceptance_window fields (legacy verdict)"
+                    ),
+                )
+            )
+            continue
+
+        any_checked = True
+        if violations:
+            results.append(
+                CheckResult(
+                    check="acceptance_window_sub_scores_invariant",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=int(sub_scores.get("acceptance_window_verified") or 0),
+                    ground_truth=int(
+                        sub_scores.get("acceptance_window_write_total") or 0
+                    ),
+                    delta=len(violations),
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"version {version.id}: "
+                        + "; ".join(violations[:3])
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="acceptance_window_sub_scores_invariant",
+                    status=CheckStatus.OK,
+                    self_reported=int(sub_scores.get("acceptance_window_verified") or 0),
+                    ground_truth=int(
+                        sub_scores.get("acceptance_window_write_total") or 0
+                    ),
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"version {version.id}: acceptance_window sub_scores consistent"
+                    ),
+                )
+            )
+
+    if not any_checked and not any(
+        r.status != CheckStatus.SKIPPED for r in results
+    ):
+        return [
+            CheckResult(
+                check="acceptance_window_sub_scores_invariant",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no open versions with acceptance_window fields found",
+            )
+        ]
+
+    return results
+
+
+@register_check(
+    "undeclared_test_cochange_coverage_split",
+    "Report the split between undeclared merges with inferrable test co-change "
+    "coverage vs bare-undeclared (no test files or no production files), providing "
+    "visibility into whether agents are already shipping tests.",
+)
+async def check_undeclared_test_cochange_coverage_split(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Observe-only metric: split of undeclared merges by inferred test co-change.
+
+    Ground truth: among recent COMPLETED tasks with a PR artifact (landed merges)
+    that carry NO explicit acceptance verdict, count the split between:
+      - inferred_test_cochange: CI-verified merge with both test + production files
+      - bare_undeclared: all other undeclared (either no test files or no prod files)
+
+    Reports metrics only, never flags. Answers whether agents are shipping tests
+    (high inferred fraction) or tests are genuinely absent (all bare-undeclared).
+    Bounded to the most recent ``sample_limit`` PR-artifact COMPLETED tasks.
+    """
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        _is_test_path,
+        _context_merge_verification_status,
+    )
+    from app.landed_signal import has_landed_signal
+    from app.models import Artifact, ArtifactType, Task, TaskStatus
+
+    # Bounded: newest PR-artifact task ids first, capped at the sample limit.
+    pr_task_id_rows = (
+        await ctx.session.execute(
+            select(Artifact.task_id)
+            .where(Artifact.artifact_type == ArtifactType.PULL_REQUEST)
+            .order_by(Artifact.created_at.desc())
+            .limit(ctx.sample_limit)
+        )
+    ).all()
+    pr_task_ids = [row[0] for row in pr_task_id_rows]
+    if not pr_task_ids:
+        return [
+            CheckResult(
+                check="undeclared_test_cochange_coverage_split",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no PR-artifact tasks in sample window",
+            )
+        ]
+
+    tasks = (
+        await ctx.session.execute(
+            select(Task).where(
+                Task.id.in_(pr_task_ids),
+                Task.status == TaskStatus.COMPLETED,
+            )
+        )
+    ).scalars().all()
+
+    # Filter to landed tasks with no explicit acceptance verdict (undeclared).
+    undeclared_tasks: List[Task] = []
+    for t in tasks:
+        if not has_landed_signal(t):
+            continue
+        recorded = (t.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if isinstance(recorded, dict):
+            # Explicit verdict recorded — not undeclared.
+            continue
+        undeclared_tasks.append(t)
+
+    if not undeclared_tasks:
+        return [
+            CheckResult(
+                check="undeclared_test_cochange_coverage_split",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no landed undeclared merges in sample window",
+            )
+        ]
+
+    # Classify each undeclared task: does it have inferred test co-change?
+    # Per-project counters for split.
+    per_project_split: Dict[str, Dict[str, int]] = {}
+
+    for t in undeclared_tasks:
+        pid = str(t.project_id)
+        if pid not in per_project_split:
+            per_project_split[pid] = {
+                "inferred_test_cochange": 0,
+                "bare_undeclared": 0,
+            }
+
+        # Check merge verification status.
+        if _context_merge_verification_status(t.context) != "verified":
+            # No-CI gate fall-open: not verified, so no inferred test co-change.
+            per_project_split[pid]["bare_undeclared"] += 1
+            continue
+
+        # Verified merge: check for test + production files.
+        changed = t.context.get("_pr_changed_files") if t.context else None
+        if not isinstance(changed, list):
+            # No changed files recorded: bare undeclared.
+            per_project_split[pid]["bare_undeclared"] += 1
+            continue
+
+        str_paths = [p for p in changed if isinstance(p, str) and p.strip()]
+        has_test = any(_is_test_path(p) for p in str_paths)
+        has_prod = any(not _is_test_path(p) for p in str_paths)
+
+        if has_test and has_prod:
+            per_project_split[pid]["inferred_test_cochange"] += 1
+        else:
+            per_project_split[pid]["bare_undeclared"] += 1
+
+    # Report per project.
+    results: List[CheckResult] = []
+    for pid in sorted(per_project_split.keys()):
+        counts = per_project_split[pid]
+        inferred = counts["inferred_test_cochange"]
+        bare = counts["bare_undeclared"]
+        total = inferred + bare
+
+        # Observe-only: report the split with OK status (never flagged).
+        # Use self_reported for inferred count, ground_truth for bare count.
+        results.append(
+            CheckResult(
+                check="undeclared_test_cochange_coverage_split",
+                status=CheckStatus.OK,
+                self_reported=inferred,
+                ground_truth=bare,
+                delta=total,
+                subject=pid,
+                detail=(
+                    f"undeclared merges: {inferred} with inferred test co-change "
+                    f"(verified + test + prod files), {bare} bare-undeclared "
+                    f"({inferred + bare} total)"
+                ),
+            )
+        )
+
+    return results
+
+
+@register_check(
+    "acceptance_window_fraction_recompute",
+    "Recompute acceptance_window_fraction over the current open version's write-task "
+    "merge window and report it alongside the per-bucket and undeclared-reason split. "
+    "This is the operator-visible artifact proving whether inferred_test_cochange lifts "
+    "the fraction off zero on real data — or, if it stays zero, the reason split IS the "
+    "documented reframe. Reports metrics only; never flags.",
+)
+async def check_acceptance_window_fraction_recompute(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Observe-only: live recompute of acceptance_window_fraction + breakdown.
+
+    For each of the first ``max_projects`` projects with an open version, calls
+    :func:`release_qualifier._compute_acceptance_window_aggregate` — the SAME code
+    path the qualification verdict uses — and reports the recomputed fraction and
+    the per-bucket / undeclared-reason breakdown. ``self_reported`` carries the
+    verified numerator, ``ground_truth`` the write-task denominator, and ``delta``
+    the count of undeclared merges that the ``inferred_test_cochange`` bucket did
+    NOT rescue (bare undeclared), so operators see the recompute against real data.
+    Never flags: a genuinely-zero fraction is reported (not a violation), with the
+    reason split explaining exactly why.
+    """
+    from app.acceptance_gate import (
+        ACCEPTANCE_AGGREGATE_BUCKETS,
+        _UNDECLARED_REASON_KEYS,
+    )
+    from app.models import Project
+    from app.release_qualifier import _compute_acceptance_window_aggregate
+    from app.release_version import current_open_version
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="acceptance_window_fraction_recompute",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for (project_id,) in projects:
+        pid = str(project_id)
+        open_version = await current_open_version(ctx.session, project_id)
+        if open_version is None:
+            results.append(
+                CheckResult(
+                    check="acceptance_window_fraction_recompute",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open version",
+                )
+            )
+            continue
+
+        agg = await _compute_acceptance_window_aggregate(ctx.session, open_version)
+        write_total = int(agg.get("acceptance_window_write_total") or 0)
+        verified = int(agg.get("acceptance_window_verified") or 0)
+        fraction = agg.get("acceptance_window_fraction")
+        buckets = agg.get("acceptance_window_buckets") or {}
+        reasons = agg.get("acceptance_window_undeclared_reasons") or {}
+        undeclared = int(buckets.get("undeclared") or 0)
+
+        frac_str = "None" if fraction is None else f"{fraction:.3f}"
+        bucket_str = ", ".join(
+            f"{name}={buckets.get(name, 0)}" for name in ACCEPTANCE_AGGREGATE_BUCKETS
+        )
+        reason_str = ", ".join(
+            f"{name}={reasons.get(name, 0)}" for name in _UNDECLARED_REASON_KEYS
+        )
+        results.append(
+            CheckResult(
+                check="acceptance_window_fraction_recompute",
+                status=CheckStatus.OK,
+                self_reported=verified,
+                ground_truth=write_total,
+                delta=undeclared,
+                subject=pid,
+                detail=(
+                    f"acceptance_window_fraction={frac_str} "
+                    f"(verified {verified}/{write_total}); "
+                    f"buckets: {bucket_str}; undeclared_reasons: {reason_str}"
+                ),
+            )
+        )
+
+    return results
+
+
+@register_check(
     "sr_catch_rate_cache_freshness",
     "Check that design_doc['sr_catch_rate_trends']['computed_at'] is within the "
     "staleness window so operators see current catch-rate trends.",
@@ -2166,4 +2537,592 @@ async def check_sr_catch_rate_cache_freshness(
                     ),
                 )
             )
+    return results
+
+
+@register_check(
+    "evidence_claim_reconciliation",
+    "Re-verify structured gap evidence_refs against HEAD and flag active gaps "
+    "whose path-backed proven evidence was definitely removed (contradicted), or "
+    "whose evidence is absent while the gap claims closure. An indeterminate "
+    "(None) path check NEVER flags — only a definite removal counts as stale.",
+)
+async def check_evidence_claim_reconciliation(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: a gap that carries a ``proven`` structured evidence ref
+    pointing at a file/test path (``named_test`` / ``backing_path``, or any ref
+    whose ``ref`` is a repo file path) only remains proven while that path still
+    exists at HEAD. When the backing file was removed the proof is void — the
+    evidence is *contradicted* even though the stored ``proven`` flag still reads
+    True. This standing check re-verifies each path-backed proven ref via the
+    same tri-state helper the capability backing-path verifier uses
+    (:func:`app.source_ref_validation._path_exists_at_head`) and flags gaps whose
+    proof no longer holds.
+
+    CRITICAL HONESTY RULE: the path helper returns True / False / None. Only a
+    definite ``False`` (path removed at HEAD) counts as stale/contradicted. A
+    ``None`` (no checkout, git error, timeout, rate limit) degrades to
+    ``unverified`` and is NEVER flagged — an indeterminate check must not be
+    laundered into "removed".
+
+    Flag-only and side-effect-free in every mode: it reads ``problem_model``
+    JSONB directly and only constructs :class:`CheckResult` values — it NEVER
+    mutates the durable gap. In ``observe`` mode the sweep records to the bounded
+    observability ring only; enforce-mode enrollment flows through the standard
+    :func:`_enroll_flag_finding` path. Bounded to ``ctx.max_projects`` projects.
+    """
+    from app import source_ref_validation as _srv
+    from app.evidence_primitive import (
+        PATH_BACKED_KINDS,
+        claim_contradicts_evidence,
+        classify_evidence,
+    )
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.problem_model).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="evidence_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    def _is_path_backed_ref(kind: Any, ref_str: str) -> bool:
+        """Whether ``ref_str`` names a file/test path re-checkable against HEAD."""
+        if kind in PATH_BACKED_KINDS:
+            return True
+        # A ref of any other kind is only re-verified when it literally looks
+        # like a repo file path (logical ids — criterion keys, artifact ids —
+        # are not resolvable by a path check and are left untouched).
+        return _srv._looks_like_file_path(ref_str)
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for project_id, raw_pm in projects:
+        pid = str(project_id)
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        gaps = pm.get("gaps") if isinstance(pm, dict) else None
+        if not isinstance(gaps, list) or not gaps:
+            continue
+
+        gaps_with_refs = 0
+        flagged_details: List[str] = []
+        total_proven_refs = 0
+        total_stale_refs = 0
+        for gap in gaps:
+            if not isinstance(gap, dict):
+                continue
+            refs = gap.get("evidence_refs")
+            if not isinstance(refs, list) or not refs:
+                continue
+            gaps_with_refs += 1
+
+            # Re-verify each PROVEN, path-backed ref against HEAD. A proven ref
+            # whose file is definitely removed (False) makes the gap's evidence
+            # contradicted; None (indeterminate) is left untouched, never stale.
+            proven_refs = 0
+            stale_refs: List[str] = []
+            for ref in refs:
+                if not isinstance(ref, dict) or ref.get("proven") is not True:
+                    continue
+                ref_str = ref.get("ref")
+                if not isinstance(ref_str, str) or not ref_str:
+                    continue
+                if not _is_path_backed_ref(ref.get("kind"), ref_str):
+                    continue
+                proven_refs += 1
+                exists = await _srv._path_exists_at_head(ref_str)
+                if exists is False:
+                    stale_refs.append(ref_str)
+                # True (present) or None (indeterminate) → not stale.
+
+            # Stored classification, then override to contradicted ONLY on a
+            # definite removal. classify_evidence never returns contradicted on
+            # its own — that verdict requires the ground-truth re-check above.
+            evidence_status = classify_evidence(refs)
+            if stale_refs:
+                evidence_status = "contradicted"
+            total_proven_refs += proven_refs
+            total_stale_refs += len(stale_refs)
+
+            gap_id = gap.get("id", "unknown")
+            gap_status = gap.get("status")
+            # Flag when a proven ref was definitely removed, OR when the gap
+            # claims closure while its evidence fails to back it (unproven /
+            # contradicted). An in-progress ("active"/"blocked") gap with
+            # merely-unproven evidence is expected and never flagged.
+            if stale_refs:
+                flagged_details.append(
+                    f"gap {gap_id}: {len(stale_refs)} proven evidence ref(s) "
+                    f"removed at HEAD (e.g. {stale_refs[0]}) — proof contradicted"
+                )
+            elif claim_contradicts_evidence(gap_status, evidence_status):
+                flagged_details.append(
+                    f"gap {gap_id}: claims {gap_status} but evidence is "
+                    f"{evidence_status}"
+                )
+
+        if gaps_with_refs == 0:
+            # No gap in this project carries structured evidence refs — nothing
+            # to reconcile. Emit a per-project SKIPPED for observability parity.
+            results.append(
+                CheckResult(
+                    check="evidence_claim_reconciliation",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no gaps carry structured evidence_refs",
+                )
+            )
+            continue
+
+        any_checked = True
+        if flagged_details:
+            preview = "; ".join(flagged_details[:3])
+            if len(flagged_details) > 3:
+                preview += f" (+{len(flagged_details) - 3} more)"
+            results.append(
+                CheckResult(
+                    check="evidence_claim_reconciliation",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total_proven_refs,
+                    ground_truth=total_proven_refs - total_stale_refs,
+                    delta=len(flagged_details),
+                    severity="warn",
+                    subject=pid,
+                    detail=preview,
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="evidence_claim_reconciliation",
+                    status=CheckStatus.OK,
+                    self_reported=total_proven_refs,
+                    ground_truth=total_proven_refs,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"{gaps_with_refs} gap(s) with evidence_refs reconciled; "
+                        "all path-backed proven refs still present at HEAD"
+                    ),
+                )
+            )
+
+    if not any_checked and not results:
+        return [
+            CheckResult(
+                check="evidence_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no gaps with structured evidence_refs in any project",
+            )
+        ]
+    return results
+
+
+@register_check(
+    "saturated_direction_with_nonmerge_productivity",
+    "Detect directions marked possibly_saturated that carry recent non-merge "
+    "productive outcomes (verified merges, acceptance evidence) — flags the "
+    "self-reported stale saturation state.",
+)
+async def check_saturated_direction_with_nonmerge_productivity(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: a direction marked possibly_saturated should not simultaneously
+    carry evidence of recent non-merge productive outcomes (verification verdicts,
+    acceptance evidence). When this contradiction exists, the saturation flag is
+    stale — productivity has been recorded but not credited by the classifier.
+
+    Non-merge productivity indicators in research_history:
+    - verified_prs_merged > 0 (CI-verified merge verdicts)
+    - acceptance_proven_merged > 0 (proof evidence accumulated)
+    - acceptance_verified_merged > 0 (verified acceptance evidence)
+
+    These are "non-merge" outcomes in the sense that the productivity does not
+    come from newly-spawned child tasks, but from verification / proof cycles
+    on existing direction state — exactly the pattern the fix (#13378) credits.
+
+    Flag-only: never mutates direction data. Bounded to max_projects projects.
+    """
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.directions).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="saturated_direction_with_nonmerge_productivity",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for project_id, directions in projects:
+        pid = str(project_id)
+        for d in directions or []:
+            if not d.get("possibly_saturated"):
+                continue
+
+            # Check for non-merge productive outcomes in recent research_history
+            history = d.get("research_history") or []
+            has_nonmerge_outcome = False
+            detail_parts: List[str] = []
+
+            for entry in history:
+                verified = int(entry.get("verified_prs_merged") or 0)
+                acceptance_proven = int(entry.get("acceptance_proven_merged") or 0)
+                acceptance_verified = int(entry.get("acceptance_verified_merged") or 0)
+
+                if verified > 0 or acceptance_proven > 0 or acceptance_verified > 0:
+                    has_nonmerge_outcome = True
+                    if verified > 0:
+                        detail_parts.append(f"verified={verified}")
+                    if acceptance_proven > 0:
+                        detail_parts.append(f"proven={acceptance_proven}")
+                    if acceptance_verified > 0:
+                        detail_parts.append(f"verified_evidence={acceptance_verified}")
+                    break  # Found at least one; enough to flag
+
+            if has_nonmerge_outcome:
+                direction_id = d.get("id", "unknown")
+                results.append(
+                    CheckResult(
+                        check="saturated_direction_with_nonmerge_productivity",
+                        status=CheckStatus.FLAGGED,
+                        self_reported=1,
+                        ground_truth=0,
+                        delta=1,
+                        severity="warn",
+                        subject=pid,
+                        detail=(
+                            f"direction {direction_id} marked possibly_saturated but has "
+                            f"recent non-merge productive outcomes: {', '.join(detail_parts[:2])}"
+                        ),
+                    )
+                )
+
+    if not results:
+        return [
+            CheckResult(
+                check="saturated_direction_with_nonmerge_productivity",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no saturated directions with non-merge productivity found",
+            )
+        ]
+
+    return results
+
+
+@register_check(
+    "capability_claim_reconciliation",
+    "Re-verify working/partial capability backing_paths against HEAD and flag "
+    "capabilities whose EVERY declared backing path was definitely removed. An "
+    "indeterminate (None) path check NEVER flags — only definite removal counts.",
+)
+async def check_capability_claim_reconciliation(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: a capability declared 'working' or 'partial' whose
+    ``backing_paths`` ALL return a definite False from the tri-state HEAD check is
+    claiming operational status while its backing code no longer exists. This
+    standing check re-verifies each backing path via
+    :func:`app.source_ref_validation._path_exists_at_head` and flags the
+    capability only when EVERY path is definitively removed.
+
+    CRITICAL HONESTY RULE (mirrors ``evidence_claim_reconciliation`` exactly): the
+    path helper returns True / False / None. Only a definite ``False`` for ALL
+    declared paths triggers a flag. A single ``True`` (still present) OR a single
+    ``None`` (indeterminate: no checkout, git error, timeout, rate-limit) anywhere
+    in the path list PREVENTS the flag — an outage must never be laundered into
+    'removed'. ``planned`` capabilities are aspirational (code not yet built) and
+    are NEVER flagged for absent backing paths.
+
+    Flag-only and side-effect-free in every mode: reads ``problem_model`` JSONB
+    directly and only constructs :class:`CheckResult` values — NEVER mutates the
+    durable capability. Bounded to ``ctx.max_projects`` projects.
+    """
+    from app import source_ref_validation as _srv
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.problem_model).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="capability_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for project_id, raw_pm in projects:
+        pid = str(project_id)
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        capabilities = pm.get("capabilities") if isinstance(pm, dict) else None
+        if not isinstance(capabilities, list) or not capabilities:
+            continue
+
+        # Eligible: working/partial capabilities with at least one file-path-shaped
+        # backing_path. planned capabilities are aspirational — never flagged.
+        eligible: List[dict] = []
+        for cap in capabilities:
+            if not isinstance(cap, dict):
+                continue
+            if cap.get("status") not in ("working", "partial"):
+                continue
+            paths = cap.get("backing_paths")
+            if not isinstance(paths, list) or not paths:
+                continue
+            # Keep only paths that look like repo file paths; skip logical ids.
+            file_paths = [
+                p for p in paths
+                if isinstance(p, str) and p and _srv._looks_like_file_path(p)
+            ]
+            if not file_paths:
+                continue
+            eligible.append({"cap": cap, "file_paths": file_paths})
+
+        if not eligible:
+            results.append(
+                CheckResult(
+                    check="capability_claim_reconciliation",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no working/partial capabilities with backing_paths to audit",
+                )
+            )
+            continue
+
+        any_checked = True
+        audited = len(eligible)
+        flagged_caps: List[str] = []
+
+        for item in eligible:
+            cap = item["cap"]
+            file_paths = item["file_paths"]
+
+            # Re-verify each backing path. A single True or None prevents a flag.
+            all_removed = True
+            for path in file_paths:
+                exists = await _srv._path_exists_at_head(path)
+                if exists is True or exists is None:
+                    # Present or indeterminate — do NOT flag. Stop early.
+                    all_removed = False
+                    break
+                # exists is False — definitely removed; keep checking remaining paths.
+
+            if all_removed:
+                cap_name = cap.get("name") or cap.get("id") or "unknown"
+                flagged_caps.append(cap_name)
+
+        if flagged_caps:
+            preview = ", ".join(flagged_caps[:3])
+            if len(flagged_caps) > 3:
+                preview += f" (+{len(flagged_caps) - 3} more)"
+            results.append(
+                CheckResult(
+                    check="capability_claim_reconciliation",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=audited,
+                    ground_truth=audited - len(flagged_caps),
+                    delta=len(flagged_caps),
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{len(flagged_caps)} working/partial capability(ies) whose "
+                        f"every declared backing path was removed at HEAD: {preview}"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="capability_claim_reconciliation",
+                    status=CheckStatus.OK,
+                    self_reported=audited,
+                    ground_truth=audited,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"{audited} working/partial capability(ies) with backing_paths "
+                        "reconciled; all paths still present or indeterminate at HEAD"
+                    ),
+                )
+            )
+
+    if not any_checked and not results:
+        return [
+            CheckResult(
+                check="capability_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no working/partial capabilities with backing_paths in any project",
+            )
+        ]
+    return results
+
+
+@register_check(
+    "merged_pr_count_consistency",
+    "Recompute merged-PR counts with the canonical rollup-aware definition and "
+    "flag projects where the naive count (llm_cost_per_merged_pr / merge_rate) "
+    "exceeds the canonical count; delta is the rollup double-count.",
+)
+async def check_merged_pr_count_consistency(ctx: SweepContext) -> List[CheckResult]:
+    """Ground truth: the CANONICAL merged-PR count excludes rollup-parent task ids
+    so that a rollup landing that credits the parent and all its children is not
+    double-counted. This matches ``efficiency_snapshot._cost_and_merges``.
+
+    The NAIVE count (used by ``llm_cost_attribution._compute_llm_cost_per_merged_pr``
+    and the ``merge_rate`` totals in ``compute_llm_cost_breakdown``) increments for
+    every ``is_merged_completion(t)`` including rollup parents, inflating the
+    denominator when rollup tasks are present in the window.
+
+    When ``naive > canonical`` the project is flagged with:
+    - ``self_reported`` = naive count (what the LLM-cost / merge_rate axes see)
+    - ``ground_truth`` = canonical count (rollup-parent-excluded)
+    - ``delta`` = rollup double-count (number of extra merges from rollup parents)
+
+    If the loaded task volume hits the sample cap the ground truth cannot be
+    trusted as complete — returns ``INCONCLUSIVE`` instead of a partial delta.
+
+    Bounded to the most-recent ``sample_limit`` COMPLETED tasks; groups per project.
+    Flag-only in every mode — never writes to the tasks it audits.
+    """
+    from app.efficiency_snapshot import _rollup_parent_ids
+    from app.landed_signal import is_merged_completion
+    from app.models import Task, TaskStatus
+
+    tasks = (
+        await ctx.session.execute(
+            select(Task)
+            .where(Task.status == TaskStatus.COMPLETED)
+            # Order by created_at, NOT Task.id: task ids are uuid4 (non-monotonic),
+            # so id.desc() yields a quasi-random subset instead of the most recent
+            # tasks — new rollup regressions would land outside the sample with
+            # ~uniform probability and go unaudited. Matches the recency ordering
+            # used by the other DB checks in this module.
+            .order_by(Task.created_at.desc())
+            .limit(ctx.sample_limit + 1)
+        )
+    ).scalars().all()
+
+    if len(tasks) > ctx.sample_limit:
+        return [
+            CheckResult(
+                check="merged_pr_count_consistency",
+                status=CheckStatus.INCONCLUSIVE,
+                subject="global",
+                detail=(
+                    f"terminal-task volume exceeds sample_limit={ctx.sample_limit}; "
+                    "cannot recompute within bounds"
+                ),
+            )
+        ]
+
+    if not tasks:
+        return [
+            CheckResult(
+                check="merged_pr_count_consistency",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no completed tasks in sample window",
+            )
+        ]
+
+    # Group by project.
+    by_project: Dict[str, List[Task]] = {}
+    for t in tasks:
+        by_project.setdefault(str(t.project_id), []).append(t)
+
+    results: List[CheckResult] = []
+    any_merged = False
+
+    for pid, proj_tasks in sorted(by_project.items()):
+        proj_parent_ids = _rollup_parent_ids(proj_tasks)
+        naive = sum(1 for t in proj_tasks if is_merged_completion(t))
+        canonical = sum(
+            1 for t in proj_tasks
+            if is_merged_completion(t) and t.id not in proj_parent_ids
+        )
+
+        if naive == 0:
+            results.append(
+                CheckResult(
+                    check="merged_pr_count_consistency",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no merged completions in sample window",
+                )
+            )
+            continue
+
+        any_merged = True
+
+        if naive > canonical:
+            delta = naive - canonical
+            results.append(
+                CheckResult(
+                    check="merged_pr_count_consistency",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=naive,
+                    ground_truth=canonical,
+                    delta=delta,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"llm_cost_per_merged_pr and merge_rate totals over-count "
+                        f"merged PRs by {delta}: {naive} naive vs {canonical} "
+                        "canonical (rollup-parent-excluded). The delta equals the "
+                        "number of rollup-parent tasks counted as extra merges."
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="merged_pr_count_consistency",
+                    status=CheckStatus.OK,
+                    self_reported=naive,
+                    ground_truth=canonical,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"naive={naive} == canonical={canonical}; "
+                        "no rollup double-count detected in sample window"
+                    ),
+                )
+            )
+
+    if not any_merged and not results:
+        return [
+            CheckResult(
+                check="merged_pr_count_consistency",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no merged completions in sample window",
+            )
+        ]
+
     return results

@@ -153,6 +153,32 @@ export function writeGithubTokenFile(token: string): boolean {
 }
 
 /**
+ * Bash function for generated helpers that need to build JSON request bodies
+ * without assuming `jq` exists on the VM.
+ *
+ * The exact encoder uses python3 when present, then node. If neither is
+ * available, fail loudly rather than silently emitting invalid JSON.
+ */
+export function jsonStrShellFn(): string {
+  return [
+    '# Encode one shell value as a JSON string literal without requiring jq.',
+    '_json_str() {',
+    '  if command -v python3 >/dev/null 2>&1; then',
+    "    printf '%s' \"${1-}\" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))'",
+    '    return $?',
+    '  fi',
+    '  if command -v node >/dev/null 2>&1; then',
+    "    printf '%s' \"${1-}\" | node -e 'const fs=require(\"fs\"); process.stdout.write(JSON.stringify(fs.readFileSync(0,\"utf8\")));'",
+    '    return $?',
+    '  fi',
+    '  echo "[ERROR] no JSON string encoder available (python3/node missing)" >&2',
+    '  return 1',
+    '}',
+    '_json_str "" >/dev/null || exit 1',
+  ].join('\n');
+}
+
+/**
  * Bash functions, emitted into helper scripts that need a fresh GitHub
  * installation token before a git push or GitHub API call.
  *
@@ -179,7 +205,7 @@ export function githubTokenShellFn(): string {
     '  fi',
     '  if [ -z "$GH_TOKEN" ] && [ -n "${ORCHESTRATOR_URL:-}" ] && [ -n "${TASK_ID:-}" ] && [ -n "${TOKEN:-}" ]; then',
     '    _GT_RESP=$(curl -f -sS --max-time 30 -H "X-Agent-Token: $TOKEN" "${ORCHESTRATOR_URL}/api/agent/github/token?task_id=${TASK_ID}" 2>/dev/null) || _GT_RESP=""',
-    '    GH_TOKEN=$(printf "%s" "$_GT_RESP" | jq -r ".data.token // empty" 2>/dev/null || true)',
+    '    GH_TOKEN=$(printf "%s" "$_GT_RESP" | _json_field data.token 2>/dev/null || true)',
     '  fi',
     '  if [ -z "$GH_TOKEN" ]; then',
     '    echo "[ERROR] no GitHub token available (GITHUB_TOKEN_FILE empty and backend API fallback failed)" >&2',
@@ -191,6 +217,58 @@ export function githubTokenShellFn(): string {
     '# Must call _load_github_token first. Usage: _set_github_remote <owner> <repo>',
     '_set_github_remote() {',
     '  git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/$1/$2.git"',
+    '}',
+  ].join('\n');
+}
+
+/**
+ * Bash function, emitted into helpers that PARSE a JSON response without `jq`.
+ * On the strategist VM class `jq` is not reliably present, and the helpers used
+ * `jq -r '.field.sub // empty'` to extract fields from orchestrator/GitHub
+ * responses. `_json_field` replaces that: it reads JSON from stdin and prints
+ * the value at a dot-separated path via `python3 -c` (standard on every agent
+ * VM). An optional second argument sets the default printed when the path is
+ * absent or null (defaults to empty, matching `jq -r '… // empty'`).
+ *
+ * Usage: printf '%s' "$JSON" | _json_field data.token
+ *        printf '%s' "$JSON" | _json_field mergeable null
+ *
+ * Returned as an array of single-quoted lines joined with newlines so no bash
+ * `$`/`${...}` needs escaping through a TypeScript template literal. The python3
+ * inline code is inside a single-quoted argument so bash expansion is off;
+ * Python string literals use double quotes to avoid conflicting with the
+ * enclosing bash single quotes, and TS emits them via single-quoted strings.
+ */
+export function jsonFieldShellFn(): string {
+  return [
+    '# Extract a dot-path field from stdin JSON via python3 (no jq dependency).',
+    '# Usage: printf "%s" "$JSON" | _json_field <dot.path> [default]',
+    '# Reads stdin, walks the dot-separated path through nested objects, and',
+    '# prints the field value if present and non-null; otherwise prints the',
+    '# default (empty when omitted — matches jq -r \'… // empty\').',
+    '_json_field() {',
+    "  python3 -c '",
+    'import json, sys',
+    'try:',
+    '    data = json.loads(sys.stdin.read())',
+    '    path = sys.argv[1]',
+    '    default = sys.argv[2] if len(sys.argv) > 2 else ""',
+    '    parts = path.split(".")',
+    '    for p in parts:',
+    '        if isinstance(data, dict):',
+    '            data = data.get(p)',
+    '        else:',
+    '            data = None',
+    '            break',
+    '    if data is None:',
+    '        sys.stdout.write(default)',
+    '    elif isinstance(data, str):',
+    '        sys.stdout.write(data)',
+    '    else:',
+    '        sys.stdout.write(json.dumps(data))',
+    'except Exception:',
+    '    sys.stdout.write(sys.argv[2] if len(sys.argv) > 2 else "")',
+    "' \"$1\" \"${2:-}\"",
     '}',
   ].join('\n');
 }
@@ -219,10 +297,20 @@ export function agentTokenShellFn(): string {
     '# long-lived resident session authenticates with the ROTATED token, not the',
     '# stale spawn-time env snapshot. Falls back to AGENT_API_TOKEN when the file',
     '# is unset/empty. Re-callable after a 401 to re-read a rotated token.',
+    '_agent_token_looks_like_jwt() {',
+    '  case "${1:-}" in',
+    '    *.*.*) return 0 ;;',
+    '    *) return 1 ;;',
+    '  esac',
+    '}',
     '_load_agent_token() {',
     '  if [ -n "${AGENT_TOKEN_FILE:-}" ] && [ -s "${AGENT_TOKEN_FILE}" ]; then',
     '    TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)',
     '  else',
+    '    TOKEN=""',
+    '  fi',
+    '  if [ -n "$TOKEN" ] && ! _agent_token_looks_like_jwt "$TOKEN"; then',
+    '    echo "[WARN] ignoring invalid AGENT_TOKEN_FILE contents; falling back to AGENT_API_TOKEN" >&2',
     '    TOKEN=""',
     '  fi',
     '  [ -n "$TOKEN" ] || TOKEN="${AGENT_API_TOKEN:-}"',

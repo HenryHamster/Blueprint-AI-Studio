@@ -116,11 +116,23 @@ export function formatProjectBlindSpotSummary(
 // check_results — tests_executed_cleanly, lint_executed_cleanly, typecheck_executed_cleanly,
 // and test_assertion_quality — and to PASS only when the command was actually run on
 // this VM with a zero exit code (or assertions were inspected for the quality check).
-export function formatExecutionEvidenceForSrPrompt(): string {
+// The tests_executed_cleanly wording follows the same project branch as
+// buildCodeChangeHelperGuidance: Blueprint self-repo (no build_config) gets the
+// stack-specific harness guidance; any other project gets wording that defers to
+// its own configured test commands so Blueprint stack identity never leaks into
+// non-Blueprint prompts. Callers outside the self-repo MUST pass
+// { blueprintSelfRepo: false }; the default preserves the shipped self-repo text.
+export function formatExecutionEvidenceForSrPrompt(
+  opts?: { blueprintSelfRepo?: boolean },
+): string {
+  const blueprintSelfRepo = opts?.blueprintSelfRepo ?? true;
+  const testsLine = blueprintSelfRepo
+    ? `- **tests_executed_cleanly** — did the appropriate test command run on this VM and exit 0? (On agent VMs, run targeted backend tests via \`bash scripts/test-backend.sh testing/test_<module>.py\` or \`bash scripts/test-backend.sh --standalone --no-postgres\` per CLAUDE.md; NEVER the full backend suite, which OOMs. For frontend: \`npm run typecheck\`. For agent: \`npx tsc --noEmit\`.)\n`
+    : `- **tests_executed_cleanly** — did the appropriate test command run on this VM and exit 0? (Run this project's configured test command — \`./check test\` runs the configured tests for the directories your changes touched.)\n`;
   return (
     `## Execution-evidence categories (required in check_results)\n` +
     `You MUST populate these four sub-categories every time you write a self-review:\n\n` +
-    `- **tests_executed_cleanly** — did the test suite run on this VM and exit 0?\n` +
+    testsLine +
     `- **lint_executed_cleanly** — did the linter / style checker run on this VM and exit 0?\n` +
     `- **typecheck_executed_cleanly** — did the type-checker run on this VM and exit 0?\n` +
     `- **test_assertion_quality** — for each test added or modified in this PR: does the assertion exercise the specific behavior changed (e.g., a particular output value, a side-effect, a specific error type/message), or is it essentially smoke (e.g., "returns a value", "no exception", asserts truthiness only)? If a test mocks the unit under test, is the mock surface narrow enough that the test still validates the changed logic, or is the changed code path effectively unverified?\n\n` +
@@ -134,7 +146,10 @@ export function formatExecutionEvidenceForSrPrompt(): string {
     `**FAIL rules (command categories):**\n` +
     `- If you did NOT run the command, set passed=false, severity="major", evidence="command not run".\n` +
     `- If the command exited non-zero, set passed=false, severity="major", evidence="exit_code=<N> from <command>".\n` +
-    `- Claiming a command passed when you have no execution log is a FAIL with severity=major.\n\n` +
+    `- Claiming a command passed when you have no execution log is a FAIL with severity=major.\n` +
+    (blueprintSelfRepo
+      ? `- Running the full backend suite (\`bash scripts/test-backend.sh\` with no args) on an agent VM violates CLAUDE.md — use targeted or standalone tests instead.\n\n`
+      : `\n`) +
     `Do not skip these categories or mark them passed without a real exit-code record.\n\n`
   );
 }

@@ -178,6 +178,11 @@ _HISTORY_AGG_DEFAULTS = {
     "total_acceptance_proven_merged": 0,
     "total_acceptance_consumed_merged": 0,
     "total_acceptance_declared_merged": 0,
+    # Lifetime count of undeclared merges upgraded to the inferred_test_cochange
+    # bucket (verified CI + test/prod co-change, no stamped verdict). Folded so
+    # directions past the eviction window keep the inferred-coverage signal.
+    # Disjoint from total_acceptance_declared_merged by construction.
+    "total_acceptance_inferred_merged": 0,
     "total_acceptance_merged_write_total": 0,
     "total_prs_rejected": 0,
     "total_tasks_failed": 0,
@@ -217,6 +222,10 @@ _HISTORY_AGG_DEFAULTS = {
     # established acceptance-coverage consumers) and reused here.
     "total_acceptance_verified_merged": 0,
     "total_acceptance_verified_write_merged": 0,
+    # Lifetime estimated spend folded from evicted cycles. Legacy-0 fallback on
+    # eviction: pre-attribution entries have no recorded cost and contribute 0,
+    # matching the existing legacy-0 convention for other aggregate keys.
+    "total_estimated_cost_usd": 0.0,
 }
 
 _DECOMP_AGG_DEFAULTS = {
@@ -549,6 +558,9 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_acceptance_declared_merged"] += ev.get(
             "acceptance_declared_merged", 0
         )
+        agg["total_acceptance_inferred_merged"] += ev.get(
+            "acceptance_inferred_merged", 0
+        )
         agg["total_acceptance_merged_write_total"] += ev.get(
             "acceptance_merged_write_total", 0
         )
@@ -595,6 +607,13 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
             outcome_kind_breakdown,
             ev.get("outcome_kind_breakdown") or _fallback_outcome_kind_breakdown(ev),
         )
+        # Legacy-0 fallback: pre-attribution entries have no estimated_cost_usd.
+        try:
+            agg["total_estimated_cost_usd"] += max(
+                0.0, float(ev.get("estimated_cost_usd") or 0.0)
+            )
+        except (TypeError, ValueError):
+            pass
         if not agg["first_cycle_at"] and ev.get("timestamp"):
             agg["first_cycle_at"] = ev["timestamp"]
         for scope, stats in (ev.get("scope_breakdown") or {}).items():
@@ -618,10 +637,17 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         for qd in ev.get("decomposition_quality") or []:
             dq["total_decompositions"] += 1
             count = qd.get("subtask_count") or 0
-            dq["subtask_count_sum"] += count
             dq["cross_module_count_sum"] += qd.get("cross_module_count") or 0
             rate = qd.get("subtask_merge_rate")
+            # Only plans that contribute to the weighted-average NUMERATOR may
+            # contribute to its DENOMINATOR. A None-rate plan (subtasks exist
+            # but no merged/failed-not-classified outcome yet) would otherwise
+            # inflate subtask_count_sum without any numerator, biasing the
+            # weighted merge-rate downward. This mirrors the live-history
+            # consumers in spawn_calibration.py, which only add a plan's weight
+            # to `total` when its rate is numeric.
             if isinstance(rate, (int, float)) and count > 0:
+                dq["subtask_count_sum"] += count
                 dq["subtask_merge_rate_weighted_sum"] += float(rate) * count
     normalized_generalized = _normalize_aggregate_generalized_state(agg)
     agg["total_generalized_successes"] = normalized_generalized[
@@ -679,6 +705,7 @@ def build_evicted_cycle_snapshot(entry: dict[str, Any]) -> dict[str, Any]:
         "acceptance_proven_merged": int(entry.get("acceptance_proven_merged") or 0),
         "acceptance_consumed_merged": int(entry.get("acceptance_consumed_merged") or 0),
         "acceptance_declared_merged": int(entry.get("acceptance_declared_merged") or 0),
+        "acceptance_inferred_merged": int(entry.get("acceptance_inferred_merged") or 0),
         "acceptance_merged_write_total": int(
             entry.get("acceptance_merged_write_total") or 0
         ),
@@ -904,6 +931,25 @@ def _compute_rolling_median_review_iterations(d: dict) -> float | None:
     if n % 2 == 1:
         return values[mid]
     return (values[mid - 1] + values[mid]) / 2.0
+
+
+def canonical_cost_per_merged_pr(
+    total_cost: float, total_merged_prs: int
+) -> float | None:
+    """Return cost-per-merged-PR using a population-consistent formula.
+
+    The numerator (total_cost) covers ALL work on a direction — autonomous AND
+    operator-assisted. The denominator MUST cover the same population: ALL
+    merged PRs (autonomous + assisted). Dividing by autonomous-only merges
+    while including assisted costs in the numerator over-states the metric for
+    any direction that accepted operator help, and can trigger spurious
+    retirement flags. This helper is the single source of truth for that
+    population rule so the three compute sites (digest_direction_progress,
+    strategic_analysis, strategic_spawning) can never drift again.
+    """
+    if total_merged_prs <= 0:
+        return None
+    return round(total_cost / total_merged_prs, 4)
 
 
 

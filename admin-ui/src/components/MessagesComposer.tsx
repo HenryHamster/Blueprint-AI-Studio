@@ -4,6 +4,7 @@ import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
+import { MESSAGE_CONTENT_MAX } from '../api';
 
 export interface MessagesComposerProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
@@ -65,6 +66,9 @@ export function MessagesComposer({
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, 96)}px`;
   }
+
+  const overLimit = newContent.length > MESSAGE_CONTENT_MAX;
+  const nearLimit = newContent.length > MESSAGE_CONTENT_MAX * 0.8;
 
   // Hint reflects the server's real decision for the last send when available
   // (the only source that accounts for routine/system event exclusions),
@@ -144,7 +148,7 @@ export function MessagesComposer({
             value={newContent}
             onChange={e => { onChangeContent(e.target.value); handleTextareaInput(); }}
             onKeyDown={e => {
-              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!composerDisabled) onSubmit(); }
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!composerDisabled && !overLimit) onSubmit(); }
             }}
             placeholder={disabledReason ?? (minimal ? 'Message Strategic' : 'Type a message...')}
             rows={1}
@@ -158,7 +162,7 @@ export function MessagesComposer({
         <button
           type="button"
           onClick={onSubmit}
-          disabled={composerDisabled || submitting || !newContent.trim()}
+          disabled={composerDisabled || submitting || !newContent.trim() || overLimit}
           aria-label="Send message"
           title="Send message"
           className={minimal
@@ -171,11 +175,18 @@ export function MessagesComposer({
       </div>
       {/* Steering hint: grounded in the last send's real outcome when available,
           otherwise predicted from the selected type. */}
-      {showHint && (
+      {(showHint || nearLimit) && (
         <div className={minimal ? `${minimalColumnClass} mt-1.5 px-1` : ''}>
-          <p className={`${minimal ? 'text-ui-md text-neutral-600' : 'text-ui-md text-neutral-500'} leading-snug ${minimal ? '' : 'mt-1.5 px-0.5'}`}>
-            {disabledReason ?? hintText}
-          </p>
+          {showHint && (
+            <p className={`${minimal ? 'text-ui-md text-neutral-600' : 'text-ui-md text-neutral-500'} leading-snug ${minimal ? '' : 'mt-1.5 px-0.5'}`}>
+              {disabledReason ?? hintText}
+            </p>
+          )}
+          {nearLimit && (
+            <p className={`text-right text-xs leading-snug ${minimal ? '' : 'px-0.5'} ${showHint ? 'mt-0.5' : (minimal ? '' : 'mt-1.5')} ${overLimit ? 'text-red-400' : 'text-amber-500'}`}>
+              {newContent.length.toLocaleString()} / {MESSAGE_CONTENT_MAX.toLocaleString()}
+            </p>
+          )}
         </div>
       )}
     </div>

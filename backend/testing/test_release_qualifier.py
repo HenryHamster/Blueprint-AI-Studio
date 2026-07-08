@@ -5042,10 +5042,11 @@ class TestChallengedVsUnchallengedTelemetry:
 
         # 3 challenged verdicts with binding synthesis shape (as produced by
         # _compute_challenge_synthesis_from_binding_verdicts after a real merge-test).
-        # Verdict A: 1 refuted, 0 excluded
-        # Verdict B: 2 refuted, 1 excluded
-        # Verdict C: 0 refuted, 0 excluded
-        # Total refuted = 3, n = 3 → challenge_refuted_rate = 1.0
+        # Verdict A: confirmed=1, refuted=1, uncertain=0, excluded=0
+        # Verdict B: confirmed=1, refuted=2, uncertain=0, excluded=1
+        # Verdict C: confirmed=1, refuted=0, uncertain=0, excluded=0
+        # Total refuted = 3, total reviewed = (1+1+0)+(1+2+0)+(1+0+0) = 6
+        # → challenge_refuted_rate = 3/6 = 0.5
         # exclusion_count = 1 (only B has excluded_findings_count > 0) → exclusion_rate = 1/3
         def _make_binding_verdict(
             refuted_count, excluded_findings_count, sha="abc1234"
@@ -5087,8 +5088,13 @@ class TestChallengedVsUnchallengedTelemetry:
         assert ch["sample_size"] == 3
 
         # challenge_refuted_count/rate: sum of refuted_count across challenged verdicts
+        # divided by total findings reviewed (confirmed + refuted + uncertain)
+        # Verdict A: 1+1+0=2 total reviewed
+        # Verdict B: 1+2+0=3 total reviewed
+        # Verdict C: 1+0+0=1 total reviewed
+        # Rate = (1+2+0) / (2+3+1) = 3/6 = 0.5
         assert ch["challenge_refuted_count"] == 3
-        assert ch["challenge_refuted_rate"] == pytest.approx(3 / 3, abs=1e-4)
+        assert ch["challenge_refuted_rate"] == pytest.approx(3 / 6, abs=1e-4)
 
         # exclusion_rate is driven by excluded_findings_count, not refuted_count
         assert ch["exclusion_count"] == 1
@@ -8777,6 +8783,103 @@ async def test_coverage_recovery_backfills_stranded_evidence_before_check(
     from app.acceptance_criteria import get_evidence_for_criterion
     evidence = await get_evidence_for_criterion(db_session, criterion.id)
     assert len(evidence) > 0, "Expected evidence rows after backfill"
+
+
+@pytest.mark.asyncio
+async def test_coverage_recovery_records_acceptance_window_evidence_before_check(
+    db_session, mocker
+):
+    """Reconciler re-scores the acceptance-window metric and records covering
+    evidence for the acceptance-window criterion before deciding coverage.
+
+    An acceptance-window criterion (its text names the metric) is uncovered by
+    proven task_merge evidence because the merges are UNDECLARED inferred
+    test-cochange merges. The reconciler must call
+    record_acceptance_window_coverage_evidence, which flips the criterion to
+    covered off the recomputed non-zero window, then spawn a fresh qualification.
+    """
+    from datetime import timedelta
+
+    from app.acceptance_criteria import (
+        get_evidence_for_criterion,
+        get_version_coverage_summary,
+    )
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "windowev" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await _add_version_criterion(
+        db_session, project, version,
+        key="c-window-metric",
+        text="The false acceptance-coverage 0/346 is fixed (acceptance_window_fraction non-zero)",
+    )
+
+    # Two inferred_test_cochange merges in the window: CI-verified, undeclared,
+    # test+prod co-change → verified=2, write_total=2, fraction=1.0.
+    for i in range(2):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "prompt": "implement it"}],
+                context={
+                    LANDED_SIGNAL_KEY: True,
+                    LANDED_ON_INTEGRATION_KEY: True,
+                    "_pr_changed_files": [f"testing/test_{i}.py", f"app/mod_{i}.py"],
+                },
+                status=TaskStatus.COMPLETED,
+                completed_at=version.opened_at + timedelta(seconds=i + 1),
+            )
+        )
+    await db_session.commit()
+
+    pre_coverage = await get_version_coverage_summary(db_session, version.id)
+    assert pre_coverage["covered"] == 0
+    assert pre_coverage["total"] == 1
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True, (
+        "Expected reconciled=True after acceptance-window recompute cleared coverage"
+    )
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+
+    evidence = await get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1
+    assert evidence[0].source_kind == "acceptance_window_recompute"
+    assert evidence[0].detail["acceptance_window_verified"] == 2
 
 
 @pytest.mark.asyncio
@@ -17780,7 +17883,7 @@ async def test_sweep_redrives_deferred_unsynced_when_now_synced(db_session, mock
     )
     await db_session.commit()
 
-    assert count == 1
+    assert count == 0
     await db_session.refresh(version)
     # Deferral cleared → qualification actually started.
     assert version.last_qualification["status"] == "pending"
@@ -17929,7 +18032,7 @@ async def test_sweep_redrives_transient_sha_error_version(db_session, mocker):
     )
     await db_session.commit()
 
-    assert count >= 1
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -18083,7 +18186,7 @@ async def test_sweep_error_redrive_allows_versions_with_many_lifetime_attempts(
     await db_session.commit()
 
     # The version MUST have been re-driven despite high lifetime attempts.
-    assert count >= 1
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -18170,7 +18273,7 @@ async def test_sweep_redrives_infra_failure_version(db_session, mocker):
     )
     await db_session.commit()
 
-    assert count >= 1
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -18348,7 +18451,9 @@ async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mo
     )
     await db_session.commit()
 
-    assert count == 1
+    # The sweep return counts FINALIZED versions only — a re-drive spawn is
+    # deliberately not a finalization; the spawn itself is asserted below.
+    assert count == 0
     await db_session.refresh(version)
     # Stale verdict overwritten — qualification started.
     assert version.last_qualification["status"] == "pending"
@@ -18588,8 +18693,10 @@ async def test_auto_stale_writes_stale_rows_when_head_advanced(db_session, mocke
     # itself (via the shared factory) — all writes including the operator
     # notification should be committed by the production code, not by this test.
 
-    # Auto-stale writes a ledger row; re-drive fires in the same cycle → count=1.
-    assert count == 1
+    # Auto-stale writes a ledger row and the re-drive fires in the same cycle,
+    # but the sweep return counts FINALIZED versions only (a re-drive spawn is
+    # not a finalization) — the spawn is asserted below via status "pending".
+    assert count == 0
 
     # Stale ledger row was written for the finding.
     ledger_rows = list(
@@ -18739,8 +18846,9 @@ async def test_requalification_durable_across_multiple_not_promoted_rounds(
     )
     await db_session.commit()
 
-    # auto-stale wrote a row + re-drive spawned fresh qual → count=1.
-    assert count1 == 1
+    # auto-stale wrote a row + re-drive spawned fresh qual; the sweep return
+    # counts FINALIZED versions only, so the spawn is asserted below instead.
+    assert count1 == 0
 
     rows_r1 = list(
         (
@@ -18785,7 +18893,9 @@ async def test_requalification_durable_across_multiple_not_promoted_rounds(
     )
     await db_session.commit()
 
-    assert count2 == 1
+    # Finalized-only return semantics — round-2 re-drive spawn asserted via
+    # the ledger rows below.
+    assert count2 == 0
 
     rows_r2 = list(
         (
@@ -19011,7 +19121,8 @@ async def test_auto_stale_idempotent_skips_existing_ledger_rows(db_session, mock
     await db_session.commit()
 
     # Re-drive fires (finding already resolved) → version moves to pending.
-    assert count == 1
+    # Finalized-only return semantics: the re-drive spawn is not counted.
+    assert count == 0
 
     # Existing 'resolved' row was NOT overwritten by auto-stale.
     ledger_rows = list(
@@ -19103,7 +19214,8 @@ async def test_auto_stale_clears_keyless_challenger_independent_blocker(
     assert ledger_rows[0].state == "stale"
 
     # Re-drive fired: version moved to pending (fresh qualification spawned).
-    assert count == 1
+    # Finalized-only return semantics: the re-drive spawn is not counted.
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -19224,7 +19336,8 @@ async def test_keyless_blocker_on_current_head_spawns_bounded_requalification(
     # HEAD == candidate_sha. This is bounded: the stale not_promoted record is
     # overwritten with a pending qualification, so the next sweep sees an
     # in-flight/current qualification instead of repeatedly spawning.
-    assert count == 1
+    # Finalized-only return semantics: the re-drive spawn is not counted.
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
     assert version.last_qualification["candidate_sha"] == current_sha
@@ -19392,7 +19505,9 @@ async def test_keyless_blocker_consumed_marker_does_not_block_new_head(
     )
     await db_session.refresh(version)
 
-    assert result == 1
+    # Finalized-only return semantics: the re-drive spawn is not counted; the
+    # spawn_mock await and pending status are the authoritative assertions.
+    assert result == 0
     assert spawn_mock.await_count == 1
     assert version.last_qualification["status"] == "pending"
     assert version.last_qualification["candidate_sha"] == new_sha
@@ -19551,8 +19666,9 @@ async def test_auto_stale_file_anchored_finding_staled_when_file_changed(
     assert ledger_rows[0].finding_key == "FILE_CHANGED_FINDING"
     assert ledger_rows[0].state == "stale"
 
-    # Re-drive fired: fresh qualification spawned.
-    assert count == 1
+    # Re-drive fired: fresh qualification spawned. Finalized-only return
+    # semantics: the spawn is not counted.
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -19593,7 +19709,9 @@ async def test_redrive_requalifies_zero_gating_ready_version(db_session, mocker)
     )
     await db_session.commit()
 
-    assert count == 1
+    # The sweep return counts FINALIZED versions only — a re-drive spawn is
+    # deliberately not a finalization; the spawn itself is asserted below.
+    assert count == 0
     await db_session.refresh(version)
     # Stale verdict overwritten — qualification started.
     assert version.last_qualification["status"] == "pending"
@@ -19654,9 +19772,10 @@ async def test_full_requalification_flow_not_promoted_to_promoted(db_session, mo
     )
     await db_session.commit()
 
-    # Exactly one action: auto-stale wrote a stale row, re-drive spawned a new
-    # qualification (count=1).
-    assert count == 1
+    # Auto-stale wrote a stale row and the re-drive spawned a new qualification;
+    # finalized-only return semantics means the spawn is not counted here — the
+    # ledger row and pending status below are the authoritative assertions.
+    assert count == 0
 
     # Stale ledger row written for the gating finding.
     ledger_rows = (
@@ -29214,6 +29333,190 @@ async def test_acceptance_window_aggregate_legacy_no_verdict_counted(db_session)
 
 
 @pytest.mark.asyncio
+async def test_acceptance_window_fraction_counts_inferred_test_cochange(db_session):
+    """Undeclared merges that co-changed a test + production file under genuine CI
+    are counted as verified, so the window fraction is non-zero.
+
+    This is the retirement-metric proof for the inferred_test_cochange bucket: a
+    merged WRITE task with NO code_acceptance_verdict, but whose
+    ``_pr_changed_files`` records both a test file and a non-test production file
+    and whose merge was CI-verified (no fall-open reason), lands in the
+    ``inferred_test_cochange`` bucket and is now inside the window's verified
+    numerator. A sibling merge that shipped the SAME verified CI but only a
+    production file (no test) stays ``undeclared`` and is excluded — proving the
+    numerator discriminates genuine test co-change from bare undeclared merges,
+    rather than blanket-counting every legacy merge.
+    """
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        classify_merged_acceptance_context,
+    )
+
+    project, version = await _make_project_and_version(db_session)
+
+    inferred_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "_pr_changed_files": [
+            "backend/app/release_qualifier.py",
+            "backend/testing/test_release_qualifier.py",
+        ],
+    }
+    # No verdict key: the merge is genuinely undeclared, upgraded only by inference.
+    assert CODE_ACCEPTANCE_VERDICT_KEY not in inferred_ctx
+    assert classify_merged_acceptance_context(inferred_ctx) == "inferred_test_cochange"
+
+    inferred_task = Task(
+        project_id=project.id,
+        title="inferred-cochange",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context=inferred_ctx,
+    )
+    # Same verified CI, production-only diff → stays undeclared (excluded).
+    bare_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "_pr_changed_files": ["backend/app/release_qualifier.py"],
+    }
+    assert classify_merged_acceptance_context(bare_ctx) == "undeclared"
+    bare_task = Task(
+        project_id=project.id,
+        title="bare-undeclared",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context=bare_ctx,
+    )
+    db_session.add(inferred_task)
+    db_session.add(bare_task)
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+    # Two write-task merges landed; only the genuine test-cochange one is verified.
+    assert agg["acceptance_window_total"] == 2
+    assert agg["acceptance_window_verified"] == 1
+    # The retirement metric is now non-zero (was a false 0/N before the bucket).
+    assert agg["acceptance_window_fraction"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_fraction_nonzero_with_inferred_cochange(db_session):
+    """Named retirement proof: the inferred_test_cochange bucket lifts the window
+    fraction strictly off zero, and the additive breakdown is exact and total.
+
+    Builds a synthetic write-task merge window mixing (1) a genuine CI-verified
+    test+production co-change (the only verified merge), and the three distinct
+    undeclared reasons: (2) a benign-unverified fall-open whose diff DID co-change
+    a test + production file — proving CI-verification gates inference so it stays
+    undeclared as ``not_ci_verified``; (3) a CI-verified merge with no
+    ``_pr_changed_files`` context (``no_changed_files_context``); and (4) a
+    CI-verified production-only diff (``no_test_prod_cochange``). Asserts:
+      (a) fraction is strictly non-zero (the inferred_test_cochange contribution),
+      (b) per-bucket counts sum to the write-task population and the undeclared
+          reason split sums to the undeclared bucket exactly, and
+      (c) all pre-existing acceptance_window_* invariants still hold.
+    """
+    from app.acceptance_gate import (
+        ACCEPTANCE_AGGREGATE_BUCKETS,
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        _UNDECLARED_REASON_KEYS,
+        acceptance_window_sub_scores_violations,
+        classify_merged_acceptance_context,
+        classify_undeclared_reason,
+    )
+
+    project, version = await _make_project_and_version(db_session)
+
+    # (1) Verified CI + test + production diff → inferred_test_cochange (verified).
+    inferred_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "_pr_changed_files": [
+            "backend/app/release_qualifier.py",
+            "backend/testing/test_release_qualifier.py",
+        ],
+    }
+    assert CODE_ACCEPTANCE_VERDICT_KEY not in inferred_ctx
+    assert classify_merged_acceptance_context(inferred_ctx) == "inferred_test_cochange"
+
+    # (2) Benign-unverified fall-open, even WITH a test+prod diff → not_ci_verified.
+    not_verified_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "review_loop": {"unverified_merge_reason": "no_detectable_test_command"},
+        "_pr_changed_files": [
+            "backend/app/release_qualifier.py",
+            "backend/testing/test_release_qualifier.py",
+        ],
+    }
+    assert classify_merged_acceptance_context(not_verified_ctx) == "undeclared"
+    assert classify_undeclared_reason(not_verified_ctx) == "not_ci_verified"
+
+    # (3) Verified CI but no changed-files context recorded → no_changed_files_context.
+    no_files_ctx = {"pr_merged": True, "landed_on_integration": True}
+    assert classify_merged_acceptance_context(no_files_ctx) == "undeclared"
+    assert classify_undeclared_reason(no_files_ctx) == "no_changed_files_context"
+
+    # (4) Verified CI, production-only diff → no_test_prod_cochange.
+    prod_only_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "_pr_changed_files": ["backend/app/release_qualifier.py"],
+    }
+    assert classify_merged_acceptance_context(prod_only_ctx) == "undeclared"
+    assert classify_undeclared_reason(prod_only_ctx) == "no_test_prod_cochange"
+
+    for title, ctx in (
+        ("inferred", inferred_ctx),
+        ("not-verified", not_verified_ctx),
+        ("no-files", no_files_ctx),
+        ("prod-only", prod_only_ctx),
+    ):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=title,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                context=ctx,
+            )
+        )
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    # (a) Strictly non-zero: exactly one of four write merges is verified (0.25).
+    assert agg["acceptance_window_total"] == 4
+    assert agg["acceptance_window_verified"] == 1
+    assert agg["acceptance_window_fraction"] == pytest.approx(0.25)
+    assert agg["acceptance_window_fraction"] > 0
+
+    # (b) Per-bucket counts are exact and partition the write-task population.
+    buckets = agg["acceptance_window_buckets"]
+    assert set(buckets.keys()) == set(ACCEPTANCE_AGGREGATE_BUCKETS)
+    assert buckets["inferred_test_cochange"] == 1
+    assert buckets["undeclared"] == 3
+    assert sum(buckets.values()) == agg["acceptance_window_total"]
+    # verified numerator is exactly the three verified buckets.
+    assert (
+        buckets["proven"]
+        + buckets["satisfied_unproven"]
+        + buckets["inferred_test_cochange"]
+    ) == agg["acceptance_window_verified"]
+
+    # The undeclared reason split is exact and sums to the undeclared bucket.
+    reasons = agg["acceptance_window_undeclared_reasons"]
+    assert set(reasons.keys()) == set(_UNDECLARED_REASON_KEYS)
+    assert reasons["not_ci_verified"] == 1
+    assert reasons["no_changed_files_context"] == 1
+    assert reasons["no_test_prod_cochange"] == 1
+    assert sum(reasons.values()) == buckets["undeclared"]
+
+    # (c) The additive nested keys do not break the sub-scores invariant guard.
+    assert acceptance_window_sub_scores_violations(agg) == []
+
+
+@pytest.mark.asyncio
 async def test_acceptance_window_aggregate_fraction_none_when_empty(db_session):
     """When no tasks land in the version window, fraction is None (not 0 or NaN)."""
     _project, version = await _make_project_and_version(db_session)
@@ -29392,6 +29695,115 @@ async def test_acceptance_window_metric_distinguishes_verified_merge_predicate_f
     assert agg["acceptance_window_verified"] == 2
     # Undeclared task is in total but not in verified — fraction is 2/3.
     assert agg["acceptance_window_fraction"] == pytest.approx(2 / 3)
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_denominator_write_task_population(db_session):
+    """Denominator counts only write-task merges; read-only types are excluded.
+
+    Fixture: 2 write-type tasks (type='create') — one with proven acceptance,
+    one without — plus 2 non-write tasks (type='research' and type='review')
+    that are also merged. The denominator must equal 2 (write tasks only),
+    fraction = 1/2, and the observability field must equal 4 (all merges).
+    When there are zero write-task merges, fraction must be None.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Write task with proven acceptance — counts in total AND verified.
+    write_proven = Task(
+        project_id=project.id,
+        title="write-proven",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "test_name": "test_write_feature",
+            },
+        },
+    )
+    # Write task without acceptance — counts in total but NOT in verified.
+    write_undeclared = Task(
+        project_id=project.id,
+        title="write-undeclared",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    # Non-write task (research) — must NOT count in write-task total or verified.
+    read_research = Task(
+        project_id=project.id,
+        title="research-task",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    # Non-write task (review) — must NOT count in write-task total or verified.
+    read_review = Task(
+        project_id=project.id,
+        title="review-task",
+        payloads=[{"type": "review"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    db_session.add(write_proven)
+    db_session.add(write_undeclared)
+    db_session.add(read_research)
+    db_session.add(read_review)
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    # Denominator: write tasks only (create + fix = 2).
+    assert agg["acceptance_window_total"] == 2, (
+        f"denominator should count only write-task merges; got {agg['acceptance_window_total']}"
+    )
+    assert agg["acceptance_window_write_total"] == 2
+    # Numerator: only the proven write task.
+    assert agg["acceptance_window_verified"] == 1
+    # Fraction: 1 verified / 2 write-task merges.
+    assert agg["acceptance_window_fraction"] == pytest.approx(0.5)
+    # Observability field includes ALL landed merges (2 write + 2 read = 4).
+    assert agg["acceptance_window_total_all_merges"] == 4, (
+        f"all-merges field should include non-write tasks; got {agg['acceptance_window_total_all_merges']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_denominator_none_when_no_write_tasks(db_session):
+    """fraction must be None when zero write-task merges land in the window.
+
+    Non-write merges inflate acceptance_window_total_all_merges but must NOT
+    produce a 0.0 fraction — None signals 'no coverage judgement possible'.
+    """
+    project, version = await _make_project_and_version(db_session)
+
+    for task_type in ("research", "review", "audit"):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"{task_type}-task",
+                payloads=[{"type": task_type}],
+                status=TaskStatus.COMPLETED,
+                context={"pr_merged": True},
+            )
+        )
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    assert agg["acceptance_window_total"] == 0
+    assert agg["acceptance_window_write_total"] == 0
+    assert agg["acceptance_window_verified"] == 0
+    assert agg["acceptance_window_fraction"] is None, (
+        "fraction must be None when no write-task merges exist, not 0.0"
+    )
+    assert agg["acceptance_window_total_all_merges"] == 3
 
 
 @pytest.mark.asyncio
@@ -30265,6 +30677,60 @@ class TestRecoverConfidenceFromCiUnresolved:
         out = self._fn(record, policy=_POLICY)
         assert out["blocker"] is None
         assert out["confidence"] > 0.0
+
+    def test_enforce_mode_ci_unresolved_recovery_includes_debt_blend(self):
+        """NAMED ACCEPTANCE TEST — enforce-mode ci_unresolved recovery records a debt-blended confidence.
+
+        When ci_unresolved forces confidence to 0.0, the recovery helper
+        recomputes the 'real' qualified confidence. In enforce mode (completion_debt
+        weight > 0), the debt blend must be applied, so the recovered confidence
+        equals a normal finalize of the same sub_scores.
+        """
+        # Establish enforce-mode policy with debt weight.
+        enforce_policy = {
+            "weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+                "completion_debt": 0.15,
+            },
+            "threshold": 0.90,
+        }
+
+        # Sub-scores for a normally-qualifying candidate.
+        sub_scores = {
+            "audit": 0.85,
+            "test_erosion": 0.90,
+            "smoketest": 0.95,
+            "debt_pressure": 0.50,  # moderate open debt
+        }
+
+        # Normal finalize with ci_green=True (control case).
+        normal_result = rq.compute_composite(
+            ci_green=True,
+            audit_score=sub_scores["audit"],
+            test_erosion=sub_scores["test_erosion"],
+            smoketest_score=sub_scores["smoketest"],
+            policy=enforce_policy,
+            debt_pressure_score=sub_scores["debt_pressure"],
+        )
+
+        # ci_unresolved blocker — confidence forced to 0.0 (no debt blend).
+        blocked_record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": sub_scores,
+            "smoketest_enabled": True,
+        }
+
+        # Recovery applies the debt blend.
+        recovered = self._fn(blocked_record, policy=enforce_policy)
+
+        # Recovered confidence must equal the normally-finalized confidence
+        # (both include the debt blend).
+        assert recovered["confidence"] == pytest.approx(normal_result["confidence"])
+        assert recovered.get("confidence_recovered_from_ci_unresolved") is True
+        assert recovered.get("blocker") is None
 
 
 
@@ -32500,8 +32966,8 @@ async def test_sweep_promotes_dry_run_candidate_when_promotion_enabled(
         session_factory=_shared_session_factory(db_session),
     )
 
-    # At least the dry_run re-drive must have contributed to the finalized count.
-    assert count >= 1
+    # Re-drives do not contribute to the finalized count.
+    assert count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -32779,6 +33245,102 @@ async def test_sweep_initial_qualification_wired(db_session, mocker):
 
     assert count >= 1
     run_qual_mock.assert_called()
+
+
+# Named acceptance test: test_sweep_finalized_count_excludes_redrives
+@pytest.mark.asyncio
+async def test_sweep_finalized_count_excludes_redrives(db_session, mocker):
+    """Named acceptance test: the finalized count from sweep_stuck_qualifications
+    excludes versions that are redriven (spawn new qualifications) and only counts
+    versions that are genuinely finalized from a stuck pending state.
+
+    Regression: finalized counter was incorrectly incremented for redrives,
+    inflating the '[REAPER] Finalized N stuck release qualification(s)' metric.
+    """
+    from datetime import datetime, timedelta
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    # Create project and version 1.
+    project, version1 = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Version 1: stuck pending with both children completed — will be genuinely finalized.
+    audit_task1, smoke_task1 = await _seed_pending_qualification(
+        db_session,
+        project,
+        version1,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    db_session.add(
+        Artifact(
+            task_id=audit_task1.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "test_erosion": {
+                        "deleted_test_files": [],
+                        "assertion_delta": 0,
+                        "test_count_delta": 0,
+                    },
+                }
+            ),
+        )
+    )
+    db_session.add(
+        Artifact(
+            task_id=smoke_task1.id,
+            artifact_type=ArtifactType.SMOKETEST_RESULT,
+            logs=json.dumps(
+                {
+                    "passed": True,
+                    "tests": [{"name": "a", "status": "pass"}],
+                    "suites": {"startup": {"passed": True}},
+                }
+            ),
+        )
+    )
+
+    # Version 2: in deferred_unsynced state — will be redriven.
+    version2 = await rv.open_version(db_session, project.id, version_number=2)
+    rv.set_version_phase(version2, "stabilize", reasoning="test setup")
+    version2.last_qualification = {
+        "status": "deferred_unsynced",
+        "candidate_sha": "redrive0" * 5 + "00000",
+        "first_deferred_at": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=3)).isoformat(),
+    }
+    db_session.add(version2)
+    await db_session.commit()
+
+    # Mock GitHub: main is NOW absorbed into the candidate (back-merge landed).
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    # Run the sweep: version1 will be genuinely finalized, version2 will be redriven.
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # The count should be 1 — only the genuine finalization, not the redrive.
+    assert count == 1, (
+        f"Expected finalized count of 1 (only genuine finalization), "
+        f"but got {count}. This indicates redrives are incorrectly counted "
+        f"in the finalized counter."
+    )
+
+    # Verify the first version is now finalized.
+    await db_session.refresh(version1)
+    assert version1.last_qualification["status"] == "dry_run"
+
+    # Verify the second version was redriven (deferral cleared, qualification spawned).
+    await db_session.refresh(version2)
+    assert version2.last_qualification["status"] == "pending"
+    assert len(await _audit_tasks(db_session, project.id)) == 2
 
 
 # Named acceptance test: test_fire_initial_qualification_if_coverage_complete
@@ -33074,6 +33636,128 @@ async def test_finalize_logs_completion_debt_snapshot_fetch_failure(db_session, 
 
     # Finalize should proceed and produce a verdict.
     assert result["status"] in ("promoted", "not_promoted", "dry_run")
+
+
+@pytest.mark.asyncio
+async def test_enforce_mode_debt_read_failure_does_not_inflate_confidence(
+    db_session, mocker
+):
+    """NAMED ACCEPTANCE TEST — enforce mode debt-read failure must not inflate confidence.
+
+    When completion_debt_weight_mode='enforce' and the debt-snapshot fetch raises,
+    _finalize_qualification must NOT silently drop the (1 - w_debt) down-scaling
+    that compute_composite applies in enforce mode.  Without the fix, a None
+    debt_pressure_score causes compute_composite to skip the scaling entirely,
+    producing confidence == existing_confidence instead of the correctly bounded
+    (1 - w_debt) * existing_confidence + w_debt * debt_pressure value.
+
+    Verified by comparing:
+      - enforce_confidence_fail: confidence when debt fetch raises (post-fix = 0.0 pressure)
+      - enforce_confidence_clean: confidence when debt fetch returns zero debt (pressure = 1.0)
+
+    Post-fix: the failed-read path MUST produce confidence <= the zero-debt
+    clean path, because 0.0 pressure pulls confidence down via the blend.
+    Pre-fix: the failed-read path produced confidence > the clean path because
+    the down-scaling was silently skipped.
+    """
+    from app import shared_state
+    from importlib import import_module as original_import
+
+    _enforce_weight = 0.15  # DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+
+    def _make_cfg():
+        return {
+            "promotion_enabled": False,
+            "completion_debt_weight_mode": "enforce",
+            "promotion_threshold": 0.90,
+            "promotion_weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+            },
+        }
+
+    _good_audit = {
+        "audit_score": 0.92,
+        "findings": [],
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 0,
+            "test_count_delta": 0,
+        },
+    }
+    _good_smoke = {
+        "passed": True,
+        "tests": [{"name": "s", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+
+    # --- Arm 1: debt snapshot fetch raises --------------------------------
+    mocker.patch.dict(shared_state.runtime_config, _make_cfg(), clear=False)
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session, project, version, audit_logs=_good_audit, smoke_logs=_good_smoke
+    )
+
+    def _fail_import(name, *args, **kwargs):
+        if "completion_debt" in name:
+            raise RuntimeError("simulated debt-module failure")
+        return original_import(name, *args, **kwargs)
+
+    mocker.patch("importlib.import_module", new=_fail_import)
+
+    _ci_pre_gates = _clean_finalize_pre_gates(rq._CI_GREEN, ci_green=True)
+
+    result_fail = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_ci_pre_gates,
+    )
+    enforce_confidence_fail = result_fail["confidence"]
+
+    # --- Arm 2: debt snapshot succeeds with zero open debt ----------------
+    # Reset the mock so the real module is importable again.
+    mocker.stopall()
+    mocker.patch.dict(shared_state.runtime_config, _make_cfg(), clear=False)
+
+    project2, version2 = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session, project2, version2, audit_logs=_good_audit, smoke_logs=_good_smoke
+    )
+
+    # Empty debt snapshot → pressure = 1.0 (no open items).
+    _mock_cd_zero = MagicMock()
+    _mock_cd_zero.get_open_completion_debt = AsyncMock(return_value={"total_open": 0})
+    mocker.patch.dict("sys.modules", {"app.completion_debt": _mock_cd_zero})
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result_clean = await rq._finalize_qualification(
+        db_session,
+        version2,
+        _pre_gates=_clean_finalize_pre_gates(rq._CI_GREEN, ci_green=True),
+    )
+    enforce_confidence_clean = result_clean["confidence"]
+
+    # Post-fix: a failed read is treated as maximum debt (pressure=0.0), so its
+    # confidence must be STRICTLY LESS than the clean zero-debt run (pressure=1.0).
+    assert enforce_confidence_fail < enforce_confidence_clean, (
+        f"Enforce-mode debt-read failure inflated confidence: "
+        f"fail={enforce_confidence_fail} should be < clean={enforce_confidence_clean}. "
+        f"The (1 - w_debt) down-scaling was skipped when debt fetch raised."
+    )
+
+    # The failed-read confidence must equal the formula for 0.0 pressure:
+    # (1 - w_debt) * existing_confidence + w_debt * 0.0
+    # existing_confidence with a clean zero-debt (pressure=1.0) equals
+    # (1 - w_debt) * existing_confidence + w_debt * 1.0, so:
+    # failed_confidence = clean_confidence - w_debt (the pure-debt term drops)
+    assert enforce_confidence_fail == pytest.approx(
+        enforce_confidence_clean - _enforce_weight, abs=1e-3
+    ), (
+        f"Failed-read confidence {enforce_confidence_fail} does not match expected "
+        f"formula: clean {enforce_confidence_clean} - weight {_enforce_weight}"
+    )
 
 
 @pytest.mark.asyncio

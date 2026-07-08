@@ -68,6 +68,7 @@ from app.retry_prompt import (
     _extract_error_files,
     _build_scope_overflow_details,
     _build_retry_prompt_suffix,
+    _detect_ci_review_disagreement,
     merge_retry_prompt_suffix,
 )
 
@@ -2401,6 +2402,143 @@ def test_merge_retry_prompt_suffix_carries_snapshot_forward_on_repeat():
     )
     assert out.count("IMPORTANT: The previous attempt TIMED OUT") == 1
     assert "ORIGINAL_NOTE: kept verbatim" in out
+
+
+# ── _detect_ci_review_disagreement ─────────────────────────────────────────
+
+
+def test_detect_ci_review_disagreement_frontend_uses_typecheck_not_build():
+    """When reviewer flags frontend build issues but CI is green, the
+    disagreement block instructs `npm run typecheck` (agent-VM safe)
+    instead of `npm run build` (which OOMs on agent VMs).
+
+    Key requirement: CLAUDE.md forbids `npm run build` on agent VMs and
+    mandates `npm run typecheck` as the substitute. The retry prompt must
+    reflect this — agents must not be told to run the OOM command.
+    """
+    ci_check = {
+        "details": [
+            {
+                "name": "CI / Frontend",
+                "conclusion": "success",
+                "status": "completed",
+            }
+        ]
+    }
+    # Reviewer complaint includes "npm run build" (the problematic command).
+    feedback = "npm run build failed: vite bundle error"
+    issues = []
+    pr_number = 123
+
+    result = _detect_ci_review_disagreement(issues, feedback, ci_check, pr_number)
+
+    # Must include the disagreement block (CI is green but reviewer flagged).
+    assert "## CI vs reviewer build-gate disagreement" in result
+    assert "CI / Frontend" in result
+
+    # Must include npm run typecheck (agent-VM safe).
+    assert "npm run typecheck" in result
+
+    # Must NOT tell agents to run npm run build (the OOM-prone command).
+    # Note: The pattern regex still detects "npm run build" in complaints,
+    # but the example steps should use typecheck instead.
+    lines = result.split("\n")
+    # Find the lines with example commands (marked with "Run `" or similar).
+    command_lines = [line for line in lines if "npm run" in line]
+    # All command lines should reference typecheck, not build.
+    for line in command_lines:
+        if "npm run" in line and "example" not in line.lower():
+            # This is a command to run, verify it's typecheck
+            assert "npm run typecheck" in line, f"Command line should use typecheck: {line}"
+
+
+def test_detect_ci_review_disagreement_references_ci_as_authoritative():
+    """The disagreement block references the green CI run as the
+    authoritative build proof, so reviewers don't need to reproduce the
+    full bundle locally."""
+    ci_check = {
+        "details": [
+            {
+                "name": "CI / Frontend",
+                "conclusion": "success",
+                "status": "completed",
+            }
+        ]
+    }
+    feedback = "admin-ui npm ci && npm run build failed"
+    issues = []
+    pr_number = 456
+
+    result = _detect_ci_review_disagreement(issues, feedback, ci_check, pr_number)
+
+    assert "## CI vs reviewer build-gate disagreement" in result
+    # Must reference CI as authoritative proof (not asking reviewer to reproduce).
+    assert "authoritative" in result.lower()
+    # Text should mention "green" and "CI run URL" to show the CI is the proof.
+    assert "green" in result.lower()
+    assert "run url" in result.lower()
+
+
+def test_detect_ci_review_disagreement_pattern_still_detects_build_complaints():
+    """The _BUILD_GATE_PATTERN regex used for complaint detection must
+    still match 'npm run build' to identify build-gate disputes, even
+    though the guidance will recommend typecheck instead of build."""
+    ci_check = {
+        "details": [
+            {
+                "name": "CI / Frontend",
+                "conclusion": "success",
+                "status": "completed",
+            }
+        ]
+    }
+    # Complaint contains "npm run build" — the pattern must detect it.
+    feedback = "error: npm run build failed on admin-ui"
+    issues = []
+    pr_number = 789
+
+    result = _detect_ci_review_disagreement(issues, feedback, ci_check, pr_number)
+
+    # Pattern must have detected the complaint and generated the block.
+    assert "## CI vs reviewer build-gate disagreement" in result
+
+
+def test_detect_ci_review_disagreement_empty_when_no_ci_check():
+    """Return empty string when there's no CI check data."""
+    result = _detect_ci_review_disagreement([], "some complaint", None, None)
+    assert result == ""
+
+
+def test_detect_ci_review_disagreement_empty_when_ci_not_green():
+    """Return empty string when CI jobs are not all green."""
+    ci_check = {
+        "details": [
+            {
+                "name": "CI / Frontend",
+                "conclusion": "failure",  # Not green
+                "status": "completed",
+            }
+        ]
+    }
+    feedback = "npm run build failed"
+    result = _detect_ci_review_disagreement([], feedback, ci_check, None)
+    assert result == ""
+
+
+def test_detect_ci_review_disagreement_empty_when_no_matching_complaint():
+    """Return empty string when complaint doesn't match the gate pattern."""
+    ci_check = {
+        "details": [
+            {
+                "name": "CI / Frontend",
+                "conclusion": "success",
+                "status": "completed",
+            }
+        ]
+    }
+    feedback = "Code is slow and needs optimization"  # No build complaint
+    result = _detect_ci_review_disagreement([], feedback, ci_check, None)
+    assert result == ""
 
 
 @pytest.mark.asyncio
@@ -10382,6 +10520,81 @@ async def test_stale_head_second_consecutive_accepts_verdict_with_annotation(
     # No review respawn (the verdict was accepted, not discarded).
     review_respawn_calls = [c for c in calls if c[0][1] == "review"]
     assert not review_respawn_calls, "2nd consecutive discard must not respawn a review"
+
+
+@pytest.mark.asyncio
+async def test_stale_head_discard_counter_idempotent_on_replay(tl_db, mocker):
+    """Post-commit replay of a first stale-head discard must NOT double-increment
+    stale_head_consecutive_discards and must NOT spawn a second fresh review.
+
+    Simulates replay by seeding the task context with _review_stale_head=True and
+    stale_head_consecutive_discards=1 (the state written by the first run before it
+    crashed), then re-running _process_post_commit with the same stale verdict.
+    The counter must stay at 1 and no spawn must occur.
+
+    Approach: run _run_stale_head_branch with prior_discard_count=0 (fresh) so
+    the first discard sets the counter to 1 and _review_stale_head=True, then
+    manually call _process_post_commit on the SAME task (now carrying those
+    fields) and confirm no second spawn and the counter stays at 1."""
+    import json as _json
+    from app.task_lifecycle import _process_post_commit
+
+    session, factory = tl_db
+
+    # First, run a clean first-discard to get the committed post-discard state.
+    calls1, review_task1 = await _run_stale_head_branch(
+        tl_db,
+        mocker,
+        reviewed_head_sha="stalehd000000",
+        live_head_sha="livehd1111111",
+        prior_discard_count=0,
+    )
+    # Confirm the first run set _review_stale_head and count=1.
+    ctx1 = review_task1.context or {}
+    assert ctx1.get("_review_stale_head") is True, "first run must set _review_stale_head"
+    assert ctx1.get("stale_head_consecutive_discards") == 1, (
+        "first run must set stale_head_consecutive_discards to 1"
+    )
+    assert len(calls1) == 1 and calls1[0][0][1] == "review", (
+        "first run must spawn exactly one fresh review"
+    )
+
+    # Now replay: call _process_post_commit again with the same task (context
+    # already has _review_stale_head=True and counter=1).
+    spawn_calls_replay: list[tuple] = []
+
+    async def _capture_spawn_replay(*args, **kwargs):
+        spawn_calls_replay.append((args, kwargs))
+        return (None, False)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn_replay)
+
+    verdict_json = _json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Found a real bug.",
+            "issues": [{"description": "Real bug", "severity": "major"}],
+            "reviewed_head_sha": "stalehd000000",
+        }
+    )
+    payload = AgentStatusPayload(
+        task_id=review_task1.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/o/r/pull/7070",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json=verdict_json,
+    )
+    await _process_post_commit(review_task1.id, payload, _session_factory=factory)
+    await session.refresh(review_task1)
+
+    ctx_replay = review_task1.context or {}
+    assert ctx_replay.get("stale_head_consecutive_discards") == 1, (
+        f"replay must NOT increment stale_head_consecutive_discards "
+        f"(got {ctx_replay.get('stale_head_consecutive_discards')})"
+    )
+    assert not spawn_calls_replay, (
+        f"replay must NOT spawn a second fresh review (got {len(spawn_calls_replay)} calls)"
+    )
 
 
 @pytest.mark.asyncio

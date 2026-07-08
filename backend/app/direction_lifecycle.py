@@ -1430,6 +1430,18 @@ async def _process_direction_lifecycle_locked(
                 )
             except (TypeError, ValueError):
                 continue
+        # Include evicted cycles folded into history_aggregate so the budget
+        # check fires correctly for long-lived directions past the 10-cycle window.
+        try:
+            cumulative_cost += max(
+                0.0,
+                float(
+                    (d.get("history_aggregate") or {}).get("total_estimated_cost_usd")
+                    or 0.0
+                ),
+            )
+        except (TypeError, ValueError):
+            pass
         budget = d.get("cost_budget_usd")
         try:
             budget_f = float(budget) if budget is not None else None

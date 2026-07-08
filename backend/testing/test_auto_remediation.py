@@ -2790,3 +2790,68 @@ async def test_ci_failure_selectors_absent_when_no_failing_tests(db_session: Asy
     assert "ci_failure_selectors" not in payload, (
         "ci_failure_selectors should be absent when no failing_tests extracted"
     )
+
+
+@pytest.mark.asyncio
+async def test_residual_audit_defer_count_not_lost_under_concurrent_increment(
+    db_session: AsyncSession,
+):
+    """Verify that concurrent calls to _record_residual_audit_deferral do not lose increments.
+
+    Regression test for: bug: lock ResidualRemediationCase counter RMW
+    When multiple async tasks concurrently call _record_residual_audit_deferral,
+    each increment should be counted. Without row-level locking, increments can
+    be lost due to read-modify-write races, which silently skips the escalation
+    threshold (escalates on == threshold, not >=).
+    """
+    from app.autonomous_research_residual import _record_residual_audit_deferral
+    from app.models import ResidualRemediationCase, ResidualCaseStatus
+
+    project = await _create_project(db_session)
+    await db_session.flush()
+
+    fingerprint = "test_audit_defer_fingerprint"
+    system_id = "test_system_123"
+
+    # Create a ResidualRemediationCase with audit_defer_count=0
+    case = ResidualRemediationCase(
+        project_id=project.id,
+        fingerprint=fingerprint,
+        status=ResidualCaseStatus.ACTIVE,
+        hit_count=5,
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    # Simulate concurrent calls to _record_residual_audit_deferral using separate
+    # AsyncSession instances per caller — the same session shares an identity map
+    # and serializes increments in memory, which would make the test pass even
+    # without the row lock.  Separate sessions exercise the actual DB-level lock.
+    num_concurrent_calls = 5
+    from sqlalchemy.orm import sessionmaker
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def increment_in_own_session() -> None:
+        async with Session() as s:
+            await _record_residual_audit_deferral(s, project.id, fingerprint, system_id)
+            await s.commit()
+
+    await asyncio.gather(*[increment_in_own_session() for _ in range(num_concurrent_calls)])
+
+    # Verify all increments were counted — use a fresh session to avoid reading
+    # a stale identity-map entry from db_session (expire_on_commit=False).
+    async with Session() as verify:
+        result = await verify.execute(
+            select(ResidualRemediationCase).where(
+                ResidualRemediationCase.project_id == project.id,
+                ResidualRemediationCase.fingerprint == fingerprint,
+            )
+        )
+    updated_case = result.scalar_one_or_none()
+    assert updated_case is not None
+    assert (
+        updated_case.audit_defer_count == num_concurrent_calls
+    ), f"Expected {num_concurrent_calls} increments, but got {updated_case.audit_defer_count}"

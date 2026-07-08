@@ -263,6 +263,7 @@ def _recover_confidence_from_ci_unresolved(
     audit_raw = sub_scores.get("audit")
     test_erosion_raw = sub_scores.get("test_erosion")
     smoketest_raw = sub_scores.get("smoketest")
+    debt_pressure_raw = sub_scores.get("debt_pressure")
     smoketest_enabled = bool(base_record.get("smoketest_enabled", True))
 
     if not isinstance(audit_raw, (int, float)) or isinstance(audit_raw, bool):
@@ -287,6 +288,12 @@ def _recover_confidence_from_ci_unresolved(
         and not isinstance(smoketest_raw, bool)
         else None
     )
+    debt_pressure_score = (
+        float(debt_pressure_raw)
+        if isinstance(debt_pressure_raw, (int, float))
+        and not isinstance(debt_pressure_raw, bool)
+        else None
+    )
 
     recovered = compute_composite(
         ci_green=True,
@@ -299,6 +306,7 @@ def _recover_confidence_from_ci_unresolved(
         migration_apply_blocked=base_record.get("migration_apply_safety") == "block",
         criterion_coverage=base_record.get("criterion_coverage"),
         merge_grade_misses=_merge_grade_misses_armed(base_record, _policy),
+        debt_pressure_score=debt_pressure_score,
     )
 
     return {
@@ -2066,6 +2074,29 @@ async def _record_promotion_success(
     except Exception as exc:  # noqa: BLE001 — baseline snapshot must not abort promotion
         logger.warning(
             "[RELEASE_QUALIFIER] lane baseline persistence failed after v%d "
+            "promotion (non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    # Best-effort: auto-supersede still-open, non-bug-class operator messages that
+    # belong to versions now at least two releases behind the freshly-opened one.
+    # Runs in its OWN session (the promotion's own writes ride the caller's later
+    # commit and are not yet durable) and can NEVER abort the promotion — mode-
+    # gated, default observe. Mirrors the lane-baseline / staged-activation blocks.
+    try:
+        from app.message_supersession import run_supersession_on_version_close
+
+        await run_supersession_on_version_close(
+            project_id=version.project_id,
+            closed_version_number=version.version_number,
+            closed_version_opened_at=version.opened_at,
+            terminal_status="promoted",
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 — supersession must not abort promotion
+        logger.warning(
+            "[RELEASE_QUALIFIER] message supersession failed after v%d "
             "promotion (non-fatal): %s",
             version.version_number,
             exc,

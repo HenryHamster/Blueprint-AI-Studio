@@ -53,7 +53,7 @@ from app.task_evaluators import (
     spawn_finding_challenge,
     spawn_forward_quality_grader,
 )
-from app.research_completion import _is_high_stakes_finding
+from app.research_completion import _is_high_stakes_finding, _compute_direction_productivity
 from app.time_utils import _utcnow
 
 
@@ -4122,6 +4122,30 @@ class TestRecordResearchTaskFailureScopeEmpty:
         assert called_with == [task.project_id]
         session.get.assert_not_called()
 
+    def test_research_failure_recording_is_idempotent_per_task(self):
+        """Re-running the same failed task must not append duplicate history entries
+        or double-count consecutive_unproductive_cycles."""
+        from app.research_completion import _record_research_task_failure
+
+        task = self._make_task("CODE_ERROR")
+        project = self._make_project(consecutive_unproductive=1)
+
+        # First call — records normally.
+        self._run(project, _record_research_task_failure(task, self._make_session()))
+        direction = project.directions[0]
+        assert len(direction.get("research_history", [])) == 1
+        assert direction.get("consecutive_unproductive_cycles") == 2
+
+        # Second call with same task — must be a no-op.
+        self._run(project, _record_research_task_failure(task, self._make_session()))
+        direction = project.directions[0]
+        assert len(direction.get("research_history", [])) == 1, (
+            "Duplicate history entry appended on replay"
+        )
+        assert direction.get("consecutive_unproductive_cycles") == 2, (
+            "consecutive_unproductive_cycles double-counted on replay"
+        )
+
 
 class TestTrimFindingForMemo:
     """_trim_finding_for_memo: bounds a dropped finding for memo embedding."""
@@ -4959,6 +4983,44 @@ async def test_finding_challenge_reentry_does_not_double_increment_spawn_count(
 
 
 @_pytest.mark.asyncio
+async def test_research_spawn_count_idempotent_on_replay(db_session, mocker):
+    """Post-commit replay of the initial completion must not double-increment _research_spawn_count.
+
+    On a replay, all three verdicts (grader/adversarial/challenge) are still None,
+    so the existing verdict-presence guard passes again. Without the task_id stamp,
+    the counter increments on every replay, shifting the modulo gate that decides
+    when to fire a strategic_review.
+    """
+    project, _direction, task = await _grader_project_and_task(db_session, "d-idem-rsc")
+    project.vision = {"_research_spawn_count": 4, "purpose": "keep-me"}
+    task.status = TaskStatus.COMPLETED
+    # No verdicts — this is the initial-completion state (also what replay sees).
+    task.context = {**(task.context or {})}
+    db_session.add(project)
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[])
+
+    # First call: should increment once (4 → 5) and stamp the task_id.
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(project)
+    assert project.vision["_research_spawn_count"] == 5
+    assert str(task.id) in (project.vision.get("_research_spawn_counted_ids") or [])
+
+    # Second call (simulates post-commit replay): counter must stay at 5.
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(project)
+    assert project.vision["_research_spawn_count"] == 5, (
+        "replay must not double-increment _research_spawn_count"
+    )
+    assert project.vision["purpose"] == "keep-me"
+
+
+@_pytest.mark.asyncio
 async def test_evaluating_flip_is_atomic_with_child_spawn(db_session, mocker):
     """A failure in the post-spawn wiring (AFTER the child-spawn commit) must leave
     the parent EVALUATING-with-children, never COMPLETED-with-children.
@@ -5301,6 +5363,93 @@ async def test_unmatched_task_hash_prerequisite_escalates_to_parent(db_session, 
         u.get("kind") == "task" and u.get("ref") == missing_ref
         for u in (unresolved if isinstance(unresolved, list) else [unresolved])
     ), "unresolved prerequisite details must remain in context for visibility"
+
+
+@_pytest.mark.asyncio
+async def test_prereq_cancelled_children_excluded_from_survival_and_tasks_created(
+    db_session, mocker
+):
+    """Prereq-cancelled children (escalated-to-parent) must NOT count toward
+    research_surviving_findings or tasks_created.
+
+    Before the fix: _surviving_findings was computed as _impl_spawned BEFORE the
+    prereq-wiring loop ran. If a spawned child was later cancelled with
+    prerequisite_escalated_to_parent=True (no_live_or_deferred_provider), it
+    still counted as a surviving finding and as tasks_created>=1, preventing the
+    saturation detector from ever marking the direction auto-complete.
+
+    After the fix: the survival signal is adjusted downward after the loop, and
+    direction_outcomes excludes those children from tasks_created.
+    """
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.failure_classification import CO_DEFERRED_SHELVED
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prqexcl")
+    finding = _make_finding(title="Add metrics endpoint", direction_id=direction["id"])
+    missing_ref = "deadbeef00000000"
+    # Unresolvable task-hash prerequisite forces escalation to parent.
+    finding["prerequisite"] = {"kind": "task", "ref": missing_ref}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.status == TaskStatus.CANCELLED, "prereq-escalated child must be CANCELLED"
+    assert (child.context or {}).get("prerequisite_escalated_to_parent") is True
+
+    # The key assertion: surviving_findings must be 0, not 1.
+    surviving = (task.context or {}).get("research_surviving_findings")
+    assert surviving == 0, (
+        f"prereq-cancelled child must not count as a surviving finding "
+        f"(got research_surviving_findings={surviving})"
+    )
+
+    # _first_attempt_succeeded must be downgraded because surviving==0.
+    assert not (task.context or {}).get("_first_attempt_succeeded"), (
+        "a cycle whose only child was prereq-cancelled must not be a first-attempt success"
+    )
+
+    # Confirm direction_outcomes.tasks_created would exclude this child.
+    # We test this via the context predicate directly (same logic as direction_outcomes.py).
+    child_is_prereq_cancelled = (
+        child.status == TaskStatus.CANCELLED
+        and (
+            (child.context or {}).get("prerequisite_escalated_to_parent")
+            or (child.context or {}).get(CO_DEFERRED_SHELVED)
+        )
+    )
+    assert child_is_prereq_cancelled, (
+        "child must satisfy the prereq-cancel predicate used in tasks_created exclusion"
+    )
+
+    # The initial research_history entry written by apply_post_spawn_state must also
+    # exclude prereq-cancelled children from tasks_created (research_direction_state.py).
+    await db_session.refresh(_project)
+    direction_entry = next(
+        (d for d in _project.directions if d.get("id") == direction["id"]), None
+    )
+    assert direction_entry is not None, "direction must exist in project"
+    research_history = direction_entry.get("research_history", [])
+    assert len(research_history) >= 1, "research_history must have at least one entry"
+    assert research_history[-1]["tasks_created"] == 0, (
+        f"prereq-cancelled children must not count toward tasks_created in the initial "
+        f"history entry (got {research_history[-1]['tasks_created']})"
+    )
 
 
 @_pytest.mark.asyncio
@@ -14360,6 +14509,273 @@ class TestStampNoFindingsRefractory:
 
 
 # --------------------------------------------------------------------------- #
+# Proven-merge success completion is gated on owned-criterion coverage.
+#
+# A saturated direction with >= 3 verified merges must NOT retire declaring
+# success ("verified PRs merged") while an acceptance criterion it OWNS is still
+# uncovered. These tests exercise the real seam end-to-end against a live DB:
+# a Direction ORM row (criterion_keys), an open ReleaseVersion, a
+# VersionAcceptanceCriterion, and optional CriterionEvidence — so the
+# direction_owns_uncovered_criterion coverage query runs for real.
+# --------------------------------------------------------------------------- #
+
+
+async def _setup_saturated_proven_direction(
+    db_session,
+    *,
+    direction_id: str,
+    criterion_keys: list[str],
+):
+    """Create a project whose in-memory direction is saturated + proven (3 verified
+    merges) and about to tip into possibly_saturated, plus the matching Direction
+    ORM row carrying *criterion_keys*. Returns (project, task, direction_dict)."""
+    from app.models import Direction
+
+    direction = {
+        "id": direction_id,
+        "text": "Saturated proven direction",
+        "status": "active",
+        "history_aggregate": {},
+        "consecutive_unproductive_cycles": 2,  # +1 in the call → saturated
+        "research_history": [
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+        ],
+    }
+    project = _Project(
+        name="Coverage Gate Test",
+        user_id="test-user-cov-gate",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First-class Direction ORM row carrying the mapped criterion keys. The
+    # in-memory direction dict does NOT reliably carry criterion_keys; the gate
+    # helper reads them from this row.
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            status="active",
+            data=dict(direction),
+            criterion_keys=list(criterion_keys),
+        )
+    )
+    await db_session.commit()
+
+    task = _Task(
+        project_id=project.id,
+        title="Research: saturated proven",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task, direction
+
+
+async def _open_version_with_criterion(db_session, project, *, covered: bool):
+    """Open a ReleaseVersion for *project* with one active criterion. When
+    *covered*, attach reachability evidence (coverage → 'covered')."""
+    from app import acceptance_criteria as ac
+    from app.models import CriterionEvidence, ReleaseVersion
+
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Owned acceptance outcome"
+    )
+    if covered:
+        db_session.add(
+            CriterionEvidence(
+                criterion_id=criterion.id,
+                project_id=project.id,
+                source_kind="reachability",
+                source_id="pr-1",
+            )
+        )
+        await db_session.commit()
+    return version, criterion
+
+
+@_pytest.mark.asyncio
+async def test_no_findings_proven_direction_with_uncovered_criterion_stays_active(
+    db_session,
+):
+    """Site 2 (_stamp_no_findings_refractory): a saturated, >=3-merge direction
+    that OWNS an uncovered active criterion must NOT auto-complete on the
+    throughput route — it stays active to keep working toward the unmet outcome."""
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-uncovered"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row's criterion_keys at the real (uncovered) criterion.
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "Direction owning an uncovered criterion must NOT auto-complete on the "
+        "proven-merge route; expected it to stay active"
+    )
+    assert target.get("auto_completed") is not True
+    # Refractory stamp is still applied even though completion was withheld.
+    assert target.get("possibly_saturated") is True
+
+
+@_pytest.mark.asyncio
+async def test_no_findings_proven_direction_with_covered_criterion_completes(
+    db_session,
+):
+    """Site 2: when the owned criterion IS covered, the saturated proven
+    direction still auto-completes exactly as before."""
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-covered"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=True
+    )
+
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "completed", (
+        "Direction whose owned criterion is covered must still auto-complete"
+    )
+    assert target.get("auto_completed") is True
+    assert "verified" in (target.get("auto_completed_reason") or "")
+
+
+@_pytest.mark.asyncio
+async def test_no_findings_proven_direction_owning_no_criteria_completes(db_session):
+    """Site 2: the gate is a no-op when the direction owns no criteria — a
+    saturated proven direction with an empty criterion_keys set still completes
+    (preserves current behavior)."""
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-none"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=[]
+    )
+    # An open version with an active criterion exists, but the direction owns
+    # none of it — the gate must not block completion.
+    await _open_version_with_criterion(db_session, project, covered=False)
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "completed", (
+        "Direction owning no criteria must auto-complete unchanged"
+    )
+    assert target.get("auto_completed") is True
+
+
+@_pytest.mark.asyncio
+async def test_no_findings_proven_direction_fails_open_on_coverage_error(
+    db_session, mocker
+):
+    """Site 2: if the coverage query raises, the gate fails open — the saturated
+    proven direction completes rather than being permanently stranded."""
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-failopen"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    # Force the coverage resolution to raise; the helper must swallow it (fail-open).
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(side_effect=RuntimeError("transient DB error")),
+    )
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "completed", (
+        "A coverage-query error must fail open (complete), never deadlock the "
+        "saturated direction forever"
+    )
+    assert target.get("auto_completed") is True
+
+
+# --------------------------------------------------------------------------- #
 # Deferred-memo enrollment: flag-off no-op, flag-on creates row, dedup.
 # --------------------------------------------------------------------------- #
 
@@ -15822,3 +16238,595 @@ async def test_sub_research_note_append_is_idempotent_on_replay(db_session):
         f"Sub_research_notes contain duplicate sub_task_ids: {subtask_ids}. "
         "Replay must be idempotent."
     )
+
+
+class TestResearchHistoryIdempotency:
+    """Verify that research_history entries are idempotent on post-commit retry."""
+
+    def _make_task(self, task_id, direction_id="d-test-retry"):
+        """Create a mock failed research task."""
+        task = MagicMock()
+        task.id = task_id
+        task.project_id = uuid.uuid4()
+        task.context = {
+            "failure_category": "CODE_ERROR",
+            "direction_id": direction_id,
+        }
+        task.latest_status_message = "CODE_ERROR: something went wrong"
+        task.first_payload = {"type": "research"}
+        return task
+
+    def _make_session(self):
+        """Create a mock async session."""
+        session = AsyncMock()
+        session.add = MagicMock()
+        return session
+
+    def _make_project(self, direction_id="d-test-retry"):
+        """Create a mock project with a direction."""
+        project = MagicMock()
+        project.directions = [
+            {
+                "id": direction_id,
+                "research_history": [],
+                "consecutive_unproductive_cycles": 0,
+            }
+        ]
+        return project
+
+    def _run(self, project, coro):
+        """Run coro with with_directions_locked patched to call mutate_fn on project.directions."""
+        import asyncio
+        from unittest.mock import patch
+
+        async def _mock_wdl(session, project_id, mutate_fn):
+            mutate_fn(project.directions)
+
+        with patch("app.research_completion.with_directions_locked", _mock_wdl):
+            asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_research_history_append_idempotent_on_retry(self):
+        """Calling _record_failure twice with same task_id must not duplicate entries."""
+        from app.research_completion import _record_research_task_failure
+
+        task_id = uuid.uuid4()
+        task = self._make_task(task_id)
+        project = self._make_project()
+        session = self._make_session()
+
+        # First call: record the failure
+        self._run(project, _record_research_task_failure(task, session))
+        history_first = project.directions[0]["research_history"]
+        assert len(history_first) == 1, f"Expected 1 entry after first call, got {len(history_first)}"
+        assert history_first[0]["task_id"] == str(task_id)
+
+        # Second call: simulate post_commit_pending retry — record the same failure again
+        self._run(project, _record_research_task_failure(task, session))
+        history_second = project.directions[0]["research_history"]
+
+        # Verify idempotency: still exactly one entry
+        assert len(history_second) == 1, (
+            f"Expected 1 entry after retry (idempotent), got {len(history_second)}. "
+            f"History: {history_second}. Retry duplicated the entry."
+        )
+        # Verify it's the same entry
+        assert history_second[0]["task_id"] == str(task_id)
+        # Verify the entry still has the failure_category
+        assert history_second[0]["failure_category"] == "CODE_ERROR"
+
+
+async def test_apply_post_spawn_state_research_history_idempotent_on_retry(db_session):
+    """Calling apply_post_spawn_state twice with the same task_id must not duplicate history entries.
+
+    The idempotency guard at research_direction_state.py:667-675 checks existing_task_ids
+    (including evicted aggregate entries) before appending. A second call with the same task
+    (post-commit retry scenario) must leave exactly one research_history entry.
+    """
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-idem-apply-retry"
+    direction = {
+        **_active_direction(direction_id, "Idempotency retry test direction"),
+        "research_history": [],
+    }
+    project = _Project(
+        name="Apply Post Spawn Idempotency Test",
+        user_id="test-user-idem-apss-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    _call_args = (
+        db_session,
+        task,
+        [],    # findings
+        [],    # child_tasks
+        [],    # deduplicated
+        [],    # insights
+        [],    # direction_notes
+        [],    # direction_proposals
+        0,     # hash_dedup_count
+        0,     # word_overlap_count
+        0,     # file_overlap_count
+        0,     # evidence_overlap_count
+        0,     # type_filtered_count
+        0,     # empty_prompt_count
+        "research-branch",
+        "main",
+        0,     # research_depth
+        None,  # parent_research_task_id
+    )
+
+    # First call: adds a research_history entry for this task
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    history_first = project.directions[0].get("research_history", [])
+    assert len(history_first) == 1, (
+        f"Expected 1 entry after first call, got {len(history_first)}"
+    )
+    assert history_first[0]["task_id"] == str(task.id)
+
+    # Second call: simulate post-commit retry — same task, same args
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    history_second = project.directions[0].get("research_history", [])
+    assert len(history_second) == 1, (
+        f"Expected 1 entry after retry (idempotent), got {len(history_second)}. "
+        f"apply_post_spawn_state duplicated the research_history entry on post-commit retry. "
+        f"History: {history_second}"
+    )
+    assert history_second[0]["task_id"] == str(task.id)
+
+
+async def test_apply_post_spawn_state_outcome_progress_and_findings_idempotent_on_retry(db_session):
+    """Calling apply_post_spawn_state twice with same task_id must not duplicate
+    outcome_progress_history or recent_findings_evidence entries.
+
+    The fix wraps recent_findings_evidence and record_outcome_progress_snapshot
+    inside the task_id guard (research_direction_state.py line 898) so they are
+    only updated when the task_id is new. A post-commit retry with the same task
+    must leave outcome_progress_history and recent_findings_evidence with the same
+    entries as a single call — no duplicate cycle_index snapshot and no duplicated
+    finding evidence.
+    """
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_finding, _make_research_task
+
+    direction_id = "d-idem-outcome-prog-retry"
+    direction = {
+        **_active_direction(direction_id, "Outcome progress idempotency test"),
+        "research_history": [],
+        "recent_findings_evidence": [],
+        "outcome_progress_history": [],
+    }
+    project = _Project(
+        name="Outcome Progress Idempotency Test",
+        user_id="test-user-outcome-prog-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Create finding with claims and sources so recent_findings_evidence populates
+    finding = _make_finding(title="Test Finding", direction_id=direction_id)
+    finding["claims"] = ["claim1", "claim2"]
+    finding["sources"] = [{"type": "file", "ref": "test.py:10"}]
+    deduplicated = [(0, finding, "test-hash")]
+
+    _call_args = (
+        db_session,
+        task,
+        [finding],      # findings
+        [],             # child_tasks (no children spawned, findings deduped)
+        deduplicated,   # deduplicated
+        [],             # insights
+        [],             # direction_notes
+        [],             # direction_proposals
+        1,              # hash_dedup_count
+        0,              # word_overlap_count
+        0,              # file_overlap_count
+        0,              # evidence_overlap_count
+        0,              # type_filtered_count
+        0,              # empty_prompt_count
+        "research-branch",
+        "main",
+        0,              # research_depth
+        None,           # parent_research_task_id
+    )
+
+    # First call: populate outcome_progress_history and recent_findings_evidence
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    dir_first = project.directions[0]
+    rfe_first = list(dir_first.get("recent_findings_evidence", []))
+    oph_first = list(dir_first.get("outcome_progress_history", []))
+    hist_first = list(dir_first.get("research_history", []))
+
+    # Record snapshots for comparison (independent of whether populated)
+    rfe_first_len = len(rfe_first)
+    oph_first_len = len(oph_first)
+    hist_first_len = len(hist_first)
+
+    # Second call: simulate post-commit retry — same task, same findings
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    dir_second = project.directions[0]
+    rfe_second = list(dir_second.get("recent_findings_evidence", []))
+    oph_second = list(dir_second.get("outcome_progress_history", []))
+    hist_second = list(dir_second.get("research_history", []))
+
+    # Verify idempotency: all three append-only lists must not grow on retry
+    assert len(hist_second) == hist_first_len, (
+        f"research_history duplicated on retry: "
+        f"expected {hist_first_len} entries, got {len(hist_second)}"
+    )
+    assert len(rfe_second) == rfe_first_len, (
+        f"recent_findings_evidence duplicated on retry: "
+        f"expected {rfe_first_len} entries, got {len(rfe_second)}. "
+        f"Before: {rfe_first}, After: {rfe_second}"
+    )
+    assert len(oph_second) == oph_first_len, (
+        f"outcome_progress_history duplicated on retry: "
+        f"expected {oph_first_len} entries, got {len(oph_second)}. "
+        f"Before: {oph_first}, After: {oph_second}"
+    )
+
+    # Verify entries are identical (not just same count)
+    assert rfe_second == rfe_first, (
+        "recent_findings_evidence entries differ on retry"
+    )
+    assert oph_second == oph_first, (
+        "outcome_progress_history entries differ on retry"
+    )
+
+
+class TestProductivityCounterReplay:
+    """consecutive_unproductive_cycles must not double-count on completion-handler replay."""
+
+    async def test_productivity_counter_idempotent_on_replay(self, monkeypatch):
+        """_stamp_no_findings_refractory must increment the counter exactly once even when
+        replayed with the same task (post-commit re-run scenario)."""
+        import app.research_completion as rc
+        from app.research_completion import _stamp_no_findings_refractory
+
+        direction_id = str(uuid.uuid4())
+        task = _Task(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            title="research",
+            payloads=[{"type": "research", "current_direction_id": direction_id}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"direction_id": direction_id},
+        )
+
+        directions = [{"id": direction_id, "status": "active", "consecutive_unproductive_cycles": 1}]
+
+        async def _fake_with_dirs_locked(session, project_id, fn, **kwargs):
+            fn(directions)
+            return True
+
+        monkeypatch.setattr(rc, "with_directions_locked", _fake_with_dirs_locked)
+
+        session = AsyncMock()
+
+        # First call (original run): counter should increment 1 → 2
+        await _stamp_no_findings_refractory(task, session)
+        assert directions[0]["consecutive_unproductive_cycles"] == 2, (
+            "counter should have incremented on first call"
+        )
+
+        # Second call (replay, same task): counter must NOT increment again
+        await _stamp_no_findings_refractory(task, session)
+        assert directions[0]["consecutive_unproductive_cycles"] == 2, (
+            "counter must remain at 2 on replay — double-counting a no-findings cycle "
+            "inflates the streak and triggers false saturation/auto-retirement"
+        )
+
+    async def test_productivity_counter_increments_for_different_task(self, monkeypatch):
+        """A genuinely new task (different task_id) on the same direction must still increment."""
+        import app.research_completion as rc
+        from app.research_completion import _stamp_no_findings_refractory
+
+        direction_id = str(uuid.uuid4())
+        directions = [{"id": direction_id, "status": "active", "consecutive_unproductive_cycles": 1}]
+
+        async def _fake_with_dirs_locked(session, project_id, fn, **kwargs):
+            fn(directions)
+            return True
+
+        monkeypatch.setattr(rc, "with_directions_locked", _fake_with_dirs_locked)
+        session = AsyncMock()
+
+        def _make_task():
+            return _Task(
+                id=uuid.uuid4(),
+                project_id=uuid.uuid4(),
+                title="research",
+                payloads=[{"type": "research", "current_direction_id": direction_id}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                context={"direction_id": direction_id},
+            )
+
+        await _stamp_no_findings_refractory(_make_task(), session)
+        assert directions[0]["consecutive_unproductive_cycles"] == 2
+
+        await _stamp_no_findings_refractory(_make_task(), session)
+        assert directions[0]["consecutive_unproductive_cycles"] == 3, (
+            "a different task's no-findings cycle must still increment the counter"
+        )
+
+
+async def test_note_apply_is_idempotent_on_replay(db_session):
+    """Direction notes must not duplicate when apply_post_spawn_state is replayed.
+
+    When apply_post_spawn_state is called twice with the same direction_notes (post-commit
+    retry scenario), the _apply_notes callback must not append duplicate notes with the same
+    text and added_by_task. The dedup check must examine existing notes before appending.
+    """
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-note-replay"
+    direction = {
+        **_active_direction(direction_id, "Test direction for note replay"),
+        "research_history": [],
+        "notes": [],
+    }
+    project = _Project(
+        name="Note Apply Idempotency Test",
+        user_id="test-user-note-idem-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Prepare direction notes to be appended
+    note_text = "Test direction annotation from research completion"
+    direction_notes = [
+        {
+            "direction_id": direction_id,
+            "description": note_text,
+        }
+    ]
+
+    _call_args = (
+        db_session,
+        task,
+        [],                 # findings
+        [],                 # child_tasks
+        [],                 # deduplicated
+        [],                 # insights
+        direction_notes,    # direction_notes with the test note
+        [],                 # direction_proposals
+        0,                  # hash_dedup_count
+        0,                  # word_overlap_count
+        0,                  # file_overlap_count
+        0,                  # evidence_overlap_count
+        0,                  # type_filtered_count
+        0,                  # empty_prompt_count
+        "research-branch",
+        "main",
+        0,                  # research_depth
+        None,               # parent_research_task_id
+    )
+
+    # First call: adds a note to the direction
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    notes_first = project.directions[0].get("notes", [])
+    matching_notes_first = [n for n in notes_first if n.get("text") == note_text]
+    assert len(matching_notes_first) == 1, (
+        f"Expected 1 matching note after first call, got {len(matching_notes_first)}. "
+        f"All notes: {notes_first}"
+    )
+    assert matching_notes_first[0]["added_by_task"] == str(task.id)
+
+    # Second call: simulate post-commit retry — same task, same direction_notes
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    notes_second = project.directions[0].get("notes", [])
+    matching_notes_second = [n for n in notes_second if n.get("text") == note_text]
+    assert len(matching_notes_second) == 1, (
+        f"Expected 1 matching note after retry (idempotent), got {len(matching_notes_second)}. "
+        f"apply_post_spawn_state duplicated the direction note on post-commit retry. "
+        f"All notes: {notes_second}"
+    )
+    assert matching_notes_second[0]["added_by_task"] == str(task.id)
+
+
+async def test_zero_children_note_idempotent_on_replay(db_session):
+    """Zero-children research note must not duplicate when _apply_terminal_transition is replayed.
+
+    When a research task completes with zero children, it appends a note to the direction.
+    On a post-commit retry, _apply_terminal_transition must not append duplicate notes with
+    the same message and producing task id. The dedup check must examine existing notes
+    before appending.
+    """
+    from app.research_direction_state import _apply_terminal_transition
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-zero-children-replay"
+    direction = {
+        **_active_direction(direction_id, "Test direction for zero-children replay"),
+        "research_history": [],
+        "notes": [],
+    }
+    project = _Project(
+        name="Zero Children Note Idempotency Test",
+        user_id="test-user-zero-children-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Call _apply_terminal_transition with zero children, which appends a zero-children note
+    _call_args = {
+        "session": db_session,
+        "task": task,
+        "child_tasks": [],
+        "findings": [],
+        "direction_notes": [],
+        "direction_proposals": [],
+        "status_msg": "Research produced 0 tasks",
+        "research_branch": "research-branch",
+        "original_base": "main",
+        "direction_id": direction_id,
+        "skipped_duplicates": 0,
+        "hash_dedup_count": 0,
+        "word_overlap_count": 0,
+        "file_overlap_count": 0,
+        "type_filtered_count": 0,
+        "empty_prompt_count": 0,
+    }
+
+    # First call: adds zero-children note to the direction
+    await _apply_terminal_transition(**_call_args)
+    await db_session.refresh(project)
+
+    notes_first = project.directions[0].get("notes", [])
+    # Find the note that was added by this task (should contain "created 0 tasks")
+    matching_notes_first = [n for n in notes_first if "created 0 tasks" in n.get("msg", "")]
+    assert len(matching_notes_first) == 1, (
+        f"Expected 1 zero-children note after first call, got {len(matching_notes_first)}. "
+        f"All notes: {notes_first}"
+    )
+    # Verify the note has the producing task id for dedup
+    assert matching_notes_first[0].get("added_by_task") == str(task.id), (
+        f"Expected zero-children note to have added_by_task={task.id}, "
+        f"got {matching_notes_first[0].get('added_by_task')}"
+    )
+
+    # Second call: simulate post-commit retry — same task, same parameters
+    await _apply_terminal_transition(**_call_args)
+    await db_session.refresh(project)
+
+    notes_second = project.directions[0].get("notes", [])
+    matching_notes_second = [n for n in notes_second if "created 0 tasks" in n.get("msg", "")]
+    assert len(matching_notes_second) == 1, (
+        f"Expected 1 zero-children note after retry (idempotent), got {len(matching_notes_second)}. "
+        f"_apply_terminal_transition duplicated the zero-children note on post-commit retry. "
+        f"All notes: {notes_second}"
+    )
+    assert matching_notes_second[0].get("added_by_task") == str(task.id)
+
+
+class TestVerificationOnlyCycleProductivity:
+    """_compute_direction_productivity: verification-only cycles are credited productive."""
+
+    def test_verification_only_cycle_credited_productive_short_refractory(self):
+        """A cycle with only non-spawning findings and zero child tasks is productive.
+
+        Prevents live-verification sweeps and metadata-only research cycles from
+        incurring the extended unproductive refractory window (90-240 min) when they
+        confirmed system state without spawning implementation tasks.
+        """
+        from app.direction_refractory import (
+            resolve_direction_refractory_minutes,
+            stamp_direction_refractory,
+        )
+
+        direction_id = "dir-verify-only"
+        direction = {
+            "id": direction_id,
+            "last_cycle_productive": False,
+            "consecutive_unproductive_cycles": 2,
+        }
+
+        # Simulate: agent produced only design_doc_observation findings (no child tasks)
+        productive = _compute_direction_productivity(
+            direction_id=direction_id,
+            tasks_by_dir={},  # no child tasks spawned
+            current_direction_id=direction_id,
+            has_non_spawn_findings=True,  # but non-spawning findings exist
+        )
+
+        assert productive is True, (
+            "A verification-only cycle (non-spawning findings, zero child tasks) "
+            "must be credited productive to avoid an extended refractory window"
+        )
+
+        # Applying the productive verdict should reset the consecutive counter and
+        # produce the short productive cooldown (default 45 min), not the extended
+        # 90-240 min unproductive window.
+        direction["last_cycle_productive"] = True
+        direction["consecutive_unproductive_cycles"] = 0
+        stamp_direction_refractory(direction)
+
+        refractory_minutes = resolve_direction_refractory_minutes(direction)
+        # productive_direction_cooldown_minutes defaults to 45
+        assert refractory_minutes == _pytest.approx(45.0), (
+            f"Expected productive cooldown ~45 min, got {refractory_minutes:.1f} min. "
+            "Verification-only cycles must not receive the extended unproductive window."
+        )
+
+    def test_zero_tasks_zero_non_spawn_findings_is_unproductive(self):
+        """A cycle with no findings of any kind is not productive (existing behavior)."""
+        productive = _compute_direction_productivity(
+            direction_id="dir-1",
+            tasks_by_dir={},
+            current_direction_id="dir-1",
+            has_non_spawn_findings=False,
+        )
+        assert productive is False
+
+    def test_spawned_tasks_make_cycle_productive_regardless_of_non_spawn(self):
+        """Spawning child tasks makes the cycle productive (existing behavior preserved)."""
+        productive = _compute_direction_productivity(
+            direction_id="dir-1",
+            tasks_by_dir={"dir-1": 2},
+            current_direction_id="dir-1",
+            has_non_spawn_findings=False,
+        )
+        assert productive is True
+
+    def test_non_spawn_findings_do_not_credit_other_directions(self):
+        """Non-spawning findings for current_direction_id do not credit a sibling direction."""
+        productive = _compute_direction_productivity(
+            direction_id="dir-other",
+            tasks_by_dir={},
+            current_direction_id="dir-primary",
+            has_non_spawn_findings=True,
+        )
+        assert productive is False

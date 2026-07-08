@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from sqlalchemy import select
@@ -15,6 +16,7 @@ from app.strategic_spawning import (
     _spawn_strategic_review,
     ci_compliance_qualify_gate,
 )
+from testing import check_size_limits as csl
 
 _HEAD_SHA = "a" * 40
 _CAPPED_REL = "main.py"
@@ -314,3 +316,44 @@ async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
     assert blocked_trace["head_sha"] == _HEAD_SHA
     assert blocked_trace["cap_bump_task"] == str(cap_bump_tasks[0].id)
     assert "qualify_request_blocked_at" in version.last_qualification
+
+
+def test_cap_bump_resolves_orchestrator_runner_dispatch_breach():
+    """After bumping caps via check_size_limits --fix, orchestrator_runner_dispatch
+    must be within its new cap and the module_size_limits.json must be consistent
+    with the actual file size on disk.
+
+    This is a merge-test gate: it runs against the real file tree, so a PR that
+    grows orchestrator_runner_dispatch.py past its cap will fail here even before
+    the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "orchestrator_runner_dispatch.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+
+    # Resolve app/ as testing/'s sibling (same as test_invariants._check_module):
+    # in the Docker test harness only the backend tree is present, so the
+    # dev-checkout layout <repo>/backend/app that resolve_section_root assumes
+    # does not exist there.
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(target_rel, actual_count, cap, "backend", with_verdict=False)
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )

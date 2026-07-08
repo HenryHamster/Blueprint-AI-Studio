@@ -36,6 +36,7 @@ from app.efficiency_snapshot import (
     SELF_REPAIR_SUCCESS_RATE_KEY,
     _PROMPT_STATIC_CONST_NAMES,
     _PROMPT_STATIC_PLAIN_CONST_NAMES,
+    _TASK_TYPE_FOCUS_CONST_NAMES,
     _compute_checkpoint_loss_rate,
     _extract_ts_plain_string_length,
     _extract_ts_template_literal_length,
@@ -1052,6 +1053,67 @@ async def test_cancelled_task_with_vm_cost_included_in_cost_per_merged_pr(db_ses
     expected_cost = 5 * 60 * ON_DEMAND_RATE + 3 * 60 * SPOT_RATE
     expected_cpm = round(expected_cost / 1, 4)
     assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm
+
+
+def test_merged_count_excludes_rollup_parent():
+    """Rollup parents must not be counted as merged PRs alongside their children.
+
+    When a rollup lands, is_merged_completion is True on the parent AND on every
+    child.  Counting the parent inflates cost_per_merged_pr and per-type
+    merged_count.  The fix: build the set of task IDs that appear as
+    parent_task_id on at least one sibling, and exclude those from the merged
+    count.
+    """
+    import uuid
+
+    from app.efficiency_snapshot import _cost_and_merges, compute_vm_cost_by_task_type
+
+    project_id = uuid.uuid4()
+    parent_id = uuid.uuid4()
+
+    now = _utcnow()
+
+    # Rollup parent: merged, but should be excluded from count.
+    parent = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    parent.id = parent_id
+
+    # Two children: each merged, both should count.
+    child1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=3),
+        vm_stopped_at=now,
+        vm_spot=False,
+        parent_task_id=parent_id,
+    )
+    child2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=4),
+        vm_stopped_at=now,
+        vm_spot=False,
+        parent_task_id=parent_id,
+    )
+
+    tasks = [parent, child1, child2]
+
+    # _cost_and_merges: merged count must be 2 (children only), not 3.
+    _, merged = _cost_and_merges(tasks)
+    assert merged == 2, f"Expected 2 merged (children only), got {merged}"
+
+    # compute_vm_cost_by_task_type: merged_count per bucket must also be 2.
+    by_type = compute_vm_cost_by_task_type(tasks)
+    total_merged = sum(b["merged_count"] for b in by_type)
+    assert total_merged == 2, f"Expected 2 merged across types, got {total_merged}"
 
 
 @pytest.mark.asyncio
@@ -8162,6 +8224,90 @@ def test_panel_review_effectiveness_cost_per_challenge_usd():
     )
 
 
+def test_cost_per_challenge_excludes_out_of_window_and_degraded():
+    """cost_per_challenge_usd must apply since_dt window filter to numerator (LLM cost).
+
+    The bug: panel_review LLM cost was summed with no window filter, but the
+    denominator (challenged counts) was filtered by since_dt. This inflated
+    cost_per_challenge_usd when the task list spanned wider than the reporting window.
+
+    Setup:
+      - 2 in-window challenged_confirmed (total_challenged = 2)
+      - 1 out-of-window challenged_confirmed (must be ignored in cost calc)
+      - 1 degraded_model_unavailable (no cost in calculation; state != challenged_*)
+      - 3 panel_review tasks: 2 in-window, 1 out-of-window
+      - Expected: cost_per_challenge_usd = (cost of 2 in-window panel_review) / 2
+
+    Verify:
+      - cost_per_challenge_usd correctly excludes out-of-window panel_review cost
+      - cost_per_challenge_usd correctly excludes degraded challenges
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=1)
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    def _challenged_review(state, updated_at):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": state}},
+            updated_at=updated_at,
+            vm_provisioned_at=updated_at - timedelta(minutes=5),
+            vm_stopped_at=updated_at,
+        )
+
+    def _panel_review_task(input_tokens, output_tokens, updated_at):
+        t = make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "panel_review"}],
+            updated_at=updated_at,
+            vm_provisioned_at=updated_at - timedelta(minutes=5),
+            vm_stopped_at=updated_at,
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+        t.api_call_summary = {
+            "llm_call_count": 1,
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+        }
+        return t
+
+    tasks = [
+        # In-window challenged (should count)
+        _challenged_review("challenged_confirmed", now - timedelta(minutes=10)),
+        _challenged_review("challenged_confirmed", now - timedelta(minutes=5)),
+        # Out-of-window challenged (should NOT count in cost numerator)
+        _challenged_review("challenged_confirmed", window_start - timedelta(minutes=5)),
+        # Degraded challenge (does not count in total_challenged)
+        _challenged_review("degraded_model_unavailable", now - timedelta(minutes=3)),
+        # In-window panel_review tasks (1000+2000 input, 200+400 output)
+        _panel_review_task(1000, 200, now - timedelta(minutes=8)),
+        _panel_review_task(2000, 400, now - timedelta(minutes=3)),
+        # Out-of-window panel_review task (should NOT count in cost)
+        _panel_review_task(3000, 600, window_start - timedelta(minutes=10)),
+    ]
+
+    result = compute_panel_review_effectiveness(tasks, since_dt=window_start)
+    assert result is not None
+    # Only 2 in-window challenged_confirmed counts (excludes out-of-window and degraded)
+    assert result["total_challenged"] == 2, (
+        f"expected total_challenged=2 (in-window only), got {result['total_challenged']}"
+    )
+
+    # Expected cost: only in-window panel_review tasks count
+    expected_cost = (1000 + 2000) * input_rate + (200 + 400) * output_rate
+    expected_per_challenge = round(expected_cost / 2, 4)
+    assert result["cost_per_challenge_usd"] == expected_per_challenge, (
+        f"expected cost_per_challenge_usd={expected_per_challenge} "
+        f"(in-window tasks only), got {result['cost_per_challenge_usd']}"
+    )
+
+
 def test_panel_review_effectiveness_escalated_fail_open():
     """Escalated records (unchallenged + escalated=True) are counted in
     challenged_escalated (informational) and excluded from total_challenged and fail_open_rate.
@@ -8849,10 +8995,17 @@ def test_extract_ts_template_literal_length_unterminated_returns_none():
 
 def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
     """When all template-literal and plain-string constants are found the result
-    is a positive integer equal to the sum of all their body lengths."""
+    is a positive integer equal to the sum of all their body lengths.
+
+    Both prompt.ts and prompts/task-type-focus.ts are mocked via builtins.open
+    (which returns the same synthetic source for every open call), so the
+    combined synthetic source must contain constants from all three tuples.
+    """
     from unittest.mock import mock_open, patch
 
-    # Build a synthetic prompt.ts with all template-literal constants.
+    # Build a synthetic source containing all template-literal constants from
+    # both prompt.ts and task-type-focus.ts (builtins.open returns same source
+    # for both file opens).
     tl_bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
     synthetic_src = "\n".join(
         f"const {name} = `{body}`;" for name, body in tl_bodies.items()
@@ -8864,8 +9017,17 @@ def test_compute_prompt_static_bytes_all_constants_present_returns_positive():
     synthetic_src += "\n" + "\n".join(
         f"const {name} = '{body}';" for name, body in ps_bodies.items()
     )
-    expected_total = sum(len(b) for b in tl_bodies.values()) + sum(
-        len(b) for b in ps_bodies.values()
+    # Append task-type-focus template-literal constants.
+    ttf_bodies = {
+        name: f"ttf body of {name} " * 4 for name in _TASK_TYPE_FOCUS_CONST_NAMES
+    }
+    synthetic_src += "\n" + "\n".join(
+        f"const {name} = `{body}`;" for name, body in ttf_bodies.items()
+    )
+    expected_total = (
+        sum(len(b) for b in tl_bodies.values())
+        + sum(len(b) for b in ps_bodies.values())
+        + sum(len(b) for b in ttf_bodies.values())
     )
 
     import app.efficiency_snapshot as es_mod
@@ -8957,6 +9119,202 @@ def test_compute_prompt_static_bytes_no_agent_src_returns_none():
         result = _compute_prompt_static_bytes()
 
     assert result is None
+
+
+def test_compute_prompt_static_bytes_missing_task_type_focus_file_returns_none():
+    """Returns None when prompts/task-type-focus.ts is absent even if prompt.ts is present."""
+    from unittest.mock import mock_open, patch
+
+    import app.efficiency_snapshot as es_mod
+
+    # Build a synthetic source that satisfies ALL prompt.ts constants.
+    tl_src = "\n".join(
+        f"const {name} = `body of {name}`;" for name in _PROMPT_STATIC_CONST_NAMES
+    )
+    ps_src = "\n".join(
+        f"const {name} = 'plain body';" for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    )
+    prompt_src = tl_src + "\n" + ps_src
+
+    def _fake_exists(path):
+        # prompt.ts exists; task-type-focus.ts does NOT.
+        return "task-type-focus.ts" not in path
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", side_effect=_fake_exists),
+        patch("builtins.open", mock_open(read_data=prompt_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+def test_compute_prompt_static_bytes_missing_task_type_focus_constant_returns_none():
+    """Returns None when a constant in _TASK_TYPE_FOCUS_CONST_NAMES is absent from
+    prompts/task-type-focus.ts even if all prompt.ts constants are present."""
+    from unittest.mock import mock_open, patch
+
+    import app.efficiency_snapshot as es_mod
+
+    # Build a combined source that has all prompt.ts constants but is missing
+    # the last _TASK_TYPE_FOCUS_CONST_NAMES entry.
+    tl_src = "\n".join(
+        f"const {name} = `body of {name}`;" for name in _PROMPT_STATIC_CONST_NAMES
+    )
+    ps_src = "\n".join(
+        f"const {name} = 'plain body';" for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    )
+    ttf_present = _TASK_TYPE_FOCUS_CONST_NAMES[:-1]  # omit the last one
+    ttf_src = "\n".join(
+        f"const {name} = `ttf body of {name}`;" for name in ttf_present
+    )
+    synthetic_src = tl_src + "\n" + ps_src + "\n" + ttf_src
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=synthetic_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is None
+
+
+def test_compute_prompt_static_bytes_task_type_focus_additive():
+    """task-type-focus constants add to the total beyond prompt.ts-only constants."""
+    from unittest.mock import mock_open, patch
+
+    import app.efficiency_snapshot as es_mod
+
+    # Build prompt.ts-only source.
+    tl_bodies = {name: f"body of {name} " * 5 for name in _PROMPT_STATIC_CONST_NAMES}
+    prompt_src = "\n".join(
+        f"const {name} = `{body}`;" for name, body in tl_bodies.items()
+    )
+    ps_bodies = {
+        name: f"plain body of {name} " * 3 for name in _PROMPT_STATIC_PLAIN_CONST_NAMES
+    }
+    prompt_src += "\n" + "\n".join(
+        f"const {name} = '{body}';" for name, body in ps_bodies.items()
+    )
+    prompt_only_total = sum(len(b) for b in tl_bodies.values()) + sum(
+        len(b) for b in ps_bodies.values()
+    )
+
+    # Extend to include task-type-focus constants in the SAME source (builtins.open
+    # returns same content for both file opens under mock_open).
+    ttf_bodies = {
+        name: f"ttf body of {name} " * 4 for name in _TASK_TYPE_FOCUS_CONST_NAMES
+    }
+    combined_src = prompt_src + "\n" + "\n".join(
+        f"const {name} = `{body}`;" for name, body in ttf_bodies.items()
+    )
+    ttf_total = sum(len(b) for b in ttf_bodies.values())
+
+    with (
+        patch.object(es_mod, "_find_agent_src", return_value="/fake/agent/src"),
+        patch("os.path.exists", return_value=True),
+        patch("builtins.open", mock_open(read_data=combined_src)),
+    ):
+        result = _compute_prompt_static_bytes()
+
+    assert result is not None
+    assert isinstance(result, int)
+    assert result > prompt_only_total, (
+        f"result ({result}) should exceed prompt.ts-only total ({prompt_only_total}); "
+        "task-type-focus constants must be additive"
+    )
+    assert result == prompt_only_total + ttf_total
+
+
+def test_prompt_static_bytes_covers_task_type_focus():
+    """_TASK_TYPE_FOCUS_CONST_NAMES lists the six per-task-type focus blocks and
+    _compute_prompt_static_bytes() includes their byte counts in the total.
+
+    This is the acceptance test for the v11 AXIS_PROMPT_STATIC_BYTES extension:
+    it exercises _compute_prompt_static_bytes() against the live source files so
+    any PR that removes or renames a task-type focus constant without updating
+    _TASK_TYPE_FOCUS_CONST_NAMES will fail here.
+
+    The test makes three assertions:
+    1. Every name in _TASK_TYPE_FOCUS_CONST_NAMES exists as a template-literal
+       constant in the live task-type-focus.ts source.
+    2. _compute_prompt_static_bytes() returns a value larger than what prompt.ts
+       alone would produce, confirming the task-type-focus bytes are included.
+    3. The combined result exceeds the prompt.ts-only lower bound (8 000 bytes)
+       and the task-type-focus contribution alone exceeds 1 000 bytes (the six
+       blocks together are several thousand bytes in the live source).
+    """
+    import os
+
+    import app.efficiency_snapshot as es_mod
+
+    result = _compute_prompt_static_bytes()
+    if result is None:
+        pytest.skip(
+            "agent/src/prompt.ts or agent/src/prompts/task-type-focus.ts not "
+            "available in this environment"
+        )
+
+    assert len(_TASK_TYPE_FOCUS_CONST_NAMES) >= 6, (
+        f"_TASK_TYPE_FOCUS_CONST_NAMES has only {len(_TASK_TYPE_FOCUS_CONST_NAMES)} "
+        "entries; expected at least 6 task-type focus blocks (refactor, qa, create, "
+        "fix, docs, deps)"
+    )
+
+    # Verify every declared constant exists in the live task-type-focus.ts.
+    agent_src = es_mod._find_agent_src()
+    assert agent_src is not None
+    ttf_path = os.path.join(agent_src, "prompts", "task-type-focus.ts")
+    assert os.path.exists(ttf_path), (
+        f"prompts/task-type-focus.ts not found at {ttf_path}"
+    )
+    with open(ttf_path, encoding="utf-8") as fh:
+        ttf_src = fh.read()
+
+    for name in _TASK_TYPE_FOCUS_CONST_NAMES:
+        length = es_mod._extract_ts_template_literal_length(ttf_src, name)
+        assert length is not None, (
+            f"Constant {name!r} not found as a template literal in task-type-focus.ts. "
+            "Either the constant was removed/renamed or _TASK_TYPE_FOCUS_CONST_NAMES "
+            "needs updating."
+        )
+        assert length > 0, f"{name!r} has an empty template literal body"
+
+    # Compute prompt.ts-only total to verify task-type-focus adds bytes.
+    prompt_ts = os.path.join(agent_src, "prompt.ts")
+    assert os.path.exists(prompt_ts)
+    with open(prompt_ts, encoding="utf-8") as fh:
+        prompt_src = fh.read()
+
+    prompt_only = 0
+    for name in _PROMPT_STATIC_CONST_NAMES:
+        length = es_mod._extract_ts_template_literal_length(prompt_src, name)
+        assert length is not None
+        prompt_only += length
+    for name in _PROMPT_STATIC_PLAIN_CONST_NAMES:
+        length = es_mod._extract_ts_plain_string_length(prompt_src, name)
+        assert length is not None
+        prompt_only += length
+
+    ttf_contribution = sum(
+        es_mod._extract_ts_template_literal_length(ttf_src, name) or 0
+        for name in _TASK_TYPE_FOCUS_CONST_NAMES
+    )
+
+    assert result == prompt_only + ttf_contribution, (
+        f"_compute_prompt_static_bytes() returned {result} but expected "
+        f"prompt_only ({prompt_only}) + ttf_contribution ({ttf_contribution}) = "
+        f"{prompt_only + ttf_contribution}"
+    )
+    assert result > 8_000, (
+        f"combined total {result} is below 8 000 — something is missing"
+    )
+    assert ttf_contribution > 1_000, (
+        f"task-type-focus contribution ({ttf_contribution} bytes) is below 1 000; "
+        "expected several thousand bytes across the six focus blocks"
+    )
 
 
 # ── self_repair_burn_share suppression test ──────────────────────────────────
@@ -9907,3 +10265,219 @@ async def test_llm_cost_attribution_window_delta_in_read_baseline(db_session):
     # sonnet model must appear in the by_model_delta list
     model_keys = {(r["provider"], r["model"]) for r in wd["by_model_delta"]}
     assert ("anthropic", "claude-sonnet-4-6") in model_keys
+
+
+def test_landed_rate_denominator_excludes_pr_ineligible():
+    """landed_rate and verified_landed_rate use only PR-eligible tasks as denominator.
+
+    PR-ineligible tasks (review, plan, research, …) can never open a PR, so they
+    can only inflate run_count without contributing to landed_count.  The fix
+    divides by pr_eligible_run_count (ci_and_review types only) instead of
+    run_count, so the rate truly answers "of the tasks that could ship code, what
+    fraction did?"
+
+    Scenario:
+      - 1 merged create task  (PR-eligible, verified)
+      - 1 unmerged create task (PR-eligible, did not land)
+      - 3 review tasks        (PR-ineligible — must not enter the denominator)
+
+    Expected:
+      - totals.pr_eligible_run_count == 2
+      - totals.landed_rate == 0.5  (1 landed / 2 pr-eligible)
+      - totals.verified_landed_rate == 0.5
+      Without the fix: run_count == 5 → landed_rate == 0.2 (wrong).
+    """
+    import uuid
+    from app.efficiency_snapshot import compute_effort_model_efficiency
+    from app.models import TaskStatus
+
+    project_id = uuid.uuid4()
+
+    merged_create = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "effort": "medium"}],
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    unmerged_create = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "create", "effort": "medium"}],
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    # Three review tasks — PR-ineligible; must not count in landed_rate denominator.
+    review_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=[{"type": "review", "effort": "high"}],
+            provider="anthropic",
+            model="claude-opus-4-8",
+        )
+        for _ in range(3)
+    ]
+
+    result = compute_effort_model_efficiency(
+        [merged_create, unmerged_create] + review_tasks
+    )
+
+    totals = result["totals"]
+
+    assert totals["run_count"] == 5, "run_count must include all tasks"
+    assert totals["pr_eligible_run_count"] == 2, (
+        "pr_eligible_run_count must count only ci_and_review tasks (create x2)"
+    )
+    assert totals["landed_count"] == 1
+    # landed_rate = 1 landed / 2 pr-eligible = 0.5
+    assert totals["landed_rate"] == 0.5, (
+        f"landed_rate must divide by pr_eligible_run_count (2), got {totals['landed_rate']}"
+    )
+    # With no is_verified_merge signal (context lacks review_loop CI info), the
+    # merged create counts as verified too (no unverified_merge_reason set).
+    assert totals["verified_landed_rate"] == 0.5, (
+        f"verified_landed_rate must use pr_eligible denominator, got {totals['verified_landed_rate']}"
+    )
+
+    # The by_effort breakdown must also carry pr_eligible_run_count per tier.
+    by_effort_map = {row["effort"]: row for row in result["by_effort"]}
+    medium_row = by_effort_map.get("medium")
+    assert medium_row is not None, "medium effort bucket must exist for create tasks"
+    assert medium_row["pr_eligible_run_count"] == 2
+    assert medium_row["landed_rate"] == 0.5
+
+    # The by_model breakdown must credit pr_eligible_run_count in the per-model
+    # crediting loop too, else landed_rate/verified_landed_rate collapse to None
+    # (divide-by-zero denominator) for every model row.
+    by_model_map = {(r["provider"], r["model"]): r for r in result["by_model"]}
+    sonnet_row = by_model_map.get(("anthropic", "claude-sonnet-4-6"))
+    assert sonnet_row is not None, "create tasks' model must appear in by_model"
+    assert sonnet_row["pr_eligible_run_count"] == 2, (
+        "by_model pr_eligible_run_count must count PR-eligible create tasks, "
+        f"got {sonnet_row['pr_eligible_run_count']}"
+    )
+    assert sonnet_row["landed_count"] == 1
+    assert sonnet_row["landed_rate"] == 0.5, (
+        f"by_model landed_rate must divide by pr_eligible_run_count (2), got "
+        f"{sonnet_row['landed_rate']}"
+    )
+    # PR-ineligible review-only model: zero pr_eligible denominator → rate is None.
+    opus_row = by_model_map.get(("anthropic", "claude-opus-4-8"))
+    assert opus_row is not None, "review tasks' model must appear in by_model"
+    assert opus_row["pr_eligible_run_count"] == 0
+    assert opus_row["landed_rate"] is None
+
+
+def test_landed_rate_denominator_excludes_read_only_task_types():
+    """landed_rate denominator excludes every READ_ONLY_TASK_TYPE.
+
+    READ_ONLY_TASK_TYPES are structurally incapable of landing a PR, so
+    including them in the denominator deflates landed_rate in exactly the
+    high-cost effort tiers operators scrutinize.
+
+    This test exercises the production fix directly: pr_eligible_run_count
+    (ci_and_review tasks only) is the denominator, not run_count.  It also
+    verifies that the _resolved_models rows (per-model within an effort tier)
+    carry pr_eligible_run_count so the by_effort model breakdown is
+    self-consistent.
+
+    Scenario:
+      - 2 merged create tasks (PR-eligible, medium effort)
+      - 1 each of review, research, plan, strategic_review (read-only, high)
+
+    Expected:
+      - totals.run_count == 6
+      - totals.pr_eligible_run_count == 2
+      - totals.landed_rate == 1.0 (2 landed / 2 pr-eligible)
+      - by_effort[medium].pr_eligible_run_count == 2
+      - resolved_models rows for read-only model have pr_eligible_run_count == 0
+    """
+    import uuid
+    from app.efficiency_snapshot import compute_effort_model_efficiency
+    from app.models import TaskStatus
+    from app.task_capabilities import READ_ONLY_TASK_TYPES
+
+    project_id = uuid.uuid4()
+
+    create_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "medium"}],
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+        for _ in range(2)
+    ]
+
+    # Sample four distinct read-only task types to verify none enter the
+    # pr_eligible denominator regardless of which specific type they are.
+    read_only_sample = ["review", "research", "plan", "strategic_review"]
+    assert all(t in READ_ONLY_TASK_TYPES for t in read_only_sample), (
+        "test fixture uses types that must be in READ_ONLY_TASK_TYPES"
+    )
+    read_only_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=[{"type": task_type, "effort": "high"}],
+            provider="anthropic",
+            model="claude-opus-4-8",
+        )
+        for task_type in read_only_sample
+    ]
+
+    result = compute_effort_model_efficiency(create_tasks + read_only_tasks)
+
+    totals = result["totals"]
+    assert totals["run_count"] == 6
+    assert totals["pr_eligible_run_count"] == 2, (
+        f"only create tasks are PR-eligible; got {totals['pr_eligible_run_count']}"
+    )
+    assert totals["landed_count"] == 2
+    assert totals["landed_rate"] == 1.0, (
+        f"landed_rate must divide by pr_eligible_run_count (2), got {totals['landed_rate']}"
+    )
+
+    # Per-effort breakdown: medium bucket should have both creates, zero read-only.
+    by_effort_map = {row["effort"]: row for row in result["by_effort"]}
+    medium_row = by_effort_map.get("medium")
+    assert medium_row is not None
+    assert medium_row["pr_eligible_run_count"] == 2
+    assert medium_row["landed_rate"] == 1.0
+
+    # Per-model rows within the medium effort bucket carry pr_eligible_run_count.
+    medium_models = {
+        (r["provider"], r["model"]): r
+        for r in medium_row.get("resolved_models", [])
+    }
+    sonnet_em = medium_models.get(("anthropic", "claude-sonnet-4-6"))
+    assert sonnet_em is not None, "create-task model must appear in medium resolved_models"
+    assert sonnet_em["pr_eligible_run_count"] == 2, (
+        f"resolved_models row must expose pr_eligible_run_count; got {sonnet_em}"
+    )
+
+    # high effort bucket: all read-only → pr_eligible_run_count == 0 → landed_rate is None.
+    high_row = by_effort_map.get("high")
+    assert high_row is not None
+    assert high_row["pr_eligible_run_count"] == 0
+    assert high_row["landed_rate"] is None
+
+    # Per-model rows in the high bucket: the read-only model has pr_eligible == 0.
+    high_models = {
+        (r["provider"], r["model"]): r
+        for r in high_row.get("resolved_models", [])
+    }
+    opus_em = high_models.get(("anthropic", "claude-opus-4-8"))
+    assert opus_em is not None
+    assert opus_em["pr_eligible_run_count"] == 0, (
+        f"read-only model must have pr_eligible_run_count=0; got {opus_em}"
+    )

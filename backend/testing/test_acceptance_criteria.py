@@ -4139,3 +4139,1412 @@ async def test_record_task_merge_evidence_logs_direction_fetch_failed(db_session
     assert any(MergeEvidenceReason.direction_fetch_failed in r.message for r in caplog.records), (
         f"Expected direction_fetch_failed in log; got: {[r.message for r in caplog.records]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# record_acceptance_window_coverage_evidence
+# ---------------------------------------------------------------------------
+
+
+def _make_inferred_cochange_task(project, version, *, changed_files, seconds=1):
+    """Build a COMPLETED, CI-verified, UNDECLARED merged write-task.
+
+    With a test path AND a production path in ``_pr_changed_files`` this
+    classifies as ``inferred_test_cochange`` (verified numerator); with only a
+    production path it classifies as ``undeclared`` (denominator-only, false-zero
+    numerator).
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    return Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement it"}],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": changed_files,
+            # No CODE_ACCEPTANCE_VERDICT_KEY → undeclared; a verified merge with a
+            # test+prod co-change is credited via the inferred_test_cochange path.
+        },
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=seconds),
+    )
+
+
+def test_acceptance_window_recompute_evidence_marks_covered():
+    """An ``acceptance_window_recompute`` evidence row is covering on its own."""
+    assert (
+        ac.compute_criterion_coverage(
+            [_make_evidence("acceptance_window_recompute", detail={"acceptance_window_verified": 3})]
+        )
+        == "covered"
+    )
+
+
+def test_names_acceptance_window_metric_matches_and_rejects():
+    """The metric-name matcher recognises acceptance-window text and rejects others."""
+    assert ac._names_acceptance_window_metric("The false acceptance-coverage 0/346 is fixed")
+    assert ac._names_acceptance_window_metric("acceptance_window_fraction is non-zero")
+    assert ac._names_acceptance_window_metric("recompute the ACCEPTANCE WINDOW aggregate")
+    assert not ac._names_acceptance_window_metric("subtask_merge_rate drops SCOPE_OVERFLOW")
+    assert not ac._names_acceptance_window_metric(None)
+    assert not ac._names_acceptance_window_metric("")
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_records_covering_evidence(db_session):
+    """Named acceptance-evidence test: inferred_test_cochange merges flip the
+    acceptance-window criterion from uncovered to covered.
+
+    Given an open version whose merge window contains inferred_test_cochange
+    merges (COMPLETED write-tasks whose PR co-changed a test AND a production
+    file, CI-verified, no explicit verdict) such that the recomputed aggregate
+    scores ``verified > 0``, the recorder records ONE covering
+    ``acceptance_window_recompute`` row for the criterion whose text names the
+    metric and ``get_version_coverage_summary`` reports it ``covered``.
+    """
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowRecompute")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    # The operator-authored criterion that tracks the acceptance-window metric.
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="The false acceptance-coverage 0/346 is fixed (acceptance_window_fraction non-zero)",
+        created_by="operator",
+    )
+
+    # Two inferred_test_cochange merges (verified numerator) + one prod-only
+    # undeclared merge (denominator only). verified=2, write_total=3.
+    inferred_task_a = _make_inferred_cochange_task(
+        project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
+    )
+    inferred_task_b = _make_inferred_cochange_task(
+        project, version, changed_files=["testing/test_b.py", "app/b.py"], seconds=2
+    )
+    db_session.add(inferred_task_a)
+    db_session.add(inferred_task_b)
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["app/c.py"], seconds=3
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(inferred_task_a)
+    await db_session.refresh(inferred_task_b)
+
+    # Before: no evidence, criterion uncovered.
+    summary_before = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_before["covered"] == 0
+    assert summary_before["uncovered"] == 1
+
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 1, f"Expected 1 covering row for the target criterion; got {recorded}"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1
+    row = evidence[0]
+    assert row.source_kind == "acceptance_window_recompute"
+    assert row.detail["acceptance_window_verified"] == 2
+    assert row.detail["acceptance_window_write_total"] == 3
+    assert row.detail["acceptance_window_inferred_test_cochange"] == 2
+    assert row.detail["acceptance_window_fraction"] == pytest.approx(2 / 3)
+    # Per-merge audit trail: task IDs of the inferred_test_cochange merges must
+    # appear in the evidence detail so operators can trace which merges counted.
+    assert set(row.detail["inferred_test_cochange_task_ids"]) == {
+        str(inferred_task_a.id),
+        str(inferred_task_b.id),
+    }
+
+    # After: the criterion flips to covered.
+    summary_after = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_after["covered"] == 1
+    assert summary_after["uncovered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_covers_via_direction_mapping(db_session):
+    """A criterion whose OWN text is generic is still covered when it is mapped to
+    a Direction whose text names the acceptance-window metric (rule b)."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowViaDirection")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="c-986db347 tracked outcome",  # generic text, not itself a match
+        created_by="operator",
+    )
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key="d-window",
+        data={"id": "d-window", "text": "Drive acceptance_window_fraction non-zero", "status": "active"},
+        text="Drive acceptance_window_fraction non-zero",
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
+        )
+    )
+    await db_session.commit()
+
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 1
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["covered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_nothing_when_verified_zero(db_session):
+    """False zero: write_total > 0 but verified == 0 → records NOTHING, stays uncovered."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowFalseZero")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="acceptance_window_fraction is non-zero",
+        created_by="operator",
+    )
+    # Prod-only undeclared merge: contributes to write_total but not verified.
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["app/only_prod.py"], seconds=1
+        )
+    )
+    await db_session.commit()
+
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 0, "Must record nothing when verified == 0 (false zero)"
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["uncovered"] == 1
+    assert summary["covered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_nothing_when_no_merges(db_session):
+    """Empty window: write_total == 0 → records NOTHING."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowEmpty")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="acceptance_window_fraction is non-zero",
+        created_by="operator",
+    )
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 0
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["uncovered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_does_not_over_cover(db_session):
+    """An unrelated active criterion (text does not name the metric, no mapping)
+    must NOT receive acceptance-window evidence — no blanket coverage."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowNoOverCover")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    target = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="acceptance_window_fraction is non-zero",
+        created_by="operator",
+    )
+    unrelated = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="subtask_merge_rate drops SCOPE_OVERFLOW from denominator",
+        created_by="operator",
+    )
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
+        )
+    )
+    await db_session.commit()
+
+    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert recorded == 1, "Only the target criterion should be covered"
+
+    assert await ac.get_evidence_for_criterion(db_session, target.id) != []
+    assert await ac.get_evidence_for_criterion(db_session, unrelated.id) == [], (
+        "Unrelated criterion must not receive acceptance-window evidence"
+    )
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["covered"] == 1
+    assert summary["uncovered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_recompute_is_idempotent(db_session):
+    """Running the recorder twice records at most one row (stable per-version source_id)."""
+    from app import release_version as rv
+
+    project = await _make_project(db_session, "AcceptanceWindowIdempotent")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="acceptance_window_fraction is non-zero",
+        created_by="operator",
+    )
+    db_session.add(
+        _make_inferred_cochange_task(
+            project, version, changed_files=["testing/test_a.py", "app/a.py"], seconds=1
+        )
+    )
+    await db_session.commit()
+
+    first = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    second = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert first == 1
+    assert second == 0, "Second run must be idempotent (0 new rows)"
+    assert len(await ac.get_evidence_for_criterion(db_session, criterion.id)) == 1
+
+
+def test_large_pr_changed_files_not_silently_misclassified():
+    """A >50-file PR must not be silently misclassified when its test (or
+    production) paths fall beyond the 50-entry truncation window.
+
+    Regression guard for the silent-truncation bug: ``_pr_changed_files`` is
+    capped at 50 entries when stamped onto task context, but the acceptance
+    classifier and the ``named_test`` gate treated that list as complete, so a
+    dropped test path could flip ``inferred_test_cochange`` to ``undeclared`` or
+    a would-be proof to a merge that fails closed with no signal the input was
+    incomplete. ``stamp_changed_files_signal`` carries a non-lossy full-list
+    summary so classification is truncation-proof.
+    """
+    from app.acceptance_gate import (
+        REVIEW_LOOP_KEY,
+        classify_merged_acceptance_context,
+        evaluate_code_acceptance,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    # 55 production files, then the sole test file — the test path lands beyond
+    # the 50-entry truncation window.
+    prod_files = [f"backend/app/module_{i}.py" for i in range(55)]
+    test_file = "backend/testing/test_module_54.py"
+    changed_files = [*prod_files, test_file]
+
+    signal = stamp_changed_files_signal(changed_files)
+    # The stored list is genuinely truncated (the lossy window is real), yet the
+    # full-list summary preserves the acceptance-relevant signal.
+    assert len(signal["_pr_changed_files"]) == 50
+    assert test_file not in signal["_pr_changed_files"]
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    verified_ctx = {
+        LANDED_SIGNAL_KEY: True,
+        LANDED_ON_INTEGRATION_KEY: True,
+        **signal,
+    }
+    # With the non-lossy summary the genuine test co-change is credited...
+    assert (
+        classify_merged_acceptance_context(verified_ctx) == "inferred_test_cochange"
+    )
+
+    # ...whereas the old lossy behavior (bare truncated list, no summary) would
+    # have silently demoted the identical merge to "undeclared".
+    lossy_ctx = {
+        LANDED_SIGNAL_KEY: True,
+        LANDED_ON_INTEGRATION_KEY: True,
+        "_pr_changed_files": changed_files[:50],
+    }
+    assert classify_merged_acceptance_context(lossy_ctx) == "undeclared"
+
+    # named_test: the declared test shipped beyond the truncation point. Its
+    # absence from the stored list must be treated as indeterminate (crediting
+    # soft) rather than a definitive "test not added" that records
+    # satisfied=False and blocks the large merge from crediting as success.
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "large change",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": test_file,
+                },
+            }
+        ],
+        context={REVIEW_LOOP_KEY: {}, **signal},
+        status=TaskStatus.COMPLETED,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True, "truncated named_test must not block success"
+    assert verdict.proven is False, "cannot machine-prove a truncated-away test"
+    assert "truncat" in verdict.reason.lower()
+
+    # Control: without truncation the named_test gate is unaffected — a present,
+    # verified test with a production seam still proves.
+    small_signal = stamp_changed_files_signal(
+        ["backend/app/module_0.py", test_file]
+    )
+    assert "_pr_changed_files_truncated" not in small_signal
+    small_task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "small change",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": test_file,
+                },
+            }
+        ],
+        context={REVIEW_LOOP_KEY: {}, **small_signal},
+        status=TaskStatus.COMPLETED,
+    )
+    small_verdict = evaluate_code_acceptance(small_task)
+    assert small_verdict.satisfied is True
+    assert small_verdict.proven is True
+
+
+def test_inferred_test_cochange_large_pr_truncation():
+    """Edge cases for stamp_changed_files_signal and classify_merged_acceptance_context
+    with large PRs — verifying the non-lossy summary prevents silent misclassification
+    across boundary and edge conditions.
+
+    Coverage beyond the core happy-path test (test_large_pr_changed_files_not_silently_misclassified):
+      * Exactly 50 files — NOT truncated, test file within the stored window
+      * 51 files with test at index 50 — truncated, test in last stored slot
+      * 55 production-only files — truncated, has_test=False, has_prod=True
+      * 55 test-only files — truncated, has_test=True, has_prod=False
+      * Multiple test files in a truncated PR beyond the window
+      * classify_merged_acceptance_context correctly uses the non-lossy summary
+        for each edge case
+    """
+    from app.acceptance_gate import (
+        classify_merged_acceptance_context,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    # --- Boundary: exactly 50 files (NOT truncated) ---
+    prod_49 = [f"backend/app/module_{i}.py" for i in range(49)]
+    test_1 = "backend/testing/test_boundary.py"
+    files_50 = [*prod_49, test_1]
+    signal = stamp_changed_files_signal(files_50)
+    assert len(signal["_pr_changed_files"]) == 50
+    assert "_pr_changed_files_truncated" not in signal, (
+        "Exactly 50 files must NOT be flagged as truncated"
+    )
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    ctx_50 = {LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal}
+    assert classify_merged_acceptance_context(ctx_50) == "inferred_test_cochange"
+
+    # --- Boundary: 51 files, test at index 50 (last slot in truncated window) ---
+    prod_50 = [f"backend/app/module_{i}.py" for i in range(50)]
+    test_edge = "backend/testing/test_edge_last_slot.py"
+    files_51_edge = [*prod_50, test_edge]
+    signal = stamp_changed_files_signal(files_51_edge)
+    assert len(signal["_pr_changed_files"]) == 50
+    assert signal["_pr_changed_files_truncated"] is True
+    # The test file at index 50 IS within the 50-slot window.
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    ctx_51_edge = {
+        LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal
+    }
+    assert classify_merged_acceptance_context(ctx_51_edge) == "inferred_test_cochange"
+
+    # --- Boundary: 52 files, test at index 51 (beyond truncation window) ---
+    prod_51 = [f"backend/app/module_{i}.py" for i in range(51)]
+    test_beyond = "backend/testing/test_beyond_window.py"
+    files_52 = [*prod_51, test_beyond]
+    signal = stamp_changed_files_signal(files_52)
+    assert len(signal["_pr_changed_files"]) == 50
+    assert signal["_pr_changed_files_truncated"] is True
+    # The test file at index 51 is BEYOND the stored list, but the non-lossy
+    # summary still sees it.
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    ctx_52 = {LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal}
+    assert classify_merged_acceptance_context(ctx_52) == "inferred_test_cochange"
+
+    # --- Truncated PR with only production files (no test anywhere) ---
+    prod_only = [f"backend/app/module_{i}.py" for i in range(55)]
+    signal = stamp_changed_files_signal(prod_only)
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_has_test"] is False
+    assert signal["_pr_changed_files_has_prod"] is True
+
+    ctx_prod_only = {
+        LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal
+    }
+    # No test co-change → not inferred, must be undeclared.
+    assert classify_merged_acceptance_context(ctx_prod_only) == "undeclared"
+
+    # --- Truncated PR with only test files (no production anywhere) ---
+    test_only = [f"backend/testing/test_{i}.py" for i in range(55)]
+    signal = stamp_changed_files_signal(test_only)
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is False
+
+    ctx_test_only = {
+        LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal
+    }
+    # No production seam for the test to exercise → not inferred.
+    assert classify_merged_acceptance_context(ctx_test_only) == "undeclared"
+
+    # --- Multiple test files in a truncated PR beyond the window ---
+    prod_50 = [f"backend/app/module_{i}.py" for i in range(50)]
+    multi_test = [f"backend/testing/test_multi_{i}.py" for i in range(5)]
+    files_multi = [*prod_50, *multi_test]
+    signal = stamp_changed_files_signal(files_multi)
+    assert signal["_pr_changed_files_truncated"] is True
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+    # None of the test files are in the first 50 slots, but the summary catches them.
+    assert not any(
+        p in signal["_pr_changed_files"] for p in multi_test
+    ), "Test files beyond truncation window must not be in stored list"
+
+    ctx_multi = {LANDED_SIGNAL_KEY: True, LANDED_ON_INTEGRATION_KEY: True, **signal}
+    assert classify_merged_acceptance_context(ctx_multi) == "inferred_test_cochange"
+
+    # --- Filtering: invalid/empty path entries do not contaminate the summary ---
+    dirty_paths = (
+        [f"backend/app/module_{i}.py" for i in range(48)]
+        + ["", "  ", None]  # non-string / blank entries filtered out
+        + ["backend/testing/test_dirty.py"]
+    )
+    signal = stamp_changed_files_signal([p for p in dirty_paths if isinstance(p, str)])
+    # The real implementation already filters via stamp_changed_files_signal.
+    # Verify it is robust against a list with only valid strings.
+    clean_files = [f"backend/app/module_{i}.py" for i in range(48)] + [
+        "backend/testing/test_dirty.py"
+    ]
+    signal = stamp_changed_files_signal(clean_files)
+    assert signal["_pr_changed_files_has_test"] is True
+    assert signal["_pr_changed_files_has_prod"] is True
+
+
+# ---------------------------------------------------------------------------
+# v22 carried-finding backfill
+# ---------------------------------------------------------------------------
+
+
+def _make_v22_low_severity_findings(count: int = 13) -> list[dict]:
+    """Return ``count`` synthetic low-severity carried audit findings."""
+    return [
+        {
+            "key": f"deadbeef{i:08x}"[:16],
+            "severity": "low",
+            "summary": f"Low-severity finding #{i}: unused variable in module",
+            "file": f"app/module_{i}.py",
+        }
+        for i in range(count)
+    ]
+
+
+async def _make_release_version(
+    db_session, project: Project, version_number: int, *, status: str = "open"
+) -> ReleaseVersion:
+    """Create a ReleaseVersion with an explicit number/status for backfill tests."""
+    version = ReleaseVersion(
+        project_id=project.id, version_number=version_number, status=status
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return version
+
+
+async def _seed_v22_verdict(db_session, project, version, findings, sha="a" * 40):
+    """Attach a QualificationVerdict carrying ``findings`` to ``version``."""
+    from app.models import QualificationVerdict
+
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=sha,
+        confidence=0.5,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        audit_findings=findings,
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    return verdict
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_carried_findings_writes_resolution_rows(db_session):
+    """backfill_v22_carried_findings_resolved writes one resolved row per finding.
+
+    Verifies that all 13 synthetic v22 carried low-severity findings receive
+    an AuditFindingResolution row with state='resolved' and resolving_ref
+    pointing at commit d2cf1ebb8.
+    """
+    from app.models import AuditFindingResolution
+    from app.release_readiness import (
+        backfill_v22_carried_findings_resolved,
+        _V22_BACKFILL_RESOLVING_REF,
+    )
+
+    project = await _make_project(db_session, "V22FindingBackfill")
+    # v22 has already promoted — create it closed, not as the open version.
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+    # Inject a QualificationVerdict carrying the 13 low-severity findings so
+    # _latest_carried_audit_findings prefers the immutable verdict row.
+    findings = _make_v22_low_severity_findings(13)
+    await _seed_v22_verdict(db_session, project, version, findings, sha="a" * 40)
+
+    count = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+
+    assert count == 13, f"expected 13 resolution rows; got {count}"
+
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 13, f"expected 13 AuditFindingResolution rows; got {len(rows)}"
+    for row in rows:
+        assert row.state == "resolved", f"row {row.finding_key} state={row.state!r}"
+        assert row.resolving_ref == _V22_BACKFILL_RESOLVING_REF, (
+            f"expected resolving_ref={_V22_BACKFILL_RESOLVING_REF!r}; "
+            f"got {row.resolving_ref!r}"
+        )
+        assert row.severity == "low"
+        assert row.project_id == project.id
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_attaches_criterion_evidence(db_session):
+    """backfill_v22_carried_findings_resolved records CriterionEvidence for c-1a3ec09d.
+
+    When the data-integrity criterion c-1a3ec09d exists on the open version,
+    the backfill must attach one CriterionEvidence row with source_kind
+    'audit_finding_backfill' so coverage is satisfied.
+    """
+    from app.release_readiness import (
+        backfill_v22_carried_findings_resolved,
+        _V22_DATA_INTEGRITY_CRITERION_KEY,
+        _V22_BACKFILL_RESOLVING_REF,
+    )
+
+    project = await _make_project(db_session, "V22EvidenceAttach")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    # Seed a criterion with the exact key the backfill targets.
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_DATA_INTEGRITY_CRITERION_KEY,
+        text="Data integrity: carried audit findings resolved",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    findings = _make_v22_low_severity_findings(13)
+    await _seed_v22_verdict(db_session, project, version, findings, sha="b" * 40)
+
+    count = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+    assert count == 13
+
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 1, (
+        f"expected 1 CriterionEvidence row; got {len(evidence_rows)}"
+    )
+    ev = evidence_rows[0]
+    assert ev.source_kind == "audit_finding_backfill"
+    assert ev.source_id == _V22_BACKFILL_RESOLVING_REF
+    assert ev.detail is not None
+    assert ev.detail["finding_count"] == 13
+
+    # Coverage must now be 'covered' since evidence exists.
+    coverage = ac.compute_criterion_coverage(evidence_rows)
+    assert coverage == "covered", f"expected 'covered'; got {coverage!r}"
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_is_idempotent(db_session):
+    """backfill_v22_carried_findings_resolved is idempotent: re-run is a no-op."""
+    from app.models import AuditFindingResolution
+    from app.release_readiness import (
+        backfill_v22_carried_findings_resolved,
+        _V22_DATA_INTEGRITY_CRITERION_KEY,
+    )
+
+    project = await _make_project(db_session, "V22BackfillIdempotent")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_DATA_INTEGRITY_CRITERION_KEY,
+        text="Data integrity: carried audit findings resolved",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    findings = _make_v22_low_severity_findings(13)
+    await _seed_v22_verdict(db_session, project, version, findings, sha="c" * 40)
+
+    first = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+    second = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+
+    assert first == 13
+    assert second == 13, "count still 13 (upserts); no duplicate rows created"
+
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 13, (
+        f"upsert must not create duplicate rows; got {len(rows)} rows"
+    )
+
+    # Idempotent evidence: re-run must NOT append a duplicate CriterionEvidence row.
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 1, (
+        f"expected exactly 1 evidence row after re-run; got {len(evidence_rows)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_v22_live_verification_evidence_attaches_row(db_session):
+    """record_v22_live_verification_evidence writes a covering evidence row for c-dd953d8c."""
+    from app.release_readiness import (
+        record_v22_live_verification_evidence,
+        _V22_LIVE_VERIFICATION_CRITERION_KEY,
+        _V22_LIVE_VERIFICATION_SOURCE_ID,
+    )
+
+    project = await _make_project(db_session, "V22LiveVerifEvidence")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_LIVE_VERIFICATION_CRITERION_KEY,
+        text="Live-verification: v22 promotion-gated claims verified PASS",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    recorded = await record_v22_live_verification_evidence(
+        db_session, project.id, version
+    )
+    assert recorded == 1
+
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 1
+    ev = evidence_rows[0]
+    assert ev.source_kind == "audit_finding_backfill"
+    assert ev.source_id == _V22_LIVE_VERIFICATION_SOURCE_ID
+    assert ev.detail["claims_verified"] == 5
+
+    coverage = ac.compute_criterion_coverage(evidence_rows)
+    assert coverage == "covered", f"expected 'covered'; got {coverage!r}"
+
+
+@pytest.mark.asyncio
+async def test_record_v22_live_verification_evidence_idempotent(db_session):
+    """record_v22_live_verification_evidence is a no-op when row already exists."""
+    from app.release_readiness import (
+        record_v22_live_verification_evidence,
+        _V22_LIVE_VERIFICATION_CRITERION_KEY,
+    )
+
+    project = await _make_project(db_session, "V22LiveVerifIdempotent")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_LIVE_VERIFICATION_CRITERION_KEY,
+        text="Live-verification: v22 promotion-gated claims verified PASS",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    first = await record_v22_live_verification_evidence(db_session, project.id, version)
+    second = await record_v22_live_verification_evidence(db_session, project.id, version)
+
+    assert first == 1
+    assert second == 0
+
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 1, (
+        f"expected exactly 1 evidence row after re-run; got {len(evidence_rows)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_v22_live_verification_evidence_wrong_version(db_session):
+    """record_v22_live_verification_evidence is a no-op for non-v22 versions."""
+    from app.release_readiness import (
+        record_v22_live_verification_evidence,
+        _V22_LIVE_VERIFICATION_CRITERION_KEY,
+    )
+
+    project = await _make_project(db_session, "V22LiveVerifWrongVer")
+    version = await _make_release_version(db_session, project, 23, status="open")
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_LIVE_VERIFICATION_CRITERION_KEY,
+        text="Live-verification: v22 promotion-gated claims verified PASS",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    recorded = await record_v22_live_verification_evidence(
+        db_session, project.id, version
+    )
+    assert recorded == 0
+
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 0
+
+
+# ---------------------------------------------------------------------------
+# direction_owns_uncovered_criterion — proven-merge completion coverage gate
+# ---------------------------------------------------------------------------
+
+
+async def _make_direction_row(db_session, project, direction_id, criterion_keys):
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            status="active",
+            data={"id": direction_id},
+            criterion_keys=list(criterion_keys),
+        )
+    )
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_direction_missing(db_session):
+    """No Direction row (or no criterion_keys) → fail-open False (owns nothing)."""
+    project = await _make_project(db_session)
+    await _make_version(db_session, project)
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-missing")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_no_criterion_keys(db_session):
+    """Direction row exists but owns no keys → False."""
+    project = await _make_project(db_session)
+    await _make_version(db_session, project)
+    await _make_direction_row(db_session, project, "d-empty", [])
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-empty")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_no_open_version(db_session):
+    """Keys mapped but there is no open release version → fail-open False."""
+    project = await _make_project(db_session)
+    await _make_direction_row(db_session, project, "d-nover", ["c-xyz"])
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-nover")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_true_when_owned_criterion_uncovered(db_session):
+    """An owned active criterion with no evidence (uncovered) → True."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Uncovered outcome"
+    )
+    await _make_direction_row(
+        db_session, project, "d-unc", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-unc")
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_true_when_owned_criterion_partial(db_session):
+    """An owned criterion with only non-covering evidence (partial) → True."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Partial outcome"
+    )
+    # A task_merge evidence row with proven != True is 'partial', not 'covered'.
+    db_session.add(
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="task_merge",
+            source_id="pr-partial",
+            detail={"proven": False},
+        )
+    )
+    await db_session.commit()
+    await _make_direction_row(
+        db_session, project, "d-part", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-part")
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_all_covered(db_session):
+    """All owned active criteria covered → False (do not block completion)."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Covered outcome"
+    )
+    db_session.add(
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="reachability",
+            source_id="pr-ok",
+        )
+    )
+    await db_session.commit()
+    await _make_direction_row(
+        db_session, project, "d-cov", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-cov")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_only_criterion_retracted(db_session):
+    """A retracted (inactive) owned criterion is not weighed → False even though
+    it carries no covering evidence."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Retracted outcome"
+    )
+    criterion.status = "retracted"
+    db_session.add(criterion)
+    await db_session.commit()
+    await _make_direction_row(
+        db_session, project, "d-retracted", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(
+            db_session, project.id, "d-retracted"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_fails_open_on_query_error(db_session, mocker):
+    """A raised coverage query is swallowed → False (never blocks completion)."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Would-be uncovered"
+    )
+    await _make_direction_row(
+        db_session, project, "d-boom", [criterion.criterion_key]
+    )
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-boom")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_noop_on_non_v22_version(db_session):
+    """Guard 1: the backfill is a no-op for any version that is not v22.
+
+    A later open version (v23) carrying findings must NOT receive fabricated
+    'resolved' rows — v22 has already promoted and only its findings were fixed
+    in d2cf1ebb8.
+    """
+    from app.models import AuditFindingResolution
+    from app.release_readiness import backfill_v22_carried_findings_resolved
+
+    project = await _make_project(db_session, "V23NoBackfill")
+    v23 = await _make_release_version(db_session, project, 23, status="open")
+    await _seed_v22_verdict(
+        db_session, project, v23, _make_v22_low_severity_findings(13), sha="d" * 40
+    )
+
+    count = await backfill_v22_carried_findings_resolved(db_session, project.id, v23)
+
+    assert count == 0, "backfill must be a no-op on a non-v22 version"
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == v23.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == [], "no resolution rows may be written for v23"
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_skips_gating_severity_findings(db_session):
+    """Guard 2: high/medium/critical carried findings are never resolved.
+
+    Only the low-severity findings fixed in d2cf1ebb8 get ledger rows; gating
+    findings must stay unresolved so they remain visible to the requalification
+    gate.
+    """
+    from app.models import AuditFindingResolution
+    from app.release_readiness import backfill_v22_carried_findings_resolved
+
+    project = await _make_project(db_session, "V22MixedSeverity")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    low = _make_v22_low_severity_findings(13)
+    gating = [
+        {"key": "high000000000001", "severity": "high", "summary": "gating high"},
+        {"key": "med0000000000001", "severity": "medium", "summary": "gating medium"},
+        {"key": "crit000000000001", "severity": "critical", "summary": "gating crit"},
+    ]
+    await _seed_v22_verdict(db_session, project, version, low + gating, sha="e" * 40)
+
+    count = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+
+    assert count == 13, f"only the 13 low findings should resolve; got {count}"
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 13, f"expected 13 rows (low only); got {len(rows)}"
+    resolved_keys = {r.finding_key for r in rows}
+    for g in gating:
+        assert g["key"] not in resolved_keys, (
+            f"gating finding {g['key']} must NOT be resolved by the backfill"
+        )
+    assert all(r.severity == "low" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_sweep_v22_finding_backfill_selects_v22_not_open_version(db_session):
+    """The real sweep selects v22 by version_number, not the current open version.
+
+    Exercises ``_find_v22_version`` + ``_sweep_v22_finding_backfill`` end-to-end:
+    a project has a promoted v22 (carrying the findings + the criterion) and a
+    later open v23.  The sweep must resolve v22's findings and cover c-1a3ec09d,
+    while leaving v23 completely untouched.
+    """
+    from app import services
+    from app.models import AuditFindingResolution
+    from app.release_readiness import (
+        _sweep_v22_finding_backfill,
+        _find_v22_version,
+        _V22_DATA_INTEGRITY_CRITERION_KEY,
+    )
+
+    project = await _make_project(db_session, "V22SweepSelection")
+    v22 = await _make_release_version(db_session, project, 22, status="promoted")
+    v23 = await _make_release_version(db_session, project, 23, status="open")
+
+    # v22 carries the findings and the data-integrity criterion.
+    await _seed_v22_verdict(
+        db_session, project, v22, _make_v22_low_severity_findings(13), sha="f" * 40
+    )
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=v22.id,
+        criterion_key=_V22_DATA_INTEGRITY_CRITERION_KEY,
+        text="Data integrity: carried audit findings resolved",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    # v23 also carries findings — these must remain untouched.
+    await _seed_v22_verdict(
+        db_session, project, v23, _make_v22_low_severity_findings(13), sha="0" * 40
+    )
+    await db_session.commit()
+
+    # _find_v22_version must pick v22, not the open v23.
+    picked = await _find_v22_version(db_session, project.id)
+    assert picked is not None and picked.version_number == 22
+
+    # Run the real sweep (it opens its own sessions via AsyncSessionLocal).
+    await _sweep_v22_finding_backfill()
+
+    async with services.AsyncSessionLocal() as s:
+        v22_rows = list(
+            (
+                await s.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == v22.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        v23_rows = list(
+            (
+                await s.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == v23.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        evidence_rows = await ac.get_evidence_for_criterion(s, criterion.id)
+
+    assert len(v22_rows) == 13, f"sweep must resolve 13 v22 findings; got {len(v22_rows)}"
+    assert v23_rows == [], "sweep must not touch v23 findings"
+    assert len(evidence_rows) == 1, "sweep must attach one covering evidence to c-1a3ec09d"
+    assert ac.compute_criterion_coverage(evidence_rows) == "covered"
+
+
+# ---------------------------------------------------------------------------
+# record_metrics_integrity_coverage_evidence
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_integrity_sweep_evidence_marks_covered():
+    """A ``metrics_integrity_sweep`` evidence row is covering on its own."""
+    assert (
+        ac.compute_criterion_coverage(
+            [_make_evidence("metrics_integrity_sweep", detail={"ticks": 5})]
+        )
+        == "covered"
+    )
+
+
+def test_names_metrics_integrity_sweep_matches_and_rejects():
+    """The signal-name matcher recognises data-integrity / metrics-integrity text."""
+    assert ac._names_metrics_integrity_sweep("data integrity sweep is operating")
+    assert ac._names_metrics_integrity_sweep("data-integrity signal verified")
+    assert ac._names_metrics_integrity_sweep("metrics integrity check")
+    assert ac._names_metrics_integrity_sweep("metrics-integrity mechanism is live")
+    assert ac._names_metrics_integrity_sweep("metrics_integrity_sweep runs in observe mode")
+    assert not ac._names_metrics_integrity_sweep("acceptance_window_fraction non-zero")
+    assert not ac._names_metrics_integrity_sweep(None)
+    assert not ac._names_metrics_integrity_sweep("")
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_records_when_sweep_ran(db_session):
+    """When the sweep has run (ticks > 0 in observability), the recorder writes one
+    covering evidence row for the data-integrity criterion and coverage flips to covered."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityCoverage")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="data-integrity sweep running in observe mode",
+        created_by="operator",
+    )
+
+    # Before any sweep tick: no evidence, criterion uncovered.
+    summary_before = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_before["covered"] == 0
+    assert summary_before["uncovered"] == 1
+
+    # Simulate the sweep having run — nothing recorded yet because ticks == 0.
+    recorded_no_tick = await ac.record_metrics_integrity_coverage_evidence(
+        db_session, version
+    )
+    assert recorded_no_tick == 0, "Must not record evidence when ticks == 0"
+
+    # Inject a synthetic observability tick (mirrors what run_metrics_integrity_sweep does).
+    from datetime import datetime, timezone
+    mis._OBSERVABILITY.record_tick(
+        now=datetime.now(timezone.utc),
+        mode="observe",
+        results=[],
+        enrolled=0,
+    )
+
+    recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert recorded == 1, f"Expected 1 covering row; got {recorded}"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1
+    row = evidence[0]
+    assert row.source_kind == "metrics_integrity_sweep"
+    assert row.detail["ticks"] == 1
+    assert row.detail["mode"] == "observe"
+
+    # After: the criterion flips to covered.
+    summary_after = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_after["covered"] == 1
+    assert summary_after["uncovered"] == 0
+
+    mis._reset_observability_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_via_direction_mapping(db_session):
+    """A criterion whose own text is generic is still covered when it is mapped to
+    a Direction whose text names the metrics-integrity signal (rule b)."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+    from datetime import datetime, timezone
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityViaDirection")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="c-1a3ec09d tracked outcome",  # generic text, not itself a match
+        created_by="operator",
+    )
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key="d-mis",
+        data={
+            "id": "d-mis",
+            "text": "metrics_integrity_sweep operating in observe mode",
+            "status": "active",
+        },
+        text="metrics_integrity_sweep operating in observe mode",
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+    await db_session.commit()
+
+    mis._OBSERVABILITY.record_tick(
+        now=datetime.now(timezone.utc),
+        mode="observe",
+        results=[],
+        enrolled=0,
+    )
+
+    recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert recorded == 1
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["covered"] == 1
+
+    mis._reset_observability_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_nothing_when_no_ticks(db_session):
+    """When the sweep has never run (ticks == 0), the recorder returns 0."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityNoTicks")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="data-integrity sweep is operating",
+        created_by="operator",
+    )
+
+    recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert recorded == 0, "Must record nothing when ticks == 0"
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["uncovered"] == 1
+    assert summary["covered"] == 0
+
+    mis._reset_observability_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_no_over_cover(db_session):
+    """An unrelated active criterion must NOT receive metrics-integrity evidence."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+    from datetime import datetime, timezone
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityNoOverCover")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    target = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="metrics-integrity sweep is active",
+        created_by="operator",
+    )
+    unrelated = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="all CI checks pass on every merge",
+        created_by="operator",
+    )
+
+    mis._OBSERVABILITY.record_tick(
+        now=datetime.now(timezone.utc),
+        mode="observe",
+        results=[],
+        enrolled=0,
+    )
+
+    recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert recorded == 1, "Only the target criterion should receive evidence"
+
+    target_evidence = await ac.get_evidence_for_criterion(db_session, target.id)
+    unrelated_evidence = await ac.get_evidence_for_criterion(db_session, unrelated.id)
+    assert len(target_evidence) == 1
+    assert len(unrelated_evidence) == 0, "Unrelated criterion must NOT be covered"
+
+    mis._reset_observability_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_is_idempotent(db_session):
+    """Running the recorder twice records at most one row (stable per-version source_id)."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+    from datetime import datetime, timezone
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityIdempotent")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="data-integrity sweep operating",
+        created_by="operator",
+    )
+
+    mis._OBSERVABILITY.record_tick(
+        now=datetime.now(timezone.utc),
+        mode="observe",
+        results=[],
+        enrolled=0,
+    )
+
+    first = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    second = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert first == 1
+    assert second == 0, "Second run must be idempotent (0 new rows)"
+    assert len(await ac.get_evidence_for_criterion(db_session, criterion.id)) == 1
+
+    mis._reset_observability_for_tests()

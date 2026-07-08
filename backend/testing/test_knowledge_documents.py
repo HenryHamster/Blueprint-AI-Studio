@@ -394,6 +394,57 @@ async def test_junk_citations_fail_gate(db_session, _quiet_broadcast):
     assert task.status == TaskStatus.FAILED
 
 
+@pytest.mark.asyncio
+async def test_persist_document_idempotent_on_completion_replay(
+    db_session, _quiet_broadcast
+):
+    """A second call to the completion handler (post-commit replay) on a web_research
+    task that already persisted a document is idempotent: no duplicate is inserted.
+    The task status transitions correctly only on first completion; replay finds the
+    existing document and skips re-insertion."""
+    project, task = await _make_web_research_task(
+        db_session, project_name="WRidempotent"
+    )
+
+    document = {
+        "title": "State of X on the web",
+        "summary": "A concise survey of X with citations.",
+        "body": "# X\n\nDetailed markdown body explaining X in depth.",
+        "citations": ["https://example.com/x", "file:docs/x.md"],
+        "tags": ["survey", "web"],
+        "topic": "X",
+    }
+    logs = json.dumps(document)
+
+    # First completion: task starts IN_PROGRESS, completes, persists one document.
+    await _handle_web_research_completion(task, logs, db_session)
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    docs_first = await _docs_for(db_session, task.id)
+    assert len(docs_first) == 1
+    first_doc_id = docs_first[0].id
+
+    # Reset task to IN_PROGRESS to simulate post-commit recovery replay: the
+    # handler failed to report status back to the orchestrator, so it re-runs
+    # with the same output and context.
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    # Second completion (replay): the handler runs again with identical output.
+    # This should NOT create a second document.
+    await _handle_web_research_completion(task, logs, db_session)
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED  # Status transitions again.
+
+    docs_replay = await _docs_for(db_session, task.id)
+    # CRITICAL: still exactly one document (not two).
+    assert len(docs_replay) == 1
+    # The document is the same as before (same ID).
+    assert docs_replay[0].id == first_doc_id
+
+
 # ── goal-level acceptance probe (topical responsiveness) ────────────────────
 
 

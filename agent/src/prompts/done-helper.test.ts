@@ -67,7 +67,7 @@ describe('writeDoneHelper — self-review fallback', () => {
     expect(doneScript).toContain('self_review_skip_reason_test-task-123.txt');
 
     // Verify that it always includes self_review_outcome in payload
-    expect(doneScript).toContain('{self_review_outcome: $self_review}');
+    expect(doneScript).toContain('"self_review_outcome": json.loads(self_review_raw)');
 
     // Without regressingCategories, the gate is absent
     expect(doneScript).not.toContain('REGRESSING_CATS=');
@@ -116,7 +116,8 @@ describe('writeDoneHelper — self-review fallback', () => {
     // Gate is embedded with the specific categories
     expect(doneScript).toContain('REGRESSING_CATS=("correctness" "test-coverage")');
     // Validation checks reasoning length and exits 1 on missing
-    expect(doneScript).toContain('.check_results[$c].reasoning // ""');
+    expect(doneScript).toContain('get("check_results",{}).get');
+    expect(doneScript).toContain('get("reasoning","")');
     expect(doneScript).toContain('Regressing categories need a reasoning field');
     expect(doneScript).toContain('exit 1');
     // Task-ID-specific error message for recovery instructions
@@ -339,9 +340,9 @@ describe('writeDoneHelper — consumed_artifact_ids handling', () => {
     // The error message should mention the empty report outcome
     expect(doneScript).toContain('reporting empty consumed_artifact_ids');
     // The valid-array branch must still filter and deduplicate
-    expect(doneScript).toContain('select(type == "string" and length > 0)');
+    expect(doneScript).toContain('isinstance(x,str) and len(x)>0');
     // The payload construction must include the field when CONSUMED_ARTIFACTS_JSON is set
-    expect(doneScript).toContain('{consumed_artifact_ids: $consumed_artifacts}');
+    expect(doneScript).toContain('payload["consumed_artifact_ids"]');
   });
 
   it('omits consumed_artifact_ids when consumed-artifacts file does not exist', async () => {
@@ -363,7 +364,8 @@ describe('writeDoneHelper — consumed_artifact_ids handling', () => {
     expect(doneScript).toContain('CONSUMED_ARTIFACTS_JSON=""');
     expect(doneScript).toContain('${CONSUMED_ARTIFACTS_JSON:-null}');
     // The conditional merge omits the field when consumed_artifacts is null/falsy
-    expect(doneScript).toContain('if $consumed_artifacts then {consumed_artifact_ids: $consumed_artifacts} else {} end');
+    expect(doneScript).toContain('if consumed_raw != "null"');
+    expect(doneScript).toContain('payload["consumed_artifact_ids"] = json.loads(consumed_raw)');
   });
 });
 
@@ -396,11 +398,11 @@ describe('writeDoneHelper — --already-done no-op completion', () => {
     expect(doneScript).toContain('--already-done');
     expect(doneScript).toContain('ALREADY_DONE_REASON');
     // The no-op branch posts COMPLETED with a no_op_reason field and NO pr_url.
-    expect(doneScript).toContain('status: "COMPLETED", no_op_reason: $r');
+    expect(doneScript).toContain('"status":"COMPLETED","no_op_reason"');
     // It also emits the canonical reproduce-on-HEAD verdict (already_resolved),
     // reusing the affirmative reason as the verdict reason, additively alongside
     // no_op_reason so older backends are unaffected.
-    expect(doneScript).toContain('reproduce_verdict: {status: "already_resolved", reason: $r}');
+    expect(doneScript).toContain('"status":"already_resolved","reason"');
     // The branch runs BEFORE the PR-file requirement (so it does not need ./pr open).
     const noopIdx = doneScript.indexOf('if [ -n "$ALREADY_DONE_REASON" ]; then');
     const prFileIdx = doneScript.indexOf('PR_FILE="/tmp/pr_url_noop-task-1"');
@@ -431,7 +433,9 @@ describe('writeDoneHelper — --already-done no-op completion', () => {
     expect(doneScript).toContain('INDETERMINATE_REASON');
     expect(doneScript).toContain('REPRODUCE_VERDICT_STATUS="reproduced"');
     expect(doneScript).toContain('REPRODUCE_VERDICT_STATUS="indeterminate"');
-    expect(doneScript).toContain('{reproduce_verdict: {status: $reproduce_status, reason: $reproduce_reason}}');
+    expect(doneScript).toContain('"reproduce_verdict":');
+    expect(doneScript).toContain('"status": repro_status');
+    expect(doneScript).toContain('"reason": repro_reason');
     expect(doneScript).toContain('mutually exclusive');
   });
 
@@ -531,5 +535,122 @@ describe('writeDoneHelper — --already-done no-op completion', () => {
     } finally {
       try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
     }
+  });
+});
+
+// ── writeDoneHelper — jq-free JSON payload build ───────────────────────────────
+// The strategist VM class does not reliably ship `jq`. The done-helper is the
+// critical completion path that signals task success/failure to the orchestrator;
+// a broken payload (from a missing jq or bad python3 migration) would silently
+// prevent task completion from being recorded. This test proves the generated
+// script builds a valid COMPLETED payload with jq REMOVED from PATH.
+const SUPPORTS_EXEC_BIT = process.platform !== 'win32';
+
+describe('writeDoneHelper — jq-free JSON payload build', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  /** Generate the done helper, run `./done` with jq poisoned + a curl stub that
+   *  captures the POST body, and return the parsed payload. */
+  const runDoneNoJq = async (
+    cfg: { taskId: string; workBranch: string; baseBranch: string; owner: string; repo: string; testsOnMainBranch: boolean },
+  ): Promise<{ exit: number; jqCalled: boolean; payload: Record<string, unknown> | null }> => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), `done-nojq-`));
+    try {
+      // Write the generated done script to the temp dir
+      const scriptPath = realPath.join(dir, 'done');
+      realFs.writeFileSync(scriptPath, capturedScripts['/tmp/workspace/done'], { mode: 0o755 });
+
+      // Create a fake PR URL file — the done script requires ./pr open to have
+      // run first and written /tmp/pr_url_<taskId>.
+      const prUrlFile = `/tmp/pr_url_${cfg.taskId}`;
+      realFs.writeFileSync(prUrlFile, 'https://github.com/test-owner/test-repo/pull/99');
+
+      // Poison bin: a "poison" jq at the FRONT of PATH records a marker if invoked
+      // (so a genuinely jq-free path is proven by the marker's ABSENCE), and a
+      // curl stub captures the POST body into a file while returning 200.
+      const bin = realPath.join(dir, 'bin');
+      realFs.mkdirSync(bin);
+      const payloadFile = realPath.join(dir, 'payload.json');
+      const jqMarker = realPath.join(dir, 'jq-called');
+      realFs.writeFileSync(
+        realPath.join(bin, 'curl'),
+        `#!/bin/bash\ncat > "${payloadFile}"\nprintf '200'\n`,
+        { mode: 0o755 },
+      );
+      realFs.writeFileSync(
+        realPath.join(bin, 'jq'),
+        `#!/bin/bash\necho called > "${jqMarker}"\nexit 1\n`,
+        { mode: 0o755 },
+      );
+
+      const env = {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        ORCHESTRATOR_URL: 'http://orchestrator.test',
+        AGENT_API_TOKEN: 'test-token',
+      };
+
+      let exit = 0;
+      try {
+        realCp.execFileSync('bash', [scriptPath], { stdio: 'pipe', env });
+      } catch (err: unknown) {
+        exit = (err as { status?: number }).status ?? -1;
+      }
+
+      const jqCalled = realFs.existsSync(jqMarker);
+      const payload: Record<string, unknown> | null = realFs.existsSync(payloadFile)
+        ? (JSON.parse(realFs.readFileSync(payloadFile, 'utf8')) as Record<string, unknown>)
+        : null;
+
+      // Cleanup /tmp files created by the script on success
+      try { realFs.unlinkSync(`/tmp/done_${cfg.taskId}`); } catch { /* ignore */ }
+      try { realFs.unlinkSync(`/tmp/task_${cfg.taskId}_result.json`); } catch { /* ignore */ }
+      try { realFs.unlinkSync(prUrlFile); } catch { /* ignore */ }
+
+      return { exit, jqCalled, payload };
+    } finally {
+      realFs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it.skipIf(!SUPPORTS_EXEC_BIT)('builds valid COMPLETED payload with jq REMOVED from PATH', async () => {
+    const { exit, jqCalled, payload } = await runDoneNoJq({
+      taskId: `done-nojq-${process.pid}`,
+      workBranch: 'blueprint/done-nojq',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+
+    expect(exit).toBe(0);
+    expect(jqCalled).toBe(false);
+    expect(payload).not.toBeNull();
+    expect(payload?.status).toBe('COMPLETED');
+    expect(payload?.task_id).toBe(`done-nojq-${process.pid}`);
+    expect(payload?.pr_url).toBe('https://github.com/test-owner/test-repo/pull/99');
+    expect(payload?.artifact_type).toBe('PULL_REQUEST');
+    // The self-review fallback envelope must be present so downstream consumers
+    // see the completion signal even when the agent skipped self-review.
+    expect(payload?.self_review_outcome).toMatchObject({ verdict: 'unknown' });
+    // The python3-constructed payload must round-trip fields faithfully —
+    // no jq, no silent truncation.
+    expect(payload?.logs).toContain('Task complete. PR:');
   });
 });

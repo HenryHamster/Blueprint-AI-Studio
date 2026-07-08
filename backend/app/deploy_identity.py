@@ -103,3 +103,63 @@ def project_matches_deploy_identity(
     if not project_owner or not project_repo:
         return False
     return project_owner == owner and project_repo == repo
+
+
+def project_is_deploy_repo(
+    project: object,
+    identity: DeployIdentity = None,
+) -> bool:
+    """Reliable "is *project* the repo this deployment serves?" classifier.
+
+    This is the single predicate the non-bootstrap identity/observability
+    read-sites should use instead of reading ``project.is_self_repo`` directly.
+    It stays correct whether or not the deployment has a stamped identity:
+
+      * When a deploy identity is resolvable (``DEPLOY_REPO_IDENTITY`` env or the
+        ``deploy_repo_identity`` runtime-config key), classify by matching
+        *project*'s GitHub repo against it — the deploy-level source of truth,
+        which does not depend on the per-project ``is_self_repo`` boolean being
+        set correctly.
+      * When no deploy identity is configured, fall back to ``is_self_repo`` so
+        behavior is preserved exactly on deployments that have not yet stamped
+        their identity (env unset ⇒ identical to reading the flag directly).
+
+    ``identity`` may be passed in (resolve it once, reuse across many projects)
+    or left ``None`` to resolve it here.  Never raises.
+    """
+    if identity is None:
+        identity = deploy_repo_identity()
+    if identity is not None:
+        return project_matches_deploy_identity(project, identity)
+    return bool(getattr(project, "is_self_repo", False))
+
+
+def project_is_external_repo_clause(identity: DeployIdentity = None):
+    """SQLAlchemy boolean clause selecting rows that are NOT the deploy's own repo.
+
+    The in-query counterpart to :func:`project_is_deploy_repo`, used to filter the
+    deploy's own repo out of the bootstrap-recovery sweep at the SQL layer.
+    Preserves the historical ``Project.is_self_repo IS FALSE`` filter and, when a
+    deploy identity is resolvable, additionally excludes the row whose
+    ``(github_owner, github_repo)`` matches it — hardening the sweep against a
+    self-repo flag left ``False`` on the deploy's own project. With no deploy
+    identity (tests, unstamped deployments) it reduces exactly to
+    ``Project.is_self_repo.is_(False)``.
+    """
+    # Lazy imports keep this module free of a load-time dependency on the ORM
+    # models and SQLAlchemy expression helpers (mirrors deploy_repo_identity's
+    # lazy runtime-config import).
+    from sqlalchemy import and_, func, not_
+    from app.models import Project
+
+    external = Project.is_self_repo.is_(False)
+    if identity is None:
+        identity = deploy_repo_identity()
+    if identity is None:
+        return external
+    owner, repo = identity
+    identity_match = and_(
+        func.lower(func.coalesce(Project.github_owner, "")) == owner,
+        func.lower(func.coalesce(Project.github_repo, "")) == repo,
+    )
+    return and_(external, not_(identity_match))

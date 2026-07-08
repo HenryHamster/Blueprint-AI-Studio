@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { AlertTriangle, X, ExternalLink, ChevronDown, ChevronUp, Search, Loader2, Zap } from 'lucide-react';
+import { AlertTriangle, Check, X, ExternalLink, ChevronDown, ChevronUp, Search, Loader2, Zap } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo } from '../utils/time';
 
@@ -116,6 +116,8 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
   const [expandedFindings, setExpandedFindings] = useState<Set<string>>(new Set());
   const [spawningSrAlertId, setSpawningSrAlertId] = useState<string | null>(null);
   const [spawnedSrTaskIds, setSpawnedSrTaskIds] = useState<Record<string, string>>({});
+  const [acknowledgingAlertId, setAcknowledgingAlertId] = useState<string | null>(null);
+  const [acknowledgedAlertIds, setAcknowledgedAlertIds] = useState<Set<string>>(new Set());
 
   const openDrilldown = useCallback(async (alert: Alert) => {
     const info = parseSrAlert(alert.title);
@@ -145,6 +147,26 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
       if (id) setSpawnedSrTaskIds(prev => ({ ...prev, [alert.id]: id }));
     } finally { setSpawningSrAlertId(null); }
   }, [onSpawnSrInvestigation, spawningSrAlertId, activeInvestigationTaskIds]);
+
+  const handleAcknowledge = useCallback(async (alert: Alert) => {
+    if (!projectId || acknowledgingAlertId === alert.id) return;
+    if (alert.acknowledged_at || acknowledgedAlertIds.has(alert.id)) return;
+    setAcknowledgingAlertId(alert.id);
+    try {
+      const res = await apiFetch(`/api/admin/alerts/${alert.id}/acknowledge`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        setAcknowledgedAlertIds(prev => new Set(prev).add(alert.id));
+      } else {
+        console.error(`Failed to acknowledge alert ${alert.id}: HTTP ${res.status}`);
+      }
+    } catch (err) {
+      console.error(`Failed to acknowledge alert ${alert.id}:`, err);
+    } finally {
+      setAcknowledgingAlertId(null);
+    }
+  }, [projectId, acknowledgingAlertId, acknowledgedAlertIds]);
 
   if (alerts.length === 0) return null;
 
@@ -226,6 +248,34 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
                     title="View task"
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
+                  </button>
+                );
+              })()}
+              {projectId && (() => {
+                const isAcknowledged = !!(alert.acknowledged_at) || acknowledgedAlertIds.has(alert.id);
+                const isAcknowledging = acknowledgingAlertId === alert.id;
+                if (isAcknowledged) {
+                  return (
+                    <span
+                      className="shrink-0 opacity-40 text-xs flex items-center justify-center gap-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto px-2 md:px-0"
+                      title="Acknowledged"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span className="hidden md:inline">Acknowledged</span>
+                    </span>
+                  );
+                }
+                return (
+                  <button
+                    type="button"
+                    onClick={() => void handleAcknowledge(alert)}
+                    disabled={isAcknowledging}
+                    className="shrink-0 opacity-60 hover:opacity-100 disabled:opacity-30 transition-opacity text-xs flex items-center justify-center gap-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto px-2 md:px-0"
+                    title="Acknowledge alert to suppress further re-pages"
+                    aria-label="Acknowledge alert"
+                  >
+                    {isAcknowledging ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                    <span className="hidden md:inline">Acknowledge</span>
                   </button>
                 );
               })()}

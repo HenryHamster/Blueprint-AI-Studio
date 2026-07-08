@@ -164,6 +164,56 @@ async def test_process_lifecycle_no_cost_pause_without_budget_configured(
 
 
 @pytest.mark.asyncio
+async def test_process_lifecycle_cost_pause_fires_when_aggregate_pushes_over_budget(
+    db_session, mocker
+):
+    """Auto-pause fires when live history alone is under budget but live + aggregate exceeds it.
+
+    This is the regression the fold fix addresses: without folding
+    history_aggregate.total_estimated_cost_usd, a direction past the 10-cycle
+    eviction window would fail to pause even when its true lifetime cost exceeds
+    the budget.
+    """
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    direction = {
+        "id": "d-agg-budget-over",
+        "text": "Direction past eviction window",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "cost_budget_usd": 5.0,
+        # Live history alone: 2.0 — BELOW budget 5.0
+        "research_history": _cost_history(2.0),
+        # Evicted aggregate: 4.0 — so lifetime = 6.0 > budget 5.0
+        "history_aggregate": {"total_estimated_cost_usd": 4.0},
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=_utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", (
+        "direction should be auto-paused when live + aggregate cost exceeds budget"
+    )
+    evidence = d.get("cost_pause_evidence", {})
+    assert evidence.get("cumulative_estimated_cost_usd") == 6.0, (
+        f"expected cumulative cost 6.0, got {evidence.get('cumulative_estimated_cost_usd')!r}"
+    )
+    assert evidence.get("cost_budget_usd") == 5.0
+
+
+@pytest.mark.asyncio
 async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_per_merge(
     db_session, mocker
 ):
@@ -4780,3 +4830,52 @@ async def test_paused_churn_recommended_direction_surfaces_to_operator(db_sessio
     stat = next(s for s in stats if s["id"] == "d-churn-attn")
     assert stat["churn_retirement_recommended"] is True
     assert "zombie loop" in stat["churn_retirement_recommended_reason"]
+
+
+def test_retired_diagnoses_archive_dedups_by_direction_id():
+    """retired_diagnoses_archive deduplicates by direction_id: appending the same
+    direction twice keeps only the latest entry."""
+    from app.research_direction_state import _append_archived_diagnosis
+
+    doc = {"retired_diagnoses_archive": []}
+    direction = {
+        "id": "d-dedup-test",
+        "research_context": "## Eviction Summary\nFirst diagnosis for d-dedup-test.",
+    }
+
+    # First append: add the direction to the archive
+    _append_archived_diagnosis(doc, direction, "d-dedup-test")
+    assert len(doc["retired_diagnoses_archive"]) == 1
+    first_entry = doc["retired_diagnoses_archive"][0]
+    assert first_entry["direction_id"] == "d-dedup-test"
+    assert "First diagnosis" in first_entry["diagnosis"]
+
+    # Second append with same direction_id: should deduplicate, not append
+    direction["research_context"] = "## Eviction Summary\nUpdated diagnosis for d-dedup-test."
+    _append_archived_diagnosis(doc, direction, "d-dedup-test")
+
+    # Archive should still have only 1 entry (deduplicated), with updated content
+    assert len(doc["retired_diagnoses_archive"]) == 1
+    updated_entry = doc["retired_diagnoses_archive"][0]
+    assert updated_entry["direction_id"] == "d-dedup-test"
+    assert "Updated diagnosis" in updated_entry["diagnosis"]
+
+    # Append a different direction: should add a new entry
+    direction2 = {
+        "id": "d-dedup-test-2",
+        "research_context": "## Eviction Summary\nDiagnosis for a different direction.",
+    }
+    _append_archived_diagnosis(doc, direction2, "d-dedup-test-2")
+    assert len(doc["retired_diagnoses_archive"]) == 2
+    assert doc["retired_diagnoses_archive"][0]["direction_id"] == "d-dedup-test"
+    assert doc["retired_diagnoses_archive"][1]["direction_id"] == "d-dedup-test-2"
+
+    # Append to first direction again: should still keep only 1 entry for d-dedup-test,
+    # now at the end (moved by dedup+append)
+    direction["research_context"] = "## Eviction Summary\nThird update for d-dedup-test."
+    _append_archived_diagnosis(doc, direction, "d-dedup-test")
+    assert len(doc["retired_diagnoses_archive"]) == 2
+    # After dedup+append, d-dedup-test is now at the end
+    assert doc["retired_diagnoses_archive"][0]["direction_id"] == "d-dedup-test-2"
+    assert doc["retired_diagnoses_archive"][1]["direction_id"] == "d-dedup-test"
+    assert "Third update" in doc["retired_diagnoses_archive"][1]["diagnosis"]

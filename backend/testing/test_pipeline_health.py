@@ -1420,6 +1420,67 @@ async def test_review_accuracy_skips_tasks_without_verdict():
     assert ra["total_reviews"] == 5
 
 
+@pytest.mark.asyncio
+async def test_review_recall_never_negative():
+    """recall must never be negative, even when verdicts change after misses are recorded.
+
+    Scenario: A task approved-then-changed can have user_caught_issues set while the
+    current verdict is REQUEST_CHANGES. The denominator (approvals) shrinks while the
+    numerator (misses) stays the same, making naive recall = 1 - misses/approvals negative.
+    Fix: Only count misses from tasks whose CURRENT verdict is APPROVE.
+    """
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    tasks = [
+        # 3 tasks: approved & correct
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={"blueprint_review_verdict": "APPROVE"},
+            created_at=now - timedelta(hours=i),
+        )
+        for i in range(1, 4)
+    ]
+    # Add 2 tasks that were approved but have user_caught_issues, then re-reviewed to REQUEST_CHANGES
+    # This is the problematic case: misses include them, but approvals doesn't
+    tasks.extend([
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={
+                "blueprint_review_verdict": "REQUEST_CHANGES",
+                "user_caught_issues": True,
+            },
+            created_at=now - timedelta(hours=4),
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={
+                "blueprint_review_verdict": "REQUEST_CHANGES",
+                "user_caught_issues": True,
+            },
+            created_at=now - timedelta(hours=5),
+        ),
+    ])
+    session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
+
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    ra = result["review_accuracy"]
+    assert ra is not None
+    # With the fix: misses should only count tasks with BOTH user_caught_issues AND current APPROVE verdict
+    # So misses = 0, total_approvals = 3, recall = 1 - 0/3 = 1.0
+    assert ra["misses"] == 0, "Misses should only count from currently-APPROVE tasks"
+    assert ra["total_approvals"] == 3
+    # Most importantly: recall must be in valid range [0, 1]
+    assert ra["recall"] is not None
+    assert 0 <= ra["recall"] <= 1, f"recall={ra['recall']} must be in [0, 1]"
+
+
 # ── Review effectiveness trends ───────────────────────────────────────────────
 
 
@@ -2109,6 +2170,50 @@ def _make_sr_task(project_id, check_results, human_cats, hours_ago=1):
         },
         created_at=now - timedelta(hours=hours_ago),
     )
+
+
+def test_per_type_failure_rate_excludes_empty_type_rows():
+    """Per-type failure rate must exclude empty-type rows from the sample.
+
+    When querying for a specific task type, rows with empty/absent task_type
+    should not be included in the sample. This prevents empty-type failures from
+    inflating a healthy type's failure rate and empty-type successes from
+    deflating a genuinely-failing type below the throttle threshold.
+    """
+    from app.shared_state import get_task_type_failure_rate
+    import app.shared_state as ss
+    from app.time_utils import _utcnow
+    from collections import deque
+
+    ss.deploy_monitoring["task_results"] = deque(maxlen=100)
+    ts = _utcnow().isoformat()
+
+    # Healthy "create" type: 3 successes
+    ss.deploy_monitoring["task_results"].extend(
+        [
+            (ts, "success", "", "create"),
+            (ts, "success", "", "create"),
+            (ts, "success", "", "create"),
+        ]
+    )
+
+    # Empty-type failures that should NOT contaminate the "create" sample
+    ss.deploy_monitoring["task_results"].extend(
+        [
+            (ts, "failure", "CODE_ERROR"),  # old 3-tuple format
+            (ts, "failure", "CODE_ERROR", ""),  # 4-tuple with empty type
+            (ts, "failure", "CODE_ERROR", ""),
+        ]
+    )
+
+    # Query for "create" type specifically
+    rate, sample_size = get_task_type_failure_rate("create", window_minutes=15)
+
+    # The sample should contain only the 3 "create" successes, not the empty-type failures
+    assert sample_size == 3, f"Expected sample_size=3 (only 'create' rows), got {sample_size}"
+    assert (
+        rate == 0.0
+    ), f"Expected rate=0.0 (3 successes, 0 failures in 'create'), got {rate}"
 
 
 @pytest.mark.asyncio

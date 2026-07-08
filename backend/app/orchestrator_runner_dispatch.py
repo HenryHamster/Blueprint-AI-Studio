@@ -38,6 +38,15 @@ from app.models import (
     TaskStatus,
 )
 from app.resource_envelope import resolve_project_require_local_runner
+from app.runner_health_monitors import (  # noqa: F401
+    _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+    _RUNNER_LIVENESS_SECONDS,
+    _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT,
+    _check_degraded_runners,
+    _check_fleet_no_healthy_runner,
+    _check_low_disk_runners,
+    _sweep_runner_deactivated_escalations,
+)
 from app.shared_state import runtime_config as _runtime_config
 from app.stall_alert_diagnostics import (
     _STALL_TITLE_PREFIX,
@@ -59,16 +68,16 @@ from app.workbench_state import (
 logger = logging.getLogger("blueprint")
 
 
-# A registered runner is considered live (eligible for dispatch) only if it has
-# heartbeated within this window. Runners that miss heartbeats fall out of the
-# dispatch cache and are swept to status='inactive'.
-_RUNNER_LIVENESS_SECONDS = 300
-
 # A compute_experiment held for a require-local project is failed if no runner
 # claims it within this window — prevents a permanently-wedged project when the
 # operator's hardware stays offline. Generous default; operators can bring a
 # runner up well within it.
 _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS = 6 * 3600
+
+# Early-warning threshold: emit a proactive WARNING alert when a require-local
+# compute_experiment hold has waited past this window but before the 6h hard
+# timeout — so the operator learns the hardware is offline in minutes, not hours.
+_LOCAL_RUNNER_HOLD_ALERT_SECONDS = 15 * 60  # 15 minutes
 
 
 class RunnerDispatchSnapshot(NamedTuple):
@@ -77,6 +86,7 @@ class RunnerDispatchSnapshot(NamedTuple):
     id: uuid.UUID
     project_id: uuid.UUID
     capabilities: dict
+    consecutive_job_failures: int = 0
 
 
 def _runner_handles_task_type(
@@ -214,6 +224,7 @@ async def _load_active_runners_cache(
                     LocalRunner.id,
                     LocalRunner.project_id,
                     LocalRunner.capabilities,
+                    LocalRunner.consecutive_job_failures,
                 ).where(
                     LocalRunner.status == "active",
                     LocalRunner.last_seen_at.is_not(None),
@@ -225,10 +236,10 @@ async def _load_active_runners_cache(
         logger.exception("[RUNNERS] Failed to load active-runner cache")
         return {}
     outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
-        session, [runner_id for runner_id, _project_id, _capabilities in rows]
+        session, [runner_id for runner_id, _project_id, _capabilities, _failures in rows]
     )
     by_project: dict[uuid.UUID, list[RunnerDispatchSnapshot]] = {}
-    for runner_id, project_id, capabilities in rows:
+    for runner_id, project_id, capabilities, consecutive_job_failures in rows:
         caps = dict(capabilities or {})
         heartbeat_jobs = caps.get("active_compute_job_ids") or []
         merged_job_ids: list[str] = []
@@ -246,6 +257,7 @@ async def _load_active_runners_cache(
             id=runner_id,
             project_id=project_id,
             capabilities=caps,
+            consecutive_job_failures=consecutive_job_failures or 0,
         )
         by_project.setdefault(project_id, []).append(snapshot)
     return by_project
@@ -560,11 +572,15 @@ def _select_eligible_runner(
         )
         if preferred is not None:
             return preferred
-    return min(
-        eligible,
-        key=lambda r: _runner_active_work_count(r)
-        + runner_pins_this_cycle.get(r.id, 0),
-    )
+    # Deprioritize degraded runners (consecutive_job_failures at threshold) so
+    # healthy runners are always preferred; degraded runners remain eligible as
+    # a fallback so they can receive a job and reset their failure streak.
+    def _dispatch_sort_key(r: "LocalRunner | RunnerDispatchSnapshot") -> tuple:
+        failures = getattr(r, "consecutive_job_failures", 0) or 0
+        is_degraded = int(failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD)
+        return (is_degraded, _runner_active_work_count(r) + runner_pins_this_cycle.get(r.id, 0))
+
+    return min(eligible, key=_dispatch_sort_key)
 
 
 def _build_compute_launch_kwargs(
@@ -1100,6 +1116,11 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
                 "[RUNNERS] Failed to emit stale-runner refetch for project %s",
                 project_id,
             )
+    # Escalate alerts for runners that have been inactive past the threshold.
+    try:
+        await _sweep_runner_deactivated_escalations(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep runner-deactivated escalations")
 
 
 def _parse_local_runner_hold_timestamp(raw: object) -> datetime | None:
@@ -1258,6 +1279,33 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             continue
         cutoff = strategic_cutoff if is_strategic_hold else compute_cutoff
         if stamped_at > cutoff:
+            # Within the full wait window — keep holding. For compute holds, emit a
+            # proactive early-warning alert once the hold passes the shorter threshold
+            # so the operator learns the hardware is offline in minutes, not 6h.
+            if is_compute_hold:
+                alert_cutoff = now - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS)
+                if stamped_at <= alert_cutoff:
+                    from app.alert_dispatch import _maybe_create_local_runner_hold_alert
+
+                    held_secs = int((now - stamped_at).total_seconds())
+                    remaining_secs = max(
+                        0, _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS - held_secs
+                    )
+                    try:
+                        created = await _maybe_create_local_runner_hold_alert(
+                            task,
+                            session,
+                            held_seconds=held_secs,
+                            timeout_seconds=remaining_secs,
+                        )
+                        if created:
+                            await session.commit()
+                    except Exception:
+                        logger.exception(
+                            "[RUNNERS] Failed to create early hold alert for task %s",
+                            task.id,
+                        )
+                        await session.rollback()
             continue  # within the wait window — keep holding
 
         if is_strategic_hold:

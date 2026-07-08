@@ -344,7 +344,21 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
   // the path is missing or invalid, so cold starts for every role (review-fix /
   // specialized / research / design-doc) get the clone speedup, not just
   // setupWorkspace's standard path.
-  execFileSync('rm', ['-rf', workspace], { encoding: 'utf-8' });
+  //
+  // Empty contents in place rather than removing the directory itself.
+  // Under bwrap the workspace is a bind-mount point: `rm -rf` on the
+  // mountpoint returns EBUSY, but removing its children is legal. `git clone`
+  // accepts an existing empty directory, so semantics are equivalent for
+  // the non-sandboxed case too — it keeps whatever dir already exists.
+  try {
+    const entries = fs.readdirSync(workspace);
+    for (const entry of entries) {
+      fs.rmSync(path.join(workspace, entry), { recursive: true, force: true });
+    }
+  } catch (e) {
+    // ENOENT: directory doesn't exist yet — git clone will create it.
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
   // Write the credential helper script before the clone so the `-c` option
   // below can point git at it for authentication during the clone itself.
   const helperPath = ownerRepo ? ensureGitCredentialHelperScript() : gitCredentialHelperPath();

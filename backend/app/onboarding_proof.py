@@ -147,15 +147,19 @@ def stamp_first_autonomous_improvement(task: Any, project: Any) -> None:
     """Stamp the first autonomous-improvement timestamp on a non-self-repo project.
 
     Called at every integration-branch merge via ``apply_merged_landed_signal``.
-    Guards: skips self-repo projects and tasks whose type is not one of
-    {create, fix, refactor}.  Idempotent — a second call on the same project
+    Guards: skips the deploy's own repo (via ``project_is_deploy_repo`` — deploy
+    identity when stamped, else the ``is_self_repo`` fallback) and tasks whose
+    type is not one of {create, fix, refactor}.  Idempotent — a second call on
+    the same project
     is a no-op.  No session parameter: the caller's SQLAlchemy session already
     tracks ``project`` (mirrors ``stamp_first_pr_merged``).
     """
     try:
         if project is None:
             return
-        if getattr(project, "is_self_repo", False):
+        from app.deploy_identity import project_is_deploy_repo
+
+        if project_is_deploy_repo(project):
             return
         task_type = (getattr(task, "first_payload", None) or {}).get("type")
         if task_type not in _AUTONOMOUS_IMPROVEMENT_TASK_TYPES:

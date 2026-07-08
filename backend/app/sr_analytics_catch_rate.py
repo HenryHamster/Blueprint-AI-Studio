@@ -185,7 +185,9 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
         "tasks_with_reviewer_edges_count": n_with_reviewer,
         "tasks_with_reviewer_edges_rate": round(n_with_reviewer / n_total, 3),
         "reviewer_caught_count": reviewer_caught,
-        "reviewer_caught_rate": round(reviewer_caught / n_total, 3),
+        "reviewer_caught_rate": round(reviewer_caught / n_with_reviewer, 3)
+        if n_with_reviewer
+        else None,
     }
 
 

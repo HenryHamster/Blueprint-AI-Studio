@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from app.problem_model import (
     ARCHIVED_GAPS_DURABLE_MAX,
     CAPABILITIES_DURABLE_MAX,
+    DEFERRAL_STALE_GRACE_DAYS,
     FRICTION_DURABLE_MAX,
     PROBLEM_MODEL_BYTE_BUDGET,
     GAP_HISTORY_DURABLE_MAX,
@@ -39,9 +40,11 @@ from app.problem_model import (
     apply_agent_update,
     apply_user_intent_patch,
     archive_closed_gaps,
+    lifecycle_bound_problem_model,
     check_gap_id_write,
     classify_gap_link,
     compute_model_size_signal,
+    gap_evidence_status,
     gc_problem_model,
     is_empty,
     normalize_active_moves_writeback,
@@ -210,6 +213,104 @@ def test_old_shape_problem_model_with_capabilities_parses():
     }
     model = parse_problem_model(raw)
     assert all(c.backing_paths == [] for c in model.capabilities)
+
+
+def test_gap_evidence_refs_defaults_empty():
+    """Old-shape gap (no evidence_refs) parses with an empty list, so every
+    stored model and older agent payload remains valid."""
+    gap = Gap(id="g-1", name="a gap")
+    assert gap.evidence_refs == []
+    assert gap.evidence == ""  # narrative field unchanged, still present
+
+
+def test_gap_evidence_refs_round_trip():
+    gap = Gap(
+        id="g-1",
+        name="a gap",
+        evidence="narrative still here",
+        evidence_refs=[
+            {
+                "kind": "named_test",
+                "ref": "backend/testing/test_foo.py",
+                "proven": True,
+            },
+            {"kind": "backing_path", "ref": "backend/app/foo.py", "proven": False},
+        ],
+    )
+    dumped = gap.model_dump()
+    assert dumped["evidence_refs"][0]["kind"] == "named_test"
+    assert dumped["evidence_refs"][0]["proven"] is True
+    assert dumped["evidence"] == "narrative still here"
+    restored = Gap.model_validate(dumped)
+    assert restored.evidence_refs == gap.evidence_refs
+
+
+def test_gap_missing_evidence_refs_back_compat_validates():
+    """A stored gap payload lacking evidence_refs validates (extra='forbid' on
+    the parent, but the field's empty default keeps old payloads valid)."""
+    raw = {
+        "revision": 2,
+        "gaps": [
+            {"id": "g-1", "name": "legacy gap", "status": "active", "evidence": "x"},
+        ],
+    }
+    model = parse_problem_model(raw)
+    assert model.gaps[0].evidence_refs == []
+    # Full round-trip preserves the empty default.
+    restored = parse_problem_model(model.model_dump())
+    assert restored.gaps[0].evidence_refs == []
+
+
+def test_gap_evidence_status_helper():
+    proven = Gap(
+        id="g1",
+        name="p",
+        evidence_refs=[{"kind": "named_test", "ref": "a.py", "proven": True}],
+    )
+    partial = Gap(
+        id="g2",
+        name="q",
+        evidence_refs=[{"kind": "named_test", "ref": "a.py", "proven": False}],
+    )
+    empty = Gap(id="g3", name="r")
+    assert gap_evidence_status(proven) == "proven"
+    assert gap_evidence_status(partial) == "partial"
+    assert gap_evidence_status(empty) == "unproven"
+
+
+def test_apply_agent_update_gap_evidence_refs_proposed_wins():
+    """evidence_refs is a plain proposed-wins field through _merge_gap /
+    apply_agent_update — the agent's list replaces the durable one."""
+    current = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "gap",
+                "status": "active",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "old.py", "proven": False}
+                ],
+            }
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "gap",
+                "status": "active",
+                "evidence_refs": [
+                    {"kind": "backing_path", "ref": "new.py", "proven": True}
+                ],
+            }
+        ],
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    merged_gap = new_raw["gaps"][0]
+    assert merged_gap["evidence_refs"] == [
+        {"kind": "backing_path", "ref": "new.py", "proven": True}
+    ]
 
 
 def test_apply_agent_update_unaffected_by_backing_paths_only_change():
@@ -602,6 +703,204 @@ def test_gc_problem_model_deduplicates_archived_gaps():
     kept_dup = next(g for g in model.archived_gaps if g.id == "g-dup")
     assert kept_dup.closed == "2026-01-02T00:00:00"
     assert kept_dup.name == "newer copy"
+
+
+# ---------------------------------------------------------------------------
+# lifecycle_bound_problem_model — direct unit
+# ---------------------------------------------------------------------------
+
+_LB_NOW = "2026-07-07T12:00:00"
+
+
+def _deferred_gap(gap_id: str, deferral: GapDeferral, **kw) -> Gap:
+    return Gap(
+        id=gap_id,
+        name=f"gap {gap_id}",
+        status="active",
+        opened="2026-01-01T00:00:00",
+        deferral=deferral,
+        **kw,
+    )
+
+
+def test_lifecycle_archives_gap_with_aged_hold_until():
+    """An active, unstaffed gap whose deferral hold_until is in the past is
+    marked abandoned, stamped closed, gets a lifecycle history event, and moves
+    into archived_gaps (reversible — still re-fetchable by id)."""
+    gap = _deferred_gap(
+        "g-aged",
+        GapDeferral(rationale="later", hold_until="2026-01-01T00:00:00"),
+    )
+    model = ProblemModel(gaps=[gap])
+
+    summary = lifecycle_bound_problem_model(model, _LB_NOW)
+
+    assert summary == {"gaps_lifecycle_archived": ["g-aged"]}
+    assert model.gaps == []
+    archived = {g.id: g for g in model.archived_gaps}
+    assert "g-aged" in archived
+    moved = archived["g-aged"]
+    assert moved.status == "abandoned"
+    assert moved.closed == _LB_NOW
+    assert moved.history[-1].event == "lifecycle_auto_archived"
+
+
+def test_lifecycle_preserves_gap_with_future_hold_until():
+    """A fresh/held deferral (hold_until in the future) is never touched."""
+    gap = _deferred_gap(
+        "g-held",
+        GapDeferral(rationale="pinned", hold_until="2027-01-01T00:00:00"),
+    )
+    model = ProblemModel(gaps=[gap])
+    before = model.model_dump()
+
+    summary = lifecycle_bound_problem_model(model, _LB_NOW)
+
+    assert summary == {}
+    assert model.model_dump() == before
+
+
+def test_lifecycle_created_at_grace_boundary():
+    """When hold_until is absent/unparseable, created_at drives staleness against
+    a generous grace window: within the window is preserved, past it is
+    archived."""
+    fresh = _deferred_gap(
+        "g-fresh",
+        GapDeferral(rationale="milestone", hold_until="v22", created_at=_LB_NOW),
+    )
+    aged = _deferred_gap(
+        "g-lapsed",
+        GapDeferral(
+            rationale="milestone",
+            hold_until="v22",  # unparseable → fall back to created_at
+            created_at="2026-01-01T00:00:00",  # far past the grace window
+        ),
+    )
+    model = ProblemModel(gaps=[fresh, aged])
+
+    summary = lifecycle_bound_problem_model(model, _LB_NOW)
+
+    assert summary == {"gaps_lifecycle_archived": ["g-lapsed"]}
+    assert {g.id for g in model.gaps} == {"g-fresh"}
+    assert {g.id for g in model.archived_gaps} == {"g-lapsed"}
+    # Grace window is generous — a full month — so a recently-deferred gap is safe.
+    assert DEFERRAL_STALE_GRACE_DAYS >= 14
+
+
+def test_lifecycle_never_touches_staffed_or_undeferred_gaps():
+    """A gap with active_moves, or one carrying no deferral at all, is never
+    archived even when the deferral (if any) is aged."""
+    staffed = _deferred_gap(
+        "g-staffed",
+        GapDeferral(rationale="x", hold_until="2020-01-01T00:00:00"),
+        active_moves=["d-live"],
+    )
+    undeferred = Gap(
+        id="g-plain", name="plain", status="active", opened="2026-01-01T00:00:00"
+    )
+    model = ProblemModel(gaps=[staffed, undeferred])
+    before = model.model_dump()
+
+    summary = lifecycle_bound_problem_model(model, _LB_NOW)
+
+    assert summary == {}
+    assert model.model_dump() == before
+
+
+def test_lifecycle_ignores_deferral_without_usable_dates():
+    """A deferral with an unparseable hold_until and no created_at yields no
+    usable age signal — the gap is left alone (conservative)."""
+    gap = _deferred_gap(
+        "g-nodate",
+        GapDeferral(rationale="someday", hold_until="when-ready"),
+    )
+    model = ProblemModel(gaps=[gap])
+    before = model.model_dump()
+
+    assert lifecycle_bound_problem_model(model, _LB_NOW) == {}
+    assert model.model_dump() == before
+
+
+def test_lifecycle_drops_terminal_friction_toward_healthy_floor():
+    """Terminal (resolved/mitigated) friction is dropped oldest-first, resolved
+    before mitigated, only as far as needed to reach the healthy threshold."""
+    # 2 over the healthy floor, all terminal.
+    friction = [
+        Friction(id=f"f-res-{i}", name=f"r{i}", status="resolved")
+        for i in range(MODEL_SIZE_HEALTHY_FRICTION)
+    ] + [
+        Friction(id="f-mit-0", name="m0", status="mitigated"),
+        Friction(id="f-mit-1", name="m1", status="mitigated"),
+    ]
+    model = ProblemModel(friction=friction)
+
+    summary = lifecycle_bound_problem_model(model, _LB_NOW)
+
+    assert len(model.friction) == MODEL_SIZE_HEALTHY_FRICTION
+    # Resolved are most disposable → the two oldest resolved go first.
+    assert summary["friction_lifecycle_evicted"] == ["f-res-0", "f-res-1"]
+
+
+def test_lifecycle_never_drops_active_friction():
+    """An all-active friction list above the healthy floor is left untouched —
+    live state is never dropped to satisfy a bound."""
+    friction = [
+        Friction(id=f"f-{i}", name=f"a{i}", status="active")
+        for i in range(MODEL_SIZE_HEALTHY_FRICTION + 5)
+    ]
+    model = ProblemModel(friction=friction)
+    before = model.model_dump()
+
+    assert lifecycle_bound_problem_model(model, _LB_NOW) == {}
+    assert model.model_dump() == before
+
+
+def test_lifecycle_drops_planned_capabilities_toward_healthy_floor():
+    """Surplus planned (never-built) capabilities are dropped oldest-first;
+    working/partial are never dropped."""
+    caps = [
+        Capability(name=f"working-{i}", status="working")
+        for i in range(MODEL_SIZE_HEALTHY_CAPABILITIES)
+    ] + [
+        Capability(name="planned-0", status="planned"),
+        Capability(name="planned-1", status="planned"),
+        Capability(name="partial-live", status="partial"),
+    ]
+    model = ProblemModel(capabilities=caps)
+
+    summary = lifecycle_bound_problem_model(model, _LB_NOW)
+
+    # 3 over the floor, but only 2 are planned (evictable); partial is kept.
+    assert summary["capabilities_lifecycle_evicted"] == ["planned-0", "planned-1"]
+    kept = {c.name for c in model.capabilities}
+    assert "partial-live" in kept
+    assert "planned-0" not in kept and "planned-1" not in kept
+
+
+def test_lifecycle_all_live_capabilities_untouched():
+    """An all-working/partial capability list above the floor is left untouched."""
+    caps = [
+        Capability(name=f"c-{i}", status="working" if i % 2 else "partial")
+        for i in range(MODEL_SIZE_HEALTHY_CAPABILITIES + 6)
+    ]
+    model = ProblemModel(capabilities=caps)
+    before = model.model_dump()
+
+    assert lifecycle_bound_problem_model(model, _LB_NOW) == {}
+    assert model.model_dump() == before
+
+
+def test_lifecycle_empty_model_is_noop_byte_identical():
+    """The no-op path returns {} and leaves the model byte-identical."""
+    model = ProblemModel(
+        gaps=[Gap(id="g", name="live", status="active")],
+        friction=[Friction(id="f", name="a", status="active")],
+        capabilities=[Capability(name="c", status="working")],
+    )
+    before = model.model_dump()
+
+    assert lifecycle_bound_problem_model(model, _LB_NOW) == {}
+    assert model.model_dump() == before
 
 
 def test_apply_agent_update_caps_archived_gaps():

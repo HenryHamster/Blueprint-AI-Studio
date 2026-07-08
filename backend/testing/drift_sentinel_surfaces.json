@@ -1,0 +1,23 @@
+{
+  "_doc": "Surface -> drift-sentinel manifest for the merge-time impacted-test gate. Each entry maps a SURFACE GLOB (repo-relative, '**' = any depth, '*' = one path segment) to the drift-sentinel test file(s) that guard that surface. A drift sentinel AST/rglob-scans a whole source tree (or a fixed source-file set) and compares it against a stored __fixtures__/*.json (or snapshot) — it never imports the app modules it guards, so impacted_tests.py's dotted-import reverse-dep scan cannot select it. Without this manifest such a sentinel runs only in the full promotion suite, so a drift-introducing change (e.g. a new websocket emitter or event_type) merges green on the task PR and only breaks weeks later at the automain->main promotion matrix. Registration here makes impacted_tests.resolve_impacted() select the sentinel whenever a changed path matches its surface. Choose globs conservatively: a whole-tree glob fires on every PR touching that tree (acceptable for a fast source-scan sentinel), but scope to specific files when the sentinel only scans a fixed source-file set.",
+  "surfaces": [
+    {
+      "glob": "backend/app/**/*.py",
+      "sentinels": [
+        "backend/testing/test_websocket_emitter_inventory.py",
+        "backend/testing/test_direction_referential_guard.py"
+      ],
+      "why": "test_websocket_emitter_inventory.py AST-scans the ENTIRE backend/app tree (read_app_sources -> app_dir.rglob('*.py')) against __fixtures__/websocket_event_inventory_v1.json and imports only backend/testing helpers, so a new emitter in any app module never selects it by import. test_direction_referential_guard.py rglobs the whole app tree for new Direction.criterion_keys writers (against KNOWN_GUARDED_WRITERS); it imports app.direction_referential_guard, so it is only import-selectable when THAT module changes, never when a new writer appears in an unrelated file. Both must run whenever any app source changes. (test_websocket_emitter_inventory.py is ALSO in scripts/test-backend.sh STANDALONE_ARGS; this registration is additive and complementary.)"
+    },
+    {
+      "glob": "backend/app/notification_dispatch.py",
+      "sentinels": ["backend/testing/test_event_type_invariants.py"],
+      "why": "test_event_type_invariants.py regex-extracts event_type=\"...\" literals from a FIXED source-file set and compares them against event_type_snapshot.json. It reads the files by path (never imports the modules), so a new/renamed event_type merges undetected unless the sentinel is selected. It is NOT in STANDALONE_ARGS. Scoped to the exact files the sentinel scans rather than the whole tree so it does not fire on every app PR."
+    },
+    {
+      "glob": "backend/app/capability_trial_verdict.py",
+      "sentinels": ["backend/testing/test_event_type_invariants.py"],
+      "why": "Second source file in test_event_type_invariants.py's fixed source_paths set (event_type literals for capability trial verdicts). Same rationale as backend/app/notification_dispatch.py."
+    }
+  ]
+}

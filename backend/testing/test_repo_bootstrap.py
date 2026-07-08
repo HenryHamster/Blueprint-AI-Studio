@@ -630,6 +630,45 @@ class TestRepoBootstrapStrategicGate:
             "_spawn_strategic_review must proceed when there is no pending bootstrap task"
         )
 
+    @pytest.mark.asyncio
+    async def test_bootstrap_pending_false_for_deploy_repo_misset_flag(
+        self, db_session, monkeypatch
+    ):
+        """_bootstrap_pending short-circuits to False for the deploy's own repo
+        even when its ``is_self_repo`` column is False and an in-flight bootstrap
+        task exists — the gate routes through the deploy-repo classifier, so the
+        deploy repo never blocks strategic spawning on a stray bootstrap task."""
+        from app.strategic_spawning import _bootstrap_pending
+
+        monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/myrepo")
+
+        # _make_project uses github_owner='acme', github_repo='myrepo'.
+        project = self._make_project(
+            build_config={"language": "python"}, is_self_repo=False
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        # An in-flight bootstrap task would make a normal project "pending".
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: deploy repo",
+            description="stray bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        pending = await _bootstrap_pending(project, db_session)
+        assert pending is False, (
+            "deploy's own repo (via deploy identity) must not report bootstrap "
+            "pending even with an in-flight task and is_self_repo=False"
+        )
+
 
 class TestRepoBootstrapCompletionStamp:
     """Tests for bootstrap_completed_at being stamped on task completion."""
@@ -1160,6 +1199,69 @@ class TestRepoBootstrapCommandMemory:
         doc = project.design_doc or {}
         assert "playbook/test-detected" not in doc, (
             "self-repo projects must not get playbook seeds from bootstrap"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_skips_playbook_seed_for_deploy_repo_misset_flag(
+        self, db_session, monkeypatch
+    ):
+        """Playbook seeding is skipped for the deploy's own repo even when its
+        ``is_self_repo`` column is False, once the deploy identity resolves and
+        matches it — the completion handler routes through the deploy-repo
+        classifier, not the raw flag."""
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/deploy-seed-repo")
+
+        project = Project(
+            name=f"acme/deploy-seed-{uuid.uuid4().hex[:8]}",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="deploy-seed-repo",
+            is_self_repo=False,  # deliberately misset on the deploy's own repo
+            build_config={"language": "python"},
+            integration_branch="main",
+        )
+        db_session.add(project)
+        await db_session.flush()
+
+        bootstrap_task = Task(
+            project_id=project.id,
+            title="Bootstrap: acme/deploy-seed-repo",
+            description="Deploy-repo bootstrap",
+            payloads=[{"type": "repo_bootstrap"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"repo_overview": dict(self._VALID_OVERVIEW)},
+        )
+        db_session.add(bootstrap_task)
+        await db_session.commit()
+        await db_session.refresh(project)
+        await db_session.refresh(bootstrap_task)
+
+        bc = dict(project.build_config)
+        bc["last_command_writeback_task_id"] = str(bootstrap_task.id)
+        bc["last_command_writeback_paths"] = ["backend"]
+        bc["directories"] = [
+            {
+                "path": "backend",
+                "confirmed_test_cmd": "pytest",
+                "confirming_task_id": str(bootstrap_task.id),
+            }
+        ]
+        project.build_config = bc
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        await _handle_repo_bootstrap_completion(bootstrap_task, "", db_session)
+        await db_session.refresh(project)
+
+        doc = project.design_doc or {}
+        assert "playbook/test-detected" not in doc, (
+            "deploy's own repo (via deploy identity) must not get playbook seeds "
+            "even with is_self_repo=False"
         )
 
     @pytest.mark.asyncio
@@ -2167,6 +2269,69 @@ class TestSpawnBootstrapTaskHelper:
         assert result.reason == "self_repo"
 
     @pytest.mark.asyncio
+    async def test_recovery_no_op_for_deploy_repo_with_misset_self_repo_flag(
+        self, db_session, monkeypatch
+    ):
+        """The deploy's own repo stays bootstrap-exempt even when its
+        ``is_self_repo`` column was left False, as long as the deploy identity
+        resolves and matches it.  This is the misset-flag hardening: the
+        deploy-repo classifier catches the row the raw flag would have missed."""
+        from app.repo_bootstrap import spawn_bootstrap_task
+
+        monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/deploy-served-repo")
+
+        project = _make_external_project(
+            db_session,
+            name="acme/deploy-served-repo",
+            build_config={"language": "python"},
+            is_self_repo=False,  # flag deliberately misset on the deploy's own repo
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        result = await spawn_bootstrap_task(
+            project, db_session, is_first_bootstrap=False, spawn_reason="recovery"
+        )
+
+        assert result.outcome == "not_eligible", (
+            "deploy's own repo must be bootstrap-exempt via deploy identity even "
+            "with is_self_repo=False"
+        )
+        assert result.reason == "self_repo"
+
+    @pytest.mark.asyncio
+    async def test_recovery_spawns_for_external_repo_when_deploy_identity_set(
+        self, db_session, monkeypatch
+    ):
+        """A genuinely external project is still eligible when a deploy identity
+        is set but points at a DIFFERENT repo — the identity match must be exact,
+        never a blanket exemption."""
+        from app.repo_bootstrap import spawn_bootstrap_task
+
+        monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/deploy-served-repo")
+
+        project = _make_external_project(
+            db_session,
+            name="acme/some-other-external",
+            build_config={
+                "language": "python",
+                "bootstrap_degraded_reason": "overview_missing",
+            },
+            is_self_repo=False,
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        result = await spawn_bootstrap_task(
+            project, db_session, is_first_bootstrap=False, spawn_reason="recovery"
+        )
+
+        assert result.outcome == "spawned", (
+            f"external project (not the deploy repo) must remain eligible, got "
+            f"{result.outcome!r}: {result.reason}"
+        )
+
+    @pytest.mark.asyncio
     async def test_recovery_no_op_for_empty_repo(self, db_session):
         """Recovery returns not_eligible for an empty-repo project."""
         from app.repo_bootstrap import spawn_bootstrap_task
@@ -2964,6 +3129,79 @@ class TestBootstrapSweepDirect:
         assert len(bootstrap_tasks) == 1, (
             f"Sweep must not create a duplicate when bootstrap is already active, "
             f"got {len(bootstrap_tasks)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sweep_excludes_deploy_repo_with_misset_self_repo_flag(
+        self, db_session, monkeypatch
+    ):
+        """The recovery sweep's SQL filter must exclude the deploy's own repo even
+        when its ``is_self_repo`` column is False, as long as a deploy identity
+        resolves and matches it — hardening ``project_is_external_repo_clause``
+        against a misset flag.  A different external project still gets spawned in
+        the same sweep, proving the exclusion is exact, not a blanket skip."""
+        from app.recovery_sweeps import _sweep_bootstrap_recovery
+
+        monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/deploy-served-repo")
+
+        # The deploy's own repo, flag misset to False, needs bootstrap on paper.
+        deploy_repo = _make_external_project(
+            db_session,
+            name="acme/deploy-served-repo",
+            build_config={
+                "language": "python",
+                "bootstrap_degraded_reason": "overview_missing",
+            },
+            is_self_repo=False,
+        )
+        # A genuinely external project that must still be swept in.
+        external = _make_external_project(
+            db_session,
+            name="acme/genuinely-external",
+            build_config={
+                "language": "python",
+                "bootstrap_degraded_reason": "overview_missing",
+            },
+            is_self_repo=False,
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        await _sweep_bootstrap_recovery()
+
+        deploy_tasks = (
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == deploy_repo.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(deploy_tasks) == 0, (
+            "sweep must not spawn a bootstrap for the deploy's own repo, even with "
+            "is_self_repo=False, when the deploy identity matches it"
+        )
+
+        external_tasks = (
+            (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.project_id == external.id,
+                        Task.payloads[0]["type"].as_string() == "repo_bootstrap",
+                        Task.status == TaskStatus.QUEUED,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(external_tasks) == 1, (
+            f"genuinely-external project must still receive exactly one bootstrap "
+            f"task, got {len(external_tasks)}"
         )
 
 

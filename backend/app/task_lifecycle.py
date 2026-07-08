@@ -3078,6 +3078,10 @@ async def _process_post_commit(
                     review_is_high_stakes,
                     spawn_review_second_opinion,
                 )
+                from app.review_heuristics import (
+                    _diff_lines_changed,
+                    _is_test_file,
+                )
 
                 _recon_record = (task.context or {}).get(
                     REVIEW_SECOND_OPINION_RECONCILIATION_KEY
@@ -3123,6 +3127,39 @@ async def _process_post_commit(
                 elif not verdict_unparseable and _runtime_config.get(
                     "review_second_opinion_gate_enabled", True
                 ):
+                    # Load source task diff stats for the size-exemption check.
+                    # The review task itself does not carry _pr_diff_summary /
+                    # _pr_changed_files (both are excluded from context
+                    # propagation in review_pipeline._PROPAGATE_UNDERSCORE_KEYS),
+                    # so we read them from the original create/fix/refactor task.
+                    # One extra DB read per APPROVE-to-trunk verdict; skipped
+                    # when original_task_id is unavailable (fail-open: challenge).
+                    _so_diff_lines: int | None = None
+                    _so_file_count: int | None = None
+                    if original_task_id:
+                        try:
+                            _so_source = await session.get(
+                                Task, uuid.UUID(original_task_id)
+                            )
+                            if _so_source is not None:
+                                _so_ctx = _so_source.context or {}
+                                _so_diff_lines = _diff_lines_changed(
+                                    _so_ctx.get("_pr_diff_summary"),
+                                    exclude_test_files=True,
+                                )
+                                _so_files = _so_ctx.get("_pr_changed_files") or []
+                                _so_file_count = sum(
+                                    1
+                                    for f in _so_files
+                                    if not _is_test_file(f)
+                                )
+                        except Exception:
+                            logger.debug(
+                                "[REVIEW PIPELINE] PR #%s: could not load source task "
+                                "%s for diff-size check — proceeding with challenge",
+                                pr_number,
+                                original_task_id,
+                            )
                     if review_is_high_stakes(
                         verdict,
                         issues,
@@ -3135,6 +3172,8 @@ async def _process_post_commit(
                             ),
                             _shared_state.get_project_promotion_target(_review_project),
                         ),
+                        diff_non_test_lines=_so_diff_lines,
+                        diff_non_test_file_count=_so_file_count,
                     ):
                         _sample_rate = float(
                             _runtime_config.get(
@@ -5100,41 +5139,47 @@ async def _process_post_commit(
                             # from the iteration cap). stale_head_consecutive_discards has
                             # no underscore so it IS propagated, letting the fresh review
                             # inherit the running count and eventually accept on the 2nd hit.
-                            task.context = {
-                                **(task.context or {}),
-                                "stale_head_consecutive_discards": _stale_discard_count
-                                + 1,
-                                "_review_stale_head": True,
-                            }
-                            flag_modified(task, "context")
-                            task.status = TaskStatus.COMPLETED
-                            task.latest_status_message = (
-                                f"Stale-head review discarded for PR #{pr_number} "
-                                f"(reviewed {reviewed_head_sha[:8]}, "
-                                f"head is now {head_sha[:8]}) — respawning fresh review"
-                            )
-                            session.add(task)
-                            logger.warning(
-                                f"[REVIEW PIPELINE] PR #{pr_number}: stale-head verdict "
-                                f"discarded (reviewed={reviewed_head_sha[:8]}, "
-                                f"live={head_sha[:8]}) — respawning review "
-                                f"(discard #{_stale_discard_count + 1})"
-                            )
-                            fresh_review, _ = await _spawn_pipeline_task(
-                                task,
-                                "review",
-                                session,
-                                pr_number,
-                                branch,
-                                base_branch,
-                                original_task_id=original_task_id,
-                            )
-                            if fresh_review:
-                                logger.info(
-                                    f"[REVIEW PIPELINE] Spawned fresh review "
-                                    f"{fresh_review.id} for PR #{pr_number} "
-                                    f"after stale-head discard"
+                            #
+                            # Replay guard: _review_stale_head being set means a prior run
+                            # already committed the counter increment and spawned the fresh
+                            # review.  Skip both actions to avoid double-increment and
+                            # double-spawn.
+                            if not (task.context or {}).get("_review_stale_head"):
+                                task.context = {
+                                    **(task.context or {}),
+                                    "stale_head_consecutive_discards": _stale_discard_count
+                                    + 1,
+                                    "_review_stale_head": True,
+                                }
+                                flag_modified(task, "context")
+                                task.status = TaskStatus.COMPLETED
+                                task.latest_status_message = (
+                                    f"Stale-head review discarded for PR #{pr_number} "
+                                    f"(reviewed {reviewed_head_sha[:8]}, "
+                                    f"head is now {head_sha[:8]}) — respawning fresh review"
                                 )
+                                session.add(task)
+                                logger.warning(
+                                    f"[REVIEW PIPELINE] PR #{pr_number}: stale-head verdict "
+                                    f"discarded (reviewed={reviewed_head_sha[:8]}, "
+                                    f"live={head_sha[:8]}) — respawning review "
+                                    f"(discard #{_stale_discard_count + 1})"
+                                )
+                                fresh_review, _ = await _spawn_pipeline_task(
+                                    task,
+                                    "review",
+                                    session,
+                                    pr_number,
+                                    branch,
+                                    base_branch,
+                                    original_task_id=original_task_id,
+                                )
+                                if fresh_review:
+                                    logger.info(
+                                        f"[REVIEW PIPELINE] Spawned fresh review "
+                                        f"{fresh_review.id} for PR #{pr_number} "
+                                        f"after stale-head discard"
+                                    )
                             await session.commit()
                             return {"status": "accepted"}
                         else:

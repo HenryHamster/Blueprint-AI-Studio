@@ -23,7 +23,6 @@ export type ReviewPromptFingerprintOptions = {
 // cannot silently drift while claiming the same version.
 export const REVIEW_CLAUDEMD_PROMPT_HEADER = '## Codebase Instructions\n';
 export const REVIEW_CLAUDEMD_PROMPT_FOOTER = '\n\nCheck that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.\n\n';
-export const REVIEW_FILE_RESTRICTIONS_NOTE = 'Check that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.';
 
 export const REVIEW_HISTORY_INTRO = 'Issues from previous iterations (verify each was addressed — issues marked "(likely resolved ...)" were not re-flagged in the following iteration and are historical context, not active blockers):';
 export const REVIEW_ITERATION_PRIOR_NOTE = '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.';
@@ -110,10 +109,12 @@ export function buildReviewDiffAccessHint(baseBranch: string): string {
 // check CI does not run), framed as an optional code-quality signal — never an
 // aggregate build gate. Scoped-lint one-liners are emitted via the shared
 // buildScopedLintOneliner helper so they restrict to changed files only.
+const CI_AUTHORITY_PREAMBLE = `CI is the authoritative gate for this project's build, type-check, eslint, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because one failed or because you could not run one — CI owns that signal.`;
+
 export function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch?: string): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
     return `**Build, Tests & Lint — who verifies what:**
-- CI is the authoritative gate for this project's build, type-check, eslint, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because a build/type/test step failed or because you could not run one — CI owns that signal.
+- ${CI_AUTHORITY_PREAMBLE}
 - The ONE quality check CI does not run is the project's lint. As an OPTIONAL code-quality signal you MAY run the lint scoped to the changed files (Python: \`python -m ruff check <changed .py files>\`; JS/TS: \`npx eslint <changed files>\`) and surface only NET-NEW style/lint violations as code-quality issues. This is a scoped quality check, not a build gate — skip it freely if your sandbox can't run it.
 - You MAY run targeted commands in your already-cloned workspace to SUBSTANTIATE a specific concern (reproduce a suspected bug, confirm a claim). Use the result to inform your judgment.
 - A command you CANNOT run — tool missing, install/build failure, API 401/403, sandbox limit — is an environment condition, never a code defect. It is NOT grounds for REQUEST_CHANGES.`;
@@ -144,44 +145,66 @@ export function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch
     });
   if (checks.length === 0) {
     return `**Build, Tests & Lint — who verifies what:**
-- CI is the authoritative gate for this project's build, type-check, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because one failed or because you could not run one — CI owns that signal.
+- ${CI_AUTHORITY_PREAMBLE}
 - No reviewer-runnable lint is configured for this project, so there is no scoped quality check to run; review the code manually for correctness.
 - A command you CANNOT run (tool missing, install/build failure, API 401/403, sandbox limit) is an environment condition, never a code defect, and is NOT grounds for REQUEST_CHANGES.`;
   }
   return `**Build, Tests & Lint — who verifies what:**
-- CI is the authoritative gate for this project's build, type-check, eslint, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because one failed or because you could not run one — CI owns that signal.
+- ${CI_AUTHORITY_PREAMBLE}
 - The ONE quality check CI does not run is the project's lint. As an OPTIONAL code-quality signal you MAY run the scoped lint below (already restricted to the changed files) and surface only NET-NEW style/lint violations as code-quality issues. This is a scoped quality check, not a build gate — skip it freely if your sandbox can't run it.
 ${checks.join('\n')}
 - You MAY also run targeted commands in your already-cloned workspace to SUBSTANTIATE a specific concern (reproduce a suspected bug, confirm a claim) — use the result to inform your judgment.
 - A command you CANNOT run (tool missing, install/build failure, API 401/403, sandbox limit) is an environment condition, never a code defect, and is NOT grounds for REQUEST_CHANGES.`;
 }
 
-export function buildReviewChecklistSection(buildConfig?: BuildConfig, baseBranch?: string): string {
-  return `Review the changes thoroughly using this checklist:
-
-**Correctness & Logic:**
+// Per-lens checklist text used by buildLensScopedChecklistSection.
+// Each panel_review lens agent receives only its own section so it does not
+// re-read the full four-section list it was explicitly told to ignore.
+const LENS_CHECKLIST_ITEMS: Record<string, string> = {
+  correctness: `**Correctness & Logic:**
 - Does the code correctly implement what the original task asked for?
 - Are there edge cases, null/undefined handling, or off-by-one errors?
 - Are async operations properly awaited? Are errors properly handled?
-- Do any database queries have N+1 problems or missing indexes?
-
-**Security:**
+- Do any database queries have N+1 problems or missing indexes?`,
+  security: `**Security:**
 - Are user inputs validated and sanitized before use?
 - Are there SQL injection, XSS, path traversal, or command injection risks?
 - Are secrets/tokens exposed in logs, responses, or error messages?
-- Are authorization checks present on new endpoints?
-
-**Code Quality:**
+- Are authorization checks present on new endpoints?`,
+  code_quality: `**Code Quality:**
 - Is the code readable and following existing patterns in the codebase?
 - Are there obvious performance issues (unnecessary loops, redundant DB calls)?
 - Does the change break any existing interfaces or contracts?
-- Are type annotations correct (TypeScript/Python)?
-
-**Test Coverage:**
+- Are type annotations correct (TypeScript/Python)?`,
+  test_coverage: `**Test Coverage:**
 - Are there tests for the new/changed behavior? (A genuinely missing test for new behavior is a blockable defect.)
-- Do the changes look likely to break existing tests by reasoning about the diff? (CI runs the full suite as the authoritative gate — do not re-run it yourself or block on a test run you couldn't perform; flag only a specific case the diff clearly breaks.)
+- Do the changes look likely to break existing tests by reasoning about the diff? (CI runs the full suite as the authoritative gate — do not re-run it yourself or block on a test run you couldn't perform; flag only a specific case the diff clearly breaks.)`,
+};
+
+export function buildReviewChecklistSection(buildConfig?: BuildConfig, baseBranch?: string): string {
+  return `Review the changes thoroughly using this checklist:
+
+${LENS_CHECKLIST_ITEMS.correctness}
+
+${LENS_CHECKLIST_ITEMS.security}
+
+${LENS_CHECKLIST_ITEMS.code_quality}
+
+${LENS_CHECKLIST_ITEMS.test_coverage}
 
 ${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
+}
+
+// Returns a checklist section scoped to a single panel_review lens. The lens
+// agent only receives its own dimension's bullets so it is not prompted to
+// judge dimensions explicitly outside its scope. Falls back to the full
+// checklist for unrecognised lens IDs to avoid silent regressions.
+export function buildLensScopedChecklistSection(lensId: string, buildConfig?: BuildConfig, baseBranch?: string): string {
+  const lensSection = LENS_CHECKLIST_ITEMS[lensId];
+  if (!lensSection) {
+    return buildReviewChecklistSection(buildConfig, baseBranch);
+  }
+  return `Review the changes through your lens using this checklist:\n\n${lensSection}\n\n${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
 }
 
 export function buildReviewSeverityGuideSection(): string {
@@ -302,7 +325,6 @@ export function buildReviewPromptFingerprintContent(
     REVIEW_FIX_RESPONSES_INSTRUCTIONS,
     buildReviewMasterPreamble('<PR>', '<BRANCH>', '<BASE>'),
     buildReviewDiffAccessHint('<BASE>'),
-    REVIEW_FILE_RESTRICTIONS_NOTE,
     buildReviewCoreGuidance(buildConfig, 'TASK_ID'),
   ];
   const rollupGuidance = buildRollupReviewGuidance(options.branch || '', options.baseBranch || 'main');

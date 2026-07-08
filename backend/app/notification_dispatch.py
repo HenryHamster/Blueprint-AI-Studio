@@ -28,6 +28,7 @@ from app.shared_state import get_project_promotion_target
 
 from app.models import (
     MessageType,
+    NotificationDeadLetter,
     Project,
     ProjectMessage,
     ResidualCaseStatus,
@@ -124,14 +125,16 @@ _retry_queue: collections.deque[_RetryEntry] = collections.deque(
 _RETRY_DRAIN_INTERVAL_SECONDS = 30
 
 
-def _enqueue_retry(entry: _RetryEntry) -> None:
-    """Append a retry entry, logging when the bounded deque evicts the oldest.
+def _enqueue_retry(entry: _RetryEntry) -> Optional[_RetryEntry]:
+    """Append a retry entry, returning the entry evicted to make room (if any).
 
     ``collections.deque(maxlen=...)`` silently discards the oldest element on
     append once full. For an alert-delivery retry queue that silent loss is a
-    real signal disappearing, so we detect the at-capacity case and log the
-    evicted entry before it is dropped.
+    real signal disappearing, so we detect the at-capacity case, log the
+    evicted entry, and return it so the caller can durably dead-letter it (see
+    ``_enqueue_retry_durable``). Returns ``None`` when nothing was evicted.
     """
+    evicted: Optional[_RetryEntry] = None
     if len(_retry_queue) >= _RETRY_QUEUE_MAXLEN:
         evicted = _retry_queue[0]
         logger.warning(
@@ -143,6 +146,57 @@ def _enqueue_retry(entry: _RetryEntry) -> None:
             evicted.attempts,
         )
     _retry_queue.append(entry)
+    return evicted
+
+
+async def _write_dead_letter(
+    entry: _RetryEntry, reason: str, last_status: Optional[int] = None
+) -> None:
+    """Durably record a notification that will never be delivered.
+
+    Called when a retry is ``"exhausted"`` (all attempts used up) or
+    ``"evicted"`` (dropped from the full in-memory queue). Persists a
+    ``NotificationDeadLetter`` row so the failed escalation survives restarts
+    and stays operator-visible/re-drivable instead of vanishing. Best-effort:
+    a persistence failure is logged and swallowed — dead-lettering must never
+    break the dispatch/drain path.
+    """
+    from app.database import closing_session
+
+    try:
+        async with closing_session() as session:
+            session.add(
+                NotificationDeadLetter(
+                    project_id=str(entry.project_id),
+                    event_type=entry.event_type,
+                    reason=reason,
+                    attempts=entry.attempts + 1,
+                    last_status=last_status,
+                    webhook_url=entry.webhook_url or "",
+                    payload=entry.payload or {},
+                    body=entry.body or {},
+                )
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 — durability write must not raise
+        logger.warning(
+            "[NOTIFY] Failed to persist dead-letter for %s (%s): %s",
+            entry.event_type,
+            reason,
+            exc,
+        )
+
+
+async def _enqueue_retry_durable(entry: _RetryEntry) -> None:
+    """Enqueue a retry, dead-lettering any entry evicted to make room.
+
+    Wraps the synchronous ``_enqueue_retry`` so callers in async contexts get
+    durable eviction handling without duplicating the write. The evicted entry
+    would otherwise disappear silently once the bounded deque is full.
+    """
+    evicted = _enqueue_retry(entry)
+    if evicted is not None:
+        await _write_dead_letter(evicted, reason="evicted")
 
 
 def _record_project_stat(project_id: Any, outcome: str, reason: str = "") -> None:
@@ -294,7 +348,7 @@ async def _drain_retry_queue(webhook_url: str = "") -> None:
             elif entry.attempts + 1 < len(_RETRY_DELAYS):
                 # Schedule another retry
                 delay = _RETRY_DELAYS[entry.attempts + 1]
-                _enqueue_retry(
+                await _enqueue_retry_durable(
                     dataclasses.replace(
                         entry,
                         attempts=entry.attempts + 1,
@@ -309,6 +363,7 @@ async def _drain_retry_queue(webhook_url: str = "") -> None:
                 total_failed += 1
                 last_failure_reason = f"max retries exceeded (last status: {status})"
                 _record_project_stat(entry.project_id, "failed", last_failure_reason)
+                await _write_dead_letter(entry, reason="exhausted", last_status=status)
                 logger.warning(
                     f"[NOTIFY] Exhausted retries for {entry.event_type} after "
                     f"{entry.attempts + 1} attempts"
@@ -316,7 +371,7 @@ async def _drain_retry_queue(webhook_url: str = "") -> None:
         except Exception as exc:
             if entry.attempts + 1 < len(_RETRY_DELAYS):
                 delay = _RETRY_DELAYS[entry.attempts + 1]
-                _enqueue_retry(
+                await _enqueue_retry_durable(
                     dataclasses.replace(
                         entry,
                         attempts=entry.attempts + 1,
@@ -331,6 +386,7 @@ async def _drain_retry_queue(webhook_url: str = "") -> None:
                 total_failed += 1
                 last_failure_reason = str(exc)
                 _record_project_stat(entry.project_id, "failed", str(exc))
+                await _write_dead_letter(entry, reason="exhausted")
                 logger.warning(
                     f"[NOTIFY] Exhausted retries for {entry.event_type}: {exc}"
                 )
@@ -448,7 +504,7 @@ async def dispatch_external_notification(
             elif status >= 400:
                 # 5xx or unexpected 4xx — schedule first retry
                 delay = _RETRY_DELAYS[0]
-                _enqueue_retry(
+                await _enqueue_retry_durable(
                     _RetryEntry(
                         project_id=project_id,
                         event_type=event_type,
@@ -469,7 +525,7 @@ async def dispatch_external_notification(
         except Exception as exc:
             # Network/timeout error — schedule first retry
             delay = _RETRY_DELAYS[0]
-            _enqueue_retry(
+            await _enqueue_retry_durable(
                 _RetryEntry(
                     project_id=project_id,
                     event_type=event_type,
@@ -1212,19 +1268,25 @@ async def _get_or_create_residual_case(
     session: AsyncSession,
     project_id: uuid.UUID,
     fingerprint: str,
+    with_lock: bool = False,
 ) -> ResidualRemediationCase:
     """Return the case row for (project_id, fingerprint), creating it if
     missing. The UNIQUE(project_id, fingerprint) added in 0054 means one
     row per fingerprint. Caller is responsible for the surrounding commit.
+
+    When with_lock=True, acquires a row-level write lock to prevent
+    concurrent read-modify-write races on counters (e.g., audit_defer_count).
     """
     from sqlmodel import select
 
-    result = await session.execute(
-        select(ResidualRemediationCase).where(
-            ResidualRemediationCase.project_id == project_id,
-            ResidualRemediationCase.fingerprint == fingerprint,
-        )
+    stmt = select(ResidualRemediationCase).where(
+        ResidualRemediationCase.project_id == project_id,
+        ResidualRemediationCase.fingerprint == fingerprint,
     )
+    if with_lock:
+        stmt = stmt.with_for_update()
+
+    result = await session.execute(stmt)
     case = result.scalars().first()
     if case is None:
         case = ResidualRemediationCase(
@@ -1247,7 +1309,7 @@ async def post_residual_fix_spawned_message(
     Also transitions the case row to REMEDIATING and stamps last_spawned_*
     so the next idle-tick spawn-dedup query sees the in-flight attempt.
     """
-    case = await _get_or_create_residual_case(session, project_id, fingerprint)
+    case = await _get_or_create_residual_case(session, project_id, fingerprint, with_lock=True)
     case.status = ResidualCaseStatus.REMEDIATING
     case.last_spawned_task_id = task_id
     case.last_spawned_at = _utcnow()
@@ -1331,14 +1393,14 @@ async def post_residual_fix_result_message(
         # Don't touch the failure counter or status — wait for the human
         # gate. The case stays REMEDIATING.
         if pr_number is not None:
-            case = await _get_or_create_residual_case(session, project_id, fingerprint)
+            case = await _get_or_create_residual_case(session, project_id, fingerprint, with_lock=True)
             case.last_spawned_pr_number = pr_number
             case.updated_at = _utcnow()
             session.add(case)
         return msg
 
     try:
-        case = await _get_or_create_residual_case(session, project_id, fingerprint)
+        case = await _get_or_create_residual_case(session, project_id, fingerprint, with_lock=True)
         if pr_number is not None:
             case.last_spawned_pr_number = pr_number
         case.updated_at = _utcnow()
@@ -1678,7 +1740,7 @@ async def close_residual_case_resolved(
     auto-resolve threshold. Distinct from MERGED (PR-driven close) and from
     CLOSED_ORGANICALLY (legacy reaper close of ACTIVE rows).
     """
-    case = await _get_or_create_residual_case(session, project_id, fingerprint)
+    case = await _get_or_create_residual_case(session, project_id, fingerprint, with_lock=True)
     case.status = ResidualCaseStatus.RESOLVED
     case.updated_at = _utcnow()
     session.add(case)

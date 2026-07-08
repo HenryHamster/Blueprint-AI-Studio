@@ -1,8 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   buildTypeCheckInstructions,
+  buildLensScopedChecklistSection,
   buildReviewIterationPreamble,
   buildReviewVerdictInstructions,
+  buildReviewPromptFingerprintContent,
   REVIEW_DELTA_FOCUS_NOTE,
 } from './review-prompt.js';
 
@@ -196,6 +198,60 @@ describe('buildTypeCheckInstructions — CI owns build/tests, reviewer owns scop
   });
 });
 
+describe('buildLensScopedChecklistSection — per-lens scoping', () => {
+  it('security lens contains Security checklist and omits other lens sections', () => {
+    const out = buildLensScopedChecklistSection('security');
+    expect(out).toContain('**Security:**');
+    expect(out).toContain('SQL injection');
+    expect(out).not.toContain('**Correctness & Logic:**');
+    expect(out).not.toContain('**Code Quality:**');
+    expect(out).not.toContain('**Test Coverage:**');
+  });
+
+  it('correctness lens contains Correctness checklist and omits other lens sections', () => {
+    const out = buildLensScopedChecklistSection('correctness');
+    expect(out).toContain('**Correctness & Logic:**');
+    expect(out).toContain('edge cases');
+    expect(out).not.toContain('**Security:**');
+    expect(out).not.toContain('**Code Quality:**');
+    expect(out).not.toContain('**Test Coverage:**');
+  });
+
+  it('test_coverage lens contains Test Coverage checklist and omits other lens sections', () => {
+    const out = buildLensScopedChecklistSection('test_coverage');
+    expect(out).toContain('**Test Coverage:**');
+    expect(out).toContain('new/changed behavior');
+    expect(out).not.toContain('**Security:**');
+    expect(out).not.toContain('**Correctness & Logic:**');
+    expect(out).not.toContain('**Code Quality:**');
+  });
+
+  it('code_quality lens contains Code Quality checklist and omits other lens sections', () => {
+    const out = buildLensScopedChecklistSection('code_quality');
+    expect(out).toContain('**Code Quality:**');
+    expect(out).toContain('existing patterns');
+    expect(out).not.toContain('**Security:**');
+    expect(out).not.toContain('**Correctness & Logic:**');
+    expect(out).not.toContain('**Test Coverage:**');
+  });
+
+  it('all lenses still include the shared CI/lint guidance', () => {
+    for (const lensId of ['correctness', 'security', 'code_quality', 'test_coverage']) {
+      const out = buildLensScopedChecklistSection(lensId);
+      expect(out).toContain('Build, Tests & Lint');
+      expect(out).toContain('CI is the authoritative gate');
+    }
+  });
+
+  it('unknown lens id falls back to the full four-section checklist', () => {
+    const out = buildLensScopedChecklistSection('unknown_lens');
+    expect(out).toContain('**Correctness & Logic:**');
+    expect(out).toContain('**Security:**');
+    expect(out).toContain('**Code Quality:**');
+    expect(out).toContain('**Test Coverage:**');
+  });
+});
+
 describe('buildReviewVerdictInstructions — block on substantiated code defects, not unverifiable uncertainty', () => {
   const out = buildReviewVerdictInstructions('task-xyz');
 
@@ -224,5 +280,17 @@ describe('buildReviewVerdictInstructions — block on substantiated code defects
 
   it('still writes the verdict JSON to the per-task /tmp file', () => {
     expect(out).toContain('/tmp/review_verdict_task-xyz.json');
+  });
+});
+
+describe('buildReviewPromptFingerprintContent — no duplicate constants', () => {
+  it('fingerprint content does not contain duplicate file-restrictions sentence', () => {
+    const content = buildReviewPromptFingerprintContent();
+    // The file-restrictions sentence should appear exactly once in the fingerprint,
+    // not duplicated by a standalone constant. This verifies the dead REVIEW_FILE_RESTRICTIONS_NOTE
+    // constant has been removed and is not injected into the fingerprint.
+    const restrictionsSentence = 'Check that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.';
+    const count = (content.match(new RegExp(restrictionsSentence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+    expect(count).toBe(1);
   });
 });

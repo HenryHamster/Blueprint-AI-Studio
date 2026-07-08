@@ -113,7 +113,7 @@ async def _record_residual_audit_deferral(
             select(ResidualRemediationCase).where(
                 ResidualRemediationCase.project_id == project_id,
                 ResidualRemediationCase.fingerprint == fingerprint,
-            )
+            ).with_for_update()
         )
     ).scalar_one_or_none()
     if case is None:
@@ -235,7 +235,7 @@ async def _spawn_residual_fingerprint_remediation(
                 select(ResidualRemediationCase).where(
                     ResidualRemediationCase.project_id == project.id,
                     ResidualRemediationCase.fingerprint == fp,
-                )
+                ).with_for_update()
             )
         ).scalar_one_or_none()
         if case_row is None:
@@ -607,7 +607,7 @@ async def _spawn_viewport_regression_remediation(
                 select(ResidualRemediationCase).where(
                     ResidualRemediationCase.project_id == project.id,
                     ResidualRemediationCase.fingerprint == fp,
-                )
+                ).with_for_update()
             )
         ).scalar_one_or_none()
         if case_row is None:

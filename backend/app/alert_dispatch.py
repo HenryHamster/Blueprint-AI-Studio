@@ -11,8 +11,8 @@ for backward compatibility.
 Pure leaf module — depends only on ``app.broadcast``, ``app.notification``,
 ``app.shared_state``, ``app.time_utils``, ``app.models``. Tests patch
 ``app.alert_dispatch.broadcast_to_project`` and
-``app.alert_dispatch._send_webhook_notification`` for the helpers that live
-here, and ``app.alert_dispatch.<helper>`` where a caller invokes one.
+``app.notification_dispatch.dispatch_external_notification`` for the helpers
+that live here, and ``app.alert_dispatch.<helper>`` where a caller invokes one.
 """
 
 import logging
@@ -1688,159 +1688,37 @@ async def _resolve_wake_delivery_stall_alert(
     return len(open_alerts)
 
 
-# Event type + dedupe-key scheme for the self-hosted fleet-runner death alert.
-# The dedupe key encodes the runner id so an active->inactive flip raises exactly
-# ONE open alert per runner (the ux_alert_active_dedupe_key unique index enforces
-# it), and a genuinely distinct death event — after the previous one was resolved
-# on recovery — gets a fresh alert. Kept stable: the resolve-on-recovery path
-# rebuilds the SAME key to find the open alert to dismiss.
-_RUNNER_DEACTIVATED_EVENT_TYPE = "runner.deactivated"
 
-
-def _runner_deactivated_dedupe_key(runner_id: "uuid.UUID | str") -> str:
-    return f"{_RUNNER_DEACTIVATED_EVENT_TYPE}:{runner_id}"
-
-
-async def _maybe_create_runner_deactivated_alert(
-    session: AsyncSession,
-    *,
-    project_id: "uuid.UUID",
-    runner_id: "uuid.UUID | str",
-    hostname: "str | None" = None,
-    had_active_work: bool = False,
-    active_work_count: int = 0,
-    seconds_since_last_seen: "int | None" = None,
-) -> bool:
-    """Create ONE deduplicated operator Alert when a fleet runner is deactivated.
-
-    Fired from the orchestrator's stale-runner sweep at the moment it flips a
-    registered self-hosted runner ``active -> inactive`` (missed heartbeat
-    window). Previously that sweep only nudged the UI cache — an idle registered
-    runner could die and nothing told the operator. This surfaces the death in
-    the same Alerts banner/popover as PIPELINE_HALTED / CIRCUIT_BREAKER_OPEN and,
-    when ``PIPELINE_WEBHOOK_URL`` is set, PUSHES the ``RUNNER_DEACTIVATED`` webhook
-    so the operator is notified without watching the console.
-
-    Severity mirrors impact: **ERROR** when the runner had active work in flight
-    at deactivation (a job may have been interrupted), **WARNING** when it was
-    idle. Uses the always-on ``core`` alert domain (runner death is a portable
-    operator incident), so it is never suppressed by per-project domain config.
-
-    Deduplicated on ``dedupe_key = runner.deactivated:{runner_id}`` via the shared
-    :func:`create_project_alert_if_allowed` upsert: a repeated sweep (or any
-    re-entry while the runner stays inactive) bumps the existing open alert's
-    occurrence count instead of creating a second row. The webhook fires ONLY on
-    the first (newly-created) alert, not on dedup hits. Commits its own row so the
-    caller's transaction boundary is independent. Returns ``True`` when a NEW
-    alert was created (and the webhook pushed), else ``False``.
-    """
-    runner_label = hostname or f"runner {str(runner_id)[:8]}"
-    severity = AlertSeverity.ERROR if had_active_work else AlertSeverity.WARNING
-    if had_active_work:
-        title = f"Fleet runner went offline mid-job: {runner_label}"
-        work_desc = (
-            f" It had {active_work_count} active "
-            f"task{'s' if active_work_count != 1 else ''} in flight, which may "
-            f"have been interrupted."
-        )
-    else:
-        title = f"Fleet runner went offline: {runner_label}"
-        work_desc = " It had no active work at deactivation."
-    if seconds_since_last_seen is not None:
-        last_seen_desc = (
-            f" Last heartbeat {_fmt_duration_seconds(seconds_since_last_seen)} ago."
-        )
-    else:
-        last_seen_desc = " It never sent a heartbeat after registering."
-    message = (
-        f"Self-hosted fleet runner {runner_label} ({str(runner_id)[:8]}) missed "
-        f"its heartbeat window and was deactivated.{work_desc}{last_seen_desc} "
-        f"Bring the runner back online — it re-arms automatically on its next "
-        f"heartbeat (the alert clears then) — or retarget its work to another "
-        f"runner or the cloud fallback."
-    )[:1000]
-
-    alert, created, _decision = await create_project_alert_if_allowed(
-        session,
-        project_id=project_id,
-        event_type=_RUNNER_DEACTIVATED_EVENT_TYPE,
-        severity=severity,
-        title=title,
-        message=message,
-        source="orchestrator",
-        dedupe_key=_runner_deactivated_dedupe_key(runner_id),
-        broadcast=False,
-    )
-    if alert is None:
-        # Policy suppressed the durable alert (should not happen for the core
-        # domain, but keep the contract honest): nothing staged, nothing to push.
-        return False
-    await session.commit()
-    if not created:
-        # Dedup hit: the open alert's occurrence count was bumped and committed;
-        # do not re-broadcast or re-push the webhook while the runner stays dead.
-        return False
-    await broadcast_to_project(
-        str(project_id),
-        "alert_created",
-        {
-            "alert_id": str(alert.id),
-            "severity": severity.value,
-            "title": alert.title,
-            "domain": alert.domain,
-            "event_type": alert.event_type,
-        },
-    )
-    await _send_webhook_notification("RUNNER_DEACTIVATED", alert.title, alert.message)
-    return True
-
-
-async def _resolve_runner_deactivated_alert(
-    session: AsyncSession,
-    project_id: "uuid.UUID",
-    runner_id: "uuid.UUID | str",
-) -> int:
-    """Dismiss any open runner-deactivated alert for a runner that recovered.
-
-    The companion to :func:`_maybe_create_runner_deactivated_alert`. Called from
-    the runner heartbeat handler when a previously-inactive runner re-arms
-    (status flips back to ``active``): the WARNING/ERROR alert that flagged the
-    death no longer describes a real condition, so it is resolved — mirroring how
-    :func:`_resolve_wake_delivery_stall_alert` dismisses its alert on recovery.
-
-    Looks the open alert up by the deterministic ``dedupe_key`` (rebuilt with the
-    SAME construction the create path used), stamps ``dismissed_at``, commits its
-    own rows, and broadcasts one ``alert_dismissed`` per dismissed alert so the
-    operator UI drops it without waiting for a poll. Only open
-    (``dismissed_at IS NULL``) alerts are touched, so this is a safe idempotent
-    no-op when none exists. Returns the number of alerts dismissed (0 or 1 in
-    practice). Best-effort contract: the caller wraps this so a resolve failure
-    never aborts the heartbeat that triggered it.
-    """
-    dedupe_key = _runner_deactivated_dedupe_key(runner_id)
-    result = await session.execute(
-        select(Alert).where(
-            Alert.project_id == project_id,
-            Alert.dedupe_key == dedupe_key,
-            Alert.dismissed_at.is_(None),
-        )
-    )
-    open_alerts = result.scalars().all()
-    if not open_alerts:
-        return 0
-    now = _utcnow()
-    for alert in open_alerts:
-        alert.dismissed_at = now
-        session.add(alert)
-    await session.commit()
-    for alert in open_alerts:
-        await broadcast_to_project(
-            str(project_id),
-            "alert_dismissed",
-            {"alert_id": str(alert.id), "title": alert.title},
-        )
-    return len(open_alerts)
-
+# Runner health alert helpers live in app.runner_health_alerts; re-exported here
+# so existing ``from app.alert_dispatch import ...`` callers keep working.
+from app.runner_health_alerts import (  # noqa: F401
+    _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE,
+    _LOCAL_RUNNER_HOLD_ALERT_TITLE,
+    _RUNNER_DEACTIVATED_EVENT_TYPE,
+    _RUNNER_DEGRADED_EVENT_TYPE,
+    _RUNNER_ESCALATION_AGE_SECONDS_DEFAULT,
+    _RUNNER_ESCALATION_FIRST_SECONDS,
+    _RUNNER_ESCALATION_REPEAT_SECONDS,
+    _RUNNER_LOW_DISK_EVENT_TYPE,
+    _fleet_no_healthy_runner_dedupe_key,
+    _maybe_create_fleet_no_healthy_runner_alert,
+    _maybe_create_local_runner_hold_alert,
+    _maybe_create_runner_deactivated_alert,
+    _maybe_create_runner_degraded_alert,
+    _maybe_create_runner_low_disk_alert,
+    _maybe_escalate_runner_deactivated_alert,
+    _maybe_escalate_runner_deactivated_alerts,
+    _maybe_escalate_runner_degraded_alerts,
+    _resolve_fleet_no_healthy_runner_alert,
+    _resolve_runner_deactivated_alert,
+    _resolve_runner_degraded_alert,
+    _resolve_runner_low_disk_alert,
+    _runner_deactivated_dedupe_key,
+    _runner_degraded_dedupe_key,
+    _runner_escalation_last_notified,
+    _runner_low_disk_dedupe_key,
+    _runner_outage_escalated_keys,
+)
 
 async def _create_strategic_alert(
     project_id: "uuid.UUID",

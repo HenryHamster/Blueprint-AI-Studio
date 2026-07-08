@@ -239,15 +239,35 @@ def merge_vision(
     return merged, rejected
 
 
+def _rejected_edit_fingerprint(entry: Any) -> tuple:
+    """Stable content key for dedup: (field, kind, repr(agent_value)).
+
+    Two entries with the same field/kind/agent_value are replay duplicates;
+    the ``at`` timestamp differs on retry but the logical content is the same.
+    Dedup is intentionally content-only (ignores ``at``). Entries missing
+    field/kind/agent_value are not expected in production; they all share the
+    (None, None, 'None') fingerprint and collapse to one.
+    """
+    return (entry.get("field"), entry.get("kind"), repr(entry.get("agent_value")))
+
+
 def append_rejected_edits(vision: dict, new_rejected: Iterable[dict]) -> dict:
     """Append rejected-edit entries to ``vision[REJECTED_EDITS_KEY]`` and
     cap the list at ``REJECTED_EDITS_MAX``. Returns the mutated vision dict
     so the caller can ``flag_modified`` once.
+
+    Entries that duplicate an existing (field, kind, agent_value) fingerprint
+    are dropped so a reconciliation replay cannot inflate the ledger.
     """
     new_list = list(new_rejected or [])
     if not new_list:
         return vision
     existing = list(vision.get(REJECTED_EDITS_KEY) or [])
-    existing.extend(new_list)
+    seen = {_rejected_edit_fingerprint(e) for e in existing}
+    for e in new_list:
+        fp = _rejected_edit_fingerprint(e)
+        if fp not in seen:
+            existing.append(e)
+            seen.add(fp)
     vision[REJECTED_EDITS_KEY] = existing[-REJECTED_EDITS_MAX:]
     return vision

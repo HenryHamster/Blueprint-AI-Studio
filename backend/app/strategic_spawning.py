@@ -19,7 +19,10 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app import strategic_cycle
-from app.direction_metrics import _compute_direction_quality_score
+from app.direction_metrics import (
+    _compute_direction_quality_score,
+    canonical_cost_per_merged_pr,
+)
 from app.direction_outcomes import (
     compute_direction_autonomy_state,
     declared_merged_count,
@@ -39,7 +42,10 @@ from app.models import (
     ProjectMessage,
     SystemMaturity,
 )
-from app.deploy_identity import project_matches_deploy_identity
+from app.deploy_identity import (
+    project_is_deploy_repo,
+    project_matches_deploy_identity,
+)
 from app.resource_envelope import resolve_project_require_local_runner
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.strategic_payload_compaction import (
@@ -2145,6 +2151,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "research_mode": {"priority": "critical"},
     "project_name": {"priority": "critical"},
     "base_branch": {"priority": "critical"},
+    # Non-behavioral schema key registration for serialized payload field (not a
+    # self-repo gate). Exempt from deploy-identity de-gating: registering the
+    # priority tier of the packed is_self_repo field, not reading project.is_self_repo.
     "is_self_repo": {"priority": "critical"},
     "enable_self_improvement": {"priority": "critical"},
     "model": {"priority": "critical"},
@@ -2752,7 +2761,7 @@ async def _build_recent_interventions(
     _TERMINAL = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
 
     def _window_counts(tasks: list[Task], since: datetime) -> dict[str, Any]:
-        """Count *terminal* tasks that reached their final state within the window.
+        """Count *terminal* root tasks that reached their final state within the window.
 
         Filtering by terminal-updated-in-window instead of created-in-window
         avoids the in-flight bias that would otherwise make short windows
@@ -2763,6 +2772,11 @@ async def _build_recent_interventions(
         biggest victims. "merged/finished" answers the operator question
         "of the work that landed or failed in this window, what fraction
         succeeded?" — the number they actually want to read.
+
+        Both numerator (merged) and denominator (finished) count only root tasks
+        (parent_task_id is None), excluding rollup children whose pr_merged status
+        reflects integration into a staging branch, not the integration branch itself.
+        This ensures the merge_rate reflects the actual integration-landing rate.
         """
         from app.time_utils import _to_naive_utc
 
@@ -2780,15 +2794,19 @@ async def _build_recent_interventions(
             updated_at = _to_naive_utc(t.updated_at) or created_at
             if not updated_at or (since_naive and updated_at < since_naive):
                 continue
+            # Count only root tasks (parent_task_id is None). Rollup children should
+            # not be counted in the denominator: their pr_merged=True means they landed
+            # on a staging branch, not the integration branch, so they are not actual
+            # integration-landing work. Both numerator and denominator must count the
+            # same population for a valid merge_rate calculation.
+            if t.parent_task_id is not None:
+                continue
             finished += 1
-            # Count only integration-landed merges: root tasks (parent_task_id is None)
-            # whose PR merged directly to the integration branch. Child tasks (rollup
-            # members) have pr_merged=True when their PR lands on the rollup staging
-            # branch — not on the integration branch — so they must not be counted here.
+            # Count only integration-landed merges: root tasks whose PR merged
+            # directly to the integration branch.
             if (
                 t.status == TaskStatus.COMPLETED
                 and (t.context or {}).get("pr_merged")
-                and t.parent_task_id is None
             ):
                 merged += 1
         rate = round(merged / finished, 3) if finished > 0 else None
@@ -3790,15 +3808,16 @@ async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
     """Return True if a repo_bootstrap task is still in-flight for this project,
     or if an automatic recovery attempt is scheduled but not yet due.
 
-    False for self-repo projects and for projects whose bootstrap has already
-    completed (``bootstrap_completed_at`` is set).  A terminal bootstrap
+    False for the deploy's own repo (``project_is_deploy_repo``) and for
+    projects whose bootstrap has already completed (``bootstrap_completed_at``
+    is set).  A terminal bootstrap
     (FAILED / COMPLETED / …) with no pending recovery also returns False so a
     permanently degraded bootstrap never deadlocks autonomous spawning.
     """
     from app.repo_bootstrap import _parse_recovery_at
 
     _build_cfg = project.build_config or {}
-    if _build_cfg.get("bootstrap_completed_at") or project.is_self_repo:
+    if _build_cfg.get("bootstrap_completed_at") or project_is_deploy_repo(project):
         return False
     pending = (
         await session.execute(
@@ -4843,15 +4862,23 @@ def _build_direction_stats(
         from app.routers.admin_analytics import ON_DEMAND_RATE
         from app.strategic_analysis import _entry_cost_usd
 
+        # Include evicted cycles folded into history_aggregate so the lifetime
+        # cost numerator is not truncated at the 10-cycle eviction window — the
+        # denominator (total_merged) already folds in the evicted aggregate, so
+        # a window-only numerator would understate cost for aged directions.
+        # Mirror strategic_analysis.summarize_direction_outcomes exactly.
+        try:
+            agg_cost = max(0.0, float(agg.get("total_estimated_cost_usd") or 0.0))
+        except (TypeError, ValueError):
+            agg_cost = 0.0
         estimated_cost_usd = round(
-            sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history), 2
+            sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history) + agg_cost, 2
         )
         if estimated_cost_usd > 0:
             stat_entry["estimated_cost_usd"] = estimated_cost_usd
-            if total_merged > 0:
-                stat_entry["cost_per_merged_pr"] = round(
-                    estimated_cost_usd / total_merged, 2
-                )
+            cpm = canonical_cost_per_merged_pr(estimated_cost_usd, total_merged)
+            if cpm is not None:
+                stat_entry["cost_per_merged_pr"] = cpm
         ctx = d.get("research_context")
         if ctx:
             stat_entry["research_context"] = ctx[:3000]
@@ -7302,7 +7329,13 @@ async def _spawn_strategic_review(
             ),
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
-            "is_self_repo": bool(project.is_self_repo),
+            # De-gated from the raw project.is_self_repo column to the deploy-repo
+            # predicate: the strategist's self-improvement framing (modify your own
+            # prompts/schemas/orchestration) keys off this field, so it must follow
+            # deploy identity like every other migrated backend gate. Falls back to
+            # is_self_repo verbatim on deployments with no stamped identity, so this
+            # cannot regress unstamped deployments or tests.
+            "is_self_repo": project_is_deploy_repo(project),
             # Machine-checkable g-generality retirement signal: set when a
             # create/fix/refactor task has merged on this external project for
             # the first time.  Absent (no key) for self-repo and projects with

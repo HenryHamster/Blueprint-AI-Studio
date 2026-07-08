@@ -21,6 +21,7 @@ vi.mock('../api', () => ({
     return new Response('{}', { status: 200 });
   }),
   API_BASE_URL: 'http://localhost',
+  MESSAGE_CONTENT_MAX: 20000,
   authHeaders: vi.fn(async () => ({})),
   authGet: vi.fn(async () => new Response('{}', { status: 200 })),
 }));

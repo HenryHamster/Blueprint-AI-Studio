@@ -2308,3 +2308,52 @@ def test_fall_open_reason_acceptance_test_could_not_run_key():
 
 def test_acceptance_test_not_run_is_degraded_reason():
     assert ci_resolution.is_degraded_unverified_reason("acceptance_test_not_run")
+
+
+# ---------------------------------------------------------------------------
+# re-poll idempotency guard — the orchestrator's no_ci_runtime_recorded sticky
+# marker must prevent record_no_ci_gate_runtime from appending a second entry
+# to recent_outcomes or incrementing unverified_reason_counts when a
+# still-EVALUATING task is re-polled before it reaches a terminal state.
+# ---------------------------------------------------------------------------
+
+
+def test_repoll_without_guard_inflates_counts():
+    """Calling the recorder TWICE without a guard doubles recent_outcomes and
+    the per-reason count — this confirms the bug the sticky marker fixes."""
+    project = _proj()
+    _record(project, verified=False, reason="undetected_runtime", when="2026-06-10T00:00:01")
+    _record(project, verified=False, reason="undetected_runtime", when="2026-06-10T00:00:02")
+    block = ci_resolution.merge_gate_runtime_block(project)
+    # Without a guard, a second poll appends a second entry — the bug.
+    assert len(block["recent_outcomes"]) == 2
+    assert block["unverified_reason_counts"]["undetected_runtime"] == 2
+
+
+def test_repoll_with_guard_records_exactly_once():
+    """The orchestrator's no_ci_runtime_recorded sticky marker prevents the
+    recorder from being called on the second poll of the same EVALUATING task,
+    keeping recent_outcomes and the per-reason counter at exactly 1 entry."""
+    project = _proj()
+    ci_loop: dict = {}
+
+    def _guarded_record(when):
+        if not ci_loop.get("no_ci_runtime_recorded"):
+            ci_resolution.record_no_ci_gate_runtime(
+                None,
+                project,
+                executed_real_tests=False,
+                unverified_reason="undetected_runtime",
+                when=when,
+            )
+            ci_loop["no_ci_runtime_recorded"] = True
+
+    # First poll — records normally.
+    _guarded_record("2026-06-10T00:00:01")
+    # Second poll — guard fires; recorder is NOT called again.
+    _guarded_record("2026-06-10T00:00:02")
+
+    block = ci_resolution.merge_gate_runtime_block(project)
+    assert len(block["recent_outcomes"]) == 1
+    assert block["recent_outcomes"][0]["at"] == "2026-06-10T00:00:01"
+    assert block["unverified_reason_counts"]["undetected_runtime"] == 1

@@ -216,6 +216,36 @@ runtime_config: Dict = {
     "metrics_integrity_sweep_window_days": int(
         os.getenv("METRICS_INTEGRITY_SWEEP_WINDOW_DAYS", "14")
     ),
+    # --- Message supersession lane (auto-resolve stale operator messages) ---
+    # When a release version reaches a terminal state (promoted/abandoned), the
+    # promotion/abandon path auto-resolves still-open, non-bug-class operator
+    # messages that were created strictly before the closing version's window
+    # (i.e. from a version at least min_versions_back back) AND older than
+    # min_age_days. Mode mirrors metrics_integrity_sweep_mode exactly:
+    #   off     — never supersede.
+    #   observe — measure the would-be resolutions + log, mutate nothing (default).
+    #   enforce — stamp the eligible messages resolved.
+    # Unresolved BUG_REPORT/BLOCKER messages are ALWAYS left open (a bug does not
+    # become fixed just because a version promoted).
+    "message_supersession_mode": os.getenv(
+        "MESSAGE_SUPERSESSION_MODE", "observe"
+    ).lower()
+    if os.getenv("MESSAGE_SUPERSESSION_MODE", "observe").lower()
+    in ("off", "observe", "enforce")
+    else "observe",
+    # A message must be at least this many days old to be superseded (safety margin).
+    "message_supersession_min_age_days": int(
+        os.getenv("MESSAGE_SUPERSESSION_MIN_AGE_DAYS", "14")
+    ),
+    # A message must belong to a version at least this many versions behind the
+    # current open version (2 => never touch the current or immediately-prior one).
+    "message_supersession_min_versions_back": int(
+        os.getenv("MESSAGE_SUPERSESSION_MIN_VERSIONS_BACK", "2")
+    ),
+    # Upper bound on messages resolved per version close (runaway-batch backstop).
+    "message_supersession_max_resolve": int(
+        os.getenv("MESSAGE_SUPERSESSION_MAX_RESOLVE", "500")
+    ),
     # --- Completion-debt pressure signal graduation gate ---
     # Operator-facing graduation knob for blending the qualification debt-pressure
     # signal into the promotion composite (release_qualifier._load_policy →
@@ -444,7 +474,8 @@ runtime_config: Dict = {
     # the whole group. Every task type listed here falls under the matching
     # category_routing block; unlisted types resolve via category_routing["_default"].
     "task_type_categories": {
-        "strategic": ["strategic_review", "design_doc_update", "research", "plan"],
+        "strategic": ["strategic_review", "design_doc_update"],
+        "initiative": ["research", "plan"],
         "build": ["create", "refactor", "migrate"],
         "review": ["review", "qa", "security_audit", "perf", "debug", "fix"],
         "ops": ["docs", "deps", "smoketest"],
@@ -455,23 +486,27 @@ runtime_config: Dict = {
     # concrete settings bag (including model).
     "category_routing": {
         "_default": {
-            "providers": ["zai", "anthropic", "openai", "gemini"],
+            "providers": ["deepseek", "anthropic", "openai", "gemini"],
             "effort": "medium",
         },
         "strategic": {
-            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "providers": ["zai", "anthropic", "deepseek", "openai", "gemini"],
             "effort": "max",
         },
+        "initiative": {
+            "providers": ["deepseek", "anthropic", "openai", "gemini"],
+            "effort": "medium",
+        },
         "build": {
-            "providers": ["zai", "anthropic", "openai", "gemini"],
+            "providers": ["deepseek", "anthropic", "openai", "gemini"],
             "effort": "medium",
         },
         "review": {
-            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "providers": ["anthropic", "deepseek", "openai", "gemini"],
             "effort": "high",
         },
         "ops": {
-            "providers": ["deepseek", "anthropic", "zai", "openai", "gemini"],
+            "providers": ["deepseek", "anthropic", "openai", "gemini"],
             "effort": "low",
         },
     },
@@ -540,7 +575,7 @@ runtime_config: Dict = {
             # prose — terse output saves tokens without losing debug signal.
             # review (high) gets medium so review comments can explain.
             # strategic (max) gets high because the prose *is* the deliverable
-            # (design docs, research, plans).
+            # (design docs and strategic reviews).
             "low": {
                 "model": "gpt-5.4-mini",
                 "reasoning_effort": "low",
@@ -1223,6 +1258,9 @@ _DORMANT_MODE_KNOBS = {
     "metrics_integrity_sweep_mode": (
         "Metrics-integrity sweep recomputing counters but not enrolling drift findings"
     ),
+    "message_supersession_mode": (
+        "Message supersession measuring stale-message backlog but not resolving them"
+    ),
     "autonomous_spawn_budget_mode": (
         "Autonomous spawn-budget mode observe-only pending dedicated rollout"
     ),
@@ -1417,11 +1455,31 @@ def _insert_provider_once(providers: list[Any], provider: str, index: int) -> No
     providers.insert(max(0, min(index, len(providers))), provider)
 
 
+def _remove_provider(providers: list[Any], provider: str) -> None:
+    providers[:] = [candidate for candidate in providers if candidate != provider]
+
+
+def _move_provider_once(providers: list[Any], provider: str, index: int) -> None:
+    _remove_provider(providers, provider)
+    providers.insert(max(0, min(index, len(providers))), provider)
+
+
 def _insert_provider_after(
     providers: list[Any], provider: str, after_provider: str
 ) -> None:
     if provider in providers:
         return
+    try:
+        index = providers.index(after_provider) + 1
+    except ValueError:
+        index = len(providers)
+    providers.insert(index, provider)
+
+
+def _move_provider_after(
+    providers: list[Any], provider: str, after_provider: str
+) -> None:
+    _remove_provider(providers, provider)
     try:
         index = providers.index(after_provider) + 1
     except ValueError:
@@ -1453,10 +1511,36 @@ def _ensure_route_defaults(
 def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
     """Add provider defaults introduced after the settings-bag migration.
 
-    This is intentionally additive. Existing provider order is preserved unless
-    a new provider is absent, so a future operator patch does not fight this
-    backfill on every DB->memory sync.
+    Explicit single-provider routes are preserved. Multi-provider broad routes
+    are normalized to keep high-volume work off GLM by default after upgrade.
     """
+    categories = config.setdefault("task_type_categories", {})
+    if isinstance(categories, dict):
+        default_categories = runtime_config.get("task_type_categories", {})
+        if isinstance(default_categories, dict):
+            for category, members in default_categories.items():
+                if isinstance(members, list):
+                    categories.setdefault(category, list(members))
+
+        strategic_members = categories.get("strategic")
+        if isinstance(strategic_members, list):
+            categories["strategic"] = [
+                member
+                for member in strategic_members
+                if member not in ("research", "plan")
+            ]
+
+        initiative_members = categories.setdefault("initiative", [])
+        if isinstance(initiative_members, list):
+            for task_type in ("research", "plan"):
+                present_elsewhere = any(
+                    isinstance(members, list) and task_type in members
+                    for members in categories.values()
+                    if members is not initiative_members
+                )
+                if not present_elsewhere and task_type not in initiative_members:
+                    initiative_members.append(task_type)
+
     tier_map = config.setdefault("provider_tier_model_map", {})
     if isinstance(tier_map, dict):
         for provider in ("zai", "deepseek"):
@@ -1486,20 +1570,25 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
 
     category_routing = config.setdefault("category_routing", {})
     if isinstance(category_routing, dict):
-        for category in ("_default", "strategic", "build", "review", "ops"):
+        for category in ("_default", "strategic", "initiative", "build", "review", "ops"):
             route = _ensure_route_defaults(category_routing, category)
             providers = route.get("providers")
             if not isinstance(providers, list):
                 continue
             if len(providers) <= 1:
                 continue
-            if category in ("_default", "build"):
-                _insert_provider_once(providers, "zai", 0)
+            if category == "strategic":
+                _move_provider_once(providers, "zai", 0)
+                _move_provider_after(providers, "deepseek", "anthropic")
+            elif category == "review":
+                _remove_provider(providers, "zai")
+                _move_provider_after(providers, "deepseek", "anthropic")
             elif category == "ops":
-                _insert_provider_once(providers, "deepseek", 0)
-                _insert_provider_after(providers, "zai", "anthropic")
-            elif category in ("strategic", "review"):
-                _insert_provider_after(providers, "zai", "anthropic")
+                _remove_provider(providers, "zai")
+                _move_provider_once(providers, "deepseek", 0)
+            else:
+                _remove_provider(providers, "zai")
+                _move_provider_once(providers, "deepseek", 0)
 
     if config.get("provider_selection_mode") not in (
         "balanced",
@@ -1568,7 +1657,7 @@ def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
         if "_default" not in cat_routing:
             default_providers = (
                 legacy_pref.get("_default") if isinstance(legacy_pref, dict) else None
-            ) or ["zai", "anthropic", "openai", "gemini"]
+            ) or ["deepseek", "anthropic", "openai", "gemini"]
             cat_routing["_default"] = {
                 "providers": list(default_providers),
                 "effort": default_effort,
@@ -1971,6 +2060,30 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                             _mi_val = int(config_json[_mi_int_key])
                             if _mi_val > 0:
                                 _set(_mi_int_key, _mi_val)
+                        except (TypeError, ValueError):
+                            pass
+                # Message supersession: mode + bounded numeric margins. Persisted
+                # so an operator enable/tune survives a Cloud Run restart and
+                # reaches the leader across instances (mirrors the metrics-integrity
+                # sweep knobs above).
+                if "message_supersession_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["message_supersession_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("message_supersession_mode", raw_mode)
+                for _ms_int_key in (
+                    "message_supersession_min_age_days",
+                    "message_supersession_min_versions_back",
+                    "message_supersession_max_resolve",
+                ):
+                    if _ms_int_key in config_json:
+                        try:
+                            _ms_val = int(config_json[_ms_int_key])
+                            if _ms_val > 0:
+                                _set(_ms_int_key, _ms_val)
                         except (TypeError, ValueError):
                             pass
                 # Resident strategic session (dead-man's-switch safety + resident

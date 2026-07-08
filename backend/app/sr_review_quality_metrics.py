@@ -137,11 +137,18 @@ def _compute_sr_skip_rate(terminal_tasks: List[Task]) -> "Dict[str, Any] | None"
     """Share of code-change tasks (create/fix/refactor/migrate) where the
     self-review JSON was missing or invalid. Detects the bash ./done
     fallback envelope. Returns None when sample size < 5.
+
+    Denominator is restricted to code-change tasks that actually reached the
+    self-review step (i.e. ``"_self_review_outcome" in task.context``). Tasks
+    that failed before self-review have no such key and are excluded so they do
+    not silently deflate the rate.
     """
     code_change_tasks: List[Task] = []
     for t in terminal_tasks:
         ttype = (t.first_payload or {}).get("type")
-        if ttype in _SR_CODE_CHANGE_TYPES:
+        if ttype in _SR_CODE_CHANGE_TYPES and "_self_review_outcome" in (
+            t.context or {}
+        ):
             code_change_tasks.append(t)
 
     if len(code_change_tasks) < 5:
@@ -188,11 +195,18 @@ def _compute_sr_disallowed_blind_spot_rate(
     """Share of code-change tasks where the agent emitted at least one disallowed
     blind-spot phrase (captured as ``_filtered_blind_spots_count > 0`` by
     ``filter_disallowed_blind_spots``). Returns None when sample size < 5.
+
+    Denominator is restricted to code-change tasks that actually reached the
+    self-review step (i.e. ``"_self_review_outcome" in task.context``). Tasks
+    that failed before self-review have no such key and are excluded so they do
+    not silently deflate the rate.
     """
     code_change_tasks: List[Task] = []
     for t in terminal_tasks:
         ttype = (t.first_payload or {}).get("type")
-        if ttype in _SR_CODE_CHANGE_TYPES:
+        if ttype in _SR_CODE_CHANGE_TYPES and "_self_review_outcome" in (
+            t.context or {}
+        ):
             code_change_tasks.append(t)
 
     if len(code_change_tasks) < 5:
@@ -251,12 +265,12 @@ def _compute_fresh_reviewer_effectiveness(
         for t in code_change_tasks
         if (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
     ]
+    # Baseline excludes clean-reviewed tasks (where reviewer pass ran but found nothing).
+    # Only include tasks where no reviewer pass ran at all.
     tasks_without_reviewer = [
         t
         for t in code_change_tasks
-        if not (t.context or {})
-        .get("_self_review_outcome", {})
-        .get("reviewer_findings")
+        if "_self_review_outcome" not in (t.context or {})
     ]
 
     def _fa_rate(tasks: List[Task]) -> "float | None":
@@ -499,7 +513,9 @@ def _compute_edges_considered_metrics(
         "tasks_with_reviewer_edges_count": n_with_reviewer,
         "tasks_with_reviewer_edges_rate": round(n_with_reviewer / sample_size, 3),
         "reviewer_caught_count": reviewer_caught,
-        "reviewer_caught_rate": round(reviewer_caught / sample_size, 3),
+        "reviewer_caught_rate": round(reviewer_caught / n_with_reviewer, 3)
+        if n_with_reviewer
+        else None,
     }
 
 
@@ -646,13 +662,16 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
         dismissals = sum(
             1 for t in review_tasks if (t.context or {}).get("review_dismissed")
         )
-        misses = sum(
-            1 for t in review_tasks if (t.context or {}).get("user_caught_issues")
-        )
         approvals = sum(
             1
             for t in review_tasks
             if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
+        )
+        misses = sum(
+            1
+            for t in review_tasks
+            if (t.context or {}).get("user_caught_issues")
+            and (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
         )
         review_accuracy = {
             "total_reviews": total,

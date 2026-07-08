@@ -5,7 +5,7 @@ import { WORKSPACE } from './index.js';
 import type { BuildConfig } from './index.js';
 import { isReadOnlyTaskType } from './taskCapabilities.js';
 import { parseBackendTimestamp } from './utils/time.js';
-import { agentTokenShellFn } from './token-file.js';
+import { agentTokenShellFn, jsonStrShellFn } from './token-file.js';
 
 // ── Re-exports from sub-modules (facade) ────────────────────────────────────
 // The bulky helpers have been split out into prompts/* modules so that small
@@ -308,8 +308,8 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
   }
 
   if (promotionTarget) {
-    const lts = promotionTarget;
-    hints['release_audit'] = `You are running on the LTS branch (${lts}) and reviewing the incoming diff against ${lts}'s standards. Run \`git diff <diff_range>\` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.`;
+    const target = promotionTarget;
+    hints['release_audit'] = `You are running on the promotion/integration branch (${target}) and reviewing the incoming diff against ${target}'s standards. Run \`git diff <diff_range>\` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.`;
   }
 
   return hints;
@@ -690,6 +690,7 @@ KEY="$2"
 VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
+${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
 ${retryPostShellFn()}
@@ -703,11 +704,16 @@ elif [ "$OP" = "set" ]; then
   # the entry. Absent (non-git workspace) => omitted => backend keeps it legacy.
   BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
   HEAD_SHA=$(git rev-parse --short HEAD 2>/dev/null || true)
-  jq -n --arg tid "$TASK" --arg k "$KEY" --arg v "$VALUE" --arg br "$BRANCH" --arg sha "$HEAD_SHA" \\
-    '{task_id: $tid, op: "set", key: $k, value: $v}
-       + (if $br == "" then {} else {branch: $br} end)
-       + (if $sha == "" then {} else {head_sha: $sha} end)' | \\
-    _post_with_retry "$API/api/agent/playbook" "playbook set"
+  PAYLOAD=$(printf '{"task_id":%s,"op":"set","key":%s,"value":%s' \\
+    "$(_json_str "$TASK")" "$(_json_str "$KEY")" "$(_json_str "$VALUE")")
+  if [ -n "$BRANCH" ]; then
+    PAYLOAD="\${PAYLOAD},\\"branch\\":$(_json_str "$BRANCH")"
+  fi
+  if [ -n "$HEAD_SHA" ]; then
+    PAYLOAD="\${PAYLOAD},\\"head_sha\\":$(_json_str "$HEAD_SHA")"
+  fi
+  PAYLOAD="\${PAYLOAD}}"
+  printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/playbook" "playbook set"
 elif [ "$OP" = "list" ]; then
   printf '{"task_id":"%s","op":"list"}' "$TASK" | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
@@ -742,6 +748,7 @@ export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKS
 OP="\${1:?Usage: messages send|resolve ...}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
+${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
 ${retryPostShellFn()}
@@ -755,17 +762,17 @@ if [ "$OP" = "send" ]; then
   fi
   [ -n "$CONTENT" ] || { echo "Error: send requires message content" >&2; exit 1; }
   IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
-  PAYLOAD=$(jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" --arg k "$IDEM_KEY" \\
-    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c, idempotency_key: $k}}') || {
+  PAYLOAD=$(printf '{"task_id":%s,"op":"create_message","data":{"type":%s,"content":%s,"idempotency_key":%s}}' \\
+    "$(_json_str "$TASK")" "$(_json_str "$MSG_TYPE")" "$(_json_str "$CONTENT")" "$(_json_str "$IDEM_KEY")") || {
     echo "[ERROR] send: failed to serialize message payload" >&2; exit 1
   }
   printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/strategic" "messages $OP"
 elif [ "$OP" = "resolve" ]; then
   MSG_ID="\${2:?resolve requires <message-id>}"
   RESOLUTION="\${3:-Addressed}"
-  jq -n --arg tid "$TASK" --arg mid "$MSG_ID" --arg r "$RESOLUTION" \\
-    '{task_id: $tid, op: "resolve_message", data: {message_id: $mid, resolution: $r}}' | \\
-    _post_with_retry "$API/api/agent/strategic" "messages $OP"
+  PAYLOAD=$(printf '{"task_id":%s,"op":"resolve_message","data":{"message_id":%s,"resolution":%s}}' \\
+    "$(_json_str "$TASK")" "$(_json_str "$MSG_ID")" "$(_json_str "$RESOLUTION")")
+  printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/strategic" "messages $OP"
 else
   echo "Unknown op: $OP. Use send or resolve." >&2; exit 1
 fi
@@ -1052,11 +1059,12 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
   non-zero on failure with the actual error tail; fix and re-run until
   green. If your changes don't touch admin-ui/, agent/, or backend/,
   \`./check\` returns PASS without running anything — that's expected
-  for pure-docs tasks. For \`admin-ui/\` changes this includes the
-  browser-mode \`npm run test:viewport\` gate, not the jsdom-only
-  \`npm run test:run\` suite.
+  for pure-docs tasks. For \`admin-ui/\` changes this includes both
+  the happy-dom unit suite via \`npx vitest run\` (equivalently
+  \`npm run test:run\`) on every invocation AND the browser-mode
+  \`npm run test:viewport\` gate (scoped to changed components).
 - \`./check test\` — same plus a **lightweight standalone backend test
-  pass** (3 invariant files, ~30s). This VM is 8 GB; the FULL Docker
+  pass** (~10 invariant/contract files, ~30s). This VM is 8 GB; the FULL Docker
   + Postgres pytest suite OOMs (exit 137) here. CI runs the full suite
   on the PR after \`./pr open\`, so this local gate is just a smoke
   check — file-size guardrails, security regs, pipeline invariants.

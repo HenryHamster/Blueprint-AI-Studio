@@ -267,6 +267,37 @@ describe('formatExecutionEvidenceForSrPrompt', () => {
   it('returns non-empty string unconditionally', () => {
     expect(formatExecutionEvidenceForSrPrompt().length).toBeGreaterThan(0);
   });
+
+  it('scopes test suite guidance to agent VM constraints: targeted/standalone backend tests', () => {
+    const result = formatExecutionEvidenceForSrPrompt();
+    expect(result).toContain('agent VMs');
+    expect(result).toContain('testing/test_<module>.py');
+    expect(result).toContain('--standalone');
+    expect(result).toContain('--no-postgres');
+  });
+
+  it('explicitly forbids running the full backend suite on agent VMs', () => {
+    const result = formatExecutionEvidenceForSrPrompt();
+    expect(result).toContain('NEVER the full backend suite');
+    expect(result).toContain('OOMs');
+    expect(result).toContain('CLAUDE.md');
+  });
+
+  it('specifies frontend test commands for agent VMs', () => {
+    const result = formatExecutionEvidenceForSrPrompt();
+    expect(result).toContain('npm run typecheck');
+  });
+
+  it('specifies agent/TypeScript test commands', () => {
+    const result = formatExecutionEvidenceForSrPrompt();
+    expect(result).toContain('npx tsc --noEmit');
+  });
+
+  it('includes full backend suite violation in FAIL rules', () => {
+    const result = formatExecutionEvidenceForSrPrompt();
+    expect(result).toContain('Running the full backend suite');
+    expect(result).toContain('violates CLAUDE.md');
+  });
 });
 
 describe('formatSrRecentMissExamplesForSrPrompt', () => {

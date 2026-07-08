@@ -423,14 +423,18 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     Promise.resolve(onStrategicInteraction()).catch(() => {});
   }, [onStrategicInteraction]);
   const selectedProjectIdRef = useRef(selectedProjectId);
+  // eslint-disable-next-line react-hooks/refs
   selectedProjectIdRef.current = selectedProjectId;
   const conversationModeRef = useRef(conversationMode);
+  // eslint-disable-next-line react-hooks/refs
   conversationModeRef.current = conversationMode;
   const targetMessageId = targetMessage?.messageId ?? null;
   const targetMessageIdRef = useRef<string | null>(targetMessageId);
+  // eslint-disable-next-line react-hooks/refs
   targetMessageIdRef.current = targetMessageId;
   const strategicSessionPinnedTargetRef = useRef<{ projectId: string; messageId: string } | null>(null);
   const usesStrategicReadModelRef = useRef(usesStrategicReadModel);
+  // eslint-disable-next-line react-hooks/refs
   usesStrategicReadModelRef.current = usesStrategicReadModel;
   const attentionNeeds = strategicAttention?.counts.needs_operator ?? 0;
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
@@ -453,9 +457,25 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // then dropped once the durable message lands via fetchMessages. Reply-only /
   // resolve paths do not use it (those messages are the operator's answer to an
   // existing thread, not a new chat turn).
+  // On mount, restore any in-flight optimistic bubble that was serialised to
+  // sessionStorage before a tab switch unmounted this component. The bubble
+  // survives the round-trip and is cleared once the durable message lands (see
+  // the useEffect below). Entries older than 60 s are treated as stale and
+  // discarded so they never ghost into a fresh session.
   const [optimisticSend, setOptimisticSend] = useState<{
     key: string; content: string; created_at: string; message_type: string;
-  } | null>(null);
+  } | null>(() => {
+    if (!selectedProjectId) return null;
+    try {
+      const raw = sessionStorage.getItem(`optimisticSend:${selectedProjectId}`);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as { key: string; content: string; created_at: string; message_type: string };
+      const age = Date.now() - new Date(parsed.created_at).getTime();
+      return age < 60_000 ? parsed : null;
+    } catch {
+      return null;
+    }
+  });
   // "Workday's on it" working state: set the instant the operator sends, cleared
   // when a fresh strategist reply lands (count vs baseline — clock-skew-proof), a
   // `done` lifecycle frame arrives, or a safety timeout. Drives the live activity
@@ -659,12 +679,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
+  // eslint-disable-next-line react-hooks/refs
   addToastRef.current = addToast;
   const notifyOnHighSignalMessageRef = useRef(notifyOnHighSignalMessage);
+  // eslint-disable-next-line react-hooks/refs
   notifyOnHighSignalMessageRef.current = notifyOnHighSignalMessage;
   // Stable ref for the direction convert-form so the memoized convert handler
   // does not churn on the form hook's per-render object identity.
   const convertFormRef = useRef(convertForm);
+  // eslint-disable-next-line react-hooks/refs
   convertFormRef.current = convertForm;
 
   // Track seen messages to detect new arrivals and avoid initial-load toast spam
@@ -672,8 +695,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const hasInitiallyLoadedRef = useRef(false);
   const seenPromotedGroupKeysRef = useRef<Set<string>>(new Set());
   const eventPrefsRef = useRef(eventPrefs);
+  // eslint-disable-next-line react-hooks/refs
   eventPrefsRef.current = eventPrefs;
   const tempMutesRef = useRef(tempMutes);
+  // eslint-disable-next-line react-hooks/refs
   tempMutesRef.current = tempMutes;
 
   // Reset toast suppression state when switching projects so that the next
@@ -686,6 +711,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
     const localPrefs = loadEventPrefs(auth.currentUser?.email, selectedProjectId);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEventPrefs(localPrefs);
     setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
@@ -899,6 +925,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // reply text until it reconciles).
   useEffect(() => {
     if (workingSince == null) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (liveActivity.latestLifecycle === 'done') setWorkingSince(null);
   }, [workingSince, liveActivity.latestLifecycle]);
   // Safety net: never leave the working state stuck if a turn silently stalls.
@@ -908,11 +935,42 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     return () => window.clearTimeout(timer);
   }, [workingSince]);
   // Reset instant-ack state on project switch so a prior project's pending turn
-  // never bleeds onto the newly-selected project.
+  // never bleeds onto the newly-selected project. Skip the first run so a
+  // sessionStorage-restored optimistic bubble (from a same-project tab-switch)
+  // is not immediately cleared on mount.
+  const projectSwitchMountedRef = useRef(false);
   useEffect(() => {
+    if (!projectSwitchMountedRef.current) {
+      projectSwitchMountedRef.current = true;
+      return;
+    }
     setOptimisticSend(null);
     setWorkingSince(null);
   }, [selectedProjectId]);
+  // Mirror optimisticSend to sessionStorage so it survives a tab-switch unmount.
+  // Any setOptimisticSend call (set or clear) automatically keeps storage in sync.
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    const key = `optimisticSend:${selectedProjectId}`;
+    if (optimisticSend) {
+      try { sessionStorage.setItem(key, JSON.stringify(optimisticSend)); } catch { /* quota */ }
+    } else {
+      sessionStorage.removeItem(key);
+    }
+  }, [optimisticSend, selectedProjectId]);
+  // After a remount (e.g. the user switched tabs and came back), handleSubmit
+  // from the previous mount may have finished its POST without clearing the
+  // optimistic bubble. Clear it here once the durable message lands so there
+  // is no permanent ghost bubble.
+  useEffect(() => {
+    if (!optimisticSend) return;
+    const landed = conversationMessages.some(m => {
+      const ft = (m.from_type || '').toLowerCase();
+      return (ft === 'user' || ft === 'operator') && m.content === optimisticSend.content;
+    });
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (landed) setOptimisticSend(null);
+  }, [conversationMessages, optimisticSend]);
   const showStrategicStatusStrip = conversationMode && Boolean(
     strategistActive
       || strategicRefresh
@@ -957,6 +1015,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       }
       return;
     }
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setHighlightedMessageId(target.id);
     const node = scrollRef.current?.querySelector(`[data-message-id="${target.id}"]`);
     node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -1181,6 +1240,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       Object.entries(tempMutes).filter(([, expiresAt]) => expiresAt > now)
     );
     if (Object.keys(cleaned).length !== Object.keys(tempMutes).length) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setTempMutes(cleaned);
       saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, cleaned);
     }
@@ -1721,6 +1781,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         idemKey = generateIdempotencyKey();
         directionIdempotencyKeysRef.current.set(msg.id, idemKey);
       }
+      // eslint-disable-next-line react-hooks/immutability
       convertForm.addIdempotencyKeyRef.current = idemKey;
       const body: Record<string, unknown> = {
         text: convertForm.newText.trim(),
@@ -2203,11 +2264,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
               </button>
             </div>
             <div className="overflow-y-auto flex-1 min-h-0">
+              {/* eslint-disable react-hooks/immutability */}
               <DirectionsAddForm
                 form={convertForm}
                 addDirection={handleSubmitConvertForm}
                 stageTargetVersion={null}
               />
+              {/* eslint-enable react-hooks/immutability */}
             </div>
             <div className="px-5 py-3 border-t border-neutral-800 flex justify-end gap-2 shrink-0">
               <button

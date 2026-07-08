@@ -123,6 +123,7 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 ACCEPTANCE_AGGREGATE_BUCKETS: tuple[str, ...] = (
     "proven",
     "satisfied_unproven",
+    "inferred_test_cochange",
     "declared_unsatisfied",
     "undeclared",
     "merged_unverified_degraded",
@@ -170,6 +171,29 @@ def _changed_files(task: Task) -> list[str]:
     return [p for p in raw if isinstance(p, str) and p.strip()]
 
 
+def stamp_changed_files_signal(paths: list[str]) -> dict[str, Any]:
+    """Non-lossy acceptance signal for a PR's changed-file paths.
+
+    ``_pr_changed_files`` is truncated to 50 entries when stamped onto task
+    context, but the acceptance classifier and the ``named_test`` gate treat that
+    list as complete. A >50-file PR could drop every test path (or the declared
+    test file) beyond index 50 and be silently misclassified — flipping
+    ``inferred_test_cochange`` to ``undeclared`` or a would-be proof to a merge
+    that fails closed. Compute the acceptance-relevant summary over the FULL list
+    here (whether any test path and any production path shipped, and whether the
+    stored list was truncated) so downstream classification is truncation-proof.
+    """
+    str_paths = [p for p in paths if isinstance(p, str) and p.strip()]
+    signal: dict[str, Any] = {
+        "_pr_changed_files": str_paths[:50],
+        "_pr_changed_files_has_test": any(_is_test_path(p) for p in str_paths),
+        "_pr_changed_files_has_prod": any(not _is_test_path(p) for p in str_paths),
+    }
+    if len(str_paths) > 50:
+        signal["_pr_changed_files_truncated"] = True
+    return signal
+
+
 def _is_test_path(path: str) -> bool:
     """Whether ``path`` names a test file (under a tests/testing dir or by name)."""
     return _looks_like_test_file(path)
@@ -195,24 +219,27 @@ def _paths_match(changed: str, declared: str) -> bool:
 
 
 def _merge_was_test_verified(task: Task) -> bool:
-    """Whether the merge was gated by a REAL test verdict (no fall-open).
+    """Whether the merge was gated by a REAL test verdict (fail-closed).
 
     The no-CI merge gate stamps ``review_loop["unverified_merge_reason"]`` when
-    it legitimately "falls open" and merges WITHOUT running real tests. Absence
-    of that reason means a real CI / test verdict gated the merge — i.e. a
-    ``named_test`` that ran green did so under genuine verification. Mirrors the
-    ``"verified"`` arm of :func:`app.landed_signal.merge_verification_status`
-    without requiring the task to already be a terminal merged completion.
+    it legitimately "falls open" and merges WITHOUT running real tests. Presence
+    of that reason (or an absent/malformed review_loop) means the merge was NOT
+    test-verified — returns False. Only returns True when review_loop is a dict
+    AND ``unverified_merge_reason`` is absent or empty, meaning a real CI / test
+    verdict gated the merge.
     """
     review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
     if not isinstance(review_loop, dict):
-        return True
+        return False
     reason = review_loop.get(UNVERIFIED_MERGE_REASON_KEY)
     return not (isinstance(reason, str) and reason)
 
 
 def _evaluate_named_test(
-    evidence: AcceptanceEvidence, changed: list[str], verified: bool
+    evidence: AcceptanceEvidence,
+    changed: list[str],
+    verified: bool,
+    truncated: bool = False,
 ) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``named_test`` acceptance declaration.
 
@@ -224,10 +251,27 @@ def _evaluate_named_test(
     the changed seam, and an always-true assertion added in isolation is exactly
     that shape. Trivial / placeholder test references are already rejected
     fail-closed at declaration time by ``AcceptanceEvidence`` validation.
+
+    ``truncated`` marks that the changed-file list was capped (a >50-file PR): the
+    declared test may have shipped beyond the truncation point, so its absence
+    from ``changed`` is indeterminate rather than proof it was never added.
+    Recording ``satisfied=False`` there would penalize a large PR for a data
+    artifact and block its merge from crediting as success, so instead the merge
+    is credited soft (``satisfied=True, proven=False``) — the specific test could
+    not be machine-verified from the truncated input.
     """
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
     if not test_present:
+        if truncated:
+            return AcceptanceGateVerdict(
+                True,
+                True,
+                evidence.kind,
+                f"declared named_test {declared_path!r} could not be confirmed "
+                "among the PR's changed files because the changed-file list was "
+                "truncated (>50 files) — crediting soft without machine proof",
+            )
         return AcceptanceGateVerdict(
             True,
             False,
@@ -399,9 +443,10 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
 
     changed = _changed_files(task)
     verified = _merge_was_test_verified(task)
+    truncated = bool((task.context or {}).get("_pr_changed_files_truncated"))
 
     if evidence.kind == "named_test":
-        return _evaluate_named_test(evidence, changed, verified)
+        return _evaluate_named_test(evidence, changed, verified, truncated)
 
     if evidence.kind == "downstream_artifact":
         return _evaluate_downstream_artifact(evidence, changed)
@@ -535,6 +580,35 @@ def classify_merged_acceptance_context(context: Mapping[str, Any] | None) -> str
         return "merged_unverified_degraded"
     recorded = (context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
     if not isinstance(recorded, dict):
+        # No explicit declaration. Infer verified test co-change from the signals
+        # the merge already carries: a CI-VERIFIED merge (no fall-open reason)
+        # whose PR changed at least one test file AND at least one non-test
+        # production file is stronger evidence than a bare undeclared merge — CI
+        # genuinely gated the change and tests shipped alongside it. This mirrors
+        # the named_test gate's (2)+(3) conditions (verified merge + a production
+        # seam for the test to exercise) minus the declaration linking the test
+        # to the claim, so it is deliberately a distinct, weaker bucket than
+        # satisfied_unproven. A benign/degraded fall-open (CI did not actually
+        # run) does NOT qualify — test presence is moot without verification.
+        if _context_merge_verification_status(context) == "verified":
+            ctx = context or {}
+            changed = ctx.get("_pr_changed_files")
+            if isinstance(changed, list):
+                # Prefer the non-lossy full-list summary (stamped by
+                # stamp_changed_files_signal) so a >50-file PR whose test or
+                # production paths fall beyond the truncation point is not
+                # silently demoted to "undeclared". Legacy rows lack the summary
+                # and fall back to scanning the (possibly truncated) list.
+                has_test = ctx.get("_pr_changed_files_has_test")
+                has_prod = ctx.get("_pr_changed_files_has_prod")
+                if not isinstance(has_test, bool) or not isinstance(has_prod, bool):
+                    str_paths = [
+                        p for p in changed if isinstance(p, str) and p.strip()
+                    ]
+                    has_test = any(_is_test_path(p) for p in str_paths)
+                    has_prod = any(not _is_test_path(p) for p in str_paths)
+                if has_test and has_prod:
+                    return "inferred_test_cochange"
         return "undeclared"
     if acceptance_blocks_success(recorded):
         return "declared_unsatisfied"
@@ -545,18 +619,55 @@ def classify_merged_acceptance_context(context: Mapping[str, Any] | None) -> str
     return "malformed"
 
 
+# The three mutually-exclusive reasons an already-``undeclared`` merge stayed
+# undeclared, partitioning the ``undeclared`` bucket for operator-visible audit.
+_UNDECLARED_REASON_KEYS: tuple[str, ...] = (
+    "not_ci_verified",
+    "no_changed_files_context",
+    "no_test_prod_cochange",
+)
+
+
+def classify_undeclared_reason(context: Mapping[str, Any] | None) -> str:
+    """Sub-classify an ``undeclared`` merge context into WHY it stayed undeclared.
+
+    Precondition: ``classify_merged_acceptance_context(context) == "undeclared"``.
+    The three reasons mirror the undeclared branch of
+    :func:`classify_merged_acceptance_context` EXACTLY, so the split partitions
+    the undeclared bucket perfectly:
+
+      * ``not_ci_verified`` — the merge was not CI-verified (benign fall-open),
+        so test presence is moot and co-change can never be inferred.
+      * ``no_changed_files_context`` — CI-verified, but no ``_pr_changed_files``
+        list was recorded, so co-change cannot be inferred from the context.
+      * ``no_test_prod_cochange`` — CI-verified with a changed-files list, but it
+        did not co-change BOTH a test file and a non-test production file.
+
+    Pure and read-only; never raises. On a context that is NOT actually
+    undeclared the return value is meaningless (callers must gate on the bucket
+    first), but the function still returns one of the three keys deterministically.
+    """
+    if _context_merge_verification_status(context) != "verified":
+        return "not_ci_verified"
+    changed = (context or {}).get("_pr_changed_files")
+    if not isinstance(changed, list):
+        return "no_changed_files_context"
+    return "no_test_prod_cochange"
+
+
 def acceptance_counts_as_verified_context(
     context: Mapping[str, Any] | None,
 ) -> bool:
     """Whether a landed task context still counts as verified merged work.
 
-    Verified merges include the strict proven, soft satisfied-unproven, and
-    undeclared buckets. Degraded, explicitly unsatisfied, and malformed rows do
-    not count.
+    Verified merges include the strict proven, soft satisfied-unproven,
+    inferred test-cochange, and undeclared buckets. Degraded, explicitly
+    unsatisfied, and malformed rows do not count.
     """
     return classify_merged_acceptance_context(context) in {
         "proven",
         "satisfied_unproven",
+        "inferred_test_cochange",
         "undeclared",
     }
 
@@ -785,6 +896,9 @@ def classify_merged_acceptance(task: Task) -> str:
       * ``proven`` — non-degraded merge with strict machine-checked proof;
       * ``satisfied_unproven`` — non-degraded merge with soft satisfied
         declared acceptance;
+      * ``inferred_test_cochange`` — non-degraded, CI-verified merge with no
+        declaration whose PR co-changed a test file and a non-test production
+        file (inferred evidence, weaker than a declared satisfied acceptance);
       * ``declared_unsatisfied`` — non-degraded merge with declared evidence
         that failed;
       * ``undeclared`` — non-degraded merge with no recorded declaration;
@@ -820,3 +934,93 @@ def summarize_version_acceptance_aggregate(
         round(satisfied / aggregate["total"], 3) if aggregate["total"] > 0 else None
     )
     return aggregate
+
+
+# ---------------------------------------------------------------------------
+# Release-qualifier acceptance_window sub_scores invariant guard
+# ---------------------------------------------------------------------------
+
+#: The five keys emitted by ``_compute_acceptance_window_aggregate`` and merged
+#: into ``last_qualification["sub_scores"]``.  The helper is fail-safe: it
+#: returns ``[]`` when NONE of these keys are present (legacy verdicts).
+_ACCEPTANCE_WINDOW_KEYS: frozenset[str] = frozenset(
+    {
+        "acceptance_window_total",
+        "acceptance_window_verified",
+        "acceptance_window_fraction",
+        "acceptance_window_write_total",
+        "acceptance_window_total_all_merges",
+    }
+)
+
+# The two keys introduced by the write-task-population fix.  Their absence means
+# the verdict was written by pre-fix code (3-key schema) and should be skipped by
+# invariant checks that only apply to the new schema.
+_ACCEPTANCE_WINDOW_POPULATION_KEYS: frozenset[str] = frozenset(
+    {"acceptance_window_write_total", "acceptance_window_total_all_merges"}
+)
+
+
+def acceptance_window_sub_scores_violations(sub_scores: dict) -> list[str]:
+    """Return invariants VIOLATED by the ``acceptance_window_*`` fields in ``sub_scores``.
+
+    Empty list ⇒ every guarantee holds (or the fields are absent — legacy-safe).
+    Pure and read-only: never mutates, never raises. Fail-safe over legacy
+    verdicts that predate the acceptance-window keys.
+
+    Invariants checked (matching the population contract in
+    ``_compute_acceptance_window_aggregate``):
+      * ``verified >= 0``
+      * ``write_total >= 0``
+      * ``verified <= write_total``
+      * ``write_total <= total_all_merges``
+      * ``fraction is None iff write_total == 0, else fraction == verified / write_total``
+    """
+    # Skip when the new population keys are absent — this covers both the zero-key
+    # case (no acceptance_window fields at all) and the pre-fix 3-key schema
+    # (acceptance_window_total/verified/fraction without write_total/total_all_merges).
+    # Checking for the new keys rather than any of the 5 prevents false violations
+    # on healthy legacy verdicts where write_total would default to 0.
+    if not any(k in sub_scores for k in _ACCEPTANCE_WINDOW_POPULATION_KEYS):
+        return []
+
+    violations: list[str] = []
+
+    verified: int = int(sub_scores.get("acceptance_window_verified") or 0)
+    write_total: int = int(sub_scores.get("acceptance_window_write_total") or 0)
+    total_all: int = int(sub_scores.get("acceptance_window_total_all_merges") or 0)
+    fraction = sub_scores.get("acceptance_window_fraction")
+
+    if verified < 0:
+        violations.append(f"acceptance_window_verified ({verified}) is negative")
+    if write_total < 0:
+        violations.append(f"acceptance_window_write_total ({write_total}) is negative")
+    if verified > write_total:
+        violations.append(
+            f"acceptance_window_verified ({verified}) exceeds "
+            f"acceptance_window_write_total ({write_total})"
+        )
+    if write_total > total_all:
+        violations.append(
+            f"acceptance_window_write_total ({write_total}) exceeds "
+            f"acceptance_window_total_all_merges ({total_all})"
+        )
+    if write_total == 0:
+        if fraction is not None:
+            violations.append(
+                f"acceptance_window_fraction ({fraction}) is not None "
+                "with zero write_total (expected None)"
+            )
+    else:
+        expected = verified / write_total
+        if fraction is None:
+            violations.append(
+                f"acceptance_window_fraction is None but write_total ({write_total}) > 0"
+            )
+        elif fraction != expected:
+            violations.append(
+                f"acceptance_window_fraction ({fraction}) != "
+                f"verified/write_total ({verified}/{write_total} = {expected})"
+            )
+
+    return violations

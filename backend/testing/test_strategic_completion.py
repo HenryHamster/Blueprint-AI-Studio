@@ -65,6 +65,7 @@ from app.strategic_completion import (
     _compute_model_gc_telemetry,
     record_retired_direction_memory,
     _check_gap_respawn_block,
+    _merge_rejected_proposals,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -1470,6 +1471,27 @@ class TestRecordRetiredDirectionMemory:
         assert entry["reason"] == "strategic_superseded"
         assert entry["outcome"] == "superseded by d-successor"
 
+    def test_recently_retired_directions_deduped_by_id(self):
+        """A retry/replay calling record_retired_direction_memory with the same
+        direction ID must not produce a duplicate entry — the existing entry is
+        replaced by the latest one so cap slots aren't wasted on the same direction."""
+        vision: dict = {}
+        d = {"id": "d-dup", "text": "database optimization cache", "research_history": [{"prs_merged": 1}]}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        # Second call for the same direction (simulating a retry/replay)
+        record_retired_direction_memory(vision, d, reason="auto_completed")
+        entries = vision["_recently_retired_directions"]
+        assert len(entries) == 1, f"Expected 1 entry after dedup, got {len(entries)}"
+        # The latest call wins; its reason should be persisted
+        assert entries[0]["id"] == "d-dup"
+        assert entries[0]["reason"] == "auto_completed"
+
+        # Distinct IDs must each get their own slot
+        d2 = {"id": "d-other", "text": "unrelated other direction"}
+        record_retired_direction_memory(vision, d2, reason="strategic_retire")
+        assert len(vision["_recently_retired_directions"]) == 2
+
+
 
 class TestCheckGapRespawnBlock:
     def _make_entry(self, *, direction_id="d-abc", text_tokens=None, gap_id=None, days_ago=1):
@@ -2427,6 +2449,101 @@ class TestCheckDirectionStarvation:
         # Alert fired to prompt manual intervention
         alert_mock.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_starvation_and_bootstrap_counters_idempotent_on_replay(
+        self, strat_fail_db, mocker
+    ):
+        """Replay of the same task must not double-count either counter.
+
+        Starvation: calling _check_direction_starvation twice with the same
+        task id should increment _direction_starvation_count exactly once.
+
+        Bootstrap degraded: calling _handle_repo_bootstrap_completion twice
+        with the same task (no overview → degraded path) should record
+        bootstrap_recovery_attempts == 1, not 2.
+        """
+        from contextlib import asynccontextmanager
+        from app.task_completion import _handle_repo_bootstrap_completion
+
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
+
+        # ── Starvation counter ──────────────────────────────────────────────
+        project = Project(
+            name="StarveP",
+            user_id="u1",
+            vision={},
+            directions=[_active_dir(id="1", category="structural")],  # <3 active → gap
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        task_mock = MagicMock()
+        task_mock.id = uuid.uuid4()
+
+        # First run: counter should go from 0 → 1
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db, task=task_mock
+        )
+        assert project.vision.get("_direction_starvation_count") == 1
+
+        # Replay with same task id: counter must stay at 1
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db, task=task_mock
+        )
+        assert project.vision.get("_direction_starvation_count") == 1, (
+            "Replay with same task id must not re-increment _direction_starvation_count"
+        )
+
+        # ── Bootstrap recovery counter ──────────────────────────────────────
+        bs_project = Project(
+            name="BootstrapP",
+            user_id="u1",
+            build_config={},
+            design_doc={},
+        )
+        strat_fail_db.add(bs_project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(bs_project)
+
+        bs_task = Task(
+            project_id=bs_project.id,
+            payloads=[{"type": "repo_bootstrap"}],
+            context={},  # No repo_overview → degraded path
+        )
+        strat_fail_db.add(bs_task)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(bs_task)
+
+        # Mock project_lock to yield bs_project directly
+        @asynccontextmanager
+        async def _mock_project_lock(session, project_id, **kwargs):
+            yield bs_project
+
+        mocker.patch("app.task_completion.project_lock", side_effect=_mock_project_lock)
+        mocker.patch(
+            "app.task_completion.with_design_doc_locked",
+            new=AsyncMock(),
+        )
+        mocker.patch("app.task_completion._stamp_command_memory_status")
+        mocker.patch(
+            "app.task_completion._seed_bootstrap_playbook_commands", new=AsyncMock()
+        )
+        mocker.patch(
+            "app.task_completion._upsert_domain_knowledge_document", new=AsyncMock()
+        )
+
+        # First run: degraded path records attempts == 1
+        await _handle_repo_bootstrap_completion(bs_task, logs="", session=strat_fail_db)
+        bc = bs_project.build_config or {}
+        assert bc.get("bootstrap_recovery_attempts") == 1
+
+        # Replay with same task: must stay at 1
+        await _handle_repo_bootstrap_completion(bs_task, logs="", session=strat_fail_db)
+        bc = bs_project.build_config or {}
+        assert bc.get("bootstrap_recovery_attempts") == 1, (
+            "Replay of the same bootstrap task must not re-increment bootstrap_recovery_attempts"
+        )
+
 
 # ── Rationale persistence & retrieval ────────────────────────────────────────
 
@@ -2893,6 +3010,169 @@ async def test_strategic_completion_persists_recommended_mode_on_create(
     assert new_dirs[0].get("recommended_mode") == "audit", (
         f"Expected recommended_mode='audit' on created direction; "
         f"got {new_dirs[0].get('recommended_mode')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_direction_create_idempotent_on_replay(db_session, mocker):
+    """Calling _handle_strategic_completion twice with the same direction_ops
+    (simulating a post-commit replay) must produce exactly ONE direction, not two.
+
+    The fallback path previously minted a fresh random UUID on every run so the
+    id-based dedup guard could never fire. The fix makes the ID deterministic
+    (task_id + text hash), so the second call finds the already-committed direction
+    and skips creation.
+    """
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Improve test coverage across modules",
+                    "priority": "medium",
+                    "rationale": "coverage gaps",
+                    "success_evidence": "Coverage reaches 80% on all modules",
+                    "retirement_condition": "Coverage stable for 2 cycles",
+                },
+            ],
+        }
+    )
+
+    # First call — creates the direction
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+    dirs_after_first = [
+        d for d in (project.directions or [])
+        if d.get("text") == "Improve test coverage across modules"
+    ]
+    assert len(dirs_after_first) == 1, (
+        f"Expected 1 direction after first call, got {len(dirs_after_first)}"
+    )
+    first_id = dirs_after_first[0]["id"]
+
+    # Second call — simulates a post-commit replay; must NOT create a duplicate
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+    dirs_after_replay = [
+        d for d in (project.directions or [])
+        if d.get("text") == "Improve test coverage across modules"
+    ]
+    assert len(dirs_after_replay) == 1, (
+        f"Replay created a duplicate: expected 1 direction, got {len(dirs_after_replay)}"
+    )
+    assert dirs_after_replay[0]["id"] == first_id, (
+        f"Replay changed the direction id: {first_id!r} -> {dirs_after_replay[0]['id']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_stage_direction_note_idempotent_on_replay(db_session, mocker):
+    """Replaying stage_direction must NOT append the staged note twice.
+
+    The stage_direction branch has no "already staged, skip" pre-guard — it
+    re-enters on a post-commit replay and re-sets status/staged_for_version.
+    The only thing preventing a duplicate note is the inline
+    ``not any(n.get("text") == note_text ...)`` dedup guard, so this pins that
+    idempotency contract directly.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+    # stage_direction requires an open version; make one deterministically.
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new_callable=AsyncMock,
+        return_value=SimpleNamespace(version_number=7),
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": "d-stage-1", "text": "Stage me", "status": "proposed", "notes": []}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "stage",
+                    "direction_id": "d-stage-1",
+                    "rationale": "sequence after current version",
+                },
+            ],
+        }
+    )
+
+    expected_note = "Staged to begin after v7 promotes: sequence after current version"
+
+    # First call — stages the direction and appends the note.
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == "d-stage-1")
+    assert target["status"] == "staged"
+    staged_notes = [n for n in target.get("notes", []) if n.get("text") == expected_note]
+    assert len(staged_notes) == 1, f"Expected 1 staged note, got {len(staged_notes)}"
+
+    # Second call — simulates a post-commit replay; must NOT duplicate the note.
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == "d-stage-1")
+    staged_notes = [n for n in target.get("notes", []) if n.get("text") == expected_note]
+    assert len(staged_notes) == 1, (
+        f"Replay duplicated the staged note: expected 1, got {len(staged_notes)}"
     )
 
 
@@ -8125,6 +8405,88 @@ async def test_api_path_create_direction_persists_gap_id(client, db_session, moc
 
 
 @pytest.mark.asyncio
+async def test_api_path_create_direction_persists_criterion_keys(client, db_session):
+    """HTTP create_direction must persist criterion_keys onto the JSON snapshot
+    and normalized Direction row; downstream merge evidence reads the row."""
+    from app import strategic_cycle
+
+    project = Project(
+        name="CRITERIONLINK-CREATE-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-create-direction-map",
+        text="Mapped create_direction criterion",
+        created_by="test",
+    )
+    db_session.add(criterion)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-criterion-create",
+        payloads=[{"type": "strategic_review"}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-criterion-create", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Own the mapped create criterion",
+                "priority": "high",
+                "criterion_keys": [criterion.criterion_key],
+                "rationale": "link acceptance coverage",
+                "success_evidence": "Criterion evidence is recorded",
+                "retirement_condition": "Criterion is covered",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["criterion_keys"] == [criterion.criterion_key]
+    new_id = body["direction_id"]
+
+    await db_session.refresh(project)
+    created = next(d for d in project.directions if d.get("id") == new_id)
+    assert created.get("criterion_keys") == [criterion.criterion_key]
+
+    direction_row = (
+        await db_session.execute(
+            select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == new_id,
+            )
+        )
+    ).scalar_one()
+    assert direction_row.criterion_keys == [criterion.criterion_key]
+
+
+@pytest.mark.asyncio
 async def test_api_path_update_direction_sets_and_clears_gap_id(
     client, db_session, mocker
 ):
@@ -8209,6 +8571,117 @@ async def test_api_path_update_direction_sets_and_clears_gap_id(
     await db_session.refresh(project)
     d = next(d for d in project.directions if d.get("id") == "d-link")
     assert "gap_id" not in d
+
+
+@pytest.mark.asyncio
+async def test_api_path_update_direction_persists_and_clears_criterion_keys(
+    client, db_session
+):
+    """HTTP update_direction changes.criterion_keys must update both storage
+    surfaces and de-duplicate keys while preserving order."""
+    from app import strategic_cycle
+
+    direction_dict = {
+        "id": "d-criterion-update",
+        "text": "Existing mapped direction",
+        "status": "active",
+        "priority": "medium",
+        "notes": [],
+        "research_history": [],
+    }
+    project = Project(
+        name="CRITERIONLINK-UPDATE-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[dict(direction_dict)],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-update-direction-map",
+        text="Mapped update_direction criterion",
+        created_by="test",
+    )
+    db_session.add(criterion)
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-criterion-update",
+        data=dict(direction_dict),
+        status="active",
+    )
+    db_session.add(direction)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-criterion-update",
+        payloads=[{"type": "strategic_review"}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-criterion-update", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-criterion-update",
+                "changes": {
+                    "criterion_keys": [
+                        criterion.criterion_key,
+                        criterion.criterion_key,
+                    ],
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["criterion_keys"] == [criterion.criterion_key]
+
+    await db_session.refresh(project)
+    d = next(d for d in project.directions if d.get("id") == "d-criterion-update")
+    assert d.get("criterion_keys") == [criterion.criterion_key]
+    await db_session.refresh(direction)
+    assert direction.criterion_keys == [criterion.criterion_key]
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-criterion-update",
+                "changes": {"criterion_keys": []},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["criterion_keys"] == []
+
+    await db_session.refresh(project)
+    d = next(d for d in project.directions if d.get("id") == "d-criterion-update")
+    assert d.get("criterion_keys") == []
+    await db_session.refresh(direction)
+    assert direction.criterion_keys == []
 
 
 @pytest.mark.asyncio
@@ -19025,3 +19498,179 @@ async def test_fallback_directions_write_preserves_concurrent_add(db_session, mo
     assert retired is not None and retired["status"] == "retired", (
         f"d-retire must be retired after fallback retire_direction; got {retired}"
     )
+
+
+@pytest.mark.asyncio
+async def test_retire_direction_note_not_duplicated_on_reprocess(db_session, mocker):
+    """Fallback retire_direction must not append the same note twice on a retry.
+
+    Simulates the post-commit-pending re-entry: _handle_strategic_completion is
+    called twice with the same retire_direction op (same rationale, same direction
+    id).  The retirement note must appear exactly once in the direction's notes list.
+    """
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="NoteDedup",
+        user_id="u-note-dedup",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-dedup",
+                "text": "Direction to retire",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    rationale = "Completed all objectives"
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "retire_direction",
+                    "direction_id": "d-dedup",
+                    "rationale": rationale,
+                }
+            ],
+        }
+    )
+
+    def _make_task():
+        return Task(
+            project_id=project.id,
+            payloads=[
+                {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+            ],
+            context={},
+        )
+
+    # First call — simulates the original run
+    task1 = _make_task()
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+    await _handle_strategic_completion(task1, logs, db_session)
+
+    # Second call — simulates the post-commit-pending retry with a new task
+    # but identical op payload (same direction id, same rationale)
+    task2 = _make_task()
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+    await _handle_strategic_completion(task2, logs, db_session)
+
+    await db_session.refresh(project)
+    retired = next(
+        (d for d in (project.directions or []) if d.get("id") == "d-dedup"), None
+    )
+    assert retired is not None, "d-dedup must still be present in directions"
+    assert retired["status"] == "retired", (
+        f"d-dedup must be retired; got status={retired.get('status')}"
+    )
+    retire_notes = [
+        n for n in (retired.get("notes") or [])
+        if n.get("text") == f"Retired by strategic review: {rationale}"
+    ]
+    assert len(retire_notes) == 1, (
+        f"Retirement note must appear exactly once (dedup); found {len(retire_notes)}: {retire_notes}"
+    )
+
+
+def test_self_reflection_log_dedups_replayed_cycle():
+    """Replaying the same cycle (post-commit-pending recovery) must not duplicate
+    self_reflection_log entries. Dedup is by cycle_task_id to prevent bloated token
+    consumption and recurrence hallucination when identical entries are re-appended."""
+    from app.problem_model import SelfReflectionEntry, append_self_reflection
+    from app.time_utils import _utcnow
+
+    cycle_task_id = "t-12345"
+    now = _utcnow().isoformat()
+
+    # Create an entry for this cycle
+    entry = SelfReflectionEntry(
+        ts=now,
+        cycle_task_id=cycle_task_id,
+        what_was_hard="Missing context on async patterns",
+        missing_context="",
+        proposed_self_improvement="Add async examples to prompt",
+    )
+
+    # First append: log should have 1 entry
+    log = append_self_reflection(None, entry)
+    assert len(log) == 1, f"Expected 1 entry after first append, got {len(log)}"
+    assert log[0]["cycle_task_id"] == cycle_task_id
+
+    # Replay: append identical entry again (same cycle_task_id, same task_id)
+    log = append_self_reflection(log, entry)
+    assert len(log) == 1, (
+        f"Dedup must prevent duplicate: expected 1 entry after replay, got {len(log)}. "
+        "This can happen when post-commit-pending recovery re-appends from saved payload."
+    )
+
+    # Verify the entry is unchanged
+    assert log[0]["cycle_task_id"] == cycle_task_id
+    assert log[0]["what_was_hard"] == "Missing context on async patterns"
+
+
+def test_rejected_proposals_dedup_on_replay():
+    """_merge_rejected_proposals must not create duplicate entries on replay.
+
+    The recovery sweeper can re-run _apply_rejected_proposals with the same
+    batch after a post-commit crash.  Each call must be idempotent: an entry
+    whose 'text' is already present in vision['rejected_proposals'] must be
+    skipped, so the list does not grow beyond the number of genuinely distinct
+    proposals.
+    """
+    batch = [
+        {"text": "Improve user onboarding", "rejected_at": "2024-01-01T00:00:00+00:00"},
+        {"text": "Add dashboard charts", "rejected_at": "2024-01-01T00:00:01+00:00"},
+    ]
+    vision: dict = {}
+
+    # Initial run
+    _merge_rejected_proposals(vision, batch)
+    assert len(vision["rejected_proposals"]) == 2
+
+    # Replay: same batch applied again (simulating recovery-sweeper re-dispatch)
+    _merge_rejected_proposals(vision, batch)
+    rp = vision["rejected_proposals"]
+    assert len(rp) == 2, (
+        f"Replay must not duplicate entries: expected 2, got {len(rp)}. "
+        "This fires when _merge_rejected_proposals appends without checking existing texts."
+    )
+    texts = {e["text"] for e in rp}
+    assert "Improve user onboarding" in texts
+    assert "Add dashboard charts" in texts
+
+
+def test_rejected_proposals_dedup_preserves_cap():
+    """_merge_rejected_proposals caps at 30 and still deduplicates on replay."""
+    # Pre-populate with 29 distinct entries
+    existing = [{"text": f"proposal-{i}", "rejected_at": "2024-01-01T00:00:00+00:00"} for i in range(29)]
+    vision = {"rejected_proposals": list(existing)}
+
+    batch = [{"text": "proposal-new", "rejected_at": "2024-01-02T00:00:00+00:00"}]
+    _merge_rejected_proposals(vision, batch)
+    assert len(vision["rejected_proposals"]) == 30
+
+    # Replay: the new entry is already present — list must stay at 30
+    _merge_rejected_proposals(vision, batch)
+    assert len(vision["rejected_proposals"]) == 30

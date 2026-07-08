@@ -13,6 +13,7 @@ from typing import Any, Dict
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.deploy_identity import project_is_deploy_repo
 from app.runtime_config_state import runtime_config
 
 logger = logging.getLogger(__name__)
@@ -1021,13 +1022,16 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
 
         # Self-repo: leave NULL as-is. The live resolver treats the self-repo's
         # unset integration branch as automain without silently rewriting the
-        # column behind the operator's back.
-        if project.is_self_repo and need_integration:
+        # column behind the operator's back. Classify via the deploy-repo
+        # predicate (deploy identity when stamped, else the is_self_repo
+        # fallback) so a misset flag can't misroute the deploy's own repo.
+        is_deploy_repo = project_is_deploy_repo(project)
+        if is_deploy_repo and need_integration:
             summary["self_repo_skipped"] += 1
             need_integration = False
 
         # Self-repo promotion_target: no GitHub round-trip needed.
-        if project.is_self_repo and need_promotion:
+        if is_deploy_repo and need_promotion:
             project.promotion_target = "main"
             flag_modified(project, "promotion_target")
             session.add(project)
@@ -1109,9 +1113,27 @@ def _is_blueprint_self_repo(project) -> bool:
     Catches both the correctly-flagged case (``is_self_repo=True``) and the
     historically-broken case where ``is_self_repo`` is misset False but the
     GitHub repo name is a known Blueprint alias.
+
+    INTENTIONALLY EXEMPT from deploy-identity de-gating: this is_self_repo read
+    is a deliberate fallback for namespace-alias resolution (GitHub name matching),
+    not deploy-level observability. Must remain as-is to preserve historical
+    incident recovery for misset is_self_repo flags (2026-05-26..28).
     """
     if getattr(project, "is_self_repo", False):
         return True
+    return _project_repo_is_blueprint(project)
+
+
+def _project_repo_is_blueprint(project) -> bool:
+    """True when *project*'s GitHub repo is a known Blueprint alias.
+
+    Classifies purely by repo identity — it deliberately does NOT read the raw
+    ``is_self_repo`` flag.  The canonical ``"blueprint"`` task-branch namespace
+    is owned by the actual Blueprint repo (the aliases below), not by any
+    project that merely happens to carry ``is_self_repo=True``; a non-Blueprint
+    self-hosted repo must keep its own slug-derived namespace rather than being
+    misrouted under ``blueprint/...``.
+    """
     github_repo = getattr(project, "github_repo", "") or ""
     return github_repo.lower() in _BLUEPRINT_REPO_ALIASES
 
@@ -1127,8 +1149,8 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
         slugified ``github_repo`` for everything else.  Mirrors
         ``_derive_task_branch_namespace`` in ``admin_onboard.py``.
       * **Corrective overwrite (incident 2026-05-26..28):** if the project is
-        the Blueprint self-repo (by flag or by historical alias —
-        ``BlueprintAIStudio``) but the persisted namespace differs from
+        the Blueprint self-repo (by historical alias — ``BlueprintAIStudio``)
+        but the persisted namespace differs from
         ``"blueprint"``, force-overwrite it.  The agent always pushes to
         ``blueprint/...``; an out-of-sync orchestrator-side namespace makes
         every merge-conflict fix-spawn try to clone a nonexistent branch.
@@ -1170,7 +1192,7 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
         build_config = project.build_config or {}
         current_ns = build_config.get("task_branch_namespace") or ""
         github_repo = getattr(project, "github_repo", "") or ""
-        is_blueprint = _is_blueprint_self_repo(project)
+        is_blueprint = _project_repo_is_blueprint(project)
 
         if is_blueprint:
             expected_ns = "blueprint"

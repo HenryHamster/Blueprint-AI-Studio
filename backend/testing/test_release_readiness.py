@@ -494,3 +494,66 @@ class TestPromotionCiGreenGate:
 
         assert result is False
         run_qual.assert_not_awaited()
+
+
+class TestChallengeRefutedRate:
+    def test_challenge_refuted_rate_never_exceeds_one(self):
+        """challenge_refuted_rate is always in [0.0, 1.0].
+
+        The rate must be: refuted_count / (confirmed + refuted + uncertain),
+        not refuted_count / num_verdicts. This ensures the rate stays bounded.
+        """
+        from app.release_scoring import compute_challenged_vs_unchallenged_telemetry
+
+        # Create 3 verdicts where summing refuted_count / num_verdicts would
+        # exceed 1.0 if the bug existed, but the correct formula stays in [0, 1].
+        # Verdict A: confirmed=5, refuted=3, uncertain=2 (total=10, 3/10=0.3 refuted)
+        # Verdict B: confirmed=4, refuted=4, uncertain=2 (total=10, 4/10=0.4 refuted)
+        # Verdict C: confirmed=3, refuted=3, uncertain=4 (total=10, 3/10=0.3 refuted)
+        # Total refuted = 10, total reviewed = 30
+        # Correct rate = 10 / 30 = 0.333...
+        # Buggy formula = 10 / 3 = 3.333... (exceeds 1.0!)
+        def _make_verdict(confirmed, refuted, uncertain, sha="abc1234"):
+            return {
+                "candidate_sha": sha,
+                "audit_reconciliation": {
+                    "model_reported_score": 1.0,
+                    "findings_derived_score": 1.0,
+                    "score_delta": 0.0,
+                    "excluded_findings_count": 0,
+                    "audit_challenge": {
+                        "status": "available",
+                        "binding": True,
+                        "confirmed_count": confirmed,
+                        "refuted_count": refuted,
+                        "uncertain_count": uncertain,
+                        "reported_agreement": "partial" if refuted > 0 else "agree",
+                        "challenged_candidate_sha": sha,
+                    },
+                },
+                "would_promote": True,
+                "terminal_status": "not_promoted",
+                "post_promotion_outcome": None,
+                "excluded_audit_findings": None,
+            }
+
+        verdicts = [
+            _make_verdict(confirmed=5, refuted=3, uncertain=2, sha="sha0001"),
+            _make_verdict(confirmed=4, refuted=4, uncertain=2, sha="sha0002"),
+            _make_verdict(confirmed=3, refuted=3, uncertain=4, sha="sha0003"),
+        ]
+        result = compute_challenged_vs_unchallenged_telemetry(verdicts)
+        ch = result["challenged"]
+
+        assert ch["insufficient_sample"] is False
+        assert ch["sample_size"] == 3
+
+        # Total refuted across all verdicts
+        assert ch["challenge_refuted_count"] == 10
+
+        # The rate must be bounded in [0, 1]
+        rate = ch["challenge_refuted_rate"]
+        assert 0.0 <= rate <= 1.0, f"Rate {rate} exceeds [0, 1] bounds"
+
+        # Verify the correct calculation: 10 / (5+4+3 + 3+4+3 + 2+2+4) = 10/30
+        assert rate == pytest.approx(10 / 30, abs=1e-4)

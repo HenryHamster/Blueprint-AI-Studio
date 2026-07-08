@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.deploy_identity import project_is_deploy_repo
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.time_utils import _coerce_naive_utc, _utcnow, exponential_backoff
 
@@ -95,7 +96,8 @@ async def spawn_bootstrap_task(
     """Idempotently enqueue a repo_bootstrap task for an eligible project.
 
     Eligibility:
-    - Project must not be a self-repo (``is_self_repo`` is False).
+    - Project must not be the deploy's own repo (``project_is_deploy_repo`` is
+      False — deploy-identity match, or the ``is_self_repo`` fallback).
     - Project must not be an empty repo (``build_config.repo_is_empty`` is False/absent).
     - Project must not have ``bootstrap_completed_at`` set in ``build_config``
       UNLESS this is an operator refresh (``spawn_reason == "operator_refresh"``),
@@ -121,7 +123,7 @@ async def spawn_bootstrap_task(
     build_cfg = dict(project.build_config or {})
     is_refresh = spawn_reason == REFRESH_SPAWN_REASON
 
-    if project.is_self_repo:
+    if project_is_deploy_repo(project):
         return BootstrapSpawnResult(
             outcome="not_eligible",
             reason="self_repo",

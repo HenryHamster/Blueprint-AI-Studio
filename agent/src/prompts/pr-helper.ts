@@ -2,8 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WORKSPACE } from '../index.js';
-import { agentTokenShellFn, githubTokenShellFn } from '../token-file.js';
-import { validateCfgShellSafety, type CodeChangeHelperConfig } from './code-change-helpers.js';
+import { agentTokenShellFn, githubTokenShellFn, jsonStrShellFn, jsonFieldShellFn } from '../token-file.js';
+import { validateCfgShellSafety, shouldRunBackendMergeGate, type CodeChangeHelperConfig } from './code-change-helpers.js';
 
 // Load the canonical sr-pr-section.js renderer from disk and base64-encode
 // it for safe bash-level injection into the generated ./pr script. Per
@@ -56,6 +56,8 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   const _SCREENSHOTS_SECTION_SCRIPT_B64 = loadScreenshotsSectionScriptB64();
   const agentTokenFn = agentTokenShellFn();
   const githubTokenFn = githubTokenShellFn();
+  const jsonStrFn = jsonStrShellFn();
+  const jsonFieldFn = jsonFieldShellFn();
   const script = `#!/bin/bash
 # ./pr open --title "..." --body "..."  — ship the diff via PR
 #
@@ -69,6 +71,8 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
 set -uo pipefail
 ${agentTokenFn}
 ${githubTokenFn}
+${jsonStrFn}
+${jsonFieldFn}
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
@@ -114,7 +118,7 @@ if [ "$OP" = "close" ]; then
     echo "[pr close] Failed to fetch GitHub token from orchestrator" >&2
     exit 1
   }
-  GH_TOKEN=$(printf '%s' "$TOKEN_RESP" | jq -r '.data.token // empty')
+  GH_TOKEN=$(printf '%s' "$TOKEN_RESP" | _json_field data.token)
   if [ -z "$GH_TOKEN" ]; then
     echo "[pr close] orchestrator returned no token: $TOKEN_RESP" >&2
     exit 1
@@ -136,7 +140,8 @@ if [ "$OP" = "close" ]; then
 
   # Post supersession comment for traceability
   if [ -n "$SUPERSEDED_BY" ]; then
-    COMMENT_BODY=$(jq -n --arg msg "Closing: equivalent changes already merged via PR #$SUPERSEDED_BY. No further action needed on this branch." '{body: $msg}')
+    _comment_msg="Closing: equivalent changes already merged via PR #$SUPERSEDED_BY. No further action needed on this branch."
+    COMMENT_BODY=$(printf '{"body":%s}' "$(_json_str "$_comment_msg")")
     curl -sS --max-time 30 \\
       -X POST "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/issues/$PR_NUMBER/comments" \\
       -H "Authorization: token $GH_TOKEN" \\
@@ -205,7 +210,7 @@ if [ -n "$SHOTS_SECTION" ]; then
   BODY=$(printf '%s\\n\\n%s' "$BODY" "$SHOTS_SECTION")
 fi
 
-${(cfg.promotionTarget !== undefined ? cfg.baseBranch === cfg.promotionTarget : cfg.testsOnMainBranch) ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
+${shouldRunBackendMergeGate(cfg) ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
 # The agent must not be able to skip backend tests on LTS-branch tasks.
 _BASE_GATE="${cfg.baseBranch}"
 _CMT_GATE=""
@@ -221,8 +226,9 @@ if printf '%s\\n' "$_CHG_GATE" | grep -q '^backend/'; then
   WITH_TESTS=1
 fi
 ` : ''}
-# 1. Run ./check as gate (lint always; tests on main branch when --with-tests
-#    OR on review-fix path that touches backend changes).
+# 1. Run ./check as gate (lint always; tests when --with-tests, or forced on
+#    when the backend merge gate applies (self-repo/promotion-target/LTS
+#    branch) and the diff touches backend/ — see the WITH_TESTS=1 block above).
 # Branch on WITH_TESTS instead of expanding an array. Older bash + set -u
 # aborts on an empty array expansion, so just call ./check directly.
 if [ "$WITH_TESTS" = "1" ]; then
@@ -399,7 +405,7 @@ if [ -n "$SR_SECTION" ] || [ -n "$SHOTS_SECTION" ]; then
   _PTRESP=$(curl -f -sS --max-time 30 \\
     -H "X-Agent-Token: $TOKEN" \\
     "$API/api/agent/github/token?task_id=$TASK" 2>/dev/null) || _PTRESP=""
-  _PTOKEN=$(printf '%s' "$_PTRESP" | jq -r '.data.token // empty' 2>/dev/null || true)
+  _PTOKEN=$(printf '%s' "$_PTRESP" | _json_field data.token 2>/dev/null || true)
   if [ -n "$_PTOKEN" ]; then
     # Fetch current PR body. Use -f so non-2xx GET responses (auth/rate-limit/
     # 5xx/404) fail fast rather than yielding an empty body that would let the
@@ -409,7 +415,7 @@ if [ -n "$SR_SECTION" ] || [ -n "$SHOTS_SECTION" ]; then
         "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/pulls/${cfg.existingPrNumber}" \\
         -H "Authorization: token $_PTOKEN" -H "Accept: application/vnd.github+json" \\
         -o "$_GETBODY_FILE" 2>/dev/null; then
-      _CURBODY=$(jq -r '.body // ""' "$_GETBODY_FILE" 2>/dev/null || printf '')
+      _CURBODY=$(_json_field body < "$_GETBODY_FILE" 2>/dev/null || printf '')
       # Strip any prior blocks (idempotent), then re-append the fresh non-empty ones.
       _UPDBODY=$(printf '%s' "$_CURBODY" | sed '/<!-- blueprint:self-review -->/,/<!-- \\/blueprint:self-review -->/d')
       _UPDBODY=$(printf '%s' "$_UPDBODY" | sed '/<!-- blueprint:screenshots -->/,/<!-- \\/blueprint:screenshots -->/d')
@@ -419,7 +425,7 @@ if [ -n "$SR_SECTION" ] || [ -n "$SHOTS_SECTION" ]; then
       if [ -n "$SHOTS_SECTION" ]; then
         _UPDBODY=$(printf '%s\\n\\n%s' "$_UPDBODY" "$SHOTS_SECTION")
       fi
-      _PHTTP=$(jq -n --arg b "$_UPDBODY" '{body: $b}' | curl -sS -o /dev/null -w '%{http_code}' \\
+      _PHTTP=$(printf '{"body":%s}' "$(_json_str "$_UPDBODY")" | curl -sS -o /dev/null -w '%{http_code}' \\
         --max-time 30 -X PATCH \\
         "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/pulls/${cfg.existingPrNumber}" \\
         -H "Authorization: token $_PTOKEN" -H "Accept: application/vnd.github+json" \\
@@ -433,9 +439,10 @@ if [ -n "$SR_SECTION" ] || [ -n "$SHOTS_SECTION" ]; then
   fi
 fi
 ` : `
-PR_PAYLOAD=$(jq -n --arg tid "$TASK" --arg owner "${cfg.owner}" --arg repo "${cfg.repo}" \\
-  --arg title "$TITLE" --arg head "${cfg.workBranch}" --arg base "${cfg.baseBranch}" --arg body "$BODY" \\
-  '{task_id: $tid, owner: $owner, repo: $repo, title: $title, head: $head, base: $base, body: $body}')
+PR_PAYLOAD=$(printf '{"task_id":%s,"owner":${JSON.stringify(cfg.owner)},"repo":${JSON.stringify(cfg.repo)},"title":%s,"head":${JSON.stringify(cfg.workBranch)},"base":${JSON.stringify(cfg.baseBranch)},"body":%s}' \\
+  "$(_json_str "$TASK")" \\
+  "$(_json_str "$TITLE")" \\
+  "$(_json_str "$BODY")")
 PR_RESP=""
 PR_OK=0
 PR_HDR_FILE=/tmp/pr_create_hdrs_${cfg.taskId}
@@ -488,7 +495,7 @@ if [ "$PR_OK" = "0" ]; then
   echo "[pr] PR creation failed after 5 retries — orchestrator/GitHub quota unavailable" >&2
   exit 1
 fi
-PR_URL=$(printf '%s' "$PR_RESP" | jq -r '.data.html_url // empty')
+PR_URL=$(printf '%s' "$PR_RESP" | _json_field data.html_url)
 if [ -z "$PR_URL" ]; then
   echo "[pr] orchestrator response had no html_url: $PR_RESP" >&2
   exit 1
@@ -520,7 +527,7 @@ if [ -n "$PR_NUMBER" ]; then
   TOKEN_RESP=$(curl -f -sS --max-time 30 \\
     -H "X-Agent-Token: $TOKEN" \\
     "$API/api/agent/github/token?task_id=$TASK" 2>/dev/null) || TOKEN_RESP=""
-  GH_TOKEN_PR=$(printf '%s' "$TOKEN_RESP" | jq -r '.data.token // empty' 2>/dev/null || true)
+  GH_TOKEN_PR=$(printf '%s' "$TOKEN_RESP" | _json_field data.token 2>/dev/null || true)
   if [ -n "$GH_TOKEN_PR" ]; then
     PR_MERGEABLE="null"
     PR_STATE="unknown"
@@ -529,8 +536,8 @@ if [ -n "$PR_NUMBER" ]; then
         -H "Authorization: token $GH_TOKEN_PR" \\
         -H "Accept: application/vnd.github+json" \\
         "https://api.github.com/repos/${cfg.owner}/${cfg.repo}/pulls/$PR_NUMBER" 2>/dev/null || echo "")
-      PR_MERGEABLE=$(printf '%s' "$_PR_DETAIL" | jq -r '.mergeable // "null"' 2>/dev/null || echo "null")
-      PR_STATE=$(printf '%s' "$_PR_DETAIL" | jq -r '.mergeable_state // "unknown"' 2>/dev/null || echo "unknown")
+      PR_MERGEABLE=$(printf '%s' "$_PR_DETAIL" | _json_field mergeable null 2>/dev/null || echo "null")
+      PR_STATE=$(printf '%s' "$_PR_DETAIL" | _json_field mergeable_state unknown 2>/dev/null || echo "unknown")
       [ "$PR_MERGEABLE" != "null" ] && break
       sleep 3
     done

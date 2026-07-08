@@ -76,6 +76,7 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_deactivate_stale_runners",
         "_fail_stale_local_runner_holds",
         "_emit_all_accounts_blocked_stall",
+        "_sweep_runner_deactivated_escalations",
         "_RUNNER_LIVENESS_SECONDS",
         "_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS",
     ),

@@ -16,8 +16,19 @@ const {
   RESEARCH_PLAN_EXPORT_NAMES,
   STRATEGIC_SECTIONS_EXPORT_NAMES,
   TELEMETRY_EXPORT_NAMES,
-} = vi.hoisted(() => ({
-  INDEX_EXPORT_NAMES: [
+} = vi.hoisted(() => {
+  // Type-safe export name lists: satisfies ensures each name exists in the actual module exports
+  type IndexExportKey = keyof typeof import('../index.js');
+  type WorkspacePrepExportKey = keyof typeof import('../workspacePrep.js');
+  type StrategicHelpersExportKey = keyof typeof import('./strategic-helpers.js');
+  type DesignDocPresenceExportKey = keyof typeof import('../utils/design-doc-presence.js');
+  type ResearchDirectionContextExportKey = keyof typeof import('./research-direction-context.js');
+  type ResearchPlanExportKey = keyof typeof import('./research-plan.js');
+  type StrategicSectionsExportKey = keyof typeof import('./strategic-sections.js');
+  type TelemetryExportKey = keyof typeof import('../telemetry.js');
+
+  return {
+    INDEX_EXPORT_NAMES: [
     'AUTH_MODE',
     'AuthFailureError',
     'ClaudeTimeoutError',
@@ -165,15 +176,15 @@ const {
     'strVal',
     'testFixLoop',
     'validateBranchName',
-  ],
-  WORKSPACE_PREP_EXPORT_NAMES: [
+  ] satisfies IndexExportKey[],
+    WORKSPACE_PREP_EXPORT_NAMES: [
     'getLastWorkspacePrepOutcome',
     'prepareWorkspaceForRole',
     'listWorkspaceTopDirs',
     'resetWorkspacePrepOutcome',
     'resolveReferenceRepo',
-  ],
-  STRATEGIC_HELPERS_EXPORT_NAMES: [
+  ] satisfies WorkspacePrepExportKey[],
+    STRATEGIC_HELPERS_EXPORT_NAMES: [
     'DESIGN_DOC_FETCH_VERBS',
     'FETCH_VERB_HELP',
     'PLAN_FETCH_VERBS',
@@ -190,16 +201,16 @@ const {
     'runStrategicChallenge',
     'writeFetchHelper',
     'writeStrategicHelpers',
-  ],
-  DESIGN_DOC_PRESENCE_EXPORT_NAMES: [
+  ] satisfies StrategicHelpersExportKey[],
+    DESIGN_DOC_PRESENCE_EXPORT_NAMES: [
     'extractEntryPaths',
     'reconcileDesignDocIndex',
     'reconcileDesignDocPresence',
     'reconcileEntry',
     'reconcileMissingCapabilities',
     'reconcileSystemEntry',
-  ],
-  RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES: [
+  ] satisfies DesignDocPresenceExportKey[],
+    RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES: [
     'differentiationHintFor',
     'formatCochangeHints',
     'formatDecompositionOutcomes',
@@ -207,8 +218,8 @@ const {
     'formatPreviousDecisionOutcomes',
     'formatRetiredDirectionsSummary',
     'formatRetiredDirectionGrounding',
-  ],
-  RESEARCH_PLAN_EXPORT_NAMES: [
+  ] satisfies ResearchDirectionContextExportKey[],
+    RESEARCH_PLAN_EXPORT_NAMES: [
     'CAPABILITY_DECLARATION_DOC',
     'PR_INELIGIBLE_TASK_TYPES',
     'QUALIFICATION_STATE_VOCAB',
@@ -242,8 +253,8 @@ const {
     'readProgressArtifact',
     'resolveMemoHandles',
     'runThinkerWithGate',
-  ],
-  STRATEGIC_SECTIONS_EXPORT_NAMES: [
+  ] satisfies ResearchPlanExportKey[],
+    STRATEGIC_SECTIONS_EXPORT_NAMES: [
     'buildCapabilityVerificationSection',
     'buildCiComplianceSection',
     'buildCompletionDebtSection',
@@ -265,8 +276,8 @@ const {
     'buildSweepComparisonSection',
     'buildSystemMaturitySection',
     'fmtScalar',
-  ],
-  TELEMETRY_EXPORT_NAMES: [
+  ] satisfies StrategicSectionsExportKey[],
+    TELEMETRY_EXPORT_NAMES: [
     'computePromptFingerprint',
     'errorFingerprint',
     'estimateTokensFromChars',
@@ -291,8 +302,9 @@ const {
     'resetResidentTurnLatencyTelemetry',
     'setCurrentPromptFingerprint',
     'setPromptSizeTelemetry',
-  ],
-}));
+  ] satisfies TelemetryExportKey[],
+  };
+});
 
 vi.mock('fs', () => ({
   default: {

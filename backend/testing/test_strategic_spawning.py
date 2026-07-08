@@ -2355,7 +2355,7 @@ async def test_cost_fields_present_when_history_has_merge_data(db_session):
 
     expected_cost = round((4 * 1.5 + 2 * 2.0) * 3600 * ON_DEMAND_RATE, 2)
     assert d_stat["estimated_cost_usd"] == expected_cost
-    assert d_stat["cost_per_merged_pr"] == round(expected_cost / 3, 2)
+    assert d_stat["cost_per_merged_pr"] == round(expected_cost / 3, 4)
 
 
 @pytest.mark.asyncio
@@ -2429,6 +2429,74 @@ async def test_cost_fields_use_recorded_spend_over_proxy(db_session):
 
     assert d_stat["estimated_cost_usd"] == 6.50
     assert d_stat["cost_per_merged_pr"] == round(6.50 / 2, 2)
+
+
+@pytest.mark.asyncio
+async def test_cost_per_merged_pr_folds_evicted_aggregate_cost(db_session):
+    """cost_per_merged_pr folds the evicted-aggregate cost into the numerator.
+
+    A direction older than the 10-cycle window has cost-bearing cycles that
+    aged out into history_aggregate. The merge DENOMINATOR already folds in
+    agg.total_prs_merged; the cost NUMERATOR must fold in
+    agg.total_estimated_cost_usd too, otherwise cost-per-merge is understated.
+    This is the parity contract: strategic_spawning and strategic_analysis must
+    report an EQUAL cost_per_merged_pr for the same direction data.
+    """
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+    from app.strategic_analysis import _entry_cost_usd
+    from app.direction_metrics import canonical_cost_per_merged_pr
+
+    history = [
+        {"prs_merged": 2, "tasks_created": 4, "avg_time_to_merge_hours": 1.5},
+        {"prs_merged": 1, "tasks_created": 2, "avg_time_to_merge_hours": 2.0},
+    ]
+    history_aggregate = {
+        "total_cycles": 8,
+        "total_prs_merged": 5,
+        "total_estimated_cost_usd": 12.34,
+    }
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cost-evicted",
+                "status": "active",
+                "text": "Direction with evicted cost + merges",
+                "priority": "medium",
+                "research_history": history,
+                "history_aggregate": history_aggregate,
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-cost-evicted"
+    )
+
+    # Lifetime numerator = window cost + evicted-aggregate cost.
+    window_cost = sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history)
+    expected_cost = round(window_cost + 12.34, 2)
+    # Lifetime denominator = window merges + evicted-aggregate merges.
+    total_merged = (2 + 1) + 5
+    expected_cpm = canonical_cost_per_merged_pr(expected_cost, total_merged)
+
+    assert d_stat["estimated_cost_usd"] == expected_cost
+    assert d_stat["cost_per_merged_pr"] == expected_cpm
+    # Parity contract: dropping the folded aggregate cost would understate it.
+    window_only_cpm = canonical_cost_per_merged_pr(
+        round(window_cost, 2), total_merged
+    )
+    assert d_stat["cost_per_merged_pr"] > window_only_cpm
 
 
 @pytest.mark.asyncio
@@ -3040,6 +3108,74 @@ async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_
     task_flag = result2.scalars().one()
     assert task_flag.payloads[0]["is_self_repo"] is False
     assert task_flag.payloads[0]["enable_self_improvement"] is True
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_is_self_repo_follows_deploy_identity(
+    db_session, monkeypatch
+):
+    """The agent-facing ``is_self_repo`` payload field keys off the deploy-repo
+    predicate, not the raw ``project.is_self_repo`` column.
+
+    This is the self-improvement-framing consumer: the strategic agent gates the
+    "modify your own prompts/schemas/orchestration" block on this field, so it
+    must classify by deploy identity like every other migrated backend gate.
+    When a deploy identity is stamped, the field follows repo identity even when
+    the raw column disagrees.
+    """
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+
+    # Repo matches the deploy identity but the raw column is False → payload True
+    # (deploy identity is authoritative, overriding the mis-set column).
+    project_match = _make_project(
+        github_owner="acme",
+        github_repo="widget",
+        is_self_repo=False,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project_match)
+    await db_session.commit()
+    await db_session.refresh(project_match)
+    await _seed_legacy_cycles(db_session, project_match)
+
+    spawned = await _spawn_strategic_review(project_match, db_session)
+    assert spawned is True
+    task_match = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project_match.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert task_match.payloads[0]["is_self_repo"] is True
+
+    # Repo does NOT match the deploy identity but the raw column is True → payload
+    # False (a stale is_self_repo flag no longer grants self-improvement framing).
+    project_mismatch = _make_project(
+        github_owner="other",
+        github_repo="proj",
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project_mismatch)
+    await db_session.commit()
+    await db_session.refresh(project_mismatch)
+    await _seed_legacy_cycles(db_session, project_mismatch)
+
+    spawned2 = await _spawn_strategic_review(project_mismatch, db_session)
+    assert spawned2 is True
+    task_mismatch = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project_mismatch.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert task_mismatch.payloads[0]["is_self_repo"] is False
 
 
 # ── Additional _spawn_design_doc_update tests ─────────────────────────────────
@@ -11422,6 +11558,70 @@ async def test_rolling_rates_exclude_rollup_children(db_session):
     assert rates["last_7d"]["merged"] == 1, (
         f"Expected 1 integration-landed merge (root task only), "
         f"got {rates['last_7d']['merged']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_window_merge_rate_population_consistent_with_rollup_children(db_session):
+    """Both numerator and denominator of merge_rate count only root tasks.
+
+    When a rollup parent and its children all complete in the same window,
+    the merge_rate denominator ('finished') must count only root tasks,
+    consistent with the numerator ('merged'). If the denominator included
+    rollup children, the rate would be artificially deflated: 1 root merged
+    over 3 total (parent + 2 children) = 33% instead of 1 root over 1 root = 100%.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Rollup parent — merged to integration branch
+    parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    # Two rollup children — each merged to staging only
+    for i in range(2):
+        child = Task(
+            project_id=project.id,
+            title=f"Child fix {i}",
+            description="child",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent.id,
+            context={"pr_merged": True},
+        )
+        db_session.add(child)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    rates = result["rolling_rates"]
+
+    # merged should be 1 (root parent only)
+    assert rates["last_7d"]["merged"] == 1, (
+        f"Expected 1 merged (root task only), got {rates['last_7d']['merged']}"
+    )
+    # finished should also be 1 (root parent only), NOT 3 (parent + 2 children)
+    assert rates["last_7d"]["finished"] == 1, (
+        f"Expected 1 finished (root task only), got {rates['last_7d']['finished']}. "
+        "Denominator must exclude rollup children for consistent merge_rate."
+    )
+    # merge_rate should be 1.0 (100%), NOT 0.333 (33%)
+    assert rates["last_7d"]["merge_rate"] == 1.0, (
+        f"Expected 100% merge_rate, got {rates['last_7d']['merge_rate'] * 100}%. "
+        "Rate is deflated when denominator counts rollup children."
     )
 
 

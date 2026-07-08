@@ -169,6 +169,13 @@ def test_registry_contains_initial_checks():
         "direction_cumulative_merge_invariant",
         "first_attempt_rate_denominator_coverage",
         "sr_catch_rate_cache_freshness",
+        "acceptance_window_sub_scores_invariant",
+        "undeclared_test_cochange_coverage_split",
+        "acceptance_window_fraction_recompute",
+        "evidence_claim_reconciliation",
+        "saturated_direction_with_nonmerge_productivity",
+        "capability_claim_reconciliation",
+        "merged_pr_count_consistency",
     } <= names
 
 
@@ -414,6 +421,386 @@ async def test_criterion_merge_evidence_gap_skips_with_no_qualifying_tasks(db):
     results = await mis.check_criterion_merge_evidence_gap(ctx)
     assert len(results) == 1
     assert results[0].status == CheckStatus.SKIPPED
+
+
+# --- Check: undeclared_test_cochange_coverage_split --------------------------
+
+
+@pytest.mark.asyncio
+async def test_undeclared_test_cochange_coverage_split():
+    """Report the split of undeclared merges: inferred test co-change vs bare.
+
+    A real merge-test verdict gating a CI-verified merge with both test and
+    production files changed represents inferred test co-change (agents shipping
+    tests). A bare-undeclared merge has either no test files or no production
+    files. The check observes and reports the split per project.
+    """
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    Session = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    async with Session() as db:
+        project = await _project(db)
+
+        # Case 1: Verified merge with both test and production files → inferred.
+        t_inferred = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                # CI-verified (no unverified_merge_reason): passes the verified check.
+                # Both test and production files changed.
+                "_pr_changed_files": [
+                    "backend/testing/test_foo.py",  # test file
+                    "backend/app/foo.py",            # production file
+                ],
+            },
+        )
+        db.add(t_inferred)
+        await db.commit()
+        await db.refresh(t_inferred)
+        art_inferred = Artifact(
+            task_id=t_inferred.id, artifact_type=ArtifactType.PULL_REQUEST
+        )
+        db.add(art_inferred)
+        await db.commit()
+
+        # Case 2: Verified merge but only test files (no production) → bare.
+        t_only_test = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": ["backend/testing/test_bar.py"],  # only test
+            },
+        )
+        db.add(t_only_test)
+        await db.commit()
+        await db.refresh(t_only_test)
+        art_only_test = Artifact(
+            task_id=t_only_test.id, artifact_type=ArtifactType.PULL_REQUEST
+        )
+        db.add(art_only_test)
+        await db.commit()
+
+        # Case 3: Verified merge but only production files (no test) → bare.
+        t_only_prod = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": ["backend/app/baz.py"],  # only production
+            },
+        )
+        db.add(t_only_prod)
+        await db.commit()
+        await db.refresh(t_only_prod)
+        art_only_prod = Artifact(
+            task_id=t_only_prod.id, artifact_type=ArtifactType.PULL_REQUEST
+        )
+        db.add(art_only_prod)
+        await db.commit()
+
+        # Case 4: No-CI gate fall-open (unverified merge) → bare (cannot infer).
+        t_unverified = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                # Unverified merge: has unverified_merge_reason in review_loop.
+                "review_loop": {"unverified_merge_reason": "ci_setup_failed"},
+                "_pr_changed_files": [
+                    "backend/testing/test_fallopen.py",
+                    "backend/app/fallopen.py",
+                ],
+            },
+        )
+        db.add(t_unverified)
+        await db.commit()
+        await db.refresh(t_unverified)
+        art_unverified = Artifact(
+            task_id=t_unverified.id, artifact_type=ArtifactType.PULL_REQUEST
+        )
+        db.add(art_unverified)
+        await db.commit()
+
+        # Run the check.
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="observe",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        results = await mis.check_undeclared_test_cochange_coverage_split(ctx)
+
+        # Expect exactly one result per project (since all tasks are in one project).
+        assert len(results) >= 1, f"expected at least one result, got {results}"
+        pid = str(project.id)
+        per_project_results = [r for r in results if r.subject == pid]
+        assert len(per_project_results) == 1, f"expected one result for project {pid}"
+
+        result = per_project_results[0]
+        assert result.check == "undeclared_test_cochange_coverage_split"
+        assert result.status == CheckStatus.OK  # Observe-only, never flagged
+
+        # Result metrics:
+        # - self_reported = count with inferred test co-change (1: t_inferred)
+        # - ground_truth = count bare-undeclared (3: t_only_test, t_only_prod, t_unverified)
+        # - delta = total (4)
+        assert result.self_reported == 1, f"expected 1 inferred, got {result.self_reported}"
+        assert result.ground_truth == 3, f"expected 3 bare, got {result.ground_truth}"
+        assert result.delta == 4, f"expected delta=4 total, got {result.delta}"
+        assert "inferred test co-change" in result.detail
+        assert "bare-undeclared" in result.detail
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_undeclared_test_cochange_coverage_split_truncated_pr():
+    """The sweep check classifies truncated PRs correctly given only the stored list.
+
+    When ``_pr_changed_files`` is the truncated list (capped at 50 entries) and the
+    test path falls beyond the truncation window, the sweep's current
+    implementation scans the stored list directly without consulting the non-lossy
+    summary fields (``_pr_changed_files_has_test`` / ``_pr_changed_files_has_prod``).
+    This test documents the current behaviour: a >50-file PR whose test paths are
+    beyond index 50 is classified as ``bare_undeclared`` even when the non-lossy
+    summary is present.
+
+    The acceptance_gate ``classify_merged_acceptance_context`` already prefers the
+    summary fields for the same classification. When the sweep is updated to do the
+    same, this test's assertion should be flipped: with summary fields present and
+    ``_pr_changed_files_has_test=True, _pr_changed_files_has_prod=True``, the
+    sweep should classify the merge as ``inferred_test_cochange`` (self_reported=1)
+    instead of ``bare_undeclared`` (ground_truth=1).
+    """
+    from app.models import Artifact, ArtifactType
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    Session = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    async with Session() as db:
+        project = await _project(db)
+
+        # --- Case 1: Truncated PR (50 prod files), summary says test co-change ---
+        # The stored list has only production files (the test file is beyond
+        # index 50), so the current sweep implementation — which scans
+        # _pr_changed_files directly — sees no test files and classifies as
+        # bare_undeclared, despite _pr_changed_files_has_test being True.
+        prod_50 = [f"backend/app/module_{i}.py" for i in range(50)]
+        t_trunc = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": prod_50,
+                "_pr_changed_files_has_test": True,
+                "_pr_changed_files_has_prod": True,
+                "_pr_changed_files_truncated": True,
+            },
+        )
+        db.add(t_trunc)
+        await db.commit()
+        await db.refresh(t_trunc)
+        db.add(Artifact(task_id=t_trunc.id, artifact_type=ArtifactType.PULL_REQUEST))
+        await db.commit()
+
+        # --- Case 2: Truncated PR with NO summary fields (legacy shape) ---
+        # The stored list has only production files, and no summary fields
+        # exist to help. Also classified as bare_undeclared.
+        prod_50_b = [f"backend/app/module_{i}.py" for i in range(50)]
+        t_legacy = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": prod_50_b,
+            },
+        )
+        db.add(t_legacy)
+        await db.commit()
+        await db.refresh(t_legacy)
+        db.add(Artifact(task_id=t_legacy.id, artifact_type=ArtifactType.PULL_REQUEST))
+        await db.commit()
+
+        # --- Case 3: Small PR (non-truncated) with summary fields — control ---
+        # With both test and prod files in the stored list, the sweep correctly
+        # classifies as inferred_test_cochange regardless of summary fields.
+        t_small = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": [
+                    "backend/app/foo.py",
+                    "backend/testing/test_foo.py",
+                ],
+                "_pr_changed_files_has_test": True,
+                "_pr_changed_files_has_prod": True,
+            },
+        )
+        db.add(t_small)
+        await db.commit()
+        await db.refresh(t_small)
+        db.add(Artifact(task_id=t_small.id, artifact_type=ArtifactType.PULL_REQUEST))
+        await db.commit()
+
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="observe",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        results = await mis.check_undeclared_test_cochange_coverage_split(ctx)
+
+        pid = str(project.id)
+        per_project = [r for r in results if r.subject == pid]
+        assert len(per_project) == 1
+        result = per_project[0]
+        assert result.check == "undeclared_test_cochange_coverage_split"
+        assert result.status == CheckStatus.OK
+
+        # Current behaviour: the sweep scans _pr_changed_files directly.
+        # - t_trunc: 50 prod files, no test file in list → bare_undeclared
+        # - t_legacy: same, no summary → bare_undeclared
+        # - t_small: test + prod files in list → inferred_test_cochange
+        #
+        # When the sweep is updated to prefer the non-lossy summary fields
+        # (mirroring classify_merged_acceptance_context), the assertion should
+        # become: self_reported=2 (t_trunc + t_small), ground_truth=1 (t_legacy).
+        assert result.self_reported == 1, (
+            f"small PR with test+prod in stored list should be inferred; "
+            f"got self_reported={result.self_reported}"
+        )
+        assert result.ground_truth == 2, (
+            f"both truncated PRs should be bare_undeclared in current behaviour; "
+            f"got ground_truth={result.ground_truth}"
+        )
+        assert result.delta == 3
+
+    await engine.dispose()
+
+
+# --- Check: acceptance_window_fraction_recompute -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_fraction_recompute_reports_nonzero(db):
+    """Observe-only recompute reports a non-zero fraction + reason split on real data."""
+    project = await _project(db)
+    version, _criterion = await _open_version_with_criterion(
+        db, project, text="acceptance window recompute"
+    )
+
+    # One inferred_test_cochange (verified) + two undeclared reasons in the window.
+    inferred = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "landed_on_integration": True,
+            "pr_merged": True,
+            "_pr_changed_files": [
+                "backend/app/release_qualifier.py",
+                "backend/testing/test_release_qualifier.py",
+            ],
+        },
+    )
+    prod_only = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "landed_on_integration": True,
+            "pr_merged": True,
+            "_pr_changed_files": ["backend/app/release_qualifier.py"],
+        },
+    )
+    no_files = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={"landed_on_integration": True, "pr_merged": True},
+    )
+    db.add_all([inferred, prod_only, no_files])
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_fraction_recompute(ctx)
+
+    pid = str(project.id)
+    mine = [r for r in results if r.subject == pid]
+    assert len(mine) == 1, f"expected one result for {pid}, got {results}"
+    result = mine[0]
+    assert result.check == "acceptance_window_fraction_recompute"
+    assert result.status == CheckStatus.OK  # observe-only, never flagged
+    # verified=1 numerator, write_total=3 denominator, undeclared (bare) delta=2.
+    assert result.self_reported == 1
+    assert result.ground_truth == 3
+    assert result.delta == 2
+    # The recomputed fraction is surfaced non-zero, with the reason split visible.
+    assert "acceptance_window_fraction=0.333" in result.detail
+    assert "inferred_test_cochange=1" in result.detail
+    assert "no_test_prod_cochange=1" in result.detail
+    assert "no_changed_files_context=1" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_fraction_recompute_skips_without_open_version(db):
+    """No open version → SKIPPED, never a flag."""
+    project = await _project(db)
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_fraction_recompute(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert not mine[0].flagged
 
 
 # --- Check: playbook_confirmation_integrity ---------------------------------
@@ -1948,3 +2335,1091 @@ async def test_sr_cache_freshness_skips_when_no_cache(db):
     )
     results = await mis.check_sr_catch_rate_cache_freshness(ctx)
     assert all(r.status == CheckStatus.SKIPPED for r in results)
+
+
+# --- Pure helper: acceptance_window_sub_scores_violations -------------------
+
+
+def test_acceptance_window_violations_empty_dict_returns_no_violations():
+    """An empty sub_scores dict has no acceptance_window fields — fail-safe: []."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    assert acceptance_window_sub_scores_violations({}) == []
+
+
+def test_acceptance_window_violations_legacy_sub_scores_no_violations():
+    """A sub_scores dict with no acceptance_window_* keys is a legacy verdict: []."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    legacy = {"audit_score": 0.9, "test_erosion": 0.8}
+    assert acceptance_window_sub_scores_violations(legacy) == []
+
+
+def test_acceptance_window_violations_three_key_intermediate_schema_no_violations():
+    """Pre-fix 3-key schema (total/verified/fraction without write_total/total_all_merges)
+    must not produce violations — the new population keys are absent so the check skips."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    # This is the schema written by pre-fix code: healthy values but no population keys.
+    three_key = {
+        "acceptance_window_total": 346,
+        "acceptance_window_verified": 40,
+        "acceptance_window_fraction": 40 / 346,
+    }
+    assert acceptance_window_sub_scores_violations(three_key) == []
+
+
+def test_acceptance_window_violations_consistent_fields_no_violations():
+    """Consistent acceptance_window fields produce no violations."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    sub_scores = {
+        "acceptance_window_verified": 2,
+        "acceptance_window_write_total": 4,
+        "acceptance_window_total_all_merges": 6,
+        "acceptance_window_fraction": 2 / 4,  # 0.5
+        "acceptance_window_total": 4,
+    }
+    assert acceptance_window_sub_scores_violations(sub_scores) == []
+
+
+def test_acceptance_window_violations_ignores_additive_breakdown_keys():
+    """The additive nested breakdown keys never trip the sub-scores invariant."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    sub_scores = {
+        "acceptance_window_verified": 1,
+        "acceptance_window_write_total": 4,
+        "acceptance_window_total_all_merges": 4,
+        "acceptance_window_fraction": 1 / 4,
+        "acceptance_window_total": 4,
+        # New additive nested keys — must be inert to the invariant guard.
+        "acceptance_window_buckets": {
+            "proven": 0,
+            "satisfied_unproven": 0,
+            "inferred_test_cochange": 1,
+            "declared_unsatisfied": 0,
+            "undeclared": 3,
+            "merged_unverified_degraded": 0,
+            "malformed": 0,
+        },
+        "acceptance_window_undeclared_reasons": {
+            "not_ci_verified": 1,
+            "no_changed_files_context": 1,
+            "no_test_prod_cochange": 1,
+        },
+    }
+    assert acceptance_window_sub_scores_violations(sub_scores) == []
+
+
+def test_acceptance_window_violations_verified_exceeds_write_total():
+    """verified > write_total is a violation (the mixed-population bug pattern)."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    sub_scores = {
+        "acceptance_window_verified": 5,
+        "acceptance_window_write_total": 3,
+        "acceptance_window_total_all_merges": 10,
+        "acceptance_window_fraction": 5 / 3,
+    }
+    viols = acceptance_window_sub_scores_violations(sub_scores)
+    assert any("verified" in v and "write_total" in v for v in viols), viols
+
+
+def test_acceptance_window_violations_write_total_exceeds_all_merges():
+    """write_total > total_all_merges is a violation."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    sub_scores = {
+        "acceptance_window_verified": 2,
+        "acceptance_window_write_total": 10,
+        "acceptance_window_total_all_merges": 5,
+        "acceptance_window_fraction": 2 / 10,
+    }
+    viols = acceptance_window_sub_scores_violations(sub_scores)
+    assert any("write_total" in v and "total_all_merges" in v for v in viols), viols
+
+
+def test_acceptance_window_violations_fraction_mismatch():
+    """A stored fraction that doesn't match verified/write_total is a violation."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    sub_scores = {
+        "acceptance_window_verified": 2,
+        "acceptance_window_write_total": 4,
+        "acceptance_window_total_all_merges": 6,
+        "acceptance_window_fraction": 0.99,  # should be 0.5
+    }
+    viols = acceptance_window_sub_scores_violations(sub_scores)
+    assert any("fraction" in v for v in viols), viols
+
+
+def test_acceptance_window_violations_fraction_none_but_write_total_nonzero():
+    """fraction=None with write_total > 0 is a violation."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    sub_scores = {
+        "acceptance_window_verified": 0,
+        "acceptance_window_write_total": 3,
+        "acceptance_window_total_all_merges": 5,
+        "acceptance_window_fraction": None,
+    }
+    viols = acceptance_window_sub_scores_violations(sub_scores)
+    assert any("None" in v or "fraction" in v for v in viols), viols
+
+
+def test_acceptance_window_violations_fraction_not_none_but_write_total_zero():
+    """fraction is not None with write_total=0 is a violation."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    sub_scores = {
+        "acceptance_window_verified": 0,
+        "acceptance_window_write_total": 0,
+        "acceptance_window_total_all_merges": 5,
+        "acceptance_window_fraction": 0.0,
+    }
+    viols = acceptance_window_sub_scores_violations(sub_scores)
+    assert any("fraction" in v and "None" in v for v in viols), viols
+
+
+def test_acceptance_window_violations_write_total_zero_fraction_none_ok():
+    """write_total=0 with fraction=None is the correct None state — no violation."""
+    from app.acceptance_gate import acceptance_window_sub_scores_violations
+
+    sub_scores = {
+        "acceptance_window_verified": 0,
+        "acceptance_window_write_total": 0,
+        "acceptance_window_total_all_merges": 5,
+        "acceptance_window_fraction": None,
+    }
+    assert acceptance_window_sub_scores_violations(sub_scores) == []
+
+
+# --- Check: acceptance_window_sub_scores_invariant --------------------------
+
+
+async def _version_with_sub_scores(db, project, sub_scores: dict) -> ReleaseVersion:
+    """Create an open ReleaseVersion with the given last_qualification sub_scores."""
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "not_promoted", "sub_scores": sub_scores},
+    )
+    db.add(version)
+    await db.commit()
+    await db.refresh(version)
+    return version
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_sub_scores_invariant_ok_when_consistent(db):
+    """A version with consistent acceptance_window sub_scores returns OK."""
+    project = await _project(db)
+    await _version_with_sub_scores(
+        db,
+        project,
+        {
+            "acceptance_window_verified": 2,
+            "acceptance_window_write_total": 4,
+            "acceptance_window_total_all_merges": 6,
+            "acceptance_window_fraction": 2 / 4,
+            "acceptance_window_total": 4,
+        },
+    )
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_sub_scores_invariant(ctx)
+    assert any(r.status == CheckStatus.OK for r in results), results
+    assert not any(r.flagged for r in results)
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_sub_scores_invariant_flags_verified_exceeds_write_total(db):
+    """A version where verified > write_total is flagged (mixed-population bug)."""
+    project = await _project(db)
+    await _version_with_sub_scores(
+        db,
+        project,
+        {
+            "acceptance_window_verified": 100,
+            "acceptance_window_write_total": 5,
+            "acceptance_window_total_all_merges": 346,
+            "acceptance_window_fraction": 100 / 5,
+            "acceptance_window_total": 5,
+        },
+    )
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_sub_scores_invariant(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, results
+    assert "verified" in flagged[0].detail or "write_total" in flagged[0].detail
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_sub_scores_invariant_skips_three_key_intermediate_schema(db):
+    """A version with the pre-fix 3-key schema (no write_total/total_all_merges) must be
+    SKIPPED rather than flagged — otherwise healthy in-flight ReleaseVersions emit false
+    FLAGGED warn results until they are re-qualified with post-fix code."""
+    project = await _project(db)
+    await _version_with_sub_scores(
+        db,
+        project,
+        {
+            "acceptance_window_total": 346,
+            "acceptance_window_verified": 40,
+            "acceptance_window_fraction": 40 / 346,
+        },
+    )
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_sub_scores_invariant(ctx)
+    assert not any(r.flagged for r in results), results
+    assert any(r.status == CheckStatus.SKIPPED for r in results), results
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_sub_scores_invariant_flags_write_total_exceeds_all_merges(db):
+    """A version where write_total > total_all_merges is flagged."""
+    project = await _project(db)
+    await _version_with_sub_scores(
+        db,
+        project,
+        {
+            "acceptance_window_verified": 2,
+            "acceptance_window_write_total": 50,
+            "acceptance_window_total_all_merges": 10,
+            "acceptance_window_fraction": 2 / 50,
+            "acceptance_window_total": 50,
+        },
+    )
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_sub_scores_invariant(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, results
+    assert "write_total" in flagged[0].detail or "total_all_merges" in flagged[0].detail
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_sub_scores_invariant_flags_fraction_mismatch(db):
+    """A stored fraction that doesn't match verified/write_total is flagged."""
+    project = await _project(db)
+    await _version_with_sub_scores(
+        db,
+        project,
+        {
+            "acceptance_window_verified": 2,
+            "acceptance_window_write_total": 4,
+            "acceptance_window_total_all_merges": 6,
+            "acceptance_window_fraction": 0.99,  # should be 0.5
+            "acceptance_window_total": 4,
+        },
+    )
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_sub_scores_invariant(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, results
+    assert "fraction" in flagged[0].detail
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_sub_scores_invariant_skips_legacy_verdict(db):
+    """A version with no acceptance_window fields in sub_scores → SKIPPED."""
+    project = await _project(db)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "sub_scores": {"audit_score": 0.9, "test_erosion": 0.8},
+        },
+    )
+    db.add(version)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_sub_scores_invariant(ctx)
+    assert all(r.status == CheckStatus.SKIPPED for r in results), results
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_sub_scores_invariant_skips_no_last_qualification(db):
+    """A version with no last_qualification at all → SKIPPED (no acceptance_window keys)."""
+    project = await _project(db)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification=None,
+    )
+    db.add(version)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_sub_scores_invariant(ctx)
+    assert all(r.status == CheckStatus.SKIPPED for r in results), results
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_sub_scores_invariant_skips_no_open_versions(db):
+    """When there are no open ReleaseVersion rows → global SKIPPED."""
+    await _project(db)
+    # No ReleaseVersion row added.
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_acceptance_window_sub_scores_invariant(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert results[0].subject == "global"
+
+
+# --- evidence_claim_reconciliation ------------------------------------------
+
+
+async def _project_with_gap_evidence_ref(
+    db, *, ref, proven=True, kind="named_test", status="active"
+) -> Project:
+    """A project whose problem_model has one active gap carrying one evidence_ref."""
+    pm = {
+        "gaps": [
+            {
+                "id": "g-ev-1",
+                "name": "evidence gap",
+                "status": status,
+                "evidence_refs": [{"kind": kind, "ref": ref, "proven": proven}],
+            }
+        ]
+    }
+    p = Project(name="mi-ev", user_id="u1", problem_model=pm)
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+    return p
+
+
+def _ev_ctx(db) -> SweepContext:
+    return SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_flags_stale_gap_evidence(db, monkeypatch):
+    """A proven, path-backed evidence_ref whose file is REMOVED at HEAD (the path
+    helper returns a definite False) flags the gap on the observability surface —
+    WITHOUT mutating the durable gap — while an indeterminate (None) result does
+    not (companion assertion below)."""
+    import app.source_ref_validation as srv
+
+    project = await _project_with_gap_evidence_ref(
+        db, ref="backend/testing/test_foo.py"
+    )
+
+    async def _removed(path, *args, **kwargs):
+        return False  # path definitely removed at HEAD → proof contradicted
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    # Run in observe mode via the full sweep so we exercise the observability
+    # surface (recent_flags), not just the check function in isolation.
+    _rc["metrics_integrity_sweep_mode"] = "observe"
+    tick = await run_metrics_integrity_sweep(db, now=_utcnow())
+    assert tick is not None
+
+    snap = get_metrics_integrity_observability()
+    ev_flags = [
+        f
+        for f in snap["recent_flags"]
+        if f["check"] == "evidence_claim_reconciliation"
+    ]
+    assert len(ev_flags) == 1, snap["recent_flags"]
+    flag = ev_flags[0]
+    assert flag["subject"] == str(project.id)
+    assert flag["self_reported"] == 1  # one proven path-backed ref
+    assert flag["ground_truth"] == 0  # none still present at HEAD
+    assert flag["delta"] == 1
+    assert "removed at HEAD" in flag["detail"]
+
+    # Observe mode is side-effect-free: durable gap untouched, nothing enrolled.
+    await db.refresh(project)
+    gap = project.problem_model["gaps"][0]
+    assert gap["evidence_refs"][0]["proven"] is True
+    assert gap["status"] == "active"
+    enrolled = (await db.execute(select(EvergreenBacklogItem))).scalars().all()
+    assert enrolled == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_indeterminate_not_flagged(db, monkeypatch):
+    """CRITICAL HONESTY RULE: a None (git/API indeterminate) path check must NEVER
+    be laundered into 'removed' — the gap is not flagged."""
+    import app.source_ref_validation as srv
+
+    await _project_with_gap_evidence_ref(db, ref="backend/testing/test_foo.py")
+
+    async def _indeterminate(path, *args, **kwargs):
+        return None  # no checkout / timeout / rate limit — indeterminate
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _indeterminate)
+
+    results = await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+    assert all(not r.flagged for r in results), results
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok, results
+    # Proven ref still counts as present ground truth (never laundered to stale).
+    assert ok[0].ground_truth == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_ok_when_ref_present(db, monkeypatch):
+    """A proven ref whose backing file still exists (True) reconciles OK."""
+    import app.source_ref_validation as srv
+
+    await _project_with_gap_evidence_ref(db, ref="backend/testing/test_foo.py")
+
+    async def _present(path, *args, **kwargs):
+        return True
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _present)
+
+    results = await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+    assert all(not r.flagged for r in results)
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok and ok[0].self_reported == 1 and ok[0].ground_truth == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_never_mutates_durable_gap(db, monkeypatch):
+    """The flag-only guarantee: even the check function in isolation performs
+    zero writes to the durable problem_model gap."""
+    import app.source_ref_validation as srv
+
+    project = await _project_with_gap_evidence_ref(
+        db, ref="backend/testing/test_foo.py"
+    )
+    before = project.problem_model["gaps"][0]["evidence_refs"][0].copy()
+
+    async def _removed(path, *args, **kwargs):
+        return False
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+
+    await db.refresh(project)
+    after = project.problem_model["gaps"][0]["evidence_refs"][0]
+    assert after == before  # ref, proven flag, kind all untouched
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_closed_gap_unproven_flagged(db, monkeypatch):
+    """A gap that CLAIMS closure but carries only unproven evidence is a
+    'closed but unproven' contradiction — flagged even with no path removal."""
+    import app.source_ref_validation as srv
+
+    await _project_with_gap_evidence_ref(
+        db, ref="backend/testing/test_foo.py", proven=False, status="closed"
+    )
+
+    async def _present(path, *args, **kwargs):
+        return True  # nothing removed — the flag comes from the claim contradiction
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _present)
+
+    results = await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, results
+    assert "claims closed" in flagged[0].detail
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_skips_gaps_without_refs(db):
+    """A gap carrying no structured evidence_refs is skipped (nothing to
+    reconcile) — no flag, no error."""
+    pm = {"gaps": [{"id": "g-1", "name": "plain gap", "status": "active"}]}
+    p = Project(name="mi-ev-none", user_id="u1", problem_model=pm)
+    db.add(p)
+    await db.commit()
+
+    results = await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+    assert all(not r.flagged for r in results)
+    assert any(
+        r.status == CheckStatus.SKIPPED and "no gaps carry" in r.detail
+        for r in results
+    )
+
+
+# --- Check: saturated_direction_with_nonmerge_productivity -------------------
+
+
+@pytest.mark.asyncio
+async def test_flags_saturated_direction_with_recorded_nonmerge_productivity(db):
+    """A direction marked possibly_saturated but with recent non-merge productive
+    outcomes (verified merges, acceptance evidence) is flagged — the saturation
+    marker is stale or productivity was not properly credited.
+
+    This is the named acceptance test validating that the guard check detects
+    when the self-reported saturation state diverges from actual recorded
+    productivity, the regression class that the fix (#13378) closes.
+    """
+    project = await _project(db)
+
+    # Create a direction marked possibly_saturated with recent non-merge productivity.
+    # Non-merge productivity: verified merges + acceptance evidence without new tasks.
+    project.directions = [
+        {
+            "id": "d-saturated-productive",
+            "possibly_saturated": True,
+            "last_cycle_productive": False,  # marked unproductive
+            "consecutive_unproductive_cycles": 4,  # multiple consecutive unproductive
+            "research_history": [
+                {
+                    "task_id": "xxxxxxxx-0000-0000-0000-000000000001",
+                    "verified_prs_merged": 1,  # CI-verified merge verdict
+                    "acceptance_proven_merged": 1,  # acceptance evidence recorded
+                    "tasks_created": 0,  # but no child tasks spawned (non-merge productivity)
+                },
+                {
+                    "task_id": "xxxxxxxx-0000-0000-0000-000000000002",
+                    "verified_prs_merged": 0,
+                    "tasks_created": 0,
+                },
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    # Run the check.
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_saturated_direction_with_nonmerge_productivity(ctx)
+
+    # Verify the check flags this contradiction.
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+    f = flagged[0]
+    assert f.check == "saturated_direction_with_nonmerge_productivity"
+    assert f.status == CheckStatus.FLAGGED
+    assert f.subject == str(project.id)
+    assert f.delta == 1  # one flagged direction
+    assert "possibly_saturated" in f.detail
+    assert "verified" in f.detail or "proven" in f.detail
+    assert "d-saturated-productive" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_saturated_direction_with_nonmerge_productivity_ok_when_no_productivity(db):
+    """A direction marked possibly_saturated with no recorded productivity → OK.
+
+    The saturation flag is consistent with the recorded state when no
+    non-merge outcomes exist in the recent history.
+    """
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-truly-saturated",
+            "possibly_saturated": True,
+            "research_history": [
+                {
+                    "task_id": "yyyyyyyy-0000-0000-0000-000000000001",
+                    "verified_prs_merged": 0,  # no verification
+                    "acceptance_proven_merged": 0,  # no acceptance evidence
+                    "tasks_created": 0,  # no child tasks
+                },
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_saturated_direction_with_nonmerge_productivity(ctx)
+
+    # No contradiction → not flagged.
+    assert all(not r.flagged for r in results)
+    # Should be SKIPPED since the direction is saturated but has no productivity.
+    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
+    assert len(skipped) == 1
+
+
+@pytest.mark.asyncio
+async def test_saturated_direction_with_nonmerge_productivity_skips_non_saturated(db):
+    """Directions not marked possibly_saturated are skipped — they are not audited."""
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-active",
+            "possibly_saturated": False,  # not saturated
+            "research_history": [
+                {
+                    "verified_prs_merged": 3,  # has productivity
+                    "acceptance_proven_merged": 2,
+                    "tasks_created": 0,
+                },
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_saturated_direction_with_nonmerge_productivity(ctx)
+
+    # Non-saturated directions are not audited — result is SKIPPED.
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert "no saturated directions" in results[0].detail
+
+
+@pytest.mark.asyncio
+async def test_saturated_direction_with_nonmerge_productivity_checks_acceptance_verified(db):
+    """A saturated direction with acceptance_verified_merged > 0 is flagged.
+
+    Acceptance evidence (both proven and verified) counts as non-merge
+    productivity that contradicts the saturation flag.
+    """
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-saturated-verified-acceptance",
+            "possibly_saturated": True,
+            "research_history": [
+                {
+                    "task_id": "zzzzzzzz-0000-0000-0000-000000000001",
+                    "verified_prs_merged": 0,  # no merge verification
+                    "acceptance_verified_merged": 2,  # verified acceptance evidence
+                    "tasks_created": 0,
+                },
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_saturated_direction_with_nonmerge_productivity(ctx)
+
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert "possibly_saturated" in f.detail
+    assert "verified_evidence" in f.detail or "acceptance" in f.detail.lower()
+
+
+# --- Check: capability_claim_reconciliation ---------------------------------
+
+
+async def _project_with_capabilities(db, capabilities: list) -> Project:
+    """A project whose problem_model has the given capabilities list."""
+    pm = {"capabilities": capabilities}
+    p = Project(name="mi-cap", user_id="u1", problem_model=pm)
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+    return p
+
+
+def _cap_ctx(db) -> SweepContext:
+    return SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_flags_removed_backing_paths(
+    db, monkeypatch
+):
+    """REQUIRED acceptance test: a working/partial capability whose every declared
+    backing_path is DEFINITELY removed at HEAD (False) must be FLAGGED — the
+    self-reported 'working' claim is no longer backed by code."""
+    import app.source_ref_validation as srv
+
+    project = await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py"],
+            }
+        ],
+    )
+
+    async def _removed(path, *args, **kwargs):
+        return False  # definite removal
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "capability_claim_reconciliation"
+    assert f.status == CheckStatus.FLAGGED
+    assert f.subject == str(project.id)
+    assert f.delta == 1
+    assert "repo_map" in f.detail
+    assert "removed at HEAD" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_indeterminate_not_flagged(
+    db, monkeypatch
+):
+    """CRITICAL HONESTY RULE: a None (indeterminate) path check must NEVER be
+    laundered into 'removed' — the capability is NOT flagged."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py"],
+            }
+        ],
+    )
+
+    async def _indeterminate(path, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _indeterminate)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok, results
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_ok_when_all_paths_present(
+    db, monkeypatch
+):
+    """All backing_paths still present at HEAD → OK, not flagged."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py", "backend/app/foo.py"],
+            }
+        ],
+    )
+
+    async def _present(path, *args, **kwargs):
+        return True
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _present)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok and ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_mixed_presence_not_flagged(
+    db, monkeypatch
+):
+    """If SOME paths are removed but at least one is still present, no flag is raised."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "partial",
+                "backing_paths": [
+                    "backend/app/gone.py",  # removed
+                    "backend/app/present.py",  # still present
+                ],
+            }
+        ],
+    )
+
+    async def _mixed(path, *args, **kwargs):
+        return path == "backend/app/present.py"  # True for present, False for gone
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _mixed)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_planned_never_flagged(
+    db, monkeypatch
+):
+    """planned capabilities must NEVER be flagged for absent backing paths."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "future_feature",
+                "status": "planned",
+                "backing_paths": ["backend/app/future.py"],
+            }
+        ],
+    )
+
+    async def _removed(path, *args, **kwargs):
+        return False
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+    # planned caps don't count as eligible → SKIPPED
+    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
+    assert skipped
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_skips_empty_backing_paths(db):
+    """A working capability with no backing_paths is skipped (nothing to audit)."""
+    await _project_with_capabilities(
+        db,
+        [{"name": "repo_map", "status": "working", "backing_paths": []}],
+    )
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
+    assert skipped
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_is_flag_only(db, monkeypatch):
+    """The check must never mutate the durable problem_model — flag-only guarantee."""
+    import app.source_ref_validation as srv
+
+    project = await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py"],
+            }
+        ],
+    )
+    before = project.problem_model["capabilities"][0].copy()
+
+    async def _removed(path, *args, **kwargs):
+        return False
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+
+    await db.refresh(project)
+    after = project.problem_model["capabilities"][0]
+    assert after == before  # name, status, backing_paths all untouched
+
+
+def test_registry_contains_capability_claim_reconciliation():
+    """The new check must be registered in the global registry."""
+    names = {c.name for c in registered_checks()}
+    assert "capability_claim_reconciliation" in names
+
+
+# --- Check: merged_pr_count_consistency --------------------------------------
+
+
+def _mpc_ctx(db, **kwargs):
+    return SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode=kwargs.get("mode", "observe"),
+        max_projects=kwargs.get("max_projects", 25),
+        sample_limit=kwargs.get("sample_limit", 200),
+        window_days=kwargs.get("window_days", 14),
+    )
+
+
+async def _merged_task(db, project, *, parent_task_id=None) -> Task:
+    """A COMPLETED merged task; optionally a rollup parent (has children pointing at it)."""
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={"landed_on_integration": True, "pr_merged": True},
+        parent_task_id=parent_task_id,
+    )
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+async def _unmerged_task(db, project) -> Task:
+    """A COMPLETED but unmerged task."""
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+def test_registry_contains_merged_pr_count_consistency():
+    names = {c.name for c in registered_checks()}
+    assert "merged_pr_count_consistency" in names
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_flags_rollup_double_count(db):
+    """Rollup parent + children all merged → naive=3, canonical=2, delta=1."""
+    project = await _project(db)
+
+    # Seed a rollup parent and two children. The parent task will be identified
+    # as a parent because other tasks carry parent_task_id pointing at it.
+    parent = await _merged_task(db, project)
+    await _merged_task(db, project, parent_task_id=parent.id)
+    await _merged_task(db, project, parent_task_id=parent.id)
+
+    results = await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, results
+    f = flagged[0]
+    assert f.check == "merged_pr_count_consistency"
+    # naive = 3 (parent + 2 children), canonical = 2 (children only)
+    assert f.self_reported == 3
+    assert f.ground_truth == 2
+    assert f.delta == 1
+    assert f.severity == "warn"
+    assert f.subject == str(project.id)
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_ok_when_no_rollup_parents(db):
+    """Two independent merged tasks with no parent links → OK, delta=0."""
+    project = await _project(db)
+    await _merged_task(db, project)
+    await _merged_task(db, project)
+
+    results = await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+    assert all(not r.flagged for r in results), results
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok) == 1
+    assert ok[0].delta == 0
+    assert ok[0].self_reported == 2
+    assert ok[0].ground_truth == 2
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_skips_when_no_merged_tasks(db):
+    """Completed but unmerged tasks → SKIPPED."""
+    project = await _project(db)
+    await _unmerged_task(db, project)
+    await _unmerged_task(db, project)
+
+    results = await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+    assert all(not r.flagged for r in results), results
+    assert any(r.status == CheckStatus.SKIPPED for r in results)
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_is_flag_only(db):
+    """The check must never mutate any audited task row."""
+    project = await _project(db)
+    parent = await _merged_task(db, project)
+    child = await _merged_task(db, project, parent_task_id=parent.id)
+
+    before_parent_ctx = dict(parent.context or {})
+    before_child_ctx = dict(child.context or {})
+
+    await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+
+    await db.refresh(parent)
+    await db.refresh(child)
+    assert parent.context == before_parent_ctx
+    assert child.context == before_child_ctx
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_multiple_parents_inflates_delta(db):
+    """Two rollup parents each with children → delta=2."""
+    project = await _project(db)
+
+    parent1 = await _merged_task(db, project)
+    await _merged_task(db, project, parent_task_id=parent1.id)
+
+    parent2 = await _merged_task(db, project)
+    await _merged_task(db, project, parent_task_id=parent2.id)
+
+    results = await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, results
+    f = flagged[0]
+    # naive=4 (2 parents + 2 children), canonical=2 (children only)
+    assert f.self_reported == 4
+    assert f.ground_truth == 2
+    assert f.delta == 2

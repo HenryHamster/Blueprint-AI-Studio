@@ -2229,6 +2229,8 @@ def compute_challenged_vs_unchallenged_telemetry(
             # explicitly marked refuted_false_positive across all challenged verdicts.
             # Distinct from exclusion_rate (unverified primary findings) — this is
             # findings the challenger actively refuted, not verification-excluded ones.
+            # challenge_refuted_rate is the fraction of all findings reviewed that were
+            # refuted: refuted_count / (confirmed_count + refuted_count + uncertain_count).
             challenge_refuted_count = sum(
                 int(
                     v["audit_reconciliation"]["audit_challenge"].get("refuted_count")
@@ -2240,8 +2242,22 @@ def compute_challenged_vs_unchallenged_telemetry(
                 and v["audit_reconciliation"]["audit_challenge"].get("status")
                 == "available"
             )
+            challenge_total_reviewed = sum(
+                int(v["audit_reconciliation"]["audit_challenge"].get("confirmed_count") or 0)
+                + int(v["audit_reconciliation"]["audit_challenge"].get("refuted_count") or 0)
+                + int(v["audit_reconciliation"]["audit_challenge"].get("uncertain_count") or 0)
+                for v in cohort
+                if isinstance(v.get("audit_reconciliation"), dict)
+                and isinstance(v["audit_reconciliation"].get("audit_challenge"), dict)
+                and v["audit_reconciliation"]["audit_challenge"].get("status")
+                == "available"
+            )
             stats["challenge_refuted_count"] = challenge_refuted_count
-            stats["challenge_refuted_rate"] = round(challenge_refuted_count / n, 4)
+            stats["challenge_refuted_rate"] = (
+                round(challenge_refuted_count / challenge_total_reviewed, 4)
+                if challenge_total_reviewed > 0
+                else 0.0
+            )
 
         return stats
 

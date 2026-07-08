@@ -924,6 +924,9 @@ AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.web_research.value,
         TaskType.design.value,
         TaskType.compute_experiment.value,
+        TaskType.investigate.value,
+        TaskType.memo.value,
+        TaskType.repo_bootstrap.value,
         *STRATEGIC_TASK_TYPES,
     }
 )
@@ -945,6 +948,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.release_audit.value,
         TaskType.release_audit_challenge.value,
         TaskType.release_merge_grade.value,
+        TaskType.self_audit.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering
@@ -1099,6 +1103,17 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
         "evaluation_strategy": capability.evaluation_strategy,
         "cost_ceiling_usd": capability.cost_ceiling_usd,
     }
+
+
+def is_pr_eligible_task_type(task_type: str | TaskType) -> bool:
+    """Return True if tasks of this type can produce a merged PR.
+
+    Only ``ci_and_review`` evaluation-strategy types (create, fix, qa, deps,
+    migrate, refactor, …) can land a PR; all read-only / research / audit types
+    return False.  Unknown types return False (fail-safe: treat as ineligible).
+    """
+    capability = get_task_capability(task_type)
+    return capability is not None and capability.evaluation_strategy == "ci_and_review"
 
 
 def task_type_catalog() -> list[dict]:

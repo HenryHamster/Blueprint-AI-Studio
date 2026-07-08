@@ -2615,6 +2615,23 @@ class Alert(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Operator acknowledgement: set when the operator acknowledges an ongoing
+    # outage alert (e.g. runner offline) to suppress further escalation re-pages
+    # until the alert auto-resolves on recovery. Distinct from dismissed_at: the
+    # alert remains visible; only escalation webhooks are gated on this field.
+    acknowledged_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    # Persisted escalation cadence for the periodic re-page sweep
+    # (_maybe_escalate_runner_deactivated_alerts). None = never escalated by the
+    # sweep (first re-page fires after _RUNNER_ESCALATION_FIRST_SECONDS); set to
+    # now() after each sweep dispatch so cadence survives orchestrator restart.
+    # Distinct from last_seen_at, which alert_policy owns for dedup tracking.
+    last_escalated_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
 
     __table_args__ = (
         Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),
@@ -2802,7 +2819,7 @@ class OrchestratorErrorAck(SQLModel, table=True):
 # Maximum stored length for operator/user-authored message content and
 # resolution notes. Shared by the admin-notifications and project-directions
 # message endpoints so their over-limit rejection cannot drift apart.
-MESSAGE_CONTENT_MAX = 5000
+MESSAGE_CONTENT_MAX = 20000
 
 
 class DigestCacheEntry(SQLModel, table=True):
@@ -4635,6 +4652,45 @@ class UiLoadTimingSample(SQLModel, table=True):
     page_ready_ms: int = Field(sa_column=Column(Integer, nullable=False))
     sample_type: str = Field(default="first_commit", sa_column=Column(String(32), nullable=False))
     recorded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
+class NotificationDeadLetter(SQLModel, table=True):
+    """Durable record of an external notification that failed to deliver.
+
+    The webhook retry queue is a bounded in-memory deque: entries are lost on
+    orchestrator restart, the oldest is silently evicted when the queue is
+    full, and a notification that exhausts its retries just disappears. When
+    either terminal outcome occurs, a row is written here so the failed
+    escalation is operator-visible and re-drivable instead of vanishing.
+
+    ``reason`` is ``"exhausted"`` (all retry attempts used up) or
+    ``"evicted"`` (dropped from the full retry queue to make room). ``payload``
+    and ``body`` preserve the original notification so it can be re-driven.
+    """
+
+    __tablename__ = "notification_dead_letter"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    event_type: str = Field(sa_column=Column(String(128), nullable=False))
+    reason: str = Field(sa_column=Column(String(16), nullable=False))
+    attempts: int = Field(default=0, sa_column=Column(Integer, nullable=False))
+    last_status: int | None = Field(
+        default=None, sa_column=Column(Integer, nullable=True)
+    )
+    webhook_url: str = Field(default="", sa_column=Column(String(2048), nullable=False))
+    payload: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    body: dict = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )

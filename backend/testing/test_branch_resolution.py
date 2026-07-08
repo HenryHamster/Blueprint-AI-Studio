@@ -21,6 +21,7 @@ fixture.
 
 from app.branch_resolution import (
     EFFORT_ORDER,
+    _project_repo_is_blueprint,
     escalate_effort,
     get_project_integration_branch,
     get_project_promotion_target,
@@ -63,6 +64,35 @@ class _FakeProject:
         self.promotion_target = promotion_target
         self.is_self_repo = is_self_repo
         self.github_repo = "external-repo"
+
+
+class _RepoIdentityProject:
+    """Stand-in exposing only the columns the namespace classifier reads."""
+
+    def __init__(self, *, github_repo, is_self_repo=False):
+        self.github_repo = github_repo
+        self.is_self_repo = is_self_repo
+
+
+class TestBlueprintNamespaceByRepoIdentity:
+    """The 'blueprint' task-branch namespace is granted by repo identity, not by
+    the raw ``is_self_repo`` flag — so a non-Blueprint self-hosted repo keeps its
+    own namespace instead of being misrouted under ``blueprint/...``."""
+
+    def test_blueprint_alias_repo_is_classified_blueprint(self):
+        project = _RepoIdentityProject(github_repo="BlueprintAIStudio")
+        assert _project_repo_is_blueprint(project) is True
+
+    def test_non_blueprint_self_repo_is_not_blueprint_namespace(self):
+        """is_self_repo=True must NOT alone grant the canonical namespace."""
+        project = _RepoIdentityProject(
+            github_repo="some-other-repo", is_self_repo=True
+        )
+        assert _project_repo_is_blueprint(project) is False
+
+    def test_non_blueprint_external_repo_is_not_blueprint(self):
+        project = _RepoIdentityProject(github_repo="external-repo")
+        assert _project_repo_is_blueprint(project) is False
 
 
 class TestCustomBranchPairResolution:

@@ -35,6 +35,7 @@ from app.direction_metrics import (
     build_evicted_cycle_snapshot,
 )
 from app.direction_outcomes import credit_gate_merged_count
+from app.failure_classification import CO_DEFERRED_SHELVED
 from app.research_context import (
     _build_research_context,
     build_recent_findings_evidence,
@@ -134,8 +135,10 @@ def _append_archived_diagnosis(doc: dict, direction: dict, direction_id: str) ->
     """Archive a direction's diagnosis when it is completed/retired.
 
     Extracts the diagnosis summary from the direction's research_context and appends
-    it to doc['retired_diagnoses_archive']. Maintains FIFO list capped at
-    _ARCHIVED_DIAGNOSES_CAP entries, each truncated to _DIAGNOSIS_MAX_CHARS.
+    it to doc['retired_diagnoses_archive']. Deduplicates by direction_id: if an entry
+    with the same direction_id already exists, replaces it instead of appending.
+    Maintains FIFO list capped at _ARCHIVED_DIAGNOSES_CAP entries, each truncated
+    to _DIAGNOSIS_MAX_CHARS.
 
     Operates on the doc dict in place so it can be called inside
     with_design_doc_locked (which passes the freshly-locked dict).
@@ -146,6 +149,10 @@ def _append_archived_diagnosis(doc: dict, direction: dict, direction_id: str) ->
         return
     diagnosis = diagnosis.strip()[:_DIAGNOSIS_MAX_CHARS]
     archive = list(doc.get("retired_diagnoses_archive") or [])
+
+    # Deduplicate by direction_id: remove existing entry if present
+    archive = [e for e in archive if e.get("direction_id") != direction_id]
+
     archive.append(
         {
             "direction_id": direction_id,
@@ -616,7 +623,19 @@ async def apply_post_spawn_state(
                     entry = {
                         "timestamp": now_iso,
                         "task_id": str(task.id),
-                        "tasks_created": len(dir_child_tasks),
+                        "tasks_created": sum(
+                            1
+                            for ct in dir_child_tasks
+                            if not (
+                                ct.status == TaskStatus.CANCELLED
+                                and (
+                                    (ct.context or {}).get(
+                                        "prerequisite_escalated_to_parent"
+                                    )
+                                    or (ct.context or {}).get(CO_DEFERRED_SHELVED)
+                                )
+                            )
+                        ),
                         "findings_produced": findings_produced_by_dir.get(did, 0),
                         "batch_cap_applied": batch_cap_applied_count,
                         "summary": "; ".join(t[:60] for t in titles)
@@ -662,7 +681,17 @@ async def apply_post_spawn_state(
                     if no_findings_cycle and not titles:
                         entry["no_findings"] = True
                     # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats
-                    new_history = history + [entry]
+                    # Guard against duplicate task_ids on post-commit retry: if this task_id
+                    # is already in the history, skip the append to ensure idempotency.
+                    existing_task_ids = {e.get("task_id") for e in history}
+                    agg = d.get("history_aggregate") or {}
+                    for _ev in (agg.get("evicted_findings") or []):
+                        if _ev.get("task_id"):
+                            existing_task_ids.add(_ev.get("task_id"))
+                    if entry.get("task_id") not in existing_task_ids:
+                        new_history = history + [entry]
+                    else:
+                        new_history = history
                     if len(new_history) > 10:
                         d["history_aggregate"] = _fold_evicted_into_aggregate(
                             d.get("history_aggregate"), new_history[:-10]
@@ -879,39 +908,42 @@ async def apply_post_spawn_state(
                                 f"{_af_consec} consecutive scope-empty cycles (task {task.id})"
                             )
 
+                    # Guard against duplicate appends on post-commit retry: only update
+                    # recent_findings_evidence and outcome_progress_history if this is a
+                    # new task_id (same guard as research_history above).
+                    if entry.get("task_id") not in existing_task_ids:
+                        _evicted_out: list = []
+                        d["research_context"] = _build_research_context(
+                            prior_context=d.get("research_context"),
+                            finding_titles=finding_titles_by_dir.get(did, [])[:5],
+                            key_finding_descriptions=finding_descriptions_by_dir.get(
+                                did, []
+                            )[:5],
+                            finding_scopes=finding_scopes_by_dir.get(did, [])[:5],
+                            finding_claims=finding_claims_by_dir.get(did, [])[:5],
+                            finding_sources=finding_sources_by_dir.get(did, [])[:5],
+                            cycle_insights=[i["summary"][:200] for i in insights[:3]],
+                            history_entry=entry,
+                            prior_history=d.get("research_history", [])[:-1],
+                            evicted_out=_evicted_out,
+                        )
+                        _append_evicted_findings(d, _evicted_out)
+                        prior_rfe = list(d.get("recent_findings_evidence") or [])
+                        cur_rfe = build_recent_findings_evidence(
+                            finding_titles=finding_titles_by_dir.get(did, []),
+                            finding_claims=finding_claims_by_dir.get(did, []),
+                            finding_sources=finding_sources_by_dir.get(did, []),
+                        )
+                        d["recent_findings_evidence"] = (prior_rfe + cur_rfe)[-5:]
 
-                    _evicted_out: list = []
-                    d["research_context"] = _build_research_context(
-                        prior_context=d.get("research_context"),
-                        finding_titles=finding_titles_by_dir.get(did, [])[:5],
-                        key_finding_descriptions=finding_descriptions_by_dir.get(
-                            did, []
-                        )[:5],
-                        finding_scopes=finding_scopes_by_dir.get(did, [])[:5],
-                        finding_claims=finding_claims_by_dir.get(did, [])[:5],
-                        finding_sources=finding_sources_by_dir.get(did, [])[:5],
-                        cycle_insights=[i["summary"][:200] for i in insights[:3]],
-                        history_entry=entry,
-                        prior_history=d.get("research_history", [])[:-1],
-                        evicted_out=_evicted_out,
-                    )
-                    _append_evicted_findings(d, _evicted_out)
-                    prior_rfe = list(d.get("recent_findings_evidence") or [])
-                    cur_rfe = build_recent_findings_evidence(
-                        finding_titles=finding_titles_by_dir.get(did, []),
-                        finding_claims=finding_claims_by_dir.get(did, []),
-                        finding_sources=finding_sources_by_dir.get(did, []),
-                    )
-                    d["recent_findings_evidence"] = (prior_rfe + cur_rfe)[-5:]
+                        # Record the per-cycle outcome-progress snapshot (bounded) so the
+                        # advisory scaffolding detector can spot directions that keep
+                        # merging PRs without advancing their stated success_evidence.
+                        from app.strategic_completion import (
+                            record_outcome_progress_snapshot,
+                        )
 
-                    # Record the per-cycle outcome-progress snapshot (bounded) so the
-                    # advisory scaffolding detector can spot directions that keep
-                    # merging PRs without advancing their stated success_evidence.
-                    from app.strategic_completion import (
-                        record_outcome_progress_snapshot,
-                    )
-
-                    record_outcome_progress_snapshot(d)
+                        record_outcome_progress_snapshot(d)
 
                     # Auto-complete if saturated and proven by merged PRs.
                     # Require >= 3 merged PRs for the PROVEN route (retires a
@@ -936,6 +968,24 @@ async def apply_post_spawn_state(
                             )
                             - int(agg.get("total_stranded_prs_merged", 0) or 0),
                         )
+                        # Gate the PROVEN-merge SUCCESS route on outcome
+                        # coverage: a saturated direction must not retire
+                        # declaring success while an acceptance criterion it
+                        # owns is still uncovered. Fail-open (helper returns
+                        # False) preserves current behavior for directions that
+                        # own no criteria or on any query error. When gated, the
+                        # direction simply stays active — do NOT fall through to
+                        # the exhaustion route, which declares deadlock (not
+                        # success), not an unmet-but-productive outcome.
+                        _owns_uncovered = False
+                        if total_merged >= 3:
+                            from app.acceptance_criteria import (  # noqa: PLC0415
+                                direction_owns_uncovered_criterion,
+                            )
+
+                            _owns_uncovered = await direction_owns_uncovered_criterion(
+                                session, task.project_id, did
+                            )
                         if total_merged < 3:
                             await _maybe_autocomplete_exhausted_direction(
                                 session,
@@ -944,7 +994,7 @@ async def apply_post_spawn_state(
                                 did,
                                 _pending_archived_diagnoses,
                             )
-                        elif total_merged >= 3:
+                        elif total_merged >= 3 and not _owns_uncovered:
                             total_cycles = len(history) + (agg.get("total_cycles") or 0)
                             d["status"] = "completed"
                             d["completed_at"] = _utcnow().isoformat()
@@ -1143,7 +1193,14 @@ async def apply_post_spawn_state(
                         for _d in dirs:
                             if _d.get("id") == _target_id:
                                 _notes = list(_d.get("notes") or [])
-                                _notes.append(_note_entry)
+                                # Dedup: only append if no existing note has the same text and added_by_task
+                                _note_text = _note_entry.get("text", "")
+                                _note_task = _note_entry.get("added_by_task")
+                                if not any(
+                                    n.get("text") == _note_text and n.get("added_by_task") == _note_task
+                                    for n in _notes
+                                ):
+                                    _notes.append(_note_entry)
                                 if len(_notes) > STRATEGIC_NOTES_HISTORY_MAX:
                                     logger.warning(
                                         f"[RESEARCH] Task {task.id}: dropping {len(_notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {_target_id}"
@@ -1442,14 +1499,23 @@ async def _apply_terminal_transition(
             _zero_note_entry = {
                 "t": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 "msg": note,
+                "added_by_task": str(task.id),
             }
             session.expire(project, ["directions"])
 
             def _apply_zero_note(dirs: list) -> None:
                 for _d in dirs:
                     if _d.get("id") == direction_id:
-                        _d.setdefault("notes", [])
-                        _d["notes"] = (_d["notes"] or [])[-4:] + [_zero_note_entry]
+                        _notes = list(_d.get("notes") or [])
+                        # Dedup: only append if no existing note has the same msg and added_by_task
+                        _note_msg = _zero_note_entry.get("msg")
+                        _note_task = _zero_note_entry.get("added_by_task")
+                        if not any(
+                            n.get("msg") == _note_msg and n.get("added_by_task") == _note_task
+                            for n in _notes
+                        ):
+                            _notes.append(_zero_note_entry)
+                        _d["notes"] = _notes[-5:]
                         break
 
             await with_directions_locked(session, task.project_id, _apply_zero_note)

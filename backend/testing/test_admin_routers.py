@@ -561,6 +561,62 @@ class TestNullBranchConfigDiagnostics:
         assert skipped["is_self_repo"] is True
         assert "created_at" in skipped
 
+    @pytest.mark.asyncio
+    async def test_buckets_deploy_repo_by_identity_despite_misset_flag(
+        self, client: AsyncClient, db_session
+    ):
+        """Verify deploy-identity predicate is used instead of is_self_repo flag.
+
+        When a project matches the deploy identity (github_owner/repo) but has
+        is_self_repo=False (misset), it should still be classified in
+        self_repo_skipped because deploy-identity is the source of truth.
+        """
+        from app.runtime_config_state import runtime_config
+
+        # Set deploy identity via runtime_config (simulates DEPLOY_REPO_IDENTITY env)
+        runtime_config["deploy_repo_identity"] = "acme/deploy-repo"
+
+        # Create the actual deploy repo with misset is_self_repo flag
+        deploy_repo_misset = Project(
+            name="Deploy Repo (misset flag)",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="deploy-repo",
+            is_self_repo=False,  # Misset — should be True but isn't
+        )
+
+        # Create a properly configured non-deploy project
+        other_project = Project(
+            name="Other Project",
+            user_id=TEST_USER_ID,
+            github_owner="other",
+            github_repo="other-repo",
+            is_self_repo=False,
+        )
+
+        db_session.add_all([deploy_repo_misset, other_project])
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/diagnostics/null-branch-config")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        # The deploy_repo_misset should be in self_repo_skipped (despite is_self_repo=False)
+        # because it matches the deploy identity
+        assert data["total"] == 2
+        assert len(data["self_repo_skipped"]) == 1
+        skipped = data["self_repo_skipped"][0]
+        assert skipped["id"] == str(deploy_repo_misset.id)
+        assert skipped["name"] == "Deploy Repo (misset flag)"
+        assert skipped["github_owner"] == "acme"
+        assert skipped["github_repo"] == "deploy-repo"
+        assert skipped["is_self_repo"] is False  # Misset flag, but still skipped by identity
+
+        # The other project should be in projects (not skipped)
+        assert len(data["projects"]) == 1
+        project = data["projects"][0]
+        assert project["id"] == str(other_project.id)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_projects.py — Project CRUD + Autonomous Mode
@@ -9249,6 +9305,35 @@ class TestNotificationConfigSettings:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
+    async def test_patch_notification_config_runner_events_are_valid(
+        self, client: AsyncClient
+    ):
+        """The five runner-health event types are accepted by PATCH validation
+        so an operator can opt in (previously the allowlist rejected them as
+        unknown events, silently blocking every runner-health external page)."""
+        runner_events = [
+            "RUNNER_DEACTIVATED",
+            "RUNNER_DEGRADED",
+            "RUNNER_FLEET_OFFLINE",
+            "RUNNER_LOW_DISK",
+            "RUNNER_OUTAGE_ESCALATED",
+        ]
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "notification_config": {
+                    "webhook_url": "https://hooks.example.com/x",
+                    "enabled_events": ["TASK_FAILED", *runner_events],
+                    "throttle_seconds": 30,
+                }
+            },
+        )
+        assert resp.status_code == 200
+        nc = resp.json()["notification_config"]
+        for event in runner_events:
+            assert event in nc["enabled_events"]
+
+    @pytest.mark.asyncio
     async def test_get_settings_non_admin_returns_403(self, override_get_session):
         """Non-admin caller is blocked with 403 from GET /api/admin/settings."""
         from app.main import app as _app
@@ -15490,6 +15575,7 @@ class TestVersionLifecycleAcceptanceAggregate:
         assert current["acceptance_aggregate"] == {
             "proven": 0,
             "satisfied_unproven": 0,
+            "inferred_test_cochange": 0,
             "declared_unsatisfied": 0,
             "undeclared": 0,
             "merged_unverified_degraded": 0,
@@ -15942,8 +16028,10 @@ class TestVersionLifecycleChallengedVsUnchallenged:
         assert ch["insufficient_sample"] is False
         assert ch["sample_size"] == 3
         # 3 verdicts × 2 refuted_count each = 6 total refuted
+        # Each verdict: confirmed=1, refuted=2, uncertain=0 → 3 total reviewed per verdict
+        # Total reviewed = 3 × 3 = 9, Rate = 6/9 ≈ 0.667
         assert ch["challenge_refuted_count"] == 6
-        assert abs(ch["challenge_refuted_rate"] - round(6 / 3, 4)) < 1e-4
+        assert abs(ch["challenge_refuted_rate"] - round(6 / 9, 4)) < 1e-4
         # Unchallenged cohort absent — insufficient_sample, no challenge_refuted keys
         assert tel["unchallenged"]["insufficient_sample"] is True
         assert "challenge_refuted_count" not in tel["unchallenged"]
@@ -24167,7 +24255,7 @@ class TestGetReleaseVersionSummary:
     async def test_summary_acceptance_aggregate_buckets_present(
         self, client: AsyncClient, db_session
     ):
-        """acceptance_aggregate includes the standard six buckets plus total."""
+        """acceptance_aggregate includes the standard acceptance buckets plus total."""
         project = await _make_project(db_session)
         version = ReleaseVersion(
             project_id=project.id,

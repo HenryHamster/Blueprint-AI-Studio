@@ -1,20 +1,26 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // ── Module mocks ─────────────────────────────────────────────────────────────
-// Mock fs.existsSync so we can flip warm-vs-cold detection deterministically.
+// Mock fs so we can flip warm-vs-cold detection deterministically and intercept
+// the cold-path readdirSync / rmSync calls (which replaced the old execFileSync
+// 'rm -rf' invocation so that bwrap bind-mount points are cleaned in-place).
 const fsMocks = vi.hoisted(() => ({
   existsSync: vi.fn().mockReturnValue(false),
+  readdirSync: vi.fn().mockReturnValue([]),
+  rmSync: vi.fn(),
 }));
 
 vi.mock('fs', () => ({
   default: {
     existsSync: fsMocks.existsSync,
+    readdirSync: fsMocks.readdirSync,
+    rmSync: fsMocks.rmSync,
   },
 }));
 
-// child_process.execFileSync is the cold path's `rm -rf` AND every warm-path
-// `git ...` invocation. Mock it so each test can drive success/failure per
-// invocation.
+// child_process.execFileSync is every warm-path `git ...` invocation.
+// The cold path uses fs.readdirSync / fs.rmSync directly (not execFileSync).
+// Mock it so each test can drive success/failure per invocation.
 const execFileSyncMock = vi.hoisted(() => vi.fn().mockReturnValue(''));
 
 vi.mock('child_process', () => ({
@@ -70,6 +76,9 @@ describe('prepareWorkspaceForRole', () => {
     cloneWithRetryMock.mockResolvedValue(undefined);
     fsMocks.existsSync.mockReset();
     fsMocks.existsSync.mockReturnValue(false);
+    fsMocks.readdirSync.mockReset();
+    fsMocks.readdirSync.mockReturnValue([]);
+    fsMocks.rmSync.mockReset();
     logMock.mockReset();
     registerSizeCapMergeDriverMock.mockReset();
     writeGitTokenFileMock.mockReset();
@@ -88,7 +97,7 @@ describe('prepareWorkspaceForRole', () => {
   });
 
   // ── Cold path ──────────────────────────────────────────────────────────────
-  it('cold path: BLUEPRINT_WARM_HANDOFF unset → rm -rf + cloneWithRetry', async () => {
+  it('cold path: BLUEPRINT_WARM_HANDOFF unset → empty-in-place + cloneWithRetry', async () => {
     await prepareWorkspaceForRole({
       workspace: '/ws',
       repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
@@ -97,12 +106,11 @@ describe('prepareWorkspaceForRole', () => {
       depth: 50,
     });
 
-    // execFileSync called exactly once with rm -rf <workspace>.
-    const rmCall = execFileSyncMock.mock.calls.find(
-      c => c[0] === 'rm' && Array.isArray(c[1]) && (c[1] as string[]).includes('-rf'),
-    );
-    expect(rmCall).toBeDefined();
-    expect(rmCall?.[1]).toEqual(['-rf', '/ws']);
+    // Cold path empties the workspace in-place via fs.readdirSync / fs.rmSync
+    // (not execFileSync 'rm -rf') so bwrap bind-mount points are preserved.
+    expect(fsMocks.readdirSync).toHaveBeenCalledWith('/ws');
+    // Default mock returns [] so rmSync is not called (nothing to remove).
+    expect(fsMocks.rmSync).not.toHaveBeenCalled();
 
     // cloneWithRetry called with clean URL (no embedded token) and -c credential helper.
     expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
@@ -153,6 +161,59 @@ describe('prepareWorkspaceForRole', () => {
     ]);
   });
 
+  // ── Cold path: empty-in-place semantics ────────────────────────────────────
+  it('cold path: workspace has children → each child removed via fs.rmSync, mountpoint kept', async () => {
+    fsMocks.readdirSync.mockReturnValue(['file.txt', 'subdir']);
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'main',
+      depth: 50,
+    });
+
+    expect(fsMocks.readdirSync).toHaveBeenCalledWith('/ws');
+    // Each child removed individually; the mountpoint itself is never removed.
+    expect(fsMocks.rmSync).toHaveBeenCalledWith('/ws/file.txt', { recursive: true, force: true });
+    expect(fsMocks.rmSync).toHaveBeenCalledWith('/ws/subdir', { recursive: true, force: true });
+    expect(fsMocks.rmSync).toHaveBeenCalledTimes(2);
+    expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('cold path: readdirSync throws ENOENT (dir absent) → tolerated, clone proceeds', async () => {
+    const err = Object.assign(new Error('no such file or directory'), { code: 'ENOENT' });
+    fsMocks.readdirSync.mockImplementationOnce(() => { throw err; });
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'main',
+      depth: 50,
+    });
+
+    // ENOENT is swallowed; git clone will create the directory.
+    expect(fsMocks.rmSync).not.toHaveBeenCalled();
+    expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('cold path: readdirSync throws non-ENOENT error → propagated', async () => {
+    const err = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    fsMocks.readdirSync.mockImplementationOnce(() => { throw err; });
+
+    await expect(
+      prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+      }),
+    ).rejects.toThrow('permission denied');
+
+    expect(cloneWithRetryMock).not.toHaveBeenCalled();
+  });
+
   it('cold path: BLUEPRINT_WARM_HANDOFF=1 BUT no .git directory → still cold', async () => {
     process.env.BLUEPRINT_WARM_HANDOFF = '1';
     fsMocks.existsSync.mockReturnValue(false);
@@ -184,11 +245,9 @@ describe('prepareWorkspaceForRole', () => {
       baseBranch: 'main',
     });
 
-    // No rm -rf call.
-    const rmCalls = execFileSyncMock.mock.calls.filter(
-      c => c[0] === 'rm' && Array.isArray(c[1]) && (c[1] as string[]).includes('-rf'),
-    );
-    expect(rmCalls.length).toBe(0);
+    // No workspace cleaning on the warm path (no readdirSync/rmSync, no rm -rf).
+    expect(fsMocks.readdirSync).not.toHaveBeenCalled();
+    expect(fsMocks.rmSync).not.toHaveBeenCalled();
     // No cloneWithRetry call.
     expect(cloneWithRetryMock).not.toHaveBeenCalled();
 
@@ -293,7 +352,6 @@ describe('prepareWorkspaceForRole', () => {
         }
         return '';
       }
-      // rm -rf — succeed silently.
       return '';
     });
 
@@ -304,11 +362,8 @@ describe('prepareWorkspaceForRole', () => {
       branch: 'feature/x',
     });
 
-    // Cold path was taken after the warm-path failure.
-    const rmCall = execFileSyncMock.mock.calls.find(
-      c => c[0] === 'rm' && Array.isArray(c[1]) && (c[1] as string[]).includes('-rf'),
-    );
-    expect(rmCall).toBeDefined();
+    // Cold path was taken after the warm-path failure: workspace emptied in-place.
+    expect(fsMocks.readdirSync).toHaveBeenCalledWith('/ws');
     expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
     // We logged the warning about the warm path failure.
     const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
@@ -550,12 +605,9 @@ describe('prepareWorkspaceForRole', () => {
         depth: 0,
       });
 
-      // Cold path taken: rm -rf + cloneWithRetry, and the cold clone honors
-      // the depth-0 full-clone request (no --depth flag).
-      const rmCall = execFileSyncMock.mock.calls.find(
-        c => c[0] === 'rm' && Array.isArray(c[1]) && (c[1] as string[]).includes('-rf'),
-      );
-      expect(rmCall).toBeDefined();
+      // Cold path taken: workspace emptied in-place + cloneWithRetry, and the
+      // cold clone honors the depth-0 full-clone request (no --depth flag).
+      expect(fsMocks.readdirSync).toHaveBeenCalledWith('/ws');
       expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
       expect(cloneWithRetryMock).toHaveBeenCalledWith([
         '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
@@ -736,11 +788,8 @@ describe('prepareWorkspaceForRole', () => {
         branch: 'feat/lane',
       });
 
-      // Cold path taken after the warm-path failure.
-      const rmCall = execFileSyncMock.mock.calls.find(
-        c => c[0] === 'rm' && Array.isArray(c[1]) && (c[1] as string[]).includes('-rf'),
-      );
-      expect(rmCall).toBeDefined();
+      // Cold path taken after the warm-path failure: workspace emptied in-place.
+      expect(fsMocks.readdirSync).toHaveBeenCalledWith('/ws');
       expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
       const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
       expect(logged).toMatch(/warm path failed/i);

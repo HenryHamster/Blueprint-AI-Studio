@@ -92,6 +92,12 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 
 ### Operator Experience
 
+- **[RUNNER_RUNBOOK.md](RUNNER_RUNBOOK.md)** — Self-hosted runner enrollment runbook
+  - Per-shape steps for WSL PC, second PC, DGX, and lab server
+  - Expected `blueprint-runner check` output and GPU detection
+  - Common failure fixes and bwrap/container troubleshooting
+  - Multi-runner registration, observability, and partitioning
+
 - **[operator-experience-operating-model.md](operator-experience-operating-model.md)** — Canonical operator IA and decision loops
   - Five operator spaces: Operate, Work, Strategy, Fleet, Policy
   - Core object relationships (project, task, wave, PR, direction, finding, version, runner, account)
@@ -136,6 +142,7 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 
 - **Launch Blueprint locally** → [Quick Start in ../README.md](../README.md#quick-start-local-mode)
 - **Deploy to production** → [Deploy.md](../Deploy.md)
+- **Enroll a self-hosted runner** → [RUNNER_RUNBOOK.md](RUNNER_RUNBOOK.md)
 - **Onboard a new repository** → [ONBOARDING.md](ONBOARDING.md)
 - **Understand task lifecycle** → [TASK_LIFECYCLE.md](TASK_LIFECYCLE.md)
 - **Debug a failed task** → [DEBUG_GUIDE.md](DEBUG_GUIDE.md)

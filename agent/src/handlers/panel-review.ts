@@ -54,7 +54,7 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import type { BuildConfig } from '../index.js';
 import {
-  buildReviewChecklistSection,
+  buildLensScopedChecklistSection,
   buildReviewDiffAccessHint,
   buildReviewMasterPreamble,
   buildReviewSeverityGuideSection,
@@ -306,7 +306,7 @@ ${viewportScreenshotSection}Rules for your lens pass:
 
 ${buildReviewDiffAccessHint(baseBranch)}
 
-${buildReviewChecklistSection(buildConfig, baseBranch)}
+${buildLensScopedChecklistSection(lens.id, buildConfig, baseBranch)}
 
 ${buildReviewSeverityGuideSection()}
 
@@ -461,7 +461,7 @@ export async function handlePanelReview(
   const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
   const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
   const panelProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
-  const panelProjectIdForShots = strVal(panelProjectMeta?.project_id as string | undefined);
+  const panelProjectIdForShots = strVal(panelProjectMeta?.project_id);
   const panelOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
   let downloadedShotPaths: string[] = [];
   if (viewportShotEntries.length > 0 && viewportSourceTaskId && panelProjectIdForShots) {
@@ -554,7 +554,7 @@ export async function handlePanelReview(
   const challengeContext: ChallengeContext | undefined = isChallenge
     ? {
         primaryVerdict: strVal(
-          (payload.primary_verdict !== undefined ? payload.primary_verdict : taskContext?.primary_verdict) as string | undefined,
+          payload.primary_verdict !== undefined ? payload.primary_verdict : taskContext?.primary_verdict,
         ),
         primaryIssues: Array.isArray(payload.primary_issues)
           ? payload.primary_issues

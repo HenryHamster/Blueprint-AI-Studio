@@ -239,7 +239,7 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     messagePollMs: Math.min(idleTickMs, Math.max(750, Math.round(messagePollSec * 1000))),
     turnTimeoutMs: Math.max(15_000, Math.round(turnTimeoutSec * 1000)),
     autonomousEnabled,
-    // Never poll slower than the idle tick (60s floor keeps the session lively).
+    // Never poll slower than the idle tick (600s floor keeps the session lively).
     minTickMs: Math.max(idleTickMs, Math.round(minTickSec * 1000)),
     autonomousTurnTimeoutMs: Math.max(15_000, Math.round(autonomousTurnTimeoutSec * 1000)),
     maxOpsPerTurn,
@@ -423,6 +423,17 @@ conversation with the operator in memory. You operate at two speeds:
   Busy-work means unneeded MUTATION; examination is never busy-work. Then stop so
   the loop can check for operator input again. Your autonomous turn can be
   interrupted the moment the operator speaks.
+
+Dispatched work runs concurrently and independently of your own turn-by-turn
+reasoning: once you \`spawn_task\`, \`spawn_fix\`, or \`create_direction\` (and the
+autonomous research pipeline behind each active direction), that work executes
+in the pipeline regardless of your cadence — you do NOT have to finish or watch
+one before opening the next. When two pieces of intended work are genuinely
+independent (no shared files, no logical dependency, no real conflict risk),
+dispatching BOTH now is the DEFAULT — do not stage one behind the other merely
+to avoid context-switching, since there is no context to switch: the pipeline
+carries them in parallel. Sequence work only when there is a real dependency or
+conflict (the \`conflicts_with\` field marks that case).
 
 Never wait on the operator to proceed. Never claim the session is "done" — it
 ends only when the operator stops it.
@@ -930,6 +941,15 @@ export function buildAutonomousPrompt(
     'welcome: read code, task outcomes, a direction, or the qualification findings',
     'before deciding — do not stop at revision numbers or counts.',
     '',
+    'Dispatched work runs concurrently: once you spawn_task, spawn_fix, or',
+    'create_direction, that work executes in the pipeline regardless of your cadence.',
+    'When two pieces of work are genuinely independent (no shared files, no logical',
+    'dependency), dispatch BOTH now rather than staging one behind the other.',
+    '',
+    'Maintain a standing agenda in your session memory; act on the highest-leverage',
+    'item actionable NOW. If more actionable items remain after this turn, end with a',
+    'literal line: AGENDA-CONTINUE',
+    '',
     'Rotating examination focus (prefer the first; pick another ONLY with a concrete',
     'lead — your verdict MUST name the surface you actually examined):',
   );
@@ -951,14 +971,14 @@ export function buildAutonomousPrompt(
 
   lines.push(
     '',
-    'Maintain a standing agenda in your session memory; act on the highest-leverage',
-    'item actionable NOW. If more actionable items remain after this turn, end with a',
-    'literal line: AGENDA-CONTINUE',
-    '',
     'Operator visibility: do NOT send unsolicited durable messages. Use `./messages',
     "send` ONLY to reply to the operator or to surface something operator-actionable",
     '(a question, blocker, or real finding). Operator-facing status goes to',
-    '`set-running-update`. Idle is stated here in the stream, never in the inbox.',
+    '`set-running-update` — pass a FILE PATH, not inline markdown:',
+    '  write your markdown to /tmp/running_update.md first, then',
+    '  `./strategic set-running-update /tmp/running_update.md`.',
+    'The helper reads the file and wraps it as JSON; passing markdown as argv fails silently.',
+    'Idle is stated here in the stream, never in the inbox.',
     '',
     'Cheap delta signals — revision numbers, attempt counts, `git fetch`, unchanged',
     'payload fields — may be checked but can NEVER justify a CLEAR: "no change since',

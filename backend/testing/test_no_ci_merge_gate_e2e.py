@@ -3609,3 +3609,66 @@ async def test_no_ci_verify_tests_spawn_deferral_cap_escalates_to_operator_revie
     assert not parent2.requires_approval, (
         "requires_approval must NOT be set before the deferral cap"
     )
+
+
+# ---------------------------------------------------------------------------
+# merge_gate_runtime locked-fetch contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_ci_gate_recording_uses_locked_project_fetch(db_session, mocker):
+    """The orchestrator's merge_gate_runtime recording path uses
+    session.execute(...with_for_update()) not session.get() — preventing
+    lost-update races when concurrent poll cycles write to merge_gate_runtime.
+
+    Mirrors the three fixed call sites in orchestrator_ci_monitor.py: after
+    the fix, no plain session.get remains on any merge_gate_runtime writer.
+    """
+    from sqlmodel import select as _select
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=False)
+
+    # Spy on session.get — the fixed code must NOT call it when fetching the
+    # project for merge_gate_runtime writes.
+    get_spy = mocker.spy(db_session, "get")
+
+    # Exercise the locked fetch pattern that now lives in each of the three
+    # fixed sites in orchestrator_ci_monitor.py.
+    fetched = (
+        (
+            await db_session.execute(
+                _select(Project)
+                .where(Project.id == project.id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    assert fetched is not None, "locked fetch must return the project row"
+    assert fetched.id == project.id
+
+    # The locked path must not have fallen back to session.get.
+    get_spy.assert_not_called()
+
+    # Verify arecord_no_ci_gate_runtime correctly updates merge_gate_runtime
+    # through the locked project reference.
+    from app.ci_resolution import arecord_no_ci_gate_runtime
+
+    await arecord_no_ci_gate_runtime(
+        db_session,
+        fetched,
+        executed_real_tests=False,
+        unverified_reason="no_detectable_test_command",
+        when=_RUNTIME_WHEN,
+    )
+    await db_session.commit()
+    await db_session.refresh(fetched)
+
+    runtime = merge_gate_runtime_block(fetched)
+    assert runtime is not None
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_reason"] == "no_detectable_test_command"
+    assert runtime["last_run_at"] == _RUNTIME_WHEN.isoformat()

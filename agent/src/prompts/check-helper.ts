@@ -2,12 +2,13 @@ import fs from 'fs';
 import { WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { SHELL_CMD_RE } from '../shell-safety.js';
-import { agentTokenShellFn } from '../token-file.js';
+import { agentTokenShellFn, jsonFieldShellFn } from '../token-file.js';
 import {
   buildScopedLintOneliner,
   detectLinterKind,
   validateCfgShellSafety,
   isBlueprintSelfRepo,
+  shouldRunBackendMergeGate,
   sanitizeCiFailureSelectors,
   type CodeChangeHelperConfig,
 } from './code-change-helpers.js';
@@ -164,7 +165,16 @@ function buildImpactedTestBlock(taskId: string): string {
     # bounded under the sanctioned Postgres harness so an impacted-test failure
     # blocks ./pr open instead of leaking to the promotion suite.
     IMPACTED_TEST_CAP=8
-    _it_all=$(printf '%s\\n' "$CHANGED" | python3 backend/testing/impacted_tests.py 2>/dev/null || true)
+    _it_stderr_f=$(mktemp /tmp/check_impacted_XXXXXX)
+    _it_all=$(printf '%s\\n' "$CHANGED" | python3 backend/testing/impacted_tests.py 2>"$_it_stderr_f")
+    _it_rc=$?
+    if [ "$_it_rc" -ne 0 ]; then
+      echo "[check] impacted-test resolver: crashed (exit $_it_rc) — stderr follows:" >&2
+      cat "$_it_stderr_f" >&2
+      echo "[check] impacted-test resolver: crash surfaced as gate failure" >&2
+      FAILED+=("impacted-test resolver crash")
+    fi
+    rm -f "$_it_stderr_f"
     if [ -n "$_it_all" ]; then
       _it_count=$(printf '%s\\n' "$_it_all" | grep -c '^' || true)
       if [ "$_it_count" -gt "$IMPACTED_TEST_CAP" ]; then
@@ -208,7 +218,7 @@ function buildViewportUploadBlock(taskId: string): string {
   return `
       # ── viewport screenshot upload (PR-only regression evidence) ──────────
       # Non-fatal: missing JSON / PNG / tools / token → WARN and skip.
-      if command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \\
+      if command -v curl >/dev/null 2>&1 \\
           && _load_agent_token 2>/dev/null && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
         VP_JSON="admin-ui/test-results/viewport-failures.json"
         if [ -f "$VP_JSON" ]; then
@@ -268,8 +278,8 @@ function buildViewportUploadBlock(taskId: string): string {
               echo "[check] WARN: viewport upload — signing request failed for $_vp_comp@\${_vp_width}px"
               continue
             }
-            _vp_url=$(printf '%s' "$_vp_resp" | jq -r '.upload_url // empty' 2>/dev/null || true)
-            _vp_uri=$(printf '%s' "$_vp_resp" | jq -r '.storage_uri // empty' 2>/dev/null || true)
+            _vp_url=$(printf '%s' "$_vp_resp" | _json_field upload_url 2>/dev/null || true)
+            _vp_uri=$(printf '%s' "$_vp_resp" | _json_field storage_uri 2>/dev/null || true)
             if [ -z "$_vp_url" ]; then
               echo "[check] WARN: viewport upload — empty upload_url for $_vp_comp@\${_vp_width}px"
               continue
@@ -286,14 +296,17 @@ function buildViewportUploadBlock(taskId: string): string {
             cp "$_vp_png" "$_vp_local_path" 2>/dev/null || true
             echo "[check] viewport screenshot uploaded: $_vp_uri ($_vp_comp@\${_vp_width}px) — local copy: $_vp_local_path"
           done < <(
-            jq -r '
-              .testResults[]
-              | ((.name // .filepath // .file // .testFile // "") | tostring) as $file
-              | .assertionResults[]
-              | select(.status=="failed")
-              | [$file, (.fullName // .title // "")]
-              | @tsv
-            ' "$VP_JSON" 2>/dev/null || true
+            python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for tr in data.get("testResults", []):
+    fname = tr.get("name") or tr.get("filepath") or tr.get("file") or tr.get("testFile") or ""
+    for ar in tr.get("assertionResults", []):
+        if ar.get("status") == "failed":
+            title = ar.get("fullName") or ar.get("title") or ""
+            print(fname + "\t" + title)
+' "$VP_JSON" 2>/dev/null || true
           )
         fi
       fi
@@ -336,7 +349,7 @@ function buildVisualCaptureBlock(taskId: string, component: string, width: numbe
 # satisfiable (the upload stamps the canonical (component, width) context URI
 # the acceptance gate resolves against).
 if [ \${#FAILED[@]} -eq 0 ] && admin_ui_runtime_touched \\
-    && command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \\
+    && command -v curl >/dev/null 2>&1 \\
     && _load_agent_token 2>/dev/null && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
   _VA_COMPONENT='${component}'
   _VA_WIDTH=${width}
@@ -363,8 +376,8 @@ if [ \${#FAILED[@]} -eq 0 ] && admin_ui_runtime_touched \\
     if [ -z "$_VA_RESP" ]; then
       echo "[check] WARN: visual acceptance — signing request failed for $_VA_COMPONENT@\${_VA_WIDTH}px"
     else
-      _VA_URL=$(printf '%s' "$_VA_RESP" | jq -r '.upload_url // empty' 2>/dev/null || true)
-      _VA_URI=$(printf '%s' "$_VA_RESP" | jq -r '.storage_uri // empty' 2>/dev/null || true)
+      _VA_URL=$(printf '%s' "$_VA_RESP" | _json_field upload_url 2>/dev/null || true)
+      _VA_URI=$(printf '%s' "$_VA_RESP" | _json_field storage_uri 2>/dev/null || true)
       if [ -z "$_VA_URL" ]; then
         echo "[check] WARN: visual acceptance — empty upload_url for $_VA_COMPONENT@\${_VA_WIDTH}px"
       elif curl -sf -T "$_VA_PNG" -H "Content-Type: image/png" "$_VA_URL"; then
@@ -413,6 +426,7 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   const ciFailureSelectors = sanitizeCiFailureSelectors(cfg.ciFailureSelectors);
   const agentTokenFn = agentTokenShellFn();
+  const jsonFieldFn = jsonFieldShellFn();
   // Auto-detects which stacks were touched (admin-ui / agent / backend) by
   // inspecting `git diff --name-only` against the base branch + uncommitted.
   // Runs the corresponding lint/build commands plus the admin-ui browser-mode
@@ -437,6 +451,7 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
 
 set -uo pipefail
 ${agentTokenFn}
+${jsonFieldFn}
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
@@ -566,7 +581,7 @@ if admin_ui_runtime_touched; then
   # 2) BASELINE: if the (scoped or full) run fails, re-run the SAME
   #    subset against origin/$BASE in a detached worktree. Both fail →
   #    pre-existing → warn-pass (mirrors frontend CI's BROKEN/OK
-  #    pattern at .github/workflows/ci.yml line 111-143). PR-only fail →
+  #    pattern). PR-only fail →
   #    real regression → block. Worktree path keeps the agent's working
   #    tree untouched.
   ADMIN_UI_CHANGED=$(printf '%s\\n' "$CHANGED" | grep -E '^admin-ui/' || true)
@@ -708,7 +723,8 @@ ${buildViewportUploadBlock(cfg.taskId)}      fi
     fi
   fi
 
-  run "admin-ui build"   bash -c 'cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run build 2>&1'
+  # Typecheck on agent VM; vite bundle OOMs here and is CI's job.
+  run "admin-ui typecheck" bash -c 'cd admin-ui && npm run typecheck 2>&1'
 
   # Run the admin-ui unit vitest suite on EVERY ./check (not gated behind \`test\`):
   # mirrors the agent-vitest rationale — ./pr open gates on plain ./check, so
@@ -773,15 +789,16 @@ if touches backend/; then
   else
     echo "[check] ruff not installed, skipping backend lint"
   fi
-  if [ "$WITH_TESTS" = "1" ] && [ "${(cfg.promotionTarget !== undefined ? cfg.baseBranch === cfg.promotionTarget : cfg.testsOnMainBranch) ? '1' : '0'}" = "1" ]; then
+  if [ "$WITH_TESTS" = "1" ] && [ "${shouldRunBackendMergeGate(cfg) ? '1' : '0'}" = "1" ]; then
     # --standalone --no-postgres: agent VM is e2-standard-2 (8 GB) and
     # cannot fit Docker build + Postgres sidecar + full pytest suite +
     # agent + Claude subprocess in memory. The full suite OOMs (exit
     # 137) during the mandatory pre-PR gate (53ef061b, b150b4d6, b15b6813
-    # all died this way 2026-05-05). Standalone runs the 3 invariant
-    # files (security, pipeline, invariants) which catch file-size
-    # breaches, security regressions, and basic pipeline assertions —
-    # the rest is CI's job. \`set -o pipefail\` so the harness's non-zero
+    # all died this way 2026-05-05). Standalone runs the ~10-file
+    # invariant set (security, pipeline, invariants, audit-finding-class,
+    # admin-auth, metric-manifest + emitter-inventory contracts) which
+    # catches file-size breaches, security regressions, and basic pipeline
+    # and contract assertions — the rest is CI's job. \`set -o pipefail\` so the harness's non-zero
     # exit propagates through \`| tail\` (same rationale as the agent
     # vitest line above — the outer pipefail does not reach a fresh bash -c).
     run "backend pytest" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'

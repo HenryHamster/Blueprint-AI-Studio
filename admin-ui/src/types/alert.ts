@@ -13,6 +13,7 @@ export interface Alert {
   task_id: string | null;
   created_at: string;
   dismissed_at: string | null;
+  acknowledged_at: string | null;
 }
 
 export interface AlertFilters {

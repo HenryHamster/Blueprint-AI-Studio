@@ -1664,6 +1664,99 @@ def test_compute_digest_cost_economics_excludes_non_merge_unblocks():
     assert by_type["create"]["merged_count"] == 1
 
 
+def test_cost_per_merge_excludes_typeless_bucket_from_median():
+    """Typeless bucket ("unknown" type) is excluded from median that drives retirement threshold.
+
+    When tasks have no declared type in first_payload, they default to "unknown".
+    The median_cpm_by_type should only include real task types, not the phantom
+    "unknown" bucket, so that retirement thresholds are computed from meaningful
+    type cohorts rather than being skewed by untyped tasks.
+    """
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+
+    # Create task with "create" type, 1 hour, merged
+    create_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        context={"pr_merged": True},
+    )
+
+    # Create task with "refactor" type, 2 hours, merged
+    refactor_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "refactor"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(minutes=30),
+        context={"pr_merged": True},
+    )
+
+    # Create task with NO type (defaults to "unknown"), 100 hours, merged
+    # With three task types having costs [1h, 2h, 100h]:
+    # - Median including unknown: statistics.median([1h, 2h, 100h]) = 2h
+    # - Median excluding unknown: statistics.median([1h, 2h]) = 1.5h
+    # These are clearly different, so the test will catch the bug
+    typeless_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{}],  # No type field
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=100),
+        vm_stopped_at=now - timedelta(minutes=30),
+        context={"pr_merged": True},
+    )
+
+    result = compute_digest_cost_economics(
+        all_tasks=[create_task, refactor_task, typeless_task],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+
+    by_type = result["cost_per_merge_by_type"]
+
+    # All three types should be present in the result
+    assert "create" in by_type
+    assert "refactor" in by_type
+    assert "unknown" in by_type
+
+    # All should have merged counts and costs
+    assert by_type["create"]["merged_count"] == 1
+    assert by_type["refactor"]["merged_count"] == 1
+    assert by_type["unknown"]["merged_count"] == 1
+
+    create_cpm = by_type["create"]["cost_per_merge"]
+    refactor_cpm = by_type["refactor"]["cost_per_merge"]
+    unknown_cpm = by_type["unknown"]["cost_per_merge"]
+
+    # Verify costs are as expected (roughly proportional to runtime)
+    assert create_cpm is not None
+    assert refactor_cpm is not None
+    assert unknown_cpm is not None
+    assert refactor_cpm > create_cpm  # 2 hours > 1 hour
+    assert unknown_cpm > refactor_cpm * 10  # 100 hours >> 2 hours
+
+    # The critical assertion: median should be based on create and refactor only
+    # (the "real" types), not include the expensive "unknown" bucket.
+    # Median with all three = 2h * rate (the middle value of [1h, 2h, 100h])
+    # Median without unknown = 1.5h * rate (average of [1h, 2h])
+    # These are distinctly different.
+    median_cpm = result["median_cpm_by_type"]
+    expected_median_without_unknown = (create_cpm + refactor_cpm) / 2
+    expected_median_with_unknown = refactor_cpm  # Median of sorted [create, refactor, unknown]
+
+    # The median should be close to the average of create and refactor
+    # (excluding the expensive unknown bucket), NOT including unknown
+    assert median_cpm is not None
+    assert abs(median_cpm - expected_median_without_unknown) < expected_median_without_unknown * 0.01
+    # Make sure it's NOT close to the median that would include unknown
+    assert abs(median_cpm - expected_median_with_unknown) > expected_median_with_unknown * 0.1
+
+
 def test_pipeline_conversion_rate_uses_pr_eligible_denominator():
     """Headline pipeline_conversion_rate divides merges by PR-eligible tasks only.
 
@@ -1783,11 +1876,10 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
     assert "pipeline_outcome_kind_breakdown" not in result
 
 
-def test_compute_digest_cost_economics_pipeline_uses_verified_merged():
-    """Pipeline acceptance/conversion rates sum the verified merge count, so a
-    direction whose only merges are unverified-degraded does not inflate the
-    headline rate, while a direction with genuine verified merges contributes
-    normally — matching the verified per-direction rates the pipeline aggregates."""
+def test_compute_digest_cost_economics_pipeline_uses_raw_acceptance_rate():
+    """Pipeline acceptance/conversion rates sum RAW merge counts (operator-accepted),
+    matching the per-direction acceptance_rate convention in digest_direction_progress
+    and direction_metrics. Unverified-degraded merges are counted like any other."""
     now = _utcnow()
     dirs = [
         {
@@ -1816,25 +1908,23 @@ def test_compute_digest_cost_economics_pipeline_uses_verified_merged():
         now=now,
         daily_cost_ceiling_usd=0.0,
     )
-    # Verified merged = 3 + 0 = 3 (NOT raw 3 + 2 = 5).
-    # acceptance = 3 / (3 + 2 rejected) = 0.6; conversion = 3 / 15 created = 0.2.
-    assert result["pipeline_acceptance_rate"] == 0.6
-    assert result["pipeline_conversion_rate"] == 0.2
-    # The degraded merges lower BOTH rates versus the raw-count rollup, which
-    # would have produced acceptance 5/7 ≈ 0.714 and conversion 5/15 ≈ 0.333.
-    assert result["pipeline_acceptance_rate"] < round(5 / 7, 3)
-    assert result["pipeline_conversion_rate"] < round(5 / 15, 3)
+    # Raw merged = 3 + 2 = 5; rejected = 1 + 1 = 2.
+    # acceptance = 5 / (5 + 2) = 5/7 ≈ 0.714; conversion = 5 / 15 ≈ 0.333.
+    assert result["pipeline_acceptance_rate"] == round(5 / 7, 3)
+    assert result["pipeline_conversion_rate"] == round(5 / 15, 3)
 
 
-def test_compute_digest_cost_economics_pipeline_verified_fallback():
-    """A direction dict lacking verified_prs_merged falls back to raw prs_merged
-    so legacy/partial entries degrade to prior behavior rather than to zero."""
+def test_compute_digest_cost_economics_pipeline_raw_with_verified_present():
+    """Pipeline acceptance rates use raw prs_merged regardless of whether
+    verified_prs_merged is present. The verified field is ignored for
+    acceptance_rate (though still used separately for verified-specific metrics)."""
     now = _utcnow()
     dirs = [
         {
-            # Legacy dict: no verified_prs_merged key → falls back to prs_merged.
+            # Raw and verified differ; raw is used.
             "estimated_cost_usd": 0.0,
             "prs_merged": 4,
+            "verified_prs_merged": 2,
             "prs_rejected": 1,
             "tasks_created": 8,
             "pr_eligible_tasks_created": 8,
@@ -1855,9 +1945,9 @@ def test_compute_digest_cost_economics_pipeline_verified_fallback():
         now=now,
         daily_cost_ceiling_usd=0.0,
     )
-    # merged = 4 (fallback) + 1 (verified) = 5; rejected = 1; created = 12.
-    assert result["pipeline_acceptance_rate"] == round(5 / 6, 3)
-    assert result["pipeline_conversion_rate"] == round(5 / 12, 3)
+    # merged = 4 + 3 = 7 (RAW, not verified 2 + 1 = 3); rejected = 1; created = 12.
+    assert result["pipeline_acceptance_rate"] == round(7 / 8, 3)
+    assert result["pipeline_conversion_rate"] == round(7 / 12, 3)
 
 
 def test_cost_economics_includes_llm_dollar_companions():
@@ -3886,6 +3976,51 @@ def test_duplicate_foundation_signal_ignores_non_write_tasks():
 
     assert result["total"] == 0
     assert result["candidates"] == []
+
+
+def test_duplicate_foundation_signal_includes_qa_docs_deps():
+    """QA/docs/deps write-tasks that produce PRs ARE included in duplicate-foundation
+    detection (not limited to SR code-change types create/fix/refactor/migrate)."""
+    from app.digest_metrics import compute_duplicate_foundation_signal
+
+    files = ["app/foundation.py", "app/db.py"]
+    p_a, p_b, p_c, p_d, p_e = uuid4(), uuid4(), uuid4(), uuid4(), uuid4()
+
+    # Each task gets a unique parent so they're all flagged as cross-parent duplicates
+    qa_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_a,
+        payloads=[{"type": "qa", "related_files": files}],
+    )
+    create_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_b,
+        payloads=[{"type": "create", "related_files": files}],
+    )
+    docs_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_c,
+        payloads=[{"type": "docs", "related_files": files}],
+    )
+    fix_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_d,
+        payloads=[{"type": "fix", "related_files": files}],
+    )
+    deps_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_e,
+        payloads=[{"type": "deps", "related_files": files}],
+    )
+
+    result = compute_duplicate_foundation_signal([qa_task, create_task, docs_task, fix_task, deps_task])
+
+    # With 5 tasks all sharing the same files and different parents, we get C(5,2) = 10 pairs
+    assert result["total"] == 10
+    # All candidates should have strong overlap (all share identical files)
+    for cand in result["candidates"]:
+        assert cand["overlap_ratio"] == 1.0
+        assert cand["shared_files"] == ["app/db.py", "app/foundation.py"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

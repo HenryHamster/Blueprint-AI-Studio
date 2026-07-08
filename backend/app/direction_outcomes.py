@@ -36,6 +36,7 @@ from app.acceptance_gate import (
     acceptance_is_proven,
     acceptance_was_declared,
     classify_merged_acceptance,
+    classify_merged_acceptance_context,
 )
 from app.landed_signal import (
     LANDED_ON_INTEGRATION_KEY,
@@ -45,6 +46,8 @@ from app.landed_signal import (
 from app.models import (
     Artifact,
     ArtifactType,
+    ComputeJob,
+    ComputeJobStatus,
     Project,
     Task,
     TaskStatus,
@@ -305,6 +308,10 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
       * proven ⊆ verified ⊆ merged
         (0 ≤ acceptance_proven_merged ≤ verified_prs_merged ≤ prs_merged)
       * declared ⊆ merged          (acceptance_declared_merged ≤ prs_merged)
+      * inferred ⊆ merged-write, disjoint from declared
+        (0 ≤ acceptance_inferred_merged ≤ acceptance_merged_write_total and
+         acceptance_inferred_merged + acceptance_declared_merged
+         ≤ acceptance_merged_write_total)
       * coverage identity          (acceptance_declaration_coverage ==
         round(declared / merged-write, 3), or None ⇔ merged-write == 0)
 
@@ -318,11 +325,14 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
     proven = proven_merged_count(entry)
     consumed = consumed_merged_count(entry)
     declared = int(entry.get("acceptance_declared_merged") or 0)
+    inferred = int(entry.get("acceptance_inferred_merged") or 0)
     verified = verified_merged_count(entry)
     prs_merged = int(entry.get("prs_merged") or 0)
 
     if proven < 0:
         violations.append(f"proven ({proven}) is negative")
+    if inferred < 0:
+        violations.append(f"inferred ({inferred}) is negative")
     if consumed < 0:
         violations.append(f"consumed ({consumed}) is negative")
     if consumed > proven:
@@ -396,6 +406,19 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
         if verified_write > verified:
             violations.append(
                 f"verified-write ({verified_write}) exceeds verified ({verified})"
+            )
+        # inferred_test_cochange merges are a subset of merged-write, and are
+        # disjoint from declared merges (the classifier only infers when no
+        # verdict dict is present), so declared + inferred also cannot exceed the
+        # merged-write population.
+        if inferred > merged_write:
+            violations.append(
+                f"inferred ({inferred}) exceeds merged-write ({merged_write})"
+            )
+        if inferred + declared > merged_write:
+            violations.append(
+                f"inferred + declared ({inferred + declared}) exceeds "
+                f"merged-write ({merged_write})"
             )
         if merged_write <= 0:
             if coverage is not None:
@@ -504,13 +527,45 @@ def _longest_chain_length(deps_map: dict[str, list[str]]) -> int:
     return max((depth(n, frozenset()) for n in nodes), default=0)
 
 
-def _apply_cochange_to_doc(doc: dict, merged_files_lists: list[list[str]]) -> None:
+def _apply_cochange_to_doc(
+    doc: dict,
+    merged_files_lists: list[list[str]],
+    pr_keys: list[str] | None = None,
+) -> None:
     """Apply co-change affinity index updates to a design_doc dict in place.
 
     Core logic extracted from _update_cochange_index so it can be called
     inside with_design_doc_locked (which passes the doc dict directly).
+
+    When pr_keys is provided (a list aligned with merged_files_lists), each
+    entry is only folded in once — already-applied keys are skipped.  If all
+    keys are already recorded the function returns without touching the index
+    (no spurious decay).  The applied-key set is capped at 1000 entries; an
+    evicted key may be re-folded on the next refresh at most once, which is
+    safe (it does not corrupt scores the way saturation does).
     """
-    if not merged_files_lists:
+    APPLIED_CAP = 1000
+
+    if pr_keys is not None:
+        # Idempotent path: filter to only genuinely-new PRs.
+        applied_list: list[str] = list(doc.get("cochange_applied_prs") or [])
+        applied_set = set(applied_list)
+        new_pairs = [
+            (key, files)
+            for key, files in zip(pr_keys, merged_files_lists)
+            if key not in applied_set
+        ]
+        if not new_pairs:
+            return
+        new_keys = [key for key, _ in new_pairs]
+        effective_files_lists = [files for _, files in new_pairs]
+    else:
+        # Legacy path: no idempotency tracking; apply all lists as before.
+        new_keys = []
+        effective_files_lists = merged_files_lists
+        applied_list = []
+
+    if not effective_files_lists:
         return
 
     DECAY = 0.90
@@ -532,7 +587,7 @@ def _apply_cochange_to_doc(doc: dict, merged_files_lists: list[list[str]]) -> No
             del index[file_key]
 
     # Accumulate new co-change pairs from each merged PR
-    for files in merged_files_lists:
+    for files in effective_files_lists:
         unique_files = list(dict.fromkeys(files))
         if len(unique_files) < 2:
             continue
@@ -561,6 +616,13 @@ def _apply_cochange_to_doc(doc: dict, merged_files_lists: list[list[str]]) -> No
         index = {f: index[f] for f in top_files}
 
     doc["cochange_index"] = index
+
+    # Persist applied keys (idempotent path only).
+    if pr_keys is not None and new_keys:
+        updated_applied = applied_list + new_keys
+        if len(updated_applied) > APPLIED_CAP:
+            updated_applied = updated_applied[-APPLIED_CAP:]
+        doc["cochange_applied_prs"] = updated_applied
 
 
 def _update_cochange_index(
@@ -617,6 +679,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
         "consumer": "direction_lifecycle.py / admin.py (cumulative spend), strategic_analysis.py"
     },
     # --- Terminal task counts ---
+    "tasks_created": {
+        "consumer": "direction_metrics.py (total_tasks_created + momentum/conversion), anomaly_detection.py, claim_task_helpers.py, digest_direction_progress.py (conversion denominator)"
+    },
     "tasks_completed": {
         "consumer": "direction_metrics.py, strategic_completion.py, research_completion.py"
     },
@@ -676,6 +741,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     },
     "acceptance_declared_merged": {
         "consumer": "digest_direction_progress.py (declaration coverage), strategic_spawning.py, direction_metrics.py (total_acceptance_declared_merged)"
+    },
+    "acceptance_inferred_merged": {
+        "consumer": "direction_metrics.py (total_acceptance_inferred_merged lifetime fold + build_evicted_cycle_snapshot), acceptance_metric_invariant_violations (this module, inferred-ordering guard)"
     },
     "acceptance_merged_write_total": {
         "consumer": "digest_direction_progress.py + strategic_spawning.py (coverage denominator), direction_metrics.py (total_acceptance_merged_write_total)"
@@ -1037,6 +1105,7 @@ async def _update_direction_research_outcomes(
     if not project:
         return
     merged_files_lists: list[list[str]] = []
+    merged_pr_keys: list[str] = []
     # Snapshot read for early-exit guards and computation base; the actual
     # write is serialized via with_directions_locked below.
     d = next(
@@ -1376,6 +1445,33 @@ async def _update_direction_research_outcomes(
             return True
         return bool((ct.first_payload or {}).get("pr_number"))
 
+    def _associated_with_pr(ct: Task) -> bool:
+        """True when *ct* is associated with a real PR — for the no-op gate ONLY.
+
+        Unlike ``_opened_pr``, this predicate does NOT skip the pr_number
+        signals for 'review', 'fix', and 'panel_review' types.  For the
+        no-CODE-no-op question, ANY association with a real pull request
+        disqualifies the child: a fix task that pushed code onto an existing
+        open (not-yet-landed) PR carries ``context['review_loop']['pr_number']``
+        (and often ``context['pr_number']``) but no PULL_REQUEST artifact of
+        its own, so ``_opened_pr`` returns False — yet it emphatically churned
+        code and is NOT a "work already exists" no-op.
+
+        Do NOT reuse this for the merge-VOLUME metrics (``merged_prs_any_base``
+        and others): there the fix/review/panel_review pr_number skip in
+        ``_opened_pr`` is correct (a review's pr_number is the PR under review,
+        not a merge that task produced).
+        """
+        if _opened_pr(ct):
+            return True
+        ctx_ = ct.context or {}
+        review_loop = ctx_.get("review_loop")
+        if isinstance(review_loop, dict) and review_loop.get("pr_number"):
+            return True
+        if ctx_.get("pr_number") or ctx_.get("rollup_pr_number"):
+            return True
+        return bool((ct.first_payload or {}).get("pr_number"))
+
     # Per-(provider, model) cost rollup using the shared pair-atomic helper so
     # both this path and the digest path stay consistent and cannot produce
     # chimera keys (e.g. openai|claude-opus-4-8 from independently-resolved
@@ -1391,12 +1487,54 @@ async def _update_direction_research_outcomes(
                 cost_by_provider_model.get(bucket_key, 0.0) + t_cost
             )
             cycle_cost_total += t_cost
+
+    # Include ComputeJob.final_cost_usd for compute_experiment tasks. These tasks
+    # run on compute substrate rather than a VM, so their real spend lives on the
+    # ComputeJob ledger while the monitoring task's vm_runtime_cost is ~$0. Without
+    # this the direction's estimated_cost_usd is silently deflated, causing the
+    # cost-budget auto-pause gate to never fire on compute-heavy directions.
+    _child_ids = [ct.id for ct in child_tasks_rows]
+    if _child_ids:
+        _compute_terminal_statuses = {
+            ComputeJobStatus.SUCCEEDED,
+            ComputeJobStatus.FAILED,
+            ComputeJobStatus.CANCELLED,
+            ComputeJobStatus.TIMED_OUT,
+        }
+        _cj_stmt = select(ComputeJob.final_cost_usd).where(
+            ComputeJob.task_id.in_(_child_ids),
+            ComputeJob.final_cost_usd.is_not(None),
+            ComputeJob.status.in_(_compute_terminal_statuses),
+        )
+        _cj_rows = (await session.execute(_cj_stmt)).scalars().all()
+        for _cj_cost in _cj_rows:
+            _cost = float(_cj_cost)
+            if _cost > 0:
+                cost_by_provider_model["compute|substrate"] = (
+                    cost_by_provider_model.get("compute|substrate", 0.0) + _cost
+                )
+                cycle_cost_total += _cost
+
     if cost_by_provider_model:
         entry["cost_by_provider_model"] = {
             k: round(v, 4) for k, v in cost_by_provider_model.items()
         }
         entry["estimated_cost_usd"] = round(cycle_cost_total, 4)
 
+    # Exclude children cancelled at spawn time by prerequisite wiring
+    # (escalated-to-parent or co-deferred-shelved) — they were inserted but
+    # never ran, so counting them inflates tasks_created and masks saturation.
+    entry["tasks_created"] = sum(
+        1
+        for ct in child_tasks_rows
+        if not (
+            ct.status == TaskStatus.CANCELLED
+            and (
+                (ct.context or {}).get("prerequisite_escalated_to_parent")
+                or (ct.context or {}).get(CO_DEFERRED_SHELVED)
+            )
+        )
+    )
     entry["tasks_completed"] = sum(
         1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED
     )
@@ -1442,20 +1580,28 @@ async def _update_direction_research_outcomes(
         for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_rejected")
     )
-    # tasks_completed_no_pr: children that COMPLETED correctly without ever
-    # opening a PR — "no changes needed / work already exists" outcomes. These
-    # are a healthy result, NOT churn, so a downstream zero-merge/churn guard
-    # must be able to subtract them from the completed-but-unmerged population.
-    # Excludes merged completions (is_merged_completion) and pr_rejected ones so
-    # only genuine no-PR completions are counted; ``_opened_pr`` gates on the
-    # canonical PULL_REQUEST artifact (plus pr_number fallbacks).
+    # tasks_completed_no_pr: children that COMPLETED correctly without producing
+    # any code toward ANY pull request — genuine "no changes needed / work
+    # already exists" no-CODE no-ops. These are a healthy result, NOT churn, so
+    # a downstream zero-merge/churn guard must be able to subtract them from the
+    # completed-but-unmerged population.
+    #
+    # Excludes merged completions (is_merged_completion) and pr_rejected ones,
+    # AND — via ``_associated_with_pr`` rather than ``_opened_pr`` — any
+    # fix/review/panel_review child attached to an open (unmerged) PR.  A fix
+    # task that pushed code onto an existing open PR carries a pr_number in
+    # context/review_loop but no PULL_REQUEST artifact of its own, so
+    # ``_opened_pr`` returns False for it; counting it here would wrongly treat
+    # churned code as a no-op and under-report churn.  ``_associated_with_pr``
+    # closes that gap so the count is genuine no-CODE no-ops, not merely "did
+    # not open a NEW PR".
     entry["tasks_completed_no_pr"] = sum(
         1
         for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED
         and not is_merged_completion(ct)
         and not (ct.context or {}).get("pr_rejected")
-        and not _opened_pr(ct)
+        and not _associated_with_pr(ct)
     )
     _merged_rows = [ct for ct in child_tasks_rows if is_merged_completion(ct)]
     entry["autonomous_prs_merged"] = sum(
@@ -1472,11 +1618,12 @@ async def _update_direction_research_outcomes(
     #
     # The shared acceptance classifier keeps the direction window and release
     # window in sync: the verified buckets (strict proven + satisfied_unproven
-    # + undeclared) still count as verified, while degraded, explicitly
-    # unsatisfied, and malformed rows stay out.
+    # + inferred_test_cochange + undeclared) still count as verified, while
+    # degraded, explicitly unsatisfied, and malformed rows stay out.
     aggregate_buckets = {
         "proven": 0,
         "satisfied_unproven": 0,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 0,
         "undeclared": 0,
         "merged_unverified_degraded": 0,
@@ -1487,19 +1634,26 @@ async def _update_direction_research_outcomes(
     entry["verified_prs_merged"] = (
         aggregate_buckets["proven"]
         + aggregate_buckets["satisfied_unproven"]
+        + aggregate_buckets["inferred_test_cochange"]
         + aggregate_buckets["undeclared"]
     )
     # verified_autonomous_prs_merged: the honest basis for the retirement-
     # eligibility milestone (compute_direction_autonomy_state). A merge counts
     # here only when it is BOTH autonomous (no operator intervention) AND lands
     # in one of the same verified acceptance buckets as verified_prs_merged
-    # (proven + satisfied_unproven + undeclared). Degraded-unverified and
+    # (proven + satisfied_unproven + inferred_test_cochange + undeclared).
+    # Degraded-unverified and
     # acceptance-unsatisfied autonomous merges are excluded, so by construction
     # verified_autonomous_prs_merged <= autonomous_prs_merged and
     # <= verified_prs_merged. Confirmed-stranded merges are already absent from
     # _merged_rows (is_merged_completion returns False when landed_on_integration
     # is explicitly False), so they never inflate this count on a full recompute.
-    _VERIFIED_ACCEPTANCE_BUCKETS = ("proven", "satisfied_unproven", "undeclared")
+    _VERIFIED_ACCEPTANCE_BUCKETS = (
+        "proven",
+        "satisfied_unproven",
+        "inferred_test_cochange",
+        "undeclared",
+    )
     entry["verified_autonomous_prs_merged"] = sum(
         1
         for ct in _merged_rows
@@ -1545,6 +1699,12 @@ async def _update_direction_research_outcomes(
     #   * acceptance_declared_merged — merges that DECLARED any acceptance
     #     evidence at plan time (acceptance_was_declared, i.e. a verdict was
     #     stamped). Undeclared / legacy merges are excluded.
+    #   * acceptance_inferred_merged — undeclared merges upgraded to the
+    #     inferred_test_cochange bucket: no verdict was stamped, but the PR
+    #     co-changed a test file and a non-test production file under genuine CI.
+    #     Disjoint from acceptance_declared_merged by construction (the classifier
+    #     only infers when no verdict dict is present), so declared + inferred are
+    #     non-overlapping subsets of the merged-write population.
     #   * acceptance_declaration_coverage — declared / merged-write, the fraction
     #     of merged code work that committed to forward evidence. None when no
     #     merged write task exists (no denominator), never retro-failing legacy
@@ -1573,6 +1733,12 @@ async def _update_direction_research_outcomes(
         1
         for ct in _merged_write_rows
         if acceptance_was_declared((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
+    )
+    entry["acceptance_inferred_merged"] = sum(
+        1
+        for ct in _merged_write_rows
+        if classify_merged_acceptance_context(ct.context or {})
+        == "inferred_test_cochange"
     )
     _merged_write_count = len(_merged_write_rows)
     # Persist the coverage denominator so lifetime/window coverage can be
@@ -1613,29 +1779,38 @@ async def _update_direction_research_outcomes(
     # (new multi-direction mode). In legacy mode (untagged children), all
     # children in child_tasks_rows already match this direction, so skip the
     # redundant filter that would exclude all untagged children.
+    # ALSO exclude PR-ineligible task types (read-only tasks that can never open
+    # a PR): they cannot satisfy is_merged_completion, so including them in the
+    # denominator silently deflates both challenged and unchallenged merge rates
+    # with never-merging children. The scope_breakdown section already applies
+    # this same filter for scope conversion rates, proving the intended convention.
     if has_tagged_children:
         challenged_children = [
             ct
             for ct in child_tasks_rows
             if (ct.context or {}).get("research_spawn_gate_challenged") is True
             and (ct.context or {}).get("direction_id") == direction_id
+            and (ct.first_payload or {}).get("type") not in PR_INELIGIBLE_TASK_TYPES
         ]
         unchallenged_children = [
             ct
             for ct in child_tasks_rows
             if not (ct.context or {}).get("research_spawn_gate_challenged")
             and (ct.context or {}).get("direction_id") == direction_id
+            and (ct.first_payload or {}).get("type") not in PR_INELIGIBLE_TASK_TYPES
         ]
     else:
         challenged_children = [
             ct
             for ct in child_tasks_rows
             if (ct.context or {}).get("research_spawn_gate_challenged") is True
+            and (ct.first_payload or {}).get("type") not in PR_INELIGIBLE_TASK_TYPES
         ]
         unchallenged_children = [
             ct
             for ct in child_tasks_rows
             if not (ct.context or {}).get("research_spawn_gate_challenged")
+            and (ct.first_payload or {}).get("type") not in PR_INELIGIBLE_TASK_TYPES
         ]
     challenged_spawned = len(challenged_children)
     unchallenged_spawned = len(unchallenged_children)
@@ -1660,12 +1835,15 @@ async def _update_direction_research_outcomes(
     )
     # remediation_tasks_{created,merged,failed} retired 2026-06-05 —
     # see RESEARCH_HISTORY_METRIC_MANIFEST.
-    # Collect changed files from merged PRs for co-change index update
-    merged_files_lists = [
-        (ct.context or {}).get("_pr_changed_files", [])
+    # Collect changed files from merged PRs for co-change index update.
+    # Build parallel (key, files) pairs so each PR is folded in at most once.
+    _merged_cochange_entries = [
+        (str(ct.id), (ct.context or {}).get("_pr_changed_files", []))
         for ct in child_tasks_rows
         if is_merged_completion(ct) and (ct.context or {}).get("_pr_changed_files")
     ]
+    merged_files_lists = [files for _, files in _merged_cochange_entries]
+    merged_pr_keys = [key for key, _ in _merged_cochange_entries]
     # Generalized outcome aggregates — ADDITIVE alongside existing PR metrics.
     # Uses evaluate_task_outcome to count successes across ALL task types (code
     # merges + research quality + audit findings + memo artifacts + verification
@@ -1684,6 +1862,10 @@ async def _update_direction_research_outcomes(
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         ):
+            continue
+        # Non-genuine cancellations (cascade kills, superseded, cap-exhausted-after-approve, etc.)
+        # must not count against direction health per the _is_non_genuine_cancelled contract.
+        if _is_non_genuine_cancelled(_ct):
             continue
         _task_outcome = evaluate_task_outcome(_ct)
         _kind = _task_outcome.kind
@@ -1878,7 +2060,12 @@ async def _update_direction_research_outcomes(
         research_task_obj is not None and research_task_obj.status == TaskStatus.FAILED
     )
     sd_staging_only = sum(
-        1 for ct in child_tasks_rows if is_merged_completion(ct) and rollup_failed
+        1
+        for ct in child_tasks_rows
+        if rollup_failed
+        and ct.status == TaskStatus.COMPLETED
+        and has_merge_unblock_signal(ct)
+        and not is_merged_completion(ct)
     )
     entry["stage_dropout"] = {
         "tasks_failed_code_error": sd_code_error,
@@ -1927,6 +2114,8 @@ async def _update_direction_research_outcomes(
     SCOPE_RANK = {"small": 0, "medium": 1, "large": 2}
     expansion_sums: dict = {}
     expansion_counts: dict = {}
+    expansion_merged_sums: dict = {}
+    expansion_merged_counts: dict = {}
     expansion_failed_sums: dict = {}
     expansion_failed_counts: dict = {}
     cplx_merged_sum: dict = {}
@@ -2056,6 +2245,13 @@ async def _update_direction_research_outcomes(
         prod_changed = [f for f in changed if not _is_test_file(f)]
         if related and prod_changed:
             ratio = len(prod_changed) / len(related)
+            if is_merged_completion(ct):
+                expansion_merged_sums[scope] = (
+                    expansion_merged_sums.get(scope, 0.0) + ratio
+                )
+                expansion_merged_counts[scope] = (
+                    expansion_merged_counts.get(scope, 0) + 1
+                )
             if ct.status == TaskStatus.COMPLETED:
                 expansion_sums[scope] = expansion_sums.get(scope, 0.0) + ratio
                 expansion_counts[scope] = expansion_counts.get(scope, 0) + 1
@@ -2071,9 +2267,14 @@ async def _update_direction_research_outcomes(
                 )
     for scope_key, count in expansion_counts.items():
         if count > 0:
-            avg = round(expansion_sums[scope_key] / count, 2)
-            scope_breakdown[scope_key]["avg_expansion_ratio"] = avg
-            scope_breakdown[scope_key]["avg_expansion_ratio_merged"] = avg
+            scope_breakdown[scope_key]["avg_expansion_ratio"] = round(
+                expansion_sums[scope_key] / count, 2
+            )
+    for scope_key, count in expansion_merged_counts.items():
+        if count > 0:
+            scope_breakdown[scope_key]["avg_expansion_ratio_merged"] = round(
+                expansion_merged_sums[scope_key] / count, 2
+            )
     for scope_key, count in expansion_failed_counts.items():
         if count > 0:
             _ensure_scope(scope_key)
@@ -2195,12 +2396,18 @@ async def _update_direction_research_outcomes(
             by_parent.setdefault(st.parent_task_id, []).append(st)
         for plan_id, sts in by_parent.items():
             merged_ct = sum(1 for st in sts if is_merged_completion(st))
+            # SCOPE_OVERFLOW stays in the denominator even though it lives in
+            # INFRA_CLASSES: it is a scope-quality signal (subtasks cut too
+            # large), which is exactly what subtask_merge_rate exists to detect.
+            # Mirrors spawn_calibration._effective_scope_denominator, which keeps
+            # SCOPE_OVERFLOW and excludes only non-overflow infra fails.
             failed_nc = sum(
                 1
                 for st in sts
                 if _counts_as_failure(st)
                 and (
-                    _classify_failure(st) not in INFRA_CLASSES
+                    (fc := _classify_failure(st)) not in INFRA_CLASSES
+                    or fc == SCOPE_OVERFLOW
                     or _is_review_cap_exhausted(st)
                 )
             )
@@ -2400,6 +2607,7 @@ async def _update_direction_research_outcomes(
         ("acceptance_proven_merged", "total_acceptance_proven_merged"),
         ("acceptance_consumed_merged", "total_acceptance_consumed_merged"),
         ("acceptance_declared_merged", "total_acceptance_declared_merged"),
+        ("acceptance_inferred_merged", "total_acceptance_inferred_merged"),
         ("acceptance_merged_write_total", "total_acceptance_merged_write_total"),
     )
 
@@ -2472,7 +2680,9 @@ async def _update_direction_research_outcomes(
         await with_design_doc_locked(
             session,
             project_id,
-            lambda doc: _apply_cochange_to_doc(doc, merged_files_lists),
+            lambda doc: _apply_cochange_to_doc(
+                doc, merged_files_lists, pr_keys=merged_pr_keys
+            ),
         )
 
     await session.commit()

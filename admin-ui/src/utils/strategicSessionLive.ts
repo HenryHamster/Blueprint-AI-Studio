@@ -93,18 +93,41 @@ function visibleSessionDeltas(
   });
 }
 
+/** Seq of the last `done` lifecycle frame in `visible` (or NEGATIVE_INFINITY if
+ *  none). A `done` frame is always the LAST frame emitted for a turn (the agent
+ *  calls `streamer.done()` only after the turn's text/tool deltas have flushed),
+ *  so its seq exceeds every reply/activity delta of that completed turn — including
+ *  any post-send "Sent — here is a summary…" narration. Anything at or before it
+ *  belongs to a finished turn whose reply is now durable, and is dropped from both
+ *  live views. */
+function lastDoneSeq(visible: StrategicSessionDelta[]): number {
+  let seq = Number.NEGATIVE_INFINITY;
+  for (const d of visible) {
+    if (d.status === 'done') {
+      const s = d.seq ?? d.id;
+      if (s > seq) seq = s;
+    }
+  }
+  return seq;
+}
+
 /**
  * Derive the live streaming turn from the resident-session transcript deltas.
  *
- * Dedup / reconciliation key: the newest DURABLE strategic message's `created_at`
- * acts as a high-water mark. Only REPLY-kind deltas (message / reasoning) from the
- * most recent session whose `ts` is strictly newer than that water mark build the
- * preview — the command / tool activity one-liners render in the ephemeral strip
- * instead, so command noise never appears in the reply the operator keeps. When
- * the durable `from_type=strategic` ProjectMessage lands, the water mark advances
- * past the turn's deltas, the preview empties, and the durable bubble takes its
- * place — no duplicate. A cadence / non-resident turn streams nothing, so this
- * returns null and only the persisted message renders.
+ * Dedup / reconciliation uses TWO gates. (1) The newest DURABLE strategic
+ * message's `created_at` is a high-water mark: only deltas from the most recent
+ * session whose `ts` is strictly newer than it are considered. (2) The last `done`
+ * lifecycle frame marks the end of a completed turn: reply deltas at or before it
+ * are dropped. Gate (2) is what kills the "reply shown twice" bug — after the
+ * strategist sends its durable reply it may keep narrating in the live stream
+ * ("Sent — here is a summary of what I said…"), and those post-send reply deltas
+ * carry a `ts` that is NOT strictly older than the durable message's `created_at`,
+ * so the time-only water mark lets them survive as a second bubble. They always
+ * precede the turn's `done` frame, so gating on `lastDoneSeq` removes them and only
+ * the durable persisted message remains. Only REPLY-kind deltas (message /
+ * reasoning) build the preview — command / tool one-liners render in the ephemeral
+ * strip instead. A cadence / non-resident turn streams nothing, so this returns
+ * null and only the persisted message renders.
  */
 export function computeStrategicStreamingTurn(
   transcript: StrategicSessionDelta[] | undefined,
@@ -115,8 +138,11 @@ export function computeStrategicStreamingTurn(
   const latestSessionId = deltas[deltas.length - 1]?.session_id;
   const watermark = strategicReplyWatermark(conversationMessages);
   const visible = visibleSessionDeltas(deltas, latestSessionId, watermark);
+  const doneSeq = lastDoneSeq(visible);
 
-  const replyDeltas = visible.filter(d => isStrategicReplyDelta(d.kind));
+  const replyDeltas = visible.filter(
+    d => isStrategicReplyDelta(d.kind) && (d.seq ?? d.id) > doneSeq,
+  );
   if (replyDeltas.length === 0) return null;
 
   const text = replyDeltas.map(d => d.text).filter(Boolean).join('\n').trim();
@@ -146,18 +172,14 @@ export function computeStrategicSessionActivity(
   const visible = visibleSessionDeltas(deltas, latestSessionId, watermark);
 
   let latestLifecycle: 'responding' | 'working' | 'done' | null = null;
-  let lastDoneSeq = Number.NEGATIVE_INFINITY;
   for (const d of visible) {
     if (d.status === 'responding' || d.status === 'working' || d.status === 'done') latestLifecycle = d.status;
-    if (d.status === 'done') {
-      const s = d.seq ?? d.id;
-      if (s > lastDoneSeq) lastDoneSeq = s;
-    }
   }
+  const doneSeq = lastDoneSeq(visible);
 
   const inFlight = latestLifecycle === 'working' || latestLifecycle === 'responding';
   const rawItems: StrategicActivityItem[] = visible
-    .filter(d => STRATEGIC_ACTIVITY_KINDS.has(d.kind ?? '') && Boolean(d.text) && (d.seq ?? d.id) > lastDoneSeq)
+    .filter(d => STRATEGIC_ACTIVITY_KINDS.has(d.kind ?? '') && Boolean(d.text) && (d.seq ?? d.id) > doneSeq)
     .map(d => {
       const tsMs = d.ts ? parseTimestamp(d.ts).getTime() : undefined;
       return { id: d.id, kind: d.kind ?? 'tool', text: d.text, ts: Number.isNaN(tsMs) ? undefined : tsMs };

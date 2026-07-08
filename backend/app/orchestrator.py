@@ -367,7 +367,10 @@ _last_sidecar_sweep: datetime = _utcnow()
 _last_bootstrap_recovery_sweep: datetime = _utcnow()
 _last_lane_baseline_backfill: datetime = _utcnow()
 _last_merge_credit_backfill: datetime = _utcnow()
+_last_v22_finding_backfill: datetime = _utcnow()
 _last_runner_deactivation_sweep: datetime = _utcnow()
+_last_runner_degraded_sweep: datetime = _utcnow()
+_last_runner_escalation_sweep: datetime = _utcnow()
 _last_local_runner_hold_sweep: datetime = _utcnow()
 _last_deadlock_check: datetime | None = None
 _last_zone_exhaustion_log: datetime | None = None
@@ -394,6 +397,7 @@ from app.orchestrator_runner_dispatch import (  # noqa: F401
     _RUNNER_LIVENESS_SECONDS,
     RunnerDispatchSnapshot,
     _build_compute_launch_kwargs,
+    _check_degraded_runners,
     _create_strategic_local_cloud_fallback_alert,
     _deactivate_stale_runners,
     _dispatch_compute_experiment_directly,
@@ -413,6 +417,7 @@ from app.orchestrator_runner_dispatch import (  # noqa: F401
     _runner_handles_task_type,
     _select_eligible_runner,
     _strategic_local_hold_timeout_seconds,
+    _sweep_runner_deactivated_escalations,
     _task_requires_strategic_local_runner,
     _try_runner_dispatch,
     _try_strategic_local_required_runner_path,
@@ -925,7 +930,10 @@ async def orchestrator_worker():
         _last_bootstrap_recovery_sweep, \
         _last_lane_baseline_backfill, \
         _last_merge_credit_backfill, \
+        _last_v22_finding_backfill, \
         _last_runner_deactivation_sweep, \
+        _last_runner_degraded_sweep, \
+        _last_runner_escalation_sweep, \
         _last_local_runner_hold_sweep
     while True:
         queued_tasks = []
@@ -3934,6 +3942,27 @@ async def orchestrator_worker():
                     logger.exception(
                         "[ORCHESTRATOR] Merge-credit backfill sweep error"
                     )
+            # v22 carried finding backfill — every 600s. Upserts "resolved"
+            # AuditFindingResolution rows for the 13 v22 low-severity carried
+            # audit findings (fixed in d2cf1ebb8 / PR #13245) and attaches
+            # a CriterionEvidence row to c-1a3ec09d. Idempotent no-op once
+            # all findings are resolved.
+            if _is_cadence_due(_last_v22_finding_backfill, 600):
+                _last_v22_finding_backfill = _utcnow()
+                try:
+                    from app.release_readiness import (  # noqa: PLC0415
+                        _sweep_v22_finding_backfill,
+                    )
+
+                    await _bounded_leader_step(
+                        "v22_finding_backfill",
+                        _sweep_v22_finding_backfill(),
+                        budget=90,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] v22 finding backfill sweep error"
+                    )
             # Stale-runner deactivation — every 300s. Marks registered fleet
             # runners that missed the heartbeat window as inactive so they drop
             # out of the dispatch cache and the admin listing. Tasks already
@@ -3951,6 +3980,41 @@ async def orchestrator_worker():
                 except Exception:
                     logger.exception(
                         "[ORCHESTRATOR] Stale-runner deactivation sweep error"
+                    )
+            # Degraded-runner alert sweep — every 300s. Alerts the operator when a
+            # runner is heartbeating normally but failing every job it claims (a
+            # false-green that the deactivated-runner alert never catches). Also
+            # resolves degraded alerts when the runner completes a successful job.
+            if _is_cadence_due(_last_runner_degraded_sweep, 300):
+                _last_runner_degraded_sweep = _utcnow()
+                try:
+                    async with AsyncSessionLocal() as _degraded_sweep_session:
+                        await _bounded_leader_step(
+                            "runner_degraded_check",
+                            _check_degraded_runners(_degraded_sweep_session),
+                            budget=30,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Degraded-runner alert sweep error"
+                    )
+            # Runner-deactivated escalation sweep — every 300s. Re-notifies for
+            # runner-deactivated alerts that have been open for > 1h (then every 4h)
+            # so a long outage does not stay silent after the initial notification.
+            if _is_cadence_due(_last_runner_escalation_sweep, 300):
+                _last_runner_escalation_sweep = _utcnow()
+                try:
+                    from app.alert_dispatch import _maybe_escalate_runner_deactivated_alerts
+
+                    async with AsyncSessionLocal() as _esc_session:
+                        await _bounded_leader_step(
+                            "runner_escalation",
+                            _maybe_escalate_runner_deactivated_alerts(_esc_session),
+                            budget=30,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Runner-deactivated escalation sweep error"
                     )
             # Enforce-local hold timeout — every 300s. Terminally fails any
             # compute_experiment that has been held QUEUED awaiting a self-hosted

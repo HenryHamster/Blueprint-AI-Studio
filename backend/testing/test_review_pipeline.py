@@ -9407,10 +9407,6 @@ async def test_release_safeguard_gate_post_gate_merge_held_on_dual_head(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=False,
-    reason="Pending _spawn_cross_cutting_safeguard_task call in _spawn_pipeline_task sibling subtask",
-)
 async def test_safeguard_spawned_and_merge_gate_set_for_large_scope_pr(
     db_session, mocker
 ):
@@ -9418,7 +9414,7 @@ async def test_safeguard_spawned_and_merge_gate_set_for_large_scope_pr(
     safeguard (security_audit or qa) task AND set requires_approval=True on the
     original task so it cannot be merged until the safeguard approves.
 
-    The agent spawn is mocked via _spawn_cross_cutting_safeguard_task; the test
+    The agent spawn is mocked via maybe_spawn_cross_cutting_safeguard; the test
     verifies both that the spawn was attempted and that the merge gate is armed."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
@@ -9430,10 +9426,9 @@ async def test_safeguard_spawned_and_merge_gate_set_for_large_scope_pr(
     mocker.patch("app.github.add_issue_label", new_callable=AsyncMock)
 
     safeguard_mock = mocker.patch(
-        "app.review_pipeline._spawn_cross_cutting_safeguard_task",
-        create=True,
+        "app.review_pipeline.maybe_spawn_cross_cutting_safeguard",
         new_callable=AsyncMock,
-        return_value=None,
+        wraps=maybe_spawn_cross_cutting_safeguard,
     )
 
     project = await _make_db_project(db_session)
@@ -9503,13 +9498,6 @@ async def test_safeguard_not_spawned_for_small_scope_pr(db_session, mocker):
     even when they happen to touch multiple top-level modules."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
-    safeguard_mock = mocker.patch(
-        "app.review_pipeline._spawn_cross_cutting_safeguard_task",
-        create=True,
-        new_callable=AsyncMock,
-        return_value=None,
-    )
-
     project = await _make_db_project(db_session)
     original_task = make_task(
         project_id=project.id,
@@ -9559,9 +9547,9 @@ async def test_safeguard_not_spawned_for_small_scope_pr(db_session, mocker):
         original_task_id=str(original_task.id),
     )
 
-    (
-        safeguard_mock.assert_not_awaited(),
-        ("Small-scope PRs must never trigger the cross-cutting safeguard gate"),
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is not True, (
+        "Small-scope PRs must never be merge-gated by the cross-cutting safeguard"
     )
 
 

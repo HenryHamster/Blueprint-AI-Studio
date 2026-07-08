@@ -43,8 +43,11 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # intentional broad-except guards: VM-teardown / GCP-count / webhook-post and
 # the TASK_FAILED notification dispatch are all "log and continue — never crash
 # the caller or leak a VM" paths, exactly as documented for main.py above.
+# E402 for alert_dispatch.py: re-exports runner health alert helpers from
+# app.runner_health_alerts via a deferred end-of-module import (after the bulk
+# of the alert definitions — same intentional load-order pattern as orchestrator.py).
 "app/vm_lifecycle.py" = ["BLE001"]
-"app/alert_dispatch.py" = ["BLE001"]
+"app/alert_dispatch.py" = ["BLE001", "E402"]
 "app/notification.py" = ["BLE001"]
 "app/deploy_health_alerts.py" = ["BLE001"]
 # services.py is entirely background workers (cleanup, persist, timeout sweep, orphan
@@ -139,6 +142,16 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # (BLE001): a crash mid-provision must be logged, the slot/VM cleaned up, and the
 # task requeued — never propagate out and abort the dispatch loop.
 "app/orchestrator_provision.py" = ["BLE001"]
+# runner_health_alerts.py was extracted from alert_dispatch.py; it holds all
+# runner-specific alert create/resolve helpers. Same log-and-continue policy
+# (BLE001): notification dispatch and alert persistence must never crash the
+# monitoring sweep that calls them.
+"app/runner_health_alerts.py" = ["BLE001"]
+# runner_health_monitors.py was extracted from orchestrator_runner_dispatch.py;
+# it holds the periodic runner-health sweeps. PERF203 (try/except inside a loop)
+# is the intentional resilient-sweep pattern — a per-runner alert failure must be
+# logged and skipped, never abort the whole sweep.
+"app/runner_health_monitors.py" = ["PERF203"]
 # routers/agent.py re-exports the GitHub-token cache helpers extracted to
 # app.github_token_resolver via a deferred mid-module import (keeps the 15+
 # `from app.routers.agent import get_github_token_for_task` call sites working).

@@ -254,6 +254,27 @@ describe('DEPS_TASK_FOCUS — content invariants', () => {
   });
 });
 
+describe('SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC — shared constant usage', () => {
+  it('is used consistently in create, fix, refactor, and docs task focuses', async () => {
+    const { CREATE_TASK_FOCUS, FIX_TASK_FOCUS, REFACTOR_TASK_FOCUS, DOCS_TASK_FOCUS } = await import('./task-type-focus.js');
+    // All four task focuses should mention the allowlist items
+    const allowlistMarkers = ['package-lock.json', 'poetry.lock', 'Cargo.lock', 'go.sum', '.gitignore'];
+    for (const marker of allowlistMarkers) {
+      expect(CREATE_TASK_FOCUS).toContain(marker);
+      expect(FIX_TASK_FOCUS).toContain(marker);
+      expect(REFACTOR_TASK_FOCUS).toContain(marker);
+      expect(DOCS_TASK_FOCUS).toContain(marker);
+    }
+  });
+
+  it('mentions sibling test files in all four task focuses', async () => {
+    const { CREATE_TASK_FOCUS, FIX_TASK_FOCUS, REFACTOR_TASK_FOCUS, DOCS_TASK_FOCUS } = await import('./task-type-focus.js');
+    for (const focus of [CREATE_TASK_FOCUS, FIX_TASK_FOCUS, REFACTOR_TASK_FOCUS, DOCS_TASK_FOCUS]) {
+      expect(focus).toMatch(/test.*files|sibling.*test/i);
+    }
+  });
+});
+
 describe('getTaskTypeFocusBlock + CODE_CHANGE_HELPER_GUIDANCE independence', () => {
   it('CODE_CHANGE_HELPER_GUIDANCE is unchanged regardless of task type', async () => {
     const { CODE_CHANGE_HELPER_GUIDANCE } = await import('../prompt.js');

@@ -1406,6 +1406,33 @@ describe('buildThinkerPrompt stabilize-hardening guidance', () => {
     efficiencySnapshotSection: '',
   };
 
+  it('does not include executor-owned container-runtime field documentation (setup_step, container_registry_auth)', () => {
+    const prompt = buildThinkerPrompt(base);
+    // These are Executor-level launch-contract details trimmed to reduce per-cycle thinker bloat.
+    // The thinker commissions experiments by abstract spec; the Executor owns the full field schema.
+    expect(prompt).not.toContain('setup_step');
+    expect(prompt).not.toContain('container_registry_auth');
+    // Essential commissioning fields must still be present so GPU experiments can be authored
+    expect(prompt).toContain('container_image');
+    expect(prompt).toContain('accelerator');
+  });
+
+  it('Judgment-over-citation subsection does not repeat the intro judgment phrase verbatim', () => {
+    const prompt = buildThinkerPrompt(base);
+    // The intro paragraph already states "The user hired you for judgment, not audit trails…";
+    // the closing sentence of the Judgment-over-citation block was an exact duplicate and was removed.
+    // The essential point (sources are traceability, not justification) still appears via Cite sources.
+    const judgmentIdx = prompt.indexOf('**Judgment over citation.**');
+    expect(judgmentIdx).toBeGreaterThan(-1);
+    // Find the next bold-section boundary after Judgment over citation
+    const nextBoldIdx = prompt.indexOf('\n\n**', judgmentIdx + 1);
+    const judgmentBlock = nextBoldIdx > -1 ? prompt.slice(judgmentIdx, nextBoldIdx) : prompt.slice(judgmentIdx);
+    // The duplicate trailing sentence must not appear inside the subsection
+    expect(judgmentBlock).not.toContain('The user hired you for judgment, not audit trails.');
+    // But the intro still has the related phrase (we only removed the in-section duplicate)
+    expect(prompt).toContain('judgment, not for audit trails');
+  });
+
   it('instructs that stabilize is hardening time (not idle) and to commission an audit rather than hold', () => {
     const prompt = buildThinkerPrompt(base);
     // Stabilize must be framed as active hardening, not idling.

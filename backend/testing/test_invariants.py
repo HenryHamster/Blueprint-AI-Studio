@@ -5884,7 +5884,10 @@ class TestEdgesConsideredInvariants:
         result = _compute_edges_considered_metrics(tasks)
         assert result is not None
         assert result["reviewer_caught_count"] == 1
-        assert result["reviewer_caught_rate"] == round(1 / 3, 3)
+        assert result["reviewer_caught_rate"] == 1.0, (
+            "reviewer_caught_rate must denominate on reviewer-eligible tasks "
+            "(tasks_with_reviewer_edges_count), not all code-change tasks."
+        )
         assert result["tasks_with_reviewer_edges_count"] == 1
 
     def test_reviewer_caught_count_via_handled_downgrade(self):
@@ -5912,7 +5915,10 @@ class TestEdgesConsideredInvariants:
         result = _compute_edges_considered_metrics(tasks)
         assert result is not None
         assert result["reviewer_caught_count"] == 1
-        assert result["reviewer_caught_rate"] == round(1 / 3, 3)
+        assert result["reviewer_caught_rate"] == 1.0, (
+            "reviewer_caught_rate must denominate on reviewer-eligible tasks "
+            "(tasks_with_reviewer_edges_count), not all code-change tasks."
+        )
 
     def test_reviewer_caught_case_match_is_normalized(self):
         """Case-string comparison must be lowercased + trimmed so that
@@ -5941,6 +5947,55 @@ class TestEdgesConsideredInvariants:
         assert result["reviewer_caught_count"] == 0, (
             "Reviewer entry whose case matches an author case (modulo case/whitespace) "
             "and is handled=true must NOT count as a reviewer catch."
+        )
+
+    def test_reviewer_caught_rate_denominated_on_reviewer_eligible(self):
+        """reviewer_caught_rate must use tasks_with_reviewer_edges_count as the
+        denominator, not all code-change tasks.
+
+        5 tasks total; 2 have reviewer edges; 1 of those 2 is a catch.
+        With the correct denominator: 1/2 = 0.5.
+        With the wrong (all-tasks) denominator: 1/5 = 0.2.
+        The test asserts 0.5 to enforce reviewer-eligible-only denominator.
+        """
+        from unittest.mock import MagicMock
+        from app.routers.admin_digest import _compute_edges_considered_metrics
+
+        def _make_task(edges):
+            t = MagicMock()
+            t.first_payload = {"type": "create"}
+            t.context = {"_self_review_outcome": {"edges_considered": edges}}
+            return t
+
+        # task A: reviewer raises a new case the author missed → reviewer caught
+        task_a = _make_task(
+            [
+                {"case": "null payload", "handled": True, "origin": "author"},
+                {"case": "concurrent writes", "handled": False, "origin": "reviewer"},
+            ]
+        )
+        # task B: reviewer reviews but matches the author's case → no catch
+        task_b = _make_task(
+            [
+                {"case": "empty input", "handled": True, "origin": "author"},
+                {"case": "empty input", "handled": True, "origin": "reviewer"},
+            ]
+        )
+        # tasks C–E: no reviewer edges — ineligible to appear in the denominator
+        task_c = _make_task([{"case": "c1", "handled": True}])
+        task_d = _make_task([{"case": "c2", "handled": True}])
+        task_e = _make_task([{"case": "c3", "handled": True}])
+
+        result = _compute_edges_considered_metrics(
+            [task_a, task_b, task_c, task_d, task_e]
+        )
+        assert result is not None
+        assert result["tasks_with_reviewer_edges_count"] == 2
+        assert result["reviewer_caught_count"] == 1
+        assert result["reviewer_caught_rate"] == 0.5, (
+            "reviewer_caught_rate must equal reviewer_caught_count / "
+            "tasks_with_reviewer_edges_count (1/2 = 0.5), not 1/5 = 0.2 "
+            "which would be the deflated all-tasks denominator."
         )
 
     def test_origin_missing_defaults_to_author(self):
@@ -10538,6 +10593,555 @@ def test_string_patch_target_scanner_self_tests():
         assert _collect_app_patch_targets(tmpdir_path) == {}
 
 
+# Redundant ``create=True`` patches currently in the suite (target already exists
+# at module top level). ``create=True`` is legitimate ONLY when the attribute is
+# absent; these are grandfathered so this invariant fails only on NEWLY-accreted
+# redundancy. A queued refactor drops the flags below — prune the matching entry
+# here as each one lands (leftover entries are harmless: the check is subset-only).
+_KNOWN_REDUNDANT_CREATE_TRUE: "frozenset[str]" = frozenset({
+    "test_admin_routers.py::app.routers.admin_digest._runtime_config",
+    "test_c5_approval_gate_invariant.py::app.ci_completion._post_merge_summary",
+    "test_c5_approval_gate_invariant.py::app.review_pipeline.broadcast_to_project",
+    "test_evaluating.py::app.services.broadcast_to_project",
+    "test_release_stall_alerts.py::app.release_promotion._notify_operator",
+    "test_warm_vm_integration.py::app.broadcast.broadcast_to_project",
+})
+
+
+def test_redundant_create_true_patches_flagged():
+    """A ``create=True`` patch whose target now EXISTS at module top level is
+    redundant and must be flagged at the standalone merge gate.
+
+    ``create=True`` fabricates an attribute mock deems absent; once the real
+    attribute exists the flag is a no-op that silently suppresses the
+    ``AttributeError`` a later rename/removal of that symbol would raise — the
+    exact drift that ``test_string_patch_targets_resolve`` catches, except that
+    invariant deliberately skips ``create=True`` patches. This keeps redundant
+    ``create=True`` from re-accreting: any ``create=True`` ``app.*`` target that
+    resolves at module top level fails unless grandfathered in
+    ``_KNOWN_REDUNDANT_CREATE_TRUE``.
+    """
+    from testing import impacted_tests
+
+    testing_dir = Path(__file__).resolve().parent
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+
+    pairs = impacted_tests.collect_create_true_patch_targets(str(testing_dir))
+
+    module_cache: dict[str, "set[str] | None"] = {}
+    offenders: list[str] = []
+    for test_file, target in pairs:
+        last_dot = target.rfind(".")
+        if last_dot == -1:
+            continue
+        module_dotted = target[:last_dot]
+        attr = target[last_dot + 1:]
+
+        if module_dotted not in module_cache:
+            module_cache[module_dotted] = _app_module_top_level_names(
+                app_dir, module_dotted
+            )
+
+        top_level = module_cache[module_dotted]
+        if top_level is None:
+            continue  # nested-import pattern — create=True is legitimate
+        if attr in top_level and f"{test_file}::{target}" not in _KNOWN_REDUNDANT_CREATE_TRUE:
+            offenders.append(
+                f"  {test_file}: '{target}' — '{attr}' already exists in {module_dotted}"
+            )
+
+    assert not offenders, (
+        f"Redundant create=True patch(es) detected ({len(offenders)}):\n"
+        + "\n".join(sorted(offenders))
+        + "\n\ncreate=True is a no-op when the attribute exists and silently masks "
+        "future renames/removals of that symbol. Fix: drop the create=True keyword "
+        "so the patch resolves against the real attribute (and is then covered by "
+        "test_string_patch_targets_resolve)."
+    )
+
+
+def test_redundant_create_true_scanner_self_test():
+    """Self-test: the create=True collector returns create=True targets and only those.
+
+    Guards the invariant above from going vacuous — proves detection is live by
+    constructing a file with one create=True patch and one plain patch and
+    asserting only the former is returned.
+    """
+    import textwrap
+    import tempfile
+    from testing import impacted_tests
+
+    src = textwrap.dedent("""
+        def test_thing(mocker):
+            mocker.patch("app.some_module.exists", create=True)
+            mocker.patch("app.some_module.plain")
+            mocker.patch("backend.app.other.sym", create=True)
+    """)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        (Path(tmpdir) / "test_synthetic.py").write_text(src)
+        pairs = impacted_tests.collect_create_true_patch_targets(tmpdir)
+
+    assert pairs == [
+        ("test_synthetic.py", "app.other.sym"),
+        ("test_synthetic.py", "app.some_module.exists"),
+    ]
+
+
+# ── Route Contract Ownership ────────────────────────────────────────────────
+
+
+def _find_test_funcs_matching(content: str, pattern: re.Pattern) -> list[str]:
+    """Return names of test functions whose body contains the given pattern."""
+    func_starts = list(re.finditer(r"^(?:async )?def (test_\w+)", content, re.MULTILINE))
+    offending: list[str] = []
+    for i, match in enumerate(func_starts):
+        start = match.start()
+        end = func_starts[i + 1].start() if i + 1 < len(func_starts) else len(content)
+        if pattern.search(content[start:end]):
+            offending.append(match.group(1))
+    return offending
+
+
+_API_URL_RE = re.compile(r'["\'](/api/[a-z][^"\'\s?#{]*)["\']')
+
+_TEST_FUNC_DEF_RE = re.compile(r"^(?:async )?def (test_\w+)", re.MULTILINE)
+
+
+def _validate_route_contract_registry(
+    testing_dir: Path,
+    registry: dict,
+) -> list[str]:
+    """Return a list of rot errors for a route-contract ownership registry.
+
+    Each entry is validated against the test files in ``testing_dir``:
+    * the owner file must exist;
+    * the ``search_pattern`` must be a valid regex;
+    * the ``search_pattern`` must match inside the body of at least one real
+      ``test_*`` function in the owner file — a match only in a comment,
+      docstring, or unrelated top-level line means the owning contract test was
+      renamed/deleted and is reported;
+    * every ``exempt_tests`` name must exist as a ``test_*`` function somewhere
+      in ``testing_dir`` (a dangling exemption is dead config).
+
+    Returns an empty list when the registry is fully valid.
+    """
+    all_test_funcs: set[str] = set()
+    for test_file in testing_dir.glob("test_*.py"):
+        all_test_funcs.update(_TEST_FUNC_DEF_RE.findall(test_file.read_text()))
+
+    errors: list[str] = []
+    for endpoint, config in registry.items():
+        owner_file: str = config["owner"]
+        search_pattern: str = config["search_pattern"]
+
+        owner_path = testing_dir / owner_file
+        if not owner_path.exists():
+            errors.append(
+                f"Endpoint '{endpoint}': owner file '{owner_file}' does not exist "
+                f"at {owner_path}"
+            )
+            continue
+
+        owner_content = owner_path.read_text()
+        try:
+            compiled = re.compile(search_pattern)
+        except re.error as exc:
+            errors.append(
+                f"Endpoint '{endpoint}': invalid search_pattern regex: {exc}"
+            )
+            continue
+
+        # Require the pattern to match inside a real test_* function body, not
+        # merely anywhere in the file (a comment/docstring/import line).
+        owning_funcs = _find_test_funcs_matching(owner_content, compiled)
+        if not owning_funcs:
+            if compiled.search(owner_content):
+                errors.append(
+                    f"Endpoint '{endpoint}': search_pattern matches owner file "
+                    f"'{owner_file}' but not inside any test_* function body "
+                    f"(only in a comment/docstring/unrelated line). The owning "
+                    f"contract test appears to have been renamed or deleted. "
+                    f"Pattern: {search_pattern}"
+                )
+            else:
+                errors.append(
+                    f"Endpoint '{endpoint}': search_pattern does not match any "
+                    f"content in owner file '{owner_file}'. Pattern: {search_pattern}"
+                )
+
+        # Every declared exemption must name a real test_* function; a stale
+        # name silently widens the ownership gate.
+        errors.extend(
+            f"Endpoint '{endpoint}': exempt_tests names '{exempt_name}', "
+            f"which is not a test_* function anywhere in backend/testing. "
+            f"Remove the stale exemption or fix the name."
+            for exempt_name in config.get("exempt_tests", [])
+            if exempt_name not in all_test_funcs
+        )
+
+    return errors
+
+
+def _find_unregistered_duplicated_contracts(
+    testing_dir: Path,
+    registry: dict,
+) -> list[tuple[str, list[str]]]:
+    """Return (url, [file_names]) for API URLs asserted in 2+ test files but not registered.
+
+    Scans test_*.py files for literal API URL strings and groups them by the set
+    of files whose test functions reference each URL.  URLs already covered by a
+    registry search_pattern are excluded — only unregistered cross-file duplicates
+    are returned so callers can fail fast when a new contradiction appears.
+    """
+    registered_patterns = [
+        re.compile(cfg["search_pattern"]) for cfg in registry.values()
+    ]
+
+    url_files: dict[str, list[str]] = {}
+    for test_file in sorted(testing_dir.glob("test_*.py")):
+        content = test_file.read_text()
+        seen: set[str] = set(_API_URL_RE.findall(content))
+        for url in seen:
+            url_files.setdefault(url, []).append(test_file.name)
+
+    violations: list[tuple[str, list[str]]] = []
+    for url, files in url_files.items():
+        if len(files) < 2:
+            continue
+        if any(pat.search(url) for pat in registered_patterns):
+            continue
+        violations.append((url, sorted(files)))
+    return violations
+
+
+class TestRouteContractOwnership:
+    """Standalone guard: each endpoint's response-shape contract must live in
+    exactly one owner test file (declared in route_contract_owners.json).
+
+    A second test file asserting the same endpoint's shape is a contract
+    violation caught at standalone CI time — the mechanical speed bump that was
+    missing when the /tasks flat-vs-nested contradiction merged undetected.
+    """
+
+    def test_no_duplicate_route_contracts(self):
+        """No non-owner test file may introduce response-shape tests for a
+        registered endpoint unless the test function is explicitly exempted.
+
+        To register a new endpoint: add an entry to route_contract_owners.json.
+        To exempt a pre-existing co-located test: add its function name to
+        'exempt_tests' for that endpoint's entry.
+        """
+        import json
+
+        registry_path = BACKEND_ROOT / "testing" / "route_contract_owners.json"
+        assert registry_path.exists(), (
+            f"Route contract registry not found: {registry_path}. "
+            "Create backend/testing/route_contract_owners.json to use this guard."
+        )
+
+        with open(registry_path) as f:
+            registry = json.load(f)
+
+        testing_dir = BACKEND_ROOT / "testing"
+        violations: list[str] = []
+
+        for endpoint, config in registry.items():
+            owner_file: str = config["owner"]
+            raw_pattern: str = config["search_pattern"]
+            exempt_tests: set[str] = set(config.get("exempt_tests", []))
+
+            try:
+                compiled = re.compile(raw_pattern)
+            except re.error as exc:
+                raise AssertionError(
+                    f"route_contract_owners.json: invalid regex for '{endpoint}': {exc}"
+                ) from exc
+
+            for test_file in sorted(testing_dir.glob("test_*.py")):
+                if test_file.name == owner_file:
+                    continue
+                content = test_file.read_text()
+                if not compiled.search(content):
+                    continue
+
+                offending = [
+                    fn
+                    for fn in _find_test_funcs_matching(content, compiled)
+                    if fn not in exempt_tests
+                ]
+                if offending:
+                    violations.append(
+                        f"Endpoint '{endpoint}' response-shape contract is owned by "
+                        f"'{owner_file}' but also asserted in {test_file.name}: "
+                        + ", ".join(offending)
+                    )
+
+        assert not violations, (
+            "Route contract violations detected. Each endpoint's response-shape "
+            "contract must live in its registered owner file "
+            "(see backend/testing/route_contract_owners.json).\n"
+            + "\n".join(f"  • {v}" for v in violations)
+        )
+
+    def test_route_contract_owners_are_valid(self):
+        """Each endpoint's owner file must exist and own a real contract test.
+
+        This meta-integrity check prevents silent rot: a stale/typo'd owner file
+        path or a drifted search_pattern that no longer matches its endpoint
+        is caught at merge time.
+
+        Rot-prevention tightening: the search_pattern must match inside the body
+        of at least one real ``test_*`` function in the owner file — a match in a
+        comment, docstring, or an unrelated top-level line is NOT enough, so a
+        deleted/renamed owner contract test is caught. Every name listed in an
+        entry's ``exempt_tests`` must also exist as a ``test_*`` function
+        somewhere in backend/testing; a dangling exemption is dead config that
+        silently widens the gate.
+        """
+        import json
+
+        registry_path = BACKEND_ROOT / "testing" / "route_contract_owners.json"
+        with open(registry_path) as f:
+            registry = json.load(f)
+
+        testing_dir = BACKEND_ROOT / "testing"
+        errors = _validate_route_contract_registry(testing_dir, registry)
+
+        assert not errors, (
+            "Route contract ownership registry has invalid entries:\n"
+            + "\n".join(f"  • {e}" for e in errors)
+        )
+
+    def test_route_contract_registry_is_populated(self):
+        """The registry must contain at least one entry beyond the seed entry.
+
+        This prevents the guard from being silently hollowed out by removing
+        entries; any PR that drops the registry below the minimum must update
+        this threshold with justification.
+        """
+        import json
+
+        registry_path = BACKEND_ROOT / "testing" / "route_contract_owners.json"
+        with open(registry_path) as f:
+            registry = json.load(f)
+
+        _MINIMUM_REGISTERED_ENDPOINTS = 3
+        assert len(registry) >= _MINIMUM_REGISTERED_ENDPOINTS, (
+            f"route_contract_owners.json has only {len(registry)} registered "
+            f"endpoint(s); the guard requires at least {_MINIMUM_REGISTERED_ENDPOINTS}. "
+            "Add entries for admin endpoints whose response-shape contracts live in "
+            "more than one test file, or lower the threshold with justification."
+        )
+
+    def test_unregistered_endpoint_with_multiple_contract_assertions_fails(self):
+        """Verify _find_unregistered_duplicated_contracts catches cross-file violations.
+
+        Creates two synthetic test files that both assert the same unregistered API
+        endpoint, then confirms the helper returns that endpoint as a violation.
+        The registry is kept empty so the endpoint is definitely unregistered.
+        """
+        import tempfile
+
+        endpoint_url = "/api/admin/fake-widgets"
+        src_a = (
+            f'async def test_get_widgets(client):\n'
+            f'    r = await client.get("{endpoint_url}")\n'
+            f'    assert r.json()["widgets"]\n'
+        )
+        src_b = (
+            f'async def test_widget_list(client):\n'
+            f'    r = await client.get("{endpoint_url}")\n'
+            f'    assert r.json()["count"] == 0\n'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_alpha.py").write_text(src_a)
+            (tmpdir_path / "test_beta.py").write_text(src_b)
+
+            violations = _find_unregistered_duplicated_contracts(tmpdir_path, {})
+
+        assert any(endpoint_url in url for url, _ in violations), (
+            f"Expected '{endpoint_url}' (asserted in test_alpha.py and test_beta.py) "
+            f"to be flagged as an unregistered duplicate contract, but "
+            f"_find_unregistered_duplicated_contracts returned: {violations}"
+        )
+
+    def test_validate_registry_accepts_pattern_inside_test_function(self):
+        """A pattern that matches inside a real test_* body is valid (no errors)."""
+        import tempfile
+
+        owner_src = (
+            "async def test_widgets_contract(client):\n"
+            '    r = await client.get("/api/admin/widgets")\n'
+            '    assert r.json()["widgets"] == []\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert errors == [], (
+            f"Expected no errors for a pattern matched inside a test_* function, "
+            f"got: {errors}"
+        )
+
+    def test_validate_registry_rejects_missing_owner_file(self):
+        """A registered owner file that does not exist is reported."""
+        import tempfile
+
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_does_not_exist.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            errors = _validate_route_contract_registry(Path(tmpdir), registry)
+
+        assert any("does not exist" in e for e in errors), (
+            f"Expected a missing-owner-file error, got: {errors}"
+        )
+
+    def test_validate_registry_rejects_pattern_only_in_comment(self):
+        """A pattern that matches only in a comment/docstring — not inside any
+        test_* function body — is caught as a renamed/deleted owner contract.
+
+        This is the core rot-prevention tightening: the old check accepted a
+        match anywhere in the file, so deleting the real contract test while
+        leaving a stray mention would pass silently.
+        """
+        import tempfile
+
+        # The endpoint string appears only in a module docstring / comment, and
+        # the sole test_* function does NOT reference it (its contract was
+        # renamed away).
+        owner_src = (
+            '"""Tests once covered /api/admin/widgets response shape."""\n'
+            "\n"
+            "# TODO: /api/admin/widgets contract lives here\n"
+            "async def test_unrelated(client):\n"
+            '    r = await client.get("/api/admin/other")\n'
+            '    assert r.status_code == 200\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert any("not inside any test_* function body" in e for e in errors), (
+            f"Expected a comment-only match to be rejected (renamed/deleted owner "
+            f"test), got: {errors}"
+        )
+
+    def test_validate_registry_rejects_pattern_matching_nowhere(self):
+        """A pattern that matches nothing in the owner file is reported as a
+        drifted pattern (distinct from the comment-only case)."""
+        import tempfile
+
+        owner_src = (
+            "async def test_something(client):\n"
+            '    r = await client.get("/api/admin/other")\n'
+            '    assert r.status_code == 200\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": [],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert any("does not match any" in e for e in errors), (
+            f"Expected a drifted-pattern error, got: {errors}"
+        )
+
+    def test_validate_registry_rejects_dangling_exempt_test(self):
+        """An exempt_tests name that is not a real test_* function anywhere in
+        the testing dir is reported as a stale exemption."""
+        import tempfile
+
+        owner_src = (
+            "async def test_widgets_contract(client):\n"
+            '    r = await client.get("/api/admin/widgets")\n'
+            '    assert r.json()["widgets"] == []\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": ["test_this_was_deleted_long_ago"],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert any(
+            "test_this_was_deleted_long_ago" in e and "stale exemption" in e
+            for e in errors
+        ), f"Expected a stale-exemption error, got: {errors}"
+
+    def test_validate_registry_accepts_exempt_test_in_other_file(self):
+        """A function-scoped exemption may live in a DIFFERENT test file; it is
+        valid as long as the name exists as a test_* function somewhere in the
+        testing dir (matching the real registry's cross-file exemptions)."""
+        import tempfile
+
+        owner_src = (
+            "async def test_widgets_contract(client):\n"
+            '    r = await client.get("/api/admin/widgets")\n'
+            '    assert r.json()["widgets"] == []\n'
+        )
+        other_src = (
+            "async def test_widgets_from_other_angle(client):\n"
+            '    r = await client.get("/api/admin/widgets")\n'
+            '    assert r.json()["count"] == 0\n'
+        )
+        registry = {
+            "GET /api/admin/widgets": {
+                "owner": "test_widgets.py",
+                "search_pattern": r"/api/admin/widgets",
+                "exempt_tests": ["test_widgets_from_other_angle"],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            (tmpdir_path / "test_widgets.py").write_text(owner_src)
+            (tmpdir_path / "test_widgets_other.py").write_text(other_src)
+
+            errors = _validate_route_contract_registry(tmpdir_path, registry)
+
+        assert errors == [], (
+            f"Expected a cross-file exemption naming a real test_* function to be "
+            f"valid, got: {errors}"
+        )
+
+
 def test_no_deprecated_datetime_utcnow_calls():
     """No app/ file may call datetime.utcnow() — use _utcnow() from app.time_utils instead.
 
@@ -10576,4 +11180,270 @@ def test_no_deprecated_datetime_utcnow_calls():
         "Replace each with _utcnow() from app.time_utils — it returns a UTC-aware\n"
         "datetime and avoids the Python 3.12 DeprecationWarning.\n\n"
         "Offending files:\n" + "\n".join(violating_files)
+    )
+
+
+
+def test_spawn_budget_partition_is_exhaustive():
+    """Assert that the autonomous spawn-budget partition is exhaustive and disjoint.
+
+    Every task type must be in exactly one of INITIATIVE or SERVICING partition,
+    with no gaps. Live spawn paths exist for memo, repo_bootstrap, and investigate,
+    so all three must be classified to prevent the initiative cap from silently
+    under-binding due to 'other' bucket spillover.
+    """
+    from app.task_capabilities import (
+        ALL_TASK_TYPES,
+        AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES,
+        AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES,
+    )
+
+    initiative = AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES
+    servicing = AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES
+
+    # Disjoint: no overlap between partitions
+    overlap = initiative & servicing
+    assert not overlap, (
+        f"initiative and servicing partitions overlap: {sorted(overlap)}. "
+        "Each task type must be in exactly one partition."
+    )
+
+    # Exhaustive: union covers all task types with no gaps
+    union = initiative | servicing
+    all_types = frozenset(ALL_TASK_TYPES)
+    missing = all_types - union
+    assert not missing, (
+        f"task types missing from both partitions: {sorted(missing)}. "
+        "All task types must be classified as either initiative or servicing."
+    )
+
+    # Verify union exactly equals all types (redundant but explicit check)
+    assert union == all_types, (
+        f"partition union {sorted(union)} != all task types {sorted(all_types)}"
+    )
+
+
+def test_orchestrator_health_task_type_vocab_is_registry_known():
+    """orchestrator_health hand-maintained type sets must contain only registry-known types.
+
+    Drift class: a type name removed from TaskType can silently linger in these
+    frozensets (e.g., 'modify' was never registered but appeared in
+    _CODE_PRODUCING_TASK_TYPES and _OUTPUT_TRANSFORMING_TASK_TYPES).  This guard
+    catches that at PR time rather than silently at runtime.
+
+    The empty-string sentinel in _CODE_PRODUCING_TASK_TYPES is intentional — it
+    is the normalized form for a default-create task whose payload carries no
+    explicit type — and is therefore excluded from the registry check.
+    """
+    from app.task_capabilities import ALL_TASK_TYPES
+    import app.orchestrator_health as _oh
+
+    covered_sets = {
+        "_CODE_PRODUCING_TASK_TYPES": _oh._CODE_PRODUCING_TASK_TYPES,
+        "_OUTPUT_TRANSFORMING_TASK_TYPES": _oh._OUTPUT_TRANSFORMING_TASK_TYPES,
+    }
+    for set_name, type_set in covered_sets.items():
+        unknown = {t for t in type_set if t and t not in ALL_TASK_TYPES}
+        assert not unknown, (
+            f"orchestrator_health.{set_name} contains unregistered task type(s): "
+            f"{sorted(unknown)}.  Either add the type to TaskType in task_capabilities.py "
+            "or remove the stale literal from the frozenset."
+        )
+
+
+def test_orchestrator_health_vocab_guard_catches_injected_fake_type():
+    """Self-test: the vocab guard above must catch a deliberately injected fake type.
+
+    Verifies the guard is live — not accidentally vacuous — by constructing a
+    patched frozenset that contains a fake type and asserting the guard logic
+    raises.
+    """
+    from app.task_capabilities import ALL_TASK_TYPES
+
+    fake_set = frozenset({"create", "fix", "__nonexistent_type__"})
+    unknown = {t for t in fake_set if t and t not in ALL_TASK_TYPES}
+    assert unknown == {"__nonexistent_type__"}, (
+        "Guard logic failed to detect the injected fake type '__nonexistent_type__'. "
+        "The standing vocab check would silently pass on real drift."
+    )
+
+
+def test_mock_patch_targets_resolve():
+    """Every first-party mock.patch() string target in the test suite must resolve.
+
+    Uses ``impacted_tests.collect_first_party_patch_targets`` (production API) to
+    enumerate every ``patch("app.*")`` call across ``backend/testing/test_*.py``,
+    then resolves each to the module file it references (via the same AST-based
+    top-level-name check as ``_app_module_top_level_names``). A renamed or removed
+    attribute only surfaces at test-run time when the impacted-test selector
+    happens to include the patching file; this static check closes that gap at the
+    standalone merge gate.
+
+    ``create=True`` patches and targets whose module path does not map to a file
+    on disk (nested-import patterns such as ``app.storage.storage.Client``) are
+    excluded rather than flagged.
+    """
+    from testing import impacted_tests
+
+    testing_dir = Path(__file__).resolve().parent
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+
+    targets = impacted_tests.collect_first_party_patch_targets(str(testing_dir))
+
+    module_cache: dict[str, "set[str] | None"] = {}
+    failures: list[str] = []
+
+    for target in targets:
+        last_dot = target.rfind(".")
+        if last_dot == -1:
+            continue
+        module_dotted = target[:last_dot]
+        attr = target[last_dot + 1:]
+
+        if module_dotted not in module_cache:
+            module_cache[module_dotted] = _app_module_top_level_names(
+                app_dir, module_dotted
+            )
+
+        top_level = module_cache[module_dotted]
+        if top_level is None:
+            continue  # nested import pattern — not statically checkable
+        if attr not in top_level:
+            failures.append(
+                f"  '{target}' — '{attr}' not defined in {module_dotted}"
+            )
+
+    assert not failures, (
+        f"Stale mock-patch target(s) detected ({len(failures)} of {len(targets)}).\n"
+        "A renamed/removed attribute only fails at test run time when the "
+        "impacted-test selector happens to include the patching file.\n"
+        "Fix: update the patch target string to the current module.attribute path.\n\n"
+        + "\n".join(sorted(failures)[:50])
+        + ("" if len(failures) <= 50 else f"\n... and {len(failures) - 50} more")
+    )
+
+
+def test_acceptance_window_evidence_call_site_wired():
+    """release_qualifier_sweep.py must import and call record_acceptance_window_coverage_evidence.
+
+    This invariant guards that the acceptance-window evidence recording function
+    stays wired into the sweep hot path. A rename or accidental deletion would
+    silently break coverage re-scoring without this tripwire.
+    """
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    sweep_path = app_dir / "release_qualifier_sweep.py"
+    criteria_path = app_dir / "acceptance_criteria.py"
+
+    sweep_source = sweep_path.read_text(encoding="utf-8")
+    criteria_source = criteria_path.read_text(encoding="utf-8")
+
+    func_name = "record_acceptance_window_coverage_evidence"
+
+    # Confirm the function is defined in acceptance_criteria.py
+    assert f"def {func_name}" in criteria_source, (
+        f"'{func_name}' is no longer defined in acceptance_criteria.py. "
+        "Either restore the function or update this invariant to match the new name."
+    )
+
+    # Confirm it is imported in release_qualifier_sweep.py
+    sweep_tree = ast.parse(sweep_source, filename=str(sweep_path))
+    imported_names: set[str] = set()
+    for node in ast.walk(sweep_tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "app.acceptance_criteria":
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name)
+
+    assert func_name in imported_names, (
+        f"release_qualifier_sweep.py does not import '{func_name}' from "
+        "app.acceptance_criteria. The acceptance-window evidence recording "
+        "call site may be broken — restore the import."
+    )
+
+    # Confirm it is actually called in release_qualifier_sweep.py
+    called = False
+    for node in ast.walk(sweep_tree):
+        if isinstance(node, ast.Call):
+            name = _ast_called_name(node)
+            if name == func_name:
+                called = True
+                break
+        # Also handle `await record_acceptance_window_coverage_evidence(...)`
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            name = _ast_called_name(node.value)
+            if name == func_name:
+                called = True
+                break
+
+    assert called, (
+        f"release_qualifier_sweep.py imports '{func_name}' but never calls it. "
+        "The acceptance-window evidence re-scoring sweep is effectively disabled — "
+        "restore the call site."
+    )
+
+
+def test_metrics_integrity_sweep_wired_in_reaper():
+    """sweep_metrics_integrity must be imported from reaper_sweeps and called in reaper.py."""
+    import ast
+    from pathlib import Path
+
+    reaper_path = Path(__file__).resolve().parents[1] / "app" / "reaper.py"
+    source = reaper_path.read_text()
+    tree = ast.parse(source)
+
+    # Verify import
+    imported = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "app.reaper_sweeps":
+            for alias in node.names:
+                if alias.name == "sweep_metrics_integrity":
+                    imported = True
+    assert imported, (
+        "sweep_metrics_integrity is not imported from app.reaper_sweeps in reaper.py. "
+        "The metrics-integrity sweep must be wired in reaper.py."
+    )
+
+    # Verify call site
+    called = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "sweep_metrics_integrity"
+        for node in ast.walk(tree)
+    )
+    assert called, (
+        "sweep_metrics_integrity is imported but never called in reaper.py. "
+        "The metrics-integrity sweep must be invoked in the reaper service loop."
+    )
+
+
+def test_v22_finding_backfill_wired_in_orchestrator():
+    """_sweep_v22_finding_backfill must be imported and called inside orchestrator.py."""
+    import ast
+    from pathlib import Path
+
+    orch_path = Path(__file__).resolve().parents[1] / "app" / "orchestrator.py"
+    source = orch_path.read_text()
+    tree = ast.parse(source)
+
+    # Verify inline import from release_readiness
+    imported = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "app.release_readiness"
+        and any(alias.name == "_sweep_v22_finding_backfill" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    assert imported, (
+        "_sweep_v22_finding_backfill is not imported from app.release_readiness in orchestrator.py. "
+        "The v22 finding backfill must be wired into the orchestrator cadence loop."
+    )
+
+    # Verify call site
+    called = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_sweep_v22_finding_backfill"
+        for node in ast.walk(tree)
+    )
+    assert called, (
+        "_sweep_v22_finding_backfill is imported but never called in orchestrator.py. "
+        "The v22 finding backfill must be invoked on a cadence in the orchestrator loop."
     )

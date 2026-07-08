@@ -467,6 +467,42 @@ async def dismiss_alert(
     return {"status": "dismissed"}
 
 
+@router.post("/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(
+    alert_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Acknowledge an ongoing alert, suppressing further escalation re-pages.
+
+    Sets ``acknowledged_at`` on the alert without dismissing it — the alert
+    remains visible in the operator UI, but the orchestrator's escalation sweep
+    will not fire additional webhooks for this outage until the alert auto-resolves
+    on recovery (e.g. runner comes back online). Used primarily for runner-offline
+    escalation suppression: operator sees the alert, knows about it, and opts out
+    of repeated pages while the issue is being worked. Idempotent — acknowledging
+    an already-acknowledged alert is a no-op that returns 200.
+    """
+    alert = await session.get(Alert, uuid.UUID(alert_id))
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    member = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == alert.project_id,
+                ProjectMember.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    if alert.acknowledged_at is None:
+        alert.acknowledged_at = _utcnow()
+        session.add(alert)
+        await session.commit()
+    return {"status": "acknowledged"}
+
+
 @router.post("/alerts/dismiss-all")
 async def dismiss_all_alerts(
     project_id: Optional[str] = None,

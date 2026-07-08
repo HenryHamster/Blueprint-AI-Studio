@@ -15,6 +15,7 @@ from httpx import AsyncClient
 
 from app.auth import create_agent_token
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+from test_agent_task_contract import assert_task_list_response_contract
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +336,7 @@ async def test_get_task_rejects_invalid_token(client: AsyncClient, db_session):
 
 @pytest.mark.asyncio
 async def test_list_tasks_returns_strategic_agent_tasks(client: AsyncClient, db_session):
-    """List returns only STRATEGIC_AGENT tasks for the project."""
+    """List returns only STRATEGIC_AGENT tasks for the project, with flat+children contract."""
     project, calling_task = await _make_project_and_task(db_session, name="List Test")
 
     t1 = await _make_strategic_task(db_session, project, title="Task 1", task_type="research")
@@ -352,7 +353,10 @@ async def test_list_tasks_returns_strategic_agent_tasks(client: AsyncClient, db_
     )
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body["status"] == "success"
+
+    # Validate against the shared flat+children contract
+    assert_task_list_response_contract(body)
+
     ids = {item["id"] for item in body["data"]}
     assert str(t1.id) in ids
     assert str(t2.id) in ids

@@ -2426,7 +2426,15 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                 from app import ci_resolution as _blk_ci_res
 
                 _block_proj = (
-                    await session.get(Project, ci_task.project_id)
+                    (
+                        await session.execute(
+                            select(Project)
+                            .where(Project.id == ci_task.project_id)
+                            .with_for_update()
+                        )
+                    )
+                    .scalars()
+                    .first()
                     if ci_task.project_id
                     else None
                 )
@@ -2505,11 +2513,13 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
             # ci_loop marker prevents re-alerting across polls.
             if _unverified_merge_reason:
                 if _block_proj is None and ci_task.project_id:
-                    from app.models import Project as _NTProject
-
-                    _block_proj = await session.get(
-                        _NTProject, ci_task.project_id
-                    )
+                    _block_proj = (
+                        await session.execute(
+                            select(Project)
+                            .where(Project.id == ci_task.project_id)
+                            .with_for_update()
+                        )
+                    ).scalars().first()
                 from app import ci_resolution as _nt_ci_res
 
                 if _nt_ci_res.should_block_no_test_unverified_merge(
@@ -2600,11 +2610,25 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
             # executed_real_tests is True only when verify_tests
             # produced a real pass/fail verdict. Best-effort: the
             # helper never raises, so it cannot break the merge path.
-            if _no_ci_verify_gate or _unverified_merge_reason:
+            # Sticky marker mirrors the sibling block-recorders: a
+            # re-polled still-EVALUATING strand must not inflate
+            # recent_outcomes or unverified_reason_counts a second time
+            # for the same gate event.
+            if (_no_ci_verify_gate or _unverified_merge_reason) and not ci_loop.get(
+                "no_ci_runtime_recorded"
+            ):
                 from app import ci_resolution
 
                 _rt_proj = (
-                    await session.get(Project, ci_task.project_id)
+                    (
+                        await session.execute(
+                            select(Project)
+                            .where(Project.id == ci_task.project_id)
+                            .with_for_update()
+                        )
+                    )
+                    .scalars()
+                    .first()
                     if ci_task.project_id
                     else None
                 )
@@ -2618,6 +2642,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     unverified_reason=_unverified_merge_reason,
                     when=_utcnow(),
                 )
+                ci_loop["no_ci_runtime_recorded"] = True
 
             logger.info(
                 f"[CI] Poll fallback: CI completed for PR #{ci_pr_number}, processing"

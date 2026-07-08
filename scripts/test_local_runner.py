@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 # Add scripts dir to path so we can import local_runner directly
 sys.path.insert(0, str(Path(__file__).parent))
+import blueprint_runner as br
 import local_runner
 import runner_isolation as iso
 
@@ -234,6 +235,110 @@ class TestAgentWorkspace(unittest.TestCase):
             self.assertTrue(workspace.startswith(os.path.abspath(tmpdir)))
             self.assertTrue(workspace.endswith("task_abc_123"))
             self.assertTrue(os.path.isdir(workspace))
+
+    def test_workspace_path_does_not_create_dir(self):
+        """_agent_workspace_path computes the same path but has no side effect."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                path = local_runner._agent_workspace_path("task/abc:123")
+                created = local_runner._agent_workspace_for_task("task/abc:123")
+            self.assertEqual(path, created)
+            self.assertTrue(path.endswith("task_abc_123"))
+
+    def test_cleanup_removes_per_task_workspace(self):
+        """Auto-clean: a finished task's workspace dir is rmtree'd, not left behind."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir},
+                            clear=False):
+                os.environ.pop("BLUEPRINT_RUNNER_KEEP_WORKSPACES", None)
+                workspace = local_runner._agent_workspace_for_task("task-xyz")
+                # Simulate leftover scratch content the agent produced.
+                with open(os.path.join(workspace, "big.log"), "w") as fh:
+                    fh.write("x" * 1024)
+                self.assertTrue(os.path.isdir(workspace))
+
+                local_runner._cleanup_agent_workspace("task-xyz")
+
+            self.assertFalse(os.path.exists(workspace))
+
+    def test_cleanup_respects_keep_workspaces_opt_out(self):
+        """BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 retains the dir for debugging."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {
+                "BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir,
+                "BLUEPRINT_RUNNER_KEEP_WORKSPACES": "1",
+            }):
+                workspace = local_runner._agent_workspace_for_task("task-keep")
+                local_runner._cleanup_agent_workspace("task-keep")
+            self.assertTrue(os.path.isdir(workspace))
+
+    def test_cleanup_missing_workspace_is_noop(self):
+        """Cleaning a workspace that was never created must not raise."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                os.environ.pop("BLUEPRINT_RUNNER_KEEP_WORKSPACES", None)
+                local_runner._cleanup_agent_workspace("never-made")  # no raise
+
+
+class TestLowDiskGuard(unittest.TestCase):
+    def test_min_free_disk_bytes_parses_env(self):
+        with patch.dict(os.environ, {"BLUEPRINT_RUNNER_MIN_DISK_BYTES": "2048"}):
+            self.assertEqual(local_runner._min_free_disk_bytes(), 2048)
+
+    def test_min_free_disk_bytes_defaults_and_rejects_garbage(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BLUEPRINT_RUNNER_MIN_DISK_BYTES", None)
+            self.assertEqual(local_runner._min_free_disk_bytes(), 0)
+        with patch.dict(os.environ, {"BLUEPRINT_RUNNER_MIN_DISK_BYTES": "notanint"}):
+            self.assertEqual(local_runner._min_free_disk_bytes(), 0)
+
+    def test_guard_disabled_when_threshold_zero(self):
+        # Even with a tiny reported free space, threshold 0 never guards.
+        with patch.object(local_runner, "_disk_free_bytes", return_value=1):
+            self.assertFalse(local_runner._disk_below_min("/some/root", 0))
+
+    def test_guard_trips_below_threshold(self):
+        with patch.object(local_runner, "_disk_free_bytes", return_value=500):
+            self.assertTrue(local_runner._disk_below_min("/some/root", 1000))
+
+    def test_guard_ok_at_or_above_threshold(self):
+        with patch.object(local_runner, "_disk_free_bytes", return_value=1500):
+            self.assertFalse(local_runner._disk_below_min("/some/root", 1000))
+
+    def test_guard_ignores_unknown_free_space(self):
+        # Unknown free space (None) must not falsely trip the guard.
+        with patch.object(local_runner, "_disk_free_bytes", return_value=None):
+            self.assertFalse(local_runner._disk_below_min("/some/root", 1000))
+
+
+# ── Stale workspace cleanup ────────────────────────────────────────────────────
+
+class TestStaleWorkspaceCleanup(unittest.TestCase):
+    def test_stale_workspace_cleanup_removes_old_dirs(self):
+        """Cleanup removes workspace dirs not matching any active task id."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                stale_a = os.path.join(tmpdir, "task_stale_1")
+                stale_b = os.path.join(tmpdir, "task_stale_2")
+                active_dir = os.path.join(tmpdir, "task_active_1")
+                for d in (stale_a, stale_b, active_dir):
+                    os.makedirs(d)
+
+                # "task/active:1" sanitizes to "task_active_1" — matching active_dir
+                removed = local_runner._cleanup_stale_workspaces(
+                    {"task/active:1"}, max_age_seconds=0
+                )
+
+                self.assertEqual(removed, 2)
+                self.assertFalse(os.path.isdir(stale_a))
+                self.assertFalse(os.path.isdir(stale_b))
+                self.assertTrue(os.path.isdir(active_dir))
 
 
 # ── Startup summary ───────────────────────────────────────────────────────────
@@ -481,6 +586,36 @@ class TestReaperLoop(unittest.TestCase):
         self.assertNotIn("task-done", active_tasks)
         self.assertTrue(capacity.acquire(blocking=False))
 
+    def test_reap_cleans_up_finished_workspace(self):
+        """A reaped agent's per-task workspace is removed (auto-clean wiring)."""
+        import tempfile
+
+        done_proc = MagicMock()
+        done_proc.poll.return_value = 0
+        done_proc.returncode = 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                os.environ.pop("BLUEPRINT_RUNNER_KEEP_WORKSPACES", None)
+                workspace = local_runner._agent_workspace_for_task("task-done")
+                self.assertTrue(os.path.isdir(workspace))
+
+                active_tasks = {"task-done": done_proc}
+                lock = threading.Lock()
+
+                def stop_after_sleep(secs):
+                    local_runner._shutdown_event.set()
+
+                local_runner._shutdown_event.clear()
+                try:
+                    with patch("time.sleep", stop_after_sleep):
+                        local_runner._reap_loop(active_tasks, lock)
+                finally:
+                    local_runner._shutdown_event.clear()
+
+                self.assertNotIn("task-done", active_tasks)
+                self.assertFalse(os.path.exists(workspace))
+
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
@@ -580,6 +715,105 @@ class TestComputeJobReport(unittest.TestCase):
             )
 
         self.assertFalse(result)
+
+    def test_running_report_does_not_retry_transient_failure(self):
+        """Interim 'running' heartbeats are single-shot — no retry, no sleep."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            raise RuntimeError("boom")
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-run",
+                exec_status="running",
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(calls["n"], 1)
+        mock_sleep.assert_not_called()
+
+    def test_terminal_report_retries_network_error_then_succeeds(self):
+        """A transient network blip on the terminal metric report is retried, not lost."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("transient network error")
+            return 200, {"cancel_requested": False}
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-metrics",
+                exec_status="succeeded", exit_code=0,
+                result_metrics={"loss": 0.5},
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(calls["n"], 3)  # failed twice, succeeded on the third
+        self.assertEqual(mock_sleep.call_count, 2)  # one backoff per retry
+
+    def test_terminal_report_retries_5xx_then_gives_up(self):
+        """Terminal report retries a 5xx up to the cap, then settles without raising."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            return 503, None
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-5xx",
+                exec_status="failed", exit_code=1,
+            )
+
+        self.assertFalse(result)
+        # 1 initial attempt + _REPORT_MAX_RETRIES retries.
+        self.assertEqual(calls["n"], local_runner._REPORT_MAX_RETRIES + 1)
+        self.assertEqual(mock_sleep.call_count, local_runner._REPORT_MAX_RETRIES)
+
+    def test_terminal_report_does_not_retry_permanent_4xx(self):
+        """A permanent 4xx (e.g. 400) is not retried — retrying can't fix it."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            return 400, {"detail": "bad request"}
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-400",
+                exec_status="succeeded", exit_code=0,
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(calls["n"], 1)
+        mock_sleep.assert_not_called()
+
+    def test_terminal_report_404_still_short_circuits(self):
+        """A 404 on a terminal report means the job is gone — cancel, no retry."""
+        calls = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            calls["n"] += 1
+            return 404, None
+
+        with patch.object(local_runner, "_post", fake_post), \
+                patch("time.sleep") as mock_sleep:
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-gone",
+                exec_status="failed", exit_code=1,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(calls["n"], 1)
+        mock_sleep.assert_not_called()
 
 
 # ── Compute job worker ────────────────────────────────────────────────────────
@@ -1283,6 +1517,82 @@ class TestGpuDetection(unittest.TestCase):
         with patch.object(local_runner.socket, "gethostname", side_effect=OSError):
             self.assertIsNone(local_runner._hostname())
 
+    def test_isolation_backends_included_in_heartbeat_body(self):
+        """Heartbeat body carries the isolation-backend inventory, selected
+        agent/compute backends, and the runner version when caps are supplied."""
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v22-abc"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                    agent_image=None,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        body = posted_bodies[0]
+        self.assertEqual(body["version"], "v22-abc")
+        self.assertIsInstance(body["isolation_backends"], dict)
+        self.assertTrue(body["isolation_backends"]["bwrap_ok"])
+        self.assertFalse(body["isolation_backends"]["docker_usable"])
+        # bwrap host with an agent binary → bwrap agent backend, bwrap compute.
+        self.assertEqual(body["agent_backend"], iso.BACKEND_BWRAP)
+        self.assertEqual(body["compute_backend"], iso.BACKEND_BWRAP)
+
+    def test_isolation_fields_none_when_caps_absent(self):
+        """caps=None (an old caller) → the three isolation fields serialize as
+        None so the heartbeat is non-breaking and the backend tolerates them."""
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value=None), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        body = posted_bodies[0]
+        self.assertIsNone(body["isolation_backends"])
+        self.assertIsNone(body["agent_backend"])
+        self.assertIsNone(body["compute_backend"])
+        self.assertIsNone(body["version"])
+
     def test_docker_only_declares_read_only_agent_slice(self):
         """A docker-only box (docker+image, NO bwrap) DECLARES the read-only agent
         slice in supported_agent_task_types.
@@ -1743,11 +2053,64 @@ class TestArtifactUpload(unittest.TestCase):
             with patch(
                 "urllib.request.urlopen",
                 side_effect=urllib.error.HTTPError("u", 500, "err", {}, None),
-            ):
-                # Must NOT raise.
+            ), patch("time.sleep"):
+                # Must NOT raise even after exhausting retries.
                 local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
+
+    def test_upload_retries_5xx_up_to_cap(self):
+        """A 5xx artifact upload is retried up to the cap before giving up."""
+        import tempfile
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "f.txt", b"data")
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.HTTPError("u", 503, "err", {}, None),
+            ) as mock_urlopen, patch("time.sleep") as mock_sleep:
+                local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+
+        self.assertEqual(
+            mock_urlopen.call_count, local_runner._REPORT_MAX_RETRIES + 1
+        )
+        self.assertEqual(mock_sleep.call_count, local_runner._REPORT_MAX_RETRIES)
+
+    def test_upload_retries_network_error_then_succeeds(self):
+        """A transient network blip on upload is retried instead of dropping artifacts."""
+        import tempfile
+        import urllib.error
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        calls = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise urllib.error.URLError("conn reset")
+            return _Resp()
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "f.txt", b"data")
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                    patch("time.sleep") as mock_sleep:
+                local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+
+        self.assertEqual(calls["n"], 2)  # failed once, uploaded on retry
+        self.assertEqual(mock_sleep.call_count, 1)
 
 
 class TestBoundedDedupLog(unittest.TestCase):
@@ -1962,6 +2325,35 @@ class TestFunctionalProbes(unittest.TestCase):
         fake.stdout = "250\n"
         with patch("subprocess.run", return_value=fake):
             self.assertEqual(local_runner._gpu_utilization_pct(), 100)
+
+    def test_runner_version_returns_describe_output(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "v22-15-gabc1234-dirty\n"
+        with patch("subprocess.run", return_value=fake):
+            self.assertEqual(local_runner._runner_version(), "v22-15-gabc1234-dirty")
+
+    def test_runner_version_none_on_nonzero_exit(self):
+        fake = MagicMock()
+        fake.returncode = 128  # not a git repo
+        fake.stdout = ""
+        with patch("subprocess.run", return_value=fake):
+            self.assertIsNone(local_runner._runner_version())
+
+    def test_runner_version_none_when_git_absent(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(local_runner._runner_version())
+
+    def test_runner_version_none_on_os_error(self):
+        with patch("subprocess.run", side_effect=OSError):
+            self.assertIsNone(local_runner._runner_version())
+
+    def test_runner_version_none_on_empty_output(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "   \n"
+        with patch("subprocess.run", return_value=fake):
+            self.assertIsNone(local_runner._runner_version())
 
 
 class TestAgentWallClockDeadline(unittest.TestCase):
@@ -2233,6 +2625,54 @@ class TestHeartbeat401Streak(unittest.TestCase):
             )
 
         self.assertEqual(exits, [], "streak reset by the 200 must not trigger an exit")
+
+
+class TestHeartbeatJitterAndNetworkFailureEscalation(unittest.TestCase):
+    """Heartbeat loop: jitter spreads restarts; network failure streak escalates."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_heartbeat_jitter_and_network_failure_escalation(self):
+        """Jitter spreads sleep intervals; consecutive network errors trigger _die."""
+        jitter_calls = []
+        exits = []
+
+        def fake_post(url, token, body, **kwargs):
+            raise RuntimeError("Network error: [Errno -2] Name or service not known")
+
+        def fake_exit(code):
+            exits.append(code)
+            local_runner._shutdown_event.set()
+            raise SystemExit(code)
+
+        def fake_uniform(a, b):
+            jitter_calls.append((a, b))
+            return 3.0  # deterministic jitter for test
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch("os._exit", fake_exit), \
+             patch("time.sleep", lambda s: None), \
+             patch("random.uniform", fake_uniform):
+            with self.assertRaises(SystemExit):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    max_network_failures=3,
+                )
+
+        # _die must have been called exactly once with exit code 1
+        self.assertEqual(exits, [1], "network failure streak must exit non-zero")
+
+        # Jitter: random.uniform must have been called with the ±6s window on each
+        # sleep cycle so runners don't thundering-herd on orchestrator restart.
+        self.assertGreater(len(jitter_calls), 0, "random.uniform never called — jitter not applied")
+        for args in jitter_calls:
+            self.assertEqual(args, (-6, 6), f"jitter window wrong: got {args}, want (-6, 6)")
 
 
 class TestComputePollRetryAfter(unittest.TestCase):
@@ -2645,6 +3085,88 @@ class TestAgentImagePresence(unittest.TestCase):
         self.assertFalse(self._advertised_after_image_gate(inspect_rc=1))
 
 
+class TestAgentBackendPreference(unittest.TestCase):
+    """The default agent backend is bwrap-first; docker requires an explicit opt-in.
+
+    These tests drive the preference logic in main() (agent_backend_pref) and the
+    decide_agent_backend integration, confirming that:
+      1. Default (no env vars, no image) → bwrap backend selected.
+      2. BLUEPRINT_AGENT_BACKEND=docker → docker backend for read-only types.
+      3. BLUEPRINT_AGENT_BACKEND=bwrap with image set → image ignored, bwrap used.
+    """
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _backend_from_env(self, env_overrides, *, caps, task_type="research"):
+        """Drive decide_agent_backend the way main() + _spawn_agent_task would.
+
+        Parses agent_image and agent_backend_pref from env_overrides (mirrors the
+        main() startup block), then calls decide_agent_backend with the result.
+        ``agent_binary_present=True`` is assumed (we're testing backend selection,
+        not binary detection — the host binary check is separate from isolation routing).
+        """
+        env = {**env_overrides}
+        agent_image = env.get("BLUEPRINT_AGENT_IMAGE", "").strip() or None
+        pref = env.get("BLUEPRINT_AGENT_BACKEND", "").strip().lower() or "auto"
+        if pref == "bwrap":
+            agent_image = None
+        # BLUEPRINT_AGENT_BACKEND=docker just keeps agent_image as-is; the
+        # docker path activates when decide_agent_backend sees image+docker_usable.
+        return iso.decide_agent_backend(
+            caps, True, task_type=task_type, agent_image=agent_image
+        )
+
+    def test_default_no_env_uses_bwrap(self):
+        """No env vars at all → bwrap backend (the default)."""
+        backend = self._backend_from_env({}, caps=_bwrap_caps())
+        self.assertEqual(backend, iso.BACKEND_BWRAP)
+
+    def test_default_docker_usable_but_no_image_uses_bwrap(self):
+        """Docker usable but BLUEPRINT_AGENT_IMAGE not set → bwrap."""
+        backend = self._backend_from_env({}, caps=_docker_caps())
+        # No image means decide_agent_backend returns bwrap (or decline if no bwrap).
+        # _docker_caps has no bwrap, so it's DECLINE — proving docker is NOT auto-selected.
+        self.assertNotEqual(backend, iso.BACKEND_DOCKER)
+
+    def test_docker_opt_in_with_image_routes_read_only_to_docker(self):
+        """BLUEPRINT_AGENT_BACKEND=docker + BLUEPRINT_AGENT_IMAGE → docker for research."""
+        backend = self._backend_from_env(
+            {
+                "BLUEPRINT_AGENT_BACKEND": "docker",
+                "BLUEPRINT_AGENT_IMAGE": "registry/agent:prod",
+            },
+            caps=_docker_caps(),
+            task_type="research",
+        )
+        self.assertEqual(backend, iso.BACKEND_DOCKER)
+
+    def test_bwrap_force_ignores_image(self):
+        """BLUEPRINT_AGENT_BACKEND=bwrap zeroes out agent_image → docker NOT selected."""
+        # With BACKEND=bwrap, agent_image is discarded. Even though docker is usable and
+        # the image would normally enable docker, bwrap is forced so docker is never chosen.
+        backend = self._backend_from_env(
+            {
+                "BLUEPRINT_AGENT_BACKEND": "bwrap",
+                "BLUEPRINT_AGENT_IMAGE": "registry/agent:prod",
+            },
+            caps=_docker_caps(),   # docker usable, but bwrap is forced → docker NOT selected
+        )
+        self.assertNotEqual(backend, iso.BACKEND_DOCKER)
+
+    def test_explicit_image_without_backend_pref_acts_as_docker_optin(self):
+        """BLUEPRINT_AGENT_IMAGE set (no BACKEND pref) → auto mode treats image as opt-in."""
+        backend = self._backend_from_env(
+            {"BLUEPRINT_AGENT_IMAGE": "registry/agent:prod"},
+            caps=_docker_caps(),
+            task_type="research",
+        )
+        self.assertEqual(backend, iso.BACKEND_DOCKER)
+
+
 class TestCredentialPersistence(unittest.TestCase):
     """Token persistence: save/load round-trip, file permissions, fallback behaviour."""
 
@@ -2666,6 +3188,49 @@ class TestCredentialPersistence(unittest.TestCase):
     def test_save_and_load_roundtrip(self):
         local_runner._save_runner_token("tok-abc123-test")
         self.assertEqual(local_runner._load_runner_token(), "tok-abc123-test")
+
+    def test_save_load_runner_token_roundtrip(self):
+        """Comprehensive save/load roundtrip verifying credential persistence,
+        directory permissions (0700), and file permissions (0600).
+
+        Exercises the hardened _save_runner_token which now chmods the credential
+        directory, and the cross-module agreement with blueprint_runner._credential_dir.
+        """
+        import blueprint_runner as br
+
+        # Verify the two modules agree on the credential directory (shared contract).
+        self.assertEqual(
+            local_runner._credential_dir(),
+            br._credential_dir(),
+            "local_runner._credential_dir() and blueprint_runner._credential_dir() "
+            "must agree so the runner writes and the launcher reads from the same place.",
+        )
+
+        # Save a token and reload it — the basic round-trip.
+        token = "tok-roundtrip-verify-123"
+        local_runner._save_runner_token(token)
+        self.assertEqual(local_runner._load_runner_token(), token)
+
+        # Credential directory must be 0700 (hardened by the production change).
+        cred_dir = local_runner._credential_dir()
+        dir_mode = os.stat(cred_dir).st_mode & 0o777
+        self.assertEqual(dir_mode, 0o700,
+                        f"credential dir must be 0700, got {oct(dir_mode)}")
+
+        # Token file must be 0600.
+        path = local_runner._credential_path()
+        file_mode = os.stat(path).st_mode & 0o777
+        self.assertEqual(file_mode, 0o600,
+                        f"token file must be 0600, got {oct(file_mode)}")
+
+        # Overwrite with a new token and verify the latest value.
+        local_runner._save_runner_token("updated-token")
+        self.assertEqual(local_runner._load_runner_token(), "updated-token")
+
+        # The credential dir permissions must survive the overwrite.
+        dir_mode2 = os.stat(cred_dir).st_mode & 0o777
+        self.assertEqual(dir_mode2, 0o700,
+                        f"credential dir permissions must survive overwrite, got {oct(dir_mode2)}")
 
     def test_file_permissions_0600(self):
         local_runner._save_runner_token("tok-secret")
@@ -2930,6 +3495,413 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
             warning_lines,
             f"Did not expect mismatch warning when values match. Got: {warning_lines}",
         )
+
+
+class BlueprintRunnerInstallTests(unittest.TestCase):
+    """Acceptance-evidence tests: the install path operators rely on for onboarding
+    a new device renders a valid systemd unit with real host paths and the crash-loop
+    burst cap. These tests import and exercise ``blueprint_runner`` (not local_runner)
+    — the launcher that wraps the runner as a systemd service."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="bp_install_test_")
+        self.unit_path = os.path.join(self.tmp, "blueprint-runner.service")
+        self.env_path = os.path.join(self.tmp, "runner.env")
+        # The template file MUST exist at the real path — render_unit reads it.
+        # Both templates live at well-known paths relative to this test file.
+        self._user_template = br._USER_SERVICE_TEMPLATE
+        self._system_template = br._SYSTEM_SERVICE_TEMPLATE
+        self.assertTrue(
+            os.path.isfile(self._user_template),
+            f"user template missing: {self._user_template}",
+        )
+        self.assertTrue(
+            os.path.isfile(self._system_template),
+            f"system template missing: {self._system_template}",
+        )
+
+    def tearDown(self):
+        import shutil as _sh
+        _sh.rmtree(self.tmp, ignore_errors=True)
+
+    def test_install_renders_unit_with_real_paths(self):
+        """Acceptance evidence: the --user install flow renders the real template
+        with resolved host paths, writes it to the user unit path, and preserves the
+        crash-loop burst cap directives (StartLimitIntervalSec / StartLimitBurst)."""
+        calls = []
+        from scripts.test_blueprint_runner import _systemctl_recorder
+        run = _systemctl_recorder(record=calls)
+
+        patches = [
+            patch.object(br, "_user_unit_path", return_value=self.unit_path),
+            patch.object(br, "_env_file_path", return_value=self.env_path),
+            patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(
+                system=False,
+                token="acceptance-token",
+                url="https://orch.acceptance.example",
+                _run=run,
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(rc, 0, "install must return 0 when all steps succeed")
+
+        # The unit was written and contains real resolved paths (not @TOKENS@).
+        unit_text = Path(self.unit_path).read_text()
+        self.assertIn(sys.executable, unit_text,
+                      "rendered unit must contain the real Python path")
+        self.assertIn(br._LOCAL_RUNNER, unit_text,
+                      "rendered unit must contain the real local_runner.py path")
+        self.assertTrue(
+            br._LOCAL_RUNNER.endswith("local_runner.py"),
+            f"_LOCAL_RUNNER should point at local_runner.py, got {br._LOCAL_RUNNER}",
+        )
+        # No leftover @…@ template placeholders.
+        import re
+        leftover = re.findall(r"@[A-Z_]+@", unit_text)
+        self.assertEqual(leftover, [], f"leftover placeholders: {leftover}")
+
+        # Crash-loop guard directives from the updated service template are present.
+        self.assertIn("StartLimitIntervalSec=60", unit_text,
+                      "burst-cap interval must be in rendered unit")
+        self.assertIn("StartLimitBurst=3", unit_text,
+                      "burst count must be in rendered unit")
+        self.assertIn("RestartSec=5", unit_text)
+        self.assertIn("Restart=on-failure", unit_text)
+
+        # The comment block documents crash-loop recovery.
+        self.assertIn("reset-failed", unit_text,
+                      "comment block must mention reset-failed recovery")
+
+        # The token is in the env file, NOT baked into the unit.
+        self.assertNotIn("acceptance-token", unit_text,
+                         "token must never appear in the rendered unit")
+        env_text = Path(self.env_path).read_text()
+        self.assertIn("BLUEPRINT_RUNNER_TOKEN=acceptance-token", env_text)
+
+        # systemctl commands were issued.
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(any("daemon-reload" in j for j in joined),
+                        "daemon-reload must be called during install")
+        self.assertTrue(
+            any("enable --now blueprint-runner.service" in j for j in joined),
+            "enable --now must be called during install",
+        )
+
+    def test_system_install_renders_unit_with_burst_cap(self):
+        """System install path also includes the crash-loop guard in the
+        rendered unit."""
+        calls = []
+        from scripts.test_blueprint_runner import _systemctl_recorder
+        run = _systemctl_recorder(record=calls)
+
+        sys_unit = os.path.join(self.tmp, "etc-system", "blueprint-runner.service")
+        patches = [
+            patch.object(br, "_system_unit_path", return_value=sys_unit),
+            patch.object(br, "_env_file_path", return_value=self.env_path),
+            patch.object(br, "_install_user", return_value="testop"),
+            patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(
+                system=True, token=None, url="https://o.example", _run=run,
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(rc, 0)
+        unit_text = Path(sys_unit).read_text()
+        self.assertIn("StartLimitIntervalSec=60", unit_text)
+        self.assertIn("StartLimitBurst=3", unit_text)
+        self.assertIn("reset-failed", unit_text)
+        self.assertIn("User=testop", unit_text)
+        self.assertIn("WantedBy=multi-user.target", unit_text)
+
+    def test_uninstall_stops_and_removes_unit(self):
+        """Uninstall disables, stops, and removes a present unit file, leaving
+        credentials untouched."""
+        unit = os.path.join(self.tmp, "installed.service")
+        Path(unit).write_text("[Unit]\n")
+        calls = []
+        from scripts.test_blueprint_runner import _systemctl_recorder
+        run = _systemctl_recorder(record=calls)
+
+        with patch.object(br, "_user_unit_path", return_value=unit), \
+             patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"):
+            rc = br.do_uninstall(system=False, _run=run)
+
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(unit), "unit file must be removed")
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(
+            any("disable --now blueprint-runner.service" in j for j in joined),
+        )
+        self.assertTrue(any("daemon-reload" in j for j in joined))
+
+    def test_resolve_token_falls_back_to_persisted_file(self):
+        """resolve_token() reads the persisted token file when CLI and env are absent."""
+        token_path = os.path.join(self.tmp, "runner_token")
+        with open(token_path, "w") as f:
+            f.write("persisted-acceptance-token\n")
+
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "_credential_dir", return_value=self.tmp):
+            self.assertEqual(br.resolve_token(None), "persisted-acceptance-token")
+
+
+class TestStatusJson(unittest.TestCase):
+    """On-box status.json liveness file: write, read, permissions, no-secrets."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+        self._orig_cred_dir = os.environ.get("BLUEPRINT_CREDENTIAL_DIR")
+        os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self._tmpdir
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        if self._orig_cred_dir is None:
+            os.environ.pop("BLUEPRINT_CREDENTIAL_DIR", None)
+        else:
+            os.environ["BLUEPRINT_CREDENTIAL_DIR"] = self._orig_cred_dir
+
+    def _status_path(self):
+        return os.path.join(self._tmpdir, "status.json")
+
+    def test_write_and_read_round_trip(self):
+        """Write status.json with known fields, read it back, verify all keys."""
+        caps = _bwrap_caps()
+        local_runner._write_status_json(
+            runner_id="test-box",
+            last_heartbeat_status="ok",
+            active_task_ids=["task-1", "task-2"],
+            active_compute_job_ids=["job-a"],
+            caps=caps,
+            agent_backend="bwrap",
+            compute_backend="bwrap",
+        )
+        path = self._status_path()
+        self.assertTrue(os.path.exists(path))
+
+        with open(path) as f:
+            data = json.loads(f.read())
+
+        self.assertEqual(data["runner_id"], "test-box")
+        self.assertEqual(data["last_heartbeat_status"], "ok")
+        self.assertEqual(data["active_task_ids"], ["task-1", "task-2"])
+        self.assertEqual(data["active_compute_job_ids"], ["job-a"])
+        self.assertTrue(data["bwrap_ok"])
+        self.assertFalse(data["docker_usable"])
+        self.assertEqual(data["agent_backend"], "bwrap")
+        self.assertEqual(data["compute_backend"], "bwrap")
+        # last_heartbeat_at must be a plausible ISO UTC string
+        self.assertIn("T", data["last_heartbeat_at"])
+        self.assertIn("Z", data["last_heartbeat_at"])
+
+    def test_atomic_write_no_partial_file(self):
+        """tempfile + rename leaves no .tmp artifact in the credential dir."""
+        local_runner._write_status_json(
+            runner_id="box",
+            last_heartbeat_status="ok",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+        tmp_files = [f for f in os.listdir(self._tmpdir) if f.endswith(".tmp")]
+        self.assertEqual(len(tmp_files), 0, f"stale .tmp files: {tmp_files}")
+
+    def test_permissions_are_0644(self):
+        """status.json must be world-readable (0644), not 0600 like the token."""
+        local_runner._write_status_json(
+            runner_id="box",
+            last_heartbeat_status="ok",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+        path = self._status_path()
+        mode = os.stat(path).st_mode & 0o777
+        self.assertEqual(mode, 0o644, f"Expected 0644 but got {oct(mode)}")
+
+    def test_no_secrets_in_file(self):
+        """status.json must NOT contain the token or any secret-like field."""
+        local_runner._write_status_json(
+            runner_id="box",
+            last_heartbeat_status="ok",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+        )
+        path = self._status_path()
+        with open(path) as f:
+            text = f.read()
+        data = json.loads(text)
+        for key in data:
+            self.assertNotIn("token", key.lower(), f"secret-like key '{key}' in status.json")
+            self.assertNotIn("secret", key.lower(), f"secret-like key '{key}' in status.json")
+            self.assertNotIn("password", key.lower(), f"secret-like key '{key}' in status.json")
+        # No sensitive string values
+        self.assertNotIn("blpr_", text)
+
+    def test_caps_none_writes_null_fields(self):
+        """When caps is None, capability fields serialize as null — all keys present."""
+        local_runner._write_status_json(
+            runner_id="box",
+            last_heartbeat_status="ok",
+            active_task_ids=[],
+            active_compute_job_ids=[],
+            caps=None,
+            agent_backend=None,
+            compute_backend=None,
+        )
+        path = self._status_path()
+        with open(path) as f:
+            data = json.loads(f.read())
+        self.assertIsNone(data["bwrap_ok"])
+        self.assertIsNone(data["docker_usable"])
+        self.assertIsNone(data["agent_backend"])
+        self.assertIsNone(data["compute_backend"])
+
+    def test_heartbeat_ok_path_writes_status(self):
+        """After a successful heartbeat POST, status.json is written with 'ok'."""
+        posted_bodies = []
+        status_writes = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        orig_write = local_runner._write_status_json
+
+        def capturing_write(**kw):
+            status_writes.append(kw)
+            return orig_write(**kw)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_write_status_json", capturing_write), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True), \
+                 patch.object(local_runner, "_hostname", return_value="test-host"):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(status_writes), 1)
+        self.assertEqual(status_writes[0]["last_heartbeat_status"], "ok")
+        self.assertEqual(status_writes[0]["runner_id"], "test-host")
+        self.assertEqual(status_writes[0]["active_task_ids"], [])
+        self.assertEqual(status_writes[0]["active_compute_job_ids"], [])
+
+    def test_heartbeat_error_path_writes_status(self):
+        """After a heartbeat POST returns non-2xx, status.json records the error."""
+        status_writes = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 503, {}
+
+        orig_write = local_runner._write_status_json
+
+        def capturing_write(**kw):
+            status_writes.append(kw)
+            return orig_write(**kw)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_write_status_json", capturing_write), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(status_writes), 1)
+        self.assertIn("error", status_writes[0]["last_heartbeat_status"])
+        self.assertIn("503", status_writes[0]["last_heartbeat_status"])
+
+    def test_heartbeat_exception_path_writes_status(self):
+        """When _post raises (network error), status.json records the exception."""
+        status_writes = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            raise RuntimeError("connection refused")
+
+        orig_write = local_runner._write_status_json
+
+        def capturing_write(**kw):
+            status_writes.append(kw)
+            return orig_write(**kw)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_write_status_json", capturing_write), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(status_writes), 1)
+        self.assertIn("error", status_writes[0]["last_heartbeat_status"])
+        self.assertIn("connection refused", status_writes[0]["last_heartbeat_status"])
+
+    def test_die_writes_final_status(self):
+        """_die() writes a status.json with the fatal reason before os._exit."""
+        status_writes = []
+
+        def capturing_write(**kw):
+            status_writes.append(kw)
+
+        def fake_exit(code):
+            raise SystemExit(code)
+
+        with patch.object(local_runner, "_write_status_json", capturing_write), \
+             patch.object(local_runner, "_hostname", return_value="dying-box"), \
+             patch.object(local_runner.os, "_exit", fake_exit):
+            try:
+                local_runner._die("OOM killer struck", code=137)
+            except SystemExit:
+                pass
+
+        self.assertEqual(len(status_writes), 1)
+        self.assertEqual(status_writes[0]["runner_id"], "dying-box")
+        self.assertIn("fatal", status_writes[0]["last_heartbeat_status"])
+        self.assertIn("OOM killer struck", status_writes[0]["last_heartbeat_status"])
+        self.assertEqual(status_writes[0]["active_task_ids"], [])
+        self.assertEqual(status_writes[0]["active_compute_job_ids"], [])
 
 
 if __name__ == "__main__":

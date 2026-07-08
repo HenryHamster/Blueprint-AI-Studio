@@ -256,6 +256,98 @@ def test_multiple_directions_aggregate():
     assert len(result["directions"]) == 2
 
 
+def test_success_rate_clamped_when_pr_ineligible_failures_exceed_total_failed():
+    """Genuinely-cancelled PR-ineligible tasks must not drive success_rate > 1.0.
+
+    total_failed sums each cycle's ``tasks_failed`` (TaskStatus.FAILED only),
+    while type_breakdown[*]['failed'] counts FAILED *plus* genuinely-cancelled
+    tasks. Subtracting the broader PR-ineligible failure count from the stricter
+    total can go negative; the fix clamps the eligible-failure count at zero and
+    the emitted rate at 1.0 so no impossible success_rate reaches strategic eval.
+    """
+    directions = [
+        {
+            "id": "dir-A",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 3,
+                    # No FAILED tasks this cycle...
+                    "tasks_failed": 0,
+                    # ...but one genuinely-cancelled read-only 'research' task,
+                    # which type_breakdown counts as a failure.
+                    "type_breakdown": {
+                        "research": {"created": 1, "merged": 0, "failed": 1},
+                    },
+                },
+            ],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+
+    assert result["overall"]["merged"] == 3
+    assert result["overall"]["failed"] == 0
+    # Pre-fix this emitted 1.5 (3 / max(3 + (0 - 1), 1) = 3/2). Must be clamped.
+    assert result["overall"]["success_rate"] == 1.0
+
+
+def test_success_rate_excludes_retired_direction_pr_ineligible_failures():
+    """Retired directions must not contribute to total_failed_pr_ineligible.
+
+    total_merged/total_failed only sum over active/expired/paused directions.
+    A retired direction with windowed research_history must not have its
+    PR-ineligible failures subtracted from a total_failed that never included
+    them, which would silently inflate success_rate toward 1.0.
+    """
+    directions = [
+        {
+            "id": "dir-active",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 4,
+                    "tasks_failed": 2,
+                    "type_breakdown": {},
+                },
+            ],
+        },
+        {
+            "id": "dir-retired",
+            "status": "retired",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 0,
+                    "tasks_failed": 0,
+                    # This PR-ineligible failure must NOT be subtracted
+                    # from total_failed, because this direction is retired
+                    # and contributed 0 to total_merged/total_failed.
+                    "type_breakdown": {
+                        "research": {"created": 1, "merged": 0, "failed": 1},
+                    },
+                },
+            ],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+
+    # Only active direction contributes: 4 merged, 2 failed → 4/(4+2) = 0.667
+    # If the retired direction's PR-ineligible failure was (wrongly) subtracted:
+    #   total_failed_pr_ineligible=1, total_failed_pr_eligible=max(2-1,0)=1,
+    #   success_rate=4/(4+1)=0.8 — incorrect silent inflation.
+    assert result["overall"]["merged"] == 4
+    assert result["overall"]["failed"] == 2
+    assert result["overall"]["success_rate"] == round(4 / (4 + 2), 2)
+
+
 # ---------------------------------------------------------------------------
 # 6. operator_rejection_rate — only when rejected > 0
 # ---------------------------------------------------------------------------
@@ -1187,9 +1279,9 @@ def test_cost_estimate_per_direction_and_overall():
     cheap_cost = round(4 * 1.0 * 3600 * ON_DEMAND_RATE, 2)
     pricey_cost = round(5 * 4.0 * 3600 * ON_DEMAND_RATE, 2)
     assert by_id["dir-cheap"]["estimated_cost_usd"] == cheap_cost
-    assert by_id["dir-cheap"]["cost_per_merged_pr"] == round(cheap_cost / 4, 2)
+    assert by_id["dir-cheap"]["cost_per_merged_pr"] == round(cheap_cost / 4, 4)
     assert by_id["dir-pricey"]["estimated_cost_usd"] == pricey_cost
-    assert by_id["dir-pricey"]["cost_per_merged_pr"] == round(pricey_cost / 1, 2)
+    assert by_id["dir-pricey"]["cost_per_merged_pr"] == round(pricey_cost / 1, 4)
 
     overall = result["overall"]
     assert overall["estimated_cost_usd"] == round(cheap_cost + pricey_cost, 2)
@@ -2142,10 +2234,21 @@ def test_evidence_absent_when_no_recent_findings_evidence():
 
 
 class TestAutonomousCPM:
-    """cost_per_merged_pr uses autonomous_prs_merged as denominator."""
+    """cost_per_merged_pr uses the FULL merged population (autonomous + assisted) as denominator.
 
-    def test_cpm_absent_when_all_assisted_merges(self):
-        """CPM is None when autonomous_prs_merged == 0 even if prs_merged > 0."""
+    The numerator (total_cost) covers ALL work on a direction. To keep
+    numerator/denominator population-consistent, the denominator must also cover
+    ALL merged PRs — including operator-assisted ones — so a direction is not
+    penalised for accepting operator help.
+    """
+
+    def test_cpm_present_when_all_assisted_merges(self):
+        """CPM uses total merged (autonomous + assisted), so prs_merged=3 gives CPM=cost/3."""
+        from app.routers.admin_analytics import ON_DEMAND_RATE
+
+        tasks = 3
+        hours = 2.0
+        expected_cost = round(tasks * hours * 3600 * ON_DEMAND_RATE, 2)
         directions = [
             {
                 "id": "dir-1",
@@ -2156,8 +2259,8 @@ class TestAutonomousCPM:
                         "prs_merged": 3,
                         "autonomous_prs_merged": 0,
                         "assisted_prs_merged": 3,
-                        "tasks_created": 3,
-                        "avg_time_to_merge_hours": 2.0,
+                        "tasks_created": tasks,
+                        "avg_time_to_merge_hours": hours,
                     }
                 ],
             }
@@ -2165,7 +2268,8 @@ class TestAutonomousCPM:
         d = _build_outcome_evaluation(_make_project(directions=directions))[
             "directions"
         ][0]
-        assert "cost_per_merged_pr" not in d
+        # total merged = 3 (the full population), not 0 (autonomous only)
+        assert d.get("cost_per_merged_pr") == round(expected_cost / 3, 4)
 
     def test_fully_autonomous_cpm_equals_legacy_cpm(self):
         """Fully-autonomous direction: CPM with autonomous_prs_merged == CPM with prs_merged."""
@@ -2196,8 +2300,8 @@ class TestAutonomousCPM:
         ][0]
         assert d.get("cost_per_merged_pr") == round(expected_cost / prs, 2)
 
-    def test_legacy_entry_without_autonomous_field_uses_prs_merged_fallback(self):
-        """Legacy entries lacking autonomous_prs_merged default to prs_merged (all-autonomous)."""
+    def test_legacy_entry_without_autonomous_field_uses_prs_merged(self):
+        """Legacy entries lacking autonomous_prs_merged use prs_merged as the total merged count."""
         from app.routers.admin_analytics import ON_DEMAND_RATE
 
         prs = 2
@@ -2222,10 +2326,16 @@ class TestAutonomousCPM:
         d = _build_outcome_evaluation(_make_project(directions=directions))[
             "directions"
         ][0]
-        assert d.get("cost_per_merged_pr") == round(expected_cost / prs, 2)
+        assert d.get("cost_per_merged_pr") == round(expected_cost / prs, 4)
 
-    def test_mixed_attribution_cpm_uses_autonomous_count(self):
-        """CPM denominator is autonomous count, not total merged."""
+    def test_mixed_attribution_cpm_uses_total_merged_count(self):
+        """CPM denominator is the FULL merged count (autonomous + assisted), not autonomous-only.
+
+        Population-consistency: the numerator (total_cost) covers all direction work;
+        the denominator must cover the same population — all merged PRs. Using
+        autonomous-only (3) instead of total (5) would inflate CPM and penalise
+        directions that accepted operator help.
+        """
         from app.routers.admin_analytics import ON_DEMAND_RATE
 
         tasks = 5
@@ -2250,7 +2360,8 @@ class TestAutonomousCPM:
         d = _build_outcome_evaluation(_make_project(directions=directions))[
             "directions"
         ][0]
-        assert d.get("cost_per_merged_pr") == round(expected_cost / 3, 2)
+        # canonical: total merged = 5 (not autonomous-only = 3)
+        assert d.get("cost_per_merged_pr") == round(expected_cost / 5, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -3029,7 +3140,7 @@ def test_cost_uses_recorded_spend_over_proxy():
     result = _build_outcome_evaluation(_make_project(directions=directions))
     d = result["directions"][0]
     assert d["estimated_cost_usd"] == 7.77
-    assert d["cost_per_merged_pr"] == round(7.77 / 2, 2)
+    assert d["cost_per_merged_pr"] == round(7.77 / 2, 4)
 
 
 def test_cost_sums_recorded_and_proxy_entries():
@@ -3060,7 +3171,12 @@ def test_cost_sums_recorded_and_proxy_entries():
 
 
 def test_retired_summary_uses_recorded_cost_per_merge():
-    """cost_per_merge in retired summary uses estimated_cost_usd when present."""
+    """cost_per_merge in retired summary uses estimated_cost_usd when present.
+
+    Uses canonical cost_per_merged_pr denominator: ALL merged PRs (raw total),
+    not verified-only. This ensures directions with unverified/degraded merges
+    report cost metrics that reflect actual work per delivered PR.
+    """
     directions = [
         {
             "id": "dir-ret-recorded",
@@ -3084,7 +3200,9 @@ def test_retired_summary_uses_recorded_cost_per_merge():
     assert len(result) == 1
     entry = result[0]
     assert entry["prs_merged"] == 4
-    assert entry.get("cost_per_merge") == round(8.00 / 2, 2)
+    # Canonical rule: denominator MUST be ALL merged PRs (the raw 4), not verified-only.
+    # Using the canonical helper ensures cost_per_merge is consistent with live path.
+    assert entry.get("cost_per_merge") == round(8.00 / 4, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -3560,4 +3678,144 @@ def test_retired_directions_summary_memory_surfaces_outcome():
     assert entry["id"] == "d-pruned-with-merges"
     assert entry["cycles"] == 5
     assert entry["prs_merged"] == 3
+
+
+def test_retired_directions_summary_cost_per_merge_includes_aggregate_cost():
+    """cost_per_merge reflects lifetime cost including folded history_aggregate spend.
+
+    A direction with empty research_history (all cycles evicted) and
+    history_aggregate.total_estimated_cost_usd=10.0 should yield a
+    cost_per_merge that reflects the aggregate cost, not 0.
+    """
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-evicted-cost",
+                "text": "direction with evicted cost",
+                "status": "retired",
+                "retired_at": "2026-06-01T00:00:00",
+                "research_history": [],
+                "history_aggregate": {
+                    "total_cycles": 5,
+                    "total_prs_merged": 2,
+                    "total_verified_prs_merged": 2,
+                    "total_estimated_cost_usd": 10.0,
+                },
+            }
+        ]
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+    # 10.0 / 2 merges = 5.0
+    assert entry.get("cost_per_merge") == 5.0, (
+        f"expected cost_per_merge=5.0 from aggregate, got {entry.get('cost_per_merge')!r}"
+    )
     assert entry["status"] == "retired"
+
+
+def test_retired_summary_cost_per_merge_uses_raw_denominator():
+    """cost_per_merge divides by ALL merged PRs, not verified-only subset.
+
+    The canonical cost_per_merged_pr helper mandates that the denominator
+    must cover the same population as the numerator: ALL work (cost) divided
+    by ALL merged PRs (autonomous + assisted). Using verified-only merges
+    while including all costs overstates the metric for directions with
+    unverified/degraded merges. This test ensures retired summary uses raw
+    total_merged count, not verified_total_merged.
+    """
+    directions = [
+        {
+            "id": "dir-mixed-merges",
+            "text": "Direction with degraded merges",
+            "status": "retired",
+            "retired_at": _recent_iso(5),
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(5),
+                    "prs_merged": 4,  # raw total: 4 PRs
+                    "verified_prs_merged": 2,  # only 2 verified; 2 were degraded
+                    "tasks_created": 10,
+                    "avg_time_to_merge_hours": 1.0,
+                    "estimated_cost_usd": 8.0,  # cost reflects all 4 merges
+                }
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+
+    # Canonical rule: denominator MUST be ALL merged PRs (the raw count).
+    # Cost is 8.0, which reflects work on all 4 merges. Dividing by only 2
+    # (verified) would inflate the reported cost/merge from 2.0 to 4.0.
+    assert entry["prs_merged"] == 4
+    assert entry.get("cost_per_merge") == round(8.0 / 4, 4)
+    # The inflated value (dividing by verified-only) must NOT appear.
+    assert entry.get("cost_per_merge") != round(8.0 / 2, 4)
+
+
+# ---------------------------------------------------------------------------
+# success_rate denominator: PR-eligible vs PR-ineligible tasks
+# ---------------------------------------------------------------------------
+
+
+def test_success_rate_same_population_denominator():
+    """success_rate should count only PR-eligible failed tasks in denominator.
+
+    Demonstrates that a portfolio with PR-eligible success and PR-ineligible
+    failures (e.g., failed read-only audits) must not deflate the success_rate
+    by mixing per-PR numerator with all-tasks denominator.
+
+    Portfolio:
+    - dir-1: 2 merged PRs + 1 security_audit task failed (PR-ineligible)
+    - dir-2: 1 merged PR + 2 research tasks failed (PR-ineligible)
+
+    Expected: success_rate = 3 merged / (3 + 0 pr_eligible_failed) = 1.0
+    Bug (before fix): success_rate = 3 / (3 + 3) = 0.5 (deflated)
+    """
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 2,
+                    "verified_prs_merged": 2,
+                    "tasks_failed": 1,
+                    "type_breakdown": {
+                        "security_audit": {"created": 1, "merged": 0, "failed": 1},
+                    },
+                }
+            ],
+        },
+        {
+            "id": "dir-2",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,
+                    "tasks_failed": 2,
+                    "type_breakdown": {
+                        "research": {"created": 2, "merged": 0, "failed": 2},
+                    },
+                }
+            ],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+
+    # Both dirs have only PR-ineligible failures, so portfolio has:
+    # - 3 total merged PRs
+    # - 0 PR-eligible failed tasks
+    # → success_rate should be 3 / (3 + 0) = 1.0
+    assert result["overall"]["merged"] == 3
+    assert result["overall"]["failed"] == 3  # raw count includes all tasks
+    assert result["overall"]["success_rate"] == 1.0  # only counts PR-eligible failures

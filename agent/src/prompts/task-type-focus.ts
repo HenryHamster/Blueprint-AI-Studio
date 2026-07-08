@@ -3,6 +3,11 @@
 // the dominant miss patterns observed per task type in sr_catch_rate_trends.
 // Handlers compose these into the prompt via getTaskTypeFocusBlock(taskType).
 
+// Shared scope-drift incidental allowlist used across create/fix/refactor/docs tasks.
+// Ensures consistent, comprehensive documentation of files that don't count as scope-drift.
+const SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC =
+  'lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`, `go.sum`), generated outputs, `.gitignore`, sibling test files (`.test.*`/`.spec.*`)';
+
 // Builds the migrate-task self-review focus block. Defaults reproduce
 // Blueprint's own layout byte-for-byte (`backend/app/main.py` /
 // `EXPECTED_SCHEMA_REVISION`) so existing content tests stay valid. Callers on
@@ -48,8 +53,7 @@ is accidental scope-drift or subtle behavioral changes that bypass tests.
 1. **Scope-drift (mandatory)** — run BOTH \`git diff --stat HEAD\` AND
    \`git diff --name-only HEAD\`. Both triggers apply: the diff-size threshold
    (Trigger A) and the file-set check against the declared \`related_files\`
-   (Trigger B, modulo the incidental allowlist — lockfiles, generated outputs,
-   sibling test files). If ANY externally-observable behavior changed (return
+   (Trigger B, modulo the incidental allowlist — ${SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC}). If ANY externally-observable behavior changed (return
    values, side effects, error messages, API shape), record it under \`correctness\`
    with explicit before/after: \`"issue": "behavior changed: foo() returned X, now returns Y"\`.
 2. **Caller inventory** — grep for every caller of renamed or restructured exports.
@@ -85,8 +89,7 @@ the declared scope. Apply these additional checks before \`./done\`:
 2. **Scope-drift** — run BOTH \`git diff --stat HEAD\` AND \`git diff --name-only HEAD\`.
    Trigger A: diff size against the declared scope threshold. Trigger B: every
    modified file must be in the declared \`related_files\` set OR in the incidental
-   allowlist (lockfiles like \`package-lock.json\`/\`poetry.lock\`/\`Cargo.lock\`/\`go.sum\`,
-   generated outputs, \`.gitignore\`, sibling \`*.test.*\`/\`*.spec.*\` files). Any
+   allowlist (${SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC}). Any
    modified file outside \`related_files\` and outside the allowlist is off-scope —
    record under \`scope-drift\` with \`passed: false\` and list the off-scope files
    (e.g. "modified files outside declared scope: backend/app/foo.py — declared related_files: [agent/src/baz.ts]").
@@ -141,8 +144,7 @@ failing, and scope creep into unrelated files. Apply these additional checks:
 2. **Scope-drift** — run BOTH \`git diff --stat HEAD\` AND \`git diff --name-only HEAD\`.
    Fixes should be surgical, so both triggers apply: diff-size threshold (Trigger A)
    AND the file-set check against \`related_files\` (Trigger B). Any modified file
-   outside \`related_files\` (after the incidental allowlist — lockfiles, generated
-   outputs, sibling test files like \`foo.test.ts\` next to \`foo.ts\`) is off-scope.
+   outside \`related_files\` (after the incidental allowlist — ${SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC}) is off-scope.
    Record unjustified additions under \`scope-drift\` with \`passed: false\` and list
    the off-scope file paths.
 3. **Root-cause vs. symptom** — confirm the fix addresses the root cause, not just
@@ -153,11 +155,7 @@ failing, and scope creep into unrelated files. Apply these additional checks:
    as \`_self_review_outcome\` in context) is reference material, not a template to copy.
    Write to \`/tmp/self_review_<YOUR_task_id>.json\` using the CURRENT task ID from the
    ORCHESTRATOR env — never a prior task's ID.
-5. **Cross-file consistency** — when the fix touches multiple files, confirm the fix pattern
-   is applied consistently across all affected files. Identify the primary fix pattern and
-   verify it is applied in all relevant locations. If the fix is incomplete across files,
-   record under \`correctness\` with \`passed: false\` and the issue: "fix pattern inconsistency:
-   [description of where pattern is/isn't applied]".
+5. **Cross-file consistency** — when the diff touches multiple files, identify the dominant pattern introduced or modified (e.g., 'added null guard before .map calls', 'switched timestamps to UTC-aware', 'added try/except around external HTTP call'). Enumerate every touched file and attest that the pattern is applied consistently. If the pattern is inconsistently applied across files, record under \`correctness\` with \`passed: false\` and the issue: \`"pattern X inconsistently applied: present in [files], missing/divergent in [files]"\`.
 `;
 
 export const DOCS_TASK_FOCUS = `
@@ -173,8 +171,7 @@ current code behavior. Apply these additional checks before \`./done\`:
    between docs and code is worse than no docs.
 3. **Production-code untouched** — confirm \`git diff --name-only HEAD\` shows only
    documentation files (README, docs/, docstrings). Any production-code change
-   that is not in \`related_files\` (and not an incidental allowlisted file like a
-   lockfile) belongs in a separate task; record under \`scope-drift\` with
+   that is not in \`related_files\` (and not in the incidental allowlist — ${SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC}) belongs in a separate task; record under \`scope-drift\` with
    \`passed: false\` and list the off-scope files.
 `;
 

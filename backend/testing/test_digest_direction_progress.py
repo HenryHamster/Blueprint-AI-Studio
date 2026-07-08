@@ -2213,8 +2213,8 @@ async def test_digest_direction_progress_empty_history_sane_defaults(
 async def test_digest_direction_progress_zero_autonomous_with_operator_actions(
     client: AsyncClient, db_session
 ):
-    """When autonomous_prs_merged=0 but operator_action_count>0, cost_per_merged_pr is None
-    (not zero, not infinity — division is guarded on autonomous_prs_merged)."""
+    """When prs_merged=0 (no merges at all) but operator_action_count>0, cost_per_merged_pr
+    is None (not zero, not infinity — division is guarded on the total merged count)."""
     recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
 
     project = make_project(
@@ -2256,6 +2256,91 @@ async def test_digest_direction_progress_zero_autonomous_with_operator_actions(
     assert dp["autonomous_prs_merged"] == 0
     assert dp["operator_action_count"] == 3
     assert dp["cost_per_merged_pr"] is None
+
+
+@pytest.mark.asyncio
+async def test_cost_per_merged_pr_canonical_population_mixed_autonomous_assisted(
+    client: AsyncClient, db_session
+):
+    """cost_per_merged_pr uses the FULL merged population (autonomous + assisted), not
+    autonomous-only.
+
+    A direction with 2 autonomous merges and 1 assisted merge (total=3) and a
+    known total cost must report cost_per_merged_pr = total_cost / 3, NOT
+    total_cost / 2. Using the wrong (autonomous-only) denominator would inflate
+    the metric and could trigger a spurious cost_per_merge_exceeds_threshold flag
+    for a direction that merely accepted operator help.
+    """
+    from app.routers.admin_analytics import SPOT_RATE
+
+    # 3000-second spot task → cost = SPOT_RATE * 3000; large enough that
+    # round(cost/2, 4) != round(cost/3, 4) so the population check is meaningful.
+    duration_sec = 3000.0
+    task_cost = round(SPOT_RATE * duration_sec, 4)
+    recent_ts = (_utcnow() - timedelta(minutes=1)).isoformat()
+
+    # Direction with 2 autonomous + 1 assisted merge = 3 total merges
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-mixed",
+                "text": "Mixed autonomous and assisted merges",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        "prs_merged": 3,
+                        "autonomous_prs_merged": 2,
+                        "assisted_prs_merged": 1,
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_spot=True,
+            vm_provisioned_at=now - timedelta(seconds=duration_sec),
+            vm_started_at=now - timedelta(seconds=duration_sec),
+            vm_stopped_at=now,
+            context={"direction_id": "dir-mixed"},
+            payloads=[{"type": "research"}],
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    dp_list = data["direction_progress"]
+    assert len(dp_list) == 1
+    dp = dp_list[0]
+
+    # Canonical formula: total_cost / total_merged (autonomous + assisted = 3)
+    expected_cpm = round(task_cost / 3, 4)
+    wrong_autonomous_only_cpm = round(task_cost / 2, 4)
+
+    assert dp["cost_per_merged_pr"] == expected_cpm, (
+        f"cost_per_merged_pr should use full merged population (total=3), "
+        f"got {dp['cost_per_merged_pr']!r} — expected {expected_cpm!r}, "
+        f"autonomous-only (wrong) would have been {wrong_autonomous_only_cpm!r}"
+    )
+    assert dp["cost_per_merged_pr"] != wrong_autonomous_only_cpm, (
+        "cost_per_merged_pr is using autonomous-only denominator — population mismatch"
+    )
+
+    # A direction this cheap should NOT be flagged cost-inefficient
+    assert dp.get("cost_per_merge_exceeds_threshold") is False, (
+        "Direction should not be flagged cost-inefficient with such low CPM"
+    )
 
 
 @pytest.mark.asyncio
@@ -2949,3 +3034,75 @@ async def test_digest_direction_progress_budget_alert_stamped_in_db_and_idempote
     assert dispatch_mock.await_count == 0, (
         "BUDGET_EXCEEDED fired again despite _budget_alerted=True in DB"
     )
+
+
+
+@pytest.mark.asyncio
+async def test_conversion_rate_not_deflated_without_type_breakdown(
+    client: AsyncClient, db_session
+):
+    """Conversion rate is correctly computed even when type_breakdown is not yet written.
+
+    During the (potentially multi-hour) execution window before the first finding task
+    reaches terminal status, type_breakdown has not been written to the entry. Without
+    this fix, the PR-ineligible task reduction would be skipped (since type_breakdown is
+    missing), causing conversion_rate to be deflated by including tasks that can never
+    open PRs (research, investigate, audit, memo) in the denominator.
+
+    This test verifies that conversion_rate is computed correctly using tasks_created
+    directly, even when type_breakdown is absent (fresh/ongoing cycle).
+    """
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-fresh",
+                "text": "Direction with fresh cycle (no type_breakdown yet)",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        # 2 verified PRs merged from this cycle
+                        "prs_merged": 2,
+                        "verified_prs_merged": 2,
+                        # 5 total finding tasks created (mix of create, research, audit, memo)
+                        # But type_breakdown is NOT yet written (empty) because no tasks have
+                        # reached terminal status yet.
+                        "tasks_created": 5,
+                        # type_breakdown is missing — this is the key test case
+                        # (fresh cycle where finding tasks are still executing)
+                        # Don't set type_breakdown at all
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-fresh"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    # With type_breakdown missing, conversion_rate should use tasks_created directly.
+    # 2 verified PRs / 5 tasks created = 0.4
+    # This is more accurate than an inflated rate computed without the PR-ineligible reduction.
+    assert dp["prs_merged"] == 2
+    assert dp["verified_prs_merged"] == 2
+    assert dp["pr_eligible_tasks_created"] == 5
+    assert dp["conversion_rate"] == 0.4  # 2 / 5, not deflated

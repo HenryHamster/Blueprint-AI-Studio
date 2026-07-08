@@ -613,6 +613,19 @@ class TestComputeStartupScriptBeacons:
         assert "curl failed with exit $?" not in script
         assert "curl exit $?" not in script
 
+    def test_jq_missing_is_repaired_before_agent_service_start(self):
+        """Generated helpers still use jq for PR/done/check parsing. The VM
+        image bakes jq, but stale/custom images must repair it before the agent
+        starts rather than failing later inside a helper."""
+        for script in (_render_compute_startup_script(), _render_pool_startup_script()):
+            guard_idx = script.find("command -v jq")
+            start_idx = script.find("systemctl restart blueprint-agent")
+            assert guard_idx != -1, "startup script must guard on jq presence"
+            assert start_idx != -1, "startup script must start blueprint-agent"
+            assert guard_idx < start_idx, "jq guard must run before the agent service"
+            assert "apt-get install -y jq" in script
+            assert "jq missing after startup repair" in script
+
 
 # ---------------------------------------------------------------------------
 # shellcheck — runs if the binary is available. Complements the narrow

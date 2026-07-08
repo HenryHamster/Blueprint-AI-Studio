@@ -665,6 +665,7 @@ _HEALTH_WINDOW_SECONDS = 24 * 3600  # 24-hour rolling window
 _OUTCOME_WINDOW_SECONDS = (
     7 * 24 * 3600
 )  # 7-day rolling window for success-rate tracking
+_OUTCOME_EVENTS_CAP = 500  # per-account cardinality cap before JSONB persistence
 
 # Accounts whose 24h health score is below this threshold are excluded from
 # the healthy candidate list when at least one alternative exists. Prevents
@@ -1875,6 +1876,8 @@ def _build_rate_limit_state_blob(acct: Dict[str, Any]) -> dict | None:
         if e.get("task_type"):
             entry["task_type"] = e["task_type"]
         pruned_outcomes.append(entry)
+    if len(pruned_outcomes) > _OUTCOME_EVENTS_CAP:
+        pruned_outcomes = pruned_outcomes[-_OUTCOME_EVENTS_CAP:]
     out: dict[str, Any] = {}
     if dm:
         out["disabled_models"] = {
@@ -2873,6 +2876,7 @@ async def disable_account_model(
     kind: str = "rate_limit",
     regression_stats: dict | None = None,
     provider: str | None = None,
+    task_type: str | None = None,
 ) -> None:
     """Mark an account's cascade of models as rate-limited and persist.
 
@@ -2953,7 +2957,7 @@ async def disable_account_model(
         _prune_health_events(acct, now)
         acct.setdefault("rl_events", []).append(now)
         _prune_outcome_events(acct, now)
-        acct.setdefault("outcome_events", []).append({"at": now, "success": False})
+        acct.setdefault("outcome_events", []).append({"at": now, "success": False, "task_type": task_type})
         # Legacy model names (e.g. claude-sonnet-4-6) may not match any cascade
         # entry directly, so key off the cascade primary we just wrote. Guaranteed
         # non-empty: cascade_disabled_models always returns at least one entry.
