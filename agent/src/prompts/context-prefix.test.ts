@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildContextPrefix, formatRejectionPatternsSection, formatDomainOverview } from './context-prefix.js';
+import { buildContextPrefix, formatRejectionPatternsSection, formatDomainOverview, REVIEW_GATED_TASK_TYPES } from './context-prefix.js';
 
 describe('buildContextPrefix', () => {
   it('preserves strategic intent when project context is present', () => {
@@ -958,5 +960,32 @@ describe('buildContextPrefix — domain overview', () => {
     const withUndefined = buildContextPrefix({ ...base, domain_overview: undefined });
     expect(without).not.toContain('## Domain Knowledge');
     expect(withUndefined).toEqual(without);
+  });
+});
+
+// ── REVIEW_GATED_TASK_TYPES contract ─────────────────────────────────────────
+describe('REVIEW_GATED_TASK_TYPES contract', () => {
+  it('matches the backend CODE_REVIEW_GATED_TASK_TYPES derived from the registry', () => {
+    // REVIEW_GATED_TASK_TYPES is a hand-maintained TS array mirroring the
+    // registry-derived CODE_REVIEW_GATED_TASK_TYPES in task_capabilities.py.
+    // Parse it via TaskCapability entries with evaluation="code-ci-review".
+    const capabilitiesSource = readFileSync(
+      path.resolve(process.cwd(), '..', 'backend/app/task_capabilities.py'),
+      'utf8',
+    );
+    // Split on TaskCapability( boundaries to get individual capability blocks,
+    // then filter for blocks containing evaluation="code-ci-review".
+    const blocks = capabilitiesSource.split(/TaskCapability\(/);
+    const backendTypes: string[] = [];
+    for (const block of blocks) {
+      if (!block.includes('evaluation="code-ci-review"')) continue;
+      const m = block.match(/TaskType\.(\w+)/);
+      if (m) backendTypes.push(m[1]);
+    }
+    expect(
+      backendTypes.length,
+      'backend task_capabilities.py must contain at least one code-ci-review TaskCapability',
+    ).toBeGreaterThan(0);
+    expect([...REVIEW_GATED_TASK_TYPES].sort()).toEqual(backendTypes.sort());
   });
 });

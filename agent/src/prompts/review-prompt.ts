@@ -109,10 +109,12 @@ export function buildReviewDiffAccessHint(baseBranch: string): string {
 // check CI does not run), framed as an optional code-quality signal — never an
 // aggregate build gate. Scoped-lint one-liners are emitted via the shared
 // buildScopedLintOneliner helper so they restrict to changed files only.
+const CI_AUTHORITY_PREAMBLE = `CI is the authoritative gate for this project's build, type-check, eslint, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because one failed or because you could not run one — CI owns that signal.`;
+
 export function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch?: string): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
     return `**Build, Tests & Lint — who verifies what:**
-- CI is the authoritative gate for this project's build, type-check, eslint, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because a build/type/test step failed or because you could not run one — CI owns that signal.
+- ${CI_AUTHORITY_PREAMBLE}
 - The ONE quality check CI does not run is the project's lint. As an OPTIONAL code-quality signal you MAY run the lint scoped to the changed files (Python: \`python -m ruff check <changed .py files>\`; JS/TS: \`npx eslint <changed files>\`) and surface only NET-NEW style/lint violations as code-quality issues. This is a scoped quality check, not a build gate — skip it freely if your sandbox can't run it.
 - You MAY run targeted commands in your already-cloned workspace to SUBSTANTIATE a specific concern (reproduce a suspected bug, confirm a claim). Use the result to inform your judgment.
 - A command you CANNOT run — tool missing, install/build failure, API 401/403, sandbox limit — is an environment condition, never a code defect. It is NOT grounds for REQUEST_CHANGES.`;
@@ -143,12 +145,12 @@ export function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch
     });
   if (checks.length === 0) {
     return `**Build, Tests & Lint — who verifies what:**
-- CI is the authoritative gate for this project's build, type-check, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because one failed or because you could not run one — CI owns that signal.
+- ${CI_AUTHORITY_PREAMBLE}
 - No reviewer-runnable lint is configured for this project, so there is no scoped quality check to run; review the code manually for correctness.
 - A command you CANNOT run (tool missing, install/build failure, API 401/403, sandbox limit) is an environment condition, never a code defect, and is NOT grounds for REQUEST_CHANGES.`;
   }
   return `**Build, Tests & Lint — who verifies what:**
-- CI is the authoritative gate for this project's build, type-check, eslint, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because one failed or because you could not run one — CI owns that signal.
+- ${CI_AUTHORITY_PREAMBLE}
 - The ONE quality check CI does not run is the project's lint. As an OPTIONAL code-quality signal you MAY run the scoped lint below (already restricted to the changed files) and surface only NET-NEW style/lint violations as code-quality issues. This is a scoped quality check, not a build gate — skip it freely if your sandbox can't run it.
 ${checks.join('\n')}
 - You MAY also run targeted commands in your already-cloned workspace to SUBSTANTIATE a specific concern (reproduce a suspected bug, confirm a claim) — use the result to inform your judgment.
