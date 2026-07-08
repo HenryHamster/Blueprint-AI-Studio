@@ -1048,6 +1048,12 @@ async def apply_post_spawn_state(
                                 logger.warning(
                                     f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
                                 )
+                        elif total_merged >= 3 and _owns_uncovered:
+                            logger.info(
+                                f"[RESEARCH] Criterion-coverage gate: direction {did} "
+                                f"saturated ({total_merged} verified merges) but owns "
+                                f"an uncovered acceptance criterion — staying active"
+                            )
 
             # Also apply sub-research annotation directly on the in-memory
             # `directions` list before the locked write so both updates land

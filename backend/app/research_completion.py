@@ -804,12 +804,13 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 ) - int(agg.get("total_stranded_prs_merged", 0) or 0),
             )
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
-            # Gated: a saturated direction with >= 3 verified merges whose owned
-            # acceptance outcome is still uncovered is withheld from the SUCCESS
-            # route — AND must not slip through the exhaustion route either
-            # (that declares deadlock, which a productive-but-unmet direction is
-            # not). It stays active. The < 3 exhaustion fallback is unaffected.
-            _proven_gated = total_merged >= 3 and _owns_uncovered
+            # Gated: a direction (regardless of merge count) whose owned
+            # acceptance outcome is still uncovered is withheld from BOTH the
+            # SUCCESS route AND the exhaustion route — a criterion-carrying
+            # direction with an unmet outcome is neither proven NOR deadlocked;
+            # it stays active. The exhaustion route declares deadlock, which a
+            # productive-but-unmet direction is not.
+            _proven_gated = _owns_uncovered
             if total_merged >= 3 and not _owns_uncovered:
                 target["status"] = "completed"
                 target["completed_at"] = now_iso

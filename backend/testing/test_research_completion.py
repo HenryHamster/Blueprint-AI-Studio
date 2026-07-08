@@ -15174,6 +15174,258 @@ async def test_no_findings_proven_direction_fails_open_on_coverage_error(
     assert target.get("auto_completed") is True
 
 
+@_pytest.mark.asyncio
+async def test_no_findings_exhausted_direction_with_uncovered_criterion_stays_active(
+    db_session,
+):
+    """Site 2 (_stamp_no_findings_refractory): a saturated direction with <3
+    verified merges that owns an uncovered active criterion must NOT auto-complete
+    via the exhaustion route — it stays active to keep working toward the unmet
+    outcome."""
+    from app.models import Direction
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-exhausted"
+
+    # Custom setup: direction has <3 verified merges (total_merged=2), is about
+    # to become saturated (2 consecutive unproductive → +1 = 3), and has no
+    # recent prs_merged entries so _direction_has_recent_merges is False —
+    # meaning the direction WOULD be flagged as "exhausted" by the deadlock
+    # predicate if the criterion gate did not block it.
+    direction_dict = {
+        "id": direction_id,
+        "text": "Exhausted direction with uncovered criterion",
+        "status": "active",
+        "history_aggregate": {},
+        "consecutive_unproductive_cycles": 2,  # +1 → saturated
+        "research_history": [
+            {"verified_prs_merged": 1},  # total_merged = 2 (< 3)
+            {"verified_prs_merged": 1},
+        ],
+    }
+    project = _Project(
+        name="Exhaustion Gate Test",
+        user_id="test-user-exhaust-gate",
+        autonomous_enabled=True,
+        directions=[direction_dict],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First-class Direction ORM row with placeholder criterion keys.
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            status="active",
+            data=dict(direction_dict),
+            criterion_keys=["placeholder"],
+        )
+    )
+    await db_session.commit()
+
+    # Open release version with one uncovered criterion.
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row at the real (uncovered) criterion.
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    task = _Task(
+        project_id=project.id,
+        title="Research: exhausted uncovered",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction_dict],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "Direction with <3 merges owning an uncovered criterion must NOT "
+        "auto-complete via the exhaustion route; expected it to stay active"
+    )
+    assert target.get("auto_completed") is not True
+    # Refractory stamp is still applied even though completion was withheld.
+    assert target.get("possibly_saturated") is True
+
+
+# --------------------------------------------------------------------------- #
+# Site 1 (apply_post_spawn_state): proven-route criterion-coverage gate.
+#
+# The proven-merge success completion path inside apply_post_spawn_state must
+# also gate on owned-criterion coverage — identical policy to Site 2
+# (_stamp_no_findings_refractory) but exercised through the full post-spawn
+# state pipeline. A saturated direction with >= 3 verified merges must NOT
+# auto-complete when it owns an uncovered acceptance criterion.
+# --------------------------------------------------------------------------- #
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_proven_direction_with_uncovered_criterion_stays_active(
+    db_session,
+):
+    """Site 1 (apply_post_spawn_state): a saturated, >=3-merge direction that
+    OWNS an uncovered active criterion must NOT auto-complete via the proven
+    route — it stays active to keep working toward the unmet outcome."""
+    from app.research_direction_state import apply_post_spawn_state
+
+    direction_id = "d-apply-cov-uncovered"
+    project, task, _direction = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row's criterion_keys at the real (uncovered) criterion.
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    # Ensure task context carries direction_id so apply_post_spawn_state can
+    # find the current direction for the no-findings cycle entry.
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "Direction owning an uncovered criterion must NOT auto-complete via "
+        "apply_post_spawn_state's proven route; expected it to stay active"
+    )
+    assert target.get("auto_completed") is not True
+    # The direction must have entered the auto-complete check (saturated).
+    assert target.get("possibly_saturated") is True, (
+        "Direction must be saturated (proving the auto-complete check ran) "
+        "but gate must have blocked completion"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_proven_direction_with_covered_criterion_completes(
+    db_session,
+):
+    """Site 1: when the owned criterion IS covered, the saturated proven
+    direction still auto-completes via apply_post_spawn_state (control)."""
+    from app.research_direction_state import apply_post_spawn_state
+
+    direction_id = "d-apply-cov-covered"
+    project, task, _direction = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=True
+    )
+
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "completed", (
+        "Direction whose owned criterion IS covered must still auto-complete "
+        "via apply_post_spawn_state"
+    )
+    assert target.get("auto_completed") is True
+    assert "verified" in (target.get("auto_completed_reason") or "")
+
+
 # --------------------------------------------------------------------------- #
 # Deferred-memo enrollment: flag-off no-op, flag-on creates row, dedup.
 # --------------------------------------------------------------------------- #
