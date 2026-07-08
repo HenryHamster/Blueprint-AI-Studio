@@ -83,7 +83,7 @@ import { runClaudeCode, persistAndPostStatus, readHandlerOutput, apiGet } from '
 import { configureAgentPermissions, writePlaybookHelper, writeMessagesHelper } from '../prompt.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
-import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess, getLlmTelemetry, resetLlmTelemetry } from '../telemetry.js';
 
 const TASK_ID = 'task-design-1';
 const WS = null;
@@ -109,7 +109,7 @@ describe('handleDesign', () => {
     vi.clearAllMocks();
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     // Citations ground by default so tests not targeting the grounding-repair
     // reopen never trigger it incidentally.
@@ -294,13 +294,13 @@ describe('handleDesign', () => {
     // First run: clean exit but unparseable output.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: 'Analysis complete but forgot to emit JSON.', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     // Repair run: good document JSON.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0,
       allOutput: JSON.stringify(VALID_DOCUMENT),
       lastResultText: JSON.stringify(VALID_DOCUMENT),
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleDesign(
       TASK_ID, { prompt: 'Design how X should work' },
@@ -320,7 +320,7 @@ describe('handleDesign', () => {
     // Both runs return unparseable output on clean exit.
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleDesign(
       TASK_ID, { prompt: 'Design how X should work' },
@@ -338,7 +338,7 @@ describe('handleDesign', () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 1, allOutput: 'boom', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleDesign(
       TASK_ID, { prompt: 'Design X' },
@@ -389,6 +389,27 @@ describe('handleDesign', () => {
       unresolved: ['file:backend/app/reaper_sweeps.py'],
     });
   });
+
+  it('records prompt size telemetry before calling runClaudeCode', async () => {
+    resetLlmTelemetry();
+    vi.mocked(readHandlerOutput).mockReturnValue(VALID_DOCUMENT);
+
+    await handleDesign(
+      TASK_ID, { prompt: 'Design how X should work' },
+      BASE_TASK, 'tok', 'owner', 'repo', WS, STATUS_REF(),
+    );
+
+    const telemetry = getLlmTelemetry();
+    // prompt_size_bytes must reflect the real assembled design prompt.
+    expect(telemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_sizes).not.toBeNull();
+    expect((telemetry.prompt_section_sizes ?? []).length).toBeGreaterThan(0);
+    for (const s of (telemetry.prompt_section_sizes ?? [])) {
+      expect(s.bytes).toBeGreaterThan(0);
+      expect(typeof s.name).toBe('string');
+    }
+  });
 });
 
 // ── Bounded self-repair on a clean-exit-but-unparseable first response ────────
@@ -405,11 +426,11 @@ describe('handleDesign — bounded self-repair on format miss', () => {
     // First call: clean exit, narrative but no document JSON.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: 'I explored the reaper but forgot the JSON.', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     // Second call (repair): valid document JSON in lastResultText.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleDesign(
       TASK_ID, { prompt: 'Design how X should work' },
@@ -435,7 +456,7 @@ describe('handleDesign — bounded self-repair on format miss', () => {
   it('does NOT record repair success when the re-ask is also unparseable; falls back to raw output (still bounded to one re-ask)', async () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: 'no json', lastResultText: 'raw fallback',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleDesign(
       TASK_ID, { prompt: 'Design X' },
@@ -453,7 +474,7 @@ describe('handleDesign — bounded self-repair on format miss', () => {
   it('skips the re-ask entirely (no format telemetry) when the run exited non-zero', async () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 1, allOutput: 'boom', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleDesign(
       TASK_ID, { prompt: 'Design X' },
@@ -470,11 +491,11 @@ describe('handleDesign — bounded self-repair on format miss', () => {
     // First run: clean exit but no document.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: 'Analysis done but no JSON.', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     // Repair run: valid document.
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     // Progress file exists with content.
     vi.mocked(fs.existsSync).mockImplementation((p: unknown) => {
       return String(p).includes(`design_progress_${TASK_ID}`) || true;
@@ -499,10 +520,10 @@ describe('handleDesign — bounded self-repair on format miss', () => {
   it('omits prior analysis in the repair prompt when the progress file is absent', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: 'Analysis done but no JSON.', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: '', lastResultText: JSON.stringify(VALID_DOCUMENT),
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     // existsSync returns true for workspace paths (citation grounding) but false for progress file.
     vi.mocked(fs.existsSync).mockImplementation((p: unknown) => {
       return !String(p).includes(`design_progress_${TASK_ID}`);
@@ -536,7 +557,7 @@ describe('handleDesign — citation-grounding repair reopen', () => {
     vi.clearAllMocks();
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     // Only clean (undecorated) paths exist in the mocked working tree.
     vi.mocked(fs.existsSync).mockImplementation(
@@ -579,10 +600,10 @@ describe('handleDesign — citation-grounding repair reopen', () => {
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({
         exitCode: 0, allOutput: '', lastResultText: '',
-      } as Awaited<ReturnType<typeof runClaudeCode>>)
+      })
       .mockResolvedValueOnce({
         exitCode: 0, allOutput: '', lastResultText: JSON.stringify(CORRECTED_DOCUMENT),
-      } as Awaited<ReturnType<typeof runClaudeCode>>);
+      });
 
     await handleDesign(
       TASK_ID, { prompt: 'Design how X should work' },
@@ -643,7 +664,7 @@ describe('handleDesign — citation-grounding repair reopen', () => {
     vi.mocked(readHandlerOutput).mockReturnValue({ ...UNGROUNDED_DOCUMENT });
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 1, allOutput: 'boom', lastResultText: '',
-    } as Awaited<ReturnType<typeof runClaudeCode>>);
+    });
 
     await handleDesign(
       TASK_ID, { prompt: 'Design X' },

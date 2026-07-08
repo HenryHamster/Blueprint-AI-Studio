@@ -37,6 +37,7 @@ import {
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
 import { extractJsonObject } from '../json-extract.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { buildAvailableCapabilitiesSection, CAPABILITY_DECLARATION_DOC } from './research-plan.js';
 
 // Reads the design progress markdown the agent writes for retry context.
@@ -147,8 +148,14 @@ async function repairUngroundedCitations(
   // the backend gate fails the task (the fail path persists only the counts).
   sendLog(ws, `[WARNING] None of the ${fileCitations} file citation(s) resolve in the working tree (unresolved: ${unresolved.join(' | ')}) — reopening once so the agent can correct them\n`);
   statusRef.value = 'Correcting unresolved design citations...';
+  const repairPrompt = buildCitationRepairPrompt(unresolved, documentPath);
+  // Do NOT call setPromptSizeTelemetry here — the repair prompt is small
+  // (~hundreds of bytes) and would overwrite the main design prompt telemetry
+  // (~thousands of bytes, set by handleDesign before the Claude run). The
+  // repair reopens Claude exactly once and the main telemetry is the one
+  // the heartbeat should report.
   const retry = await runClaudeCode(
-    buildCitationRepairPrompt(unresolved, documentPath),
+    repairPrompt,
     ws, statusRef, model, effort, disallowedTools,
   );
   // Candidate order: the re-written /tmp document file first, then a document
@@ -282,7 +289,11 @@ export async function handleDesign(
     ? `${designVocabSection}${CAPABILITY_DECLARATION_DOC}\n\n`
     : '';
 
-  const designPrompt = `${claudeMdPrefix}${designPlaybookSection}${retryContext}${contextPrefix}You are a software design agent. Your job is to answer the design question below by GROUNDING your design in the ACTUAL code of this repository, and produce a single structured design DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
+  // Build the prompt footer and core body as named variables so the
+  // telemetry decomposition reuses the same values — no fragile slicing
+  // that would silently drift if the template is edited independently.
+  const designFooter = `\n\n${PLAYBOOK_GUIDANCE}\n\n${designFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const designCoreBody = `${contextPrefix}You are a software design agent. Your job is to answer the design question below by GROUNDING your design in the ACTUAL code of this repository, and produce a single structured design DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
 
 ${topicLine}Design question:
 ${prompt}
@@ -317,16 +328,30 @@ ALSO write ${progressPath} — a concise markdown summary (under ~3000 chars) of
 ## Codebase
 ${fileTreeSection}
 
-Read full design-doc section prose on demand with \`./design-doc get <key>\` (list keys with \`./design-doc list\`).
+Read full design-doc section prose on demand with \`./design-doc get <key>\` (list keys with \`./design-doc list\`).`;
 
-${PLAYBOOK_GUIDANCE}
-
-${designFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const designPrompt = `${claudeMdPrefix}${designPlaybookSection}${retryContext}${designCoreBody}${designFooter}`;
 
   statusRef.value = 'Running design analysis...';
   const fingerprint = computePromptFingerprint('design');
   setCurrentPromptFingerprint(fingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: fingerprint });
+
+  // Record prompt size telemetry so cost attribution covers design task types.
+  // Sections are built from the same named variables used to assemble the prompt
+  // — no post-hoc slicing that would silently drift if the template is edited.
+  const designSections: Array<[string, string]> = [];
+  if (claudeMdPrefix) designSections.push(['claude_md', claudeMdPrefix]);
+  if (designPlaybookSection) designSections.push(['playbook', designPlaybookSection]);
+  if (retryContext) designSections.push(['retry_context', retryContext]);
+  designSections.push(['core_body', designCoreBody]);
+  if (designFooter.trim()) designSections.push(['guidance_footer', designFooter]);
+  const designTelemetry = buildPromptSizeTelemetry(designPrompt, designSections);
+  setPromptSizeTelemetry(
+    designTelemetry.prompt_size_bytes,
+    designTelemetry.prompt_section_count,
+    designTelemetry.prompt_section_sizes,
+  );
 
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(
     designPrompt, ws, statusRef, model, effort, disallowedTools,

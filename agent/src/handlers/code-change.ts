@@ -6,6 +6,9 @@ import {
 } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { writeCodeChangeHelpers, SELF_REVIEW_PROMPT_VERSION } from '../prompt.js';
+// buildPromptSizeTelemetry / setPromptSizeTelemetry are NOT called here —
+// callers (standard.ts, review-fix.ts, specialized.ts) set richer
+// per-section decompositions before invoking runCodeChangeTask.
 
 // ── Code-change task runner ─────────────────────────────────────────────────
 //

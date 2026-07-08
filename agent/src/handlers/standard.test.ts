@@ -4926,4 +4926,34 @@ describe('prompt size telemetry', () => {
       { name: 'guidance', bytes: 100 },
     ]);
   });
+
+  it('runCodeChangeTask does not set telemetry — callers set richer per-section decompositions', async () => {
+    // runCodeChangeTask no longer calls setPromptSizeTelemetry. The comment at
+    // code-change.ts:9-11 explains that callers (standard.ts, review-fix.ts,
+    // specialized.ts) set richer per-section decompositions before invoking
+    // runCodeChangeTask.  This test confirms runCodeChangeTask does NOT
+    // overwrite caller-set telemetry.
+    const real = await vi.importActual<typeof import('./code-change.js')>('./code-change.js');
+    const realRunCodeChangeTask = real.runCodeChangeTask;
+
+    await realRunCodeChangeTask({
+      taskId: 'test-telemetry-cc',
+      prompt: 'Test code-change prompt for telemetry verification',
+      ws: null,
+      statusRef: { value: '' },
+      workBranch: 'task-cc-telemetry',
+      baseBranch: 'main',
+      owner: 'owner',
+      repo: 'repo',
+      testsOnMainBranch: false,
+      baseCommit: 'abc123',
+    });
+
+    // Telemetry should remain in its reset state — runCodeChangeTask
+    // no longer owns prompt-size reporting; callers do.
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.prompt_size_bytes).toBeNull();
+    expect(telemetry.prompt_section_count).toBeNull();
+    expect(telemetry.prompt_section_sizes).toBeNull();
+  });
 });
