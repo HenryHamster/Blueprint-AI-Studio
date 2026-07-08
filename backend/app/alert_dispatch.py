@@ -1710,6 +1710,7 @@ from app.runner_health_alerts import (  # noqa: F401
     _maybe_escalate_runner_deactivated_alerts,
     _maybe_escalate_runner_degraded_alerts,
     _resolve_fleet_no_healthy_runner_alert,
+    _resolve_local_runner_hold_alert,
     _resolve_runner_deactivated_alert,
     _resolve_runner_degraded_alert,
     _resolve_runner_low_disk_alert,

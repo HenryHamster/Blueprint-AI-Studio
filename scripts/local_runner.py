@@ -1128,6 +1128,22 @@ def _heartbeat_loop(
                     compute_backend=compute_backend,
                 )
             elif status == 401:
+                # Before counting this as an auth failure, re-read the token file
+                # so the operator can rotate a revoked token without restarting the
+                # runner (update the file → runner auto-detects → resumes heartbeats).
+                new_token = _load_runner_token()
+                if not new_token:
+                    new_token = os.environ.get("BLUEPRINT_RUNNER_TOKEN", "").strip() or None
+                if new_token and new_token != token:
+                    print(
+                        "[runner] heartbeat 401 — detected updated token on disk; "
+                        "resetting auth counter and resuming with new token.",
+                        flush=True,
+                    )
+                    token = new_token
+                    consecutive_401 = 0
+                    consecutive_network_failures = 0
+                    continue  # retry immediately with the new token
                 consecutive_401 += 1
                 print(
                     f"[runner] heartbeat 401 ({consecutive_401} consecutive) — token "

@@ -2626,6 +2626,55 @@ class TestHeartbeat401Streak(unittest.TestCase):
 
         self.assertEqual(exits, [], "streak reset by the 200 must not trigger an exit")
 
+    def test_token_reload_on_401_prevents_exit(self):
+        """When the token file is updated on disk during a 401 streak, the runner
+        detects the new token, resets the counter, and resumes without exit."""
+        # _post always returns 401 while using the old token; after reload the
+        # runner retries with the new token and gets a 200.
+        call_count = [0]
+        tokens_seen = []
+
+        def fake_post(url, token, body, **kwargs):
+            tokens_seen.append(token)
+            call_count[0] += 1
+            # Old token always gets 401; new token succeeds.
+            if token == "new-token":
+                return 200, None
+            return 401, None
+
+        # _load_runner_token returns the old token on the first call (no change
+        # detected), then returns a new token on the second call (simulating
+        # operator updating the file between heartbeat cycles).
+        load_calls = [0]
+        def fake_load_token():
+            load_calls[0] += 1
+            if load_calls[0] == 1:
+                return "old-token"
+            return "new-token"
+
+        exits = []
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_load_runner_token", fake_load_token), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch("os._exit", lambda c: exits.append(c)), \
+             patch("time.sleep", lambda s: None):
+            # Shut down after the new token succeeds so the loop terminates.
+            def shutdown_after_success():
+                if call_count[0] >= 3:
+                    local_runner._shutdown_event.set()
+            with patch.object(local_runner, "_write_status_json",
+                              lambda **kw: shutdown_after_success()):
+                local_runner._heartbeat_loop(
+                    "https://api", "old-token", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    max_auth_failures=3,
+                )
+
+        self.assertEqual(exits, [], "token reload must prevent auth-fatal exit")
+        self.assertIn("new-token", tokens_seen,
+                      "heartbeat must use the reloaded token")
+
 
 class TestHeartbeatJitterAndNetworkFailureEscalation(unittest.TestCase):
     """Heartbeat loop: jitter spreads restarts; network failure streak escalates."""

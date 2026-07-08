@@ -176,6 +176,7 @@ def test_registry_contains_initial_checks():
         "saturated_direction_with_nonmerge_productivity",
         "capability_claim_reconciliation",
         "merged_pr_count_consistency",
+        "criterion_evidence_count_integrity",
     } <= names
 
 
@@ -3423,3 +3424,224 @@ async def test_merged_pr_count_consistency_multiple_parents_inflates_delta(db):
     assert f.self_reported == 4
     assert f.ground_truth == 2
     assert f.delta == 2
+
+
+# --- Check: criterion_evidence_count_integrity --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_new_integrity_check_flags_counter_divergence(db):
+    """Named acceptance evidence: seed a divergence and assert FLAGGED.
+
+    Creates a criterion with CriterionEvidence rows, mocks
+    get_version_coverage_summary to return a wrong evidence_count, and
+    verifies the check flags the divergence between the mock self-reported
+    count and the independent COUNT(*) ground truth.
+    """
+    from unittest.mock import patch
+
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Evidence count integrity divergence test"
+    )
+    # Insert 3 evidence rows (ground truth will be 3).
+    for i in range(3):
+        db.add(
+            CriterionEvidence(
+                project_id=project.id,
+                criterion_id=criterion.id,
+                source_kind="operator_attestation",
+                detail={"note": f"evidence {i}"},
+            )
+        )
+    await db.commit()
+
+    # Mock the summary to report evidence_count=1 (WRONG — actual is 3).
+    async def _mock_summary(*args, **kwargs):
+        return {
+            "total": 1,
+            "covered": 0,
+            "partial": 0,
+            "uncovered": 1,
+            "retracted": 0,
+            "superseded": 0,
+            "inactive": 0,
+            "stuck_count": 0,
+            "criteria": [
+                {
+                    "criterion_key": criterion.criterion_key,
+                    "text": "Evidence count integrity divergence test",
+                    "coverage": "partial",
+                    "status": "active",
+                    "evidence_count": 1,  # WRONG: says 1, but 3 rows exist
+                    "evidence_truncated": False,
+                    "stuck_reason": None,
+                    "evidence": [],
+                }
+            ],
+        }
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    with patch(
+        "app.acceptance_criteria.get_version_coverage_summary",
+        side_effect=_mock_summary,
+    ):
+        results = await mis.check_criterion_evidence_count_integrity(ctx)
+
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "criterion_evidence_count_integrity"
+    assert f.self_reported == 1   # mocked summary says 1
+    assert f.ground_truth == 3    # actual CriterionEvidence row count is 3
+    assert f.delta == 2           # |3 - 1|
+    assert criterion.criterion_key in f.detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_count_integrity_ok_when_counts_match(db):
+    """When the independent COUNT(*) matches summary evidence_count, OK with delta=0."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Evidence count integrity match test"
+    )
+    # Insert evidence rows.
+    for i in range(3):
+        db.add(
+            CriterionEvidence(
+                project_id=project.id,
+                criterion_id=criterion.id,
+                source_kind="operator_attestation",
+                detail={"note": f"evidence {i}"},
+            )
+        )
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_evidence_count_integrity(ctx)
+
+    # No flagged results expected — counts match.
+    assert all(not r.flagged for r in results), f"unexpected flagged: {results}"
+    ok_results = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok_results) >= 1
+    ok = ok_results[0]
+    assert ok.delta == 0
+    assert ok.subject == str(project.id)
+    assert "matching evidence counts" in ok.detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_count_integrity_skips_no_open_version(db):
+    """Project with no open version → SKIPPED."""
+    project = await _project(db)
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_evidence_count_integrity(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert "no open version" in mine[0].detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_count_integrity_skips_no_criteria(db):
+    """Open version with no criteria → SKIPPED."""
+    project = await _project(db)
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db.add(version)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_evidence_count_integrity(ctx)
+    mine = [r for r in results if r.subject == str(project.id)]
+    assert len(mine) == 1
+    assert mine[0].status == CheckStatus.SKIPPED
+    assert "no criteria" in mine[0].detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_count_integrity_is_flag_only(db):
+    """The check never mutates CriterionEvidence rows in any mode."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Flag-only integrity test"
+    )
+    db.add(
+        CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind="operator_attestation",
+            detail={"note": "flag-only test"},
+        )
+    )
+    await db.commit()
+
+    # Count before.
+    before_count = (
+        await db.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion.id
+            )
+        )
+    ).scalars().all()
+    before = len([r for r in before_count])
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    await mis.check_criterion_evidence_count_integrity(ctx)
+
+    # Count after must be identical.
+    after_count = (
+        await db.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion.id
+            )
+        )
+    ).scalars().all()
+    after = len([r for r in after_count])
+    assert after == before, f"CriterionEvidence rows changed: {before} → {after}"
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_count_integrity_runs_in_sweep_tick(db):
+    """The new check is auto-discovered and executed in a full sweep tick."""
+    project = await _project(db)
+    version, criterion = await _open_version_with_criterion(
+        db, project, text="Sweep tick integration test"
+    )
+    db.add(
+        CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind="operator_attestation",
+            detail={"note": "sweep tick test"},
+        )
+    )
+    await db.commit()
+
+    now = _utcnow()
+    tick = await run_metrics_integrity_sweep(db, now=now)
+    assert tick is not None
+    # The check must have run and produced a result.
+    # Tick flags are check-name-keyed; the check is registered and the sweep
+    # picks it up. The runs flag count depends on data, but the observability
+    # snapshot must record the check ran.
+    snap = get_metrics_integrity_observability()
+    assert snap["checks_run"] > 0
+    # The check name must appear in the registered set.
+    names = {c.name for c in registered_checks()}
+    assert "criterion_evidence_count_integrity" in names

@@ -737,9 +737,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     : [];
   if (prereqPointers.length > 0) {
     const resolved = new Map<string, PrereqKnowledgeDoc>();
-    for (const p of prereqPointers) {
-      const doc = await fetchKnowledgeDocumentById(p.doc_id);
-      if (doc) resolved.set(p.doc_id, doc);
+    const prereqResults = await Promise.all(
+      prereqPointers.map(async (p) => {
+        const doc = await fetchKnowledgeDocumentById(p.doc_id);
+        return { doc_id: p.doc_id, doc };
+      }),
+    );
+    for (const { doc_id, doc } of prereqResults) {
+      if (doc) resolved.set(doc_id, doc);
     }
     prerequisiteKnowledgeSection = buildPrerequisiteKnowledgeSection(prereqPointers, resolved);
     sendLog(ws, `[PrereqKnowledge] Injected ${resolved.size}/${prereqPointers.length} commissioned knowledge document(s).\n`);
@@ -761,9 +766,14 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     : [];
   const signedArtifactUrls = new Map<string, string>();
   if (artifactPointers.length > 0) {
-    for (const p of artifactPointers) {
-      const url = await fetchArtifactDownloadUrl(p.artifact_id);
-      if (url) signedArtifactUrls.set(p.artifact_id, url);
+    const urlResults = await Promise.all(
+      artifactPointers.map(async (p) => {
+        const url = await fetchArtifactDownloadUrl(p.artifact_id);
+        return { artifact_id: p.artifact_id, url };
+      }),
+    );
+    for (const { artifact_id, url } of urlResults) {
+      if (url) signedArtifactUrls.set(artifact_id, url);
     }
     prerequisiteArtifactSection = buildPrerequisiteArtifactSection(artifactPointers, signedArtifactUrls, taskId);
     sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedArtifactUrls.size} signed URL(s).\n`);

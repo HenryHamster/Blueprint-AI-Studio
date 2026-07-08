@@ -276,7 +276,7 @@ ${prompt}
 
 ${priorKnowledgeSection}
 # HOW TO RESEARCH
-1. Use WebSearch to find authoritative, current sources on the topic. Use WebFetch to read the most relevant pages in depth.
+1. Use WebSearch to find authoritative, current sources on the topic — run multiple searches in parallel to cover different facets. Use WebFetch to read the most relevant pages in depth.
 2. Cross-check claims across multiple sources. Prefer primary/official documentation over secondary commentary.
 3. Track the actual URLs you used — every substantive claim in your document must be backed by a citation.
 4. Synthesize what you learned into a clear, well-structured markdown document. Be specific and concrete; avoid filler.
