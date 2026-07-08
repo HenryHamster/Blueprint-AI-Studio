@@ -5085,14 +5085,6 @@ describe('writeMessagesHelper stdin-based send', () => {
       "echo '{\"status\":\"ok\"}'",
       'echo "200"',
     ].join('\n'), { mode: 0o755 });
-    const mockJqDir = realPath.join(tmpDir, `messages_mockjq_${process.pid}`);
-    realFs.mkdirSync(mockJqDir, { recursive: true });
-    const mockJqPath = realPath.join(mockJqDir, 'jq');
-    realFs.writeFileSync(mockJqPath, [
-      '#!/bin/bash',
-      '# Passthrough to real jq',
-      'exec /usr/bin/jq "$@"',
-    ].join('\n'), { mode: 0o755 });
     const contentWithQuote = "Everything's fine and \"quoted\"";
     try {
       const result = realCp.spawnSync('bash', [scriptPath, 'send', '--stdin', 'NOTE'], {
@@ -5115,7 +5107,6 @@ describe('writeMessagesHelper stdin-based send', () => {
       try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
       try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
       try { realFs.unlinkSync(mockCurlPath); realFs.rmdirSync(mockCurlDir); } catch { /* ignore */ }
-      try { realFs.unlinkSync(mockJqPath); realFs.rmdirSync(mockJqDir); } catch { /* ignore */ }
     }
   });
 
@@ -5204,6 +5195,132 @@ describe('writeMessagesHelper stdin-based send', () => {
       try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
     }
   });
+
+  it('send builds valid JSON with jq REMOVED from PATH (control + unicode + quotes)', async () => {
+    writeMessagesHelper('task-nojq-send');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmpDir = realOs.tmpdir();
+    const scriptPath = realPath.join(tmpDir, `messages_nojq_send_${process.pid}.sh`);
+    realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    // A "poison" jq at the FRONT of PATH: if the generated script ever shells out
+    // to jq it records a marker (and errors), so a jq-free write path is proven
+    // by the marker's ABSENCE — not merely by jq being missing.
+    const binDir = realPath.join(tmpDir, `messages_nojq_send_bin_${process.pid}`);
+    realFs.mkdirSync(binDir, { recursive: true });
+    const captureFile = realPath.join(tmpDir, `messages_nojq_send_cap_${process.pid}.json`);
+    const jqMarker = realPath.join(tmpDir, `messages_nojq_send_jqcalled_${process.pid}`);
+    realFs.writeFileSync(realPath.join(binDir, 'curl'), [
+      '#!/bin/bash',
+      `cat > "${captureFile}"`,
+      "echo '{\"status\":\"ok\"}'",
+      'echo "200"',
+    ].join('\n'), { mode: 0o755 });
+    realFs.writeFileSync(realPath.join(binDir, 'jq'), [
+      '#!/bin/bash',
+      `echo called > "${jqMarker}"`,
+      'exit 1',
+    ].join('\n'), { mode: 0o755 });
+    // Content mixes an apostrophe, embedded double-quotes, a newline, a tab, a
+    // control char (0x01) and multibyte unicode — every branch of _json_str.
+    const content = "It's a \"quoted\" line\nsecond\ttabctrl café → π";
+    try {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', '--stdin', 'BUG_REPORT'], {
+        input: content,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'http://mock',
+          AGENT_API_TOKEN: 'tok',
+          // ONLY binDir on PATH: the real jq is unreachable, coreutils resolve
+          // through the poison binDir falling back to the system path we append.
+          PATH: `${binDir}:${process.env.PATH}`,
+        },
+        timeout: 5000,
+      });
+      expect(result.status).toBe(0);
+      // jq was never invoked — the write path is genuinely jq-free.
+      expect(realFs.existsSync(jqMarker)).toBe(false);
+      const captured = realFs.readFileSync(captureFile, 'utf8').trim();
+      const parsed = JSON.parse(captured) as {
+        task_id: string; op: string; data: { type: string; content: string; idempotency_key: string };
+      };
+      expect(parsed.task_id).toBe('task-nojq-send');
+      expect(parsed.op).toBe('create_message');
+      expect(parsed.data.type).toBe('BUG_REPORT');
+      expect(parsed.data.content).toBe(content);
+      expect(parsed.data.idempotency_key).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
+      try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
+      try { realFs.unlinkSync(jqMarker); } catch { /* ignore */ }
+      try {
+        realFs.unlinkSync(realPath.join(binDir, 'curl'));
+        realFs.unlinkSync(realPath.join(binDir, 'jq'));
+        realFs.rmdirSync(binDir);
+      } catch { /* ignore */ }
+    }
+  });
+
+  it('resolve builds valid JSON with jq REMOVED from PATH', async () => {
+    writeMessagesHelper('task-nojq-resolve');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmpDir = realOs.tmpdir();
+    const scriptPath = realPath.join(tmpDir, `messages_nojq_resolve_${process.pid}.sh`);
+    realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    const binDir = realPath.join(tmpDir, `messages_nojq_resolve_bin_${process.pid}`);
+    realFs.mkdirSync(binDir, { recursive: true });
+    const captureFile = realPath.join(tmpDir, `messages_nojq_resolve_cap_${process.pid}.json`);
+    const jqMarker = realPath.join(tmpDir, `messages_nojq_resolve_jqcalled_${process.pid}`);
+    realFs.writeFileSync(realPath.join(binDir, 'curl'), [
+      '#!/bin/bash',
+      `cat > "${captureFile}"`,
+      "echo '{\"status\":\"ok\"}'",
+      'echo "200"',
+    ].join('\n'), { mode: 0o755 });
+    realFs.writeFileSync(realPath.join(binDir, 'jq'), [
+      '#!/bin/bash',
+      `echo called > "${jqMarker}"`,
+      'exit 1',
+    ].join('\n'), { mode: 0o755 });
+    try {
+      const result = realCp.spawnSync('bash', [scriptPath, 'resolve', 'abc123ef', 'Done: it\'s "fixed"'], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'http://mock',
+          AGENT_API_TOKEN: 'tok',
+          PATH: `${binDir}:${process.env.PATH}`,
+        },
+        timeout: 5000,
+      });
+      expect(result.status).toBe(0);
+      expect(realFs.existsSync(jqMarker)).toBe(false);
+      const captured = realFs.readFileSync(captureFile, 'utf8').trim();
+      const parsed = JSON.parse(captured) as {
+        task_id: string; op: string; data: { message_id: string; resolution: string };
+      };
+      expect(parsed.op).toBe('resolve_message');
+      expect(parsed.data.message_id).toBe('abc123ef');
+      expect(parsed.data.resolution).toBe('Done: it\'s "fixed"');
+    } finally {
+      try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
+      try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
+      try { realFs.unlinkSync(jqMarker); } catch { /* ignore */ }
+      try {
+        realFs.unlinkSync(realPath.join(binDir, 'curl'));
+        realFs.unlinkSync(realPath.join(binDir, 'jq'));
+        realFs.rmdirSync(binDir);
+      } catch { /* ignore */ }
+    }
+  });
 });
 
 // ── writePlaybookHelper (live token resolution) ──────────────────────────────
@@ -5241,5 +5358,96 @@ describe('writePlaybookHelper live token resolution', () => {
     } finally {
       try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
     }
+  });
+
+  // Shared harness: run `./playbook set` with jq REMOVED from PATH and a stub
+  // `git` controlling whether branch/HEAD provenance is present, then return the
+  // JSON body curl captured. Proves the set path builds a valid body jq-free and
+  // preserves the conditional branch/head_sha keys.
+  async function runPlaybookSetNoJq(gitPresent: boolean): Promise<{ status: number | null; jqCalled: boolean; body: string }> {
+    writePlaybookHelper('task-nojq-pb');
+    const script = capturedScripts['/tmp/workspace/playbook'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmpDir = realOs.tmpdir();
+    const tag = `${gitPresent ? 'git' : 'nogit'}_${process.pid}`;
+    const scriptPath = realPath.join(tmpDir, `playbook_nojq_${tag}.sh`);
+    realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    const binDir = realPath.join(tmpDir, `playbook_nojq_bin_${tag}`);
+    realFs.mkdirSync(binDir, { recursive: true });
+    const captureFile = realPath.join(tmpDir, `playbook_nojq_cap_${tag}.json`);
+    const jqMarker = realPath.join(tmpDir, `playbook_nojq_jqcalled_${tag}`);
+    // _post_with_retry parses the HTTP status from the LAST line (curl -w
+    // '\n%{http_code}'), so the stub must echo the body then the status code.
+    realFs.writeFileSync(realPath.join(binDir, 'curl'), [
+      '#!/bin/bash',
+      `cat > "${captureFile}"`,
+      "echo '{\"status\":\"ok\"}'",
+      'echo "200"',
+    ].join('\n'), { mode: 0o755 });
+    realFs.writeFileSync(realPath.join(binDir, 'jq'), [
+      '#!/bin/bash',
+      `echo called > "${jqMarker}"`,
+      'exit 1',
+    ].join('\n'), { mode: 0o755 });
+    // Stub git: present => emit a branch + short sha; absent => exit non-zero so
+    // the `|| true` guard leaves BRANCH/HEAD_SHA empty.
+    realFs.writeFileSync(realPath.join(binDir, 'git'), gitPresent
+      ? ['#!/bin/bash', 'if [ "$2" = "--abbrev-ref" ]; then echo "feature/xyz"; else echo "abc1234"; fi'].join('\n')
+      : ['#!/bin/bash', 'exit 1'].join('\n'), { mode: 0o755 });
+    try {
+      const result = realCp.spawnSync('bash', [scriptPath, 'set', 'my-key', "val with 'apos' and \"quote\"\nand newline"], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'http://mock',
+          AGENT_API_TOKEN: 'tok',
+          PATH: `${binDir}:${process.env.PATH}`,
+        },
+        timeout: 5000,
+      });
+      const jqCalled = realFs.existsSync(jqMarker);
+      const body = realFs.existsSync(captureFile) ? realFs.readFileSync(captureFile, 'utf8').trim() : '';
+      return { status: result.status, jqCalled, body };
+    } finally {
+      try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
+      try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
+      try { realFs.unlinkSync(jqMarker); } catch { /* ignore */ }
+      try {
+        realFs.unlinkSync(realPath.join(binDir, 'curl'));
+        realFs.unlinkSync(realPath.join(binDir, 'jq'));
+        realFs.unlinkSync(realPath.join(binDir, 'git'));
+        realFs.rmdirSync(binDir);
+      } catch { /* ignore */ }
+    }
+  }
+
+  it('set builds valid JSON with jq REMOVED from PATH, including branch/head_sha provenance', async () => {
+    const { status, jqCalled, body } = await runPlaybookSetNoJq(true);
+    expect(status).toBe(0);
+    expect(jqCalled).toBe(false);
+    const parsed = JSON.parse(body) as {
+      task_id: string; op: string; key: string; value: string; branch?: string; head_sha?: string;
+    };
+    expect(parsed.task_id).toBe('task-nojq-pb');
+    expect(parsed.op).toBe('set');
+    expect(parsed.key).toBe('my-key');
+    expect(parsed.value).toBe("val with 'apos' and \"quote\"\nand newline");
+    expect(parsed.branch).toBe('feature/xyz');
+    expect(parsed.head_sha).toBe('abc1234');
+  });
+
+  it('set omits branch/head_sha (non-git workspace) with jq REMOVED from PATH', async () => {
+    const { status, jqCalled, body } = await runPlaybookSetNoJq(false);
+    expect(status).toBe(0);
+    expect(jqCalled).toBe(false);
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    expect(parsed.op).toBe('set');
+    expect(parsed.value).toBe("val with 'apos' and \"quote\"\nand newline");
+    // Conditional keys omitted exactly as the old jq `if $br == "" then {}` did.
+    expect('branch' in parsed).toBe(false);
+    expect('head_sha' in parsed).toBe(false);
   });
 });

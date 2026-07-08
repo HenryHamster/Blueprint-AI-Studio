@@ -2,7 +2,7 @@ import fs from 'fs';
 import { WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { SHELL_CMD_RE } from '../shell-safety.js';
-import { agentTokenShellFn } from '../token-file.js';
+import { agentTokenShellFn, jsonFieldShellFn } from '../token-file.js';
 import {
   buildScopedLintOneliner,
   detectLinterKind,
@@ -218,7 +218,7 @@ function buildViewportUploadBlock(taskId: string): string {
   return `
       # ── viewport screenshot upload (PR-only regression evidence) ──────────
       # Non-fatal: missing JSON / PNG / tools / token → WARN and skip.
-      if command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \\
+      if command -v curl >/dev/null 2>&1 \\
           && _load_agent_token 2>/dev/null && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
         VP_JSON="admin-ui/test-results/viewport-failures.json"
         if [ -f "$VP_JSON" ]; then
@@ -278,8 +278,8 @@ function buildViewportUploadBlock(taskId: string): string {
               echo "[check] WARN: viewport upload — signing request failed for $_vp_comp@\${_vp_width}px"
               continue
             }
-            _vp_url=$(printf '%s' "$_vp_resp" | jq -r '.upload_url // empty' 2>/dev/null || true)
-            _vp_uri=$(printf '%s' "$_vp_resp" | jq -r '.storage_uri // empty' 2>/dev/null || true)
+            _vp_url=$(printf '%s' "$_vp_resp" | _json_field upload_url 2>/dev/null || true)
+            _vp_uri=$(printf '%s' "$_vp_resp" | _json_field storage_uri 2>/dev/null || true)
             if [ -z "$_vp_url" ]; then
               echo "[check] WARN: viewport upload — empty upload_url for $_vp_comp@\${_vp_width}px"
               continue
@@ -296,14 +296,17 @@ function buildViewportUploadBlock(taskId: string): string {
             cp "$_vp_png" "$_vp_local_path" 2>/dev/null || true
             echo "[check] viewport screenshot uploaded: $_vp_uri ($_vp_comp@\${_vp_width}px) — local copy: $_vp_local_path"
           done < <(
-            jq -r '
-              .testResults[]
-              | ((.name // .filepath // .file // .testFile // "") | tostring) as $file
-              | .assertionResults[]
-              | select(.status=="failed")
-              | [$file, (.fullName // .title // "")]
-              | @tsv
-            ' "$VP_JSON" 2>/dev/null || true
+            python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for tr in data.get("testResults", []):
+    fname = tr.get("name") or tr.get("filepath") or tr.get("file") or tr.get("testFile") or ""
+    for ar in tr.get("assertionResults", []):
+        if ar.get("status") == "failed":
+            title = ar.get("fullName") or ar.get("title") or ""
+            print(fname + "\t" + title)
+' "$VP_JSON" 2>/dev/null || true
           )
         fi
       fi
@@ -346,7 +349,7 @@ function buildVisualCaptureBlock(taskId: string, component: string, width: numbe
 # satisfiable (the upload stamps the canonical (component, width) context URI
 # the acceptance gate resolves against).
 if [ \${#FAILED[@]} -eq 0 ] && admin_ui_runtime_touched \\
-    && command -v jq >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \\
+    && command -v curl >/dev/null 2>&1 \\
     && _load_agent_token 2>/dev/null && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
   _VA_COMPONENT='${component}'
   _VA_WIDTH=${width}
@@ -373,8 +376,8 @@ if [ \${#FAILED[@]} -eq 0 ] && admin_ui_runtime_touched \\
     if [ -z "$_VA_RESP" ]; then
       echo "[check] WARN: visual acceptance — signing request failed for $_VA_COMPONENT@\${_VA_WIDTH}px"
     else
-      _VA_URL=$(printf '%s' "$_VA_RESP" | jq -r '.upload_url // empty' 2>/dev/null || true)
-      _VA_URI=$(printf '%s' "$_VA_RESP" | jq -r '.storage_uri // empty' 2>/dev/null || true)
+      _VA_URL=$(printf '%s' "$_VA_RESP" | _json_field upload_url 2>/dev/null || true)
+      _VA_URI=$(printf '%s' "$_VA_RESP" | _json_field storage_uri 2>/dev/null || true)
       if [ -z "$_VA_URL" ]; then
         echo "[check] WARN: visual acceptance — empty upload_url for $_VA_COMPONENT@\${_VA_WIDTH}px"
       elif curl -sf -T "$_VA_PNG" -H "Content-Type: image/png" "$_VA_URL"; then
@@ -423,6 +426,7 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
   const ciFailureSelectors = sanitizeCiFailureSelectors(cfg.ciFailureSelectors);
   const agentTokenFn = agentTokenShellFn();
+  const jsonFieldFn = jsonFieldShellFn();
   // Auto-detects which stacks were touched (admin-ui / agent / backend) by
   // inspecting `git diff --name-only` against the base branch + uncommitted.
   // Runs the corresponding lint/build commands plus the admin-ui browser-mode
@@ -447,6 +451,7 @@ export function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
 
 set -uo pipefail
 ${agentTokenFn}
+${jsonFieldFn}
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 

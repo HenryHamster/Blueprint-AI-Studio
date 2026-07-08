@@ -1,6 +1,6 @@
 import fs from 'fs';
 import { WORKSPACE } from '../index.js';
-import { agentTokenShellFn } from '../token-file.js';
+import { agentTokenShellFn, jsonStrShellFn, jsonFieldShellFn } from '../token-file.js';
 import { validateCfgShellSafety, type CodeChangeHelperConfig } from './code-change-helpers.js';
 
 export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
@@ -9,6 +9,8 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
   // Also writes /tmp/done_<task_id> as a marker for the wrapper to detect on
   // exit and skip its fallback push.
   const agentTokenFn = agentTokenShellFn();
+  const jsonStrFn = jsonStrShellFn();
+  const jsonFieldFn = jsonFieldShellFn();
   const script = `#!/bin/bash
 # ./done — mark task COMPLETED. Requires ./pr open to have run first
 # (writes /tmp/pr_url_${cfg.taskId} which this reads). Posts the COMPLETED
@@ -61,6 +63,8 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 
 set -uo pipefail
 ${agentTokenFn}
+${jsonStrFn}
+${jsonFieldFn}
 
 WARN_OUT_OF_SCOPE_REASON=""
 ALREADY_DONE_REASON=""
@@ -176,8 +180,11 @@ if [ -n "$ALREADY_DONE_REASON" ]; then
   # ($r, ≥30 chars) doubles as the verdict reason. Additive + backward-compatible:
   # no_op_reason is still emitted for older backends, and backends that predate
   # ReproduceVerdict drop the unknown field via extra="ignore".
-  ND_PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "$ALREADY_DONE_REASON" --arg logs "$ND_LOGS" \\
-    '{task_id: $tid, status: "COMPLETED", no_op_reason: $r, logs: $logs, reproduce_verdict: {status: "already_resolved", reason: $r}}')
+  ND_PAYLOAD=$(printf '{"task_id":%s,"status":"COMPLETED","no_op_reason":%s,"logs":%s,"reproduce_verdict":{"status":"already_resolved","reason":%s}}' \\
+    "$(_json_str "$TASK")" \\
+    "$(_json_str "$ALREADY_DONE_REASON")" \\
+    "$(_json_str "$ND_LOGS")" \\
+    "$(_json_str "$ALREADY_DONE_REASON")")
   # Stale-result envelope: persist BEFORE the POST so a mid-retry VM kill can
   # be replayed by the next agent boot (mirrors the PR path below).
   ND_ENVELOPE="/tmp/task_${cfg.taskId}_result.json"
@@ -245,7 +252,7 @@ fi
 FIX_RESPONSES_FILE="/tmp/fix_responses_${cfg.taskId}.json"
 FIX_RESPONSES_JSON=""
 if [ -s "$FIX_RESPONSES_FILE" ]; then
-  if jq empty "$FIX_RESPONSES_FILE" >/dev/null 2>&1; then
+  if python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$FIX_RESPONSES_FILE" >/dev/null 2>&1; then
     FIX_RESPONSES_JSON=$(cat "$FIX_RESPONSES_FILE")
   else
     echo "[done] /tmp/fix_responses_${cfg.taskId}.json exists but is not valid JSON — skipping enrichment" >&2
@@ -262,7 +269,7 @@ fi
 SELF_REVIEW_FILE="/tmp/self_review_${cfg.taskId}.json"
 SELF_REVIEW_JSON=""
 if [ -s "$SELF_REVIEW_FILE" ]; then
-  if jq empty "$SELF_REVIEW_FILE" >/dev/null 2>&1; then
+  if python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$SELF_REVIEW_FILE" >/dev/null 2>&1; then
     SELF_REVIEW_JSON=$(cat "$SELF_REVIEW_FILE")
   else
     echo "[done] /tmp/self_review_${cfg.taskId}.json exists but is not valid JSON — using fallback envelope" >&2
@@ -281,7 +288,7 @@ ${cfg.regressingCategories && cfg.regressingCategories.length > 0
   ? `REGRESSING_CATS=(${cfg.regressingCategories.map((c) => `"${c}"`).join(' ')})
 MISSING_REASONING=()
 for _CAT in "\${REGRESSING_CATS[@]}"; do
-  _R=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].reasoning // ""' 2>/dev/null || echo "")
+  _R=$(printf '%s' "$SELF_REVIEW_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); c=sys.argv[1]; print(d.get("check_results",{}).get(c,{}).get("reasoning",""))' "$_CAT" 2>/dev/null || echo "")
   if [ "\${#_R}" -lt 10 ]; then
     # Short reasoning passes if it contains a file:line evidence anchor
     _HAS_ANCHOR=0
@@ -308,8 +315,8 @@ fi`
 HIGH_STAKES_CATS=("correctness" "error-handling" "security" "regression_risk" "scope-drift")
 MISSING_EVIDENCE=()
 for _CAT in "\${HIGH_STAKES_CATS[@]}"; do
-  _PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].passed // false' 2>/dev/null || echo "false")
-  _REASONING=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].reasoning // ""' 2>/dev/null || echo "")
+  _PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); c=sys.argv[1]; print(str(d.get("check_results",{}).get(c,{}).get("passed",False)).lower())' "$_CAT" 2>/dev/null || echo "false")
+  _REASONING=$(printf '%s' "$SELF_REVIEW_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); c=sys.argv[1]; print(d.get("check_results",{}).get(c,{}).get("reasoning",""))' "$_CAT" 2>/dev/null || echo "")
 
   if [ "$_PASSED" = "true" ]; then
     # Check if reasoning has evidence anchor: file:line format, diff stats, or file list reference
@@ -342,7 +349,7 @@ fi
 # scope-drift overage gate: if the diff materially exceeds the "large" scope threshold
 # (800 lines / 15 files), do not allow scope-drift PASS — the agent must mark it FAIL.
 # This catches cases where the diff is unexpectedly huge despite a smaller scope declaration.
-_SCOPE_DRIFT_PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r '.check_results["scope-drift"].passed // false' 2>/dev/null || echo "false")
+_SCOPE_DRIFT_PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | _json_field check_results.scope-drift.passed false 2>/dev/null || echo "false")
 if [ "$_SCOPE_DRIFT_PASSED" = "true" ]; then
   _DIFF_STAT=$(git -C "${WORKSPACE}" diff --stat HEAD 2>/dev/null | tail -1 || echo "")
   if [ -n "$_DIFF_STAT" ]; then
@@ -366,7 +373,7 @@ fi
 CHANGED_FILES_JSON=""
 if BASE_COMMIT_FILE="/tmp/base_commit_${cfg.taskId}" && [ -s "$BASE_COMMIT_FILE" ]; then
   BASE_COMMIT=$(cat "$BASE_COMMIT_FILE")
-  CHANGED_FILES=$(git -C "${WORKSPACE}" diff --name-only "$BASE_COMMIT..HEAD" 2>/dev/null | head -50 | jq -R . | jq -s .)
+  CHANGED_FILES=$(git -C "${WORKSPACE}" diff --name-only "$BASE_COMMIT..HEAD" 2>/dev/null | head -50 | python3 -c 'import json,sys; lines=[l.rstrip("\\n") for l in sys.stdin.readlines() if l.rstrip("\\n")]; print(json.dumps(lines))')
   if [ -n "$CHANGED_FILES" ] && [ "$CHANGED_FILES" != "[]" ]; then
     CHANGED_FILES_JSON="$CHANGED_FILES"
   fi
@@ -375,8 +382,8 @@ fi
 CONSUMED_ARTIFACTS_JSON=""
 CONSUMED_ARTIFACTS_FILE="/tmp/consumed_artifacts_${cfg.taskId}.json"
 if [ -s "$CONSUMED_ARTIFACTS_FILE" ]; then
-  if jq -e 'type == "array"' "$CONSUMED_ARTIFACTS_FILE" >/dev/null 2>&1; then
-    CONSUMED_ARTIFACTS_JSON=$(jq '[.[] | select(type == "string" and length > 0)] | unique' "$CONSUMED_ARTIFACTS_FILE")
+  if python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d,list) else 1)' "$CONSUMED_ARTIFACTS_FILE" >/dev/null 2>&1; then
+    CONSUMED_ARTIFACTS_JSON=$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); print(json.dumps(sorted(set(x for x in d if isinstance(x,str) and len(x)>0))))' "$CONSUMED_ARTIFACTS_FILE")
   else
     echo "[done] /tmp/consumed_artifacts_${cfg.taskId}.json exists but is not a JSON array — reporting empty consumed_artifact_ids" >&2
     CONSUMED_ARTIFACTS_JSON="[]"
@@ -404,8 +411,8 @@ $WARN_OUT_OF_SCOPE_REASON
 
 Strategic / operators: this is a signal to spawn cleanup work for the
 referenced files/gates. The PR itself is intended to merge as-is."
-  jq -n --arg tid "$TASK" --arg c "$WARN_MSG" \\
-    '{task_id: $tid, op: "create_message", data: {type: "FEEDBACK", content: $c}}' | \\
+  printf '{"task_id":%s,"op":"create_message","data":{"type":"FEEDBACK","content":%s}}' \\
+    "$(_json_str "$TASK")" "$(_json_str "$WARN_MSG")" | \\
     curl -sS --max-time 30 --connect-timeout 10 -X POST "$API/api/agent/strategic" \\
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @- \\
     > /tmp/done_warn_msg_${cfg.taskId}.log 2>&1 || \\
@@ -422,21 +429,43 @@ elif [ -n "$INDETERMINATE_REASON" ]; then
   REPRODUCE_VERDICT_REASON="$INDETERMINATE_REASON"
 fi
 
-PAYLOAD=$(jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
-  --argjson fix_responses "\${FIX_RESPONSES_JSON:-null}" \\
-  --argjson self_review "$SELF_REVIEW_JSON" \\
-  --argjson changed_files "\${CHANGED_FILES_JSON:-null}" \\
-  --argjson consumed_artifacts "\${CONSUMED_ARTIFACTS_JSON:-null}" \\
-  --arg warn_reason "\${WARN_OUT_OF_SCOPE_REASON:-}" \\
-  --arg reproduce_status "\${REPRODUCE_VERDICT_STATUS:-}" \\
-  --arg reproduce_reason "\${REPRODUCE_VERDICT_REASON:-}" \\
-  '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}
-   + (if $fix_responses then {fix_agent_responses: $fix_responses} else {} end)
-   + {self_review_outcome: $self_review}
-   + (if $changed_files then {changed_files: $changed_files} else {} end)
-   + (if $consumed_artifacts then {consumed_artifact_ids: $consumed_artifacts} else {} end)
-   + (if ($warn_reason | length) > 0 then {warn_out_of_scope_reason: $warn_reason} else {} end)
-   + (if ($reproduce_status | length) > 0 then {reproduce_verdict: {status: $reproduce_status, reason: $reproduce_reason}} else {} end)')
+PAYLOAD=$(python3 -c '
+import json, sys
+tid = sys.argv[1]
+pr = sys.argv[2]
+fix_resp_raw = sys.argv[3]
+self_review_raw = sys.argv[4]
+changed_raw = sys.argv[5]
+consumed_raw = sys.argv[6]
+warn = sys.argv[7]
+repro_status = sys.argv[8]
+repro_reason = sys.argv[9]
+
+payload = {
+    "task_id": tid,
+    "status": "COMPLETED",
+    "artifact_type": "PULL_REQUEST",
+    "pr_url": pr,
+    "logs": "Task complete. PR: " + pr,
+    "self_review_outcome": json.loads(self_review_raw),
+}
+
+if fix_resp_raw != "null":
+    payload["fix_agent_responses"] = json.loads(fix_resp_raw)
+if changed_raw != "null":
+    payload["changed_files"] = json.loads(changed_raw)
+if consumed_raw != "null":
+    payload["consumed_artifact_ids"] = json.loads(consumed_raw)
+if warn:
+    payload["warn_out_of_scope_reason"] = warn
+if repro_status:
+    payload["reproduce_verdict"] = {
+        "status": repro_status,
+        "reason": repro_reason,
+    }
+
+print(json.dumps(payload))
+' "$TASK" "$PR_URL" "\${FIX_RESPONSES_JSON:-null}" "$SELF_REVIEW_JSON" "\${CHANGED_FILES_JSON:-null}" "\${CONSUMED_ARTIFACTS_JSON:-null}" "\${WARN_OUT_OF_SCOPE_REASON:-}" "\${REPRODUCE_VERDICT_STATUS:-}" "\${REPRODUCE_VERDICT_REASON:-}")
 
 # Stale-result envelope: persist BEFORE attempting the POST so that if
 # the VM is killed mid-retry, the next agent boot can scan for the

@@ -2109,6 +2109,30 @@ def test_resident_session_availability_mid_session_offline_blocks(
     assert unpinned["state"] == "active"
 
 
+def test_availability_start_failed_wins_over_active_blob(enable_strategic_session_flag):
+    """A recorded start_failed reason ALWAYS wins — even if the session blob is
+    still marked active (stale blob state). The read model must report 'error',
+    not 'starting' or 'active'. This ensures a real failure is never masked by
+    a transient blob state."""
+    # Both active blob AND recorded start_failed: the reason must win.
+    result = _resident_session_availability(
+        _project_with_vision(
+            {
+                RESIDENT_SESSION_KEY: {
+                    "status": "active",
+                    "stop_requested": False,
+                    "started_at": "2026-01-01T00:00:00",
+                    "last_progress_at": None,
+                    "last_operator_interaction_at": "2026-01-01T00:00:00",
+                },
+                RESIDENT_SESSION_REASON_KEY: {"reason": "start_failed: agent init failed"},
+            }
+        )
+    )
+    assert result["state"] == "error"
+    assert result["reason"] == "start_failed: agent init failed"
+
+
 @pytest.mark.asyncio
 async def test_build_resident_runner_options_flags(db_session):
     """``build_resident_runner_options`` returns one entry per non-deleted runner

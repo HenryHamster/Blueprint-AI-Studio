@@ -684,6 +684,11 @@ def _resident_session_availability(
     if not enabled:
         state = "off"
         reason = "sessions_disabled"
+    elif recorded_start_failed:
+        # A recorded ``start_failed`` is authoritative and never masked by a live
+        # runner count or a transient active blob — the last auto-start genuinely errored.
+        reason = recorded_reason
+        state = "error"
     elif active:
         # Block-on-offline: a live session pinned to a device that is now offline
         # (or de-enrolled) flips to ``blocked``/``runner_offline`` — the operator
@@ -699,11 +704,6 @@ def _resident_session_availability(
                 if _resident_session_has_begun_streaming(snapshot)
                 else "starting"
             )
-    elif recorded_start_failed:
-        # A recorded ``start_failed`` is authoritative and never masked by a live
-        # runner count — the last auto-start genuinely errored.
-        reason = recorded_reason
-        state = "error"
     elif recorded_reason == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:
         # A batch strategic cycle is in flight — not an error, just a transient
         # wait. The completion handler re-tries the auto-start when the blocking

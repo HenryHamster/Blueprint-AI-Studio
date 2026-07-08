@@ -500,6 +500,97 @@ esac
     realFs.rmSync('/tmp/pr_attempts_task-retry-1', { force: true });
     realFs.rmSync('/tmp/pr_url_task-retry-1', { force: true });
   });
+
+  // ── jq-free integration: the generated script must work WITHOUT jq on PATH ──
+  it('builds valid JSON payload and extracts html_url with jq REMOVED from PATH', async () => {
+    const specialTitle = 'fix: title with "quotes", apostrophe\'s, and `backticks`';
+    const specialBody = 'Body line 1\nBody line 2 with "double quotes" and \'single quotes\'';
+
+    const script = writeScript({
+      taskId: 'task-nojq-1',
+      workBranch: 'blueprint/task-nojq-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    // Capture the POST body so we can assert it is valid JSON with the correct fields.
+    const result = await runScript(script, ['open', '--title', specialTitle, '--body', specialBody], (dir, realFs) => {
+      const bin = `${dir}/bin`;
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) printf '%s\\n' '?? src/normal.txt'; exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-nojq-1"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      // curl mock: captures the POST body pipe to a file, returns a fake success
+      // response with html_url. No jq binary provided — the script must use
+      // _json_str for construction and _json_field for parsing.
+      realFs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+DUMP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    -D) DUMP="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-nojq-1"*)
+    printf '{"data":{"token":"token-nojq","html_url":"https://github.com/acme/repo/pull/99"}}'
+    exit 0 ;;
+  *"/api/agent/github/pull-requests"*)
+    # Capture the stdin body that was piped by the script (--data-binary @-).
+    cat > /tmp/pr_body_task-nojq-1
+    [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/99"}}' > "$OUT"
+    printf '201'; exit 0 ;;
+  *"/pulls/99"*)
+    printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      // DELIBERATELY omit jq from the mock bin — the generated script must NOT
+      // depend on it. The _json_str and _json_field functions (python3-based)
+      // handle all JSON construction and parsing.
+    });
+
+    expect(result.status).toBe(0);
+
+    // (a) Assert the captured PR-creation request body is valid JSON with the
+    //     exact expected fields, including special characters round-tripped.
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const bodyRaw = realFs.readFileSync('/tmp/pr_body_task-nojq-1', 'utf8').trim();
+    expect(bodyRaw).toBeTruthy();
+    const parsed = JSON.parse(bodyRaw) as Record<string, unknown>;
+    expect(parsed.task_id).toBe('task-nojq-1');
+    expect(parsed.owner).toBe('acme');
+    expect(parsed.repo).toBe('repo');
+    expect(parsed.title).toBe(specialTitle);
+    expect(parsed.head).toBe('blueprint/task-nojq-1');
+    expect(parsed.base).toBe('main');
+    expect(parsed.body).toBe(specialBody);
+
+    // (b) Assert the html_url was extracted (via _json_field) and PR_URL persisted.
+    const prUrl = realFs.readFileSync('/tmp/pr_url_task-nojq-1', 'utf8').trim();
+    expect(prUrl).toBe('https://github.com/acme/repo/pull/99');
+
+    // Cleanup.
+    realFs.rmSync('/tmp/pr_body_task-nojq-1', { force: true });
+    realFs.rmSync('/tmp/pr_url_task-nojq-1', { force: true });
+  });
 });
 
 // Static content checks (no bash execution — these run on every platform,

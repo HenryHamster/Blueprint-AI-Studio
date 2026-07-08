@@ -14,6 +14,7 @@ import {
   writeGithubTokenFile,
   githubTokenShellFn,
   jsonStrShellFn,
+  jsonFieldShellFn,
 } from './token-file.js';
 
 // Isolate every test from the real home dir: each run points token files at
@@ -144,6 +145,29 @@ describe('jsonStrShellFn', () => {
     expect(fn).toContain('no JSON string encoder available');
     expect(fn).toContain('_json_str "" >/dev/null || exit 1');
     expect(fn).not.toContain('jq -');
+  });
+});
+
+describe('jsonFieldShellFn', () => {
+  it('emits a jq-free JSON field extractor with dot-path walking and error handling', () => {
+    const fn = jsonFieldShellFn();
+    expect(fn).toContain('_json_field()');
+    expect(fn).toContain('import json, sys');
+    expect(fn).toContain('json.loads(sys.stdin.read())');
+    expect(fn).toContain('parts = path.split(".")');
+    expect(fn).toContain('isinstance(data, dict)');
+    expect(fn).toContain('data = data.get(p)');
+    expect(fn).toContain('except Exception');
+    // The doc comment references jq for context ("matches jq -r '… // empty'"),
+    // but the function itself has no jq dependency — it uses python3 exclusively.
+    const bodyAfterDocComment = fn.slice(fn.indexOf('_json_field() {'));
+    expect(bodyAfterDocComment).not.toContain('jq');
+  });
+
+  it('emits a function that accepts an optional default value argument', () => {
+    const fn = jsonFieldShellFn();
+    // The default argument is consumed via sys.argv[2] when present
+    expect(fn).toContain('sys.argv[2] if len(sys.argv) > 2 else ""');
   });
 });
 

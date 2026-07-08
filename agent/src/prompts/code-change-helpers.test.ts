@@ -78,7 +78,7 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(checkScript).toContain('mcr.microsoft.com/playwright:v1.59.1-jammy');
     expect(checkScript).not.toContain('npm run test:run');
     expect(checkScript.indexOf('admin-ui playwright chromium')).toBeLessThan(checkScript.indexOf('admin-ui viewport'));
-    expect(checkScript.indexOf('admin-ui viewport')).toBeLessThan(checkScript.indexOf('admin-ui build'));
+    expect(checkScript.indexOf('admin-ui viewport')).toBeLessThan(checkScript.indexOf('admin-ui typecheck'));
   });
 
   it('generated ./check script passes `bash -n` syntax check', async () => {
@@ -331,16 +331,21 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
       taskId: 'test-task-feat',
       workBranch: 'blueprint/test-task-feat',
       baseBranch: 'feature/xyz',
-      // Backend test-gate condition lives in the Blueprint blocks (self-repo only).
-      owner: 'HenryHamster',
-      repo: 'BlueprintAIStudio',
+      // Backend test-gate condition lives in the Blueprint blocks.
+      // Use a non-self-repo owner/repo so shouldRunBackendMergeGate checks
+      // baseBranch === promotionTarget (the self-repo always returns true).
+      owner: 'acme-org',
+      repo: 'test-repo',
       testsOnMainBranch: false,
       promotionTarget: 'production',
     });
     const checkScript = capturedScripts['/tmp/workspace/check'];
     const prScript = capturedScripts['/tmp/workspace/pr'];
-    // baseBranch !== promotionTarget, so no mandatory gate
-    expect(checkScript).toContain('"0" = "1"');
+    // baseBranch !== promotionTarget for a non-self repo: shouldRunBackendMergeGate
+    // returns false, so no backend test gate is emitted in the check script and
+    // no mandatory test gate appears in the pr script.
+    expect(checkScript).not.toContain('"0" = "1"');
+    expect(checkScript).toContain('no build_config configured');
     expect(prScript).not.toContain('mandatory test gate');
   });
 });
@@ -1263,14 +1268,19 @@ describe('writeCodeChangeHelpers — viewport upload block', () => {
           ].join('\n'),
           { mode: 0o755 },
         );
-        // Extract the _load_agent_token function from the full check script header
-        // so the isolated upload block can call it (the block guard uses it now).
+        // Extract the _load_agent_token function and the _json_field helper from the
+        // full check script header so the isolated upload block can call them
+        // (the block guard uses them for field extraction and token loading).
         const fnStart = checkScript.indexOf('_load_agent_token()');
         const fnEnd = checkScript.indexOf('\n}', fnStart) + 2;
         const loadTokenFn = fnStart >= 0 ? checkScript.slice(fnStart, fnEnd) : '';
+        const jfStart = checkScript.indexOf('_json_field()');
+        const jfEnd = checkScript.indexOf('\n}', jfStart) + 2;
+        const jsonFieldFn = jfStart >= 0 ? checkScript.slice(jfStart, jfEnd) : '';
         const harness = [
           'set -uo pipefail',
           loadTokenFn,
+          jsonFieldFn,
           `cd "${dir}"`,
           uploadBlock,
         ].join('\n');
@@ -1448,8 +1458,10 @@ describe('writeCodeChangeHelpers — lifecycle helpers use live token file', () 
       realFs.writeFileSync(scriptPath, capturedScripts['/tmp/workspace/fail'], { mode: 0o755 });
 
       // Write the live token to a file — this is what the agent process keeps fresh.
+      // Use a JWT-shaped value (header.payload.sig) so it passes the loader's
+      // _agent_token_looks_like_jwt gate instead of being rejected as a placeholder.
       const tokenFile = realPath.join(dir, 'agent-token.jwt');
-      realFs.writeFileSync(tokenFile, 'live-file-token', { mode: 0o600 });
+      realFs.writeFileSync(tokenFile, 'live.file.token', { mode: 0o600 });
 
       // curl stub: capture the X-Agent-Token header value used in the request.
       const bin = realPath.join(dir, 'bin');
@@ -1490,11 +1502,132 @@ describe('writeCodeChangeHelpers — lifecycle helpers use live token file', () 
       // The X-Agent-Token header must carry the FILE token, not the stale env snapshot.
       const headers = realFs.existsSync(headerLog) ? realFs.readFileSync(headerLog, 'utf8') : '';
       const agentTokenHeader = headers.split('\n').find(h => h.startsWith('X-Agent-Token:')) ?? '';
-      expect(agentTokenHeader).toContain('live-file-token');
+      expect(agentTokenHeader).toContain('live.file.token');
       expect(agentTokenHeader).not.toContain('stale-env-token');
     } finally {
       realFs.rmSync(dir, { recursive: true, force: true });
       try { realFs.unlinkSync(`/tmp/fail_${taskId}`); } catch { /* ignore */ }
     }
+  });
+});
+
+// ── ./fail and ./blocked build JSON without jq ────────────────────────────────
+// The strategist VM class does not reliably ship `jq`. These helpers used to
+// build their status payloads with `jq -n --arg ...`, so the self-failure and
+// precondition-blocked write paths broke before the HTTP call on a jq-less VM.
+// They now build the body with the portable `_json_str` encoder + a printf
+// skeleton. A "poison" jq at the FRONT of PATH records a marker if invoked, so a
+// genuinely jq-free path is proven by the marker's ABSENCE.
+describe('writeCodeChangeHelpers — jq-free status payload build', () => {
+  let capturedScripts: Record<string, string> = {};
+  let nextSeq = 0;
+
+  const cfg = {
+    taskId: 'task-nojq',
+    workBranch: 'blueprint/task-nojq',
+    baseBranch: 'main',
+    owner: 'test-owner',
+    repo: 'test-repo',
+    testsOnMainBranch: false,
+  };
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+      if (typeof path === 'string' && path.endsWith('/.check-task')) {
+        capturedScripts[path.replace(/\.check-task$/, 'check')] = content;
+      }
+    });
+  });
+
+  // Generate the helpers, run `helper` (fail|blocked) with jq poisoned + a curl
+  // stub that captures the POST body, and return the parsed payload.
+  const runNoJq = async (
+    helper: 'fail' | 'blocked',
+    args: string[],
+  ): Promise<{ exit: number; jqCalled: boolean; payload: Record<string, unknown> | null }> => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+
+    const taskId = `nojq-${helper}-${process.pid}-${nextSeq++}`;
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({ ...cfg, taskId });
+    try { realFs.unlinkSync(`/tmp/${helper}_${taskId}`); } catch { /* ignore */ }
+
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), `nojq-${helper}-`));
+    try {
+      const scriptPath = realPath.join(dir, helper);
+      realFs.writeFileSync(scriptPath, capturedScripts[`/tmp/workspace/${helper}`], { mode: 0o755 });
+      const bin = realPath.join(dir, 'bin');
+      realFs.mkdirSync(bin);
+      const payloadFile = realPath.join(dir, 'payload.json');
+      const jqMarker = realPath.join(dir, 'jq-called');
+      realFs.writeFileSync(
+        realPath.join(bin, 'curl'),
+        `#!/bin/bash\ncat > "${payloadFile}"\nprintf '200'\n`,
+        { mode: 0o755 },
+      );
+      realFs.writeFileSync(
+        realPath.join(bin, 'jq'),
+        `#!/bin/bash\necho called > "${jqMarker}"\nexit 1\n`,
+        { mode: 0o755 },
+      );
+      const env = {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        ORCHESTRATOR_URL: 'http://orchestrator.test',
+        AGENT_API_TOKEN: 'tok',
+      };
+      let exit = 0;
+      try {
+        realCp.execFileSync('bash', [scriptPath, ...args], { stdio: 'pipe', env });
+      } catch (err: unknown) {
+        exit = (err as { status?: number }).status ?? -1;
+      }
+      const jqCalled = realFs.existsSync(jqMarker);
+      const payload: Record<string, unknown> | null = realFs.existsSync(payloadFile)
+        ? (JSON.parse(realFs.readFileSync(payloadFile, 'utf8')) as Record<string, unknown>)
+        : null;
+      return { exit, jqCalled, payload };
+    } finally {
+      realFs.rmSync(dir, { recursive: true, force: true });
+      try { realFs.unlinkSync(`/tmp/${helper}_${taskId}`); } catch { /* ignore */ }
+    }
+  };
+
+  it.skipIf(!SUPPORTS_EXEC_BIT)('./fail builds a valid self-failure payload with jq REMOVED from PATH (quotes + newline + unicode)', async () => {
+    // Reason mixes an apostrophe, embedded double-quotes, a newline and multibyte
+    // unicode — exercises every _json_str escape branch.
+    const reason = "scope's wrong: expected \"X\"\nbut got café";
+    const { exit, jqCalled, payload } = await runNoJq('fail', [reason]);
+    expect(exit).toBe(0);
+    expect(jqCalled).toBe(false);
+    expect(payload).not.toBeNull();
+    expect(payload?.status).toBe('FAILED');
+    expect(payload?.artifact_type).toBe('ERROR_LOG');
+    expect(payload?.failure_category).toBe('agent_self_failed');
+    expect(payload?.logs).toBe(reason);
+  });
+
+  it.skipIf(!SUPPORTS_EXEC_BIT)('./blocked (no need) builds the legacy payload shape with jq REMOVED from PATH', async () => {
+    const { exit, jqCalled, payload } = await runNoJq('blocked', ["can't proceed: \"blocked\""]);
+    expect(exit).toBe(0);
+    expect(jqCalled).toBe(false);
+    expect(payload).not.toBeNull();
+    expect(payload?.failure_category).toBe('BLOCKED_PRECONDITION');
+    expect(payload?.logs).toBe('BLOCKER: can\'t proceed: "blocked"');
+    expect(payload).not.toHaveProperty('blocked_need');
+  });
+
+  it.skipIf(!SUPPORTS_EXEC_BIT)('./blocked (--needs-pr) includes the blocked_need object with jq REMOVED from PATH', async () => {
+    const { exit, jqCalled, payload } = await runNoJq('blocked', ['waiting on merge', '--needs-pr', '7910']);
+    expect(exit).toBe(0);
+    expect(jqCalled).toBe(false);
+    expect(payload?.logs).toBe('BLOCKER: waiting on merge');
+    expect(payload?.blocked_need).toEqual({ kind: 'pr', ref: '7910' });
   });
 });

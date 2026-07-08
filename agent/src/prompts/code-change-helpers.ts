@@ -454,6 +454,10 @@ fi
 # the routing is unambiguous regardless of which path the orchestrator
 # takes (normalize_agent_failure_category vs the BLOCKER:-prefix
 # fast-path in _classify_failure_class).
+# Build the status body without jq (not reliably present on the strategist VM
+# class); _json_str escapes each field into a JSON string literal. blocked_need
+# is included only when a --needs-* flag supplied both kind and ref, preserving
+# the previous conditional-object shape.
 if [ -n "$NEED_KIND" ] && [ -n "$NEED_REF" ]; then
   PAYLOAD=$(printf '{"task_id":%s,"status":"FAILED","artifact_type":"ERROR_LOG","logs":%s,"failure_category":"BLOCKED_PRECONDITION","blocked_need":{"kind":%s,"ref":%s}}' \\
     "$(_json_str "$TASK")" "$(_json_str "BLOCKER: $REASON")" "$(_json_str "$NEED_KIND")" "$(_json_str "$NEED_REF")")
