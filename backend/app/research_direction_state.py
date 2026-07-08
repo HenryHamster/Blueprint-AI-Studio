@@ -968,6 +968,24 @@ async def apply_post_spawn_state(
                             )
                             - int(agg.get("total_stranded_prs_merged", 0) or 0),
                         )
+                        # Gate the PROVEN-merge SUCCESS route on outcome
+                        # coverage: a saturated direction must not retire
+                        # declaring success while an acceptance criterion it
+                        # owns is still uncovered. Fail-open (helper returns
+                        # False) preserves current behavior for directions that
+                        # own no criteria or on any query error. When gated, the
+                        # direction simply stays active — do NOT fall through to
+                        # the exhaustion route, which declares deadlock (not
+                        # success), not an unmet-but-productive outcome.
+                        _owns_uncovered = False
+                        if total_merged >= 3:
+                            from app.acceptance_criteria import (  # noqa: PLC0415
+                                direction_owns_uncovered_criterion,
+                            )
+
+                            _owns_uncovered = await direction_owns_uncovered_criterion(
+                                session, task.project_id, did
+                            )
                         if total_merged < 3:
                             await _maybe_autocomplete_exhausted_direction(
                                 session,
@@ -976,7 +994,7 @@ async def apply_post_spawn_state(
                                 did,
                                 _pending_archived_diagnoses,
                             )
-                        elif total_merged >= 3:
+                        elif total_merged >= 3 and not _owns_uncovered:
                             total_cycles = len(history) + (agg.get("total_cycles") or 0)
                             d["status"] = "completed"
                             d["completed_at"] = _utcnow().isoformat()

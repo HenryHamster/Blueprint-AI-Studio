@@ -14509,6 +14509,273 @@ class TestStampNoFindingsRefractory:
 
 
 # --------------------------------------------------------------------------- #
+# Proven-merge success completion is gated on owned-criterion coverage.
+#
+# A saturated direction with >= 3 verified merges must NOT retire declaring
+# success ("verified PRs merged") while an acceptance criterion it OWNS is still
+# uncovered. These tests exercise the real seam end-to-end against a live DB:
+# a Direction ORM row (criterion_keys), an open ReleaseVersion, a
+# VersionAcceptanceCriterion, and optional CriterionEvidence — so the
+# direction_owns_uncovered_criterion coverage query runs for real.
+# --------------------------------------------------------------------------- #
+
+
+async def _setup_saturated_proven_direction(
+    db_session,
+    *,
+    direction_id: str,
+    criterion_keys: list[str],
+):
+    """Create a project whose in-memory direction is saturated + proven (3 verified
+    merges) and about to tip into possibly_saturated, plus the matching Direction
+    ORM row carrying *criterion_keys*. Returns (project, task, direction_dict)."""
+    from app.models import Direction
+
+    direction = {
+        "id": direction_id,
+        "text": "Saturated proven direction",
+        "status": "active",
+        "history_aggregate": {},
+        "consecutive_unproductive_cycles": 2,  # +1 in the call → saturated
+        "research_history": [
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+        ],
+    }
+    project = _Project(
+        name="Coverage Gate Test",
+        user_id="test-user-cov-gate",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First-class Direction ORM row carrying the mapped criterion keys. The
+    # in-memory direction dict does NOT reliably carry criterion_keys; the gate
+    # helper reads them from this row.
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            status="active",
+            data=dict(direction),
+            criterion_keys=list(criterion_keys),
+        )
+    )
+    await db_session.commit()
+
+    task = _Task(
+        project_id=project.id,
+        title="Research: saturated proven",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task, direction
+
+
+async def _open_version_with_criterion(db_session, project, *, covered: bool):
+    """Open a ReleaseVersion for *project* with one active criterion. When
+    *covered*, attach reachability evidence (coverage → 'covered')."""
+    from app import acceptance_criteria as ac
+    from app.models import CriterionEvidence, ReleaseVersion
+
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Owned acceptance outcome"
+    )
+    if covered:
+        db_session.add(
+            CriterionEvidence(
+                criterion_id=criterion.id,
+                project_id=project.id,
+                source_kind="reachability",
+                source_id="pr-1",
+            )
+        )
+        await db_session.commit()
+    return version, criterion
+
+
+@_pytest.mark.asyncio
+async def test_no_findings_proven_direction_with_uncovered_criterion_stays_active(
+    db_session,
+):
+    """Site 2 (_stamp_no_findings_refractory): a saturated, >=3-merge direction
+    that OWNS an uncovered active criterion must NOT auto-complete on the
+    throughput route — it stays active to keep working toward the unmet outcome."""
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-uncovered"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row's criterion_keys at the real (uncovered) criterion.
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "Direction owning an uncovered criterion must NOT auto-complete on the "
+        "proven-merge route; expected it to stay active"
+    )
+    assert target.get("auto_completed") is not True
+    # Refractory stamp is still applied even though completion was withheld.
+    assert target.get("possibly_saturated") is True
+
+
+@_pytest.mark.asyncio
+async def test_no_findings_proven_direction_with_covered_criterion_completes(
+    db_session,
+):
+    """Site 2: when the owned criterion IS covered, the saturated proven
+    direction still auto-completes exactly as before."""
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-covered"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=True
+    )
+
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "completed", (
+        "Direction whose owned criterion is covered must still auto-complete"
+    )
+    assert target.get("auto_completed") is True
+    assert "verified" in (target.get("auto_completed_reason") or "")
+
+
+@_pytest.mark.asyncio
+async def test_no_findings_proven_direction_owning_no_criteria_completes(db_session):
+    """Site 2: the gate is a no-op when the direction owns no criteria — a
+    saturated proven direction with an empty criterion_keys set still completes
+    (preserves current behavior)."""
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-none"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=[]
+    )
+    # An open version with an active criterion exists, but the direction owns
+    # none of it — the gate must not block completion.
+    await _open_version_with_criterion(db_session, project, covered=False)
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "completed", (
+        "Direction owning no criteria must auto-complete unchanged"
+    )
+    assert target.get("auto_completed") is True
+
+
+@_pytest.mark.asyncio
+async def test_no_findings_proven_direction_fails_open_on_coverage_error(
+    db_session, mocker
+):
+    """Site 2: if the coverage query raises, the gate fails open — the saturated
+    proven direction completes rather than being permanently stranded."""
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-failopen"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    # Force the coverage resolution to raise; the helper must swallow it (fail-open).
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(side_effect=RuntimeError("transient DB error")),
+    )
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "completed", (
+        "A coverage-query error must fail open (complete), never deadlock the "
+        "saturated direction forever"
+    )
+    assert target.get("auto_completed") is True
+
+
+# --------------------------------------------------------------------------- #
 # Deferred-memo enrollment: flag-off no-op, flag-on creates row, dedup.
 # --------------------------------------------------------------------------- #
 

@@ -487,6 +487,80 @@ async def get_criteria_by_keys(
     return list(result.scalars().all())
 
 
+async def direction_owns_uncovered_criterion(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+) -> bool:
+    """True iff *direction_id* owns ≥1 active criterion that is NOT 'covered'.
+
+    Used to gate the proven-merge SUCCESS auto-completion route: a saturated
+    direction with ≥3 verified merges must not retire declaring success while an
+    acceptance outcome it owns is still 'partial' or 'uncovered'.
+
+    Resolution:
+      * The direction's mapped keys come from the ``Direction`` row's first-class
+        ``criterion_keys`` column (via :func:`app.directions_repo.get_direction_row`);
+        the in-memory direction dicts do NOT reliably carry them.
+      * The lookup is scoped to the current open release version so keys from a
+        closed version cannot leak in.
+      * Only ``status == "active"`` criteria are weighed; coverage is computed
+        from each criterion's evidence via :func:`compute_criterion_coverage`.
+
+    Fail-open: returns ``False`` (do NOT block completion) when the direction
+    owns no keys, there is no open version, there are no active owned criteria,
+    all owned active criteria are covered, or the query raises. A transient DB
+    error must never permanently strand every saturated direction.
+    """
+    try:
+        from app.directions_repo import get_direction_row  # noqa: PLC0415
+        from app.release_version import current_open_version  # noqa: PLC0415
+
+        direction_row = await get_direction_row(session, project_id, direction_id)
+        keys = list(getattr(direction_row, "criterion_keys", None) or [])
+        if not keys:
+            return False
+
+        open_ver = await current_open_version(session, project_id)
+        if open_ver is None:
+            return False
+
+        criteria = await get_criteria_by_keys(
+            session, project_id, keys, release_version_id=open_ver.id
+        )
+        active = [c for c in criteria if c.status == "active"]
+        if not active:
+            return False
+
+        uncovered_keys: list[str] = []
+        for criterion in active:
+            evidence = await get_evidence_for_criterion(session, criterion.id)
+            if compute_criterion_coverage(evidence) != "covered":
+                uncovered_keys.append(criterion.criterion_key)
+
+        if uncovered_keys:
+            logger.info(
+                "direction_owns_uncovered_criterion: direction %s (project %s) owns "
+                "uncovered active criteria %s at version v%d — withholding "
+                "proven-merge success completion",
+                direction_id,
+                project_id,
+                uncovered_keys,
+                open_ver.version_number,
+            )
+            return True
+        return False
+    except Exception:
+        logger.warning(
+            "direction_owns_uncovered_criterion: coverage query failed for "
+            "direction %s (project %s); failing open (not blocking completion)",
+            direction_id,
+            project_id,
+            exc_info=True,
+        )
+        return False
+
+
 async def record_task_merge_evidence(
     session: AsyncSession,
     task: Any,

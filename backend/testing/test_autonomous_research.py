@@ -16287,6 +16287,266 @@ async def test_no_findings_completion_stamps_saturation_and_refractory(
     )
 
 
+async def _map_direction_to_criterion(db_session, project, direction_id, *, covered):
+    """Attach an open-version acceptance criterion to a Direction ORM row.
+
+    Returns the criterion_key. When *covered* is False the criterion has no
+    evidence (coverage='uncovered'); when True a reachability evidence row makes
+    it 'covered'. The gate helper reads criterion_keys off the Direction row, so
+    a row must exist even though apply_post_spawn_state operates on the in-memory
+    project.directions blob.
+    """
+    from app import acceptance_criteria as ac
+    from app.models import (
+        CriterionEvidence,
+        Direction,
+        ReleaseVersion,
+        VersionAcceptanceCriterion,
+    )
+
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Owned acceptance outcome"
+    )
+    if covered:
+        db_session.add(
+            CriterionEvidence(
+                criterion_id=criterion.id,
+                project_id=project.id,
+                source_kind="reachability",
+                source_id="pr-x",
+            )
+        )
+        await db_session.commit()
+
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            status="active",
+            data={"id": direction_id},
+            criterion_keys=[criterion.criterion_key],
+        )
+    )
+    await db_session.commit()
+    _ = VersionAcceptanceCriterion  # imported for symmetry / readability
+    return criterion.criterion_key
+
+
+@pytest.mark.asyncio
+async def test_apply_post_spawn_state_gated_when_owned_criterion_uncovered(
+    db_session, mocker
+):
+    """Site 1 (apply_post_spawn_state): a saturated, >=3-merge direction that OWNS
+    an uncovered active criterion must NOT auto-complete on the proven-merge route.
+
+    Mirrors the all-deduped harness of the proven-completion test below, but maps
+    the direction to an uncovered acceptance criterion — the gate must withhold
+    success completion and leave the direction active."""
+    direction_id = "d-site1-uncovered"
+    direction = {
+        **_active_direction(direction_id, "Saturated proven, uncovered criterion"),
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "tasks_created": 1, "prs_merged": 1},
+            {"timestamp": "2026-01-02T00:00:00", "tasks_created": 0, "prs_merged": 1},
+            {"timestamp": "2026-01-03T00:00:00", "tasks_created": 1, "prs_merged": 1},
+        ],
+    }
+    project = Project(
+        name="Site1 Uncovered Gate",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _map_direction_to_criterion(
+        db_session, project, direction_id, covered=False
+    )
+
+    dup_title = "Fix exhausted finding"
+    dup_desc = "Already addressed"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+    existing = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "direction_id": direction_id},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix the exhausted finding",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new=AsyncMock(return_value=None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    target = next(
+        (d for d in (project.directions or []) if d.get("id") == direction_id), None
+    )
+    assert target is not None
+    assert target.get("status") == "active", (
+        "Site 1 must withhold proven-merge success completion while an owned "
+        "criterion is uncovered; direction should stay active"
+    )
+    assert target.get("auto_completed") is not True
+
+
+@pytest.mark.asyncio
+async def test_apply_post_spawn_state_completes_when_owned_criterion_covered(
+    db_session, mocker
+):
+    """Site 1: when the owned criterion IS covered, the saturated proven direction
+    still auto-completes exactly as before the gate."""
+    direction_id = "d-site1-covered"
+    direction = {
+        **_active_direction(direction_id, "Saturated proven, covered criterion"),
+        "research_history": [
+            {"timestamp": "2026-01-01T00:00:00", "tasks_created": 1, "prs_merged": 1},
+            {"timestamp": "2026-01-02T00:00:00", "tasks_created": 0, "prs_merged": 1},
+            {"timestamp": "2026-01-03T00:00:00", "tasks_created": 1, "prs_merged": 1},
+        ],
+    }
+    project = Project(
+        name="Site1 Covered Gate",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _map_direction_to_criterion(db_session, project, direction_id, covered=True)
+
+    dup_title = "Fix exhausted finding"
+    dup_desc = "Already addressed"
+    fhash = hashlib.sha256((dup_title + dup_desc).encode()).hexdigest()[:16]
+    existing = Task(
+        project_id=project.id,
+        title=dup_title,
+        payloads=[{"type": "create", "prompt": "fix it", "base_branch": "main"}],
+        context={"finding_hash": fhash, "direction_id": direction_id},
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title=f"Research: {direction['text']}",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[
+            {
+                "title": dup_title,
+                "description": dup_desc,
+                "prompt": "Fix the exhausted finding",
+                "priority": "medium",
+                "scope": "small",
+                "risk": "low",
+                "type": "improvement",
+                "direction_id": direction_id,
+            }
+        ],
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_insights",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new=AsyncMock(return_value=None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    await db_session.refresh(project)
+    target = next(
+        (d for d in (project.directions or []) if d.get("id") == direction_id), None
+    )
+    assert target is not None
+    assert target.get("status") == "completed", (
+        "Site 1 must still auto-complete a saturated proven direction whose owned "
+        "criterion is covered"
+    )
+    assert target.get("auto_completed") is True
+
+
 @pytest.mark.asyncio
 async def test_exhausted_saturated_proven_direction_auto_completes(db_session, mocker):
     """A fully-exhausted saturated direction auto-completes when all findings are deduped.

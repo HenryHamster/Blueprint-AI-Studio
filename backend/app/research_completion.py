@@ -747,6 +747,20 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
 
     _auto_complete_info: list[dict] = []
 
+    # Gate the PROVEN-merge SUCCESS route on outcome coverage (same policy as
+    # apply_post_spawn_state). The coverage query is async, but the completion
+    # decision runs inside the SYNCHRONOUS with_directions_locked closure below,
+    # so we resolve the verdict here (outside the lock) and thread the boolean
+    # in. Fail-open: the helper returns False when the direction owns no criteria
+    # or the query errors, preserving current behavior.
+    from app.acceptance_criteria import (  # noqa: PLC0415
+        direction_owns_uncovered_criterion,
+    )
+
+    _owns_uncovered = await direction_owns_uncovered_criterion(
+        session, task.project_id, direction_id
+    )
+
     def _apply_no_findings_refractory(dirs: list) -> None:
         target = next((d for d in dirs if d.get("id") == direction_id), None)
         if not target:
@@ -789,7 +803,13 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 ) - int(agg.get("total_stranded_prs_merged", 0) or 0),
             )
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
-            if total_merged >= 3:
+            # Gated: a saturated direction with >= 3 verified merges whose owned
+            # acceptance outcome is still uncovered is withheld from the SUCCESS
+            # route — AND must not slip through the exhaustion route either
+            # (that declares deadlock, which a productive-but-unmet direction is
+            # not). It stays active. The < 3 exhaustion fallback is unaffected.
+            _proven_gated = total_merged >= 3 and _owns_uncovered
+            if total_merged >= 3 and not _owns_uncovered:
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
                 target["auto_completed"] = True
@@ -805,7 +825,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                         "total_cycles": total_cycles,
                     }
                 )
-            elif _should_autocomplete_exhausted(target):
+            elif not _proven_gated and _should_autocomplete_exhausted(target):
                 reason = _exhaustion_complete_reason(target)
                 target["status"] = "completed"
                 target["completed_at"] = now_iso

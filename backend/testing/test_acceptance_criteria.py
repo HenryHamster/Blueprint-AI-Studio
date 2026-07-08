@@ -4635,6 +4635,173 @@ async def test_backfill_v22_is_idempotent(db_session):
     )
 
 
+# ---------------------------------------------------------------------------
+# direction_owns_uncovered_criterion — proven-merge completion coverage gate
+# ---------------------------------------------------------------------------
+
+
+async def _make_direction_row(db_session, project, direction_id, criterion_keys):
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            status="active",
+            data={"id": direction_id},
+            criterion_keys=list(criterion_keys),
+        )
+    )
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_direction_missing(db_session):
+    """No Direction row (or no criterion_keys) → fail-open False (owns nothing)."""
+    project = await _make_project(db_session)
+    await _make_version(db_session, project)
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-missing")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_no_criterion_keys(db_session):
+    """Direction row exists but owns no keys → False."""
+    project = await _make_project(db_session)
+    await _make_version(db_session, project)
+    await _make_direction_row(db_session, project, "d-empty", [])
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-empty")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_no_open_version(db_session):
+    """Keys mapped but there is no open release version → fail-open False."""
+    project = await _make_project(db_session)
+    await _make_direction_row(db_session, project, "d-nover", ["c-xyz"])
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-nover")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_true_when_owned_criterion_uncovered(db_session):
+    """An owned active criterion with no evidence (uncovered) → True."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Uncovered outcome"
+    )
+    await _make_direction_row(
+        db_session, project, "d-unc", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-unc")
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_true_when_owned_criterion_partial(db_session):
+    """An owned criterion with only non-covering evidence (partial) → True."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Partial outcome"
+    )
+    # A task_merge evidence row with proven != True is 'partial', not 'covered'.
+    db_session.add(
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="task_merge",
+            source_id="pr-partial",
+            detail={"proven": False},
+        )
+    )
+    await db_session.commit()
+    await _make_direction_row(
+        db_session, project, "d-part", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-part")
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_all_covered(db_session):
+    """All owned active criteria covered → False (do not block completion)."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Covered outcome"
+    )
+    db_session.add(
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="reachability",
+            source_id="pr-ok",
+        )
+    )
+    await db_session.commit()
+    await _make_direction_row(
+        db_session, project, "d-cov", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-cov")
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_false_when_only_criterion_retracted(db_session):
+    """A retracted (inactive) owned criterion is not weighed → False even though
+    it carries no covering evidence."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Retracted outcome"
+    )
+    criterion.status = "retracted"
+    db_session.add(criterion)
+    await db_session.commit()
+    await _make_direction_row(
+        db_session, project, "d-retracted", [criterion.criterion_key]
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(
+            db_session, project.id, "d-retracted"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_owns_uncovered_fails_open_on_query_error(db_session, mocker):
+    """A raised coverage query is swallowed → False (never blocks completion)."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Would-be uncovered"
+    )
+    await _make_direction_row(
+        db_session, project, "d-boom", [criterion.criterion_key]
+    )
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    )
+    assert (
+        await ac.direction_owns_uncovered_criterion(db_session, project.id, "d-boom")
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_backfill_v22_noop_on_non_v22_version(db_session):
     """Guard 1: the backfill is a no-op for any version that is not v22.

@@ -2505,3 +2505,230 @@ def test_compact_version_phase_passes_failure_marker_through():
     assert out_floor.get("error") == "RuntimeError('simulated failure')"
     assert out_floor.get("integration_branch") == "automain"
     assert out_floor.get("promotion_target") == "main"
+
+
+# ---------------------------------------------------------------------------
+# lifecycle_bound_problem_model — through apply_agent_update (write-path proof)
+#
+# The lifecycle-bound pass is wired into apply_agent_update between
+# archive_closed_gaps and the gc_problem_model backstop, so BOTH durable-model
+# write paths (strategic_completion + admin_agent_ops) get it. These tests
+# exercise that seam end-to-end at the same altitude the packer round-trip
+# tests use the durable model.
+# ---------------------------------------------------------------------------
+
+_LB_NOW = "2026-07-07T12:00:00"
+
+
+def test_apply_agent_update_lifecycle_bounds_terminal_state_toward_healthy():
+    """A durable model seeded ABOVE every healthy threshold with terminal-ish
+    records (aged-deferred unstaffed gaps, terminal friction surplus, stale
+    planned-capability surplus) is pulled back to/under each healthy threshold
+    by the write-path lifecycle pass, and every action is recorded in the diff
+    and the revision-log summary."""
+    from app.problem_model import (
+        MODEL_SIZE_HEALTHY_CAPABILITIES,
+        MODEL_SIZE_HEALTHY_FRICTION,
+        MODEL_SIZE_HEALTHY_GAPS,
+        apply_agent_update,
+    )
+
+    # 4 genuinely-live staffed gaps + a surplus of aged-deferred unstaffed gaps
+    # that pushes the active-gap count above the healthy threshold.
+    live_gaps = [
+        {
+            "id": f"g-live-{i}",
+            "name": f"live {i}",
+            "status": "active",
+            "active_moves": [f"d-{i}"],
+        }
+        for i in range(4)
+    ]
+    aged_gaps = [
+        {
+            "id": f"g-aged-{i}",
+            "name": f"aged {i}",
+            "status": "active",
+            "deferral": {
+                "rationale": "deferred long ago",
+                "hold_until": "2026-01-01T00:00:00",  # well in the past
+            },
+        }
+        for i in range(MODEL_SIZE_HEALTHY_GAPS)
+    ]
+
+    # 4 active friction + a terminal surplus that pushes total friction over the
+    # healthy threshold.
+    active_friction = [
+        {"id": f"f-active-{i}", "name": f"a{i}", "status": "active"} for i in range(4)
+    ]
+    terminal_friction = [
+        {"id": f"f-res-{i}", "name": f"r{i}", "status": "resolved"} for i in range(8)
+    ]
+
+    # working caps at the healthy threshold + a stale planned surplus.
+    working_caps = [
+        {"name": f"cap-work-{i}", "status": "working"}
+        for i in range(MODEL_SIZE_HEALTHY_CAPABILITIES)
+    ]
+    planned_caps = [
+        {"name": f"cap-planned-{i}", "status": "planned"} for i in range(5)
+    ]
+
+    current = {
+        "revision": 7,
+        "gaps": live_gaps + aged_gaps,
+        "friction": active_friction + terminal_friction,
+        "capabilities": working_caps + planned_caps,
+    }
+    # Echo the same agent-owned collections so the non-destructive merge does not
+    # itself churn the diff — the only changes must come from the lifecycle pass.
+    proposed = {
+        "gaps": live_gaps + aged_gaps,
+        "friction": active_friction + terminal_friction,
+        "capabilities": working_caps + planned_caps,
+    }
+
+    new_raw, diff = apply_agent_update(current, proposed, _LB_NOW)
+
+    # Every aged-deferred unstaffed gap was archived; the live staffed ones stayed.
+    archived_ids = {g["id"] for g in new_raw["archived_gaps"]}
+    assert diff["gaps_lifecycle_archived"] == [f"g-aged-{i}" for i in range(
+        MODEL_SIZE_HEALTHY_GAPS)]
+    assert archived_ids == {f"g-aged-{i}" for i in range(MODEL_SIZE_HEALTHY_GAPS)}
+    active_ids = {g["id"] for g in new_raw["gaps"]}
+    assert active_ids == {f"g-live-{i}" for i in range(4)}
+    # Active-gap dimension pulled under the healthy threshold.
+    assert len(new_raw["gaps"]) <= MODEL_SIZE_HEALTHY_GAPS
+
+    # Friction pulled to the healthy threshold — resolved dropped first, active kept.
+    assert len(new_raw["friction"]) == MODEL_SIZE_HEALTHY_FRICTION
+    assert diff["friction_lifecycle_evicted"] == [f"f-res-{i}" for i in range(4)]
+    assert all(f["status"] == "active" for f in new_raw["friction"]
+               if f["id"].startswith("f-active"))
+
+    # Capabilities pulled to the healthy threshold — planned dropped, working kept.
+    assert len(new_raw["capabilities"]) == MODEL_SIZE_HEALTHY_CAPABILITIES
+    assert diff["capabilities_lifecycle_evicted"] == [
+        f"cap-planned-{i}" for i in range(5)
+    ]
+    assert all(c["status"] == "working" for c in new_raw["capabilities"])
+
+    # The actions are observable in the revision-log summary.
+    summary = new_raw["revision_log"][-1]["summary"]
+    assert "lifecycle-archived" in summary
+    assert "lifecycle-dropped" in summary
+
+
+def test_apply_agent_update_purely_live_model_no_lifecycle_churn():
+    """A purely-live model seeded ABOVE the thresholds (all active staffed gaps,
+    all active friction, all working/partial capabilities) round-trips through
+    the write path with NO lifecycle eviction and NO lifecycle diff keys — the
+    pass is a genuine no-op on live state."""
+    from app.problem_model import (
+        MODEL_SIZE_HEALTHY_CAPABILITIES,
+        MODEL_SIZE_HEALTHY_FRICTION,
+        MODEL_SIZE_HEALTHY_GAPS,
+        apply_agent_update,
+    )
+
+    gaps = [
+        {
+            "id": f"g-{i}",
+            "name": f"live {i}",
+            "status": "active",
+            "active_moves": [f"d-{i}"],
+        }
+        for i in range(MODEL_SIZE_HEALTHY_GAPS + 6)
+    ]
+    friction = [
+        {"id": f"f-{i}", "name": f"a{i}", "status": "active"}
+        for i in range(MODEL_SIZE_HEALTHY_FRICTION + 6)
+    ]
+    capabilities = [
+        {"name": f"c-{i}", "status": "working" if i % 2 else "partial"}
+        for i in range(MODEL_SIZE_HEALTHY_CAPABILITIES + 6)
+    ]
+    current = {
+        "revision": 3,
+        "gaps": gaps,
+        "friction": friction,
+        "capabilities": capabilities,
+    }
+    proposed = {"gaps": gaps, "friction": friction, "capabilities": capabilities}
+
+    new_raw, diff = apply_agent_update(current, proposed, _LB_NOW)
+
+    # No lifecycle diff keys at all.
+    assert "gaps_lifecycle_archived" not in diff
+    assert "friction_lifecycle_evicted" not in diff
+    assert "capabilities_lifecycle_evicted" not in diff
+    # Every live record survived intact — nothing evicted or archived.
+    assert len(new_raw["gaps"]) == MODEL_SIZE_HEALTHY_GAPS + 6
+    assert new_raw.get("archived_gaps", []) == []
+    assert len(new_raw["friction"]) == MODEL_SIZE_HEALTHY_FRICTION + 6
+    assert len(new_raw["capabilities"]) == MODEL_SIZE_HEALTHY_CAPABILITIES + 6
+    assert new_raw["revision_log"][-1]["summary"] == "no structural changes"
+
+
+def test_apply_agent_update_lifecycle_spares_staffed_and_fresh_deferrals():
+    """Even when the model is oversized, an active gap that is staffed
+    (active_moves) or carries a fresh (unexpired) deferral, plus active friction
+    and working/partial capabilities, are never touched by the lifecycle pass."""
+    from app.problem_model import apply_agent_update
+
+    gaps = [
+        # Staffed + aged deferral → spared because it is staffed.
+        {
+            "id": "g-staffed",
+            "name": "staffed",
+            "status": "active",
+            "active_moves": ["d-live"],
+            "deferral": {"rationale": "x", "hold_until": "2020-01-01T00:00:00"},
+        },
+        # Fresh (future) deferral, unstaffed → spared because the deferral holds.
+        {
+            "id": "g-fresh",
+            "name": "fresh defer",
+            "status": "active",
+            "deferral": {"rationale": "pinned", "hold_until": "2099-01-01T00:00:00"},
+        },
+    ]
+    current = {"revision": 1, "gaps": gaps}
+    new_raw, diff = apply_agent_update(current, {"gaps": gaps}, _LB_NOW)
+
+    assert "gaps_lifecycle_archived" not in diff
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-staffed", "g-fresh"}
+    assert new_raw.get("archived_gaps", []) == []
+
+
+def test_apply_agent_update_lifecycle_runs_before_gc_backstop():
+    """Lifecycle archival lands in archived_gaps and is NOT then rolled off by
+    the gc backstop: with archived_gaps well under the 200-item cap, a
+    lifecycle-archived gap remains re-fetchable in the durable model."""
+    from app.problem_model import apply_agent_update
+
+    gaps = [
+        {
+            "id": "g-aged",
+            "name": "aged",
+            "status": "active",
+            "deferral": {"rationale": "old", "hold_until": "2026-01-01T00:00:00"},
+        }
+    ]
+    current = {
+        "revision": 5,
+        "gaps": gaps,
+        "archived_gaps": [
+            {"id": "g-prior", "name": "prior", "status": "closed",
+             "closed": "2026-02-01T00:00:00"}
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, {"gaps": gaps}, _LB_NOW)
+
+    assert diff["gaps_lifecycle_archived"] == ["g-aged"]
+    # No gc eviction (well under the cap) — both the prior and the newly
+    # lifecycle-archived gap are retained and re-fetchable by id.
+    assert "archived_gaps_evicted" not in diff
+    archived_ids = {g["id"] for g in new_raw["archived_gaps"]}
+    assert archived_ids == {"g-prior", "g-aged"}
