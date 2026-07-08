@@ -47,6 +47,29 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------- #
+# v22 low-severity carried-finding backfill constants
+# --------------------------------------------------------------------------- #
+# All 13 v22 carried low-severity audit findings were fixed in commit
+# d2cf1ebb8 / PR #13245 before AuditFindingResolution rows existed.
+_V22_BACKFILL_RESOLVING_REF = "d2cf1ebb8"
+_V22_BACKFILL_NOTE = (
+    "Backfill: all v22 carried low-severity findings were fixed in "
+    "commit d2cf1ebb8 / PR #13245 before resolution rows existed."
+)
+_V22_DATA_INTEGRITY_CRITERION_KEY = "c-1a3ec09d"
+# This is a one-time, historical backfill: it MUST only ever touch release
+# version 22 and only its LOW-severity findings.  Two hard guards enforce that:
+#   * version_number == 22 — v22 has already promoted (the open version is v23+).
+#     Operating on the current open version would fabricate false "resolved"
+#     rows for whatever findings that version carries.
+#   * severity == "low" — only low-severity findings were fixed in d2cf1ebb8.
+#     Never write a resolution row for a gating (high/medium/critical) finding;
+#     those must stay visible to _compute_requalification_decision so a genuine
+#     carried gating finding cannot be silently suppressed from the promotion gate.
+_V22_BACKFILL_VERSION_NUMBER = 22
+_V22_BACKFILL_SEVERITY = "low"
+
 # Resolution states a ledger row may carry.  A high/medium carried finding counts
 # as resolved-for-requalification when its ledger row is in EITHER of these.
 _RESOLVED_LEDGER_STATES = frozenset({"resolved", "stale"})
@@ -1511,3 +1534,189 @@ async def compute_goal_coverage_drift_signal(
             "[DRIFT] goal_coverage_drift compute failed for project %s", project_id
         )
         return None
+
+
+# --------------------------------------------------------------------------- #
+# v22 carried-finding backfill
+# --------------------------------------------------------------------------- #
+
+
+async def backfill_v22_carried_findings_resolved(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+) -> int:
+    """Backfill AuditFindingResolution rows for v22's carried low-severity findings.
+
+    This is a one-time historical data attachment, NOT a general sweep.  Two hard
+    guards keep it from ever fabricating resolution rows for the wrong version or
+    the wrong severity (see the module-level constants for the full rationale):
+
+    * ``version.version_number`` must equal ``_V22_BACKFILL_VERSION_NUMBER`` (22).
+      v22 has already promoted, so a caller that hands us a later open version is
+      a no-op — we never write "resolved" rows against v23+.
+    * only findings whose severity is ``_V22_BACKFILL_SEVERITY`` ("low") are
+      resolved.  Gating (high/medium/critical) findings are left untouched so
+      ``_compute_requalification_decision`` still sees them.
+
+    For each surviving low-severity finding returned by
+    ``_latest_carried_audit_findings``, upserts a ``"resolved"`` ledger row citing
+    commit d2cf1ebb8 / PR #13245 as the fix.  Idempotent:
+    ``apply_finding_resolution`` upserts and the criterion-evidence write is
+    dedup-guarded, so re-runs are safe no-ops.
+
+    Also attaches a single ``CriterionEvidence`` row to the data-integrity
+    criterion ``c-1a3ec09d`` if it exists on this version, recording the backfill
+    as covering evidence.
+
+    Returns the number of low-severity resolution rows written (0 when the
+    version is not v22 or it carries no low-severity findings).
+    """
+    from app.acceptance_criteria import (  # noqa: PLC0415 — avoid load-time cycle
+        get_criterion_by_key,
+        get_evidence_for_criterion,
+        record_evidence,
+    )
+
+    # Guard 1: only ever operate on release version 22.
+    if version.version_number != _V22_BACKFILL_VERSION_NUMBER:
+        return 0
+
+    findings, _truncated = await _latest_carried_audit_findings(session, version)
+    if not findings:
+        return 0
+
+    # Guard 2: restrict to low-severity carried findings — the only ones fixed in
+    # d2cf1ebb8.  Gating findings must never receive a fabricated "resolved" row.
+    low_findings = [
+        f
+        for f in findings
+        if isinstance(f, dict)
+        and str(f.get("severity") or "").lower() == _V22_BACKFILL_SEVERITY
+    ]
+    if not low_findings:
+        return 0
+
+    count = 0
+    for finding in low_findings:
+        key = finding.get("key") or _KEYLESS_FINDING_SENTINEL
+        await apply_finding_resolution(
+            session,
+            project_id=project_id,
+            release_version_id=version.id,
+            finding_key=key,
+            state="resolved",
+            severity=_V22_BACKFILL_SEVERITY,
+            note=_V22_BACKFILL_NOTE,
+            resolving_ref=_V22_BACKFILL_RESOLVING_REF,
+        )
+        count += 1
+
+    await session.commit()
+
+    # Attach summary evidence to the data-integrity criterion if present on this
+    # version.  Dedup-guarded so repeated ticks do not append duplicate rows.
+    criterion = await get_criterion_by_key(
+        session, version.id, _V22_DATA_INTEGRITY_CRITERION_KEY
+    )
+    if criterion is not None:
+        existing = await get_evidence_for_criterion(session, criterion.id)
+        already_recorded = any(
+            e.source_kind == "audit_finding_backfill"
+            and e.source_id == _V22_BACKFILL_RESOLVING_REF
+            for e in existing
+        )
+        if not already_recorded:
+            await record_evidence(
+                session,
+                criterion_id=criterion.id,
+                project_id=project_id,
+                source_kind="audit_finding_backfill",
+                source_id=_V22_BACKFILL_RESOLVING_REF,
+                detail={
+                    "resolving_ref": _V22_BACKFILL_RESOLVING_REF,
+                    "finding_count": count,
+                    "note": _V22_BACKFILL_NOTE,
+                },
+            )
+
+    return count
+
+
+async def _find_v22_version(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> ReleaseVersion | None:
+    """Return the project's release version 22 (any status), or None.
+
+    The backfill targets v22 explicitly by ``version_number`` rather than the
+    current open version: v22 has already promoted, so ``current_open_version``
+    returns v23+ and would (a) never write the intended v22 rows and (b) risk
+    resolving findings on a later version.
+    """
+    return (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.version_number == _V22_BACKFILL_VERSION_NUMBER,
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def _sweep_v22_finding_backfill() -> None:
+    """Leader-cycle sweep: resolve v22's low-severity carried audit findings.
+
+    Targets release version 22 explicitly (via ``_find_v22_version``) — NOT the
+    current open version — so the one-time backfill lands on v22 even though it
+    has already promoted, and never touches later versions.  Idempotent:
+    ``backfill_v22_carried_findings_resolved`` upserts ledger rows and
+    dedup-guards its evidence write, so successive ticks are cheap no-ops once
+    all findings are resolved.  Called every 600 s from the leader loop.
+    """
+    from app import services
+    from app.models import Project
+
+    try:
+        async with services.AsyncSessionLocal() as session:
+            project_ids = list(
+                (
+                    await session.execute(
+                        select(Project.id).where(Project.archived.is_(False))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    except Exception:
+        logger.exception("[V22_FINDING_BACKFILL] failed to enumerate projects")
+        return
+
+    for project_id in project_ids:
+        try:
+            async with services.AsyncSessionLocal() as session:
+                version = await _find_v22_version(session, project_id)
+                if version is None:
+                    continue
+                count = await backfill_v22_carried_findings_resolved(
+                    session, project_id, version
+                )
+                if count:
+                    logger.info(
+                        "[V22_FINDING_BACKFILL] resolved %d carried finding(s) "
+                        "for project %s v%d",
+                        count,
+                        project_id,
+                        version.version_number,
+                    )
+        except Exception:
+            logger.exception(
+                "[V22_FINDING_BACKFILL] error backfilling project %s", project_id
+            )

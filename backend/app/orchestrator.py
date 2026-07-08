@@ -367,6 +367,7 @@ _last_sidecar_sweep: datetime = _utcnow()
 _last_bootstrap_recovery_sweep: datetime = _utcnow()
 _last_lane_baseline_backfill: datetime = _utcnow()
 _last_merge_credit_backfill: datetime = _utcnow()
+_last_v22_finding_backfill: datetime = _utcnow()
 _last_runner_deactivation_sweep: datetime = _utcnow()
 _last_runner_degraded_sweep: datetime = _utcnow()
 _last_runner_escalation_sweep: datetime = _utcnow()
@@ -929,6 +930,7 @@ async def orchestrator_worker():
         _last_bootstrap_recovery_sweep, \
         _last_lane_baseline_backfill, \
         _last_merge_credit_backfill, \
+        _last_v22_finding_backfill, \
         _last_runner_deactivation_sweep, \
         _last_runner_degraded_sweep, \
         _last_runner_escalation_sweep, \
@@ -3939,6 +3941,27 @@ async def orchestrator_worker():
                 except Exception:
                     logger.exception(
                         "[ORCHESTRATOR] Merge-credit backfill sweep error"
+                    )
+            # v22 carried finding backfill — every 600s. Upserts "resolved"
+            # AuditFindingResolution rows for the 13 v22 low-severity carried
+            # audit findings (fixed in d2cf1ebb8 / PR #13245) and attaches
+            # a CriterionEvidence row to c-1a3ec09d. Idempotent no-op once
+            # all findings are resolved.
+            if _is_cadence_due(_last_v22_finding_backfill, 600):
+                _last_v22_finding_backfill = _utcnow()
+                try:
+                    from app.release_readiness import (  # noqa: PLC0415
+                        _sweep_v22_finding_backfill,
+                    )
+
+                    await _bounded_leader_step(
+                        "v22_finding_backfill",
+                        _sweep_v22_finding_backfill(),
+                        budget=90,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] v22 finding backfill sweep error"
                     )
             # Stale-runner deactivation — every 300s. Marks registered fleet
             # runners that missed the heartbeat window as inactive so they drop

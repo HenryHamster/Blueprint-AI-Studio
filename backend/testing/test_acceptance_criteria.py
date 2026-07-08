@@ -4426,6 +4426,375 @@ async def test_acceptance_window_recompute_is_idempotent(db_session):
 
 
 # ---------------------------------------------------------------------------
+# v22 carried-finding backfill
+# ---------------------------------------------------------------------------
+
+
+def _make_v22_low_severity_findings(count: int = 13) -> list[dict]:
+    """Return ``count`` synthetic low-severity carried audit findings."""
+    return [
+        {
+            "key": f"deadbeef{i:08x}"[:16],
+            "severity": "low",
+            "summary": f"Low-severity finding #{i}: unused variable in module",
+            "file": f"app/module_{i}.py",
+        }
+        for i in range(count)
+    ]
+
+
+async def _make_release_version(
+    db_session, project: Project, version_number: int, *, status: str = "open"
+) -> ReleaseVersion:
+    """Create a ReleaseVersion with an explicit number/status for backfill tests."""
+    version = ReleaseVersion(
+        project_id=project.id, version_number=version_number, status=status
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return version
+
+
+async def _seed_v22_verdict(db_session, project, version, findings, sha="a" * 40):
+    """Attach a QualificationVerdict carrying ``findings`` to ``version``."""
+    from app.models import QualificationVerdict
+
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=sha,
+        confidence=0.5,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        audit_findings=findings,
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    return verdict
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_carried_findings_writes_resolution_rows(db_session):
+    """backfill_v22_carried_findings_resolved writes one resolved row per finding.
+
+    Verifies that all 13 synthetic v22 carried low-severity findings receive
+    an AuditFindingResolution row with state='resolved' and resolving_ref
+    pointing at commit d2cf1ebb8.
+    """
+    from app.models import AuditFindingResolution
+    from app.release_readiness import (
+        backfill_v22_carried_findings_resolved,
+        _V22_BACKFILL_RESOLVING_REF,
+    )
+
+    project = await _make_project(db_session, "V22FindingBackfill")
+    # v22 has already promoted — create it closed, not as the open version.
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+    # Inject a QualificationVerdict carrying the 13 low-severity findings so
+    # _latest_carried_audit_findings prefers the immutable verdict row.
+    findings = _make_v22_low_severity_findings(13)
+    await _seed_v22_verdict(db_session, project, version, findings, sha="a" * 40)
+
+    count = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+
+    assert count == 13, f"expected 13 resolution rows; got {count}"
+
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 13, f"expected 13 AuditFindingResolution rows; got {len(rows)}"
+    for row in rows:
+        assert row.state == "resolved", f"row {row.finding_key} state={row.state!r}"
+        assert row.resolving_ref == _V22_BACKFILL_RESOLVING_REF, (
+            f"expected resolving_ref={_V22_BACKFILL_RESOLVING_REF!r}; "
+            f"got {row.resolving_ref!r}"
+        )
+        assert row.severity == "low"
+        assert row.project_id == project.id
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_attaches_criterion_evidence(db_session):
+    """backfill_v22_carried_findings_resolved records CriterionEvidence for c-1a3ec09d.
+
+    When the data-integrity criterion c-1a3ec09d exists on the open version,
+    the backfill must attach one CriterionEvidence row with source_kind
+    'audit_finding_backfill' so coverage is satisfied.
+    """
+    from app.release_readiness import (
+        backfill_v22_carried_findings_resolved,
+        _V22_DATA_INTEGRITY_CRITERION_KEY,
+        _V22_BACKFILL_RESOLVING_REF,
+    )
+
+    project = await _make_project(db_session, "V22EvidenceAttach")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    # Seed a criterion with the exact key the backfill targets.
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_DATA_INTEGRITY_CRITERION_KEY,
+        text="Data integrity: carried audit findings resolved",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    findings = _make_v22_low_severity_findings(13)
+    await _seed_v22_verdict(db_session, project, version, findings, sha="b" * 40)
+
+    count = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+    assert count == 13
+
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 1, (
+        f"expected 1 CriterionEvidence row; got {len(evidence_rows)}"
+    )
+    ev = evidence_rows[0]
+    assert ev.source_kind == "audit_finding_backfill"
+    assert ev.source_id == _V22_BACKFILL_RESOLVING_REF
+    assert ev.detail is not None
+    assert ev.detail["finding_count"] == 13
+
+    # Coverage must now be 'covered' since evidence exists.
+    coverage = ac.compute_criterion_coverage(evidence_rows)
+    assert coverage == "covered", f"expected 'covered'; got {coverage!r}"
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_is_idempotent(db_session):
+    """backfill_v22_carried_findings_resolved is idempotent: re-run is a no-op."""
+    from app.models import AuditFindingResolution
+    from app.release_readiness import (
+        backfill_v22_carried_findings_resolved,
+        _V22_DATA_INTEGRITY_CRITERION_KEY,
+    )
+
+    project = await _make_project(db_session, "V22BackfillIdempotent")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=_V22_DATA_INTEGRITY_CRITERION_KEY,
+        text="Data integrity: carried audit findings resolved",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    findings = _make_v22_low_severity_findings(13)
+    await _seed_v22_verdict(db_session, project, version, findings, sha="c" * 40)
+
+    first = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+    second = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+
+    assert first == 13
+    assert second == 13, "count still 13 (upserts); no duplicate rows created"
+
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 13, (
+        f"upsert must not create duplicate rows; got {len(rows)} rows"
+    )
+
+    # Idempotent evidence: re-run must NOT append a duplicate CriterionEvidence row.
+    evidence_rows = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_rows) == 1, (
+        f"expected exactly 1 evidence row after re-run; got {len(evidence_rows)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_noop_on_non_v22_version(db_session):
+    """Guard 1: the backfill is a no-op for any version that is not v22.
+
+    A later open version (v23) carrying findings must NOT receive fabricated
+    'resolved' rows — v22 has already promoted and only its findings were fixed
+    in d2cf1ebb8.
+    """
+    from app.models import AuditFindingResolution
+    from app.release_readiness import backfill_v22_carried_findings_resolved
+
+    project = await _make_project(db_session, "V23NoBackfill")
+    v23 = await _make_release_version(db_session, project, 23, status="open")
+    await _seed_v22_verdict(
+        db_session, project, v23, _make_v22_low_severity_findings(13), sha="d" * 40
+    )
+
+    count = await backfill_v22_carried_findings_resolved(db_session, project.id, v23)
+
+    assert count == 0, "backfill must be a no-op on a non-v22 version"
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == v23.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == [], "no resolution rows may be written for v23"
+
+
+@pytest.mark.asyncio
+async def test_backfill_v22_skips_gating_severity_findings(db_session):
+    """Guard 2: high/medium/critical carried findings are never resolved.
+
+    Only the low-severity findings fixed in d2cf1ebb8 get ledger rows; gating
+    findings must stay unresolved so they remain visible to the requalification
+    gate.
+    """
+    from app.models import AuditFindingResolution
+    from app.release_readiness import backfill_v22_carried_findings_resolved
+
+    project = await _make_project(db_session, "V22MixedSeverity")
+    version = await _make_release_version(db_session, project, 22, status="promoted")
+
+    low = _make_v22_low_severity_findings(13)
+    gating = [
+        {"key": "high000000000001", "severity": "high", "summary": "gating high"},
+        {"key": "med0000000000001", "severity": "medium", "summary": "gating medium"},
+        {"key": "crit000000000001", "severity": "critical", "summary": "gating crit"},
+    ]
+    await _seed_v22_verdict(db_session, project, version, low + gating, sha="e" * 40)
+
+    count = await backfill_v22_carried_findings_resolved(
+        db_session, project.id, version
+    )
+
+    assert count == 13, f"only the 13 low findings should resolve; got {count}"
+    rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 13, f"expected 13 rows (low only); got {len(rows)}"
+    resolved_keys = {r.finding_key for r in rows}
+    for g in gating:
+        assert g["key"] not in resolved_keys, (
+            f"gating finding {g['key']} must NOT be resolved by the backfill"
+        )
+    assert all(r.severity == "low" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_sweep_v22_finding_backfill_selects_v22_not_open_version(db_session):
+    """The real sweep selects v22 by version_number, not the current open version.
+
+    Exercises ``_find_v22_version`` + ``_sweep_v22_finding_backfill`` end-to-end:
+    a project has a promoted v22 (carrying the findings + the criterion) and a
+    later open v23.  The sweep must resolve v22's findings and cover c-1a3ec09d,
+    while leaving v23 completely untouched.
+    """
+    from app import services
+    from app.models import AuditFindingResolution
+    from app.release_readiness import (
+        _sweep_v22_finding_backfill,
+        _find_v22_version,
+        _V22_DATA_INTEGRITY_CRITERION_KEY,
+    )
+
+    project = await _make_project(db_session, "V22SweepSelection")
+    v22 = await _make_release_version(db_session, project, 22, status="promoted")
+    v23 = await _make_release_version(db_session, project, 23, status="open")
+
+    # v22 carries the findings and the data-integrity criterion.
+    await _seed_v22_verdict(
+        db_session, project, v22, _make_v22_low_severity_findings(13), sha="f" * 40
+    )
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=v22.id,
+        criterion_key=_V22_DATA_INTEGRITY_CRITERION_KEY,
+        text="Data integrity: carried audit findings resolved",
+        created_by="operator",
+        status="active",
+    )
+    db_session.add(criterion)
+    # v23 also carries findings — these must remain untouched.
+    await _seed_v22_verdict(
+        db_session, project, v23, _make_v22_low_severity_findings(13), sha="0" * 40
+    )
+    await db_session.commit()
+
+    # _find_v22_version must pick v22, not the open v23.
+    picked = await _find_v22_version(db_session, project.id)
+    assert picked is not None and picked.version_number == 22
+
+    # Run the real sweep (it opens its own sessions via AsyncSessionLocal).
+    await _sweep_v22_finding_backfill()
+
+    async with services.AsyncSessionLocal() as s:
+        v22_rows = list(
+            (
+                await s.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == v22.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        v23_rows = list(
+            (
+                await s.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == v23.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        evidence_rows = await ac.get_evidence_for_criterion(s, criterion.id)
+
+    assert len(v22_rows) == 13, f"sweep must resolve 13 v22 findings; got {len(v22_rows)}"
+    assert v23_rows == [], "sweep must not touch v23 findings"
+    assert len(evidence_rows) == 1, "sweep must attach one covering evidence to c-1a3ec09d"
+    assert ac.compute_criterion_coverage(evidence_rows) == "covered"
+
+
+# ---------------------------------------------------------------------------
 # record_metrics_integrity_coverage_evidence
 # ---------------------------------------------------------------------------
 

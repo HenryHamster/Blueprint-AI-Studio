@@ -195,6 +195,11 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         return True
     if e.source_kind == "task_merge":
         return isinstance(e.detail, dict) and e.detail.get("proven") is True
+    if e.source_kind == "audit_finding_backfill":
+        # Evidence that all carried audit findings for a version were resolved
+        # (backfill citing the resolving commit). Treated as covering so the
+        # criterion is satisfied once the backfill writes the evidence row.
+        return True
     return False
 
 
