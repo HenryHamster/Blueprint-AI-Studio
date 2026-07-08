@@ -207,7 +207,7 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance } from './standard.js';
 import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner } from '../index.js';
-import { resetLlmTelemetry, getLlmTelemetry } from '../telemetry.js';
+import { resetLlmTelemetry, getLlmTelemetry, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
@@ -4888,5 +4888,42 @@ describe('prompt size telemetry', () => {
       expect(s.bytes).toBeGreaterThan(0);
       expect(typeof s.name).toBe('string');
     }
+  });
+
+  it('buildPromptSizeTelemetry sorts sections descending and caps at 3', () => {
+    const prompt = 'section-a-content\nsection-b-longer-content\nsection-c-even-longer-stuff-here\nsection-d-short';
+    const sections: Array<[string, string]> = [
+      ['d', 'short'],
+      ['a', 'content'],
+      ['b', 'longer-content'],
+      ['c', 'even-longer-stuff-here'],
+    ];
+    const result = buildPromptSizeTelemetry(prompt, sections);
+    expect(result.prompt_size_bytes).toBe(Buffer.byteLength(prompt, 'utf8'));
+    expect(result.prompt_section_count).toBe(4);
+    expect(result.prompt_section_sizes).toHaveLength(3);
+    // Sorted descending: c (largest), b, a
+    expect(result.prompt_section_sizes[0].name).toBe('c');
+    expect(result.prompt_section_sizes[1].name).toBe('b');
+    expect(result.prompt_section_sizes[2].name).toBe('a');
+    expect(result.prompt_section_sizes[0].bytes).toBeGreaterThanOrEqual(result.prompt_section_sizes[1].bytes);
+    expect(result.prompt_section_sizes[1].bytes).toBeGreaterThanOrEqual(result.prompt_section_sizes[2].bytes);
+  });
+
+  it('setPromptSizeTelemetry persists sections into getLlmTelemetry', () => {
+    resetLlmTelemetry();
+    setPromptSizeTelemetry(500, 3, [
+      { name: 'core', bytes: 200 },
+      { name: 'claude_md', bytes: 150 },
+      { name: 'guidance', bytes: 100 },
+    ]);
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.prompt_size_bytes).toBe(500);
+    expect(telemetry.prompt_section_count).toBe(3);
+    expect(telemetry.prompt_section_sizes).toEqual([
+      { name: 'core', bytes: 200 },
+      { name: 'claude_md', bytes: 150 },
+      { name: 'guidance', bytes: 100 },
+    ]);
   });
 });

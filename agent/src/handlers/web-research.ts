@@ -23,6 +23,7 @@ import {
   persistAndPostStatus, runClaudeCode,
   sendHeartbeatSync, setCurrentPromptFingerprint,
 } from '../index.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import {
   configureAgentPermissions, computePromptFingerprint,
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
@@ -269,19 +270,13 @@ export async function handleWebResearch(
   }
   const priorKnowledgeSection = buildPriorKnowledgeSection(priorDocs);
 
-  const webResearchPrompt = `${claudeMdPrefix}${webResearchPlaybookSection}${retryContext}${contextPrefix}You are a web-research agent. Your job is to investigate the topic below WEB-FIRST — drive WebSearch and WebFetch to gather current, authoritative information — and produce a single structured knowledge DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
-
-${topicLine}Investigation prompt:
-${prompt}
-
-${priorKnowledgeSection}
-# HOW TO RESEARCH
+  const howToResearchGuide = `# HOW TO RESEARCH
 1. Use WebSearch to find authoritative, current sources on the topic — run multiple searches in parallel to cover different facets. Use WebFetch to read the most relevant pages in depth.
 2. Cross-check claims across multiple sources. Prefer primary/official documentation over secondary commentary.
 3. Track the actual URLs you used — every substantive claim in your document must be backed by a citation.
-4. Synthesize what you learned into a clear, well-structured markdown document. Be specific and concrete; avoid filler.
+4. Synthesize what you learned into a clear, well-structured markdown document. Be specific and concrete; avoid filler.`;
 
-# OUTPUT — single knowledge document
+  const outputSchemaBlock = `# OUTPUT — single knowledge document
 Write your document as a JSON object to ${documentPath} (use Bash to write the file — the Write tool is disabled for this read-only task). The file must contain ONLY the JSON object, no markdown wrapping. Schema:
 
 {
@@ -299,11 +294,34 @@ Rules:
 - tags and topic are optional but recommended; tags is a list of short strings.
 - Also emit the same JSON object as the VERY LAST thing in your response (in addition to writing the file), so it can be recovered if the file write fails.
 
-ALSO write ${progressPath} — a concise markdown summary (under ~3000 chars) of your investigation: which searches you ran, which sources you read, key findings, and any gaps. This is surfaced to retry agents if this task fails, so they can resume instead of re-investigating.${promptSuffix}
+ALSO write ${progressPath} — a concise markdown summary (under ~3000 chars) of your investigation: which searches you ran, which sources you read, key findings, and any gaps. This is surfaced to retry agents if this task fails, so they can resume instead of re-investigating.`;
+
+  const webResearchPrompt = `${claudeMdPrefix}${webResearchPlaybookSection}${retryContext}${contextPrefix}You are a web-research agent. Your job is to investigate the topic below WEB-FIRST — drive WebSearch and WebFetch to gather current, authoritative information — and produce a single structured knowledge DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.
+
+${topicLine}Investigation prompt:
+${prompt}
+
+${priorKnowledgeSection}
+${howToResearchGuide}
+
+${outputSchemaBlock}${promptSuffix}
 
 ${PLAYBOOK_GUIDANCE}
 
 ${DEFAULT_TOOL_GUIDANCE}`;
+
+  const webResearchTelemetry = buildPromptSizeTelemetry(webResearchPrompt, [
+    ['claude_md', claudeMdPrefix],
+    ['playbook', webResearchPlaybookSection],
+    ['retry_context', retryContext],
+    ['context_prefix', contextPrefix],
+    ['core_body', `You are a web-research agent. Your job is to investigate the topic below WEB-FIRST — drive WebSearch and WebFetch to gather current, authoritative information — and produce a single structured knowledge DOCUMENT. You operate strictly read-only: you do NOT edit files, you do NOT open a pull request, and you do NOT spawn any follow-up work.\n\n${topicLine}Investigation prompt:\n${prompt}\n\n${priorKnowledgeSection}`],
+    ['how_to_research', howToResearchGuide],
+    ['output_schema', outputSchemaBlock],
+    ['prompt_suffix', promptSuffix],
+    ['guidance', `\n\n${PLAYBOOK_GUIDANCE}\n\n${DEFAULT_TOOL_GUIDANCE}`],
+  ]);
+  setPromptSizeTelemetry(webResearchTelemetry.prompt_size_bytes, webResearchTelemetry.prompt_section_count, webResearchTelemetry.prompt_section_sizes);
 
   statusRef.value = 'Running web research...';
   const fingerprint = computePromptFingerprint('web_research');
