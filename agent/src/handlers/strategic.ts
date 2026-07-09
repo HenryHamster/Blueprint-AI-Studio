@@ -1024,6 +1024,11 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 
 # Direction operations (link each create to a gap_id from the problem_model).
 # conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel.
+#   OMIT conflicts_with (or pass []) when no real overlap exists — directions without
+#   conflicts run concurrently, which is the default and preferred dispatch mode.
+#   "Overlap" means conflicting file rewrites, incompatible architecture shifts, or a
+#   shared resource that cannot be used concurrently — NOT "both are big" or "both touch
+#   the backend." When in doubt, omit: extra conflicts serialize work unnecessarily.
 # recommended_mode: audit|fundamentals|ship|pause — your judgment for this direction's system health.
 ./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"], "recommended_mode": "ship", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "implementation_constraints": "optional constraints for implementors", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "one-line justification why this is distinct in scope or mechanism"}}'
 # To create a NEW idea that belongs to the NEXT version, pass "staged": true on

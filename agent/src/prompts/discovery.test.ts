@@ -18,15 +18,17 @@ vi.mock('fs', () => ({
 
 import { execFileSync } from 'child_process';
 import fs from 'fs';
-import { countSourceFiles, detectGreenfield, isGreenfieldRepo, verifyCloneDelivered, buildRepoMap } from './discovery.js';
+import { countSourceFiles, detectGreenfield, isGreenfieldRepo, verifyCloneDelivered, buildRepoMap, clearTrackedFilesCache, clearRepoMapCache } from './discovery.js';
 import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
 
 const setLsFiles = (files: string[]) =>
-  vi.mocked(execFileSync).mockReturnValue(files.join('\n') as never);
+  vi.mocked(execFileSync).mockReturnValue(files.join('\n'));
 
 describe('countSourceFiles', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearTrackedFilesCache();
+    clearRepoMapCache();
   });
 
   it('counts real source files and ignores config / scaffolding', () => {
@@ -68,6 +70,8 @@ describe('countSourceFiles', () => {
 describe('detectGreenfield', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearTrackedFilesCache();
+    clearRepoMapCache();
   });
 
   it('returns true for a config-only tree (no real source)', () => {
@@ -98,6 +102,8 @@ describe('detectGreenfield', () => {
 describe('isGreenfieldRepo', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearTrackedFilesCache();
+    clearRepoMapCache();
   });
 
   it('is greenfield when the durable signal is true even if the live clone has source', () => {
@@ -144,6 +150,8 @@ describe('isGreenfieldRepo', () => {
 describe('verifyCloneDelivered', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearTrackedFilesCache();
+    clearRepoMapCache();
   });
 
   // Route the execFileSync mock by the git subcommand verifyCloneDelivered runs:
@@ -159,18 +167,18 @@ describe('verifyCloneDelivered', () => {
       const a = Array.isArray(args) ? (args as string[]) : [];
       if (a[0] === 'rev-parse' && a[1] === 'HEAD') {
         if (typeof opts.head === 'function') return opts.head();
-        return (opts.head ?? '') as never;
+        return (opts.head ?? '');
       }
       if (a[0] === 'rev-parse' && a[1] === '--verify') {
         if (typeof opts.originHead === 'function') return opts.originHead();
         if (opts.originHead === undefined) throw new Error('unknown revision');
-        return opts.originHead as never;
+        return opts.originHead;
       }
       if (a[0] === 'ls-files') {
         if (typeof opts.lsFiles === 'function') return opts.lsFiles();
-        return ((opts.lsFiles ?? []).join('\n')) as never;
+        return ((opts.lsFiles ?? []).join('\n'));
       }
-      return '' as never;
+      return '';
     });
   };
 
@@ -252,17 +260,19 @@ describe('verifyCloneDelivered', () => {
 describe('buildRepoMap', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearTrackedFilesCache();
+    clearRepoMapCache();
   });
 
   it('returns empty string on empty repo (no tracked files)', () => {
-    vi.mocked(execFileSync).mockReturnValue('' as never);
+    vi.mocked(execFileSync).mockReturnValue('');
     expect(buildRepoMap(null)).toBe('');
   });
 
   it('ranks most-imported module first', () => {
     // hub.ts is imported by two files; other.ts only by one
     vi.mocked(execFileSync).mockReturnValue(
-      ['src/hub.ts', 'src/other.ts', 'src/a.ts', 'src/b.ts'].join('\n') as never
+      ['src/hub.ts', 'src/other.ts', 'src/a.ts', 'src/b.ts'].join('\n')
     );
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
@@ -271,7 +281,7 @@ describe('buildRepoMap', () => {
       if (p.endsWith('a.ts')) return "import { hubFn } from './hub.js';\nimport { otherFn } from './other.js';";
       if (p.endsWith('b.ts')) return "import { hubFn2 } from './hub.js';";
       return '';
-    }) as never);
+    }));
 
     const result = buildRepoMap(null);
     expect(result).toContain('## Repo Map');
@@ -292,7 +302,7 @@ describe('buildRepoMap', () => {
         'packages/api/src/consumer-b.ts',
         'packages/web/src/config.ts',
         'packages/web/src/consumer.ts',
-      ].join('\n') as never
+      ].join('\n')
     );
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
@@ -302,7 +312,7 @@ describe('buildRepoMap', () => {
       if (p.endsWith('consumer-b.ts')) return "import { apiConfig } from './config.js';";
       if (p.endsWith('consumer.ts')) return "import { webConfig } from './config.js';";
       return '';
-    }) as never);
+    }));
 
     const result = buildRepoMap(null);
     expect(result).toContain('**packages/api/src/config.ts** (imported by 2)');
@@ -315,7 +325,7 @@ describe('buildRepoMap', () => {
   it('output is capped at 3000 chars', () => {
     // Generate many files each exporting a long-named symbol
     const files = Array.from({ length: 30 }, (_, i) => `src/mod${i}.ts`);
-    vi.mocked(execFileSync).mockReturnValue(files.join('\n') as never);
+    vi.mocked(execFileSync).mockReturnValue(files.join('\n'));
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
       const idx = files.findIndex(f => p.endsWith(f.replace('src/', '')));
@@ -328,7 +338,7 @@ describe('buildRepoMap', () => {
         return `${imports}\nexport function ${'veryLongExportedSymbolName'.repeat(5)}_${idx}() {}`;
       }
       return '';
-    }) as never);
+    }));
 
     const result = buildRepoMap(null);
     expect(result.length).toBeLessThanOrEqual(3000);
@@ -336,7 +346,7 @@ describe('buildRepoMap', () => {
 
   it('handles a mixed Python+TypeScript repo', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      ['backend/app/models.py', 'agent/src/prompt.ts', 'agent/src/index.ts'].join('\n') as never
+      ['backend/app/models.py', 'agent/src/prompt.ts', 'agent/src/index.ts'].join('\n')
     );
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
@@ -347,7 +357,7 @@ describe('buildRepoMap', () => {
         return "from models import Task\nimport { buildPrompt } from './prompt.js';\n";
       }
       return '';
-    }) as never);
+    }));
 
     const result = buildRepoMap(null);
     // Should include at least one of the imported modules
@@ -366,7 +376,7 @@ describe('buildRepoMap', () => {
     // agent/src/a.ts imports from './index.js' (relative → resolves to agent/src/index.ts).
     // admin-ui/src/index.ts must NOT receive any in-degree from that import.
     vi.mocked(execFileSync).mockReturnValue(
-      ['admin-ui/src/index.ts', 'agent/src/index.ts', 'agent/src/a.ts'].join('\n') as never
+      ['admin-ui/src/index.ts', 'agent/src/index.ts', 'agent/src/a.ts'].join('\n')
     );
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
@@ -374,7 +384,7 @@ describe('buildRepoMap', () => {
       if (p.endsWith('agent/src/index.ts')) return "export function agentFn() {}";
       if (p.endsWith('agent/src/a.ts')) return "import { agentFn } from './index.js';";
       return '';
-    }) as never);
+    }));
 
     const result = buildRepoMap(null);
     // agent/src/index.ts is the hub (1 relative importer), should appear
@@ -384,7 +394,7 @@ describe('buildRepoMap', () => {
   });
 
   it('is fail-soft when file reads throw', () => {
-    vi.mocked(execFileSync).mockReturnValue('src/a.ts\nsrc/b.ts' as never);
+    vi.mocked(execFileSync).mockReturnValue('src/a.ts\nsrc/b.ts');
     vi.mocked(fs.readFileSync).mockImplementation(() => {
       throw new Error('ENOENT');
     });
@@ -396,7 +406,7 @@ describe('buildRepoMap', () => {
     // dep.ts has low in-degree BUT is directly imported by the relatedFile task.ts.
     // With opts.relatedFiles=[task.ts], dep.ts should appear before hub.ts in the map.
     vi.mocked(execFileSync).mockReturnValue(
-      ['src/hub.ts', 'src/dep.ts', 'src/task.ts', 'src/a.ts', 'src/b.ts', 'src/c.ts'].join('\n') as never
+      ['src/hub.ts', 'src/dep.ts', 'src/task.ts', 'src/a.ts', 'src/b.ts', 'src/c.ts'].join('\n')
     );
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
@@ -408,7 +418,7 @@ describe('buildRepoMap', () => {
       if (p.endsWith('b.ts')) return "import { hubFn } from './hub.js';";
       if (p.endsWith('c.ts')) return "import { hubFn } from './hub.js';";
       return '';
-    }) as never);
+    }));
 
     // Without opts: hub appears first (higher in-degree)
     const resultGlobal = buildRepoMap(null);
@@ -428,7 +438,7 @@ describe('buildRepoMap', () => {
     // consumer.ts imports from service.ts (a relatedFile) and exports a function.
     // With opts.relatedFiles=[service.ts], consumer.ts should be boosted before hub.ts.
     vi.mocked(execFileSync).mockReturnValue(
-      ['src/service.ts', 'src/consumer.ts', 'src/hub.ts', 'src/a.ts', 'src/b.ts', 'src/c.ts'].join('\n') as never
+      ['src/service.ts', 'src/consumer.ts', 'src/hub.ts', 'src/a.ts', 'src/b.ts', 'src/c.ts'].join('\n')
     );
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
@@ -440,7 +450,7 @@ describe('buildRepoMap', () => {
       if (p.endsWith('b.ts')) return "import { hubFn } from './hub.js';";
       if (p.endsWith('c.ts')) return "import { hubFn } from './hub.js';";
       return '';
-    }) as never);
+    }));
 
     const result = buildRepoMap(null, { relatedFiles: ['src/service.ts'] });
     expect(result).toContain('consumer.ts');
@@ -452,7 +462,7 @@ describe('buildRepoMap', () => {
     // models.ts basename matches keyword "models" in the prompt.
     // hub.ts has higher in-degree but no keyword match.
     vi.mocked(execFileSync).mockReturnValue(
-      ['src/models.ts', 'src/hub.ts', 'src/a.ts', 'src/b.ts'].join('\n') as never
+      ['src/models.ts', 'src/hub.ts', 'src/a.ts', 'src/b.ts'].join('\n')
     );
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
@@ -461,7 +471,7 @@ describe('buildRepoMap', () => {
       if (p.endsWith('a.ts')) return "import { hubFn } from './hub.js';";
       if (p.endsWith('b.ts')) return "import { hubFn } from './hub.js';";
       return '';
-    }) as never);
+    }));
 
     // hub has in-degree 2, models has in-degree 0 — without prompt, hub wins
     const noPrompt = buildRepoMap(null);
@@ -477,7 +487,7 @@ describe('buildRepoMap', () => {
 
   it('falls back to global in-degree ranking when no opts provided', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      ['src/hub.ts', 'src/other.ts', 'src/a.ts'].join('\n') as never
+      ['src/hub.ts', 'src/other.ts', 'src/a.ts'].join('\n')
     );
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
@@ -485,7 +495,7 @@ describe('buildRepoMap', () => {
       if (p.endsWith('other.ts')) return "export function otherFn() {}";
       if (p.endsWith('a.ts')) return "import { hubFn } from './hub.js';";
       return '';
-    }) as never);
+    }));
 
     // No opts → same as passing undefined
     const result = buildRepoMap(null);
@@ -493,13 +503,13 @@ describe('buildRepoMap', () => {
   });
 
   it('remains fail-soft when relatedFiles paths are not in the tracked file set', () => {
-    vi.mocked(execFileSync).mockReturnValue('src/hub.ts\nsrc/a.ts' as never);
+    vi.mocked(execFileSync).mockReturnValue('src/hub.ts\nsrc/a.ts');
     vi.mocked(fs.readFileSync).mockImplementation(((path: unknown) => {
       const p = path as string;
       if (p.endsWith('hub.ts')) return "export function hubFn() {}";
       if (p.endsWith('a.ts')) return "import { hubFn } from './hub.js';";
       return '';
-    }) as never);
+    }));
 
     // Untracked file in relatedFiles — should not crash, just skip
     const result = buildRepoMap(null, { relatedFiles: ['src/nonexistent.ts'] });

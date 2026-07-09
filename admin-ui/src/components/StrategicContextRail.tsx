@@ -781,7 +781,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   const pendingSteer = state?.strategic.refresh.pending ?? null;
   const latestCycle = state?.strategic.latest_cycle ?? null;
   const attention = state?.attention ?? null;
-  const attentionItems = attention?.items.slice(0, 2) ?? [];
+  const attentionItems = useMemo(() => attention?.items.slice(0, 2) ?? [], [attention?.items]);
   const staleCycle = Boolean(activeCycle?.stale);
   const shaFreshness = state?.sha_freshness ?? null;
   const operatorSteerQueued = Boolean(

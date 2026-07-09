@@ -1089,18 +1089,24 @@ async def delete_project_admin(
         # Fetch all affected task IDs before the bulk UPDATE so we can fire
         # terminal callbacks after commit — the bulk UPDATE bypasses the ORM
         # event listener that normally populates the JWT deny-list.
+        # Bounded to 1000; the bulk UPDATE below covers ALL rows regardless.
         all_cancelled_ids = (
             (
                 await session.execute(
                     select(Task.id).where(
                         Task.project_id == project_id,
                         Task.status.in_(ACTIVE_STATUSES),
-                    )
+                    ).limit(1000)
                 )
             )
             .scalars()
             .all()
         )
+        if len(all_cancelled_ids) >= 1000:
+            logger.warning(
+                "delete_project_admin: all_cancelled_ids reached limit 1000 for project %s — NOTIFY fanout truncated",
+                project_id,
+            )
 
         result = await session.execute(
             update(Task)
@@ -1606,15 +1612,22 @@ async def get_autonomous_status(
     )
 
     user_pids = (
-        await session.execute(_user_project_ids(current_user["user_id"]))
+        await session.execute(
+            _user_project_ids(current_user["user_id"]).limit(500)
+        )
     ).scalars().all()
+    if len(user_pids) >= 500:
+        logger.warning(
+            "get_autonomous_status: user %s has >=500 project memberships — results truncated",
+            current_user["user_id"],
+        )
     projects = (
         (
             await session.execute(
                 select(Project)
                 .where(Project.id.in_(user_pids))
                 .order_by(Project.created_at.desc())
-                .limit(200)
+                .limit(500)
                 .options(
                     load_only(
                         Project.id,
@@ -1629,6 +1642,11 @@ async def get_autonomous_status(
         .scalars()
         .all()
     )
+    if len(projects) >= 500:
+        logger.warning(
+            "get_autonomous_status: project list truncated at 500 for user %s",
+            current_user["user_id"],
+        )
 
     one_hour_ago = _utcnow() - timedelta(hours=1)
     budget_snapshot = None
@@ -1668,9 +1686,14 @@ async def get_autonomous_status(
                     Task.project_id.in_(user_pids),
                     Task.created_by == "ORCHESTRATOR",
                     Task.created_at >= one_hour_ago,
-                )
+                ).limit(200)
             )
         ).all()
+        if len(recent_autonomous_rows) >= 200:
+            logger.warning(
+                "get_autonomous_status: recent autonomous rows truncated at 200 for user %s",
+                current_user["user_id"],
+            )
         for row in recent_autonomous_rows:
             stats = project_stats.get(row.project_id)
             if stats is None:
@@ -1712,8 +1735,14 @@ async def get_autonomous_status(
                     initiative_type_expr.in_(["research", "create"]),
                 )
                 .group_by(Task.project_id)
+                .limit(200)
             )
         ).all()
+        if len(last_research_rows) >= 200:
+            logger.warning(
+                "get_autonomous_status: last_research_rows truncated at 200 for user %s",
+                current_user["user_id"],
+            )
         last_research_map = {
             row.project_id: row.max_created_at for row in last_research_rows
         }

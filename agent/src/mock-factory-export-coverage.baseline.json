@@ -1,13 +1,4 @@
 {
-  "_readme": [
-    "Grandfathering baseline for src/mock-factory-export-coverage.test.ts.",
-    "Maps relTestFile -> vi.mock spec -> real exports the factory currently omits.",
-    "Lets existing intentionally-partial full-replacement mocks stay green while a",
-    "NEWLY-added real export (or an export dropped from a factory) fails the guard.",
-    "Regenerate after intentionally changing a mock:",
-    "  DUMP_MOCK_COVERAGE_BASELINE=1 npx vitest run src/mock-factory-export-coverage.test.ts",
-    "then replace this file with the printed object (keep this _readme key)."
-  ],
   "handlers/artifact-consume.test.ts": {
     "../index.js": [
       "AUTH_MODE",
