@@ -3975,7 +3975,7 @@ def reconcile_review_second_opinion(
         primary_sigs = {_review_issue_signature(i) for i in (primary_issues or [])}
         challenge_sigs = {_review_issue_signature(i) for i in challenge_issues}
         reconciled_verdict = "REQUEST_CHANGES"
-        if primary_sigs and primary_sigs == challenge_sigs:
+        if primary_sigs == challenge_sigs:
             state = "challenged_confirmed"
             surviving = list(primary_issues or [])
         else:

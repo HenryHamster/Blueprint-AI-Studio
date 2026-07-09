@@ -3831,6 +3831,23 @@ def test_reconcile_revised_falls_back_to_challenge_issues_when_no_overlap():
     assert rec["surviving_issues"] == chal_issues
 
 
+def test_reconcile_confirmed_request_changes_no_issues():
+    """Both REQUEST_CHANGES with empty issue lists (prose-only verdict) → challenged_confirmed.
+
+    Regression: the condition ``if primary_sigs and primary_sigs == challenge_sigs``
+    used a truthiness guard on the first set, which is False for empty sets even
+    when both sides agree (both empty, trivially equal). Fixed by removing the
+    redundant ``primary_sigs and``.
+    """
+    panel = _parse_panel_review_output(
+        json.dumps(_panel_verdict("REQUEST_CHANGES"))
+    )
+    rec = reconcile_review_second_opinion("REQUEST_CHANGES", [], panel)
+    assert rec["state"] == "challenged_confirmed"
+    assert rec["reconciled_verdict"] == "REQUEST_CHANGES"
+    assert rec["surviving_issues"] == []
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Panel-review verdict parser tolerance tests (regression for #10096 incident)
 # ══════════════════════════════════════════════════════════════════════════════
