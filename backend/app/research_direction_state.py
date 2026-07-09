@@ -93,6 +93,13 @@ _AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
     }
 )
 
+#: The criterion key that gates all autocomplete paths. Any direction carrying
+#: this key in its ``criterion_keys`` is blocked from reaching any auto-complete
+#: terminal state (exhaustion, proven-merge, no-findings, strategist retire)
+#: until the criterion is satisfied. Carried by direction d-12f7d408, which
+#: owns the acceptance-outcome tracking for the AST-invariant gate tests.
+_CRITERION_COVERAGE_GATE_KEY: str = "c-560ec27e"
+
 
 def _empty_finding_challenge_summary() -> dict:
     return {

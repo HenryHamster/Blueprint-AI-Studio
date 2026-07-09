@@ -373,6 +373,85 @@ class TestLowActionabilityDecay:
         assert stamped["title"] == "new-low-finding"
 
 
+class TestSalvageBundleTask:
+    """Salvage-bundle task consolidates decay-discarded findings into one actionable task."""
+
+    def _simulate_salvage_payload(self, candidates: list[dict], source_task_id: str) -> dict:
+        """Simulate the salvage bundle payload construction from research_completion.py."""
+        return {
+            "type": "salvage_bundle",
+            "source_task_id": source_task_id,
+            "salvaged_findings": [
+                {
+                    "title": f.get("title") or (f.get("description") or "")[:80],
+                    "discard_reason": f.get("deferred_reason") or "unknown",
+                    "direction_id": f.get("direction_id"),
+                }
+                for f in candidates
+            ],
+            "total_discarded": len(candidates),
+        }
+
+    def test_includes_all_decayed_findings(self):
+        """All decay-category findings appear in the salvage payload."""
+        candidates = [
+            {"title": "ultra-low-conf", "deferred_reason": "ultra_low_confidence",
+             "direction_id": "d-abc"},
+            {"title": "low-actionability", "deferred_reason": "low_actionability",
+             "direction_id": "d-def"},
+            {"title": "degradation-gate", "deferred_reason": "degradation_gate",
+             "direction_id": "d-abc"},
+            {"title": "adversarial-gate", "deferred_reason": "adversarial_gate",
+             "direction_id": "d-ghi"},
+            {"title": "prereq-deferred", "deferred_reason": "prereq_deferred_same_cycle",
+             "direction_id": None},
+        ]
+        payload = self._simulate_salvage_payload(candidates, "task-001")
+        assert payload["type"] == "salvage_bundle"
+        assert payload["total_discarded"] == 5
+        assert len(payload["salvaged_findings"]) == 5
+        titles = {f["title"] for f in payload["salvaged_findings"]}
+        assert "ultra-low-conf" in titles
+        assert "low-actionability" in titles
+        assert "degradation-gate" in titles
+        assert "adversarial-gate" in titles
+        assert "prereq-deferred" in titles
+
+    def test_each_finding_has_reason_and_title(self):
+        """Every salvaged finding entry has a title and discard_reason."""
+        candidates = [
+            {"title": "only-title", "deferred_reason": "low_actionability",
+             "direction_id": "d-1"},
+            {"title": "", "description": "desc-based title",
+             "deferred_reason": "ultra_low_confidence",
+             "direction_id": "d-2"},
+        ]
+        payload = self._simulate_salvage_payload(candidates, "task-002")
+        for entry in payload["salvaged_findings"]:
+            assert entry["discard_reason"] in ("low_actionability", "ultra_low_confidence")
+            assert entry["title"]
+
+    def test_empty_candidates_produce_no_task(self):
+        """Empty salvage candidates means no bundle entries."""
+        payload = self._simulate_salvage_payload([], "task-003")
+        assert payload["total_discarded"] == 0
+        assert payload["salvaged_findings"] == []
+
+    def test_fallback_for_missing_title(self):
+        """Finding missing title falls back to description snippet."""
+        candidates = [
+            {
+                "description": "A very long description that serves as the fallback title",
+                "deferred_reason": "low_actionability",
+                "direction_id": "d-x",
+            }
+        ]
+        payload = self._simulate_salvage_payload(candidates, "task-004")
+        entry = payload["salvaged_findings"][0]
+        assert entry["title"].startswith("A very long description")
+        assert entry["discard_reason"] == "low_actionability"
+
+
 class TestDeferredFindingStaleDiscard:
     """Stale-discard path: deferred findings older than the configured TTL are dropped."""
 

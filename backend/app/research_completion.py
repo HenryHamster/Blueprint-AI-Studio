@@ -1927,6 +1927,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _finding_give_up: dict | None = None
     _low_actionability_decayed: list[dict] = []
     _low_actionability_refinement_deferred: list[dict] = []
+    _salvage_candidates: list[dict] = []
     if prior_deferred:
         # Filter out non-actionable types that would have been handled separately above
         prior_actionable = [
@@ -2080,6 +2081,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 f.get("deferred_reason") == "adversarial_gate" for f in _decayed
             ):
                 _finding_give_up["adversarial_gate_cause"] = _give_up_cause
+            _salvage_candidates.extend(_decayed)
         prior_actionable = _kept
         # Stale-targeting: a deferred finding carries the integration HEAD it was
         # generated against. On re-dispatch, ask whether any cited file changed
@@ -5169,6 +5171,50 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 len(_memo_enrollment_queue),
                 exc_info=True,
             )
+
+    # Spawn a consolidated salvage-bundle task if any findings were discarded
+    # via decay (ultra_low_confidence >=4, low_actionability >=3, degradation_gate >=3,
+    # adversarial_gate >=3, prereq_deferred >=3). This aggregates them into one
+    # actionable task rather than only individual memo tasks or silent drops.
+    if _salvage_candidates:
+        _salvage_payload = {
+            "type": "salvage_bundle",
+            "source_task_id": str(task.id),
+            "salvaged_findings": [
+                {
+                    "title": f.get("title") or (f.get("description") or "")[:80],
+                    "discard_reason": f.get("deferred_reason") or "unknown",
+                    "direction_id": f.get("direction_id"),
+                }
+                for f in _salvage_candidates
+            ],
+            "total_discarded": len(_salvage_candidates),
+        }
+        _salvage_task = Task(
+            project_id=task.project_id,
+            title=f"Salvage bundle: {len(_salvage_candidates)} decayed finding(s)",
+            description=(
+                f"Consolidated fix batch for {len(_salvage_candidates)} research finding(s) "
+                "discarded via repeated deferral decay."
+            ),
+            parent_task_id=task.id,
+            payloads=[_salvage_payload],
+            context={
+                "research_task_id": str(task.id),
+                "salvage_source_task_id": str(task.id),
+                "salvage_finding_count": len(_salvage_candidates),
+            },
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            depends_on=[],
+            priority=TASK_PRIORITY_MAP.get("medium", 50),
+        )
+        session.add(_salvage_task)
+        logger.info(
+            "[RESEARCH] Spawned consolidated salvage-bundle task for %d decayed finding(s) (task %s)",
+            len(_salvage_candidates),
+            task.id,
+        )
 
     _deferral_reasons: list[str] = []
     if _low_actionability_deferred:

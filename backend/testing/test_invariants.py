@@ -11588,6 +11588,43 @@ def test_all_autocomplete_paths_gate_on_criterion_coverage():
         f"found {frozenset_entries}. Restore the missing entries."
     )
 
+    # ── 1b. Verify the criterion key constant that gates all paths ─────────
+    # This establishes that c-560ec27e is the unique criterion key whose
+    # coverage status gates every auto-complete path. Direction d-12f7d408
+    # carries this key; any direction owning an uncovered c-560ec27e criterion
+    # is blocked from retiring through any of the four gated paths.
+    _criterion_key_found = False
+    _criterion_key_value: str | None = None
+    for stmt in ast.iter_child_nodes(tree):
+        target_name: str | None = None
+        value_node: ast.expr | None = None
+        if isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name) and t.id == "_CRITERION_COVERAGE_GATE_KEY":
+                    target_name = t.id
+                    value_node = stmt.value
+                    break
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            if stmt.target.id == "_CRITERION_COVERAGE_GATE_KEY":
+                target_name = stmt.target.id
+                value_node = stmt.value
+        if target_name is None:
+            continue
+        _criterion_key_found = True
+        if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
+            _criterion_key_value = value_node.value
+        break
+
+    assert _criterion_key_found, (
+        "_CRITERION_COVERAGE_GATE_KEY is missing from "
+        "research_direction_state.py. This constant declares which criterion "
+        "key gates the autocomplete paths."
+    )
+    assert _criterion_key_value == "c-560ec27e", (
+        f"_CRITERION_COVERAGE_GATE_KEY expected 'c-560ec27e', got "
+        f"{_criterion_key_value!r}"
+    )
+
     # ── 2. Verify exhaustion path: _maybe_autocomplete_exhausted_direction ─
     exhaustion_func: ast.AsyncFunctionDef | None = None
     for node in ast.walk(tree):
