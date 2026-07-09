@@ -68,6 +68,7 @@ from app.models import (
 )
 from app.resource_envelope import (
     get_project_recent_spend_usd,
+    resolve_project_pause_on_ceiling_exceeded,
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
     resolve_project_vm_cap,
@@ -765,6 +766,31 @@ async def _filter_project_resource_dispatch_eligible(
     for _pid, (_recent, _ceiling, _) in spend_cache.items():
         if _recent >= _ceiling:
             _current_ceiling_deferred.add(str(_pid))
+            # HARD-pause enforcement: when pause_on_ceiling_exceeded is
+            # configured AND the spend ceiling is breached, pause the
+            # project until an operator manually unpauses.  Guard on
+            # project.paused to avoid re-firing every cycle.
+            _project = project_cache.get(_pid)
+            if _project is not None and resolve_project_pause_on_ceiling_exceeded(_project):
+                if not _project.paused:
+                    _project.paused = True
+                    session.add(_project)
+                    logger.info(
+                        "[ORCHESTRATOR] Hard-pausing project %s — "
+                        "spend ceiling exceeded and pause_on_ceiling_exceeded is set",
+                        _pid,
+                    )
+                    try:
+                        await broadcast_to_project(
+                            str(_pid),
+                            "project_spend_ceiling_exceeded",
+                            {"project_id": str(_pid)},
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[ORCHESTRATOR] Failed to broadcast spend_ceiling_exceeded for %s",
+                            _pid,
+                        )
     _prev = _shared_state.project_ceiling_deferred_ids
     for _pid in _current_ceiling_deferred - _prev:
         try:
