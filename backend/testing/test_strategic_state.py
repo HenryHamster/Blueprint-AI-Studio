@@ -7666,3 +7666,185 @@ async def test_operator_attention_stale_debt_count_in_counts_block(
     stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
     assert len(stale_items) == 1
     assert stale_items[0]["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_includes_state_revision(
+    client: AsyncClient, db_session
+):
+    """state_revision appears in every response as a non-empty hex string."""
+    project = await _make_project(db_session)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    revision = data.get("state_revision")
+    assert revision is not None, "state_revision must be present in response"
+    assert isinstance(revision, str), "state_revision must be a string"
+    assert len(revision) == 16, "state_revision must be a 16-char hex digest"
+    assert all(c in "0123456789abcdef" for c in revision), (
+        "state_revision must be a hex string"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_matching_revision_skips_context_package(
+    client: AsyncClient, db_session, mocker
+):
+    """When the client sends a matching state_revision, the endpoint skips the
+    expensive context-evidence load + package build and returns context_package=None."""
+    project = await _make_project(db_session)
+
+    # First call to get the current revision token
+    resp1 = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp1.status_code == 200
+    revision = resp1.json().get("state_revision")
+    assert revision is not None
+
+    # Mock the expensive steps to confirm they are NOT called on a matching revision
+    evidence_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.load_strategic_context_evidence",
+        new_callable=AsyncMock,
+    )
+    build_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.build_strategic_context_package_summary",
+    )
+
+    # Second call WITH matching revision token
+    resp2 = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-state?state_revision={revision}"
+    )
+    assert resp2.status_code == 200
+    data = resp2.json()
+
+    # The expensive functions must NOT have been called
+    evidence_spy.assert_not_called()
+    build_spy.assert_not_called()
+
+    # context_package is None when skipped
+    assert data.get("context_package") is None
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_non_matching_revision_triggers_full_build(
+    client: AsyncClient, db_session, mocker
+):
+    """When the client sends a stale/non-matching state_revision, the endpoint
+    performs the full context-evidence load and package build (context_package present)."""
+    project = await _make_project(db_session)
+
+    # Mock the expensive steps to confirm they ARE called on a non-matching revision
+    evidence_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.load_strategic_context_evidence",
+        new_callable=AsyncMock,
+        return_value={},
+    )
+    build_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.build_strategic_context_package_summary",
+        return_value={"id": f"strategic-context:{project.id}", "sources": []},
+    )
+
+    # Call with a clearly bogus revision token
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-state?state_revision=deadbeef12345678"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # The expensive functions must have been called
+    evidence_spy.assert_called_once()
+    build_spy.assert_called_once()
+
+    # context_package is present
+    assert data.get("context_package") is not None
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_absent_revision_triggers_full_build(
+    client: AsyncClient, db_session, mocker
+):
+    """When the client sends no state_revision (first-ever poll or backward compat),
+    the endpoint performs the full context-evidence load and package build."""
+    project = await _make_project(db_session)
+
+    evidence_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.load_strategic_context_evidence",
+        new_callable=AsyncMock,
+        return_value={},
+    )
+    build_spy = mocker.patch(
+        "app.routers.admin_project_strategic_session.build_strategic_context_package_summary",
+        return_value={"id": f"strategic-context:{project.id}", "sources": []},
+    )
+
+    # No state_revision parameter
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    evidence_spy.assert_called_once()
+    build_spy.assert_called_once()
+
+    assert data.get("context_package") is not None
+
+
+@pytest.mark.asyncio
+async def test_compute_strategic_state_revision_deterministic(
+    db_session,
+):
+    """_compute_strategic_state_revision produces the same 16-char hex digest
+    given the same inputs, regardless of call timing or order."""
+    from app.routers.admin_project_strategic_session import (
+        _compute_strategic_state_revision,
+    )
+
+    project = await _make_project(db_session)
+    base_kwargs = {
+        "active_cycle_summary": None,
+        "active_task": None,
+        "latest_cycle_summary": None,
+        "running_update_summary": {"excerpt": None, "char_count": 0},
+        "problem_model_summary": {
+            "active_gap_count": 1,
+            "capability_count": 2,
+            "pending_confirmation_count": 1,
+            "top_gap": {"id": "g-1"},
+        },
+        "directions_summary": {"total_count": 2, "active_count": 2, "paused_count": 0},
+        "message_counts": {"open": 0, "linked": 0},
+        "task_counts": {
+            "queued": 0,
+            "running": 0,
+            "evaluating": 0,
+            "blocked": 0,
+            "parked": 0,
+            "failed": 0,
+            "completed": 0,
+            "cancelled": 0,
+            "total": 0,
+        },
+        "attention": None,
+    }
+
+    # Same inputs → same output every time
+    rev1 = _compute_strategic_state_revision(project, **base_kwargs)
+    rev2 = _compute_strategic_state_revision(project, **base_kwargs)
+    assert rev1 == rev2, "deterministic: same inputs must produce same revision"
+
+    # Different project name → different output
+    project.name = "Different Project"
+    rev3 = _compute_strategic_state_revision(project, **base_kwargs)
+    assert rev3 != rev1, (
+        "changing project.name must produce a different revision"
+    )
+
+    # Different active_cycle_summary → different output
+    project.name = "Strategic State"
+    rev4 = _compute_strategic_state_revision(project, **base_kwargs)
+    assert rev4 == rev1, "reverting project.name must restore original revision"
+    diff_kwargs = {**base_kwargs, "active_cycle_summary": {"id": "sc-new"}}
+    rev5 = _compute_strategic_state_revision(project, **diff_kwargs)
+    assert rev5 != rev4, (
+        "changing active_cycle_summary must produce a different revision"
+    )

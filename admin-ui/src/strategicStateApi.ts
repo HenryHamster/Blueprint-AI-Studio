@@ -972,6 +972,10 @@ export interface StrategicStateResponse {
     stale?: boolean | null;
     stale_reason?: string | null;
   } | null;
+  /** Opaque revision token for the strategic-state payload. Send it back as
+   *  ?state_revision= on the next poll so the server can skip the expensive
+   *  context-package build if inputs haven't changed. */
+  state_revision?: string | null;
   model_integrity?: {
     orphaned_gaps: Array<{ id: string; name: string; status: string; recovery_hint?: string }>;
     ungrounded_directions: Array<{
@@ -1017,6 +1021,26 @@ export async function fetchStrategicState(
     // Bypass apiFetch's in-flight GET dedup: a post-mutation refresh must never
     // coalesce onto an older, in-flight pre-mutation request (which would
     // resolve with stale data). useStrategicReadModel sequences the results.
+    false,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch strategic state: ${res.status}`);
+  return res.json() as Promise<StrategicStateResponse>;
+}
+
+/** Fetch strategic state with an optional state_revision for server-side
+ *  context-package skip (returns cached response when inputs unchanged). */
+export async function fetchStrategicStateWithRevision(
+  projectId: string,
+  stateRevision: string | null,
+  signal?: AbortSignal,
+): Promise<StrategicStateResponse> {
+  const params = stateRevision ? `?state_revision=${encodeURIComponent(stateRevision)}` : '';
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-state${params}`,
+    undefined,
+    2,
+    30000,
+    signal,
     false,
   );
   if (!res.ok) throw new Error(`Failed to fetch strategic state: ${res.status}`);

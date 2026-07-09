@@ -7,6 +7,8 @@ admin_projects_router under the same /api/admin prefix.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -954,11 +956,68 @@ async def _persist_message_preview_strategic_session_descriptors(
     await session.refresh(message)
 
 
+def _compute_strategic_state_revision(
+    project: Project,
+    *,
+    active_cycle_summary: Dict[str, Any] | None,
+    active_task: Task | None,
+    latest_cycle_summary: Dict[str, Any] | None,
+    running_update_summary: Dict[str, Any],
+    problem_model_summary: Dict[str, Any],
+    directions_summary: Dict[str, Any],
+    message_counts: Dict[str, int],
+    task_counts: Dict[str, int],
+    attention: Dict[str, Any] | None,
+) -> str:
+    """Compute a lightweight revision token for the context package inputs.
+
+    Only includes fields that the context package build reads directly.
+    Called AFTER cheap inputs are resolved and BEFORE the expensive
+    load_strategic_context_evidence + build_strategic_context_package_summary
+    steps, so a matching client token allows those steps to be skipped.
+    """
+    seed = json.dumps(
+        {
+            "project_id": str(project.id),
+            "project_name": project.name,
+            "vision": project.vision or {},
+            "problem_model": project.problem_model or {},
+            "directions": project.directions or [],
+            "design_doc": bool(project.design_doc),
+            "has_running_update": bool(project.running_update),
+            "running_update_acknowledged_at": (
+                str(project.running_update_acknowledged_at)
+                if project.running_update_acknowledged_at
+                else None
+            ),
+            "active_cycle": active_cycle_summary or {},
+            "active_task_id": str(active_task.id) if active_task else None,
+            "active_task_updated_at": (
+                str(active_task.updated_at)
+                if active_task and active_task.updated_at
+                else None
+            ),
+            "latest_cycle": latest_cycle_summary or {},
+            "running_update_summary": running_update_summary,
+            "problem_model_summary": problem_model_summary,
+            "directions_summary": directions_summary,
+            "message_counts": message_counts,
+            "task_counts": task_counts,
+            "attention_level": (attention or {}).get("level"),
+            "attention_counts": (attention or {}).get("counts", {}),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
 @router.get("/projects/{project_id}/strategic-state")
 @limiter.limit("30/minute")
 async def get_project_strategic_state(
     request: Request,
     project_id: uuid.UUID,
+    state_revision: str | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1117,7 +1176,30 @@ async def get_project_strategic_state(
     running_update_summary = _running_update_summary(project)
     problem_model_summary = _problem_model_summary(project.problem_model or {})
     directions_summary = _direction_summary(project.directions or [])
-    async with async_timed(request, "context"):
+    # State-revision skip: if the client already has a matching revision token,
+    # the context package inputs haven't changed since their last poll.
+    # Skip the expensive evidence load + package build and log the bypass.
+    _revision = _compute_strategic_state_revision(
+        project,
+        active_cycle_summary=active_cycle_summary,
+        active_task=active_task,
+        latest_cycle_summary=latest_cycle_summary,
+        running_update_summary=running_update_summary,
+        problem_model_summary=problem_model_summary,
+        directions_summary=directions_summary,
+        message_counts=message_counts,
+        task_counts=task_counts,
+        attention=attention,
+    )
+    if state_revision is not None and state_revision == _revision:
+        context_evidence: dict = {}
+        context_package: dict | None = None
+        logger.info(
+            "[STRATEGIC_STATE] skipped context package build for project %s "
+            "(state_revision unchanged)",
+            project.id,
+        )
+    else:
         context_evidence = await load_strategic_context_evidence(session, project.id)
         context_package = build_strategic_context_package_summary(
             project,
@@ -1132,14 +1214,13 @@ async def get_project_strategic_state(
             attention=attention,
             evidence=context_evidence,
         )
-    async with async_timed(request, "runtime"):
-        runtime_summary = await build_strategic_runtime_summary(
-            session,
-            project.id,
-            active_task=active_task,
-            project_vision=project.vision or {},
-            operator_user_id=current_user["user_id"],
-        )
+    runtime_summary = await build_strategic_runtime_summary(
+        session,
+        project.id,
+        active_task=active_task,
+        project_vision=project.vision or {},
+        operator_user_id=current_user["user_id"],
+    )
     # Multi-device resident-session picker: every enrolled runner with its
     # online / agent-ready / eligible flags (for the auto-pick + override
     # dropdown) and, via ``_resident_session_availability``, the block-on-offline
@@ -1384,6 +1465,7 @@ async def get_project_strategic_state(
             else None,
         },
         "sha_freshness": sha_freshness,
+        "state_revision": _revision,
         "model_integrity": model_integrity,
         "integrity_conflict_trend": integrity_trend,
     }
