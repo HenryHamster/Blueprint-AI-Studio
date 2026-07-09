@@ -353,7 +353,7 @@ ${greenfieldBranch}
 ${planAvailableCapabilitiesSection}Instructions:
 1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.${isGreenfield ? ' (On a greenfield repo there is little to read — lean on the project goal and design-doc specs to decide the foundation.)' : ''}
 2. Decompose into substantial subtasks. Prefer fewer, larger subtasks over many tiny ones. A single subtask that modifies 200+ lines across 5+ files is fine — the implementing agent is capable. Only split when subtasks are genuinely independent or have different risk profiles.
-3. Identify dependencies between subtasks — only order true producer→consumer relationships. Minimize unnecessary dependencies so independent subtasks can run in parallel; each dependency you add serializes work that could have been concurrent.
+3. Identify dependencies between subtasks — set depends_on_indices so that dependencies flow forward. See BUILD-ON ordering rule below for detailed guidance on when to add (and when to omit) ordering edges.
 4. Write clear, self-contained prompts for each subtask. Describe the PROBLEM and desired outcome — do not prescribe exact line numbers. The implementing agent has full repo access and will figure out the details.
 
 Output EXACTLY one JSON block as the VERY LAST thing in your response:
