@@ -517,6 +517,14 @@ class Project(SQLModel, table=True):
         default_factory=list,
         sa_column=Column(JSONB, nullable=True, default=[]),
     )
+    # Strategic memory notes — append-only list of durable behavioral lessons
+    # and operator preferences. Written by the set_memory strategic op so the
+    # resident strategist can persist corrections / preferences across sessions.
+    # Each entry is {"note": <string>, "set_at": <iso_timestamp>}.
+    strategic_memory_notes: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=True, default=[]),
+    )
     # Running update — a single markdown document the strategic agent
     # maintains as a living narrative of what the project is and what's
     # shifting. Rewritten each cycle (not appended) so the user always

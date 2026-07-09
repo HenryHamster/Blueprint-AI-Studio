@@ -1224,6 +1224,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "open_completion_debt": "completion-debt",
     # Low — generic section endpoint (project-data-based, no complex async)
     "self_reflection_log": "sections",
+    "strategic_memory_notes": "sections",
     "anomaly_summary": "sections",
     "playbook_summary": "sections",
     "retired_directions_summary": "sections",
@@ -1305,6 +1306,8 @@ async def agent_fetch_payload_section(
 
     if section_name == "self_reflection_log":
         data: Any = project.self_reflection_log or []
+    elif section_name == "strategic_memory_notes":
+        data = project.strategic_memory_notes or []
     elif section_name == "anomaly_summary":
         data = _build_anomaly_summary(project)
     elif section_name == "playbook_summary":

@@ -3433,6 +3433,79 @@ async def test_exam_ledger_round_trips_through_task_context(db_session):
 
 
 @pytest.mark.asyncio
+async def test_session_summary_round_trips_through_task_context(db_session):
+    """FULL-RESTART round-trip: the ``set_session_summary`` op's persisted
+    ``_session_summary`` is carried forward into the NEXT resident session's
+    ``task.context["_session_summary"]`` so the agent receives "Prior session
+    context" on restart instead of starting blank.
+
+    A real restart ENDS the prior resident task and starts a fresh session on a
+    NEW (spawned/adopted) task; the summary the op wrote onto the OLD task's
+    context is not reachable from the new task. This test persists a summary
+    into the session-1 blob (via the same path ``set_session_summary`` takes),
+    drives that task terminal, starts a second session that ADOPTS a fresh
+    ``strategic_review`` task, and asserts the SAME summary round-trips
+    losslessly through the new task's context (read back via a FRESH session).
+    """
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap1 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Write _session_summary into the session-1 blob (the same path
+    # set_session_summary uses so it survives a restart).
+    SUMMARY = "Research revealed three key gap areas to investigate."
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = read_resident_session(vision)
+    assert blob is not None, "session-1 blob must exist"
+    blob["_session_summary"] = SUMMARY
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Confirm the blob now carries the summary.
+    fresh_project = await db_session.get(Project, project.id)
+    fresh_blob = read_resident_session(fresh_project.vision)
+    assert fresh_blob is not None
+    assert fresh_blob.get("_session_summary") == SUMMARY
+
+    # Simulate a real restart: the old resident task goes terminal and a fresh
+    # adoptable strategic_review is queued to host the next session.
+    task1 = await db_session.get(Task, task1.id)
+    task1.status = TaskStatus.COMPLETED
+    db_session.add(task1)
+    task2 = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # Start session 2 → adopts task2, carrying the summary forward from the
+    # prior session blob into the NEW task's context.
+    project = await db_session.get(Project, project.id)
+    snap2 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap2["session_id"] != snap1["session_id"]
+    assert str(snap2["task_id"]) == str(task2.id)
+
+    # Read back via a FRESH session (the task.context an agent restart sees).
+    factory = _dedicated_session_factory(db_session)
+    async with factory() as s:
+        fresh_task2 = await s.get(Task, task2.id)
+        carried = (fresh_task2.context or {}).get("_session_summary")
+    assert carried is not None, "_session_summary not carried into the new session's task"
+    assert carried == SUMMARY
+
+    # The carried _session_summary is NOT leaked by the operator-facing snapshot.
+    fresh_project = await db_session.get(Project, project.id)
+    snap_dict = resident_session_snapshot(fresh_project.vision)
+    assert snap_dict is not None and "_session_summary" not in snap_dict
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_note_malformed_json_is_ignored(db_session):
     """A malformed or non-dict note is silently ignored: the blob is updated
     normally (no crash, no _exam_ledger written), and the response is valid."""

@@ -6190,6 +6190,268 @@ async def test_strategic_api_reflect(db_session):
 
 
 @pytest.mark.asyncio
+async def test_strategic_api_set_memory(db_session):
+    """op=set_memory appends a durable note to project.strategic_memory_notes."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {"note": "Always verify claims before escalating them."},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "set_memory"
+        assert body["entry_count"] == 1
+
+        await db_session.refresh(project)
+        assert len(project.strategic_memory_notes) == 1
+        entry = project.strategic_memory_notes[0]
+        assert entry["note"] == "Always verify claims before escalating them."
+        assert "set_at" in entry
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_memory_rejects_empty_note(db_session):
+    """set_memory with missing/empty/whitespace note returns 400."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    _project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac:
+            # missing "note" key
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {"other_field": "nope"},
+                },
+            )
+        assert resp.status_code == 400, resp.text
+
+        # empty string note
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac2:
+            resp2 = await ac2.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {"note": ""},
+                },
+            )
+        assert resp2.status_code == 400, resp2.text
+
+        # whitespace-only note
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac3:
+            resp3 = await ac3.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {"note": "   "},
+                },
+            )
+        assert resp3.status_code == 400, resp3.text
+
+        # non-dict data
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac4:
+            resp4 = await ac4.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": "just a string",
+                },
+            )
+        assert resp4.status_code == 400, resp4.text
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_memory_cap(db_session):
+    """set_memory caps strategic_memory_notes at 100 entries (FIFO eviction)."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        # Pre-fill with 100 entries
+        project.strategic_memory_notes = [{"note": f"entry {i}", "set_at": "2026-01-01T00:00:00"} for i in range(100)]
+        from sqlalchemy.orm.attributes import flag_modified as _fm
+        _fm(project, "strategic_memory_notes")
+        db_session.add(project)
+        await db_session.commit()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_memory",
+                    "task_id": task_id,
+                    "data": {"note": "newest note"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(project)
+        # Should still be 100 (oldest entry 0 evicted)
+        assert len(project.strategic_memory_notes) == 100
+        assert project.strategic_memory_notes[0]["note"] == "entry 1"  # entry 0 was evicted
+        assert project.strategic_memory_notes[-1]["note"] == "newest note"
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_session_summary(db_session):
+    """op=set_session_summary stores summary in task.context and resident session."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        # Load task to verify context update
+        task = (
+            await db_session.execute(select(Task).where(Task.id == uuid.UUID(task_id)))
+        ).scalar_one()
+
+        # Seed an active resident session blob so both write paths are exercised.
+        vision = dict(project.vision or {})
+        vision[RESIDENT_SESSION_KEY] = {
+            "session_id": "test-session-id",
+            "task_id": task_id,
+            "status": "active",
+        }
+        project.vision = vision
+        from sqlalchemy.orm.attributes import flag_modified as _fm
+        _fm(project, "vision")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_session_summary",
+                    "task_id": task_id,
+                    "data": {"summary": "Research revealed three key gap areas to investigate."},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "set_session_summary"
+        assert body["status"] == "ok"
+
+        # Verify task context was updated
+        await db_session.refresh(task)
+        assert task.context is not None
+        assert task.context["_session_summary"] == "Research revealed three key gap areas to investigate."
+
+        # Verify resident session blob was also updated (blob write path)
+        await db_session.refresh(project)
+        blob = (project.vision or {}).get(RESIDENT_SESSION_KEY)
+        assert blob is not None, "resident session blob must exist"
+        assert blob.get("_session_summary") == "Research revealed three key gap areas to investigate."
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_session_summary_rejects_invalid_data(db_session):
+    """set_session_summary with invalid data returns 400."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    _project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac:
+            # non-dict data
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_session_summary",
+                    "task_id": task_id,
+                    "data": "just a string",
+                },
+            )
+        assert resp.status_code == 400, resp.text
+
+        # missing "summary" key
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac2:
+            resp2 = await ac2.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_session_summary",
+                    "task_id": task_id,
+                    "data": {"other_field": "nope"},
+                },
+            )
+        assert resp2.status_code == 400, resp2.text
+
+        # empty string summary
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac3:
+            resp3 = await ac3.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_session_summary",
+                    "task_id": task_id,
+                    "data": {"summary": ""},
+                },
+            )
+        assert resp3.status_code == 400, resp3.text
+
+        # whitespace-only summary
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test", headers={"Authorization": "Bearer test-token"}
+        ) as ac4:
+            resp4 = await ac4.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_session_summary",
+                    "task_id": task_id,
+                    "data": {"summary": "   "},
+                },
+            )
+        assert resp4.status_code == 400, resp4.text
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
 async def test_strategic_api_pending_confirm(db_session):
     """op=pending_confirm adds a pending_user_confirmation item to problem_model."""
     from httpx import AsyncClient, ASGITransport

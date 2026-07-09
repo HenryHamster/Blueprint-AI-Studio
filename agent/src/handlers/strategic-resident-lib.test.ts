@@ -304,6 +304,49 @@ describe('buildBootstrapPrompt', () => {
     expect(p).not.toContain('Prior-cycle decision outcomes');
     expect(p).not.toContain('Already-staged (next-version) directions');
   });
+
+  it('includes standing behavioral lessons when memory notes are provided', () => {
+    const p = buildBootstrapPrompt({
+      ...base,
+      strategicMemoryNotesText: '- [2026-07-01] Prefer concrete action over abstract discussion\n- [2026-07-02] Verify claims before escalating',
+    });
+    expect(p).toContain('## Standing behavioral lessons');
+    expect(p).toContain('Accumulated across sessions');
+    expect(p).toContain('./strategic set-memory');
+    expect(p).toContain('- [2026-07-01] Prefer concrete action over abstract discussion');
+    expect(p).toContain('- [2026-07-02] Verify claims before escalating');
+  });
+
+  it('omits standing behavioral lessons when memory notes is empty', () => {
+    const p = buildBootstrapPrompt({ ...base, strategicMemoryNotesText: '' });
+    expect(p).not.toContain('## Standing behavioral lessons');
+    expect(p).not.toContain('Accumulated across sessions');
+  });
+
+  it('omits standing behavioral lessons when memory notes is undefined', () => {
+    const p = buildBootstrapPrompt(base); // strategicMemoryNotesText not set
+    expect(p).not.toContain('## Standing behavioral lessons');
+    expect(p).not.toContain('Accumulated across sessions');
+  });
+
+  it('includes prior session context when priorSessionContextText is provided', () => {
+    const p = buildBootstrapPrompt({
+      ...base,
+      priorSessionContextText: 'Previous session explored authentication flows.',
+    });
+    expect(p).toContain('## Prior session context');
+    expect(p).toContain('Previous session explored authentication flows.');
+  });
+
+  it('omits prior session context when priorSessionContextText is empty', () => {
+    const p = buildBootstrapPrompt({ ...base, priorSessionContextText: '' });
+    expect(p).not.toContain('## Prior session context');
+  });
+
+  it('omits prior session context when priorSessionContextText is undefined', () => {
+    const p = buildBootstrapPrompt(base); // priorSessionContextText not set
+    expect(p).not.toContain('## Prior session context');
+  });
 });
 
 describe('retired/prior-context renderers', () => {

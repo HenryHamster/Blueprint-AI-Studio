@@ -85,6 +85,11 @@ from app.strategic_completion import (
     spawn_title_is_redundant,
     strategic_retirement_challenge_gate_mode,
 )
+from app.strategic_resident_session import (
+    RESIDENT_SESSION_KEY as _RESIDENT_SESSION_KEY,
+    read_resident_session as _read_resident_session,
+    resident_session_is_active as _resident_session_is_active,
+)
 from app.strategic_constants import (
     MIN_HEALTHY_ACTIVE_DIRECTIONS,
     STRATEGIC_DIRECTION_TEXT_MAX,
@@ -144,6 +149,8 @@ STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES = 50_000
 STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "set_problem_model",
     "set_running_update",
+    "set_memory",
+    "set_session_summary",
     "reflect",
     "pending_confirm",
     "set_vision",
@@ -3990,6 +3997,47 @@ async def strategic_operation(
             }
         )
 
+    elif payload.op == "set_memory":
+        # Append a durable behavioral-memory note to project.strategic_memory_notes.
+        # The resident strategist uses this to persist lessons and operator
+        # preferences across sessions. No challenge gate — personal memory op.
+        if not isinstance(data, dict) or not isinstance(data.get("note"), str) or not data["note"].strip():
+            raise HTTPException(
+                status_code=400,
+                detail="set_memory requires data.note as a non-empty string",
+            )
+        note = data["note"].strip()
+        # Per-note length cap (10 KB UTF-8) to keep JSONB columns lean,
+        # consistent with set_session_summary's 10 KB limit.
+        _MAX_MEMORY_NOTE_BYTES = 10_000
+        note_bytes = note.encode("utf-8")
+        if len(note_bytes) > _MAX_MEMORY_NOTE_BYTES:
+            note = note_bytes[:_MAX_MEMORY_NOTE_BYTES].decode("utf-8", errors="replace")
+        entry = {"note": note, "set_at": _utcnow().isoformat()}
+        if project.strategic_memory_notes is None:
+            project.strategic_memory_notes = []
+        project.strategic_memory_notes.append(entry)
+        # Keep last 100 entries for defense-in-depth against JSONB column bloat
+        project.strategic_memory_notes = project.strategic_memory_notes[-100:]
+        flag_modified(project, "strategic_memory_notes")
+        session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Appended strategic_memory note for project {project.id} "
+            f"(entry count: {len(project.strategic_memory_notes)})"
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_memory",
+                "entry_count": len(project.strategic_memory_notes),
+            }
+        )
+
     elif payload.op == "pending_confirm":
         # Add a pending_user_confirmation item to the problem_model.
         # Scoped to external blockers only: credentials, access, major
@@ -4955,6 +5003,50 @@ async def strategic_operation(
                 "release_version_id": str(resolution_version_id),
             }
         )
+
+    elif payload.op == "set_session_summary":
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="set_session_summary data must be an object with a 'summary' field",
+            )
+        summary = str(data.get("summary", "")).strip()
+        if not summary:
+            raise HTTPException(
+                status_code=400,
+                detail="summary text is required",
+            )
+        # Bounded to 10 KB to keep JSONB columns lean
+        _MAX_SUMMARY_BYTES = 10_000
+        summary_bytes = summary.encode("utf-8")
+        if len(summary_bytes) > _MAX_SUMMARY_BYTES:
+            summary = summary_bytes[:_MAX_SUMMARY_BYTES].decode("utf-8", errors="replace")
+
+        # Write to task context so the running agent reads it on bootstrap
+        ctx = dict(task.context or {})
+        ctx["_session_summary"] = summary
+        task.context = ctx
+        flag_modified(task, "context")
+        session.add(task)
+
+        # Also persist into the resident session blob so it survives a restart
+        # (a new task picks it up via start_resident_session's carry-forward).
+        # Uses with_vision_locked so the invariant test counts it as a locked
+        # write, consistent with the rest of the session-blob code.
+        _existing = _read_resident_session(project.vision)
+        if _existing is not None and _resident_session_is_active(_existing):
+
+            def _update_session_summary(vision: dict) -> None:
+                current = _read_resident_session(vision)
+                if current is not None and _resident_session_is_active(current):
+                    updated = dict(current)
+                    updated["_session_summary"] = summary
+                    vision[_RESIDENT_SESSION_KEY] = updated
+
+            await _with_vision_locked(session, project.id, _update_session_summary)
+
+        await session.commit()
+        return _resp({"status": "ok", "op": "set_session_summary"})
 
     elif payload.op == "cancel_task":
         if not isinstance(data, dict):

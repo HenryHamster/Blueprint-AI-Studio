@@ -2310,6 +2310,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "priority": "low",
         "summarize": _summarize_self_reflection_log,
     },
+    # Already compact (note + set_at per entry, capped by the handler at build
+    # time), so drop-whole is correct degradation under budget pressure.
+    "strategic_memory_notes": {
+        "priority": "low",
+        "exempt": True,
+    },
     "previous_decision_outcomes": {
         "priority": "low",
         "summarize": _summarize_previous_decision_outcomes,
@@ -7370,6 +7376,7 @@ async def _spawn_strategic_review(
             ),
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
+            "strategic_memory_notes": project.strategic_memory_notes or [],
             # De-gated from the raw project.is_self_repo column to the deploy-repo
             # predicate: the strategist's self-improvement framing (modify your own
             # prompts/schemas/orchestration) keys off this field, so it must follow

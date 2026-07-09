@@ -295,6 +295,29 @@ export async function handleStrategicResident(
     ? payload.previous_decision_outcomes as Record<string, unknown>
     : undefined;
 
+  // Read the session summary from the prior session's set-session-summary output
+  // (carried forward by the backend on restart). The bootstrap will include it as
+  // a "Prior session context" section so the agent knows what was in-flight.
+  const priorSessionContextText = strVal(ctx._session_summary) || '';
+
+  // Format strategic memory notes for the bootstrap prompt. Each entry is
+  // {note, set_at}; render as "- [set_at] note" so the timestamp provides
+  // ordering context. Absent or non-array degrades to empty string.
+  const strategicMemoryNotesText = ((): string => {
+    const raw = payload.strategic_memory_notes;
+    if (!Array.isArray(raw) || raw.length === 0) return '';
+    return raw
+      .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
+      .map((e) => {
+        const note = typeof e.note === 'string' ? e.note.trim() : '';
+        const setAt = typeof e.set_at === 'string' ? e.set_at.trim() : '';
+        if (!note) return '';
+        return setAt ? `- [${setAt}] ${note}` : `- ${note}`;
+      })
+      .filter(Boolean)
+      .join('\n');
+  })();
+
   const bootstrapPrompt = buildBootstrapPrompt({
     contextPrefix,
     projectName: strVal(payload.project_name, 'this project'),
@@ -304,10 +327,12 @@ export async function handleStrategicResident(
     stagedDirectionsText: buildStagedDirectionsText(stagedDirections),
     retiredDirectionsText: buildRetiredContextText(retiredDirections),
     previousDecisionOutcomesText: buildPriorDecisionsText(previousDecisionOutcomes),
+    strategicMemoryNotesText,
     visionJson,
     openMessagesText: buildOpenMessagesText(openMessages),
     sessionId,
     fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
+    priorSessionContextText,
   });
 
   const cfg = residentConfig(payload);

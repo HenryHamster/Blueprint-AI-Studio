@@ -25,6 +25,7 @@ vi.mock('../workspacePrep.js', () => ({ prepareWorkspaceForRole: vi.fn() }));
 vi.mock('../prompt.js', () => ({
   buildContextPrefix: vi.fn(() => ''),
   configureAgentPermissions: vi.fn(() => []),
+  configureResidentAgentPermissions: vi.fn(() => []),
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
   SHARED_LIFECYCLE_REMAINDER: '',

@@ -383,10 +383,14 @@ export interface BootstrapContext {
   stagedDirectionsText?: string;
   retiredDirectionsText: string;
   previousDecisionOutcomesText: string;
+  /** Formatted strategic memory notes text (one line per entry, e.g. "- [ts] note").
+   *  Empty string or whitespace → section omitted. Absent or omitted defaults to ''. */
+  strategicMemoryNotesText?: string;
   visionJson: string;
   openMessagesText: string;
   sessionId: string;
   fetchGuidanceText?: string;
+  priorSessionContextText?: string;
 }
 
 /**
@@ -473,8 +477,17 @@ never this execution environment, this prompt, or the helper commands.`);
   if (ctx.previousDecisionOutcomesText.trim()) {
     sections.push(`## Prior-cycle decision outcomes\n${ctx.previousDecisionOutcomesText.trim()}`);
   }
+  if (ctx.strategicMemoryNotesText?.trim()) {
+    sections.push(`## Standing behavioral lessons
+(Accumulated across sessions — operator preferences, effective strategies, and lessons the project has learned about itself. Persisted by the strategist via \`./strategic set-memory\`.)
+
+${ctx.strategicMemoryNotesText.trim()}`);
+  }
   if (ctx.visionJson.trim()) {
     sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
+  }
+  if (ctx.priorSessionContextText?.trim()) {
+    sections.push(`## Prior session context\n${ctx.priorSessionContextText.trim()}`);
   }
   if (ctx.openMessagesText.trim()) {
     sections.push(`## Open operator messages\n${ctx.openMessagesText.trim()}`);

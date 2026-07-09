@@ -97,6 +97,10 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Author acceptance criteria for a direction/task.' },
   { op: 'record_finding_resolution', alias: 'record-finding-resolution', cli: true, prompt: true, internalReason: null,
     description: 'Record a carried audit finding as resolved or code-verified stale in the re-qualification resolution ledger.' },
+  { op: 'set_memory', alias: 'set-memory', cli: true, prompt: true, internalReason: null,
+    description: 'Persist a behavioral lesson or operator preference for future sessions.' },
+  { op: 'set_session_summary', alias: 'set-session-summary', cli: true, prompt: true, internalReason: null,
+    description: 'Record a running summary of session context and progress for continuity across restarts.' },
   // ── Internal-only / auto-invoked backend ops (deliberately NOT on the CLI or
   //    resident prompt). They are accepted by the dispatch chain but are invoked
   //    programmatically by the one-shot cycle / operator seams, never as a

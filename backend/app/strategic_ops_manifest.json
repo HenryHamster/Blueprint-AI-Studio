@@ -192,6 +192,22 @@
     "internal_reason": null
   },
   {
+    "op": "set_memory",
+    "alias": "set-memory",
+    "description": "Persist a behavioral lesson or operator preference for future sessions.",
+    "cli": true,
+    "prompt": true,
+    "internal_reason": null
+  },
+  {
+    "op": "set_session_summary",
+    "alias": "set-session-summary",
+    "description": "Record a running summary of session context and progress for continuity across restarts.",
+    "cli": true,
+    "prompt": true,
+    "internal_reason": null
+  },
+  {
     "op": "decide_churn_retirement",
     "alias": null,
     "description": "Decide keep/retire for a direction the churn/zombie ladder paused pending review.",
