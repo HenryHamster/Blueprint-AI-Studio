@@ -2554,14 +2554,21 @@ def _spawn_agent_task(
     # bwrap-eligible task on a docker+image box still takes the bwrap path.
     plan_image = agent_image if backend == iso.BACKEND_DOCKER else None
 
-    # Write backend-supplied credential files into the agent's home / sandbox.
-    # The LLM provider CLI (Claude, Codex, Gemini) reads config files from
-    # well-known paths (e.g. ~/.claude.json); the runner materializes them here
-    # per-task so the agent finds exactly the credential the pool assigned.
+    # Write backend-supplied credential files into the agent's workspace
+    # (bind-mounted as / inside the bwrap sandbox; mounted at /agent-workdir
+    #  inside the docker sandbox). The LLM provider CLI (Claude, Codex,
+    # Gemini) reads config files from well-known paths;
+    # the runner materializes them per-task so the agent finds exactly the
+    # credential the pool assigned.
     if llm_files:
         for f in llm_files:
             try:
-                fpath = f["path"]
+                # Strip leading / so the path is relative to the workspace
+                # (which is bind-mounted at the sandbox root for both bwrap
+                # and docker backends), ensuring the credential file is
+                # visible inside the sandbox.
+                fpath = f["path"].lstrip("/")
+                fpath = os.path.join(workspace, fpath)
                 fcontent = f["content"]
                 fmode = f.get("mode", "0600")
                 parent = os.path.dirname(fpath)

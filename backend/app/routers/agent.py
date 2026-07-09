@@ -5432,6 +5432,9 @@ async def agent_list_knowledge_documents(
     sweep_id: str | None = Query(
         default=None, description="Exact sweep_id filter (compute experiment sweeps)"
     ),
+    lifecycle_status: str | None = Query(
+        default=None, description="Exact lifecycle_status filter (pending/consumed/dismissed)"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -5461,6 +5464,7 @@ async def agent_list_knowledge_documents(
         challenge_state=challenge_state,
         finding_hash=finding_hash,
         sweep_id=sweep_id,
+        lifecycle_status=lifecycle_status,
         limit=limit,
         offset=offset,
     )

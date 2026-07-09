@@ -452,6 +452,49 @@ class TestSalvageBundleTask:
         assert entry["discard_reason"] == "low_actionability"
 
 
+@_pytest.mark.asyncio
+async def test_salvage_activity_context_recorded_on_parent_task(db_session, mocker):
+    """When deferred findings decay and are bundled into a salvage task, the
+    parent research task's context carries salvage_activity metadata."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-salvage01"
+    )
+    # An ultra_low_confidence finding deferred 4+ times decays into salvage.
+    decayed = _make_finding("Repeatedly low confidence", direction_id=direction["id"])
+    decayed["actionability_grade"] = "LOW"
+    decayed["deferred_reason"] = "ultra_low_confidence"
+    decayed["deferred_count"] = 4
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [decayed],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    salvage = (task.context or {}).get("salvage_activity")
+    assert salvage is not None, (
+        "salvage_activity must be recorded on the parent task"
+    )
+    assert "salvage_task_id" in salvage
+    assert salvage["salvaged_count"] == 1
+    assert "salvaged_at" in salvage
+
+
 class TestDeferredFindingStaleDiscard:
     """Stale-discard path: deferred findings older than the configured TTL are dropped."""
 
@@ -5518,6 +5561,98 @@ async def test_capacity_degradation_surfaced_in_completion_message(
     # Structured context field must be set.
     assert (task.context or {}).get("degraded_by_capacity") is True
     assert (task.context or {}).get("degraded_by_capacity_reason") is not None
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_state_preserves_degradation_qualifier(
+    db_session, mocker
+):
+    """apply_post_spawn_state must re-append the (degraded: ...) qualifier to
+    latest_status_message when task.context carries degraded_by_capacity_reason,
+    even though it overwrites the message."""
+    from app.research_direction_state import apply_post_spawn_state
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-deg-aps01"
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "direction_id": direction["id"],
+        "degraded_by_capacity": True,
+        "degraded_by_capacity_reason": "provider capacity — account exhausted",
+    }
+    task.latest_status_message = "Research completed normally"
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+
+    await db_session.refresh(task)
+    assert "degraded:" in task.latest_status_message
+    assert "account exhausted" in task.latest_status_message
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_state_no_degradation_on_clean_task(db_session, mocker):
+    """apply_post_spawn_state must NOT add the degradation qualifier when
+    degraded_by_capacity_reason is absent from task.context."""
+    from app.research_direction_state import apply_post_spawn_state
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-deg-aps02"
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "direction_id": direction["id"],
+    }
+    task.latest_status_message = "Research completed normally"
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+
+    await db_session.refresh(task)
+    assert "degraded" not in (task.latest_status_message or "")
 
 
 @_pytest.mark.asyncio

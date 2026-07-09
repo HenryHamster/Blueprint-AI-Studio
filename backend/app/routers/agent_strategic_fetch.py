@@ -1216,6 +1216,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     # Medium/high — dedicated fetch verbs
     "design_doc": "section",
     "knowledge_index": "knowledge",
+    "pending_followups": "knowledge",
     "compute_experiment_sweeps": "compute-sweeps",
     "capability_trial_verdicts": "capability-trials",
     "efficiency_snapshot": "efficiency-snapshot",

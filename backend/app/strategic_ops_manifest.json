@@ -144,6 +144,22 @@
     "internal_reason": null
   },
   {
+    "op": "consume_knowledge_followup",
+    "alias": "consume-knowledge-followup",
+    "description": "Consume a pending knowledge follow-up (spawned direction, incorporated knowledge, etc.).",
+    "cli": true,
+    "prompt": true,
+    "internal_reason": null
+  },
+  {
+    "op": "dismiss_knowledge_followup",
+    "alias": "dismiss-knowledge-followup",
+    "description": "Dismiss a pending knowledge follow-up as not currently actionable.",
+    "cli": true,
+    "prompt": true,
+    "internal_reason": null
+  },
+  {
     "op": "set_retirement_critiques",
     "alias": "set-retirement-critiques",
     "description": "Record retirement critiques for the cycle.",

@@ -269,6 +269,7 @@ const {
     'buildModelHealthSection',
     'buildOpenMessagesText',
     'buildOutcomeSection',
+    'buildPendingFollowupsSection',
     'buildPayloadStalenessSection',
     'buildPruneCandidatesSection',
     'buildQuestionSection',

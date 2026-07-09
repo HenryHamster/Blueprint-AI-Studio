@@ -29,7 +29,7 @@
     "routers/admin_digest.py": 10300,
     "routers/admin_release_version.py": 1950,
     "routers/admin_pipeline_observability.py": 2000,
-    "routers/admin_agent_ops.py": 5450,
+    "routers/admin_agent_ops.py": 6350,
     "routers/admin_pool_accounts.py": 1600,
     "max_plan_pool.py": 3750,
     "anomaly_detection.py": 2100,
@@ -127,7 +127,7 @@
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 2700,
     "operator_attention.py": 2250,
-    "payload_schemas.py": 1750,
+    "payload_schemas.py": 2050,
     "lifecycle.py": 1750,
     "research_direction_state.py": 1750,
     "dep_lifecycle.py": 800,
@@ -172,7 +172,7 @@
     "utils/test-runners.ts": 2850,
     "utils/diff-detection.ts": 150,
     "utils/stale-result.ts": 150,
-    "handlers/strategic-sections.ts": 1500,
+    "handlers/strategic-sections.ts": 1800,
     "providers/runners.ts": 1900,
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950,
@@ -229,6 +229,8 @@
     "components/HeaderBar.tsx": 1100,
     "components/ResearchBrowser.tsx": 1050,
     "components/ComputeJobsPanel.tsx": 2450,
-    "hooks/useWorkbenchCommands.ts": 1800
+    "hooks/useWorkbenchCommands.ts": 1800,
+    "api/compute.ts": 2000,
+    "api/projects.ts": 1750
   }
 }

@@ -66,6 +66,7 @@ import {
   buildSweepComparisonSection,
   buildCiComplianceSection,
   buildCompletionDebtSection,
+  buildPendingFollowupsSection,
   buildPayloadStalenessSection,
   buildResidentExamLeadsSection,
 } from './strategic-sections.js';
@@ -331,6 +332,7 @@ export async function handleStrategic(
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
     const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
     const completionDebtSection = buildCompletionDebtSection(payload.open_completion_debt);
+    const pendingFollowupsSection = buildPendingFollowupsSection(payload.pending_followups);
 
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
     const outcomeSection = buildOutcomeSection(outcomeEval);
@@ -758,6 +760,7 @@ prompts, schemas, tools, or orchestration.` : '';
       efficiencySnapshotSection,
       ciComplianceSection,
       completionDebtSection,
+      pendingFollowupsSection,
       // Shared capability vocabulary + uniform provides_capability / prerequisite
       // declaration guidance, so the strategist draws cross-lane capability refs
       // from the same registry namespace every other task type uses.
@@ -833,6 +836,7 @@ prompts, schemas, tools, or orchestration.` : '';
       ['efficiency_snapshot', thinkerParams.efficiencySnapshotSection],
       ['ci_compliance', thinkerParams.ciComplianceSection || ''],
       ['completion_debt', thinkerParams.completionDebtSection || ''],
+      ['pending_followups', thinkerParams.pendingFollowupsSection || ''],
       ['sweep_comparison', thinkerParams.sweepComparisonSection || ''],
       ['local_runner', thinkerParams.localRunnerSection || ''],
       ['payload_staleness', thinkerParams.payloadStalenessSection || ''],

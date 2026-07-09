@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { apiFetch } from '../api';
 import { DEFAULT_POLL_MS, usePoller } from '../hooks/usePoller';
 import { SettingsSectionRouter, type SettingsSectionRouterProps } from './SettingsSectionRouter';
@@ -111,29 +111,64 @@ export function RuntimeAccountsPanel({
     }
   }, { intervalMs: DEFAULT_POLL_MS, deps: [] });
 
-  const configuredAccounts = settingsRouterProps.maxPlanAccounts ?? [];
-  const providerCount = new Set(configuredAccounts.map(account => account.provider)).size;
-  const enabledAccounts = configuredAccounts.filter(account => account.enabled).length;
-  const runtimeReadyAccounts = configuredAccounts.filter(accountIsDispatchReady).length;
-  const activeTasks = configuredAccounts.reduce((sum, account) => sum + (account.active_tasks ?? 0), 0);
-  const cappedAccounts = configuredAccounts.filter(
-    account => account.daily_task_cap != null || account.max_concurrent_tasks != null,
-  ).length;
-  const capHeldAccounts = configuredAccounts.filter(account => account.usage?.at_any_cap || account.account_status === 'at_cap').length;
-  const cooldowns = configuredAccounts.filter(account => account.enabled).reduce(
-    (sum, account) => sum + Object.keys(account.disabled_models ?? {}).length,
-    0,
-  );
-  const healthRows = accountHealth ?? [];
-  const actionableHealthRows = healthRows.filter(account => account.state !== 'disabled');
-  const nonHealthyRows = healthRows.filter(account => account.state !== 'healthy').length;
-  const usagePressureRows = actionableHealthRows.filter(account => highUsage(account) >= 70).length;
-  const quotaPressureRows = actionableHealthRows.filter(account => highUsage(account) >= 90).length;
-  const rateLimitedModels = actionableHealthRows.reduce(
-    (sum, account) => sum + account.rate_limited_models.length,
-    0,
-  );
-  const totalCooldowns = cooldowns + rateLimitedModels;
+  const {
+    configuredAccounts,
+    providerCount,
+    enabledAccounts,
+    runtimeReadyAccounts,
+    activeTasks,
+    cappedAccounts,
+    capHeldAccounts,
+    cooldowns,
+    healthRows,
+    nonHealthyRows,
+    usagePressureRows,
+    quotaPressureRows,
+    rateLimitedModels,
+    totalCooldowns,
+  } = useMemo(() => {
+    const configuredAccounts = settingsRouterProps.maxPlanAccounts ?? [];
+    const providerCount = new Set(configuredAccounts.map(account => account.provider)).size;
+    const enabledAccounts = configuredAccounts.filter(account => account.enabled).length;
+    const runtimeReadyAccounts = configuredAccounts.filter(accountIsDispatchReady).length;
+    const activeTasks = configuredAccounts.reduce((sum, account) => sum + (account.active_tasks ?? 0), 0);
+    const cappedAccounts = configuredAccounts.filter(
+      account => account.daily_task_cap != null || account.max_concurrent_tasks != null,
+    ).length;
+    const capHeldAccounts = configuredAccounts.filter(
+      account => account.usage?.at_any_cap || account.account_status === 'at_cap',
+    ).length;
+    const cooldowns = configuredAccounts.filter(account => account.enabled).reduce(
+      (sum, account) => sum + Object.keys(account.disabled_models ?? {}).length,
+      0,
+    );
+    const healthRows = accountHealth ?? [];
+    const actionableHealthRows = healthRows.filter(account => account.state !== 'disabled');
+    const nonHealthyRows = healthRows.filter(account => account.state !== 'healthy').length;
+    const usagePressureRows = actionableHealthRows.filter(account => highUsage(account) >= 70).length;
+    const quotaPressureRows = actionableHealthRows.filter(account => highUsage(account) >= 90).length;
+    const rateLimitedModels = actionableHealthRows.reduce(
+      (sum, account) => sum + account.rate_limited_models.length,
+      0,
+    );
+    const totalCooldowns = cooldowns + rateLimitedModels;
+    return {
+      configuredAccounts,
+      providerCount,
+      enabledAccounts,
+      runtimeReadyAccounts,
+      activeTasks,
+      cappedAccounts,
+      capHeldAccounts,
+      cooldowns,
+      healthRows,
+      nonHealthyRows,
+      usagePressureRows,
+      quotaPressureRows,
+      rateLimitedModels,
+      totalCooldowns,
+    };
+  }, [settingsRouterProps.maxPlanAccounts, accountHealth]);
   const nextAccountAction = (() => {
     if (!settingsRouterProps.githubAccount) return 'Connect GitHub identity before dispatching account-backed work.';
     if (configuredAccounts.length === 0) return 'Add a provider account to make the runtime schedulable.';

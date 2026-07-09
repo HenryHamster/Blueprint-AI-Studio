@@ -233,6 +233,12 @@ export interface ThinkerPromptParams {
    */
   completionDebtSection?: string;
   /**
+   * Pending knowledge follow-ups section: design/web_research documents the
+   * strategist has not yet consumed or dismissed. Optional so existing
+   * constructions/tests that omit it still compile; '' renders nothing.
+   */
+  pendingFollowupsSection?: string;
+  /**
    * Shared capability vocabulary section (canonical registry names + statuses)
    * plus the uniform provides_capability / prerequisite declaration guidance.
    * Built from the strategic payload's `available_capabilities` field. Optional
@@ -394,6 +400,7 @@ ${p.userStateLine}`,
     if (p.efficiencySnapshotSection) dataParts.push(p.efficiencySnapshotSection);
     if (p.ciComplianceSection) dataParts.push(`\n${p.ciComplianceSection}`);
     if (p.completionDebtSection) dataParts.push(`\n${p.completionDebtSection}`);
+    if (p.pendingFollowupsSection) dataParts.push(`\n${p.pendingFollowupsSection}`);
     if (p.sweepComparisonSection) dataParts.push(`\n${p.sweepComparisonSection}`);
     if (p.localRunnerSection) dataParts.push(`\n${p.localRunnerSection}\n`);
     sections.push(dataParts.join(''));
