@@ -289,6 +289,40 @@ def _routing_entry(raw: Any) -> tuple[list[str] | None, str | None]:
     return providers, effort
 
 
+# Categories whose low/medium-effort routing is affected by the provider
+# routing A/B verdict (direction d-cf39cb40). Strategic (max effort) and
+# review (high effort) are excluded — the verdict only compares DeepSeek
+# cost/quality on the cheaper tiers.
+_VERDICT_AFFECTED_CATEGORIES: frozenset[str] = frozenset({"initiative", "build", "ops"})
+
+
+def _apply_routing_verdict(
+    providers: list[str],
+    task_type: str,
+    runtime_config: Mapping[str, Any],
+) -> list[str]:
+    """Reorder *providers* based on the provider routing A/B verdict.
+
+    Reads ``provider_routing_verdict_state`` from *runtime_config* (set by
+    the daily efficiency snapshot). Only reorders when the verdict is ADOPT
+    or REJECT and the task's category is one of the affected low/medium-effort
+    categories (initiative, build, ops).
+
+    ADOPT → DeepSeek first.  REJECT → Anthropic first.
+    INSUFFICIENT_DATA or absent → no change.
+    """
+    verdict_state = runtime_config.get("provider_routing_verdict_state")
+    if not verdict_state or verdict_state not in ("ADOPT", "REJECT"):
+        return providers
+    category = _category_for_task_type(task_type, runtime_config)
+    if category not in _VERDICT_AFFECTED_CATEGORIES:
+        return providers
+    preferred = "deepseek" if verdict_state == "ADOPT" else "anthropic"
+    if providers and providers[0] == preferred:
+        return providers
+    return [preferred] + [p for p in providers if p != preferred]
+
+
 def _ensure_migrated(runtime_config: Mapping[str, Any]) -> Mapping[str, Any]:
     """Translate any legacy routing/effort keys to the new shape at read time.
 
@@ -391,8 +425,12 @@ def _resolve_routing_core(
             if effort is None and cand_effort:
                 effort = cand_effort
 
+    resolved_providers = providers if providers is not None else list(ALL_PROVIDERS)
+    resolved_providers = _apply_routing_verdict(
+        resolved_providers, task_type, runtime_config
+    )
     return {
-        "providers": providers if providers is not None else list(ALL_PROVIDERS),
+        "providers": resolved_providers,
         "effort": effort if effort is not None else DEFAULT_EFFORT_LEVEL,
     }
 

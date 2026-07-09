@@ -2453,6 +2453,15 @@ async def compute_current_axes(
     _effort_model = compute_effort_model_efficiency(tasks)
     provider_routing_verdict = compute_provider_routing_verdict(_effort_model["by_model"])
 
+    # Propagate verdict state to live routing so the dispatch path reorders
+    # providers without waiting for a config deploy (direction d-cf39cb40).
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        _rc["provider_routing_verdict_state"] = provider_routing_verdict["state"]
+    except Exception:
+        pass
+
     # Deploy-scoped boundary: the earliest snapshot captured under the current
     # serving SHA, so panel_review_effectiveness can be computed for
     # post-deployment traffic only. None when the SHA is unknown or this is the
