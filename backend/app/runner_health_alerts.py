@@ -1103,3 +1103,130 @@ async def _resolve_runner_low_disk_alert(
             {"alert_id": str(alert.id), "title": alert.title},
         )
     return len(open_alerts)
+
+
+# ── Runner idle-GPU alert ──────────────────────────────────────────────────
+# Fires when a live GPU runner reports GPU utilization below the idle threshold,
+# indicating expensive GPU capacity may be wasting. Mirrors the low-disk pattern:
+# deduplicated per runner, WARNING severity, auto-resolves on recovery.
+
+_RUNNER_IDLE_GPU_EVENT_TYPE = "runner.idle_gpu"
+_RUNNER_IDLE_GPU_THRESHOLD_PCT_DEFAULT = 10  # 10% utilization = idle
+
+
+def _runner_idle_gpu_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_IDLE_GPU_EVENT_TYPE}:{runner_id}"
+
+
+async def _maybe_create_runner_idle_gpu_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    gpu_utilization_pct: float,
+    threshold_pct: int,
+) -> bool:
+    """Create a deduplicated WARNING alert when a GPU runner is persistently idle.
+
+    Fires when a live runner reports GPU utilization below the idle threshold,
+    indicating expensive GPU capacity is being wasted. The alert auto-resolves
+    when GPU utilization recovers above the threshold.
+
+    Deduplicated on ``runner.idle_gpu:{runner_id}`` so repeated sweep passes
+    bump the occurrence count rather than creating duplicate rows. Returns
+    ``True`` when a NEW alert was created, else ``False``.
+    """
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    title = f"Fleet runner GPU idle: {runner_label}"
+    message = (
+        f"Self-hosted fleet runner {runner_label} ({str(runner_id)[:8]}) "
+        f"GPU utilization is {gpu_utilization_pct:.0f}%, below the "
+        f"{threshold_pct}% idle threshold. Expensive GPU capacity may be "
+        f"wasting. The alert clears automatically when GPU utilization "
+        f"recovers above the threshold."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_IDLE_GPU_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_idle_gpu_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_IDLE_GPU",
+                {
+                    "runner_id": str(runner_id),
+                    "runner_label": runner_label,
+                    "gpu_utilization_pct": gpu_utilization_pct,
+                    "threshold_pct": threshold_pct,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_IDLE_GPU dispatch setup failed: %s", _ne)
+    return True
+
+
+async def _resolve_runner_idle_gpu_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss any open runner-idle-gpu alert for a runner whose GPU recovered.
+
+    The companion to :func:`_maybe_create_runner_idle_gpu_alert`. Called from
+    the idle-GPU sweep when a runner's GPU utilization rises above the threshold.
+    Returns the number of alerts dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _runner_idle_gpu_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)

@@ -520,6 +520,13 @@ def _evaluate_coverage_delta(
     real test run, so an absent result implicitly means no test ran — no separate
     verification gate is needed.
 
+    The result is marked ``proven=True`` only when the ``coverage_pct`` comes
+    from genuine line/statement coverage instrumentation (pytest-cov, c8), NOT
+    from the test-pass-rate fallback.  When the orchestrator stores a pass-rate
+    proxy (``source="pass_rate"``) because no instrumentation was active, the
+    verdict is ``satisfied=True`` but ``proven=False`` — pass-rate is semantically
+    distinct from changed-line coverage.
+
     Absent / non-numeric result, absent or non-numeric threshold, or coverage below
     threshold all fail closed.
     """
@@ -547,52 +554,39 @@ def _evaluate_coverage_delta(
             "numeric coverage_pct",
         )
 
-    # Prefer diff-aware changed-line coverage when available (computed by
-    # the agent over the PR's changed files, not total project-wide).
-    changed_pct = coerce_number(result.get("changed_lines_coverage_pct"))
-    use_changed = changed_pct is not None
-    effective_pct = changed_pct if use_changed else coverage_pct
+    # Distinguish instrumented line coverage from the test-pass-rate fallback.
+    # When the orchestrator stored source="pass_rate", the value represents
+    # the fraction of tests that passed, NOT line coverage — the claim can be
+    # satisfied (a real test run happened) but is NOT machine-checked proof
+    # of changed-line coverage.
+    is_pass_rate = result.get("source") == "pass_rate"
 
-    source = result.get("source")
-    if source == "test_pass_rate" and not use_changed:
-        # The orchestrator fell back to (passed/total)*100 — this is test pass
-        # rate, not line coverage.  The threshold was met (satisfied) but the
-        # measurement is a proxy, not independently verified line coverage, so
-        # it is NOT machine-checked proof.  Recording proven=False here is the
-        # fail-closed guard: a task can still merge, but it never earns a
-        # proven-score credit from a proxy on its own.
-        # Note: changed_lines_coverage_pct is never computed from pass rate,
-        # so when it IS available the test_pass_rate branch is skipped.
-        if criterion_met(effective_pct, ">=", threshold):
-            return AcceptanceGateVerdict(
-                True, True, evidence.kind,
-                f"coverage_delta acceptance evidence: achieved {effective_pct}% "
-                f"(test pass rate proxy) >= {threshold}% threshold — "
-                "satisfied but NOT proven (no line-coverage instrumentation)",
-                proof_ref=f"coverage_delta={effective_pct}% (proxy)",
+    if criterion_met(coverage_pct, ">=", threshold):
+        if is_pass_rate:
+            reason = (
+                f"coverage_delta acceptance evidence: achieved {coverage_pct}% "
+                f"test pass rate >= {threshold}% threshold (pass-rate proxy — "
+                f"no line-coverage instrumentation was active)"
+            )
+        else:
+            reason = (
+                f"coverage_delta acceptance evidence: achieved {coverage_pct}% "
+                f"coverage >= {threshold}% threshold"
             )
         return AcceptanceGateVerdict(
-            True, False, evidence.kind,
-            f"coverage_delta acceptance evidence: achieved {effective_pct}% "
-            f"(test pass rate proxy) < {threshold}% threshold",
-        )
-
-    if criterion_met(effective_pct, ">=", threshold):
-        label = "changed-line" if use_changed else "total"
-        ref_key = "changed_lines_coverage_pct" if use_changed else "coverage_delta"
-        return AcceptanceGateVerdict(
             True, True, evidence.kind,
-            f"coverage_delta acceptance evidence: achieved {effective_pct}% "
-            f"{label} coverage >= {threshold}% threshold",
-            proven=True,
-            proof_ref=f"{ref_key}={effective_pct}%",
+            reason,
+            proven=not is_pass_rate,
+            proof_ref=(
+                None if is_pass_rate
+                else f"coverage_delta={coverage_pct}%"
+            ),
         )
 
-    label = "changed-line" if use_changed else "total"
     return AcceptanceGateVerdict(
         True, False, evidence.kind,
-        f"coverage_delta acceptance evidence: achieved {effective_pct}% "
-        f"{label} coverage < {threshold}% threshold",
+        f"coverage_delta acceptance evidence: achieved {coverage_pct}% "
+        f"coverage < {threshold}% threshold",
     )
 
 

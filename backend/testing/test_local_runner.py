@@ -2304,6 +2304,99 @@ class TestRunnerEndpoints:
             prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"] == old_at
         )
 
+    @pytest.mark.asyncio
+    async def test_update_report_creates_alert_on_success(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/runner/update-report with status=success creates an INFO Alert."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        resp = await client.post(
+            "/api/runner/update-report",
+            json={
+                "status": "success",
+                "old_version": "a" * 40,
+                "new_version": "b" * 40,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+
+        # Verify an alert was created.
+        rows = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.event_type == "runner.self_update",
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        alert = rows[0]
+        assert alert.severity == AlertSeverity.INFO
+        assert "succeeded" in alert.title
+        assert runner.hostname in alert.title or str(runner.id)[:8] in alert.title
+        assert "aaaaaaaaaa → bbbbbbbbbb" in alert.message
+
+    @pytest.mark.asyncio
+    async def test_update_report_creates_alert_on_failure(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/runner/update-report with status=failure creates a WARNING Alert."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        resp = await client.post(
+            "/api/runner/update-report",
+            json={"status": "failure"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+
+        rows = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.event_type == "runner.self_update",
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        alert = rows[0]
+        assert alert.severity == AlertSeverity.WARNING
+        assert "failed" in alert.title
+
+    @pytest.mark.asyncio
+    async def test_update_report_rejects_invalid_status(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/runner/update-report rejects unknown status."""
+        project = await _make_project(db_session)
+        _runner, token = await _make_runner(db_session, project.id)
+
+        resp = await client.post(
+            "/api/runner/update-report",
+            json={"status": "unknown"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_update_report_requires_auth(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/runner/update-report returns 401 without a valid token."""
+        resp = await client.post(
+            "/api/runner/update-report",
+            json={"status": "success"},
+        )
+        assert resp.status_code == 401
+
 # ── Durable artifact upload endpoint (FIX M1, backend side) ───────────────────
 
 

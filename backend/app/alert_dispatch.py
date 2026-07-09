@@ -1800,6 +1800,12 @@ from app.runner_health_alerts import (  # noqa: F401
     _runner_escalation_last_notified,
     _runner_low_disk_dedupe_key,
     _runner_outage_escalated_keys,
+    # Idle-GPU alert: runner GPU utilization below threshold
+    _RUNNER_IDLE_GPU_EVENT_TYPE,
+    _RUNNER_IDLE_GPU_THRESHOLD_PCT_DEFAULT,
+    _maybe_create_runner_idle_gpu_alert,
+    _resolve_runner_idle_gpu_alert,
+    _runner_idle_gpu_dedupe_key,
 )
 
 # Stable title prefix for the per-project cost-telemetry-reconciliation-failure alert.

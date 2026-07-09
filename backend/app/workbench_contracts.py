@@ -217,6 +217,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/routers/agent_status.py",
         "backend/app/routers/agent_warm_continuity.py",
         "backend/app/routers/directions.py",
+        "backend/app/routers/runner.py",
         "backend/app/runner_health_alerts.py",
         "backend/app/services.py",
         "backend/app/strategic_events.py",

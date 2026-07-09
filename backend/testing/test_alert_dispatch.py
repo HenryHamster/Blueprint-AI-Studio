@@ -1430,3 +1430,174 @@ async def test_local_runner_hold_alert_handles_notification_failure(
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
     assert alerts[0].task_id == task.id
+
+
+# ── Runner idle-GPU alert ────────────────────────────────────────────────────
+
+from app.alert_dispatch import (  # noqa: E402
+    _RUNNER_IDLE_GPU_EVENT_TYPE,
+    _maybe_create_runner_idle_gpu_alert,
+    _resolve_runner_idle_gpu_alert,
+)
+
+
+async def _idle_gpu_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _RUNNER_IDLE_GPU_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_runner_idle_gpu_alert_creates_and_broadcasts(db_session, mocker):
+    """A GPU runner below the utilization floor raises one WARNING alert and broadcasts it."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    threshold_pct = 10
+    gpu_utilization_pct = 2.0  # 2% — well below idle threshold
+
+    created = await _maybe_create_runner_idle_gpu_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="gpu-runner-01",
+        gpu_utilization_pct=gpu_utilization_pct,
+        threshold_pct=threshold_pct,
+    )
+
+    assert created is True
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "idle" in alert.title.lower()
+    assert "2%" in alert.message  # 2% utilization
+    assert "10%" in alert.message  # 10% threshold
+    bcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_runner_idle_gpu_alert_deduped(db_session, mocker):
+    """Repeated sweep passes create exactly one alert row."""
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    for _ in range(3):
+        await _maybe_create_runner_idle_gpu_alert(
+            db_session,
+            project_id=project.id,
+            runner_id=runner_id,
+            hostname="gpu-runner-01",
+            gpu_utilization_pct=2.0,
+            threshold_pct=10,
+        )
+
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1, "repeated sweep passes must dedup to one alert"
+
+
+@pytest.mark.asyncio
+async def test_runner_idle_gpu_alert_auto_resolves_on_recovery(db_session, mocker):
+    """Alert fires when GPU is idle and auto-resolves when GPU utilization recovers."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    threshold_pct = 10
+
+    # Runner reports idle GPU → alert fires.
+    created = await _maybe_create_runner_idle_gpu_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="gpu-runner-01",
+        gpu_utilization_pct=2.0,
+        threshold_pct=threshold_pct,
+    )
+    assert created is True
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].dismissed_at is None
+
+    # GPU utilization recovers → alert resolves.
+    resolved = await _resolve_runner_idle_gpu_alert(db_session, project.id, runner_id)
+    assert resolved == 1
+
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "alert must dismiss once GPU utilization recovers"
+
+    # Broadcast: once for create, once for dismiss.
+    assert bcast.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_idle_gpu_runner_check_integration(db_session, mocker):
+    """_check_degraded_runners raises an idle-GPU alert and auto-resolves on recovery."""
+    from app.models import LocalRunner
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+    from app.time_utils import _utcnow
+
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Active GPU runner reporting idle utilization (2% — well below the 10% default threshold).
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="hash-idle-gpu",
+        status="active",
+        last_seen_at=_utcnow(),
+        consecutive_job_failures=0,
+        capabilities={"gpu_utilization_pct": 2},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep → idle-GPU alert must fire.
+    await _check_degraded_runners(db_session)
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].dismissed_at is None
+
+    # Second sweep → deduplication (no second alert).
+    await _check_degraded_runners(db_session)
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+    # Runner GPU utilization recovers (80% — above the 10% threshold).
+    await db_session.refresh(runner)
+    caps = dict(runner.capabilities or {})
+    caps["gpu_utilization_pct"] = 80
+    runner.capabilities = caps
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep again → alert must be dismissed.
+    await _check_degraded_runners(db_session)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "idle-GPU alert must auto-resolve on recovery"

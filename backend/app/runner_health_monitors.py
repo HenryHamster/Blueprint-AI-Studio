@@ -2,10 +2,10 @@
 
 Owns the periodic sweeps that detect and alert on degraded runner states:
 stale-runner-deactivation escalations, degraded runners, low-disk conditions,
-and fleet-wide no-healthy-runner events.  All helpers take the caller's
-``session`` and lazily import alert primitives from ``app.alert_dispatch``
-(which re-exports the runner alert helpers from ``app.runner_health_alerts``)
-to avoid load-time circular deps.
+idle-GPU conditions, and fleet-wide no-healthy-runner events.  All helpers take
+the caller's ``session`` and lazily import alert primitives from
+``app.alert_dispatch`` (which re-exports the runner alert helpers from
+``app.runner_health_alerts``) to avoid load-time circular deps.
 
 ``_RUNNER_LIVENESS_SECONDS`` is the canonical definition of the runner
 heartbeat window — used by both the dispatch and monitoring layers.  It is
@@ -18,7 +18,7 @@ Re-exported symbols:
   _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT,
   _sweep_runner_deactivated_escalations,
   _check_low_disk_runners, _check_fleet_no_healthy_runner,
-  _check_degraded_runners
+  _check_degraded_runners, _check_idle_gpu_runners
 """
 
 import logging
@@ -248,6 +248,117 @@ async def _check_low_disk_runners(session: AsyncSession) -> None:
                 )
 
 
+async def _check_idle_gpu_runners(session: AsyncSession) -> None:
+    """Detect GPU runners with low GPU utilization and alert/resolve.
+
+    Queries active runners with recent heartbeats that report GPU utilization;
+    for those reporting ``gpu_utilization_pct`` below the configurable threshold,
+    calls :func:`~app.alert_dispatch._maybe_create_runner_idle_gpu_alert` to raise
+    (or dedup) a WARNING alert. Resolves alerts for runners whose GPU utilization
+    has recovered.
+
+    Called from :func:`_check_degraded_runners` so it shares the same 300s cadence
+    as the other health sweeps.
+    """
+    from app.alert_dispatch import (
+        _RUNNER_IDLE_GPU_EVENT_TYPE,
+        _RUNNER_IDLE_GPU_THRESHOLD_PCT_DEFAULT,
+        _maybe_create_runner_idle_gpu_alert,
+        _resolve_runner_idle_gpu_alert,
+    )
+    from app.models import Alert
+
+    threshold = int(
+        _runtime_config.get(
+            "runner_idle_gpu_threshold_pct", _RUNNER_IDLE_GPU_THRESHOLD_PCT_DEFAULT
+        )
+    )
+
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    active_rows = (
+        await session.execute(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.hostname,
+                LocalRunner.capabilities,
+            ).where(
+                LocalRunner.status == "active",
+                LocalRunner.last_seen_at.is_not(None),
+                LocalRunner.last_seen_at >= cutoff,
+            )
+        )
+    ).all()
+
+    idle_gpu_runner_ids: set[uuid.UUID] = set()
+    for runner_id, project_id, hostname, capabilities in active_rows:
+        gpu_pct = (capabilities or {}).get("gpu_utilization_pct")
+        if gpu_pct is None:
+            continue  # No GPU or no GPU monitoring
+        try:
+            gpu_pct_float = float(gpu_pct)
+        except (TypeError, ValueError):
+            continue
+        if gpu_pct_float < threshold:
+            idle_gpu_runner_ids.add(runner_id)
+            try:
+                await _maybe_create_runner_idle_gpu_alert(
+                    session,
+                    project_id=project_id,
+                    runner_id=runner_id,
+                    hostname=hostname,
+                    gpu_utilization_pct=gpu_pct_float,
+                    threshold_pct=threshold,
+                )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] Failed to create idle-GPU alert for runner %s",
+                    runner_id,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RUNNERS] rollback after idle-GPU alert create failed for %s",
+                        runner_id,
+                    )
+
+    # Resolve alerts for runners whose GPU utilization has recovered.
+    open_idle_gpu = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _RUNNER_IDLE_GPU_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+    for project_id_row, dedupe_key in open_idle_gpu:
+        if not dedupe_key:
+            continue
+        try:
+            runner_id = uuid.UUID(dedupe_key.split(":", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if runner_id in idle_gpu_runner_ids:
+            continue
+        try:
+            await _resolve_runner_idle_gpu_alert(
+                session, project_id_row, runner_id
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve idle-GPU alert for runner %s",
+                runner_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after idle-GPU alert resolve failed for %s",
+                    runner_id,
+                )
+
+
 async def _check_fleet_no_healthy_runner(
     session: AsyncSession,
     degraded_runner_ids: set[uuid.UUID],
@@ -465,3 +576,9 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
         await _check_low_disk_runners(session)
     except Exception:
         logger.exception("[RUNNERS] Failed to sweep low-disk runner alerts")
+
+    # 6. Proactive idle-GPU alert: GPU runners reporting utilization below threshold.
+    try:
+        await _check_idle_gpu_runners(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep idle-GPU runner alerts")

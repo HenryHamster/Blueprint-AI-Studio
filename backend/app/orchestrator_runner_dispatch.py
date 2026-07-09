@@ -44,6 +44,7 @@ from app.runner_health_monitors import (  # noqa: F401
     _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT,
     _check_degraded_runners,
     _check_fleet_no_healthy_runner,
+    _check_idle_gpu_runners,
     _check_low_disk_runners,
     _sweep_runner_deactivated_escalations,
 )

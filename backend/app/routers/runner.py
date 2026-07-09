@@ -34,10 +34,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import create_agent_token, get_current_runner
+from app.broadcast import broadcast_to_project
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.database import get_session
-from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Project, Task, TaskStatus, _utcnow
+from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobStatus, LocalRunner, Project, Task, TaskStatus, _utcnow
 from app.task_capabilities import agent_capability_slice
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -621,6 +622,85 @@ async def heartbeat(
         "enrolled_max_concurrent": caps.get("max_concurrent"),
         "version_hint": _current_sha,
     }
+
+
+class RunnerUpdateReportRequest(BaseModel):
+    """Report the outcome of a runner self-update.
+
+    Sent by ``blueprint-runner update`` after completion (or failure) so the
+    operator console surfaces whether the auto-update succeeded or failed.
+    """
+
+    status: str  # "success" or "failure"
+    old_version: str | None = None
+    new_version: str | None = None
+
+
+@router.post("/update-report")
+async def update_report(
+    payload: RunnerUpdateReportRequest,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Create an operator alert for a runner's self-update outcome.
+
+    Called best-effort by ``blueprint-runner update`` after the update
+    completes (or fails).  Creates an INFO alert on success, WARNING on
+    failure, and broadcasts it so the operator console surfaces the outcome
+    immediately — no need to SSH or grep logs to see if the version bump
+    landed.
+
+    Authenticated via the runner's bearer token (same as heartbeat).
+    Best-effort contract: the runner never blocks its own update CLI on
+    this call — any failure is logged and swallowed.
+    """
+    if payload.status not in ("success", "failure"):
+        raise HTTPException(status_code=400, detail="status must be 'success' or 'failure'")
+
+    runner_label = runner.hostname or f"runner {str(runner.id)[:8]}"
+
+    if payload.status == "success":
+        severity = AlertSeverity.INFO
+        title = f"Runner self-update succeeded: {runner_label}"
+        detail = ""
+        if payload.old_version and payload.new_version:
+            detail = f" {payload.old_version[:10]} → {payload.new_version[:10]}"
+        message = (
+            f"Self-hosted runner {runner_label} ({str(runner.id)[:8]}) "
+            f"auto-updated successfully.{detail}"
+        )
+    else:
+        severity = AlertSeverity.WARNING
+        title = f"Runner self-update failed: {runner_label}"
+        message = (
+            f"Self-hosted runner {runner_label} ({str(runner.id)[:8]}) "
+            f"self-update failed — check the runner's logs for details."
+        )
+
+    alert = Alert(
+        project_id=runner.project_id,
+        severity=severity,
+        title=title,
+        message=message[:1000],
+        source="runner",
+        event_type="runner.self_update",
+    )
+    session.add(alert)
+    await session.commit()
+
+    await broadcast_to_project(
+        str(runner.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+            "domain": alert.domain or "core",
+            "event_type": alert.event_type,
+        },
+    )
+
+    return {"ok": True}
 
 
 class ComputeJobReportRequest(BaseModel):

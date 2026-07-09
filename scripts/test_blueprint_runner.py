@@ -1122,11 +1122,11 @@ class UpdateCommandTests(unittest.TestCase):
     """Tests for the ``blueprint-runner update`` command."""
 
     def test_update_routed_from_main(self):
-        """``main(["update"])`` routes to ``do_update``."""
-        with patch.object(br, "do_update", return_value=0) as upd:
+        """``main(["update"])`` routes to ``_run_update_and_report``."""
+        with patch.object(br, "_run_update_and_report", return_value=0) as routed:
             rc = br.main(["update"])
         self.assertEqual(rc, 0)
-        upd.assert_called_once()
+        routed.assert_called_once()
 
     def test_update_returns_1_when_git_unavailable(self):
         """When _git returns None (git absent), do_update prints an error and returns 1."""
@@ -1246,6 +1246,53 @@ class UpdateCommandTests(unittest.TestCase):
             rc = br.do_update(_run=run)
         self.assertEqual(rc, 0)
         restart_mock.assert_called_once()
+
+    def test_update_reports_success_to_orchestrator(self):
+        """_run_update_and_report POSTs the update result on success."""
+        with patch.object(br, "do_update", return_value=0) as update_mock, \
+             patch.object(br, "_post_update_result") as post_mock, \
+             patch.object(br, "_git", return_value=MagicMock(returncode=0, stdout="a" * 40)), \
+             patch.object(br, "resolve_url", return_value="https://example.com"), \
+             patch.object(br, "resolve_token", return_value="test-token"):
+            rc = br._run_update_and_report()
+        self.assertEqual(rc, 0)
+        update_mock.assert_called_once()
+        post_mock.assert_called_once()
+        kwargs = post_mock.call_args[1]
+        self.assertEqual(kwargs["status"], "success")
+        self.assertEqual(kwargs["old_version"], "a" * 40)
+        self.assertEqual(kwargs["new_version"], "a" * 40)
+
+    def test_update_reports_failure_to_orchestrator(self):
+        """_run_update_and_report POSTs the update result on failure."""
+        with patch.object(br, "do_update", return_value=1) as update_mock, \
+             patch.object(br, "_post_update_result") as post_mock, \
+             patch.object(br, "_git", return_value=MagicMock(returncode=0, stdout="a" * 40)), \
+             patch.object(br, "resolve_url", return_value="https://example.com"), \
+             patch.object(br, "resolve_token", return_value="test-token"):
+            rc = br._run_update_and_report()
+        self.assertEqual(rc, 1)
+        update_mock.assert_called_once()
+        post_mock.assert_called_once()
+        kwargs = post_mock.call_args[1]
+        self.assertEqual(kwargs["status"], "failure")
+
+    def test_update_report_does_not_block_on_post_failure(self):
+        """_run_update_and_report returns the update exit code even if POST fails."""
+        with patch.object(br, "do_update", return_value=0), \
+             patch.object(br, "_post_update_result", side_effect=RuntimeError("network error")), \
+             patch.object(br, "_git", return_value=MagicMock(returncode=0, stdout="a" * 40)), \
+             patch.object(br, "resolve_url", return_value="https://example.com"), \
+             patch.object(br, "resolve_token", return_value="test-token"):
+            rc = br._run_update_and_report()
+        self.assertEqual(rc, 0)
+
+    def test_update_main_routes_to_run_update_and_report(self):
+        """``main(["update"])`` routes to ``_run_update_and_report``, not ``do_update``."""
+        with patch.object(br, "_run_update_and_report", return_value=0) as routed:
+            rc = br.main(["update"])
+        self.assertEqual(rc, 0)
+        routed.assert_called_once()
 
 
 class RestartServiceTests(unittest.TestCase):

@@ -30,6 +30,8 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -1035,6 +1037,47 @@ def do_status() -> int:
     return 0
 
 
+def _post_update_result(
+    url: str,
+    token: str,
+    *,
+    status: str,
+    old_version: str | None = None,
+    new_version: str | None = None,
+) -> None:
+    """POST the update outcome to the orchestrator. Best-effort, never raises.
+
+    ``status`` must be ``"success"`` or ``"failure"``.  Uses Python stdlib
+    ``urllib`` so there is no extra dependency.  Any HTTP / network / timeout
+    error is silently swallowed — the update CLI must never block on this.
+
+    Called from ``main()`` after ``do_update()`` returns.
+    """
+    endpoint = f"{url}/api/runner/update-report"
+    body = json.dumps(
+        {
+            "status": status,
+            "old_version": old_version,
+            "new_version": new_version,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        pass  # Best-effort — never fail the update CLI over a notification
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="blueprint-runner",
@@ -1162,6 +1205,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_update_and_report() -> int:
+    """Run ``do_update()``, capture version before/after, and report to orchestrator.
+
+    Best-effort POST to ``/api/runner/update-report`` so the operator console
+    surfaces the outcome.  A reporting failure is silently swallowed — the CLI
+    returns ``do_update()``'s exit code regardless.
+    """
+    # Capture version before update.
+    old_version: str | None = None
+    head_result = _git(["rev-parse", "HEAD"], cwd=_REPO_ROOT)
+    if head_result and head_result.returncode == 0:
+        old_version = head_result.stdout.strip()
+
+    rc = do_update()
+
+    # Capture version after update.
+    new_version: str | None = None
+    head_result = _git(["rev-parse", "HEAD"], cwd=_REPO_ROOT)
+    if head_result and head_result.returncode == 0:
+        new_version = head_result.stdout.strip()
+
+    # Report to orchestrator (best-effort).
+    try:
+        _post_update_result(
+            url=resolve_url(None),
+            token=resolve_token(None),
+            status="success" if rc == 0 else "failure",
+            old_version=old_version,
+            new_version=new_version,
+        )
+    except Exception:
+        pass
+
+    return rc
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1171,7 +1250,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "update":
-        return do_update()
+        return _run_update_and_report()
 
     if args.command == "uninstall":
         return do_uninstall(
