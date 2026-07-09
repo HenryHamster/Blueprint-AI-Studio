@@ -7,6 +7,7 @@ import type {
   EffortEfficiencyRow,
   ModelEfficiencyRow,
   ProviderRoutingVerdict,
+  ProviderRoutingShare,
 } from '../types/digest';
 
 function bucket(overrides: Partial<EfficiencyBucket> = {}): EfficiencyBucket {
@@ -349,6 +350,58 @@ describe('EffortEfficiencyPanel', () => {
     // Positive delta should show the '+' prefix.
     expect(screen.getByText(/\+4\.2pp/)).toBeInTheDocument();
     expect(screen.getByText(/0.42x/)).toBeInTheDocument();
+  });
+
+  it('renders provider routing distribution table with per-provider stats and totals', () => {
+    const share: ProviderRoutingShare = {
+      by_provider: [
+        { provider: 'deepseek', run_count: 30, pr_eligible_run_count: 28, verified_landed_count: 20, verified_landed_rate: 0.714, total_cost_usd: 12.5, cost_per_merge: 0.63 },
+        { provider: 'anthropic', run_count: 10, pr_eligible_run_count: 8, verified_landed_count: 6, verified_landed_rate: 0.75, total_cost_usd: 5.0, cost_per_merge: 0.83 },
+      ],
+      total_run_count: 40,
+      total_pr_eligible_run_count: 36,
+    };
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_share: share })} />);
+    // Section heading.
+    expect(screen.getByText(/Provider Routing Distribution/)).toBeInTheDocument();
+    // Per-provider rows: lowercase provider names (CSS capitalize, not text transform).
+    expect(screen.getByText('deepseek')).toBeInTheDocument();
+    expect(screen.getByText('anthropic')).toBeInTheDocument();
+    // DeepSeek-specific numbers unique to the routing share.
+    expect(screen.getByText('30')).toBeInTheDocument();  // deepseek run_count
+    expect(screen.getByText('28')).toBeInTheDocument();  // deepseek pr_eligible
+    // Anthropic-specific numbers.
+    expect(screen.getByText('8')).toBeInTheDocument();   // anthropic pr_eligible
+    // Verified rates.
+    expect(screen.getByText(/71%/)).toBeInTheDocument();  // deepseek rate
+    expect(screen.getByText(/75%/)).toBeInTheDocument();  // anthropic rate
+    // Cost per merge
+    expect(screen.getByText(/\$0\.63/)).toBeInTheDocument();
+    expect(screen.getByText(/\$0\.83/)).toBeInTheDocument();
+    // Totals row.
+    expect(screen.getByText('Total')).toBeInTheDocument();
+    expect(screen.getByText('36')).toBeInTheDocument();  // total_pr_eligible
+  });
+
+  it('renders a single provider row for routing distribution', () => {
+    const share: ProviderRoutingShare = {
+      by_provider: [
+        { provider: 'deepseek', run_count: 5, pr_eligible_run_count: 5, verified_landed_count: 3, verified_landed_rate: 0.6, total_cost_usd: 10.0, cost_per_merge: 3.33 },
+      ],
+      total_run_count: 5,
+      total_pr_eligible_run_count: 5,
+    };
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_share: share })} />);
+    expect(screen.getByText(/Provider Routing Distribution/)).toBeInTheDocument();
+    expect(screen.getByText('deepseek')).toBeInTheDocument();
+    expect(screen.getByText('Total')).toBeInTheDocument();
+    // Single provider totals match.
+    expect(screen.getAllByText('5').length).toBeGreaterThanOrEqual(2); // runs + pr-eligible + total
+  });
+
+  it('hides the routing distribution table when provider_routing_share is absent', () => {
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_share: undefined })} />);
+    expect(screen.queryByText(/Provider Routing Distribution/)).not.toBeInTheDocument();
   });
 
   it('hides the verdict callout when provider_routing_verdict is absent', () => {

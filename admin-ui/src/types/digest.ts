@@ -359,6 +359,25 @@ export interface ProviderRoutingVerdict {
   recommended_action: string;
 }
 
+// Per-provider routing share (run count, verified merge rate, cost) aggregated
+// from the by_model rows. Mirrors the backend compute_provider_routing_share
+// return shape so the UI can display the distribution at a glance.
+export interface ProviderRoutingShareEntry {
+  provider: string;
+  run_count: number;
+  pr_eligible_run_count: number;
+  verified_landed_count: number;
+  verified_landed_rate: number | null;
+  total_cost_usd: number;
+  cost_per_merge: number | null;
+}
+
+export interface ProviderRoutingShare {
+  by_provider: ProviderRoutingShareEntry[];
+  total_run_count: number;
+  total_pr_eligible_run_count: number;
+}
+
 export interface EffortModelEfficiency {
   by_effort: EffortEfficiencyRow[];
   by_model: ModelEfficiencyRow[];
@@ -369,6 +388,7 @@ export interface EffortModelEfficiency {
     combos: EfficiencyFallbackCombo[];
   };
   provider_routing_verdict?: ProviderRoutingVerdict;
+  provider_routing_share?: ProviderRoutingShare;
 }
 
 // Dependency/foundation-resolution observability (read-only). Mirrors the

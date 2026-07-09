@@ -74,6 +74,30 @@ function makeData(): EffortModelEfficiency {
       },
       recommended_action: 'INSUFFICIENT_DATA — only 5 DeepSeek runs (need ≥ 30) — keep collecting data before deciding',
     },
+    provider_routing_share: {
+      by_provider: [
+        {
+          provider: 'deepseek',
+          run_count: 5,
+          pr_eligible_run_count: 5,
+          verified_landed_count: 3,
+          verified_landed_rate: 0.6,
+          total_cost_usd: 10.0,
+          cost_per_merge: 3.33,
+        },
+        {
+          provider: 'anthropic',
+          run_count: 200,
+          pr_eligible_run_count: 195,
+          verified_landed_count: 156,
+          verified_landed_rate: 0.8,
+          total_cost_usd: 500.0,
+          cost_per_merge: 3.21,
+        },
+      ],
+      total_run_count: 205,
+      total_pr_eligible_run_count: 200,
+    },
   };
 }
 
