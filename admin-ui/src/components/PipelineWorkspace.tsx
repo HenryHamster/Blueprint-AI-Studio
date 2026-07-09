@@ -1,4 +1,4 @@
-import { useEffect, useState, type ComponentProps, type ReactNode } from 'react';
+import { useEffect, useState, memo, type ComponentProps, type ReactNode } from 'react';
 import { ChevronDown, ChevronRight, Star } from 'lucide-react';
 import ArchiveView from './ArchiveView';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -583,7 +583,7 @@ function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardPro
   );
 }
 
-export function PipelineWorkspace({
+export const PipelineWorkspace = memo(function PipelineWorkspace({
   surface,
   chrome,
   archive,
@@ -707,4 +707,4 @@ export function PipelineWorkspace({
       )}
     </WorkbenchSurface>
   );
-}
+});

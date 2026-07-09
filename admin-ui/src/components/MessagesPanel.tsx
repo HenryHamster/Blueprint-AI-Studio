@@ -1391,10 +1391,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
 
-  // Record data-ready timing when initial load completes (once per surface entry)
+  // Record chat data-ready timing when conversation messages first render (once per page load)
   const initialLoadDoneRef = useRef(false);
   useEffect(() => {
-    if (loading || initialLoadDoneRef.current) return;
+    if (loading || initialLoadDoneRef.current || !conversationMode) return;
     initialLoadDoneRef.current = true;
     const ms = Math.round(performance.now());
     const surface = (window.location.hash.replace(/^#\/?/, '').split('/')[0] || 'chat').slice(0, 64);
@@ -1403,10 +1403,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       fetch('/api/admin/ui-load-timing', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ surface, page_ready_ms: ms, sample_type: 'data_ready' }),
+        body: JSON.stringify({ surface, page_ready_ms: ms, sample_type: 'chat_data_ready' }),
       }).catch(() => {});
     }).catch(() => {});
-  }, [loading]);
+  }, [loading, conversationMode]);
 
   useEffect(() => {
     if (!realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;

@@ -1614,6 +1614,16 @@ async def get_autonomous_status(
                 select(Project)
                 .where(Project.id.in_(user_pids))
                 .order_by(Project.created_at.desc())
+                .limit(200)
+                .options(
+                    load_only(
+                        Project.id,
+                        Project.name,
+                        Project.autonomous_enabled,
+                        Project.build_config,
+                        raiseload=True,
+                    )
+                )
             )
         )
         .scalars()

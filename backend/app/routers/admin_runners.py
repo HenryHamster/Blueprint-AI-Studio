@@ -370,7 +370,7 @@ async def register_runner(
 @router.get("/projects/{project_id}/runners")
 async def list_runners(
     project_id: uuid.UUID,
-    limit: int | None = Query(default=None, ge=1, le=1000),
+    limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
@@ -387,8 +387,7 @@ async def list_runners(
         )
         .order_by(LocalRunner.created_at.desc())
     )
-    if limit is not None:
-        query = query.limit(limit).offset(offset)
+    query = query.limit(limit).offset(offset)
     result = await session.execute(query)
     return [_runner_view(r) for r in result.scalars().all()]
 
@@ -552,6 +551,11 @@ async def fleet_runners_health_summary(
         .limit(_MAX_HEALTH_RUNNERS)
     )
     all_runners = result.scalars().all()
+    if len(all_runners) == _MAX_HEALTH_RUNNERS:
+        logger.warning(
+            "[FLEET-HEALTH] health-summary hit limit=%d; some runners excluded",
+            _MAX_HEALTH_RUNNERS,
+        )
 
     per_project: Dict[str, List[LocalRunner]] = {}
     for runner in all_runners:

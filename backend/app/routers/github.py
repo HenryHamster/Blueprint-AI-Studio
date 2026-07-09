@@ -654,15 +654,22 @@ async def github_webhook(
         ci_tasks = (
             (
                 await session.execute(
-                    select(Task).where(
+                    select(Task)
+                    .where(
                         Task.status == TaskStatus.EVALUATING,
                         Task.project_id == project.id,
                     )
+                    .limit(200)
                 )
             )
             .scalars()
             .all()
         )
+        if len(ci_tasks) == 200:
+            logger.warning(
+                f"[WEBHOOK] github_webhook CI task lookup for {owner}/{repo} hit limit=200; "
+                "some EVALUATING tasks may be missed"
+            )
 
         # Match strategies (in order of specificity):
         #   1. head_sha equality — the original precise match, set by the review

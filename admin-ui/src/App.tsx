@@ -407,7 +407,7 @@ export default function App() {
     : combinedAlerts.some(a => a.severity === 'WARNING') ? 'WARNING'
     : combinedAlerts.length > 0 ? 'INFO' : null;
 
-  const strategicReadModel = useStrategicReadModel(s.selectedProjectId);
+  const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: activeTab === 'chat' });
   useEffect(() => {
     refreshStrategicReadModelRef.current = () => {
       void strategicReadModel.refresh();
@@ -620,7 +620,11 @@ export default function App() {
       if (selectedProjectIdRef.current === projectId) setStrategicSessionBusy(false);
     }
   }, [strategicSessionBusy, s, strategicReadModel]);
-  const taskContextSessionProps = { sessionRefs: strategicWorkbenchState?.selected_refs, savingSessionRefs: savingStrategicWorkbench, onUpdateSessionRefs: updateStrategicSessionRefs };
+  const taskContextSessionProps = useMemo(() => ({
+    sessionRefs: strategicWorkbenchState?.selected_refs,
+    savingSessionRefs: savingStrategicWorkbench,
+    onUpdateSessionRefs: updateStrategicSessionRefs,
+  }), [strategicWorkbenchState?.selected_refs, savingStrategicWorkbench, updateStrategicSessionRefs]);
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -861,9 +865,45 @@ export default function App() {
     setHealthCheckUrlsInput(s.healthCheckUrls.join('\n'));
   }, [s.healthCheckUrls]);
   const ignoreEmbeddedSettingsClose = useCallback(() => {}, []);
-  const settingsRouterProps: Omit<SettingsSectionRouterProps, 'activeSection'> = {
+  // useCallback for inline closures passed to PipelineWorkspace props
+  const handleNavigateToParent = useCallback((parentTaskId: string) => {
+    navigator.clipboard.writeText(parentTaskId).then(() => {
+      addToast('Parent task ID copied — use search to find it', 'info');
+    }).catch(() => {
+      addToast(`Could not copy to clipboard — parent task ID: ${parentTaskId}`, 'error');
+    });
+  }, [addToast]);
+  const handleArchiveGroup = useCallback((taskIds: string[]) => {
+    s.setConfirmDialog({
+      title: 'Archive this group?',
+      message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} (parent + children). They can be viewed and unarchived from the Archive view.`,
+      confirmLabel: 'Archive group',
+      onConfirm: () => s.handleBulkArchiveColumn(taskIds),
+    });
+  }, [s.setConfirmDialog, s.handleBulkArchiveColumn]);
+  const handleBoardCtrlClick = useCallback((taskId: string) => {
+    if (!s.selectionMode) s.setSelectionMode(true);
+    s.toggleTaskSelection(taskId);
+  }, [s.selectionMode, s.setSelectionMode, s.toggleTaskSelection]);
+  const handleBoardArchiveColumn = useCallback((taskIds: string[], columnLabel: string) => {
+    s.setConfirmDialog({
+      title: `Archive all ${columnLabel} tasks?`,
+      message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} in the ${columnLabel} column. They can be viewed and unarchived from the Archive view.`,
+      confirmLabel: `Archive ${columnLabel}`,
+      onConfirm: () => s.handleBulkArchiveColumn(taskIds),
+    });
+  }, [s.setConfirmDialog, s.handleBulkArchiveColumn]);
+  const handleBoardDirectionClick = useCallback((dirId: string) => {
+    setResearchBrowserDirectionId(dirId);
+    s.setShowResearchBrowser(true);
+  }, [setResearchBrowserDirectionId, s.setShowResearchBrowser]);
+  const handleClearWaveDeps = useMemo(() => {
+    const pid = s.selectedProjectId;
+    return pid ? () => s.handleClearWaveDeps(pid) : undefined;
+  }, [s.selectedProjectId, s.handleClearWaveDeps]);
+  const settingsRouterProps: Omit<SettingsSectionRouterProps, 'activeSection'> = useMemo(() => ({
     isAdmin: s.userRole === 'admin',
-    onNavigateToSection: (section) => {
+    onNavigateToSection: (section: string) => {
       if (section === 'notifications') {
         setRuntimeSection('settings');
         setRuntimeConfigSection('notifications');
@@ -1031,7 +1071,81 @@ export default function App() {
     promotionTargetData: s.promotionTargetData,
     onUpdatePromotionTarget: s.handleUpdatePromotionTarget,
     selectedProjectOnboardingProof: selectedProject?.onboarding_proof ?? null,
-  };
+  }), [
+    s.userRole, setRuntimeSection, setRuntimeConfigSection,
+    ignoreEmbeddedSettingsClose, allModelOptions, healthCheckUrlsInput, setHealthCheckUrlsInput,
+    s.updateHealthCheckUrls, s.defaultTaskType, s.setDefaultTaskType,
+    s.viewMode, s.setViewMode, s.refreshInterval, s.setRefreshInterval,
+    s.limit, s.setLimit, s.apiHealthy, s.wsConnected, s.lastFetchTime,
+    s.notifyOnComplete, s.setNotifyOnComplete, s.notifyOnFail, s.setNotifyOnFail,
+    s.notifyOnApprovalNeeded, s.setNotifyOnApprovalNeeded,
+    s.soundOnComplete, s.setSoundOnComplete,
+    s.notifyOnHighSignalMessage, s.setNotifyOnHighSignalMessage,
+    s.maxConcurrentVMs, s.updateMaxVMs, s.maxRetries, s.updateMaxRetries,
+    s.requireApprovalGates, s.updateRequireApprovalGates,
+    s.autoArchiveEnabled, s.updateAutoArchiveEnabled,
+    s.autoArchiveTerminalAfterDays, s.updateAutoArchiveTerminalAfterDays,
+    s.autoArchiveMaxTerminalTasksPerProject, s.updateAutoArchiveMaxTerminalTasksPerProject,
+    s.autoArchiveIntervalMinutes, s.updateAutoArchiveIntervalMinutes,
+    s.maxAutonomousTasksPerHour, s.handleUpdateMaxAutonomousRate,
+    s.maxGlobalAutonomousTasksPerHour, s.updateMaxGlobalAutonomousRate,
+    s.maxPipelineSlots, s.updateMaxPipelineSlots,
+    s.reservedSlotsForTypes, s.updateReservedSlotsForTypes,
+    s.evaluatingPipelineTimeoutMinutes, s.updateEvaluatingPipelineTimeout,
+    s.evaluatingFailHours, s.updateEvaluatingFailHours,
+    s.ciBackstopTimeoutMinutes, s.updateCiBackstopTimeout,
+    s.autonomousResearchIntervalMinutes, s.handleUpdateAutonomousResearchInterval,
+    s.directionCooldownMinutes, s.handleUpdateDirectionCooldownMinutes,
+    s.strategicResearchFrequency, s.handleUpdateStrategicResearchFrequency,
+    s.projects, s.handlePauseAllAutonomous, s.handleRestartOrchestrator,
+    s.directionChurnWindowCycles, s.updateDirectionChurnWindowCycles,
+    s.directionChurnNonMergeThreshold, s.updateDirectionChurnNonMergeThreshold,
+    s.directionChurnMinMergeRate, s.updateDirectionChurnMinMergeRate,
+    s.directionLifetimeNonMergeThreshold, s.updateDirectionLifetimeNonMergeThreshold,
+    s.directionLifetimeMinMergeRate, s.updateDirectionLifetimeMinMergeRate,
+    s.directionReviewRecommendationThreshold, s.updateDirectionReviewRecommendationThreshold,
+    s.githubAccount, s.connectGitHub, s.maxPlanAccounts,
+    s.toggleMaxPlanAccount, s.removeMaxPlanAccount,
+    s.resetAccountRateLimits, s.refreshAccountModels,
+    s.updateMaxPlanAccount, s.updateAccountCaps,
+    s.showUserManagement, s.setShowUserManagement,
+    showProjectMembers, setShowProjectMembers,
+    selectedProject?.my_role,
+    s.newAccountName, s.setNewAccountName,
+    s.newAccountProvider, s.setNewAccountProvider,
+    s.newAccountAuthMode, s.setNewAccountAuthMode,
+    s.newAccountToken, s.setNewAccountToken,
+    s.newAccountProviderMetadata, s.setNewAccountProviderMetadata,
+    s.newAccountClaudeConfigJson, s.setNewAccountClaudeConfigJson,
+    s.newAccountDailyTaskCap, s.setNewAccountDailyTaskCap,
+    s.newAccountMaxConcurrentTasks, s.setNewAccountMaxConcurrentTasks,
+    s.newAccountAutoDisableAfterRateLimits, s.setNewAccountAutoDisableAfterRateLimits,
+    s.addMaxPlanAccount, s.providers,
+    s.providerSettingsDefaults, s.taskTypeProviderOverrides, s.providerSettingsByEffort,
+    s.updateProviderSettingsDefaults, s.updateTaskTypeProviderOverrides,
+    s.updateProviderSettingsByEffort,
+    s.providerSelectionMode, s.updateProviderSelectionMode,
+    s.taskTypeCategories, s.updateTaskTypeCategories,
+    s.categoryRouting, s.updateCategoryRouting,
+    s.taskTypeRouting, s.updateTaskTypeRouting,
+    s.deployState, s.handlePausePipeline, s.handleResumePipeline,
+    s.handleResetHealth, s.handleRollback, s.handleMarkStable, s.handleRepairState,
+    s.failedRollback, s.zoneHealth,
+    s.notificationConfig, s.updateNotificationConfig,
+    s.dailyCostCeilingUsd, s.updateDailyCostCeiling,
+    s.selectedProjectId,
+    selectedProject?.github_owner, selectedProject?.github_repo,
+    selectedProject?.is_self_repo,
+    s.buildConfig, s.handleUpdateBuildConfig, s.handleDetectBuildConfig,
+    s.autoRemediationConfig, s.autoRemediationStats, s.handleUpdateAutoRemediationConfig,
+    s.issueImplementationConfig, s.handleUpdateIssueImplementationConfig,
+    s.autoReviewConfig, s.handleUpdateAutoReviewConfig,
+    s.resourceEnvelopeData, s.resourceEnvelopeLoading, s.resourceEnvelopeError,
+    s.handleUpdateResourceEnvelope,
+    s.integrationBranchData, s.handleUpdateIntegrationBranch,
+    s.promotionTargetData, s.handleUpdatePromotionTarget,
+    selectedProject?.onboarding_proof,
+  ]);
 
   // activeTab drives the four operator modes: Strategic, Pipeline, Project, Runtime.
   const handleTabChange = useCallback((tab: PrimaryTab) => {
@@ -1737,22 +1851,9 @@ export default function App() {
             loading: s.initialLoading,
             hasActiveFilters,
             onViewLogs: handleOpenTaskDetails,
-            onNavigateToParent: (parentTaskId) => {
-              navigator.clipboard.writeText(parentTaskId).then(() => {
-                s.addToast('Parent task ID copied — use search to find it', 'info');
-              }).catch(() => {
-                s.addToast(`Could not copy to clipboard — parent task ID: ${parentTaskId}`, 'error');
-              });
-            },
-            onClearWaveDeps: s.selectedProjectId ? (() => { const pid = s.selectedProjectId; return pid ? () => s.handleClearWaveDeps(pid) : undefined; })() : undefined,
-            onArchiveGroup: (taskIds) => {
-              s.setConfirmDialog({
-                title: 'Archive this group?',
-                message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} (parent + children). They can be viewed and unarchived from the Archive view.`,
-                confirmLabel: 'Archive group',
-                onConfirm: () => s.handleBulkArchiveColumn(taskIds),
-              });
-            },
+            onNavigateToParent: handleNavigateToParent,
+            onClearWaveDeps: handleClearWaveDeps,
+            onArchiveGroup: handleArchiveGroup,
             onUnarchiveTask: s.handleUnarchiveTask,
           }}
           rail={{
@@ -1776,18 +1877,11 @@ export default function App() {
             selectionMode: s.selectionMode,
             selectedTaskIds: s.selectedTaskIds,
             onToggleTaskSelection: s.toggleTaskSelection,
-            onCtrlClick: (taskId) => { if (!s.selectionMode) s.setSelectionMode(true); s.toggleTaskSelection(taskId); },
+            onCtrlClick: handleBoardCtrlClick,
             onBulkToggle: s.bulkColumnToggle,
             onShiftSelect: s.shiftSelectRange,
             hasActiveFilters,
-            onArchiveColumn: (taskIds, columnLabel) => {
-              s.setConfirmDialog({
-                title: `Archive all ${columnLabel} tasks?`,
-                message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} in the ${columnLabel} column. They can be viewed and unarchived from the Archive view.`,
-                confirmLabel: `Archive ${columnLabel}`,
-                onConfirm: () => s.handleBulkArchiveColumn(taskIds),
-              });
-            },
+            onArchiveColumn: handleBoardArchiveColumn,
             onApprove: s.handleApprove,
             onRequestChanges: s.handleRequestChanges,
             onCancel: s.handleCancel,
@@ -1800,7 +1894,7 @@ export default function App() {
             trackedTaskIds: s.trackedTaskIds,
             onDuplicate: s.openDuplicateTaskModal,
             searchQuery: s.searchQuery,
-            onDirectionClick: (dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); },
+            onDirectionClick: handleBoardDirectionClick,
           }}
           metrics={{
             activeTasks: visibleActiveTasks,

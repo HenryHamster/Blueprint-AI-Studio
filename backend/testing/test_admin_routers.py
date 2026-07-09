@@ -7248,7 +7248,7 @@ class TestMessagesWorkbenchState:
         assert "preferred_runner_id" not in marker
 
     @pytest.mark.asyncio
-    async def test_list_runners_returns_all_by_default(
+    async def test_list_runners_returns_all_with_explicit_limit(
         self, client: AsyncClient, db_session
     ):
         project = await _make_project(db_session)
@@ -7265,12 +7265,45 @@ class TestMessagesWorkbenchState:
         db_session.add_all(runners)
         await db_session.commit()
 
-        resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners?limit=1000"
+        )
         assert resp.status_code == 200
         listed = resp.json()
         assert len(listed) == 205
         assert listed[0]["hostname"] == "runner-000"
         assert listed[-1]["hostname"] == "runner-204"
+
+    @pytest.mark.asyncio
+    async def test_list_runners_default_limit(
+        self, client: AsyncClient, db_session
+    ):
+        """Call without limit param; should return at most 50 runners by default."""
+        project = await _make_project(db_session)
+        runners = [
+            LocalRunner(
+                project_id=project.id,
+                token_hash=f"{i:064x}",
+                hostname=f"runner-{i:03d}",
+                status="active",
+                created_at=_utcnow() - timedelta(seconds=i),
+            )
+            for i in range(205)
+        ]
+        db_session.add_all(runners)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners"
+        )
+        assert resp.status_code == 200
+        listed = resp.json()
+        # Default limit is 50; with 205 seeded runners we expect exactly 50
+        assert len(listed) == 50, f"expected 50 (default limit), got {len(listed)}"
+        # Runners are ordered by created_at DESC; the most-recently-created
+        # (lowest i) should appear first
+        assert listed[0]["hostname"] == "runner-000"
+        assert listed[-1]["hostname"] == "runner-049"
 
     @pytest.mark.asyncio
     async def test_leaving_continuous_mode_clears_local_continuation_marker(

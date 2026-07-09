@@ -516,23 +516,35 @@ class LocalSubprocessComputeBackend:
                 message=f"local subprocess already running pid={existing.proc.pid}",
                 metadata=dict(artifact_meta),
             )
-        persisted_pid = _local_subprocess_pid_for_external_id(external_id)
-        if persisted_pid is not None and _is_pid_running(persisted_pid):
+        persisted_pid = await asyncio.to_thread(
+            _local_subprocess_pid_for_external_id, external_id
+        )
+        if persisted_pid is not None and await _aio_is_pid_running(persisted_pid):
             return ComputeLaunchResult(
                 external_id=external_id,
-                started_at=_local_subprocess_started_at_for_external_id(external_id)
+                started_at=(
+                    await asyncio.to_thread(
+                        _local_subprocess_started_at_for_external_id, external_id
+                    )
+                )
                 or _utcnow(),
                 cost_rate_per_second=0.0,
                 message=f"adopted existing local subprocess pid={persisted_pid}",
                 metadata={"pid": persisted_pid, **artifact_meta},
             )
-        if _read_local_terminal_status_for_external_id(external_id) is not None:
+        if await asyncio.to_thread(
+            _read_local_terminal_status_for_external_id, external_id
+        ) is not None:
             metadata: dict[str, Any] = dict(artifact_meta)
             if persisted_pid is not None:
                 metadata["pid"] = persisted_pid
             return ComputeLaunchResult(
                 external_id=external_id,
-                started_at=_local_subprocess_started_at_for_external_id(external_id)
+                started_at=(
+                    await asyncio.to_thread(
+                        _local_subprocess_started_at_for_external_id, external_id
+                    )
+                )
                 or _utcnow(),
                 cost_rate_per_second=0.0,
                 message="adopted completed local subprocess via terminal marker",
@@ -564,7 +576,7 @@ class LocalSubprocessComputeBackend:
             _launch_spawn_subprocess,
             _cmd,
             spec.cwd or None,
-            env,
+            env
         )
         self._processes[external_id] = _LocalProcessHandle(
             proc=proc, started_at=started_at
@@ -580,11 +592,11 @@ class LocalSubprocessComputeBackend:
     async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
         handle = self._processes.get(job.external_compute_id or "")
         if handle is None:
-            # Offload sync file I/O to a thread-pool thread.
+            # Offload sync file I/O to a thread-pool thread
             terminal = await asyncio.to_thread(_read_local_terminal_status, job)
             if terminal is not None:
                 return terminal
-            pid = _local_subprocess_pid(job)
+            pid = await asyncio.to_thread(_local_subprocess_pid, job)
             if pid is None:
                 return ComputeStatusResult(
                     status=ComputeJobStatus.FAILED,
@@ -595,7 +607,7 @@ class LocalSubprocessComputeBackend:
                 live_output = await asyncio.to_thread(_read_local_live_tail, job)
                 return ComputeStatusResult(
                     status=ComputeJobStatus.RUNNING,
-                    live_output=live_output,
+                    live_output=live_output
                 )
             terminal = await asyncio.to_thread(_read_local_terminal_status, job)
             if terminal is not None:
@@ -610,7 +622,7 @@ class LocalSubprocessComputeBackend:
             live_output = await asyncio.to_thread(_read_local_live_tail, job)
             return ComputeStatusResult(
                 status=ComputeJobStatus.RUNNING,
-                live_output=live_output,
+                live_output=live_output
             )
         self._processes.pop(job.external_compute_id or "", None)
         terminal = await asyncio.to_thread(_read_local_terminal_status, job)
@@ -643,8 +655,8 @@ class LocalSubprocessComputeBackend:
                 return True
             pid = handle.proc.pid
         else:
-            pid = _local_subprocess_pid(job)
-            if pid is None or not _is_pid_running(pid):
+            pid = await asyncio.to_thread(_local_subprocess_pid, job)
+            if pid is None or not await _aio_is_pid_running(pid):
                 return True
         try:
             os.killpg(pid, signal.SIGTERM)
@@ -1680,6 +1692,10 @@ def _is_pid_running(pid: int) -> bool:
     except OSError:
         return True
     return len(fields) < 3 or fields[2] != "Z"
+
+
+async def _aio_is_pid_running(pid: int) -> bool:
+    return await asyncio.to_thread(_is_pid_running, pid)
 
 
 def _accrued_cost(job: ComputeJob, as_of: datetime) -> float:
