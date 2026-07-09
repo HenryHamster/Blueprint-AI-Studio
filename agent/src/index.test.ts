@@ -5091,6 +5091,62 @@ describe('main pool-mode startup ordering', () => {
       .join('\n');
     expect(curlReports).not.toContain('vm_config_missing');
   });
+
+  it('skips the missingCredentials check when VM_INSTANCE_ID starts with "runner:" (self-hosted runner)', async () => {
+    // A self-hosted runner's credentials are assigned dynamically by the
+    // backend pool via /api/runner/next-task and injected by the runner as
+    // env vars. There is no static local env-var credential path, so the
+    // runner: prefix in VM_INSTANCE_ID tells validateProviderAuth to skip
+    // the missingCredentials() check that would otherwise kill the agent
+    // pre-claim with 'missing provider credentials'.
+    const origRunnerVmId = process.env.VM_INSTANCE_ID;
+    const origAnthropicKey = process.env.ANTHROPIC_API_KEY;
+    process.env.VM_INSTANCE_ID = 'runner:test-runner';
+    delete process.env.ANTHROPIC_API_KEY;
+    refreshRuntimeState();
+
+    const execMock = vi.mocked(execFileSync);
+    execMock.mockClear();
+    (spawn as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') void Promise.resolve().then(() => { handler(0); });
+      }),
+      kill: vi.fn(),
+    }));
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/next-role')) {
+        return Promise.resolve({
+          status: 200,
+          json: () => Promise.resolve({ action: 'exit', reason: 'test-complete' }),
+        });
+      }
+      return Promise.resolve({
+        status: 204, ok: true,
+        text: () => Promise.resolve(''),
+        json: () => Promise.resolve({}),
+        headers: { get: () => null },
+      });
+    });
+
+    // main() exits the pool cleanly via the next-role 'exit' action — it was
+    // NOT killed pre-claim by the missingCredentials guard (which would have
+    // thrown with process.exit for a non-runner VM under the same env setup).
+    await expect(main()).resolves.toBeUndefined();
+
+    // The self-hosted runner successfully called next-role (it passed the
+    // credential-validation gate despite having no static credentials set).
+    const fetched = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(fetched.some((u) => u.includes('next-role'))).toBe(true);
+
+    if (origRunnerVmId !== undefined) process.env.VM_INSTANCE_ID = origRunnerVmId;
+    else delete process.env.VM_INSTANCE_ID;
+    if (origAnthropicKey !== undefined) process.env.ANTHROPIC_API_KEY = origAnthropicKey;
+    else delete process.env.ANTHROPIC_API_KEY;
+    refreshRuntimeState();
+  });
 });
 
 describe('main non-pool startup OAuth rotation', () => {

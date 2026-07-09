@@ -26,7 +26,7 @@ import logging
 import math
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, StrictBool, StrictStr
@@ -35,9 +35,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import create_agent_token, get_current_runner
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.compute_manifest import _apply_llm_env, _resolve_provider_materials
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.database import get_session
 from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Project, Task, TaskStatus, _utcnow
+from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import agent_capability_slice
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -156,7 +158,7 @@ def _parse_heartbeat_timestamp(raw: str | None) -> datetime | None:
 class HeartbeatRequest(BaseModel):
     active_task_ids: List[str] = []
     active_compute_job_ids: List[str] = []
-    agent_available: Optional[StrictBool] = None
+    agent_available: StrictBool | None = None
     # Runner-DECLARED agent capability floor (optional; old runners omit it). A
     # docker-only runner (docker+image, NO bwrap) can run only the read-only agent
     # slice and declares those types here so the orchestrator intersects them with
@@ -164,20 +166,20 @@ class HeartbeatRequest(BaseModel):
     # distinct from operator config — the handler stores it under a separate caps key
     # and never touches `task_types`.
     supported_agent_task_types: list[StrictStr] | None = None
-    hostname: Optional[str] = None
-    version: Optional[str] = None
+    hostname: str | None = None
+    version: str | None = None
     # Runner-reported isolation-backend inventory + selected backends (optional;
     # old runners omit these). isolation_backends is a flat {backend: bool} map
     # (bwrap_ok/userns_ok/docker_usable/podman_usable/apptainer_ok/enroot_ok/
     # systemd_run_ok); agent_backend/compute_backend name the backend the runner
     # would use for each class. All ride in capabilities JSONB for the fleet panel.
-    isolation_backends: Optional[dict] = None
-    agent_backend: Optional[str] = None
-    compute_backend: Optional[str] = None
+    isolation_backends: dict | None = None
+    agent_backend: str | None = None
+    compute_backend: str | None = None
     # Runner-reported hardware capabilities (optional; old runners omit these).
-    has_gpu: Optional[StrictBool] = None
-    gpu_count: Optional[int] = None
-    gpu_names: Optional[List[str]] = None
+    has_gpu: StrictBool | None = None
+    gpu_count: int | None = None
+    gpu_names: List[str] | None = None
     # Trust telemetry (optional; old runners omit these). last_successful_job_at
     # is ISO-8601; consecutive_job_failures/disk_free_bytes/gpu_utilization_pct are
     # ints. These drive the "connected but failing" degraded state so the operator
@@ -242,12 +244,121 @@ async def next_task(
         project_id=str(task.project_id),
     )
 
-    logger.info(
-        "[RUNNERS] Dispatched task %s (type=%s) to runner %s",
-        task.id,
-        task_type,
-        runner.id,
-    )
+    # Resolve a pooled LLM account for this task — same path as the orchestrator's
+    # cloud-VM dispatch (select_llm_runtime_for_task).  The self-hosted runner no
+    # longer carries its own static LLM credentials; the backend assigns one per
+    # task from the pool, and the runner injects the resolved credential env vars
+    # into the agent process.
+    llm_env: dict[str, str] = {}
+    llm_files: list[dict[str, str]] = []
+    llm_provider: str | None = None
+    llm_auth_mode: str | None = None
+    llm_model: str | None = None
+
+    try:
+        from app.max_plan_pool import select_llm_runtime_for_task
+
+        # Resolve the billing user: launcher pays; fall back to project owner.
+        if task.launched_by_user_id:
+            dispatch_user_id = task.launched_by_user_id
+        else:
+            task_project = await session.get(Project, task.project_id)
+            dispatch_user_id = task_project.user_id if task_project else ""
+
+        runtime_selection = await select_llm_runtime_for_task(
+            user_id=dispatch_user_id,
+            task=task,
+            runtime_config=_runtime_config,
+        )
+        if runtime_selection is None or runtime_selection.account is None:
+            # Pool exhausted — no eligible account.  Roll back the dispatch marker
+            # so the task stays claimable by a future poll once an account frees up.
+            logger.warning(
+                "[RUNNERS] No LLM account available for task %s (type=%s) — "
+                "pool exhausted; leaving task unclaimed",
+                task.id,
+                task_type,
+            )
+            task.started_at = None
+            session.add(task)
+            await session.commit()
+            response.status_code = status.HTTP_204_NO_CONTENT
+            return response
+
+        acct = runtime_selection.account
+        llm_provider = runtime_selection.provider
+        llm_auth_mode = runtime_selection.auth_mode
+        llm_model = runtime_selection.model
+
+        # Build the credential env vars and files from the resolved account using
+        # the SAME material-resolution path as cloud-VM boot and warm re-target.
+        runtime_secret = acct.get("runtime_secret") or acct.get("oauth_token")
+        materials = _resolve_provider_materials(
+            oauth_token=runtime_secret,
+            claude_config_json=acct.get("claude_config_json"),
+            provider=llm_provider,
+            auth_mode=llm_auth_mode,
+            model=llm_model,
+            provider_metadata=acct.get("provider_metadata") or {},
+            provider_settings=runtime_selection.settings,
+        )
+        llm_env = {
+            "PROVIDER": materials.provider_name,
+            "AUTH_MODE": materials.auth_mode_value,
+        }
+        _apply_llm_env(
+            llm_env,
+            model=llm_model,
+            execution_mode=None,
+            provider_settings=runtime_selection.settings,
+            materials=materials,
+        )
+        llm_files = [
+            {"path": f.path, "content": f.content, "mode": str(f.mode)}
+            for f in materials.files
+        ]
+
+        # Persist the resolved account identity in the task context so the
+        # completion / failure handler can release the account slot and record
+        # the actual provider/model used for analytics.
+        task.context = {
+            **(task.context or {}),
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
+            "llm_auth_mode": llm_auth_mode,
+            "llm_account_id": acct.get("id"),
+        }
+        # Keep the promoted column in sync with context (D2 over-fetch fix).
+        task.llm_account_id = acct.get("id")
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+
+        logger.info(
+            "[RUNNERS] Dispatched task %s (type=%s) to runner %s "
+            "with pooled account %s (provider=%s model=%s)",
+            task.id,
+            task_type,
+            runner.id,
+            acct.get("id"),
+            llm_provider,
+            llm_model,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "[RUNNERS] LLM account selection failed for task %s — "
+            "rolling back dispatch",
+            task.id,
+        )
+        task.started_at = None
+        session.add(task)
+        await session.commit()
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
+
     return {
         "task_id": str(task.id),
         "agent_token": agent_token,
@@ -255,6 +366,11 @@ async def next_task(
         "payload": task.payloads,
         "task_type": task_type,
         "capability_slice": agent_capability_slice(task_type),
+        "provider": llm_provider,
+        "auth_mode": llm_auth_mode,
+        "model": llm_model,
+        "llm_env": llm_env,
+        "llm_files": llm_files,
     }
 
 
@@ -430,9 +546,9 @@ async def heartbeat(
 
 class ComputeJobReportRequest(BaseModel):
     exec_status: str  # "running" | "succeeded" | "failed"
-    exit_code: Optional[int] = None
-    result_metrics: Optional[Dict[str, Any]] = None
-    command_log: Optional[Dict[str, Any]] = None
+    exit_code: int | None = None
+    result_metrics: Dict[str, Any] | None = None
+    command_log: Dict[str, Any] | None = None
 
 
 @router.post("/next-compute-job")

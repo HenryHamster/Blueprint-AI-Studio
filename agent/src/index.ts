@@ -3180,12 +3180,21 @@ async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailur
   // Bake-time lifecycle smoke: skip all credential checks so the smoke can
   // exercise the full claim→dispatch→complete chain without real LLM creds.
   if (process.env.BLUEPRINT_SMOKE_SKIP_VALIDATION === '1') return;
-  const missing = runner.missingCredentials();
-  if (missing.length > 0) {
-    const reason = `missing provider credentials: ${missing.join(', ')}`;
-    log(reason);
-    reportPreClaimFailure(reason);
-    process.exit(1);
+  // Self-hosted runner: credentials are assigned dynamically by the backend
+  // pool via /api/runner/next-task and injected by the runner as env vars.
+  // There is no static local env-var credential path — the runner does not
+  // carry its own LLM credentials, so the missingCredentials() check that
+  // cloud VMs use (boot-materialized env vars) is not consulted here.
+  const vmId = process.env.VM_INSTANCE_ID || '';
+  const isSelfHostedRunner = vmId.startsWith('runner:');
+  if (!isSelfHostedRunner) {
+    const missing = runner.missingCredentials();
+    if (missing.length > 0) {
+      const reason = `missing provider credentials: ${missing.join(', ')}`;
+      log(reason);
+      reportPreClaimFailure(reason);
+      process.exit(1);
+    }
   }
   // Boot-materialized config-file presence (poisoned-VM guard, 2026-06-06).
   // On a VM whose boot-materialized ~/.claude.json was destroyed mid-run, the

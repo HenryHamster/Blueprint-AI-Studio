@@ -2510,6 +2510,8 @@ def _spawn_agent_task(
     agent_started_at: dict,
     agent_teardown: dict,
     lock: threading.Lock,
+    llm_env: dict[str, str] | None = None,
+    llm_files: list[dict[str, str]] | None = None,
 ) -> bool:
     """Plan (fail-closed) + spawn one claimed agent task; record it for reaping.
 
@@ -2552,19 +2554,51 @@ def _spawn_agent_task(
     # bwrap-eligible task on a docker+image box still takes the bwrap path.
     plan_image = agent_image if backend == iso.BACKEND_DOCKER else None
 
+    # Write backend-supplied credential files into the agent's home / sandbox.
+    # The LLM provider CLI (Claude, Codex, Gemini) reads config files from
+    # well-known paths (e.g. ~/.claude.json); the runner materializes them here
+    # per-task so the agent finds exactly the credential the pool assigned.
+    if llm_files:
+        for f in llm_files:
+            try:
+                fpath = f["path"]
+                fcontent = f["content"]
+                fmode = f.get("mode", "0600")
+                parent = os.path.dirname(fpath)
+                os.makedirs(parent, exist_ok=True)
+                with open(fpath, "w") as fh:
+                    fh.write(fcontent)
+                # Parse octal mode string to int and apply.
+                try:
+                    mode_bits = int(fmode, 8)
+                    os.chmod(fpath, mode_bits)
+                except (ValueError, TypeError):
+                    os.chmod(fpath, 0o600)
+            except Exception as exc:
+                print(
+                    f"[runner] warning: failed to write credential file "
+                    f"{f.get('path', '?')} for task {task_id}: {exc}",
+                    flush=True,
+                )
+
     # Build the FAIL-CLOSED sandbox plan. The env is assembled from an explicit
     # allowlist (never os.environ.copy) and NEVER carries BLUEPRINT_RUNNER_TOKEN /
-    # BLUEPRINT_ORCHESTRATOR_URL into the task.
+    # BLUEPRINT_ORCHESTRATOR_URL into the task.  The backend-assigned pooled LLM
+    # credentials flow through injected_env so they reach the agent without the
+    # runner needing its own static LLM credentials.
+    injected_env = {
+        "AGENT_SECRET_TOKEN": agent_token,
+        "ORCHESTRATOR_URL": orchestrator_url,
+        "TASK_ID": task_id,
+        "VM_INSTANCE_ID": vm_instance_id,
+    }
+    if llm_env:
+        injected_env.update(llm_env)
     plan = iso.plan_agent_execution(
         caps=caps,
         agent_binary=agent_binary,
         workspace_host=workspace,
-        injected_env={
-            "AGENT_SECRET_TOKEN": agent_token,
-            "ORCHESTRATOR_URL": orchestrator_url,
-            "TASK_ID": task_id,
-            "VM_INSTANCE_ID": vm_instance_id,
-        },
+        injected_env=injected_env,
         source_env=dict(os.environ),
         task_type=task_type,
         agent_image=plan_image,
@@ -2970,6 +3004,8 @@ def main() -> None:
             agent_token = body.get("agent_token", "")
             task_type = body.get("task_type", "unknown")
             vm_instance_id = body.get("vm_instance_id") or "runner:local"
+            llm_env = body.get("llm_env") or {}
+            llm_files = body.get("llm_files") or []
 
             with lock:
                 already_active = task_id in active_tasks
@@ -3008,6 +3044,8 @@ def main() -> None:
                 agent_started_at=agent_started_at,
                 agent_teardown=agent_teardown,
                 lock=lock,
+                llm_env=llm_env,
+                llm_files=llm_files,
             )
             if not spawned:
                 # DECLINE / spawn failure — the reaper never sees this task, so the
