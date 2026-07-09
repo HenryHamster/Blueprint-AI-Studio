@@ -89,6 +89,26 @@ def _node_major() -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _check_provider_credentials() -> bool:
+    """Return True iff at least one LLM provider credential is set in the environment.
+
+    The agent subprocess needs at least one of these to authenticate with an LLM
+    backend.  A runner CAN start without them (compute-only jobs do not need LLM
+    access), but ``--check`` should warn the operator so they are not surprised when
+    every agent task fails at PRE_CLAIM_FAILED.
+
+    The checked env-variable names are the primary credential keys from
+    ``runner_isolation.AGENT_ENV_ALLOWLIST``.
+    """
+    _CREDENTIAL_KEYS = (
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ZAI_API_KEY",
+        "OPENAI_API_KEY",
+    )
+    return any(os.environ.get(k, "").strip() for k in _CREDENTIAL_KEYS)
+
+
 def check_prerequisites() -> list[Prereq]:
     """Check the host prerequisites for running Blueprint agent tasks.
 
@@ -1189,6 +1209,15 @@ def main(argv: list[str] | None = None) -> int:
     prereqs = check_prerequisites()
     _print_prereqs(prereqs, url)
     missing = [p for p in prereqs if not p.ok]
+
+    if not _check_provider_credentials():
+        print(
+            "  [WARNING] No LLM provider credential found (ANTHROPIC_API_KEY, "
+            "CLAUDE_CODE_OAUTH_TOKEN, ZAI_API_KEY, or OPENAI_API_KEY) — agent "
+            "tasks that require LLM access will fail at PRE_CLAIM_FAILED. "
+            "Compute-only runners are unaffected.",
+            flush=True,
+        )
 
     # Docker-agent opt-in: explicit --docker-agent flag, BLUEPRINT_AGENT_BACKEND=docker,
     # or --pull (pulling a registry image is inherently a docker operation). Without an

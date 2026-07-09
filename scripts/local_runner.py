@@ -3065,8 +3065,40 @@ def main() -> None:
             agent_token = body.get("agent_token", "")
             task_type = body.get("task_type", "unknown")
             vm_instance_id = body.get("vm_instance_id") or "runner:local"
-            llm_env = body.get("llm_env") or {}
-            llm_files = body.get("llm_files") or []
+            # Per-task server-vended LLM credentials from the nested
+            # {"credentials": {"env": {...}, "files": [...]}} response shape.
+            # The env dict (PROVIDER, AUTH_MODE, API keys) is used both as
+            # llm_env (injected into the agent subprocess) and as credential_env
+            # (passed to the isolation layer's per_task_creds).  The files list
+            # is used as credential_files (written to the workspace bind-mount
+            # before spawn) and as llm_files (written inside the sandbox).
+            _creds = body.get("credentials") or {}
+            credential_env: dict[str, str] = _creds.get("env", {})
+            credential_files: list[dict[str, Any]] = _creds.get("files", [])
+            llm_env = credential_env
+            llm_files = credential_files
+            if credential_env:
+                # Provider and model are read from the credential_env dict,
+                # not from top-level response fields (the runner response nests
+                # them inside credentials.env). Account ID/name are not currently
+                # returned by the next-task endpoint.
+                provider = credential_env.get("PROVIDER", "")
+                model = credential_env.get("LLM_MODEL", "")
+                print(
+                    f"[runner] task {task_id}: server-vended credentials "
+                    f"provider={provider} model={model} "
+                    f"env_keys={sorted(credential_env.keys())}",
+                    flush=True,
+                )
+            elif not any(
+                os.environ.get(k, "").strip() for k in _PROVIDER_CREDENTIAL_KEYS
+            ):
+                print(
+                    f"[runner] task {task_id}: NO credentials — server returned no "
+                    f"credential_env and no static host provider credentials are set. "
+                    f"The agent WILL fail at LLM call.",
+                    flush=True,
+                )
 
             with lock:
                 already_active = task_id in active_tasks

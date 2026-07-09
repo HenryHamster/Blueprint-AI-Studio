@@ -272,6 +272,13 @@ LAST_ALERTED_UNPRICED_KEY = "last_alerted_unpriced_coverage"
 # rather than every tick, and re-arms on recovery.
 LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY = "last_alerted_self_repair_burn_share"
 
+# Sub-key under the efficiency_baseline container recording whether the last
+# provider-routing verdict transition check alerted on ADOPT or REJECT. The
+# per-project transition check (:func:`maybe_alert_provider_routing_transition`)
+# compares the current verdict against this marker so it fires once per
+# decision-boundary crossing rather than every hourly tick.
+LAST_ALERTED_ROUTING_KEY = "last_alerted_routing_verdict"
+
 # Fire the unpriced-models alert when at least this share of attributed
 # (provider+model+token-bearing) tasks ran on combos absent from the pricing
 # table, and at least this many such tasks exist (so a single stray task on a
@@ -4006,6 +4013,110 @@ async def maybe_alert_self_repair_burn_share(
         SELF_REPAIR_BURN_SHARE_THRESHOLD,
     )
     return True
+
+
+async def maybe_alert_provider_routing_transition(
+    session: AsyncSession, project_id: uuid.UUID
+) -> str | None:
+    """Raise an operator Alert when the provider routing A/B verdict transitions
+    to ADOPT or REJECT, deduplicated per project + verdict.
+
+    The DeepSeek-vs-Anthropic routing A/B produces a verdict from the per-model
+    efficiency breakdown once enough PR-eligible tasks have landed on each side.
+    ADOPT (DeepSeek is cheaper with no quality regression) and REJECT (cost not
+    meaningfully lower or quality regressed) are decision boundaries — operators
+    should act on them, not poll the efficiency panel to discover them.
+
+    Edge-triggered against ``last_alerted_routing_verdict`` in the efficiency-
+    baseline container (locked read-modify-write, mirroring
+    :func:`maybe_alert_pool_payoff_transition`): fires once per verdict state,
+    does not re-fire while the same verdict persists. Returns the verdict state
+    when an alert fired, else ``None``.
+    """
+    from app.alert_dispatch import _maybe_create_provider_routing_alert
+    from app.alert_policy import alert_policy_allows
+    from app.models import AlertSeverity
+    from app.task_locking import project_lock, with_design_doc_locked
+
+    drift = await read_baseline_with_drift(session, project_id)
+    verdict = drift.get("provider_routing_verdict") or {}
+    state = verdict.get("state")
+
+    # Only ADOPT and REJECT are alert-worthy; INSUFFICIENT_DATA is the
+    # default "keep measuring" state and should not page operators.
+    if state not in (PROVIDER_ROUTING_ADOPT, PROVIDER_ROUTING_REJECT):
+        return None
+
+    supporting = dict(verdict.get("supporting") or {})
+    recommended_action = verdict.get("recommended_action") or ""
+
+    decision = await alert_policy_allows(
+        session,
+        project_id,
+        "efficiency.provider_routing_verdict",
+        severity=AlertSeverity.WARNING,
+    )
+    if not decision.emit:
+        logger.info(
+            "[ROUTING_ALERT] project=%s verdict=%s suppressed=%s",
+            project_id,
+            state,
+            decision.reason,
+        )
+        return None
+
+    # Transition edge: only fire when the alert-worthy state differs from the
+    # last state we have a durable alert for.
+    should_fire = False
+    async with project_lock(session, project_id, skip_locked=False) as project:
+        if project is None:
+            return None
+        doc = dict(project.design_doc or {})
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        should_fire = container.get(LAST_ALERTED_ROUTING_KEY) != state
+    await session.rollback()
+
+    if not should_fire:
+        return None
+
+    alert, created = await _maybe_create_provider_routing_alert(
+        project_id,
+        session,
+        verdict_state=state,
+        supporting=supporting,
+        recommended_action=recommended_action,
+        severity=AlertSeverity.WARNING,
+    )
+    if alert is None:
+        return None
+
+    # Advance the marker inside a design-doc locked block so a concurrent
+    # snapshot writer cannot clobber it.
+    changed = {"fire": False}
+
+    def _advance_marker(doc: Dict[str, Any]) -> None:
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        if container.get(LAST_ALERTED_ROUTING_KEY) == state:
+            return
+        container[LAST_ALERTED_ROUTING_KEY] = state
+        doc[DESIGN_DOC_KEY] = container
+        changed["fire"] = True
+
+    wrote_marker = await with_design_doc_locked(
+        session, project_id, _advance_marker, skip_locked=False
+    )
+    if wrote_marker and changed["fire"]:
+        await session.commit()
+    else:
+        await session.rollback()
+    if not created:
+        return None
+    logger.info(
+        "[ROUTING_ALERT] project=%s verdict=%s",
+        project_id,
+        state,
+    )
+    return state
 
 
 # ---------------------------------------------------------------------------

@@ -4122,6 +4122,156 @@ async def test_payoff_transition_unscoped_project_no_alert(db_session, mocker):
 
 
 # ---------------------------------------------------------------------------
+# Provider routing A/B verdict transition alert
+# ---------------------------------------------------------------------------
+
+from app.efficiency_snapshot import (  # noqa: E402
+    LAST_ALERTED_ROUTING_KEY,
+    maybe_alert_provider_routing_transition,
+)
+
+
+def _routing_design_doc(
+    *,
+    verdict_state: str,
+    cost_ratio: float | None = None,
+    rate_delta: float | None = None,
+    ds_run: int = 30,
+    an_run: int = 30,
+):
+    """Build a design_doc whose latest snapshot carries the given provider
+    routing verdict, suitable for testing the transition alert."""
+    snap = {
+        "captured_at": _utcnow().isoformat(),
+        "provider_routing_verdict": {
+            "state": verdict_state,
+            "supporting": {
+                "deepseek_run_count": ds_run,
+                "deepseek_pr_eligible_run_count": ds_run,
+                "deepseek_verified_landed_count": 5,
+                "deepseek_verified_landed_rate": 0.25,
+                "deepseek_cost_per_merge": 0.05,
+                "deepseek_total_cost_usd": 0.25,
+                "anthropic_run_count": an_run,
+                "anthropic_pr_eligible_run_count": an_run,
+                "anthropic_verified_landed_count": 5,
+                "anthropic_verified_landed_rate": 0.25,
+                "anthropic_cost_per_merge": 0.10,
+                "anthropic_total_cost_usd": 0.50,
+                "cost_ratio": cost_ratio or 0.50,
+                "verified_rate_delta_pct": rate_delta or 0.0,
+            },
+            "recommended_action": "Keep measuring." if verdict_state == PROVIDER_ROUTING_INSUFFICIENT_DATA
+            else "Adopt DeepSeek routing." if verdict_state == PROVIDER_ROUTING_ADOPT
+            else "Reject DeepSeek routing.",
+        },
+    }
+    return {
+        DESIGN_DOC_KEY: {
+            "baseline": {},
+            "snapshots": [snap],
+        }
+    }
+
+
+async def _routing_alerts(db_session, project_id):
+    stmt = _sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title.contains("Provider routing verdict"),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_routing_verdict_adopt_fires_warning(db_session, mocker):
+    """A transition to ADOPT fires one WARNING carrying the supporting numbers."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project(
+        design_doc=_routing_design_doc(verdict_state=PROVIDER_ROUTING_ADOPT),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_provider_routing_transition(db_session, project.id)
+    assert fired == PROVIDER_ROUTING_ADOPT
+
+    alerts = await _routing_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "ADOPT" in alerts[0].title
+    assert "0.50" in alerts[0].message  # cost ratio
+    assert "Adopt DeepSeek" in alerts[0].message
+    bcast.assert_awaited()
+
+    # The marker advanced so a repeat tick is deduped.
+    await db_session.refresh(project)
+    assert (
+        project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_ROUTING_KEY]
+        == PROVIDER_ROUTING_ADOPT
+    )
+
+
+@pytest.mark.asyncio
+async def test_routing_verdict_reject_fires_warning(db_session, mocker):
+    """A transition to REJECT fires one WARNING."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_routing_design_doc(verdict_state=PROVIDER_ROUTING_REJECT),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_provider_routing_transition(db_session, project.id)
+    assert fired == PROVIDER_ROUTING_REJECT
+
+    alerts = await _routing_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert "REJECT" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_routing_verdict_dedups_same_verdict(db_session, mocker):
+    """A second tick at the same verdict does not fire a second alert."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_routing_design_doc(verdict_state=PROVIDER_ROUTING_ADOPT),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await maybe_alert_provider_routing_transition(db_session, project.id)
+    second = await maybe_alert_provider_routing_transition(db_session, project.id)
+    assert first == PROVIDER_ROUTING_ADOPT
+    assert second is None  # deduped on the persisted marker
+    alerts = await _routing_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_routing_verdict_insufficient_data_no_alert(db_session, mocker):
+    """INSUFFICIENT_DATA is not alert-worthy."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_routing_design_doc(
+            verdict_state=PROVIDER_ROUTING_INSUFFICIENT_DATA
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_provider_routing_transition(db_session, project.id)
+    assert fired is None
+    alerts = await _routing_alerts(db_session, project.id)
+    assert alerts == []
+
+
+# ---------------------------------------------------------------------------
 # Pre-enable counterfactual warm-pool hit-rate estimate
 # ---------------------------------------------------------------------------
 

@@ -1043,6 +1043,7 @@ async def lifespan(app):
         from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
             maybe_alert_pool_payoff_transition,
+            maybe_alert_provider_routing_transition,
             maybe_alert_self_repair_burn_share,
             maybe_alert_unpriced_models_coverage,
             maybe_write_daily_snapshot,
@@ -1143,6 +1144,31 @@ async def lifespan(app):
                                 "self-repair-burn-share alert error=%s",
                                 project_id,
                                 repair_exc,
+                            )
+                        # Provider routing verdict transition alert: same hourly
+                        # tick, edge-triggered, so ADOPT/REJECT pages the operator
+                        # instead of requiring manual polling. Best-effort.
+                        try:
+                            routing_fired = (
+                                await maybe_alert_provider_routing_transition(
+                                    scan_session, project_id
+                                )
+                            )
+                            await scan_session.commit()
+                            if routing_fired is not None:
+                                logger.info(
+                                    "[EFFICIENCY_SNAPSHOT] project=%s "
+                                    "routing verdict alert fired verdict=%s",
+                                    project_id,
+                                    routing_fired,
+                                )
+                        except Exception as routing_exc:
+                            await scan_session.rollback()
+                            logger.warning(
+                                "[EFFICIENCY_SNAPSHOT] project=%s "
+                                "routing-verdict alert error=%s",
+                                project_id,
+                                routing_exc,
                             )
             except asyncio.CancelledError:
                 raise

@@ -18,6 +18,7 @@ import {
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
+  buildDirectionPortfolioSection,
   buildCiComplianceSection,
   buildSweepComparisonSection,
   buildPayloadStalenessSection,
@@ -2172,12 +2173,10 @@ describe('buildPayloadStalenessSection', () => {
       previousDecisionOutcomes: '',
       pastRetirementCritiquesSection: '',
       retiredDirectionsSummarySection: '',
-      dirSummaryText: '',
-      dirHealthSummary: '',
+      directionPortfolioSection: '',
       userPausedSection: '',
       rejectedProposalsSection: '',
       operatorOverridesSection: '',
-      portfolioCompositionText: '',
       modelHealthSection: '',
       systemMaturitySection: '',
       driftSection: '',
@@ -2467,5 +2466,119 @@ describe('reconciliation_sections fixture contract (agent render coverage)', () 
       `Add a renderer in agent/src/handlers/strategic-sections.ts: ` +
       missingRenderers.join(', '),
     ).toEqual([]);
+  });
+});
+
+describe('buildDirectionPortfolioSection', () => {
+  it('produces a consolidated portfolio block with basic direction list', () => {
+    const dirs = [
+      { id: 'd-1', text: 'improve auth', status: 'active', priority: 'high', total_cycles: 3, category: 'product', possibly_saturated: false },
+      { id: 'd-2', text: 'refactor db', status: 'active', priority: 'medium', total_cycles: 1, category: 'structural', possibly_saturated: false },
+      { id: 'd-3', text: 'add tests', status: 'active', priority: 'low', total_cycles: 2, category: 'product', possibly_saturated: false },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined);
+    expect(result).toContain('## Direction Portfolio');
+    expect(result).toContain('Active: 3/10 slots used');
+    expect(result).toContain('Product directions: 2');
+    expect(result).toContain('No critical gaps detected');
+    expect(result).toContain('improve auth');
+    expect(result).toContain('refactor db');
+    expect(result).toContain('add tests');
+  });
+
+  it('detects all three gap types when product=0, all saturated, below minimum', () => {
+    const dirs = [
+      { id: 'd-1', text: 'auth dir', status: 'active', category: 'structural', possibly_saturated: true, priority: 'medium', total_cycles: 5 },
+      { id: 'd-2', text: 'infra dir', status: 'active', category: 'infra', possibly_saturated: true, priority: 'medium', total_cycles: 2 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined, 2);
+    expect(result).toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).toContain('ALL_SATURATED');
+    expect(result).toContain('BELOW_MINIMUM');
+    expect(result).toContain('GAPS DETECTED: NO_PRODUCT_DIRECTIONS, ALL_SATURATED, BELOW_MINIMUM');
+  });
+
+  it('includes trim note when authoritative count is larger than shipped list', () => {
+    const dirs = [
+      { id: 'd-1', text: 'one dir', status: 'active', category: 'product', possibly_saturated: false, priority: 'high', total_cycles: 2 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 15, [], undefined, 6, 0);
+    expect(result).toContain('Showing 1 of 6 active directions below');
+    expect(result).toContain('trimmed for budget');
+    expect(result).toContain('./fetch direction');
+  });
+
+  it('constructs paused-note with auto/user breakdown', () => {
+    const dirs = [
+      { id: 'd-1', text: 'active dir', status: 'active', category: 'product', possibly_saturated: false, priority: 'high', total_cycles: 3 },
+      { id: 'd-p1', text: 'auto paused', status: 'paused', category: 'structural', auto_paused: true, paused_reason: 'waiting', priority: 'low', total_cycles: 0 },
+      { id: 'd-p2', text: 'user paused', status: 'paused', category: 'product', auto_paused: false, paused_reason: '', priority: 'low', total_cycles: 0 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined);
+    expect(result).toContain('Paused: 2 (1 auto, 1 user)');
+    expect(result).toContain('listed below but not consuming active slots');
+  });
+
+  it('handles empty direction list with authoritative counts (suppresses NO_PRODUCT_DIRECTIONS when detail incomplete)', () => {
+    // authoritative=1, shipped=0 → shippedActiveCount < activeCount → detailComplete=false
+    // so NO_PRODUCT_DIRECTIONS is suppressed. BELOW_MINIMUM fires (1 < 3).
+    const result = buildDirectionPortfolioSection([], 10, [], undefined, 1, 0);
+    expect(result).toContain('Active: 1/10 slots used');
+    expect(result).toContain('BELOW_MINIMUM');
+    expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('ALL_SATURATED');
+  });
+
+  it('handles empty systems array gracefully', () => {
+    const dirs = [
+      { id: 'd-1', text: 'only dir', status: 'active', category: 'product', possibly_saturated: false, priority: 'high', total_cycles: 1 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined);
+    expect(result).toContain('Active: 1/10 slots used');
+    expect(result).toContain('BELOW_MINIMUM');
+  });
+
+  it('renders single gaps independently — BELOW_MINIMUM alone', () => {
+    const dirs = [
+      { id: 'd-1', text: 'product dir', status: 'active', category: 'product', possibly_saturated: false, priority: 'high', total_cycles: 1 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined);
+    expect(result).toContain('BELOW_MINIMUM');
+    expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('ALL_SATURATED');
+  });
+
+  it('renders single gaps independently — ALL_SATURATED alone', () => {
+    const dirs = [
+      { id: 'd-1', text: 'sat product', status: 'active', category: 'product', possibly_saturated: true, priority: 'high', total_cycles: 10 },
+      { id: 'd-2', text: 'sat structural', status: 'active', category: 'structural', possibly_saturated: true, priority: 'medium', total_cycles: 8 },
+      { id: 'd-3', text: 'sat infra', status: 'active', category: 'infra', possibly_saturated: true, priority: 'medium', total_cycles: 6 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined, 3);
+    expect(result).toContain('ALL_SATURATED');
+    expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('BELOW_MINIMUM');
+  });
+
+  it('renders single gaps independently — NO_PRODUCT_DIRECTIONS alone (3+ active, not saturated, not below_min)', () => {
+    const dirs = [
+      { id: 'd-1', text: 'infra dir', status: 'active', category: 'infra', possibly_saturated: false, priority: 'high', total_cycles: 3 },
+      { id: 'd-2', text: 'structural dir', status: 'active', category: 'structural', possibly_saturated: false, priority: 'high', total_cycles: 2 },
+      { id: 'd-3', text: 'chore dir', status: 'active', category: 'infra', possibly_saturated: false, priority: 'medium', total_cycles: 1 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined, 3);
+    expect(result).toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('ALL_SATURATED');
+    expect(result).not.toContain('BELOW_MINIMUM');
+  });
+
+  it('skips gap details when detailComplete is false (shipped list incomplete)', () => {
+    // authoritative=2, shipped=0 → shippedActiveCount < activeCount → detailComplete=false
+    // so NO_PRODUCT_DIRECTIONS and ALL_SATURATED are suppressed.
+    // BELOW_MINIMUM still fires because activeCount (2) < 3, regardless of detailComplete.
+    const result = buildDirectionPortfolioSection([], 10, [], undefined, 2, 0);
+    expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('ALL_SATURATED');
+    expect(result).toContain('BELOW_MINIMUM');
   });
 });

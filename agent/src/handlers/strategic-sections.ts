@@ -1,5 +1,5 @@
 import { strVal } from '../index.js';
-import { calcMessageAge, parseResearchContext } from './research-plan.js';
+import { calcMessageAge, parseResearchContext, buildPortfolioComposition } from './research-plan.js';
 import { formatRetiredDirectionGrounding } from './research-direction-context.js';
 
 export function fmtScalar(v: unknown, fallback = '?'): string {
@@ -1252,6 +1252,74 @@ export function buildDirSummaryText(
     return `_Showing ${shippedActive} of ${authoritativeActiveCount} active directions — ${hidden} trimmed for budget; fetch the rest with \`./fetch direction <id>\`._\n\n${body}`;
   }
   return body;
+}
+
+/**
+ * Render a single consolidated `## Direction Portfolio` section that combines
+ * the health header, per-direction listing, and portfolio statistics (category
+ * mix, system coverage, concentration, scope) into one block. Replaces the
+ * prior three separate sections (dir_summary + dir_health + portfolio_composition),
+ * eliminating redundant section headers and interstitial prose.
+ */
+export function buildDirectionPortfolioSection(
+  directionsSummary: Array<Record<string, unknown>>,
+  maxActiveDirections: number,
+  systems: Array<Record<string, unknown>>,
+  activeByScope: Record<string, number> | undefined,
+  authoritativeActiveCount?: number,
+  authoritativePausedCount?: number,
+  authoritativeSystemCounts?: Record<string, number>,
+): string {
+  // ── Health header (consolidated from buildDirHealthSummary) ──
+  const shippedActiveDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
+  const shippedActiveCount = shippedActiveDirections.length;
+  const shippedPaused = directionsSummary.filter(d => strVal(d.status) === 'paused');
+  const activeCount = authoritativeActiveCount ?? shippedActiveCount;
+  const pausedCount = authoritativePausedCount ?? shippedPaused.length;
+  const detailComplete = authoritativeActiveCount === undefined || shippedActiveCount >= activeCount;
+  const autoPausedCount = shippedPaused.filter(d => d.auto_paused === true).length;
+  const userPausedCount = Math.max(0, pausedCount - autoPausedCount);
+  const saturatedCount = shippedActiveDirections.filter(d => d.possibly_saturated === true).length;
+  const productCount = shippedActiveDirections.filter(d => strVal(d.category) === 'product').length;
+  const availableSlots = Math.max(0, maxActiveDirections - activeCount);
+
+  const gaps: string[] = [];
+  if (detailComplete && productCount === 0) gaps.push('NO_PRODUCT_DIRECTIONS');
+  if (detailComplete && saturatedCount === activeCount && activeCount > 0) gaps.push('ALL_SATURATED');
+  if (activeCount < 3) gaps.push('BELOW_MINIMUM');
+
+  const pausedNote = pausedCount > 0
+    ? ` Paused: ${pausedCount} (${autoPausedCount} auto, ${userPausedCount} user) — listed below but not consuming active slots.`
+    : '';
+  const trimNote = (authoritativeActiveCount !== undefined && shippedActiveCount < activeCount)
+    ? ` Showing ${shippedActiveCount} of ${activeCount} active directions below — ${activeCount - shippedActiveCount} trimmed for budget; saturation/product counts reflect only the shipped subset. Fetch the rest with \`./fetch direction <id>\`.`
+    : '';
+
+  const healthHeader = [
+    `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.${pausedNote}${trimNote}`,
+    gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
+  ].join('\n');
+
+  // ── Direction listing ──
+  const dirList = buildDirSummaryText(directionsSummary, authoritativeActiveCount);
+
+  // ── Portfolio stats ──
+  const portfolio = buildPortfolioComposition(
+    shippedActiveDirections,
+    systems,
+    activeByScope,
+    activeCount,
+    authoritativeSystemCounts,
+  );
+
+  return [
+    '## Direction Portfolio',
+    healthHeader,
+    '',
+    dirList,
+    '',
+    portfolio,
+  ].join('\n');
 }
 
 /**

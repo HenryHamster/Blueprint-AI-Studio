@@ -40,6 +40,7 @@ vi.mock('../providers/resident-session.js', () => ({
 vi.mock('./strategic-sections.js', () => ({
   buildDirSummaryText: vi.fn(() => ''),
   buildOpenMessagesText: vi.fn(() => ''),
+  buildDirectionPortfolioSection: vi.fn(() => ''),
   buildPendingFollowupsSection: vi.fn(() => ''),
 }));
 

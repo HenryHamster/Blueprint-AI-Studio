@@ -1065,6 +1065,87 @@ async def _maybe_create_pool_payoff_alert(
     return alert, True
 
 
+# Title prefix for the per-project provider-routing-verdict transition alert.
+# The verdict state is appended to the prefix, so the dedup key
+# ``(project_id, dedupe_key)`` is effectively per project + verdict — exactly
+# one alert per distinct verdict transition. Keep the prefix stable.
+_PROVIDER_ROUTING_ALERT_TITLE_PREFIX = "Provider routing verdict"
+
+
+async def _maybe_create_provider_routing_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    verdict_state: str,
+    supporting: "dict",
+    recommended_action: str,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> tuple[Alert | None, bool]:
+    """Create a deduplicated operator Alert when the provider routing A/B verdict
+    crosses a decision boundary.
+
+    Closes the loop on the DeepSeek-vs-Anthropic routing A/B: when the verdict
+    transitions to ADOPT or REJECT, the operator is alerted so the keep / revert
+    decision is made without polling the efficiency panel. INSUFFICIENT_DATA is
+    not a decision boundary and never reaches this helper.
+
+    The message carries the supporting numbers (cost ratio, verified-rate delta,
+    per-provider counts) plus the recommended action so the operator can act from
+    the alert alone.
+
+    Deduplicated by ``efficiency.provider_routing_verdict:{project_id}:{verdict_state}``
+    — so a verdict that persists across many ticks raises exactly ONE alert, and
+    a genuinely different verdict gets its own.
+    """
+    title = f"{_PROVIDER_ROUTING_ALERT_TITLE_PREFIX}: {verdict_state} on project {str(project_id)[:8]}"
+    cost_ratio = supporting.get("cost_ratio")
+    rate_delta = supporting.get("verified_rate_delta_pct")
+    ds_run = int(supporting.get("deepseek_run_count") or 0)
+    an_run = int(supporting.get("anthropic_run_count") or 0)
+    msg_parts = [
+        f"Provider routing verdict for project {project_id} is now {verdict_state}.",
+    ]
+    if cost_ratio is not None:
+        msg_parts.append(f"DeepSeek cost ratio vs Anthropic: {cost_ratio:.4f}")
+    if rate_delta is not None:
+        msg_parts.append(
+            f"Verified-merge rate delta: {rate_delta:+.2f} percentage points"
+        )
+    msg_parts.append(
+        f"DeepSeek runs: {ds_run}, Anthropic runs: {an_run}. {recommended_action}"
+    )
+    message = " ".join(msg_parts)[:1000]
+
+    dedupe_key = f"efficiency.provider_routing_verdict:{project_id}:{verdict_state}"
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type="efficiency.provider_routing_verdict",
+        severity=severity,
+        title=title,
+        message=message,
+        source="alert_dispatch",
+        dedupe_key=dedupe_key,
+        broadcast=False,
+    )
+    if alert is None:
+        return None, False
+    if not created:
+        await session.commit()
+        return alert, False
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+    return alert, True
+
+
 # Stable per-project title for the unpriced-LLM-models coverage alert. The
 # drifting numbers (unpriced share, affected combos) live in the MESSAGE so a
 # degradation that persists across snapshot ticks dedups to exactly ONE alert

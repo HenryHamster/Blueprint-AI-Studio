@@ -62,7 +62,7 @@ import {
   buildQuestionSection,
   buildOpenMessagesText,
   buildDirSummaryText,
-  buildDirHealthSummary,
+  buildDirectionPortfolioSection,
   buildSweepComparisonSection,
   buildCiComplianceSection,
   buildCompletionDebtSection,
@@ -384,27 +384,28 @@ export async function handleStrategic(
     const fetchProjectId = (projectMetadataForFetch?.project_id as string | undefined) ?? '';
     writeStrategicHelpers(taskId, fetchProjectId, WORKSPACE);
 
-    // ── Compute direction health summary for thinker prompt ──
+    // ── Compute direction portfolio section for thinker prompt ──
     const maxActiveDirections = typeof payload.max_active_directions === 'number'
       ? payload.max_active_directions
       : 10;
     const activeDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
-    const dirHealthSummary = buildDirHealthSummary(
-      directionsSummary,
-      maxActiveDirections,
-      authoritativeActive !== undefined
-        ? { active: authoritativeActive, paused: authoritativePaused ?? 0 }
-        : undefined,
-    );
-
-    // Portfolio composition: category mix, system coverage gaps, concentration
-    // risk, in-flight scope, direction age — so the thinker doesn't have to
-    // re-compute these from scattered per-direction lines.
     const outcomeSystems = outcomeEval && Array.isArray(outcomeEval.systems)
       ? outcomeEval.systems as Array<Record<string, unknown>>
       : (vision && Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : []);
     const activeByScopeForPortfolio = (payload.recent_interventions as Record<string, unknown> | undefined)
       ?.active_by_scope as Record<string, number> | undefined;
+    const directionPortfolioSection = buildDirectionPortfolioSection(
+      directionsSummary,
+      maxActiveDirections,
+      outcomeSystems,
+      activeByScopeForPortfolio,
+      authoritativeActive,
+      authoritativePaused,
+      authoritativeSystemCounts,
+    );
+
+    // Portfolio composition: still computed for the strategic challenge pass
+    // (runStrategicChallenge receives dirSummaryText and portfolioCompositionText).
     const portfolioCompositionText = buildPortfolioComposition(
       activeDirections,
       outcomeSystems,
@@ -733,8 +734,7 @@ prompts, schemas, tools, or orchestration.` : '';
       previousDecisionOutcomes: formatPreviousDecisionOutcomes(payload.previous_decision_outcomes),
       pastRetirementCritiquesSection,
       retiredDirectionsSummarySection: formatRetiredDirectionsSummary(payload.retired_directions_summary),
-      dirSummaryText,
-      dirHealthSummary,
+      directionPortfolioSection,
       stagedDirectionsSection,
       // Live self-hosted local-runner availability note (M7) — built from the
       // backend's `local_runner_status` payload field so the strategist avoids
@@ -743,7 +743,6 @@ prompts, schemas, tools, or orchestration.` : '';
       userPausedSection: buildUserPausedSection(directionsSummary),
       rejectedProposalsSection: buildRejectedProposalsSection(Array.isArray(payload.rejected_proposals) ? payload.rejected_proposals as Array<Record<string, unknown>> : []),
       operatorOverridesSection: buildOperatorOverridesSection(Array.isArray(payload.operator_overrides) ? payload.operator_overrides as Array<Record<string, unknown>> : []),
-      portfolioCompositionText,
       modelHealthSection,
       pruneCandidatesSection,
       systemMaturitySection,
@@ -813,13 +812,11 @@ prompts, schemas, tools, or orchestration.` : '';
       ['decision_outcomes', thinkerParams.previousDecisionOutcomes],
       ['retirement_critiques', thinkerParams.pastRetirementCritiquesSection],
       ['retired_directions', thinkerParams.retiredDirectionsSummarySection],
-      ['dir_summary', thinkerParams.dirSummaryText],
-      ['dir_health', thinkerParams.dirHealthSummary],
+      ['direction_portfolio', thinkerParams.directionPortfolioSection],
       ['staged_directions', thinkerParams.stagedDirectionsSection || ''],
       ['user_paused', thinkerParams.userPausedSection],
       ['rejected_proposals', thinkerParams.rejectedProposalsSection],
       ['operator_overrides', thinkerParams.operatorOverridesSection],
-      ['portfolio_composition', thinkerParams.portfolioCompositionText],
       ['available_capabilities', thinkerParams.availableCapabilitiesSection || ''],
       ['model_health', thinkerParams.modelHealthSection],
       ['prune_candidates', thinkerParams.pruneCandidatesSection || ''],

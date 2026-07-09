@@ -4156,6 +4156,70 @@ class BlueprintRunnerInstallTests(unittest.TestCase):
             self.assertEqual(br.resolve_token(None), "persisted-acceptance-token")
 
 
+class TestProviderCredentialCheck(unittest.TestCase):
+    """LLM provider credential presence check for the preflight."""
+
+    def test_detects_anthropic_api_key(self):
+        """ANTHROPIC_API_KEY set -> credentials found."""
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True):
+            self.assertTrue(br._check_provider_credentials())
+
+    def test_detects_claude_code_oauth_token(self):
+        """CLAUDE_CODE_OAUTH_TOKEN set -> credentials found."""
+        with patch.dict("os.environ", {"CLAUDE_CODE_OAUTH_TOKEN": "tok-test"}, clear=True):
+            self.assertTrue(br._check_provider_credentials())
+
+    def test_detects_zai_api_key(self):
+        """ZAI_API_KEY set -> credentials found."""
+        with patch.dict("os.environ", {"ZAI_API_KEY": "zai-test"}, clear=True):
+            self.assertTrue(br._check_provider_credentials())
+
+    def test_detects_openai_api_key(self):
+        """OPENAI_API_KEY set -> credentials found."""
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-openai-test"}, clear=True):
+            self.assertTrue(br._check_provider_credentials())
+
+    def test_returns_false_when_none_set(self):
+        """No credential env vars -> credentials NOT found."""
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(br._check_provider_credentials())
+
+    def test_returns_false_when_only_whitespace(self):
+        """A credential key set to whitespace is treated as absent."""
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "   "}, clear=True):
+            self.assertFalse(br._check_provider_credentials())
+
+    def test_warning_printed_in_preflight_when_no_credentials(self):
+        """main() prints a WARNING when no provider credential is set (acceptance)."""
+        output_lines = []
+
+        def capture_print(*args, **kwargs):
+            text = " ".join(str(a) for a in args)
+            output_lines.append(text)
+
+        def fake_post(url, token, body, **kwargs):
+            return 200, {"ok": True}
+
+        env = {
+            "BLUEPRINT_RUNNER_TOKEN": "tok-acceptance",
+            "BLUEPRINT_ORCHESTRATOR_URL": "https://api.example.com",
+        }
+        with patch.dict("os.environ", env, clear=True), \
+             patch("builtins.print", side_effect=capture_print), \
+             patch.object(br, "_node_major", return_value=22), \
+             patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
+             patch.object(br, "run_local_runner", return_value=0):
+            rc = br.main(["check"])
+
+        warning_lines = [line for line in output_lines if "WARNING" in line and "credential" in line.lower()]
+        self.assertTrue(
+            warning_lines,
+            f"Expected WARNING about missing credentials in output. Got: {output_lines}",
+        )
+        self.assertIn("ANTHROPIC_API_KEY", warning_lines[0])
+        self.assertEqual(rc, 0, "WARNING must not change the exit code")
+
+
 class TestStatusJson(unittest.TestCase):
     """On-box status.json liveness file: write, read, permissions, no-secrets."""
 

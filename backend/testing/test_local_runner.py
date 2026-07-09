@@ -1051,6 +1051,162 @@ class TestRunnerEndpoints:
             _clear_pool()
 
     @pytest.mark.asyncio
+    async def test_next_task_returns_credentials_when_pool_account_resolved(
+        self, client: AsyncClient, db_session
+    ):
+        """next-task returns llm_env and llm_files when the account pool
+        resolves an LLM account for the task, and stamps the task context with
+        llm_account_id / llm_provider / llm_auth_mode / llm_model."""
+        from app.max_plan_pool import LLMSelectionResult
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task_instance = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task_instance)
+        await db_session.commit()
+
+        mock_selection = LLMSelectionResult(
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-opus-4-8",
+            quality_tier="opus",
+            account={
+                "id": "acct-001",
+                "oauth_token": "sk-ant-test-token",
+                "runtime_secret": "sk-ant-test-token",
+                "claude_config_json": None,
+                "provider_metadata": {},
+            },
+            settings={},
+        )
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=mock_selection),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "credentials" in body
+        creds = body["credentials"]
+        assert creds is not None
+        assert "env" in creds
+        assert "files" in creds
+        env = creds["env"]
+        assert env.get("PROVIDER") == "anthropic"
+        assert env.get("AUTH_MODE") == "oauth"
+        # Provider-specific secret should be present in the llm_env.
+        assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-test-token"
+
+        # Verify task context was stamped for cost attribution.
+        await db_session.refresh(task_instance)
+        assert task_instance.llm_account_id == "acct-001"
+        assert task_instance.context.get("llm_account_id") == "acct-001"
+        assert task_instance.context.get("llm_provider") == "anthropic"
+        assert task_instance.context.get("llm_auth_mode") == "oauth"
+        assert task_instance.context.get("llm_model") == "claude-opus-4-8"
+        assert task_instance.status == TaskStatus.PROVISIONING  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_next_task_returns_null_credentials_when_no_pool_account(
+        self, client: AsyncClient, db_session
+    ):
+        """next-task returns 204 when no LLM account is resolved — the task stays
+        in PROVISIONING for the next poll cycle, and no context fields are stamped."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task_instance = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "title": "no pool account"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task_instance)
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=None),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # When no LLM account is resolved, the handler returns 204
+        # with no body, rolling back the dispatch marker so the task
+        # stays claimable by a future poll cycle.
+        assert resp.status_code == 204
+
+        # Task context was NOT stamped since select_llm_runtime_for_task returned None.
+        await db_session.refresh(task_instance)
+        assert task_instance.llm_account_id is None  # not stamped
+        assert task_instance.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_next_task_returns_200_with_null_credentials_on_exception(
+        self, client: AsyncClient, db_session
+    ):
+        """When an unexpected exception occurs during credential resolution,
+        next-task returns 200 with credentials: null so the runner falls back
+        to host env vars instead of failing the poll entirely."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task_instance = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "title": "cred resolution exception"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task_instance)
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=RuntimeError("pool connection lost")),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # Fallback: 200 with null credentials — the task is dispatched but lacks
+        # per-task LLM credentials, so the runner falls back to host env vars.
+        assert resp.status_code == 200
+        assert resp.json()["credentials"] is None
+
+        # Task context was NOT stamped (the exception aborted credential resolution).
+        await db_session.refresh(task_instance)
+        assert task_instance.llm_account_id is None
+        assert task_instance.status == TaskStatus.PROVISIONING  # unchanged
+        # started_at IS set (unlike the pool-exhausted path, dispatch is not rolled back).
+        assert task_instance.started_at is not None
+
+    @pytest.mark.asyncio
     async def test_agent_claim_after_runner_dispatch_transitions_to_in_progress(
         self, client: AsyncClient, db_session
     ):
