@@ -1454,8 +1454,21 @@ export async function handleSalvageBundle(
   const findingsText = salvagedFindings.length > 0
     ? salvagedFindings.map((f, i) => {
         let text = `${i + 1}. ${strVal(f.title) || '(untitled)'} (reason: ${strVal(f.discard_reason) || 'unknown'})`;
-        const desc = strVal(f.description);
-        if (desc) text += `\n   Description: ${desc.slice(0, 200)}`;
+        const prompt = strVal(f.prompt);
+        if (prompt) {
+          text += `\n   Prompt: ${prompt.slice(0, 500)}`;
+        } else {
+          const desc = strVal(f.description);
+          if (desc) text += `\n   Description: ${desc.slice(0, 200)}`;
+        }
+        const claims = f.claims;
+        if (Array.isArray(claims) && claims.length > 0) {
+          const claimLines = claims.map((c: unknown) => {
+            const claimStr = typeof c === 'string' ? c : strVal((c as Record<string, unknown>).claim ?? (c as Record<string, unknown>).text ?? '');
+            return claimStr ? `     - ${claimStr}` : '';
+          }).filter(Boolean);
+          if (claimLines.length > 0) text += `\n   Claims:\n${claimLines.join('\n')}`;
+        }
         const files = f.related_files;
         if (Array.isArray(files) && files.length > 0) {
           const fileList = files.map((rf: unknown) =>
