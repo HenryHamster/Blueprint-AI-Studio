@@ -94,7 +94,7 @@ bash run_migrations.sh
 uvicorn app.main:app --host 0.0.0.0 --port 8080 &
 cd ..
 
-# Start frontends (launcher :3000, admin-ui :3001)
+# Start frontend (admin-ui :3001)
 npm run dev
 ```
 
@@ -107,4 +107,4 @@ npm run dev
 - **Database:** AlloyDB (PostgreSQL) with Alembic migrations
 - **Auth:** Firebase Auth (admin UI), JWT (agent VMs), ADMIN_API_KEY (server-to-server)
 - **Claude Auth:** Max plan accounts (pooled, load-balanced) with API key fallback
-- **Frontend:** Firebase Hosting — launcher + admin-ui as separate sites
+- **Frontend:** Firebase Hosting — admin-ui
