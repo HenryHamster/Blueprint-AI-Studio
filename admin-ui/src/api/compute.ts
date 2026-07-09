@@ -1278,6 +1278,11 @@ export interface KnowledgeDocument {
   /** Criterion verdict (True/False/None) from the success criterion evaluation for compute_experiment
    *  documents. None = unmeasured/not evaluable. Distinct from compute_acceptance_grade. */
   criterion_met?: boolean | null;
+  /** Lifecycle tracking for the strategist follow-up workflow. */
+  lifecycle_status?: 'pending' | 'consumed' | 'dismissed' | string;
+  consumed_at?: string | null;
+  dismissed_at?: string | null;
+  dismissed_reason?: string | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }
@@ -1292,7 +1297,7 @@ export interface KnowledgeDocumentsResponse {
 /** List / search a project's knowledge documents, newest-first. `q` drives full-text/tag/topic search. */
 export async function fetchKnowledgeDocuments(
   projectId: string,
-  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; origin_state?: string; challenge_state?: string; finding_hash?: string; sweep?: string; limit?: number; offset?: number },
+  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; origin_state?: string; challenge_state?: string; finding_hash?: string; sweep?: string; lifecycle_status?: string; limit?: number; offset?: number },
 ): Promise<KnowledgeDocumentsResponse> {
   const sp = new URLSearchParams();
   if (params?.q) sp.set('q', params.q);
@@ -1304,6 +1309,7 @@ export async function fetchKnowledgeDocuments(
   if (params?.challenge_state) sp.set('challenge_state', params.challenge_state);
   if (params?.finding_hash) sp.set('finding_hash', params.finding_hash);
   if (params?.sweep) sp.set('sweep_id', params.sweep);
+  if (params?.lifecycle_status) sp.set('lifecycle_status', params.lifecycle_status);
   if (params?.limit !== undefined) sp.set('limit', String(params.limit));
   if (params?.offset !== undefined) sp.set('offset', String(params.offset));
   const query = sp.toString();
