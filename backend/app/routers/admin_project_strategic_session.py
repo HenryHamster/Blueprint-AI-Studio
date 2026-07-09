@@ -1468,6 +1468,7 @@ async def get_project_strategic_state(
         "state_revision": _revision,
         "model_integrity": model_integrity,
         "integrity_conflict_trend": integrity_trend,
+        "strategic_memory_notes": project.strategic_memory_notes or [],
     }
 
 

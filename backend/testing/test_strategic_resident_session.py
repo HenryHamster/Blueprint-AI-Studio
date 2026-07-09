@@ -4009,3 +4009,115 @@ async def test_heartbeat_without_turn_latency_summary_is_liveness_ok(db_session)
     stored = blob.get("_turn_latency_summary")
     assert isinstance(stored, dict)
     assert stored["operator"]["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Restart continuity — memory notes and session summary survive into the
+# NEXT resident session's bootstrap.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_restart_loads_memory_notes(db_session):
+    """Memory notes written via set_memory appear in the bootstrap payload of the
+    NEXT spawned resident task (the restart-continuity claim)."""
+    project = await _make_project_with_member(db_session)
+    # Bypass the bootstrap-pending guard.
+    project.is_self_repo = True
+    # Seed strategic memory notes on the project (set_memory op writes these).
+    project.strategic_memory_notes = [
+        {
+            "note": "Always verify claims before escalating them.",
+            "set_at": "2026-01-01T00:00:00",
+        },
+        {
+            "note": "Prefer concrete action over abstract discussion.",
+            "set_at": "2026-01-02T00:00:00",
+        },
+    ]
+    flag_modified(project, "strategic_memory_notes")
+    flag_modified(project, "is_self_repo")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _make_live_local_runner(db_session, project)
+
+    # No adoptable strategic_review task exists -> spawn path.
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snapshot["status"] == "active"
+    assert snapshot["task_id"]
+
+    # The spawned task's bootstrap payload must include strategic_memory_notes.
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    strategic = [
+        t for t in tasks if (t.first_payload or {}).get("type") == "strategic_review"
+    ]
+    assert len(strategic) == 1
+    payload = strategic[0].first_payload or {}
+    notes = payload.get("strategic_memory_notes")
+    assert notes is not None, (
+        f"strategic_memory_notes missing from payload keys: {list(payload.keys())}"
+    )
+    assert len(notes) == 2
+    assert notes[0]["note"] == "Always verify claims before escalating them."
+    assert notes[1]["note"] == "Prefer concrete action over abstract discussion."
+
+
+@pytest.mark.asyncio
+async def test_session_restart_loads_session_summary(db_session):
+    """A session summary written during session A is carried forward into a freshly
+    spawned session B's task context (restart-continuity claim)."""
+    project = await _make_project_with_member(db_session)
+    project.is_self_repo = True
+    flag_modified(project, "is_self_repo")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _make_live_local_runner(db_session, project)
+
+    # Session A: start and write a session summary to the blob.
+    snap_a = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap_a["status"] == "active"
+
+    # Write a session summary to the blob (what set_session_summary does).
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["_session_summary"] = (
+        "Research revealed three key gap areas to investigate."
+    )
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Stop session A.
+    project = await db_session.get(Project, project.id)
+    ended = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert ended["status"] == "ended"
+
+    # Session B: start fresh (spawn path since session A's task was cancelled).
+    project = await db_session.get(Project, project.id)
+    snap_b = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap_b["status"] == "active"
+    assert snap_b["task_id"] != snap_a["task_id"]
+
+    # Session B's task context must carry the session summary forward.
+    from uuid import UUID
+    task_b = await db_session.get(Task, UUID(snap_b["task_id"]))
+    assert task_b is not None
+    ctx = task_b.context or {}
+    assert ctx.get("_session_summary") == (
+        "Research revealed three key gap areas to investigate."
+    )

@@ -733,6 +733,7 @@ export function StrategicContextWorkspace({
   const runtimeWorkStatus = runtimeWork ? runtimeWorkTone(runtimeWork) : null;
   const workSessionEvents = workSession?.events?.items ?? [];
   const showDescriptorOnlyContextMap = Boolean(contextMapDescriptor && !canvas);
+  const strategicMemoryNotes = state?.strategic_memory_notes ?? [];
 
   const handleOpenTarget = (
     target?: StrategicContextTarget | null,
@@ -1004,6 +1005,23 @@ export function StrategicContextWorkspace({
                   density="comfortable"
                   onOpenTarget={handleOpenTarget}
                 />
+              </Section>
+            )}
+
+            {strategicMemoryNotes.length > 0 && (
+              <Section
+                title="Memory"
+                meta={`${strategicMemoryNotes.length}`}
+                testId="strategic-context-workspace-memory"
+              >
+                <div className={CONTEXT_LIST_CLASS}>
+                  {strategicMemoryNotes.map((item, idx) => (
+                    <div key={idx} className="border-t border-neutral-800/70 py-2.5 first:border-t-0">
+                      <span className="block whitespace-pre-wrap text-sm text-neutral-100">{item.note}</span>
+                      <span className="mt-0.5 block text-ui-sm text-neutral-500">{item.set_at}</span>
+                    </div>
+                  ))}
+                </div>
               </Section>
             )}
 

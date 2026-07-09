@@ -757,6 +757,11 @@ export interface StrategicResidentSessionAvailability {
  * `eligible` = online + agent-ready + can handle strategic work (the full
  * auto-pick gate). The pinned device rides on `resident_session.runner_id`.
  */
+export interface StrategicMemoryNote {
+  note: string;
+  set_at: string;
+}
+
 export interface StrategicResidentRunnerOption {
   id: string;
   name: string;
@@ -1006,6 +1011,10 @@ export interface StrategicStateResponse {
       total: number;
     };
   } | null;
+  /** Durable behavioral lessons and operator preferences accumulated by the
+   *  resident Strategic session. Each entry is a {note, set_at} pair.
+   *  Written by the set_memory strategic op. */
+  strategic_memory_notes?: StrategicMemoryNote[];
 }
 
 export async function fetchStrategicState(

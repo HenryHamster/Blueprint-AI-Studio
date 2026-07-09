@@ -5611,6 +5611,10 @@ async def _spawn_strategic_review(
                         if _res_exam_leads
                         else {}
                     ),
+                    # Compact, durable behavioral memory notes written by the
+                    # set_memory strategic op. Already capped at 100 entries by the
+                    # handler, so budget-footprint is bounded.
+                    "strategic_memory_notes": project.strategic_memory_notes or [],
                 },
                 _STRATEGIC_REVIEW_SCHEMA,
             ),
