@@ -14,6 +14,7 @@
     "dev": "npm run dev --prefix admin-ui",
     "dev:admin": "npm run dev --prefix admin-ui",
     "clean": "rm -rf dist && rm -rf admin-ui/dist",
+    "build": "npm run build --prefix admin-ui",
     "lint": "npm run lint --prefix admin-ui"
   },
   "devDependencies": {
