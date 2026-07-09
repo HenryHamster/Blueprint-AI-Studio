@@ -1,6 +1,7 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { useMemo, useRef, useEffect, useState, useCallback, lazy, Suspense } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { Skeleton } from './components/DashboardMetricCards';
 import { Activity, AlertCircle, CheckSquare, LayoutList, PanelRightOpen } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
@@ -83,6 +84,22 @@ function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
   const values = new Set(b);
   return a.every(value => values.has(value));
 }
+
+function WorkspaceSkeleton() {
+  return (
+    <div className="flex-1 p-6 space-y-4">
+      <Skeleton className="h-7 w-1/4" />
+      <Skeleton className="h-4 w-1/2" />
+      <Skeleton className="h-48 w-full rounded-lg" />
+      <div className="space-y-3">
+        <Skeleton className="h-4 w-full" />
+        <Skeleton className="h-4 w-5/6" />
+        <Skeleton className="h-4 w-2/3" />
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
   const refreshMessagesRef = useRef<() => void>(() => {});
@@ -1819,7 +1836,7 @@ export default function App() {
         </WorkbenchSurface>
       ) : activeTab === 'project' ? (
         <ErrorBoundary level="panel">
-          <Suspense fallback={null}>
+          <Suspense fallback={<WorkspaceSkeleton />}>
           <ProjectWorkspace
             projectSection={projectSection}
             onProjectSectionChange={setProjectSection}
@@ -1845,7 +1862,7 @@ export default function App() {
         </ErrorBoundary>
       ) : activeTab === 'runtime' ? (
         <ErrorBoundary level="panel">
-          <Suspense fallback={null}>
+          <Suspense fallback={<WorkspaceSkeleton />}>
           <RuntimeWorkspace
             runtimeSection={runtimeSection}
             onRuntimeSectionChange={setRuntimeSection}
@@ -1898,7 +1915,7 @@ export default function App() {
           </Suspense>
         </ErrorBoundary>
       ) : (
-        <Suspense fallback={null}>
+        <Suspense fallback={<WorkspaceSkeleton />}>
         <PipelineWorkspace
           surface={{
             pipelineSection,

@@ -1458,11 +1458,11 @@ async def collect_terminal_artifact_reference(
     """
     try:
         if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
-            return _collect_local_artifact_reference(job)
+            return await asyncio.to_thread(_collect_local_artifact_reference, job)
         if job.backend == GCP_BACKEND_NAME:
             return await _collect_gcp_artifact_reference(job)
         if job.backend == RUNNER_SUBPROCESS_BACKEND_NAME:
-            return _collect_runner_artifact_reference(job)
+            return await asyncio.to_thread(_collect_runner_artifact_reference, job)
     except Exception:
         logger.warning(
             "Durable-artifact detection failed for compute job %s",

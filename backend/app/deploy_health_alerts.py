@@ -77,7 +77,14 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
         f"Pipeline auto-paused: external dependencies down — {', '.join(failed_deps)}{rl_suffix}{dispatch_suffix}. "
         "Will auto-resume when healthy."
     )
-    project_ids = (await session.execute(select(Project.id))).scalars().all()
+    project_ids = (
+        await session.execute(select(Project.id).limit(10000))
+    ).scalars().all()
+    if len(project_ids) >= 10000:
+        logger.warning(
+            "[HEALTH] Project ID fetch hit cap of 10000 — alert sweep truncated; "
+            "unfetched projects will be handled on the next sweep cycle"
+        )
     # Batch-check for existing pause alerts across all projects in one query
     already_alerted_pids = set(
         (
@@ -159,7 +166,14 @@ async def _create_forced_resume_alerts(
             "Resuming with reduced VM count (1) — operators should investigate."
         )
     now = _utcnow()
-    project_ids = (await session.execute(select(Project.id))).scalars().all()
+    project_ids = (
+        await session.execute(select(Project.id).limit(10000))
+    ).scalars().all()
+    if len(project_ids) >= 10000:
+        logger.warning(
+            "[HEALTH] Project ID fetch hit cap of 10000 — alert sweep truncated; "
+            "unfetched projects will be handled on the next sweep cycle"
+        )
     # Batch-dismiss existing pause-warning alerts across all projects in one query
     all_existing_warnings = (
         (
@@ -228,7 +242,14 @@ async def _create_auto_resume_alerts(
         resume_title = "Pipeline auto-resumed: all external dependencies healthy."
         severity = AlertSeverity.INFO
     now = _utcnow()
-    project_ids = (await session.execute(select(Project.id))).scalars().all()
+    project_ids = (
+        await session.execute(select(Project.id).limit(10000))
+    ).scalars().all()
+    if len(project_ids) >= 10000:
+        logger.warning(
+            "[HEALTH] Project ID fetch hit cap of 10000 — alert sweep truncated; "
+            "unfetched projects will be handled on the next sweep cycle"
+        )
     # Batch-dismiss existing pause-warning alerts across all projects in one query
     all_existing_warnings = (
         (

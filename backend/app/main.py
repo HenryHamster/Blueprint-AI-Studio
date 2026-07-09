@@ -800,8 +800,13 @@ class RequestDurationMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         elapsed_ms = (time.monotonic() - start_time) * 1000
 
-        # Add Server-Timing header with backend duration
-        response.headers["Server-Timing"] = f"backend;dur={elapsed_ms:.1f}"
+        # Build Server-Timing header: backend total first, then per-step entries
+        timing_parts = [f"backend;dur={elapsed_ms:.1f}"]
+        per_step_entries = getattr(request.state, "_server_timing_entries", None)
+        if per_step_entries:
+            for name, ms in per_step_entries:
+                timing_parts.append(f"{name};dur={ms:.1f}")
+        response.headers["Server-Timing"] = ", ".join(timing_parts)
 
         # Log slow requests with route template and duration
         if elapsed_ms > self.SLOW_REQUEST_THRESHOLD_MS:

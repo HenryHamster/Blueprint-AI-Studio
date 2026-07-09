@@ -169,12 +169,58 @@ def _resolve_ci_fix_branch(
     return branch or ""
 
 
+class _ProjectSnapshot:
+    """Lightweight, non-ORM snapshot of Project fields for the CI monitor cache.
+
+    Pre-loaded once per sweep and survives session.rollback() because it is not
+    tracked by the session.  Contains only the fields needed by read-only consumers
+    downstream in the CI monitor loop so the pre-load dict never returns a stale
+    (expired) ORM object.
+    """
+
+    __slots__ = (
+        "id",
+        "integration_branch",
+        "promotion_target",
+        "name",
+        "is_self_repo",
+        "github_repo",
+        "github_owner",
+        "build_config",
+    )
+
+    def __init__(self, project: Project) -> None:
+        self.id = project.id
+        self.integration_branch = getattr(project, "integration_branch", None)
+        self.promotion_target = getattr(project, "promotion_target", None)
+        self.name = getattr(project, "name", "")
+        self.is_self_repo = getattr(project, "is_self_repo", False)
+        self.github_repo = getattr(project, "github_repo", "") or ""
+        self.github_owner = getattr(project, "github_owner", "") or ""
+        self.build_config = dict(getattr(project, "build_config", None) or {})
+
+    @property
+    def staging_branch_prefixes(self) -> tuple[str, ...]:
+        configured = self.build_config.get("staging_branch_prefixes")
+        if configured is not None:
+            prefixes = tuple(str(prefix) for prefix in configured if prefix)
+            if prefixes:
+                return prefixes
+        return ("research/", "plan/")
+
+    def is_staging_branch(self, branch: str | None) -> bool:
+        if not branch:
+            return False
+        return branch.startswith(tuple(self.staging_branch_prefixes))
+
+
 async def _apply_ci_merged_landed_signal(
     ci_task: Task,
     session: AsyncSession,
     *,
     base_branch: str,
     review_loop: dict,
+    project: Project | None = None,
 ) -> bool:
     """Stage the pr_merged landed signal only when the merged PR landed on
     the project's integration branch.
@@ -182,12 +228,17 @@ async def _apply_ci_merged_landed_signal(
     Returns True when the merged PR landed on the integration branch. When the
     base branch resolves to a distinct promotion target, the helper withholds
     pr_merged and stages the same branch-safety alert the rollup boundary uses.
+
+    ``project`` may be pre-loaded from the caller's batch cache to avoid an
+    N+1 session.get(Project, ...) on the hot CI-polling path.  When omitted
+    (default), the function falls back to the legacy per-call session.get.
     """
     from app.landed_signal import apply_merged_landed_signal
 
-    project = (
-        await session.get(Project, ci_task.project_id) if ci_task.project_id else None
-    )
+    if project is None:
+        project = (
+            await session.get(Project, ci_task.project_id) if ci_task.project_id else None
+        )
     hotfix_lane = bool(
         (ci_task.first_payload or {}).get("hotfix")
         or (ci_task.context or {}).get("hotfix")
@@ -248,6 +299,47 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
         .scalars()
         .all()
     )
+    # Batch-load all unique projects referenced by the CI-waiting tasks to avoid
+    # N+1 session.get(Project, ...) queries per task. Uses _ProjectSnapshot
+    # (non-ORM lightweight data) so the cache survives session.rollback() —
+    # rollback unconditionally expires all ORM objects, which would make a
+    # plain ORM cache unusable after any early-skip rollback path.  Write paths
+    # that need a tracked ORM Project re-fetch individually (rare — merged PR
+    # signal, test-command re-detection, recovered test persistence).
+    _preloaded_projects: dict[uuid.UUID, "_ProjectSnapshot"] = {}
+    if ci_waiting_task_ids:
+        _project_ids_raw = (
+            (
+                await session.execute(
+                    select(Task.project_id).where(
+                        Task.id.in_(ci_waiting_task_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        _unique_pids = {pid for pid in _project_ids_raw if pid is not None}
+        if _unique_pids:
+            _proj_rows = await session.execute(
+                select(Project).where(
+                    Project.id.in_(list(_unique_pids))
+                )
+            )
+            _preloaded_projects = {
+                p.id: _ProjectSnapshot(p) for p in _proj_rows.scalars().all()
+            }
+
+    def _get_project(
+        project_id: uuid.UUID | None,
+    ) -> "_ProjectSnapshot" | None:
+        """Resolve a project from the pre-loaded cache, falling back to None
+        when the id is absent or not in the batch (should not occur in practice
+        since all task project_ids were collected above)."""
+        if project_id is None:
+            return None
+        return _preloaded_projects.get(project_id)
+
     for ci_task_id in ci_waiting_task_ids:
         # Heartbeat per task: this loop is O(EVALUATING backlog) and
         # is the dominant contributor to cycle wall-time. Marking
@@ -699,11 +791,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         )
                     continue
                 if pr_data.get("merged"):
-                    _orch_ci_project = (
-                        await session.get(Project, ci_task.project_id)
-                        if ci_task.project_id
-                        else None
-                    )
+                    _orch_ci_project = _get_project(ci_task.project_id)
                     _ci_base = (
                         (pr_data.get("base") or {}).get("ref", "")
                         or ci_loop.get("base_branch", "")
@@ -714,12 +802,25 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                             _orch_ci_project
                         )
                     )
+                    # Re-fetch tracked ORM Project for the write path:
+                    # _apply_ci_merged_landed_signal -> apply_merged_landed_signal
+                    # -> record_capability_proof modifies
+                    # project.capability_proof_records (flag_modified).  The
+                    # lightweight _ProjectSnapshot in the cache cannot be tracked
+                    # by the session, so a fresh ORM fetch is needed here.
+                    # This is a rare path (only when the PR is already merged).
+                    _orch_ci_project_orm = (
+                        await session.get(Project, ci_task.project_id)
+                        if ci_task.project_id is not None
+                        else None
+                    )
                     _landed_on_integration = (
                         await _apply_ci_merged_landed_signal(
                             ci_task,
                             session,
                             base_branch=_ci_base,
                             review_loop=ci_loop,
+                            project=_orch_ci_project_orm,
                         )
                     )
                     ci_task.status = TaskStatus.COMPLETED
@@ -936,11 +1037,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     # if the base tip is already an ancestor of the PR head,
                     # update_branch_with_sha_retry would just churn CI for
                     # no real change. Mirrors ci_completion.py's pattern.
-                    _orch_ci_project_pre = (
-                        await session.get(Project, ci_task.project_id)
-                        if ci_task.project_id
-                        else None
-                    )
+                    _orch_ci_project_pre = _get_project(ci_task.project_id)
                     _ci_payload_pre = ci_task.first_payload
                     _ci_base_pre = (
                         ci_loop.get("base_branch", "")
@@ -1181,11 +1278,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                 ci_branch = _resolve_ci_fix_branch(
                     ci_loop, ci_payload, pr_data
                 )
-                _orch_ci_project = (
-                    await session.get(Project, ci_task.project_id)
-                    if ci_task.project_id
-                    else None
-                )
+                _orch_ci_project = _get_project(ci_task.project_id)
                 ci_base = (
                     ci_loop.get("base_branch", "")
                     or ci_payload.get("base_branch", "")
@@ -1520,11 +1613,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     _ci_base_ref = (pr_data.get("base") or {}).get(
                         "ref", ""
                     )
-                    _ci_proj = (
-                        await session.get(Project, ci_task.project_id)
-                        if ci_task.project_id
-                        else None
-                    )
+                    _ci_proj = _get_project(ci_task.project_id)
                     # A *definitive* no_checks proceeds to the
                     # mergeability-gated merge when the PR targets an
                     # internal staging branch (research/plan, CI
@@ -1603,8 +1692,21 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                                     maybe_redetect_missing_test_command,
                                 )
 
+                                # Re-fetch tracked ORM Project for the write path:
+                                # maybe_redetect_missing_test_command modifies
+                                # project.build_config (flag_modified + commit).
+                                # The snapshot cache cannot provide a tracked
+                                # object; this is a rare path (one re-detect per
+                                # 6-hour cooldown per project).
+                                _ci_proj_orm = (
+                                    await session.get(
+                                        Project, ci_task.project_id
+                                    )
+                                    if ci_task.project_id is not None
+                                    else None
+                                )
                                 _redetected = await maybe_redetect_missing_test_command(
-                                    _ci_proj,
+                                    _ci_proj_orm,
                                     session,
                                     ref=_ci_base_ref,
                                 )
@@ -2084,8 +2186,17 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                                 persist_recovered_test_command,
                             )
 
-                            _recover_proj = await session.get(
-                                Project, ci_task.project_id
+                            # Re-fetch tracked ORM Project for the write path:
+                            # persist_recovered_test_command modifies
+                            # project.build_config (flag_modified + commit).
+                            # The snapshot cache cannot provide a tracked
+                            # object; this is a rare recovery path.
+                            _recover_proj = (
+                                await session.get(
+                                    Project, ci_task.project_id
+                                )
+                                if ci_task.project_id is not None
+                                else None
                             )
                             if _recover_proj is not None:
                                 _persisted = (
@@ -2221,13 +2332,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                             _esc_base = (pr_data.get("base") or {}).get(
                                 "ref", ""
                             ) or ci_loop.get("base_branch", "")
-                            _esc_proj = (
-                                await session.get(
-                                    Project, ci_task.project_id
-                                )
-                                if ci_task.project_id
-                                else None
-                            )
+                            _esc_proj = _get_project(ci_task.project_id)
                             _gate_on = _rt_cfg.get(
                                 "no_ci_test_gate_enabled", True
                             )
@@ -2256,8 +2361,18 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                                     maybe_redetect_ci_presence,
                                 )
 
+                                # Re-fetch tracked ORM Project for the write
+                                # path: maybe_redetect_ci_presence modifies
+                                # project.build_config (flag_modified + commit).
+                                _esc_proj_orm = (
+                                    await session.get(
+                                        Project, ci_task.project_id
+                                    )
+                                    if ci_task.project_id is not None
+                                    else None
+                                )
                                 await maybe_redetect_ci_presence(
-                                    _esc_proj,
+                                    _esc_proj_orm,
                                     session,
                                     ref=_esc_base,
                                 )

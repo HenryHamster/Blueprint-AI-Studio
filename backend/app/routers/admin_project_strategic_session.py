@@ -104,6 +104,7 @@ from app.work_session_check_in import (
     _message_is_operator_check_in,
     _persist_strategic_check_in_marker,
 )
+from app.server_timing import async_timed
 from app.shared_state import runtime_config
 from app.strategic_resident_session import (
     STRATEGIC_SESSION_ENABLED_SETTING,
@@ -1105,56 +1106,62 @@ async def get_project_strategic_state(
         if status in message_counts:
             message_counts[status] = int(count or 0)
 
-    attention = await build_operator_attention(
-        session,
-        project,
-        current_user["user_id"],
-    )
+    async with async_timed(request, "attention"):
+        attention = await build_operator_attention(
+            session,
+            project,
+            current_user["user_id"],
+        )
     active_cycle_summary = _cycle_summary(active_cycle, active_task=active_task)
     latest_cycle_summary = _cycle_summary(latest_cycle)
     running_update_summary = _running_update_summary(project)
     problem_model_summary = _problem_model_summary(project.problem_model or {})
     directions_summary = _direction_summary(project.directions or [])
-    context_evidence = await load_strategic_context_evidence(session, project.id)
-    context_package = build_strategic_context_package_summary(
-        project,
-        active_cycle=active_cycle_summary,
-        active_task=active_task,
-        latest_cycle=latest_cycle,
-        running_update=running_update_summary,
-        problem_model=problem_model_summary,
-        directions=directions_summary,
-        message_counts=message_counts,
-        task_counts=task_counts,
-        attention=attention,
-        evidence=context_evidence,
-    )
-    runtime_summary = await build_strategic_runtime_summary(
-        session,
-        project.id,
-        active_task=active_task,
-        project_vision=project.vision or {},
-        operator_user_id=current_user["user_id"],
-    )
+    async with async_timed(request, "context"):
+        context_evidence = await load_strategic_context_evidence(session, project.id)
+        context_package = build_strategic_context_package_summary(
+            project,
+            active_cycle=active_cycle_summary,
+            active_task=active_task,
+            latest_cycle=latest_cycle,
+            running_update=running_update_summary,
+            problem_model=problem_model_summary,
+            directions=directions_summary,
+            message_counts=message_counts,
+            task_counts=task_counts,
+            attention=attention,
+            evidence=context_evidence,
+        )
+    async with async_timed(request, "runtime"):
+        runtime_summary = await build_strategic_runtime_summary(
+            session,
+            project.id,
+            active_task=active_task,
+            project_vision=project.vision or {},
+            operator_user_id=current_user["user_id"],
+        )
     # Multi-device resident-session picker: every enrolled runner with its
     # online / agent-ready / eligible flags (for the auto-pick + override
     # dropdown) and, via ``_resident_session_availability``, the block-on-offline
     # verdict for a session pinned to a now-offline device.
-    resident_runner_options = await build_resident_runner_options(session, project.id)
-    workbench_state = await get_strategic_workbench_state(
-        session,
-        current_user["user_id"],
-        project.id,
-    )
-    resolved_selected_ref_descriptors = await resolve_selected_ref_descriptors(
-        session,
-        project.id,
-        _collect_selected_refs_for_resolution(
-            workbench_state.get("selected_refs"),
-            *message_rows,
-        ),
-        limit=48,
-    )
+    async with async_timed(request, "runners"):
+        resident_runner_options = await build_resident_runner_options(session, project.id)
+    async with async_timed(request, "workbench"):
+        workbench_state = await get_strategic_workbench_state(
+            session,
+            current_user["user_id"],
+            project.id,
+        )
+    async with async_timed(request, "refs"):
+        resolved_selected_ref_descriptors = await resolve_selected_ref_descriptors(
+            session,
+            project.id,
+            _collect_selected_refs_for_resolution(
+                workbench_state.get("selected_refs"),
+                *message_rows,
+            ),
+            limit=48,
+        )
     work_session = _build_work_session_summary(
         project,
         workbench_state=workbench_state,

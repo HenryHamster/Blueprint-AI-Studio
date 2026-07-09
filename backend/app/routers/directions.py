@@ -1,5 +1,6 @@
 """Direction management endpoints for project autonomous improvement steering."""
 
+import asyncio
 import json
 import uuid
 import hashlib
@@ -283,15 +284,23 @@ async def get_directions(
         refractory_reason = refractory_info["refractory_reason"]
         refractory_remaining_minutes = refractory_info["refractory_remaining_minutes"]
 
-        cache_key = _direction_metric_cache_key(d)
+        cache_key = await asyncio.to_thread(_direction_metric_cache_key, d)
         cached = _DIRECTION_METRIC_CACHE.get(cache_key)
         if cached is None:
-            generalized_state = _compute_lifetime_generalized_outcome_state(d)
-            raw_churn = _compute_churn_metrics(d)
-            raw_lifetime = _compute_lifetime_burn_metrics(d)
+            generalized_state = await asyncio.to_thread(
+                _compute_lifetime_generalized_outcome_state, d
+            )
+            raw_churn = await asyncio.to_thread(_compute_churn_metrics, d)
+            raw_lifetime = await asyncio.to_thread(_compute_lifetime_burn_metrics, d)
+            merges_per_cycle = await asyncio.to_thread(
+                _compute_direction_merges_per_cycle, d
+            )
+            quality_score = await asyncio.to_thread(
+                _compute_direction_quality_score, d
+            )
             cached = {
-                "merges_per_cycle": _compute_direction_merges_per_cycle(d),
-                "quality_score": round(_compute_direction_quality_score(d), 3),
+                "merges_per_cycle": merges_per_cycle,
+                "quality_score": round(quality_score, 3),
                 "generalized_state": generalized_state,
                 "raw_churn": raw_churn,
                 "raw_lifetime": raw_lifetime,
