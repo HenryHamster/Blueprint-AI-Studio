@@ -1586,20 +1586,6 @@ def compute_effort_model_efficiency(
     priced_model_keys: set[tuple[str, str]] = set()
     unpriced_combos: list[str] = []
 
-    # Per-effort, per-provider tracking for the provider_routing_verdict block.
-    # effort -> provider -> {cost_usd, verified_landed_count, pr_eligible_run_count, run_count}
-    def _new_ep_bucket() -> Dict[str, Any]:
-        return {
-            "cost_usd": 0.0,
-            "verified_landed_count": 0,
-            "pr_eligible_run_count": 0,
-            "run_count": 0,
-        }
-
-    effort_provider: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(
-        lambda: defaultdict(_new_ep_bucket)
-    )
-
     totals = _new_efficiency_bucket()
 
     # Model-fallback (requested-vs-actual divergence) aggregation.
@@ -1711,10 +1697,6 @@ def compute_effort_model_efficiency(
             )
             task_model_keys.add(key)
 
-            # Provider-routing-verdict accumulation: per-effort per-provider cost.
-            ep = effort_provider[effort][provider]
-            ep["cost_usd"] += cost
-
         # Per-task crediting. A task that burned no LLM tokens still counts as a
         # run (and lands its merge) under its resolved final (provider, model) so
         # it is not dropped from the model surface.
@@ -1758,17 +1740,6 @@ def compute_effort_model_efficiency(
                 em["pr_eligible_run_count"] += 1
             if landed:
                 em["landed_count"] += 1
-
-        # Provider-level crediting for the routing verdict: one run/verified
-        # credit per distinct provider the task touched (not per model).
-        task_providers: set[str] = {k[0] for k in credit_keys}
-        for provider in task_providers:
-            ep = effort_provider[effort][provider]
-            ep["run_count"] += 1
-            if pr_eligible:
-                ep["pr_eligible_run_count"] += 1
-            if verified:
-                ep["verified_landed_count"] += 1
 
         fallback = (t.context or {}).get("model_fallback")
         if isinstance(fallback, dict) and fallback.get("requested"):
@@ -1830,123 +1801,6 @@ def compute_effort_model_efficiency(
         )[:_FALLBACK_LIST_CAP]
     ]
 
-    # --- provider_routing_verdict ---
-    # Compact DeepSeek-vs-Anthropic comparison per effort tier, derived from the
-    # same accumulation data. Only emitted when BOTH providers have at least one
-    # run in a tier. cost_ratio < 1.0 means DeepSeek is cheaper; verified_rate_delta
-    # < 0 means DeepSeek landed fewer verified PRs per PR-eligible run.
-    provider_routing_verdict: Dict[str, Any] = {}
-    _ds_total = {"cost_usd": 0.0, "verified_landed_count": 0, "pr_eligible_run_count": 0, "run_count": 0}
-    _an_total = {"cost_usd": 0.0, "verified_landed_count": 0, "pr_eligible_run_count": 0, "run_count": 0}
-    _by_effort_verdicts: Dict[str, Any] = {}
-
-    for _effort in sorted(
-        set(effort_buckets.keys()) | set(effort_provider.keys()),
-        key=lambda e: (_EFFORT_TIER_ORDER.get(e, 99), e),
-    ):
-        _ep = effort_provider.get(_effort, {})
-        _ds = _ep.get("deepseek")
-        _an = _ep.get("anthropic")
-        if _ds is None or _an is None:
-            continue
-        if _ds["run_count"] == 0 or _an["run_count"] == 0:
-            continue
-        _ds_cpm = (
-            round(_ds["cost_usd"] / _ds["verified_landed_count"], 6)
-            if _ds["verified_landed_count"]
-            else None
-        )
-        _an_cpm = (
-            round(_an["cost_usd"] / _an["verified_landed_count"], 6)
-            if _an["verified_landed_count"]
-            else None
-        )
-        _ds_rate = (
-            round(_ds["verified_landed_count"] / _ds["pr_eligible_run_count"], 4)
-            if _ds["pr_eligible_run_count"]
-            else None
-        )
-        _an_rate = (
-            round(_an["verified_landed_count"] / _an["pr_eligible_run_count"], 4)
-            if _an["pr_eligible_run_count"]
-            else None
-        )
-        _by_effort_verdicts[_effort] = {
-            "deepseek": {
-                "run_count": int(_ds["run_count"]),
-                "cost_per_merge": _ds_cpm,
-                "verified_landed_rate": _ds_rate,
-            },
-            "anthropic": {
-                "run_count": int(_an["run_count"]),
-                "cost_per_merge": _an_cpm,
-                "verified_landed_rate": _an_rate,
-            },
-            "cost_ratio": (
-                round(_ds_cpm / _an_cpm, 4)
-                if (_ds_cpm is not None and _an_cpm is not None and _an_cpm > 0)
-                else None
-            ),
-            "verified_rate_delta": (
-                round(_ds_rate - _an_rate, 4)
-                if (_ds_rate is not None and _an_rate is not None)
-                else None
-            ),
-        }
-        for _k in _ds_total:
-            _ds_total[_k] += _ds[_k]
-        for _k in _an_total:
-            _an_total[_k] += _an[_k]
-
-    if _by_effort_verdicts:
-        provider_routing_verdict["by_effort"] = _by_effort_verdicts
-
-    # Overall cross-tier aggregate: same comparison on the summed DeepSeek and
-    # Anthropic totals.
-    if _ds_total["run_count"] > 0 and _an_total["run_count"] > 0:
-        _ds_cpm = (
-            round(_ds_total["cost_usd"] / _ds_total["verified_landed_count"], 6)
-            if _ds_total["verified_landed_count"]
-            else None
-        )
-        _an_cpm = (
-            round(_an_total["cost_usd"] / _an_total["verified_landed_count"], 6)
-            if _an_total["verified_landed_count"]
-            else None
-        )
-        _ds_rate = (
-            round(_ds_total["verified_landed_count"] / _ds_total["pr_eligible_run_count"], 4)
-            if _ds_total["pr_eligible_run_count"]
-            else None
-        )
-        _an_rate = (
-            round(_an_total["verified_landed_count"] / _an_total["pr_eligible_run_count"], 4)
-            if _an_total["pr_eligible_run_count"]
-            else None
-        )
-        provider_routing_verdict["overall"] = {
-            "deepseek": {
-                "run_count": int(_ds_total["run_count"]),
-                "cost_per_merge": _ds_cpm,
-                "verified_landed_rate": _ds_rate,
-            },
-            "anthropic": {
-                "run_count": int(_an_total["run_count"]),
-                "cost_per_merge": _an_cpm,
-                "verified_landed_rate": _an_rate,
-            },
-            "cost_ratio": (
-                round(_ds_cpm / _an_cpm, 4)
-                if (_ds_cpm is not None and _an_cpm is not None and _an_cpm > 0)
-                else None
-            ),
-            "verified_rate_delta": (
-                round(_ds_rate - _an_rate, 4)
-                if (_ds_rate is not None and _an_rate is not None)
-                else None
-            ),
-        }
-
     return {
         "by_effort": by_effort,
         "by_model": by_model,
@@ -1956,7 +1810,6 @@ def compute_effort_model_efficiency(
             "total": fallback_total,
             "combos": fallback_list,
         },
-        "provider_routing_verdict": provider_routing_verdict,
     }
 
 

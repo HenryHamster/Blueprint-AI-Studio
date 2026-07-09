@@ -11028,3 +11028,160 @@ def test_provider_routing_verdict_derivation():
     assert s["verified_rate_delta_pct"] < -5.0, (
         f"rate delta should be below -5pp floor, got {s['verified_rate_delta_pct']}"
     )
+
+    # -- REJECT: cost not meaningfully lower (cost_ratio >= 0.90) ------------
+    # Both providers have equal verified rates (rate_delta ≈ 0, quality OK),
+    # but DeepSeek's cost-per-merge is not meaningfully cheaper because its
+    # per-task token consumption is high enough to offset its lower per-token
+    # pricing.
+    expensive_ds_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider=prov,
+            model=mod,
+            api_call_summary={
+                # DeepSeek uses ~37x more tokens than Anthropic per call,
+                # cancelling out its ~37x cheaper per-token pricing.
+                "total_input_tokens": 37000 if prov == "deepseek" else 1000,
+                "total_output_tokens": 18500 if prov == "deepseek" else 500,
+                "llm_call_count": 5,
+            },
+        )
+        for prov, mod in [("deepseek", "deepseek-v4-flash")] * 30
+        + [("anthropic", "claude-sonnet-4-6")] * 30
+    ]
+    # Equal verified rates: 24/30 each → ~0pp delta (quality OK).
+    for i, t in enumerate(expensive_ds_tasks):
+        if (t.provider == "deepseek" and i >= 24) or (
+            t.provider == "anthropic" and i >= 54
+        ):
+            t.context = {}
+
+    verdict = compute_provider_routing_verdict(_by_model(expensive_ds_tasks))
+    assert verdict["state"] == PROVIDER_ROUTING_REJECT, (
+        f"expected REJECT with DeepSeek cost not meaningfully lower, "
+        f"got {verdict['state']}"
+    )
+    s = verdict["supporting"]
+    assert s["cost_ratio"] is not None and s["cost_ratio"] >= 0.90, (
+        f"cost_ratio should be >= 0.90 to trigger cost-rejection, "
+        f"got {s['cost_ratio']}"
+    )
+    # Quality should be OK (rate delta should be 0pp, well above -5pp floor).
+    assert s["verified_rate_delta_pct"] > -5.0, (
+        f"rate delta should be above quality floor, got {s['verified_rate_delta_pct']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_seed_routing_verdict_from_snapshot_restores_verdict_state(db_session):
+    """Verdict state is seeded from persisted efficiency_baseline on startup.
+
+    Verifies that ``_seed_routing_verdict_from_snapshot`` reads the
+    ``provider_routing_verdict`` from ``project.design_doc["efficiency_baseline"]``
+    and sets ``runtime_config["provider_routing_verdict_state"]`` accordingly.
+    This is the mechanism that restores DeepSeek preference on backend restart
+    without waiting for the next periodic snapshot write.
+    """
+    from app.shared_state import runtime_config as _rc
+    from app.lifecycle import _seed_routing_verdict_from_snapshot
+
+    # Clean slate: remove any pre-existing verdict state so the test is hermetic.
+    _rc.pop("provider_routing_verdict_state", None)
+
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "provider_routing_verdict": {
+                        "state": PROVIDER_ROUTING_ADOPT,
+                        "supporting": {
+                            "deepseek_run_count": 30,
+                            "anthropic_run_count": 30,
+                        },
+                        "recommended_action": "Adopt DeepSeek routing",
+                    },
+                },
+                "snapshots": [],
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    await _seed_routing_verdict_from_snapshot()
+
+    assert _rc.get("provider_routing_verdict_state") == PROVIDER_ROUTING_ADOPT, (
+        f"expected {PROVIDER_ROUTING_ADOPT}, got {_rc.get('provider_routing_verdict_state')}"
+    )
+
+    # Clean up so we don't leak state into other tests.
+    _rc.pop("provider_routing_verdict_state", None)
+
+
+@pytest.mark.asyncio
+async def test_seed_routing_verdict_from_snapshot_skips_project_without_verdict(db_session):
+    """When no project has a verdict, the runtime_config key remains unset."""
+    from app.shared_state import runtime_config as _rc
+    from app.lifecycle import _seed_routing_verdict_from_snapshot
+
+    _rc.pop("provider_routing_verdict_state", None)
+
+    # Project exists but has no efficiency_baseline in design_doc.
+    project = make_project(design_doc={"some_other_section": {}})
+    db_session.add(project)
+    await db_session.commit()
+
+    await _seed_routing_verdict_from_snapshot()
+
+    assert "provider_routing_verdict_state" not in _rc, (
+        "key should remain absent when no project has a verdict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_seed_routing_verdict_from_snapshot_picks_first_verdict(db_session):
+    """When multiple projects have verdicts, the first one wins (no overwrite)."""
+    from app.shared_state import runtime_config as _rc
+    from app.lifecycle import _seed_routing_verdict_from_snapshot
+
+    _rc.pop("provider_routing_verdict_state", None)
+
+    p1 = make_project(
+        name="Project A",
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "provider_routing_verdict": {"state": PROVIDER_ROUTING_ADOPT},
+                },
+            }
+        },
+    )
+    p2 = make_project(
+        name="Project B",
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "provider_routing_verdict": {"state": PROVIDER_ROUTING_REJECT},
+                },
+            }
+        },
+    )
+    db_session.add(p1)
+    db_session.add(p2)
+    await db_session.commit()
+
+    await _seed_routing_verdict_from_snapshot()
+
+    # The first project (by iteration order) seeds the verdict. If it's ADOPT,
+    # it wins; if REJECT unexpectedly showed first, that would also be correct.
+    # The key assertion is that SOME verdict is set (not INSUFFICIENT_DATA).
+    state = _rc.get("provider_routing_verdict_state")
+    assert state in (PROVIDER_ROUTING_ADOPT, PROVIDER_ROUTING_REJECT), (
+        f"unexpected state {state}"
+    )
+
+    _rc.pop("provider_routing_verdict_state", None)

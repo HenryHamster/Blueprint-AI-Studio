@@ -52,6 +52,28 @@ function makeData(): EffortModelEfficiency {
       total: 3,
       combos: [{ requested: 'opus', effective: 'sonnet', provider: 'anthropic', reason: 'rate_limit', count: 3 }],
     },
+    // Worst-case provider-routing callout: INSUFFICIENT_DATA with negative delta
+    // and long recommended_action text, so viewport tests catch overflow.
+    provider_routing_verdict: {
+      state: 'INSUFFICIENT_DATA' as const,
+      supporting: {
+        deepseek_run_count: 5,
+        deepseek_pr_eligible_run_count: 5,
+        deepseek_verified_landed_count: 3,
+        deepseek_verified_landed_rate: 0.6,
+        deepseek_cost_per_merge: 2.0,
+        deepseek_total_cost_usd: 10,
+        anthropic_run_count: 200,
+        anthropic_pr_eligible_run_count: 195,
+        anthropic_verified_landed_count: 156,
+        anthropic_verified_landed_rate: 0.8,
+        anthropic_cost_per_merge: 3.0,
+        anthropic_total_cost_usd: 500,
+        cost_ratio: 0.02,
+        verified_rate_delta_pct: -20.0,
+      },
+      recommended_action: 'INSUFFICIENT_DATA — only 5 DeepSeek runs (need ≥ 30) — keep collecting data before deciding',
+    },
   };
 }
 
@@ -101,6 +123,19 @@ describe('EffortEfficiencyPanel viewport', () => {
 
   test('renders without overflow at 1024px (desktop)', async () => {
     await expectNoOverflowAt(1024, async () => {
+      act(() => {
+        root.render(<EffortEfficiencyPanel data={makeData()} />);
+      });
+      // Expand every resolved-model reveal so the breakdown is measured, not
+      // just the collapsed summary.
+      container.querySelectorAll('details').forEach((d) => {
+        d.open = true;
+      });
+    });
+  });
+
+  test('renders without overflow at 1280px (desktop wide)', async () => {
+    await expectNoOverflowAt(1280, async () => {
       act(() => {
         root.render(<EffortEfficiencyPanel data={makeData()} />);
       });

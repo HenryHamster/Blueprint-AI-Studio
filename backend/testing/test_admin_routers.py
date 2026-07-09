@@ -11781,6 +11781,89 @@ class TestSrCatchRateTrendsDirectionExamples:
 
 
 # ---------------------------------------------------------------------------
+# Provider routing verdict in digest payload
+# ---------------------------------------------------------------------------
+
+
+class TestDigestProviderRoutingVerdict:
+    """provider_routing_verdict appears in the digest effort_model_efficiency payload."""
+
+    @pytest.mark.asyncio
+    async def test_digest_provider_routing_verdict_present(
+        self, client: AsyncClient, db_session
+    ):
+        """(a/b) The digest payload includes provider_routing_verdict inside
+        effort_model_efficiency with the expected shape."""
+        from testing.factories import make_task, make_project
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Create a minimal set of completed tasks with provider data so that
+        # compute_effort_model_efficiency produces by_model rows and
+        # compute_provider_routing_verdict derives a verdict from them.
+        # With fewer than 20 PR-eligible tasks per provider the verdict will
+        # be INSUFFICIENT_DATA — sufficient to assert the field is present and
+        # structurally sound.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                provider="anthropic",
+                model="claude-opus-4-8",
+                payloads=[{"type": "create", "effort": "high"}],
+                context={"pr_merged": True},
+                api_call_summary={
+                    "total_input_tokens": 100,
+                    "total_output_tokens": 100,
+                    "llm_call_count": 1,
+                },
+            )
+        )
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                provider="deepseek",
+                model="deepseek-chat",
+                payloads=[{"type": "create", "effort": "low"}],
+                context={"pr_merged": True},
+                api_call_summary={
+                    "total_input_tokens": 100,
+                    "total_output_tokens": 100,
+                    "llm_call_count": 1,
+                },
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        efficiency = data.get("effort_model_efficiency")
+        assert efficiency is not None, "effort_model_efficiency missing from digest"
+
+        verdict = efficiency.get("provider_routing_verdict")
+        assert verdict is not None, (
+            "provider_routing_verdict missing from effort_model_efficiency"
+        )
+
+        # Verify structural shape.
+        assert verdict["state"] in ("ADOPT", "REJECT", "INSUFFICIENT_DATA")
+        assert isinstance(verdict.get("recommended_action"), str)
+        supporting = verdict.get("supporting")
+        assert supporting is not None
+        # Check a few known supporting keys exist.
+        assert "deepseek_run_count" in supporting
+        assert "anthropic_run_count" in supporting
+        assert "cost_ratio" in supporting
+        assert "verified_rate_delta_pct" in supporting
+
+
+# ---------------------------------------------------------------------------
 # Accrual alternative-projection tests
 # ---------------------------------------------------------------------------
 

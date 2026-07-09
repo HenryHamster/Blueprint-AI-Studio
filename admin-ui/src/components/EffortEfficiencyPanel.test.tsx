@@ -6,6 +6,7 @@ import type {
   EfficiencyBucket,
   EffortEfficiencyRow,
   ModelEfficiencyRow,
+  ProviderRoutingVerdict,
 } from '../types/digest';
 
 function bucket(overrides: Partial<EfficiencyBucket> = {}): EfficiencyBucket {
@@ -228,5 +229,130 @@ describe('EffortEfficiencyPanel', () => {
     // Displays the raw landed rate with no "raw N" annotation.
     expect(screen.getAllByText(/70%/).length).toBeGreaterThan(0);
     expect(screen.queryByText(/raw 7/)).not.toBeInTheDocument();
+  });
+
+  it('renders ADOPT verdict callout with green badge, cost ratio, and merge rate delta', () => {
+    const verdict: ProviderRoutingVerdict = {
+      state: 'ADOPT',
+      supporting: {
+        deepseek_run_count: 400,
+        deepseek_pr_eligible_run_count: 380,
+        deepseek_verified_landed_count: 300,
+        deepseek_verified_landed_rate: 0.789,
+        deepseek_cost_per_merge: 1.2,
+        deepseek_total_cost_usd: 400,
+        anthropic_run_count: 200,
+        anthropic_pr_eligible_run_count: 190,
+        anthropic_verified_landed_count: 152,
+        anthropic_verified_landed_rate: 0.8,
+        anthropic_cost_per_merge: 3.0,
+        anthropic_total_cost_usd: 500,
+        cost_ratio: 0.42,
+        verified_rate_delta_pct: -1.1,
+      },
+      recommended_action: 'ADOPT — enable routing for all low/medium tasks',
+    };
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_verdict: verdict })} />);
+    // Badge with ADOPT state visible.
+    expect(screen.getByText('ADOPT')).toBeInTheDocument();
+    // Section heading.
+    expect(screen.getAllByText(/Provider Routing A\/B/).length).toBeGreaterThan(0);
+    // Cost ratio formatted.
+    expect(screen.getByText(/0.42x/)).toBeInTheDocument();
+    // Merge rate delta shown (negative here).
+    expect(screen.getByText(/-1.1pp/)).toBeInTheDocument();
+    // Recommended action.
+    expect(screen.getByText(/enable routing for all low\/medium tasks/)).toBeInTheDocument();
+  });
+
+  it('renders REJECT verdict with red badge and positive delta (A regressed)', () => {
+    const verdict: ProviderRoutingVerdict = {
+      state: 'REJECT',
+      supporting: {
+        deepseek_run_count: 100,
+        deepseek_pr_eligible_run_count: 95,
+        deepseek_verified_landed_count: 40,
+        deepseek_verified_landed_rate: 0.421,
+        deepseek_cost_per_merge: 2.5,
+        deepseek_total_cost_usd: 120,
+        anthropic_run_count: 200,
+        anthropic_pr_eligible_run_count: 195,
+        anthropic_verified_landed_count: 156,
+        anthropic_verified_landed_rate: 0.8,
+        anthropic_cost_per_merge: 3.0,
+        anthropic_total_cost_usd: 500,
+        cost_ratio: 0.24,
+        verified_rate_delta_pct: -37.9,
+      },
+      recommended_action: 'REJECT — quality regression (verified rate -37.9pp)',
+    };
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_verdict: verdict })} />);
+    expect(screen.getByText('REJECT')).toBeInTheDocument();
+    expect(screen.getByText(/0.24x/)).toBeInTheDocument();
+    // The delta appears in both the span and the recommended_action text.
+    expect(screen.getAllByText(/-37.9pp/).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText(/quality regression/).length).toBeGreaterThan(0);
+  });
+
+  it('renders INSUFFICIENT_DATA verdict with amber badge', () => {
+    const verdict: ProviderRoutingVerdict = {
+      state: 'INSUFFICIENT_DATA',
+      supporting: {
+        deepseek_run_count: 5,
+        deepseek_pr_eligible_run_count: 5,
+        deepseek_verified_landed_count: 3,
+        deepseek_verified_landed_rate: 0.6,
+        deepseek_cost_per_merge: 2.0,
+        deepseek_total_cost_usd: 10,
+        anthropic_run_count: 200,
+        anthropic_pr_eligible_run_count: 195,
+        anthropic_verified_landed_count: 156,
+        anthropic_verified_landed_rate: 0.8,
+        anthropic_cost_per_merge: 3.0,
+        anthropic_total_cost_usd: 500,
+        cost_ratio: 0.02,
+        verified_rate_delta_pct: -20.0,
+      },
+      recommended_action: 'INSUFFICIENT_DATA — only 5 DeepSeek runs (need ≥ 30)',
+    };
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_verdict: verdict })} />);
+    expect(screen.getByText('INSUFFICIENT_DATA')).toBeInTheDocument();
+    expect(screen.getByText(/0.02x/)).toBeInTheDocument();
+    // -20.0 is rendered as -20 by JS number formatting.
+    expect(screen.getByText(/-20pp/)).toBeInTheDocument();
+    expect(screen.getByText(/only 5 DeepSeek runs/)).toBeInTheDocument();
+  });
+
+  it('renders ADOPT verdict with positive delta showing + prefix', () => {
+    const verdict: ProviderRoutingVerdict = {
+      state: 'ADOPT',
+      supporting: {
+        deepseek_run_count: 400,
+        deepseek_pr_eligible_run_count: 380,
+        deepseek_verified_landed_count: 320,
+        deepseek_verified_landed_rate: 0.842,
+        deepseek_cost_per_merge: 1.2,
+        deepseek_total_cost_usd: 400,
+        anthropic_run_count: 200,
+        anthropic_pr_eligible_run_count: 190,
+        anthropic_verified_landed_count: 152,
+        anthropic_verified_landed_rate: 0.8,
+        anthropic_cost_per_merge: 3.0,
+        anthropic_total_cost_usd: 500,
+        cost_ratio: 0.42,
+        verified_rate_delta_pct: 4.2,
+      },
+      recommended_action: 'ADOPT — DeepSeek cheaper with no quality regression',
+    };
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_verdict: verdict })} />);
+    expect(screen.getByText('ADOPT')).toBeInTheDocument();
+    // Positive delta should show the '+' prefix.
+    expect(screen.getByText(/\+4\.2pp/)).toBeInTheDocument();
+    expect(screen.getByText(/0.42x/)).toBeInTheDocument();
+  });
+
+  it('hides the verdict callout when provider_routing_verdict is absent', () => {
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_verdict: undefined })} />);
+    expect(screen.queryByText(/Provider Routing A\/B/)).not.toBeInTheDocument();
   });
 });

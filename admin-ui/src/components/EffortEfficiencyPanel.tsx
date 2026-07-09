@@ -5,6 +5,7 @@ import type {
   EfficiencyResolvedModel,
   EffortEfficiencyRow,
   ModelEfficiencyRow,
+  ProviderRoutingVerdict,
 } from '../types/digest';
 
 function fmtTokens(n: number): string {
@@ -208,6 +209,57 @@ function modelRows(rows: ModelEfficiencyRow[]) {
 }
 
 /**
+ * Compact callout for the provider-routing A/B verdict: ADOPT/REJECT/INSUFFICIENT_DATA
+ * badge, cost ratio, and verified-merge-rate delta so the operator sees the routing
+ * payoff without reading raw JSON.
+ */
+function ProviderRoutingVerdictCallout({ verdict }: { verdict: ProviderRoutingVerdict }) {
+  const { state, supporting, recommended_action } = verdict;
+  const badgeColor: Record<string, string> = {
+    ADOPT: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
+    REJECT: 'bg-red-500/20 text-red-300 border-red-500/40',
+    INSUFFICIENT_DATA: 'bg-amber-500/20 text-amber-300 border-amber-500/40',
+  };
+  return (
+    <div className="mb-2 rounded border border-neutral-700/50 bg-neutral-900/30 px-2.5 py-1.5 text-ui-sm">
+      <div className="flex items-center gap-2 mb-1">
+        <span
+          className={`inline-block px-1.5 py-px rounded text-ui-xs font-semibold border ${badgeColor[state]}`}
+        >
+          {state}
+        </span>
+        <span className="text-neutral-300 font-medium">Provider Routing A/B</span>
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-500">
+        {supporting.cost_ratio != null && (
+          <span>
+            Cost: <span className="text-neutral-300 tabular-nums">{supporting.cost_ratio.toFixed(2)}x</span> of Anthropic
+          </span>
+        )}
+        {supporting.verified_rate_delta_pct != null && (
+          <span>
+            Merge rate delta:{' '}
+            <span
+              className={
+                state === 'ADOPT'
+                  ? 'text-emerald-400'
+                  : state === 'REJECT'
+                    ? 'text-red-400'
+                    : 'text-neutral-300'
+              }
+            >
+              {supporting.verified_rate_delta_pct > 0 ? '+' : ''}
+              {supporting.verified_rate_delta_pct}pp
+            </span>
+          </span>
+        )}
+      </div>
+      <div className="text-ui-xs text-neutral-600 mt-0.5">{recommended_action}</div>
+    </div>
+  );
+}
+
+/**
  * Operator view of cost & landed/merge-rate attributable by EFFORT tier and by
  * ACTUAL resolved model. Purely presentational — the rollup rides the digest
  * payload already fetched by DashboardHome (no extra fetch). Renders nothing
@@ -220,7 +272,7 @@ function modelRows(rows: ModelEfficiencyRow[]) {
  */
 export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | null | undefined }) {
   if (!data) return null;
-  const { by_effort, by_model, totals, unpriced_combos, fallbacks } = data;
+  const { by_effort, by_model, totals, unpriced_combos, fallbacks, provider_routing_verdict } = data;
   if ((by_effort?.length ?? 0) === 0 && (by_model?.length ?? 0) === 0) return null;
   if (totals.run_count === 0) return null;
 
@@ -261,6 +313,8 @@ export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | 
           )}
         </div>
       )}
+
+      {provider_routing_verdict && <ProviderRoutingVerdictCallout verdict={provider_routing_verdict} />}
 
       <EfficiencySubTable
         title="By Effective Effort Tier"
