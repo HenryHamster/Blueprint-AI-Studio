@@ -1587,6 +1587,8 @@ async def reaper_service():
                                 f"classifying landing"
                             )
                             _proj = _projects_batch.get(task.project_id)
+                            if _proj is None or inspect(_proj).expired:
+                                _proj = await session.get(Project, task.project_id)
                             from app.recovery_evaluating_helpers import (
                                 _apply_rollup_merge_classification,
                             )
@@ -1726,6 +1728,8 @@ async def reaper_service():
                                 # spawn review tasks pointing at non-existent branches
                                 # and the review fails on `git clone --branch`.
                                 _proj = _projects_batch.get(task.project_id)
+                                if _proj is None or inspect(_proj).expired:
+                                    _proj = await session.get(Project, task.project_id)
                                 _branch = (task.first_payload or {}).get(
                                     "branch"
                                 ) or _derive_task_branch(
@@ -2090,6 +2094,8 @@ async def reaper_service():
                                         _res_proj = _projects_batch.get(
                                             task.project_id
                                         )
+                                        if _res_proj is not None and inspect(_res_proj).expired:
+                                            _res_proj = await session.get(Project, task.project_id)
                                         if _res_proj is not None:
                                             await refresh_research_task_verification(
                                                 task, _res_proj, session
