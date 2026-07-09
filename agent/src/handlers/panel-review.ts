@@ -302,6 +302,7 @@ ${viewportScreenshotSection}Rules for your lens pass:
 - Use severities \`critical\`, \`major\`, or \`minor\`.
 - Only include substantiated issues with a concrete description, scoped to your lens.
 - Return \`REQUEST_CHANGES\` only for a blocking defect inside your lens's scope; otherwise \`APPROVE\`.
+- Before finalizing, check that your verdict matches your summary: if your summary describes no blocking defect, your verdict must be \`APPROVE\`, not \`REQUEST_CHANGES\`.
 - Use an empty \`issues\` array when your lens is clean.
 
 ${buildReviewDiffAccessHint(baseBranch)}
