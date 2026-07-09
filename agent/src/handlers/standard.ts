@@ -782,7 +782,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedArtifactUrls.size} signed URL(s).\n`);
   }
 
-  const finalPromptWithTree = fileTree + repoMap + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection + finalPrompt;
+  const finalPromptWithTree = finalPrompt + fileTree + repoMap + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection;
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
   });
