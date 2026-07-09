@@ -165,7 +165,7 @@ class TestAgentBinaryDetection(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"BLUEPRINT_AGENT_BINARY": path}):
                 result = local_runner._find_agent_binary()
-            self.assertEqual(result, path)
+            self.assertEqual(result, ["node", path])
         finally:
             os.unlink(path)
 
@@ -192,7 +192,9 @@ class TestAgentBinaryDetection(unittest.TestCase):
                                 os.path.join(tmpdir, "agent", "dist", "index.js")
                             )
                             result = local_runner._find_agent_binary()
-            self.assertTrue(result.endswith("index.js"))
+            self.assertEqual(len(result), 2)
+            self.assertEqual(result[0], "node")
+            self.assertTrue(result[1].endswith("index.js"))
 
     def test_auto_detect_not_found_exits(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -214,7 +216,7 @@ class TestAgentBinaryDetection(unittest.TestCase):
             path = f.name
         try:
             with patch.dict(os.environ, {"BLUEPRINT_AGENT_BINARY": path}):
-                self.assertEqual(local_runner._locate_agent_binary(), path)
+                self.assertEqual(local_runner._locate_agent_binary(), ["node", path])
         finally:
             os.unlink(path)
 
@@ -223,6 +225,100 @@ class TestAgentBinaryDetection(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with patch("os.path.isfile", return_value=False):
                 self.assertIsNone(local_runner._locate_agent_binary())
+
+    # ── tsx-based fallback ───────────────────────────────────────────────
+
+    def test_locate_falls_back_to_tsx_when_dist_missing_and_tsx_present(self):
+        """No dist/index.js but agent/src/index.ts + node_modules/.bin/tsx exist → [tsx_path, src_path]."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create agent/src/index.ts
+            src_dir = os.path.join(tmpdir, "agent", "src")
+            os.makedirs(src_dir)
+            src_idx = os.path.join(src_dir, "index.ts")
+            open(src_idx, "w").close()
+            # Create agent/node_modules/.bin/tsx
+            tsx_dir = os.path.join(tmpdir, "agent", "node_modules", ".bin")
+            os.makedirs(tsx_dir)
+            tsx_bin = os.path.join(tsx_dir, "tsx")
+            open(tsx_bin, "w").close()
+
+            with patch.dict(os.environ, {}, clear=True):
+                env_clean = {k: v for k, v in os.environ.items() if k != "BLUEPRINT_AGENT_BINARY"}
+                with patch.dict(os.environ, env_clean, clear=True):
+                    with patch("local_runner.__file__", os.path.join(tmpdir, "scripts", "local_runner.py")):
+                        result = local_runner._locate_agent_binary()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], tsx_bin)
+        self.assertEqual(result[1], src_idx)
+
+    def test_locate_falls_back_to_tsx_on_path_when_no_local_tsx_binary(self):
+        """When node_modules/.bin/tsx is absent but src/index.ts exists, fall back to 'tsx' on PATH."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = os.path.join(tmpdir, "agent", "src")
+            os.makedirs(src_dir)
+            src_idx = os.path.join(src_dir, "index.ts")
+            open(src_idx, "w").close()
+            # Do NOT create node_modules/.bin/tsx
+
+            with patch.dict(os.environ, {}, clear=True):
+                env_clean = {k: v for k, v in os.environ.items() if k != "BLUEPRINT_AGENT_BINARY"}
+                with patch.dict(os.environ, env_clean, clear=True):
+                    with patch("local_runner.__file__", os.path.join(tmpdir, "scripts", "local_runner.py")):
+                        result = local_runner._locate_agent_binary()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "tsx")
+        self.assertTrue(result[1].endswith("src/index.ts"))
+
+    def test_locate_falls_back_to_tsx_via_cwd(self):
+        """When script_dir-relative agent is absent, check cwd-relative agent."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_dir = os.path.join(tmpdir, "agent", "src")
+            os.makedirs(src_dir)
+            src_idx = os.path.join(src_dir, "index.ts")
+            open(src_idx, "w").close()
+
+            # Patch __file__ to a location that does NOT have agent/ nearby
+            with patch.dict(os.environ, {}, clear=True):
+                env_clean = {k: v for k, v in os.environ.items() if k != "BLUEPRINT_AGENT_BINARY"}
+                with patch.dict(os.environ, env_clean, clear=True):
+                    with patch("local_runner.__file__", "/tmp/nonexistent/local_runner.py"):
+                        with patch("os.getcwd", return_value=tmpdir):
+                            result = local_runner._locate_agent_binary()
+
+        self.assertIsNotNone(result)
+        # On cwd path without node_modules/.bin/tsx, falls back to 'tsx' on PATH
+        self.assertEqual(result[0], "tsx")
+        self.assertTrue(result[1].endswith("src/index.ts"))
+
+    def test_locate_dist_takes_precedence_over_tsx(self):
+        """When BOTH dist/index.js and src/index.ts exist, dist/index.js wins."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create both dist/index.js and src/index.ts
+            dist_dir = os.path.join(tmpdir, "agent", "dist")
+            os.makedirs(dist_dir)
+            dist_idx = os.path.join(dist_dir, "index.js")
+            open(dist_idx, "w").close()
+
+            src_dir = os.path.join(tmpdir, "agent", "src")
+            os.makedirs(src_dir)
+            src_idx = os.path.join(src_dir, "index.ts")
+            open(src_idx, "w").close()
+
+            with patch.dict(os.environ, {}, clear=True):
+                env_clean = {k: v for k, v in os.environ.items() if k != "BLUEPRINT_AGENT_BINARY"}
+                with patch.dict(os.environ, env_clean, clear=True):
+                    with patch("local_runner.__file__", os.path.join(tmpdir, "scripts", "local_runner.py")):
+                        result = local_runner._locate_agent_binary()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "node")
+        self.assertTrue(result[1].endswith("dist/index.js"))
 
 
 class TestAgentWorkspace(unittest.TestCase):
@@ -1425,7 +1521,7 @@ class TestGpuDetection(unittest.TestCase):
             # agent_available now also requires a working node runtime (I11); patch
             # the functional probe so the assertion is hermetic on a nodeless CI.
             with patch.object(local_runner, "_post", fake_post), \
-                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
                  patch.object(local_runner, "_node_runtime_ok", return_value=True), \
                  patch.object(local_runner, "_gpu_utilization_pct", return_value=42):
                 local_runner._heartbeat_loop(
@@ -1534,7 +1630,7 @@ class TestGpuDetection(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_runner_version", return_value="v22-abc"), \
-                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
                  patch.object(local_runner, "_node_runtime_ok", return_value=True):
                 local_runner._heartbeat_loop(
                     "https://api",
@@ -1649,7 +1745,7 @@ class TestGpuDetection(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_locate_agent_binary",
-                              return_value="/agent/dist/index.js"), \
+                              return_value=["node", "/agent/dist/index.js"]), \
                  patch.object(local_runner, "_node_runtime_ok", return_value=True):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,
@@ -1689,7 +1785,7 @@ class TestGpuDetection(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_locate_agent_binary",
-                              return_value="/agent/dist/index.js"), \
+                              return_value=["node", "/agent/dist/index.js"]), \
                  patch.object(local_runner, "_node_runtime_ok", return_value=True):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,
@@ -2530,7 +2626,7 @@ class TestHeartbeatTelemetryPayload(unittest.TestCase):
         with tempfile.TemporaryDirectory() as ws:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_node_runtime_ok", return_value=True), \
-                 patch.object(local_runner, "_locate_agent_binary", return_value="/x/index.js"):
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/x/index.js"]):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", {}, threading.Lock(),
                     {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
@@ -3856,7 +3952,7 @@ class TestStatusJson(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_write_status_json", capturing_write), \
-                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
                  patch.object(local_runner, "_node_runtime_ok", return_value=True), \
                  patch.object(local_runner, "_hostname", return_value="test-host"):
                 local_runner._heartbeat_loop(
@@ -3894,7 +3990,7 @@ class TestStatusJson(unittest.TestCase):
         try:
             with patch.object(local_runner, "_post", fake_post), \
                  patch.object(local_runner, "_write_status_json", capturing_write), \
-                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
                  patch.object(local_runner, "_node_runtime_ok", return_value=True):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock,

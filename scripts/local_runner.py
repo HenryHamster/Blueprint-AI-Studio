@@ -15,7 +15,10 @@ Optional environment variables:
     BLUEPRINT_RUNNER_MAX_CONCURRENT_COMPUTE_JOBS
                                       Max simultaneous compute jobs (default: 2, floor 1).
                                       Agents and compute have SEPARATE capacity pools.
-    BLUEPRINT_AGENT_BINARY            Path to node agent entry point (auto-detected if absent)
+    BLUEPRINT_AGENT_BINARY            Path to agent entry point (auto-detected if absent).
+                                        When unset, the runner first looks for
+                                        agent/dist/index.js (node) then falls back to
+                                        agent/src/index.ts via tsx.
     BLUEPRINT_AGENT_IMAGE             Prod agent container image (e.g. agent/Dockerfile build).
                                       When set AND docker is usable, read-only agent task
                                       types run in this image (prod-parity, non-root) instead
@@ -506,33 +509,60 @@ def _supervise_threads(threads: dict) -> None:
             )
 
 
-def _locate_agent_binary() -> str | None:
-    """Locate the node agent entry point, or return None if it is unavailable.
+def _locate_agent_binary() -> list[str] | None:
+    """Locate the agent entry argv, or return None if it is unavailable.
 
     Non-fatal counterpart to ``_find_agent_binary``.  The runner main loop uses
     this to resolve the agent LAZILY — only when an AGENT task is actually
     claimed — so a compute/GPU-only runner can boot and run compute jobs without
     a built agent.  A missing binary is therefore not an error at startup; it is
     only a problem the moment an agent task needs to run.
+
+    Returns the full argv (``["node", "/path/...js"]`` or
+    ``["/path/tsx", "/path/...ts"]``) so callers can use it directly as the
+    subprocess command.
+
+    Resolution order:
+      1. ``BLUEPRINT_AGENT_BINARY`` env var (an explicit path — run with node).
+      2. ``<script_dir>/../agent/dist/index.js`` — compiled dist artifact.
+      3. ``<cwd>/agent/dist/index.js`` — same, relative to working directory.
+      4. ``<script_dir>/../agent/src/index.ts`` via
+         ``<agent_dir>/node_modules/.bin/tsx`` — tsx-based fallback.
+      5. ``<cwd>/agent/src/index.ts`` via ``tsx`` on PATH — same, cwd-relative.
     """
     explicit = os.environ.get("BLUEPRINT_AGENT_BINARY", "").strip()
     if explicit:
-        return explicit if os.path.isfile(explicit) else None
+        return (
+            ["node", explicit]
+            if os.path.isfile(explicit)
+            else None
+        )
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(script_dir, "..", "agent", "dist", "index.js"),
-        os.path.join(os.getcwd(), "agent", "dist", "index.js"),
-    ]
-    for path in candidates:
-        normalized = os.path.normpath(path)
-        if os.path.isfile(normalized):
-            return normalized
+
+    # Check for compiled dist/index.js first (node, fast).
+    for base in [os.path.join(script_dir, ".."), os.getcwd()]:
+        dist_path = os.path.normpath(os.path.join(base, "agent", "dist", "index.js"))
+        if os.path.isfile(dist_path):
+            return ["node", dist_path]
+
+    # tsx fallback: resolve tsx from agent/node_modules/.bin/tsx, or rely on PATH.
+    for base in [os.path.join(script_dir, ".."), os.getcwd()]:
+        agent_dir = os.path.normpath(os.path.join(base, "agent"))
+        entry_ts = os.path.join(agent_dir, "src", "index.ts")
+        if not os.path.isfile(entry_ts):
+            continue
+        tsx_candidate = os.path.join(agent_dir, "node_modules", ".bin", "tsx")
+        if os.path.isfile(tsx_candidate):
+            return [tsx_candidate, entry_ts]
+        # Fallback: hope tsx is on PATH.
+        return ["tsx", entry_ts]
+
     return None
 
 
-def _find_agent_binary() -> str:
-    """Resolve the agent entry point or exit(1) (strict, hard-fail variant).
+def _find_agent_binary() -> list[str]:
+    """Resolve the agent entry argv or exit(1) (strict, hard-fail variant).
 
     Retained for callers/tests that require a hard failure when the binary is
     absent.  The runner main loop no longer calls this at startup — it resolves
@@ -549,9 +579,11 @@ def _find_agent_binary() -> str:
         sys.exit(1)
 
     print(
-        "ERROR: could not find agent/dist/index.js. "
-        "Build the agent first (cd agent && npm run build) "
-        "or set BLUEPRINT_AGENT_BINARY to its path.",
+        "ERROR: could not locate the agent entry point. "
+        "If a compiled dist/index.js exists, it will be used with node. "
+        "Otherwise the runner looks for agent/src/index.ts and runs it via tsx "
+        "(from agent/node_modules/.bin/tsx or PATH). "
+        "Set BLUEPRINT_AGENT_BINARY to the entry point path to override auto-detection.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -2186,7 +2218,7 @@ def _compute_backend_summary(caps: "iso.Capabilities") -> str:
 def _preflight(
     orchestrator_url: str,
     token: str,
-    agent_binary: str | None,
+    agent_binary: list[str] | None,
     caps: "iso.Capabilities",
     gpu_state: dict,
     max_concurrent: int,
@@ -2390,7 +2422,7 @@ def _spawn_agent_task(
     orchestrator_url: str,
     workspace: str,
     caps: "iso.Capabilities",
-    agent_binary: str | None,
+    agent_binary: list[str] | None,
     agent_image: str | None,
     active_tasks: dict,
     agent_started_at: dict,
@@ -2427,8 +2459,9 @@ def _spawn_agent_task(
     if backend != iso.BACKEND_DOCKER and not agent_binary:
         print(
             f"[runner] agent binary unavailable — cannot run agent task {task_id}; "
-            "skipping (build it with `cd agent && npm run build` or set "
-            "BLUEPRINT_AGENT_BINARY). Compute jobs are unaffected.",
+            "skipping (run `cd agent && npm install` so tsx can start "
+            "agent/src/index.ts, or set BLUEPRINT_AGENT_BINARY to override "
+            "auto-detection). Compute jobs are unaffected.",
             flush=True,
         )
         return False

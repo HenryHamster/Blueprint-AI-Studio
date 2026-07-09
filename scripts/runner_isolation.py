@@ -1075,7 +1075,7 @@ _COMPUTE_SANDBOX_TOOLS = ("bash", "sh", "env", "python3", "python", "git", "uv")
 def plan_agent_execution(
     *,
     caps: Capabilities,
-    agent_binary: str | None,
+    agent_binary: list[str] | None,
     workspace_host: str,
     injected_env: dict[str, str],
     source_env: dict[str, str],
@@ -1158,10 +1158,14 @@ def plan_agent_execution(
         )
 
     # ---- bwrap (host toolchain; unchanged) -----------------------------------
+    # agent_binary is a list[str] argv: ["node", "/path/...js"] or
+    # ["/path/tsx", "/path/...ts"]. The last element is always the entry-point
+    # file used to derive the package root for read-only binds.
     assert agent_binary is not None and caps.bwrap_path is not None
-    agent_real = os.path.realpath(agent_binary)
-    # node resolves modules from the agent package root (…/agent) which holds
-    # dist/ + node_modules/ — bind the whole package read-only.
+    entry_path = agent_binary[-1]
+    agent_real = os.path.realpath(entry_path)
+    # node/tsx resolves modules from the agent package root (…/agent) which
+    # holds dist/, src/, and node_modules/ — bind the whole package read-only.
     agent_pkg_root = os.path.dirname(os.path.dirname(agent_real))
 
     tools = resolve_tools(list(_AGENT_SANDBOX_TOOLS), source_env)
@@ -1181,7 +1185,7 @@ def plan_agent_execution(
 
     argv = build_bwrap_argv(
         bwrap_path=caps.bwrap_path,
-        command_argv=["node", agent_real],
+        command_argv=agent_binary,
         workspace_host=workspace_host,
         ro_binds=ro_binds,
         tool_paths=tools,
