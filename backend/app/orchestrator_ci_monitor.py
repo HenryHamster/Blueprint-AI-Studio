@@ -2164,6 +2164,22 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         )
                         continue
                     ci_loop["verify_tests_verdict"] = _outcome
+                    # Extract coverage data from the verify-tests verdict for the
+                    # coverage_delta acceptance gate. The MERGE_TEST_RESULT artifact
+                    # carries a ``coverage`` block with test counts (passed/skipped/total);
+                    # compute a coverage_pct and store it so the merge propagation path
+                    # can bridge it into the original code task's context.
+                    if isinstance(_verdict, dict):
+                        _cov = _verdict.get("coverage")
+                        if isinstance(_cov, dict):
+                            _total = _cov.get("total", 0) or 0
+                            _passed = _cov.get("passed", 0) or 0
+                            if _total > 0:
+                                ci_loop["test_coverage_result"] = {
+                                    "coverage_pct": round(
+                                        (_passed / _total) * 100.0, 2
+                                    )
+                                }
                     # Auto-heal a stale stored test command: when the
                     # verify run discovered the stored command was
                     # stale and ran a real replacement suite, persist

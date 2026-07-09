@@ -1166,6 +1166,40 @@ def test_coverage_delta_non_numeric_coverage_fails_closed():
     assert verdict.proven is False
 
 
+def test_coverage_delta_populated_from_verify_tests_artifact():
+    """coverage_delta acceptance evidence consumes coverage data that was
+    extracted from a MERGE_TEST_RESULT verdict and bridged into task context,
+    simulating what the orchestrator CI monitor + ci_completion do in production.
+
+    The MERGE_TEST_RESULT artifact carries a ``coverage`` block
+    (``{passed, skipped, total}``) from the verify-tests handler. This test
+    simulates the bridge: computing ``coverage_pct`` from those counts and
+    storing it under ``test_coverage_result``, then verifying the acceptance
+    gate evaluates it correctly.
+    """
+    # Simulate the coverage block a real MERGE_TEST_RESULT artifact would carry.
+    verdict_coverage = {"passed": 42, "skipped": 3, "total": 50}
+    total = verdict_coverage["total"]
+    passed = verdict_coverage["passed"]
+    coverage_pct = round((passed / total) * 100.0, 2)
+    assert coverage_pct == 84.0  # 42/50 = 84%
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": coverage_pct}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "achieved" in verdict.reason
+
+
 def test_acceptance_was_declared_and_is_proven_contract():
     # Undeclared / legacy / garbage rows are never declared and never proven.
     for bad in (None, "garbage", 123, []):

@@ -737,6 +737,15 @@ async def _attempt_merge_with_retry_and_escalation(
                         # MissingGreenlet lazy-load.
                         _orig_dir_reps: dict = {}
                         if record_pr_merged:
+                            # Bridge test coverage data from the CI loop into the
+                            # original task's context so the coverage_delta acceptance
+                            # gate can consume it during record_code_acceptance_verdict
+                            # (called inside apply_merged_landed_signal).
+                            _tcov = ci_loop.get("test_coverage_result")
+                            if _tcov is not None:
+                                _orig_ctx = dict(orig.context or {})
+                                _orig_ctx["test_coverage_result"] = _tcov
+                                orig.context = _orig_ctx
                             _orig_landed_on_integration = apply_merged_landed_signal(
                                 orig,
                                 orig_project,
