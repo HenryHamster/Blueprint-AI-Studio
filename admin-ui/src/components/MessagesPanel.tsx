@@ -1348,14 +1348,23 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         return msgs;
       });
       onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
-      // Fetch webhook delivery stats (non-critical — errors are silently ignored)
-      try {
-        const statsRes = await apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`);
-        if (statsRes.ok) {
-          const stats = await statsRes.json();
-          if (isCurrentRequest()) setWebhookStats(stats);
-        }
-      } catch { /* ignore */ }
+    } catch {
+      if (isCurrentRequest()) addToastRef.current('Failed to load messages', 'error');
+    } finally {
+      if (isCurrentRequest()) setLoading(false);
+    }
+    // Secondary fetches off the critical path — fire without awaiting so the
+    // loading flag clears as soon as the primary messages fetch resolves,
+    // making the message list visible/interactive immediately.
+    if (!conversationMode && isCurrentRequest()) {
+      // Webhook delivery stats (non-critical — errors silently ignored)
+      apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`)
+        .then(statsRes => {
+          if (!statsRes.ok) return;
+          statsRes.json().then(stats => {
+            if (isCurrentRequest()) setWebhookStats(stats);
+          }).catch(() => {});
+        }).catch(() => {});
       // Pending strategic-refresh marker — surfaced as a "strategic cycle pending"
       // badge until the autonomous loop consumes it (when it clears backend-side).
       // After consumption, shows a receipt via last_fired_at only if it was operator-origin
@@ -1363,35 +1372,30 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       // bound, and prevents a just-cancelled steer from showing an old "picked up" receipt).
       // Non-critical: errors leave the prior marker state untouched.
       if (!usesStrategicReadModel) {
-        try {
-          const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
-          if (visRes.ok) {
-            const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string; _strategic_refresh_last_fired_origin?: string } };
-            if (usesStrategicReadModelRef.current || selectedProjectIdRef.current !== selectedProjectId || !isCurrentRequest()) return;
-            const marker = proj.vision?._strategic_refresh;
-            const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
-            const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
-            // Build marker state: include pending marker if present, or add receipt if it was
-            // operator-origin AND fired recently (within STEER_RECEIPT_MAX_AGE_MS).
-            if (marker && typeof marker === 'object') {
-              setStrategicRefresh(marker);
-            } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
-              const ageMs = Date.now() - parseTimestamp(lastFiredAt).getTime();
-              if (!isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
-                setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+        apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`)
+          .then(visRes => {
+            if (!visRes.ok) return;
+            visRes.json().then(proj => {
+              const p = proj as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string; _strategic_refresh_last_fired_origin?: string } };
+              if (usesStrategicReadModelRef.current || selectedProjectIdRef.current !== selectedProjectId || !isCurrentRequest()) return;
+              const marker = p.vision?._strategic_refresh;
+              const lastFiredAt = p.vision?._strategic_refresh_last_fired_at;
+              const lastFiredOrigin = p.vision?._strategic_refresh_last_fired_origin;
+              if (marker && typeof marker === 'object') {
+                setStrategicRefresh(marker);
+              } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
+                const ageMs = Date.now() - parseTimestamp(lastFiredAt).getTime();
+                if (!isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
+                  setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+                } else {
+                  setStrategicRefresh(null);
+                }
               } else {
                 setStrategicRefresh(null);
               }
-            } else {
-              setStrategicRefresh(null);
-            }
-          }
-        } catch { /* ignore */ }
+            }).catch(() => {});
+          }).catch(() => {});
       }
-    } catch {
-      if (isCurrentRequest()) addToastRef.current('Failed to load messages', 'error');
-    } finally {
-      if (isCurrentRequest()) setLoading(false);
     }
   }, [conversationMode, getStrategicSessionIncludeMessageId, selectedProjectId, onMessageCountChange, searchQuery, targetMessageId, usesStrategicReadModel]);
 
