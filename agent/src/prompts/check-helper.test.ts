@@ -13,17 +13,24 @@ vi.mock('../index.js', async (importOriginal) => {
   };
 });
 
-vi.mock('fs', () => ({
-  default: {
-    existsSync: vi.fn().mockReturnValue(false),
-    readFileSync: vi.fn().mockReturnValue(''),
-    writeFileSync: vi.fn(),
-    appendFileSync: vi.fn(),
-    mkdirSync: vi.fn(),
-    readdirSync: vi.fn().mockReturnValue([]),
-    unlinkSync: vi.fn(),
-  },
-}));
+// readFileSync is intentionally not fully mocked — the extracted .sh file
+// lazy-loaders (check_*.sh) read real files from disk. writeFileSync remains
+// mocked so we can capture generated scripts. Use vi.importActual to get the
+// real readFileSync for the loaders while keeping the rest of the mock intact.
+vi.mock('fs', async () => {
+  const actual = await vi.importActual<typeof import('fs')>('fs');
+  return {
+    default: {
+      existsSync: vi.fn().mockReturnValue(false),
+      readFileSync: actual.readFileSync,
+      writeFileSync: vi.fn(),
+      appendFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+      readdirSync: vi.fn().mockReturnValue([]),
+      unlinkSync: vi.fn(),
+    },
+  };
+});
 
 describe('writeCheckHelper — direct invocation', () => {
   let capturedScripts: Record<string, string> = {};

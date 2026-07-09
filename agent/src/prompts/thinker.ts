@@ -296,40 +296,124 @@ The append-only \`history\` / \`past_moves\` of these gaps were trimmed to only 
 
 When you reason about whether to keep pushing, refine, or retire any of these gaps, first run \`./fetch problem-model\` (or \`./fetch gap <gap_id>\`) to read its complete history and past_moves. Do not treat the shortened view as the gap's entire lifetime — a long-lived gap may have a much longer arc than the few events shown here.`
       : '';
-  return `${p.contextPrefix}You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
+
+  // ── Build overview sections array (sections-array pattern) ────────────
+  // Each entry becomes a paragraph block separated by \n\n. Sections that
+  // are directly concatenated in the original (no \n\n separator) are
+  // pre-composed into a single entry via string concatenation.
+
+  const sections: string[] = [];
+
+  // 1. Main preamble — always present
+  sections.push(
+    `${p.contextPrefix}You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
 
 Each cycle you look at what's happening and decide whether it's still on the right track. If it is, keep going. If it isn't, change course. You're allowed to be wrong; you're not allowed to defer. The problem_model below is your working understanding of the project — nothing else has more authority. Update it, defend it, rewrite it when you see a better shape. The user hired you for judgment, not for audit trails or incremental polish.
 
 # Project: ${p.projectName}
 ${p.clockHeader}
 Self-repo: ${p.isSelfRepo ? 'true' : 'false'}
-${p.userStateLine}
-${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
-${p.payloadStalenessSection ? `\n${p.payloadStalenessSection}\n` : ''}
-${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
-${p.problemModelSection}
-${p.cycleStartReconciliationSection ? `\n${p.cycleStartReconciliationSection}\n` : ''}
+${p.userStateLine}`,
+  );
 
-${p.reflectionSection}
+  // 2. Packer meta section — conditional
+  if (p.packerMetaSection) sections.push(p.packerMetaSection);
 
-${p.runningUpdateSection}
-${p.runningUpdateSupersededSection || ''}
-## Architecture (design document — overview index)
-${p.designDocJson || 'No design document yet.'}
-${p.designDocJson ? '_The above is an OVERVIEW INDEX of the design document — which systems and capabilities exist, their reconciled presence status, and declared backing module paths. `repo_overview` additionally carries inline bootstrap context (tech_stack, directory_layout, first_steps) for immediate orientation; the full section remains fetchable. It is NOT the full design doc. To read any section\'s FULL prose/specs, run `./design-doc get <key>` (e.g. `./design-doc get systems/auth`); run `./design-doc list` to enumerate every section key. Fetch the full text whenever you need a section\'s detailed prose or specs to reason or decide._' : ''}
+  // 3. Payload staleness — conditional
+  if (p.payloadStalenessSection) sections.push(p.payloadStalenessSection);
 
-${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; retained for bootstrap reference only)\n${p.visionJson}\n` : ''}
-${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
-## Current research directions
-${p.dirSummaryText}
+  // 4. Strategic context — conditional
+  if (p.strategicContext) {
+    sections.push(`## Running Context (from prior cycles)\n${p.strategicContext}`);
+  }
 
-## Direction Health
-${p.dirHealthSummary}
-${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
-## Portfolio Composition
-${p.portfolioCompositionText}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.residentExamLeadsSection ? `\n${p.residentExamLeadsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
-${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
+  // 5. Problem model section — always present
+  sections.push(p.problemModelSection);
+
+  // 6. Cycle-start reconciliation — conditional
+  if (p.cycleStartReconciliationSection) sections.push(p.cycleStartReconciliationSection);
+
+  // 7. Reflection — always present
+  sections.push(p.reflectionSection);
+
+  // 8. Running update + superseded note (directly concatenated — no \n\n
+  //    between them in the original template)
+  sections.push(`${p.runningUpdateSection}${p.runningUpdateSupersededSection || ''}`);
+
+  // 9. Architecture — always present; the footnote about fetchability is
+  //    conditional on designDocJson being non-empty (directly appended).
+  {
+    const footnote = p.designDocJson
+      ? '\n_The above is an OVERVIEW INDEX of the design document — which systems and capabilities exist, their reconciled presence status, and declared backing module paths. `repo_overview` additionally carries inline bootstrap context (tech_stack, directory_layout, first_steps) for immediate orientation; the full section remains fetchable. It is NOT the full design doc. To read any section\'s FULL prose/specs, run `./design-doc get <key>` (e.g. `./design-doc get systems/auth`); run `./design-doc list` to enumerate every section key. Fetch the full text whenever you need a section\'s detailed prose or specs to reason or decide._'
+      : '';
+    sections.push(
+      `## Architecture (design document — overview index)\n${p.designDocJson || 'No design document yet.'}${footnote}`,
+    );
+  }
+
+  // 10. Vision — conditional
+  if (p.visionJson) {
+    sections.push(`## Vision (legacy artifact — use problem_model instead; retained for bootstrap reference only)\n${p.visionJson}`);
+  }
+
+  // 11. Outcome sections — always present, directly concatenated (may be
+  //     empty strings)
+  sections.push(
+    `${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}`,
+  );
+
+  // 12. Direction summary — always present
+  sections.push(`## Current research directions\n${p.dirSummaryText}`);
+
+  // 13. Direction health — always present
+  sections.push(`## Direction Health\n${p.dirHealthSummary}`);
+
+  // 14. Staged/paused/rejected/overrides block — directly concatenated like
+  //     the original; stagedDirectionsSection is wrapped in \n / \n when
+  //     present so the leading/trailing blank lines land correctly relative
+  //     to the sections-array \n\n separator.
+  sections.push(
+    `${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}`,
+  );
+
+  // 15. Portfolio composition — always present
+  sections.push(`## Portfolio Composition\n${p.portfolioCompositionText}`);
+
+  // 16. Data sections — the line-331 chain in the original: a series of
+  //     optional sections concatenated directly with no \n\n between them.
+  //     Each conditional preserves the original leading/trailing \n logic.
+  {
+    const dataParts: string[] = [];
+    if (p.availableCapabilitiesSection) dataParts.push(`\n${p.availableCapabilitiesSection}`);
+    if (p.modelHealthSection) dataParts.push(p.modelHealthSection);
+    if (p.pruneCandidatesSection) dataParts.push(`\n${p.pruneCandidatesSection}\n`);
+    if (p.systemMaturitySection) dataParts.push(p.systemMaturitySection);
+    if (p.driftSection) dataParts.push(p.driftSection);
+    if (p.heldDirectionsSection) dataParts.push(`\n${p.heldDirectionsSection}`);
+    if (p.residentExamLeadsSection) dataParts.push(`\n${p.residentExamLeadsSection}`);
+    if (p.efficiencySnapshotSection) dataParts.push(p.efficiencySnapshotSection);
+    if (p.ciComplianceSection) dataParts.push(`\n${p.ciComplianceSection}`);
+    if (p.completionDebtSection) dataParts.push(`\n${p.completionDebtSection}`);
+    if (p.sweepComparisonSection) dataParts.push(`\n${p.sweepComparisonSection}`);
+    if (p.localRunnerSection) dataParts.push(`\n${p.localRunnerSection}\n`);
+    sections.push(dataParts.join(''));
+  }
+
+  // 17. Tail sections — always present, directly concatenated (line 332 in
+  //     the original)
+  sections.push(
+    `${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}`,
+  );
+
+  // ── Join all overview sections with \n\n ──
+  const overviewBlock = sections.join('\n\n');
+
+  // ── Instructions block (always present, mostly static text) ──
+  // NOTE: bootstrapOrRecoverSection and gapMemoryTrimmedSection are
+  // interpolated specifically between the model-size-hygiene block and the
+  // "Running update: what the user reads" section, mirroring the original
+  // template order.
+  return `${overviewBlock}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
