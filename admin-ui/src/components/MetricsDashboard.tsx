@@ -233,6 +233,7 @@ interface EfficiencyAxisDef {
   label: string;
   unit: string;
   favorableDirection: 'lower' | 'higher';
+  percent?: boolean;
 }
 
 interface EfficiencyAxisLocal extends EfficiencyAxis {
@@ -474,6 +475,11 @@ const EFFICIENCY_AXES: EfficiencyAxisDef[] = [
   { key: 'median_api_calls_per_task', label: 'Median API calls per task', unit: '', favorableDirection: 'lower' },
   { key: 'median_review_iterations', label: 'Median review iterations', unit: '', favorableDirection: 'lower' },
   { key: 'llm_cost_per_merged_pr', label: 'LLM token cost per merged PR', unit: '$', favorableDirection: 'lower' },
+  { key: 'cost_per_verified_task', label: 'Cost per verified task', unit: '$', favorableDirection: 'lower' },
+  { key: 'llm_cost_per_verified_task', label: 'LLM cost per verified task', unit: '$', favorableDirection: 'lower' },
+  { key: 'total_cost_per_verified_task', label: 'Total cost per verified task', unit: '$', favorableDirection: 'lower' },
+  { key: 'llm_cache_hit_rate', label: 'LLM cache hit rate', unit: '%', favorableDirection: 'higher', percent: true },
+  { key: 'rework_cost_share', label: 'Rework cost share', unit: '%', favorableDirection: 'lower', percent: true },
   { key: 'lane_cost_per_merged_pr', label: 'Lane cost per merged PR', unit: '$', favorableDirection: 'lower' },
   { key: 'lane_warm_resume_rate', label: 'Lane warm resume rate', unit: '', favorableDirection: 'higher' },
   { key: 'checkpoint_loss_rate', label: 'Checkpoint loss rate', unit: '', favorableDirection: 'lower' },
@@ -589,8 +595,8 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             <div className="flex justify-between items-center">
               <span className="text-neutral-400">{axisDef.label}</span>
               <div className="flex gap-4 items-center text-neutral-300 font-mono">
-                <span>{current !== null ? `${current.toFixed(1)}${axisDef.unit}` : '—'}</span>
-                <span className="text-neutral-500">baseline: {baseline !== null ? `${baseline.toFixed(1)}${axisDef.unit}` : '—'}</span>
+                <span>{current !== null ? `${(axisDef.percent ? current * 100 : current).toFixed(1)}${axisDef.unit}` : '—'}</span>
+                <span className="text-neutral-500">baseline: {baseline !== null ? `${(axisDef.percent ? baseline * 100 : baseline).toFixed(1)}${axisDef.unit}` : '—'}</span>
                 <span className={`${driftColor} min-w-12 text-right`}>{driftDisplay}</span>
               </div>
             </div>
