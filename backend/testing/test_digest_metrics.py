@@ -19,6 +19,7 @@ from app.digest_metrics import (
     compute_churn_direction,
     compute_digest_cost_economics,
     compute_effort_model_efficiency,
+    compute_provider_routing_share,
     compute_digest_trend_history,
     compute_failure_grouping,
     compute_format_compliance_metrics,
@@ -5081,6 +5082,101 @@ def test_effort_model_efficiency_empty_input():
     assert result["totals"]["run_count"] == 0
     assert result["totals"]["landed_rate"] is None
     assert result["totals"]["cost_per_merge"] is None
+
+
+def test_provider_routing_share_by_provider():
+    """Per-provider routing share correctly aggregates by_model rows.
+
+    Exercises:
+      - mixed DeepSeek + Anthropic tasks with different volumes
+      - all-DeepSeek (no Anthropic) works without error
+      - empty input yields empty by_provider list and zero totals
+    """
+    import uuid
+
+    from app.models import TaskStatus
+
+    project_id = uuid.uuid4()
+
+    # -- Mixed providers ---------------------------------------------------
+    mixed_tasks = (
+        [make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            api_call_summary={
+                "total_input_tokens": 1000, "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+        ) for _ in range(30)]
+        + [make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            api_call_summary={
+                "total_input_tokens": 1000, "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+        ) for _ in range(10)]
+    )
+    by_model = compute_effort_model_efficiency(mixed_tasks)["by_model"]
+    share = compute_provider_routing_share(by_model)
+
+    assert "by_provider" in share
+    assert "total_run_count" in share
+    assert "total_pr_eligible_run_count" in share
+
+    # Both providers present.
+    prov_map = {p["provider"]: p for p in share["by_provider"]}
+    assert "deepseek" in prov_map
+    assert "anthropic" in prov_map
+    assert share["total_run_count"] == 40
+    assert share["total_pr_eligible_run_count"] == 40
+
+    # DeepSeek share: 30/40 = 75%.
+    ds = prov_map["deepseek"]
+    assert ds["run_count"] == 30
+    an = prov_map["anthropic"]
+    assert an["run_count"] == 10
+    # All merged → verified_landed_rate should be 1.0.
+    assert an["verified_landed_rate"] == 1.0, (
+        f"expected all Anthropic tasks landed, got {an['verified_landed_rate']}"
+    )
+
+    # -- All DeepSeek (no Anthropic) ---------------------------------------
+    ds_only_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            api_call_summary={
+                "total_input_tokens": 1000, "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+        ) for _ in range(15)
+    ]
+    by_model_ds = compute_effort_model_efficiency(ds_only_tasks)["by_model"]
+    share_ds = compute_provider_routing_share(by_model_ds)
+    prov_map_ds = {p["provider"]: p for p in share_ds["by_provider"]}
+    assert "deepseek" in prov_map_ds
+    assert "anthropic" not in prov_map_ds
+    assert share_ds["total_run_count"] == 15
+    assert prov_map_ds["deepseek"]["run_count"] == 15
+
+    # -- Empty input -------------------------------------------------------
+    share_empty = compute_provider_routing_share([])
+    assert share_empty["by_provider"] == []
+    assert share_empty["total_run_count"] == 0
+    assert share_empty["total_pr_eligible_run_count"] == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────

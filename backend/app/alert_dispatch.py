@@ -1802,6 +1802,76 @@ from app.runner_health_alerts import (  # noqa: F401
     _runner_outage_escalated_keys,
 )
 
+# Stable title prefix for the per-project cost-telemetry-reconciliation-failure alert.
+# The project id suffix ensures dedup is per-project: one undismissed alert per
+# project while the mismatch persists. Keep the prefix stable.
+_COST_TELEMETRY_RECONCILIATION_ALERT_TITLE_PREFIX = (
+    "Cost telemetry reconciliation failed tolerance"
+)
+
+
+async def _maybe_create_cost_telemetry_reconciliation_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    absolute_delta: float,
+    tolerance: float,
+    task_count: int,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert when the daily efficiency snapshot's
+    cost telemetry reconciliation exceeds the declared tolerance.
+
+    LLM cost telemetry is computed via two structurally independent paths
+    (snapshot aggregation and flat per-attempt iteration) and must agree within
+    COST_TELEMETRY_TOLERANCE (1e-6 USD). A mismatch indicates that the per-task
+    cost numbers the snapshot reports are suspect — operators should investigate
+    before relying on cost-per-merged-PR or cost-per-verified-task metrics.
+
+    Deduplicated on a STABLE title so a mismatch that persists across snapshot
+    ticks raises exactly ONE alert per project. The drifting delta and task count
+    live in the message so a moving metric never defeats dedup. Caller owns the
+    commit.
+    """
+    title = (
+        f"{_COST_TELEMETRY_RECONCILIATION_ALERT_TITLE_PREFIX}"
+        f" on project {str(project_id)[:8]}"
+    )[:200]
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    message = (
+        f"LLM cost telemetry reconciliation failed: snapshot vs direct-path "
+        f"cost delta ${absolute_delta:.6f} exceeds tolerance ${tolerance:.6f} "
+        f"over {task_count} task(s). The efficiency snapshot's LLM cost "
+        f"data may be unreliable."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,

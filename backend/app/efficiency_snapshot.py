@@ -1135,6 +1135,81 @@ def compute_provider_routing_verdict(
     )
 
 
+def compute_provider_routing_share(
+    by_model_rows: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Aggregate by-model efficiency rows into a per-provider routing share block.
+
+    Takes the same ``by_model`` rows from :func:`compute_effort_model_efficiency`
+    as :func:`compute_provider_routing_verdict` and returns a compact summary of
+    task count and verified merge rate by provider, plus overall totals — so
+    operators can confirm at a glance which provider handled what fraction of
+    tasks and at what verified-landing rate.
+
+    Returns::
+
+        {
+            "by_provider": [
+                {"provider": "deepseek", "run_count": 30,
+                 "pr_eligible_run_count": 28, "verified_landed_count": 20,
+                 "verified_landed_rate": 0.714, "total_cost_usd": 12.50,
+                 "cost_per_merge": 0.625},
+                ...
+            ],
+            "total_run_count": 40,
+            "total_pr_eligible_run_count": 36,
+        }
+    """
+    from collections import defaultdict
+
+    # Aggregate by lowercased provider.
+    accum: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "run_count": 0,
+            "pr_eligible_run_count": 0,
+            "verified_landed_count": 0,
+            "total_cost_usd": 0.0,
+        }
+    )
+    for row in by_model_rows:
+        provider = str(row.get("provider") or "other").lower()
+        b = accum[provider]
+        b["run_count"] += int(row.get("run_count", 0))
+        b["pr_eligible_run_count"] += int(row.get("pr_eligible_run_count", 0))
+        b["verified_landed_count"] += int(row.get("verified_landed_count", 0))
+        b["total_cost_usd"] += float(row.get("total_cost_usd", 0))
+
+    by_provider = []
+    total_run_count = 0
+    total_pr_eligible_run_count = 0
+
+    for provider in sorted(accum.keys()):
+        b = accum[provider]
+        total_run_count += b["run_count"]
+        total_pr_eligible_run_count += b["pr_eligible_run_count"]
+        pe = b["pr_eligible_run_count"]
+        vc = b["verified_landed_count"]
+        by_provider.append(
+            {
+                "provider": provider,
+                "run_count": b["run_count"],
+                "pr_eligible_run_count": pe,
+                "verified_landed_count": vc,
+                "verified_landed_rate": round(vc / pe, 4) if pe else None,
+                "total_cost_usd": round(b["total_cost_usd"], 6),
+                "cost_per_merge": (
+                    round(b["total_cost_usd"] / vc, 6) if vc else None
+                ),
+            }
+        )
+
+    return {
+        "by_provider": by_provider,
+        "total_run_count": total_run_count,
+        "total_pr_eligible_run_count": total_pr_eligible_run_count,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pre-enable counterfactual warm-pool hit-rate estimate (direction d-5fd69fe1)
 # ---------------------------------------------------------------------------
@@ -3008,6 +3083,26 @@ async def write_snapshot(
         captured_at,
         {k: axes[k] for k in ALL_AXES},
     )
+
+    # Trigger alert if cost telemetry reconciliation failed tolerance.
+    reconciliation: dict | None = axes.get("cost_telemetry_reconciliation")
+    if (
+        reconciliation
+        and reconciliation.get("within_tolerance") is False
+        and (reconciliation.get("total_cost_snapshot_path") or 0) > 0
+    ):
+        from app.alert_dispatch import (
+            _maybe_create_cost_telemetry_reconciliation_alert,
+        )
+
+        await _maybe_create_cost_telemetry_reconciliation_alert(
+            project_id,
+            session,
+            absolute_delta=reconciliation.get("absolute_delta", 0.0),
+            tolerance=reconciliation.get("tolerance", 1e-6),
+            task_count=reconciliation.get("task_count", 0),
+        )
+
     return snapshot
 
 

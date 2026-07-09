@@ -563,3 +563,60 @@ async def test_patch_settings_mode_wins_over_legacy_boolean_in_same_payload(clie
     body = (await client.get("/api/admin/settings")).json()
     assert body["provider_selection_mode"] == "balanced"
     assert body["cross_provider_fallback_enabled"] is True
+
+
+def test_deepseek_preferred_for_build_initiative_tasks():
+    """Verify that DeepSeek is the first preferred provider for low/medium-effort
+    task types (build, initiative, ops, _default categories) and NOT for high/max-effort
+    categories (strategic, review), exercising resolve_deepseek_preference."""
+    from app.max_plan_pool import resolve_deepseek_preference
+
+    config = {
+        "task_type_categories": {
+            "build": ["create", "refactor", "migrate"],
+            "initiative": ["research", "plan"],
+            "ops": ["docs", "deps", "smoketest"],
+            "strategic": ["strategic_review", "design_doc_update"],
+            "review": ["review", "qa", "security_audit", "perf", "debug", "fix"],
+        },
+        "category_routing": {
+            "_default": {
+                "providers": ["deepseek", "anthropic", "openai", "gemini"],
+                "effort": "medium",
+            },
+            "strategic": {
+                "providers": ["zai", "anthropic", "deepseek", "openai", "gemini"],
+                "effort": "max",
+            },
+            "initiative": {
+                "providers": ["deepseek", "anthropic", "openai", "gemini"],
+                "effort": "medium",
+            },
+            "build": {
+                "providers": ["deepseek", "anthropic", "openai", "gemini"],
+                "effort": "medium",
+            },
+            "review": {
+                "providers": ["anthropic", "deepseek", "openai", "gemini"],
+                "effort": "high",
+            },
+            "ops": {
+                "providers": ["deepseek", "anthropic", "openai", "gemini"],
+                "effort": "low",
+            },
+        },
+    }
+
+    # Low/medium-effort categories should prefer DeepSeek first
+    for task_type in ("create", "refactor", "migrate", "research", "plan",
+                      "docs", "smoketest", "deps"):
+        assert resolve_deepseek_preference(task_type, config), (
+            f"DeepSeek should be the first preferred provider for {task_type}"
+        )
+
+    # High/max-effort categories should NOT prefer DeepSeek first
+    for task_type in ("strategic_review", "design_doc_update", "review",
+                      "qa", "security_audit", "perf"):
+        assert not resolve_deepseek_preference(task_type, config), (
+            f"DeepSeek should NOT be the first preferred provider for {task_type}"
+        )

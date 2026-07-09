@@ -1902,6 +1902,21 @@ def resolve_task_quality_tier(task: Any, runtime_config: Mapping[str, Any]) -> s
     return inferred_tier or DEFAULT_QUALITY_TIER
 
 
+def resolve_deepseek_preference(
+    task_type: str, runtime_config: Mapping[str, Any]
+) -> bool:
+    """Return True if DeepSeek is the first preferred provider for the task type.
+
+    Low/medium-effort categories (build, initiative, ops, _default) list DeepSeek
+    first in their routing. Strategic/review/high-effort categories list other
+    providers first. This provides a programmatic check for monitoring and admin
+    surfaces to verify the DeepSeek routing preference is intact.
+    """
+    routing = _resolve_routing_core({}, {}, task_type, runtime_config)
+    providers = routing.get("providers", [])
+    return bool(providers and providers[0] == "deepseek")
+
+
 def _build_rate_limit_state_blob(acct: Dict[str, Any]) -> dict | None:
     """Serialize an account's rate-limit state (disabled_models + outcome_events) for DB."""
     dm = acct.get("disabled_models") or {}

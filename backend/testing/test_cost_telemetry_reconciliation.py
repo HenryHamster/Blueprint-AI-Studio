@@ -490,3 +490,92 @@ async def test_reconcile_result_asdict_serializable(db_session):
     assert isinstance(deserialized["total_cost_snapshot_path"], float)
     assert isinstance(deserialized["cache_hit_rate_snapshot_path"], float)
     assert isinstance(deserialized["per_task"], list)
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_failure_triggers_alert(db_session):
+    """When cost telemetry reconciliation fails within_tolerance, the snapshot
+    wiring creates a project-scoped WARNING alert."""
+    from unittest.mock import AsyncMock, patch
+
+    from sqlmodel import select
+
+    from app.efficiency_snapshot import write_snapshot
+    from app.models import Alert, AlertSeverity
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Tasks are required so compute_current_axes reaches the reconciliation call.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "llm_call_count": 5,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # A reconciliation result that fails within_tolerance.
+    failing_reconciliation = {
+        "total_cost_snapshot_path": 0.012345,
+        "total_cost_direct_path": 0.012346,
+        "absolute_delta": 1.0e-6,
+        "within_tolerance": False,
+        "tolerance": 1e-6,
+        "total_input_tokens_snapshot_path": 1000,
+        "total_input_tokens_direct_path": 1000,
+        "total_cache_read_input_tokens_snapshot_path": 0,
+        "total_cache_read_input_tokens_direct_path": 0,
+        "total_cache_creation_input_tokens_snapshot_path": 0,
+        "total_cache_creation_input_tokens_direct_path": 0,
+        "cache_hit_rate_snapshot_path": 0.0,
+        "cache_hit_rate_direct_path": 0.0,
+        "cache_hit_rate_delta": 0.0,
+        "cache_hit_rate_within_tolerance": True,
+        "task_count": 2,
+        "per_task": [],
+    }
+
+    with patch(
+        "backend.app.efficiency_snapshot._compute_cost_telemetry_reconciliation",
+        return_value=failing_reconciliation,
+    ), patch(
+        "app.alert_dispatch.broadcast_to_project",
+        new_callable=AsyncMock,
+    ):
+        # First snapshot: alert should be created.
+        await write_snapshot(db_session, project.id)
+
+        result = await db_session.execute(
+            select(Alert).where(Alert.project_id == project.id)
+        )
+        alerts = result.scalars().all()
+        assert len(alerts) == 1, "expected exactly one alert after first failure"
+        alert = alerts[0]
+
+        assert alert.project_id == project.id
+        assert alert.severity == AlertSeverity.WARNING
+        assert alert.dismissed_at is None
+        assert alert.task_id is None
+        assert "Cost telemetry reconciliation failed tolerance" in alert.title
+        # Delta and tolerance formatted as decimal; 1e-6 → 0.000001.
+        assert "0.000001" in alert.message
+        assert "2 task(s)" in alert.message
+
+        # Second snapshot with same failing condition: dedup, no new alert.
+        await write_snapshot(db_session, project.id)
+
+        result = await db_session.execute(
+            select(Alert).where(Alert.project_id == project.id)
+        )
+        alerts = result.scalars().all()
+        assert len(alerts) == 1, "dedup should prevent a second alert"
