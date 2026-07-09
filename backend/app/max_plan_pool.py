@@ -2101,11 +2101,15 @@ async def _refresh_usage_snapshot(acct_id: str) -> None:
     unknown with a fresh timestamp, so a broken account isn't re-probed every
     selection for the TTL window. Writes the cache under the pool lock; the
     network probe itself runs lock-free.
+
+    On a SUCCESSFUL probe the snapshot is also persisted to the DB row's
+    ``rate_limit_usage`` column so the data survives orchestrator restarts.
     """
     acct = _account_by_id.get(acct_id)
     if acct is None:
         return
     snapshot: UsageSnapshot
+    success = False
     try:
         provider_name = (
             _normalize_provider_name(acct.get("provider"))
@@ -2119,6 +2123,7 @@ async def _refresh_usage_snapshot(acct_id: str) -> None:
         snapshot = await provider.probe_usage(
             secret, LLMAuthMode(auth_mode_raw), acct.get("provider_metadata") or {}
         )
+        success = snapshot.known
     except Exception as exc:  # advisory; cache unknown on failure
         logger.debug("[POOL] usage probe errored for %s: %s", acct_id, exc)
         snapshot = UsageSnapshot.unknown()
@@ -2128,6 +2133,49 @@ async def _refresh_usage_snapshot(acct_id: str) -> None:
             live["usage_snapshot"] = snapshot
             live["usage_snapshot_at"] = _utcnow()
             live.pop("usage_probe_inflight", None)
+    # Persist to the DB row on success so the data survives restarts.
+    # Best-effort: a write failure is non-fatal — the in-memory copy is the
+    # primary source and the probe will retry with the next refresh cycle.
+    if success:
+        await _persist_rate_limit_usage_to_db(acct_id, snapshot)
+
+
+async def _persist_rate_limit_usage_to_db(
+    acct_id: str, snapshot: UsageSnapshot
+) -> None:
+    """Write the usage snapshot into MaxPlanAccount.rate_limit_usage.
+
+    Pure best-effort advisory: failures are logged but never raised.
+    """
+    if not snapshot.known:
+        return
+    usage_dict: dict[str, Any] = {
+        "updated_at": _utcnow().isoformat(),
+        "source": "oauth_usage_probe",
+    }
+    for window in ("five_hour", "seven_day"):
+        util = snapshot.window_utilizations.get(window)
+        if util is not None:
+            entry = {"utilization": float(util)}
+            reset = snapshot.resets_at.get(window)
+            if reset:
+                entry["resets_at"] = reset
+            usage_dict[window] = entry
+    try:
+        from app.models import MaxPlanAccount
+
+        async with AsyncSessionLocal() as persist_session:
+            row = await persist_session.get(MaxPlanAccount, uuid.UUID(acct_id))
+            if row is not None:
+                row.rate_limit_usage = usage_dict
+                row.updated_at = _utcnow()
+                persist_session.add(row)
+                await persist_session.commit()
+    except Exception:
+        logger.exception(
+            "[POOL] failed to persist rate_limit_usage for account %s; keeping in-memory only",
+            acct_id,
+        )
 
 
 def _schedule_usage_refresh(acct: Dict[str, Any]) -> None:

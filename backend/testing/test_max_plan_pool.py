@@ -3172,3 +3172,112 @@ class TestTypedSuccessRateFailureOutcomes:
         blob = _build_rate_limit_state_blob(acct)
         assert blob is not None
         assert len(blob.get("outcome_events", [])) <= _OUTCOME_EVENTS_CAP
+
+
+# ── _persist_rate_limit_usage_to_db ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_persist_rate_limit_usage_skips_unknown_snapshot():
+    """Unknown snapshot is not persisted (no-op)."""
+    from app.max_plan_pool import _persist_rate_limit_usage_to_db
+
+    snap = UsageSnapshot.unknown()
+    # Should not raise
+    await _persist_rate_limit_usage_to_db("some-account-id", snap)
+
+
+@pytest.mark.asyncio
+async def test_persist_rate_limit_usage_writes_usage_dict(monkeypatch):
+    """Known snapshot writes correct usage_dict to DB."""
+    from app.max_plan_pool import _persist_rate_limit_usage_to_db
+
+    snap = UsageSnapshot(
+        known=True,
+        window_utilizations={"five_hour": 30.0, "seven_day": 45.0},
+        resets_at={
+            "five_hour": "2026-07-09T15:00:00Z",
+            "seven_day": "2026-07-14T00:00:00Z",
+        },
+        probed_at="2026-07-09T12:00:00",
+    )
+
+    written = None
+
+    class FakeRow:
+        rate_limit_usage = None
+        updated_at = None
+
+    fake_row = FakeRow()
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a, **k):
+            pass
+
+        async def get(self, model, acct_id):
+            return fake_row
+
+        def add(self, obj):
+            nonlocal written
+            written = fake_row.rate_limit_usage
+
+        async def commit(self):
+            pass
+
+    monkeypatch.setattr(
+        "app.max_plan_pool.AsyncSessionLocal",
+        lambda: FakeSession(),
+    )
+    monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+    await _persist_rate_limit_usage_to_db("test-id", snap)
+
+    assert written is not None
+    assert written["source"] == "oauth_usage_probe"
+    assert written["five_hour"]["utilization"] == 30.0
+    assert written["five_hour"]["resets_at"] == "2026-07-09T15:00:00Z"
+    assert written["seven_day"]["utilization"] == 45.0
+    assert written["seven_day"]["resets_at"] == "2026-07-14T00:00:00Z"
+    assert "updated_at" in written
+    assert "source" in written
+
+
+@pytest.mark.asyncio
+async def test_persist_rate_limit_usage_no_row_is_noop(monkeypatch):
+    """When the DB row doesn't exist, the function is a no-op (no raise)."""
+    from app.max_plan_pool import _persist_rate_limit_usage_to_db
+
+    snap = UsageSnapshot(
+        known=True,
+        window_utilizations={"five_hour": 50.0, "seven_day": 50.0},
+        resets_at={},
+        probed_at="2026-07-09T12:00:00",
+    )
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a, **k):
+            pass
+
+        async def get(self, model, acct_id):
+            return None  # row not found
+
+        def add(self, obj):
+            raise AssertionError("should not add when row is None")
+
+        async def commit(self):
+            raise AssertionError("should not commit when row is None")
+
+    monkeypatch.setattr(
+        "app.max_plan_pool.AsyncSessionLocal",
+        lambda: FakeSession(),
+    )
+    monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+    # Should not raise
+    await _persist_rate_limit_usage_to_db("nonexistent-id", snap)

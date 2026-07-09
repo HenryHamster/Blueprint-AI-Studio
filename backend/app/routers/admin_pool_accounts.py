@@ -513,6 +513,10 @@ def _serialize_max_plan_account_row(
         "status_reasons": status_reasons,
         "usage": usage,
         "usage_snapshot": usage_snapshot,
+        # Persisted rate-limit/usage headroom snapshot (survives restarts).
+        # In-memory usage_snapshot above is the live probe; this is the last
+        # known-good value from the DB, available even when the pool is cold.
+        "rate_limit_usage": db_account.rate_limit_usage,
     }
 
 

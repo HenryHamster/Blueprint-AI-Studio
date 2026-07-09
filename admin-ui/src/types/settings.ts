@@ -243,6 +243,8 @@ export interface MaxPlanAccount {
   status_reasons?: string[];
   usage?: AccountUsageSummary;
   usage_snapshot?: AccountUsageSnapshot;
+  /** Persisted rate-limit/usage headroom snapshot (survives restarts). */
+  rate_limit_usage?: Record<string, unknown> | null;
 }
 
 export interface ProviderHealthSnapshot {
