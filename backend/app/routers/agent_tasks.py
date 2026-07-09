@@ -129,6 +129,7 @@ async def _fetch_children(
                 Task.project_id == project_id,
             )
             .order_by(Task.created_at.asc())
+            .limit(5000)
         )
     ).scalars().all()
 

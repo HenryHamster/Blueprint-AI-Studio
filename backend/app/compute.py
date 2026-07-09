@@ -1582,12 +1582,14 @@ async def _provision_local(
         return False
 
     try:
-        proc = subprocess.Popen(
-            ["npm", "start"],
-            cwd=agent_dir,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        proc = await asyncio.to_thread(
+            lambda: subprocess.Popen(
+                ["npm", "start"],
+                cwd=agent_dir,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
         )
         _local_processes[vm_instance_id] = proc
         logger.info(f"[LOCAL] Agent subprocess started (PID: {proc.pid})")

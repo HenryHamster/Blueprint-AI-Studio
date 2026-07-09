@@ -35,7 +35,6 @@ Three public entry points:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any
@@ -50,6 +49,7 @@ from app.branch_literal_compliance import (
     SURFACE_CONFIGS,
     strip_typescript_with_linenos,
 )
+from app.json_extract import async_json_loads
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -135,7 +135,7 @@ async def _load_size_limits_at_ref(
     if not text:
         return {}
     try:
-        data = json.loads(text)
+        data = await async_json_loads(text)
     except (ValueError, TypeError):
         logger.warning(
             "[CI-COMPLIANCE] could not parse %s at %s/%s@%s — treating as empty",

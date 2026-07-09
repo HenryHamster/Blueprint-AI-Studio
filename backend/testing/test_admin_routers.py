@@ -7278,7 +7278,7 @@ class TestMessagesWorkbenchState:
     async def test_list_runners_default_limit(
         self, client: AsyncClient, db_session
     ):
-        """Call without limit param; should return at most 50 runners by default."""
+        """Call without limit param; should return at most 100 runners by default."""
         project = await _make_project(db_session)
         runners = [
             LocalRunner(
@@ -7299,11 +7299,12 @@ class TestMessagesWorkbenchState:
         assert resp.status_code == 200
         listed = resp.json()
         # Default limit is 50; with 205 seeded runners we expect exactly 50
-        assert len(listed) == 50, f"expected 50 (default limit), got {len(listed)}"
+        # Default limit is 100; with 205 seeded runners we expect exactly 100
+        assert len(listed) == 100, f"expected 100 (default limit), got {len(listed)}"
         # Runners are ordered by created_at DESC; the most-recently-created
         # (lowest i) should appear first
         assert listed[0]["hostname"] == "runner-000"
-        assert listed[-1]["hostname"] == "runner-049"
+        assert listed[-1]["hostname"] == "runner-099"
 
     @pytest.mark.asyncio
     async def test_leaving_continuous_mode_clears_local_continuation_marker(

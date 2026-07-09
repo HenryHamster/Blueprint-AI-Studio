@@ -739,10 +739,28 @@ async def reaper_service():
                 # orphan loop crashes mid-iteration on the very first task.
                 # Iterate by id instead so no expired-attribute access happens.
                 _orphaned_task_ids: list[str] = []
+                _orphaned_project_ids: list[uuid.UUID] = []
                 if orphaned_tasks:
                     _orphaned_task_ids = [t.id for t in orphaned_tasks]
+                    _orphaned_project_ids = list(
+                        {t.project_id for t in orphaned_tasks}
+                    )
                     await session.commit()
                     session.expire_all()
+
+                # Batch-load all projects referenced by orphaned tasks to
+                # avoid N+1 SELECTs in the orphan-processing loop below (each
+                # of the 3 sites that read task.project_id previously issued a
+                # separate await session.get(Project, ...) query).
+                _projects_batch: dict[uuid.UUID, Project] = {}
+                if _orphaned_project_ids:
+                    _proj_stmt = select(Project).where(
+                        Project.id.in_(_orphaned_project_ids)
+                    )
+                    _proj_result = await session.execute(_proj_stmt)
+                    _projects_batch = {
+                        _p.id: _p for _p in _proj_result.scalars().all()
+                    }
 
                 # Collect old VM IDs for deletion after commit (can't set attrs on SQLModel)
                 _reaper_old_vms: Dict[str, str] = {}
@@ -1545,7 +1563,7 @@ async def reaper_service():
                                 f"[REAPER] Task {task.id} reaped mid-run; PR #{_pr_num} already merged — "
                                 f"classifying landing"
                             )
-                            _proj = await session.get(Project, task.project_id)
+                            _proj = _projects_batch.get(task.project_id)
                             from app.recovery_evaluating_helpers import (
                                 _apply_rollup_merge_classification,
                             )
@@ -1684,7 +1702,7 @@ async def reaper_service():
                                 # branch is recorded — without this, reaped fix tasks
                                 # spawn review tasks pointing at non-existent branches
                                 # and the review fails on `git clone --branch`.
-                                _proj = await session.get(Project, task.project_id)
+                                _proj = _projects_batch.get(task.project_id)
                                 _branch = (task.first_payload or {}).get(
                                     "branch"
                                 ) or _derive_task_branch(
@@ -2046,8 +2064,8 @@ async def reaper_service():
                                             refresh_research_task_verification,
                                         )
 
-                                        _res_proj = await session.get(
-                                            Project, task.project_id
+                                        _res_proj = _projects_batch.get(
+                                            task.project_id
                                         )
                                         if _res_proj is not None:
                                             await refresh_research_task_verification(

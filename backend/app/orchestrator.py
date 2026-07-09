@@ -1697,19 +1697,16 @@ async def orchestrator_worker():
                 # 50 NULL-launcher candidates = 50 redundant Project SELECTs
                 # every cycle.
                 _project_user_cache: Dict[uuid.UUID, str] = {}
-                # Pre-warm the project cache for tasks without a launcher so the
-                # eligibility loop and dispatch section never issue per-task
-                # Project SELECTs.
-                _null_launcher_pids = {
-                    t.project_id
-                    for t in candidate_tasks
-                    if not t.launched_by_user_id
-                }
-                if _null_launcher_pids:
+                # Pre-warm the project cache for ALL candidate tasks' projects
+                # so the eligibility loop and dispatch section never issue per-task
+                # Project SELECTs (covers both null-launcher tasks and the fallback
+                # path at dispatch-time user-owner resolution).
+                _all_candidate_pids = {t.project_id for t in candidate_tasks}
+                if _all_candidate_pids:
                     _proj_rows = (
                         await session.execute(
                             select(Project.id, Project.user_id).where(
-                                Project.id.in_(_null_launcher_pids)
+                                Project.id.in_(_all_candidate_pids)
                             )
                         )
                     ).all()

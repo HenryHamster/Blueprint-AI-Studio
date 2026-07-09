@@ -2,10 +2,13 @@
 
 import json
 
+import pytest
+
 from app.json_extract import (
     _extract_json_array,
     _extract_json_object,
     _extract_last_json_array,
+    async_json_loads,
     scan_balanced_json_objects,
 )
 
@@ -153,3 +156,71 @@ def test_extract_last_json_array_returns_last():
 def test_extract_last_json_array_missing_key_returns_none():
     text = '[{"a": 1}]'
     assert _extract_last_json_array(text, "verdict") is None
+
+
+# ---------------------------------------------------------------------------
+# async_json_loads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_async_json_loads_small_payload():
+    """Small payload (< threshold) parses synchronously and returns correct result."""
+    small = '{"key": "value", "number": 42}'
+    result = await async_json_loads(small)
+    assert result == {"key": "value", "number": 42}
+
+
+@pytest.mark.asyncio
+async def test_async_json_loads_large_payload():
+    """Large payload (> threshold) offloads to thread and returns correct result."""
+    # Build a payload just over the 8192-byte threshold
+    large = '{"data": "' + "x" * 8200 + '"}'
+    assert len(large) > 8192
+    result = await async_json_loads(large)
+    assert result["data"] == "x" * 8200
+
+
+@pytest.mark.asyncio
+async def test_async_json_loads_exactly_at_threshold():
+    """Payload at exactly 8192 bytes parses synchronously (not > threshold)."""
+    # Craft a payload that equals exactly 8192 bytes
+    inner = "x" * (8192 - len('{"data": ""}'))
+    payload = '{"data": "' + inner + '"}'
+    assert len(payload) == 8192, f"expected 8192, got {len(payload)}"
+    result = await async_json_loads(payload)
+    assert result["data"] == inner
+
+
+@pytest.mark.asyncio
+async def test_async_json_loads_invalid_json():
+    """Invalid JSON raises json.JSONDecodeError regardless of payload size."""
+    with pytest.raises(json.JSONDecodeError):
+        await async_json_loads("{invalid json}")
+    large_truncated = "{" + "x" * 9000
+    with pytest.raises(json.JSONDecodeError):
+        await async_json_loads(large_truncated)
+
+
+@pytest.mark.asyncio
+async def test_async_json_loads_empty_string():
+    """Empty string raises JSONDecodeError."""
+    with pytest.raises(json.JSONDecodeError):
+        await async_json_loads("")
+
+
+@pytest.mark.asyncio
+async def test_async_json_loads_array():
+    """Top-level JSON array also works."""
+    result = await async_json_loads('[1, 2, 3]')
+    assert result == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_async_json_loads_large_array():
+    """Large array offloads correctly."""
+    large_arr = list(range(2000))
+    text = json.dumps(large_arr)
+    assert len(text) > 8192, f"need larger array, got {len(text)} bytes"
+    result = await async_json_loads(text)
+    assert result == large_arr

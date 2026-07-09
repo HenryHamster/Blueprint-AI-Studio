@@ -1,5 +1,5 @@
 /* eslint-disable react-hooks/immutability, react-hooks/refs, react-hooks/set-state-in-effect */
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { auth, getIdToken } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
 import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
@@ -407,7 +407,7 @@ function messageListsEqual(a: ProjectMessage[], b: ProjectMessage[]): boolean {
 }
 
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -848,7 +848,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // Badge/tab-title count. Passes eventPrefs/tempMutes so muted types are excluded and
   // surfaced types are included — matching App.tsx's closed-panel count exactly so the
   // badge does not jump when the operator opens the panel.
-  const highSignalCount = countHighSignalMessages(messages, eventPrefs, tempMutes);
+  const highSignalCount = useMemo(
+    () => countHighSignalMessages(messages, eventPrefs, tempMutes),
+    [messages, eventPrefs, tempMutes],
+  );
   const conversationMessages = useMemo(() => {
     return messages
       .filter(msg => isConversationMessage(msg, eventPrefs, tempMutes))
@@ -984,7 +987,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     [conversationMode, currentStrategicState, strategicWorkbenchState],
   );
 
-  const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
+  const mutedCount = useMemo(
+    () => Object.values(eventPrefs).filter(v => v === 'mute').length,
+    [eventPrefs],
+  );
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -2317,4 +2323,4 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       />
     </div>
   );
-}
+});

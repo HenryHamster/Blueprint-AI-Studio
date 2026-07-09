@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { memo, useMemo, type ReactNode } from 'react';
 import { Activity, ArrowUpRight, CircleAlert, Cpu, CreditCard, GitBranch, Network, Radio, X } from 'lucide-react';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
@@ -751,7 +751,7 @@ function ContextPackageBlock({
   );
 }
 
-export function StrategicContextRail({
+export const StrategicContextRail = memo(function StrategicContextRail({
   state,
   loading = false,
   error = null,
@@ -857,15 +857,29 @@ export function StrategicContextRail({
   const accountActionLabel = onOpenAccounts ? 'accounts' : 'spend';
   const workSessionActions = state?.work_session?.actions ?? [];
   const workSessionEvents = state?.work_session?.events?.items ?? [];
-  const visibleWorkSessionActions = workSessionActions.filter(action => action.enabled).slice(0, 4);
-  const visibleWorkSessionActionIds = new Set(visibleWorkSessionActions.map(action => action.id));
-  const visibleAttentionItems = attentionItems.filter(item => !visibleWorkSessionActionIds.has(`attention.${item.id}`));
-  const actionableWorkSessionEvents = workSessionEvents.filter(workSessionEventHasActionableSignal).slice(0, 2);
+  const visibleWorkSessionActions = useMemo(
+    () => workSessionActions.filter(action => action.enabled).slice(0, 4),
+    [workSessionActions],
+  );
+  const visibleWorkSessionActionIds = useMemo(
+    () => new Set(visibleWorkSessionActions.map(action => action.id)),
+    [visibleWorkSessionActions],
+  );
+  const visibleAttentionItems = useMemo(
+    () => attentionItems.filter(item => !visibleWorkSessionActionIds.has(`attention.${item.id}`)),
+    [attentionItems, visibleWorkSessionActionIds],
+  );
+  const actionableWorkSessionEvents = useMemo(
+    () => workSessionEvents.filter(workSessionEventHasActionableSignal).slice(0, 2),
+    [workSessionEvents],
+  );
   const showActionableSessionActivity = visibleWorkSessionActions.length === 0 && actionableWorkSessionEvents.length > 0;
   const selectedRefs = workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [];
   const workSessionDescriptors = state?.work_session?.selected_ref_descriptors ?? [];
-  const descriptorByRef = new Map(workSessionDescriptors.map(descriptor => [sessionRefKey(descriptor), descriptor]));
-  const selectedRefDescriptors = selectedRefs.map(ref => descriptorByRef.get(sessionRefKey(ref)) ?? fallbackRefDescriptor(ref));
+  const selectedRefDescriptors = useMemo(() => {
+    const descriptorByRef = new Map(workSessionDescriptors.map(descriptor => [sessionRefKey(descriptor), descriptor]));
+    return selectedRefs.map(ref => descriptorByRef.get(sessionRefKey(ref)) ?? fallbackRefDescriptor(ref));
+  }, [workSessionDescriptors, selectedRefs]);
 
   function attentionItemAction(item: StrategicStateAttentionItem): (() => void) | undefined {
     if (item.target?.surface === 'task') {
@@ -1204,4 +1218,4 @@ export function StrategicContextRail({
       </WorkbenchPanel>
     </div>
   );
-}
+});

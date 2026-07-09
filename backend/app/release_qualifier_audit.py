@@ -36,6 +36,7 @@ from app.release_promotion import _lts_branch_names, _record_qualification_verdi
 from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
+from app.json_extract import async_json_loads
 
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
@@ -565,7 +566,7 @@ async def _latest_artifact_logs(
     if artifact is None or not artifact.logs:
         return None
     try:
-        parsed = json.loads(artifact.logs)
+        parsed = await async_json_loads(artifact.logs)
     except (json.JSONDecodeError, TypeError, ValueError):
         logger.warning(
             "[RELEASE_QUALIFIER] artifact %s for task %s has unparseable logs",
