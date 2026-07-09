@@ -493,6 +493,73 @@ def test_get_metrics_reader_routes_are_get_only_and_allowlisted():
     )
 
 
+# ── Cross-cutting test file registry ────────────────────────────────────────
+
+
+def test_cross_cutting_test_files_registry_is_current():
+    """Verify ``_CROSS_CUTTING_TEST_FILES`` in acceptance_gate.py is current.
+
+    Every registered entry must:
+        1. Point to a real file on disk.
+        2. Be a ``backend/testing/test_*.py`` file.
+        3. Be genuinely cross-cutting (its stem does not match any production
+           module's basename in ``backend/app/`` — otherwise it would qualify
+           for the normal stem-match heuristic and does not belong in the
+           cross-cutting list).
+
+    Additionally, discover **unregistered** cross-cutting test files: any
+    ``backend/testing/test_*invariant*`` file whose stem does not match a
+    production module must be registered.  This catches the exact scenario
+    described in PR #13677: a new cross-cutting test file silently receiving
+    false-negative acceptance verdicts because it was never added to the
+    allowlist.
+    """
+    from app.acceptance_gate import get_cross_cutting_test_files
+
+    registered = set(get_cross_cutting_test_files())
+    testing_dir = BACKEND_ROOT / "testing"
+
+    # All production .py basenames in backend/app/ (recursive).
+    app_dir = BACKEND_ROOT / "app"
+    prod_basenames: set[str] = set()
+    for p in app_dir.rglob("*.py"):
+        prod_basenames.add(p.stem)
+
+    # 1–3. Validate every registered entry.
+    for entry in registered:
+        assert entry.startswith("backend/testing/"), (
+            f"Cross-cutting entry {entry!r} is not under backend/testing/"
+        )
+        full_path = testing_dir / Path(*Path(entry).parts[2:])
+        assert full_path.exists(), (
+            f"Cross-cutting entry {entry!r} does not exist on disk"
+        )
+        test_basename = Path(entry).stem
+        assert test_basename.startswith("test_"), (
+            f"Cross-cutting entry {entry!r} is not a test file"
+        )
+        stem = test_basename[len("test_"):]
+        assert stem not in prod_basenames, (
+            f"Cross-cutting entry {entry!r} has stem {stem!r} which matches "
+            f"a production module — it should use the regular stem-match "
+            "heuristic, not the cross-cutting allowlist"
+        )
+
+    # 4. Discover unregistered invariant-pattern test files.
+    for test_file in sorted(testing_dir.glob("test_*invariant*")):
+        rel = f"backend/testing/{test_file.name}"
+        if rel in registered:
+            continue
+        stem = test_file.stem[len("test_"):]
+        if stem in prod_basenames:
+            continue  # matches a production module — not cross-cutting
+        raise AssertionError(
+            f"Cross-cutting test file {rel!r} is not registered in "
+            "_CROSS_CUTTING_TEST_FILES in acceptance_gate.py — add it to "
+            "the frozenset to prevent false-negative acceptance verdicts"
+        )
+
+
 # ── Safety Constants ────────────────────────────────────────────────────────
 
 

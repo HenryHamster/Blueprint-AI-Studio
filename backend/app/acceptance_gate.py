@@ -231,7 +231,18 @@ def _paths_match(changed: str, declared: str) -> bool:
 # test_<module>.py convention — add new cross-cutting entries here.
 _CROSS_CUTTING_TEST_FILES: frozenset[str] = frozenset({
     "backend/testing/test_invariants.py",
+    "backend/testing/test_admin_auth_invariant.py",
+    "backend/testing/test_agent_branch_invariants.py",
+    "backend/testing/test_backmerge_invariants.py",
+    "backend/testing/test_c5_approval_gate_invariant.py",
+    "backend/testing/test_event_type_invariants.py",
+    "backend/testing/test_schema_invariants.py",
 })
+
+
+def get_cross_cutting_test_files() -> frozenset[str]:
+    """Return the set of cross-cutting test file paths exempt from stem-match."""
+    return _CROSS_CUTTING_TEST_FILES
 
 
 def _test_semantically_grounded(
@@ -1056,6 +1067,96 @@ def summarize_version_acceptance_aggregate(
         round(satisfied / aggregate["total"], 3) if aggregate["total"] > 0 else None
     )
     return aggregate
+
+
+# ---------------------------------------------------------------------------
+# One-time backfill: false-negative acceptance verdicts (pre-fix)
+# ---------------------------------------------------------------------------
+
+
+async def backfill_acceptance_verdicts(session) -> int:
+    """One-time backfill: re-evaluate pre-fix named_test acceptance verdicts
+    that may have been false-negatives before the ``_CROSS_CUTTING_TEST_FILES``
+    semantic-grounding fix (8acdd3780, 2026-07-09T09:23 UTC).
+
+    Finds merged tasks whose recorded verdict is ``named_test`` with
+    ``satisfied=True`` but ``proven=False``, re-evaluates with the current
+    (fixed) logic, and records :class:`~app.models.CriterionEvidence` via
+    :func:`~app.acceptance_criteria.record_task_merge_evidence` when the new
+    verdict is ``proven=True``.
+
+    Bounded to 200 tasks per call so the reaper cycle is never blocked.
+    Best-effort: individual evidence-recording failures are logged and
+    skipped without aborting the remaining tasks.
+
+    Returns the number of upgraded verdicts.
+    """
+    from datetime import datetime, timezone
+
+    FIX_TIMESTAMP = datetime(2026, 7, 9, 9, 23, 0, tzinfo=timezone.utc)
+
+    result = await session.execute(
+        select(Task).where(
+            Task.status == TaskStatus.COMPLETED,
+            Task.completed_at < FIX_TIMESTAMP,
+        ).limit(200)
+    )
+    tasks = list(result.scalars().all())
+
+    # Prevent record_evidence's internal commit from expiring our task ORM
+    # instances (which would cause MissingGreenlet on the next iteration).
+    _prior_expire = session.sync_session.expire_on_commit
+    session.sync_session.expire_on_commit = False
+    try:
+        upgraded = 0
+        for task in tasks:
+            verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+            if not isinstance(verdict_data, dict):
+                continue
+            if verdict_data.get("kind") != "named_test":
+                continue
+            if verdict_data.get("satisfied") is not True:
+                continue
+            if verdict_data.get("proven") is True:
+                continue
+
+            re_eval = evaluate_code_acceptance(task)
+            if re_eval.proven:
+                ctx = dict(task.context or {})
+                ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+                    "satisfied": True,
+                    "proven": True,
+                    "kind": "named_test",
+                    "reason": re_eval.reason,
+                    "proof_ref": re_eval.proof_ref,
+                    "backfilled": True,
+                }
+                task.context = ctx
+                session.add(task)
+                # Commit the verdict upgrade FIRST so a rollback inside
+                # record_evidence (IntegrityError guard) does not undo it.
+                await session.commit()
+
+                from app.acceptance_criteria import record_task_merge_evidence
+                try:
+                    await record_task_merge_evidence(session, task, task.project_id)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "backfill_acceptance_verdicts: evidence recording failed for "
+                        "task %s",
+                        getattr(task, "id", None),
+                        exc_info=True,
+                    )
+                upgraded += 1
+
+        if upgraded:
+            logger.info(
+                "backfill_acceptance_verdicts: upgraded %d task(s)",
+                upgraded,
+            )
+        return upgraded
+    finally:
+        session.sync_session.expire_on_commit = _prior_expire
 
 
 # ---------------------------------------------------------------------------

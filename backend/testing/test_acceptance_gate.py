@@ -25,6 +25,7 @@ from app.acceptance_gate import (
     acceptance_is_proven,
     acceptance_counts_as_verified_context,
     acceptance_was_declared,
+    backfill_acceptance_verdicts,
     classify_merged_acceptance,
     classify_merged_acceptance_context,
     classify_undeclared_reason,
@@ -1867,3 +1868,65 @@ def test_missing_review_loop_not_scored_as_proven():
     assert acceptance_blocks_success(task_no_context.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
     assert acceptance_blocks_success(task_malformed.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
     assert acceptance_blocks_success(task_explicit_unverified.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_empty_db(db_session):
+    """The backfill returns 0 on an empty or unpopulated database."""
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_upgrades_false_negative(db_session):
+    """A pre-fix task with the false-negative verdict pattern is upgraded by
+    the backfill sweep, and its verdict is updated to proven=True.
+    """
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_invariants.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_invariants.py",
+        ],
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    # Stamp a false-negative verdict exactly as the pre-fix gate would have:
+    # satisfied=True (test was present, verified, and shipped a production seam)
+    # but proven=False because _test_semantically_grounded failed for the
+    # cross-cutting test_invariants.py before the _CROSS_CUTTING_TEST_FILES fix.
+    ctx = dict(task.context or {})
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": True,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_invariants.py' exercises "
+            "a production seam that does not semantically correspond to the "
+            "declared test module"
+        ),
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result >= 1, "backfill should upgrade the pre-fix false-negative verdict"
+
+    # Re-read the task and verify the verdict was upgraded
+    await db_session.refresh(task)
+    updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("proven") is True, "verdict should be upgraded to proven"
+    assert updated.get("backfilled") is True

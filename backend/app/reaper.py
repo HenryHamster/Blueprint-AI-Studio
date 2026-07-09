@@ -297,6 +297,7 @@ from app.reaper_sweeps import (
     sweep_closed_handmerge_prs,
     _sweep_strategic_cycle_starvation,
 )
+from app.acceptance_gate import backfill_acceptance_verdicts
 
 
 async def _mark_landed_parent_dependents(parent_id, session) -> None:
@@ -2840,6 +2841,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Orphaned cross-base children sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 21: Backfill acceptance verdicts for pre-fix false-negative
+                # named_test evaluations — re-evaluate with the current fixed logic
+                # and record CriterionEvidence when the new verdict is proven=True.
+                # One-time bounded sweep (200 tasks/cycle); idempotent after all
+                # candidates are processed (each upgraded task carries proven=True).
+                _mark_reaper_progress()
+                try:
+                    await backfill_acceptance_verdicts(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Backfill-acceptance-verdicts sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):
