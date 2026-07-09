@@ -56,10 +56,13 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
 from app.direction_outcomes import credit_gate_merged_count
 from app.failure_classification import (
     CO_DEFERRED_SHELVED,
+    EXTERNAL_API,
+    EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
     GRADER_CAUSE_REFUSAL,
     GRADER_TIMEOUT_CAUSES,
     GRADER_TRANSIENT_INFRA_CAUSES,
     INFRA_CLASSES,
+    classify_external_api_subtype,
     classify_failure,
 )
 from app.finding_deduplication import (
@@ -926,11 +929,17 @@ def _summarize_dispatch_outcome(
     total_findings: int,
     dedup_outcome: Any | None,
     deferred_reason_parts: list[str] | None = None,
+    degraded_reason: str | None = None,
 ) -> str:
     """Build the post-dispatch status_message that surfaces spawn / dedup / defer
     counts. Today these stats live only in logs and task.context; surfacing them
     on the task itself lets the admin UI and ./tasks failures CLI show why a
-    research cycle produced N children instead of M."""
+    research cycle produced N children instead of M.
+
+    When ``degraded_reason`` is set, appends a degradation qualifier so readers
+    can distinguish a genuinely thorough empty result from one truncated by a
+    provider capacity/rate-limit error mid-run.
+    """
     parts: list[str] = [f"spawned {spawned}/{total_findings} findings"]
     if dedup_outcome is not None:
         dedup_breakdown: list[str] = []
@@ -956,7 +965,62 @@ def _summarize_dispatch_outcome(
             parts.append("dedup filtered: " + ", ".join(dedup_breakdown))
     if deferred_reason_parts:
         parts.append("deferred: " + " + ".join(deferred_reason_parts))
+    if degraded_reason:
+        parts.append(f"degraded: {degraded_reason} — results may be incomplete")
     return " | ".join(parts)[:500]
+
+
+def _check_capacity_degradation(task: Task, logs: str = "") -> str | None:
+    """Check whether a research task encountered a provider capacity/rate-limit
+    error during its run that may have degraded its output.
+
+    Examines (1) the task context for a persisted ``EXTERNAL_API`` /
+    ``provider_quota`` failure classification (set by
+    :func:`persist_failure_category` during a terminal-FAILED path on a prior
+    pass, or mid-run by the agent-status router), and (2) the task's current
+    ``latest_status_message`` plus the ``logs`` string for provider-quota
+    signal keywords via :func:`_external_api_subtype_from_message`.
+
+    Returns a short human-readable reason string when degradation is detected,
+    or ``None`` when the task shows no capacity-signal evidence.
+    """
+    if task is None:
+        return None
+    # 1. Persisted failure classification on task context.
+    ctx = task.context or {}
+    fc = ctx.get("failure_category")
+    est = ctx.get("external_api_subtype")
+    if fc == EXTERNAL_API and est == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA:
+        return "provider capacity/rate-limit error"
+
+    # Compute the message subtype once from status + logs for steps 2-3.
+    subtype = classify_external_api_subtype(task, logs)
+
+    # 2. Agent self-reported failure category — cross-check against message text
+    #    to avoid false positives from unrelated ``claude_code_failed`` events.
+    raw_fc = ctx.get("agent_failure_category_raw", "")
+    if raw_fc in ("rate_limited", "claude_code_failed") and subtype == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA:
+        return "provider capacity/rate-limit error"
+
+    # 3. Current status message + logs — catches errors the agent reported
+    #    mid-run that weren't separately persisted to task context.
+    if subtype == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA:
+        return "provider capacity/rate-limit error"
+
+    return None
+
+
+def _mark_capacity_degraded(task: Task, reason: str) -> None:
+    """Record a capacity-degradation signal on a task's context dict.
+
+    Used by both the no-findings path and the dispatch path so the structured
+    indicator stays consistent across both sites.
+    """
+    _ctx = dict(task.context or {})
+    _ctx["degraded_by_capacity"] = True
+    _ctx["degraded_by_capacity_reason"] = reason
+    task.context = _ctx
+    flag_modified(task, "context")
 
 
 # Finding ``type`` values that are processed separately and never spawn an
@@ -1482,6 +1546,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             session, task.project_id, _increment_research_spawn_count
         )
 
+    # Assess whether this research task encountered a provider capacity/rate-limit
+    # error mid-run but still completed (rather than hard-failing). When detected,
+    # the reason is surfaced in the completion message and task context so
+    # downstream readers (strategist, operator, future research cycles) can
+    # distinguish thin-but-honest results from capacity-truncated ones.
+    _capacity_degradation_reason = _check_capacity_degradation(task, logs)
+
     # Depth guard: prevent infinite research recursion
     MAX_RESEARCH_DEPTH = 3
     research_depth = (task.context or {}).get("research_depth", 0)
@@ -1573,7 +1644,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     f"{len(_stored_findings)} stored finding(s)"
                 )[:500]
     if not findings:
-        task.latest_status_message = "Research completed with no actionable findings"
+        if _capacity_degradation_reason:
+            task.latest_status_message = (
+                "Research completed with no actionable findings "
+                f"(degraded: {_capacity_degradation_reason} — results may be incomplete)"
+            )
+            _mark_capacity_degraded(task, _capacity_degradation_reason)
+        else:
+            task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
         _record_research_survival_signal(task, surviving=0)
         # Stamp refractory on the direction before committing — this path skips
@@ -5223,7 +5301,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         total_findings=len(findings),
         dedup_outcome=_dedup_outcome,
         deferred_reason_parts=_deferral_reasons,
+        degraded_reason=_capacity_degradation_reason,
     )
+    # Structured indicator for downstream consumers: when a research task hit a
+    # provider capacity/rate-limit error mid-run but still completed (did not
+    # hard-fail), mark it so the strategist / operator / future research cycles
+    # can distinguish thin-but-honest results from capacity-truncated ones.
+    if _capacity_degradation_reason:
+        _mark_capacity_degraded(task, _capacity_degradation_reason)
     # Honest success signal: count findings that SURVIVED ingestion validation +
     # dedup + actionability and were routed to work — spawned, or deferred only
     # for capacity/health reasons (batch cap, pipeline degradation). Findings

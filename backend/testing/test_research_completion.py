@@ -4677,6 +4677,182 @@ class TestSummarizeDispatchOutcome:
         )
         assert len(msg) <= 500
 
+    # --- degraded_reason qualifier ---
+
+    def test_degraded_reason_appended_when_set(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=2,
+            total_findings=5,
+            dedup_outcome=self._outcome(),
+            degraded_reason="provider capacity/rate-limit error",
+        )
+        assert "spawned 2/5 findings" in msg
+        assert "degraded: provider capacity/rate-limit error" in msg
+        assert "results may be incomplete" in msg
+
+    def test_degraded_reason_composes_with_deferred(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=0,
+            total_findings=3,
+            dedup_outcome=self._outcome(),
+            deferred_reason_parts=["batch cap (3)"],
+            degraded_reason="provider capacity/rate-limit error",
+        )
+        assert "degraded:" in msg
+        assert "deferred:" in msg
+        # Degradation qualifier should appear last.
+        assert msg.index("degraded:") > msg.index("deferred:")
+
+    def test_degraded_reason_omitted_when_none(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=3, total_findings=3, dedup_outcome=self._outcome()
+        )
+        assert "degraded" not in msg
+        assert msg == "spawned 3/3 findings"
+
+    def test_degraded_reason_respects_500_char_truncation(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        # Long deferred reasons + a degradation qualifier must still fit in 500.
+        long_reasons = [f"reason_{i}_with_padding_text" * 5 for i in range(20)]
+        msg = _summarize_dispatch_outcome(
+            spawned=0,
+            total_findings=99,
+            dedup_outcome=self._outcome(hash_=9),
+            deferred_reason_parts=long_reasons,
+            degraded_reason="provider capacity/rate-limit error — results may be incomplete",
+        )
+        assert len(msg) <= 500
+
+
+class TestCheckCapacityDegradation:
+    """_check_capacity_degradation detects provider quota / rate-limit signals."""
+
+    def _make_task_stub(self, *, status_msg="", context=None):
+        """Build a lightweight task-like object with the attrs the helper reads."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            latest_status_message=status_msg,
+            context=context or {},
+        )
+
+    def test_none_when_clean(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(status_msg="All findings processed normally")
+        assert _check_capacity_degradation(task, "") is None
+
+    def test_none_when_empty_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(status_msg="")
+        assert _check_capacity_degradation(task, "") is None
+
+    def test_none_when_no_task(self):
+        from app.research_completion import _check_capacity_degradation
+
+        assert _check_capacity_degradation(None, "") is None
+
+    def test_detects_quota_in_status_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        # "api usage exhausted" is a key phrase matching _external_api_subtype_from_message
+        task = self._make_task_stub(
+            status_msg="Fatal error: Claude Code API usage exhausted — you have no more turns"
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+        assert "provider capacity" in result or "rate-limit" in result
+
+    def test_detects_rate_limit_in_status_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            status_msg="upstream API returned 429 Too Many Requests — rate limit exceeded"
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+        assert "provider capacity" in result or "rate-limit" in result
+
+    def test_detects_quota_in_logs(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(status_msg="")
+        logs = "insufficient_quota — provider rejected the request with 429"
+        result = _check_capacity_degradation(task, logs)
+        assert result is not None
+
+    def test_detects_quota_in_context_failure_category(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            context={
+                "failure_category": "EXTERNAL_API",
+                "external_api_subtype": "provider_quota",
+            }
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+
+    def test_context_mismatch_returns_none(self):
+        from app.research_completion import _check_capacity_degradation
+
+        # EXTERNAL_API but wrong subtype
+        task = self._make_task_stub(
+            context={
+                "failure_category": "EXTERNAL_API",
+                "external_api_subtype": "network_transient",
+            }
+        )
+        assert _check_capacity_degradation(task, "") is None
+
+        # Right subtype but wrong failure_category
+        task2 = self._make_task_stub(
+            context={
+                "failure_category": "CODE_ERROR",
+                "external_api_subtype": "provider_quota",
+            }
+        )
+        assert _check_capacity_degradation(task2, "") is None
+
+    def test_agent_raw_rate_limited_with_matching_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            status_msg="upstream rate limit exceeded — retrying",
+            context={"agent_failure_category_raw": "rate_limited"},
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+
+    def test_agent_raw_claude_code_failed_with_quota_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            status_msg="API usage exhausted — no more credits",
+            context={"agent_failure_category_raw": "claude_code_failed"},
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+
+    def test_agent_raw_claude_code_failed_without_quota_message_returns_none(self):
+        """A raw claude_code_failed without matching message text must not
+        falsely trigger capacity degradation."""
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            status_msg="process crashed with SIGSEGV (unrelated infrastructure failure)",
+            context={"agent_failure_category_raw": "claude_code_failed"},
+        )
+        assert _check_capacity_degradation(task, "") is None
+
 
 class TestBuildPreventiveContext:
     """Regression: project_anomalies entries are sometimes stored as raw strings
@@ -5220,6 +5396,156 @@ async def test_passing_grade_resumes_and_spawns_children(db_session, mocker):
     # EVALUATING state (awaiting child rollup) — NOT FAILED, and no longer
     # parked awaiting a grade.
     assert task.status == TaskStatus.EVALUATING
+
+
+@_pytest.mark.asyncio
+async def test_capacity_degradation_surfaced_in_completion_message(
+    db_session, mocker
+):
+    """A research task whose latest_status_message indicates a provider quota
+    error must surface the degradation in its completion message and context,
+    even when no findings were parsed."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, _direction, task = await _grader_project_and_task(
+        db_session, "d-deg01"
+    )
+    _patch_research_externals(mocker)
+
+    # Patch findings parser to return nothing, and health check to healthy.
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[]
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    # Simulate a task whose last agent heartbeat was a capacity error.
+    task.latest_status_message = (
+        "Fatal error: Claude Code API usage exhausted — insufficient balance"
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # The completion message must include the degradation qualifier.
+    assert "no actionable findings" in task.latest_status_message
+    assert "degraded:" in task.latest_status_message
+    assert "provider capacity" in task.latest_status_message or "rate-limit" in task.latest_status_message
+
+    # Structured context field must be set.
+    assert (task.context or {}).get("degraded_by_capacity") is True
+    assert (task.context or {}).get("degraded_by_capacity_reason") is not None
+
+
+@_pytest.mark.asyncio
+async def test_capacity_degradation_no_false_positive_on_clean_task(
+    db_session, mocker
+):
+    """A task that completed normally must NOT carry the degradation signal."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-deg02"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    # Clean task — no capacity error in status message.
+    task.latest_status_message = "All research findings processed normally"
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Completion message must NOT mention degradation.
+    assert "degraded" not in (task.latest_status_message or "")
+    assert (task.context or {}).get("degraded_by_capacity") is not True
+
+
+@_pytest.mark.asyncio
+async def test_capacity_degradation_surfaced_in_dispatch_summary(
+    db_session, mocker
+):
+    """A research task that spawns findings but had a capacity error mid-run
+    must surface degradation in the dispatch outcome message."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-deg03"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    # Capacity error in logs (even though status message is clean).
+    deg_logs = "insufficient_quota — provider rejected the request with 429"
+    task.latest_status_message = "Completed processing findings"
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, deg_logs, db_session)
+    await db_session.refresh(task)
+
+    # Dispatch summary must include the degradation qualifier.
+    assert "degraded:" in (task.latest_status_message or "")
+    assert "provider capacity" in task.latest_status_message or "rate-limit" in task.latest_status_message
+    assert (task.context or {}).get("degraded_by_capacity") is True
+
+
+@_pytest.mark.asyncio
+async def test_capacity_degradation_from_context_failure_category(
+    db_session, mocker
+):
+    """When task.context already has EXTERNAL_API / provider_quota from
+    persist_failure_category, the completion message must surface degradation."""
+    from test_autonomous_research import _patch_research_externals
+    from app.failure_classification import EXTERNAL_API, EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+
+    _project, _direction, task = await _grader_project_and_task(
+        db_session, "d-deg04"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[]
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    # Persisted failure classification on context — no error in status message.
+    task.context = {
+        **(task.context or {}),
+        "failure_category": EXTERNAL_API,
+        "external_api_subtype": EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
+    }
+    task.latest_status_message = "All clean"
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert "degraded:" in (task.latest_status_message or "")
+    assert (task.context or {}).get("degraded_by_capacity") is True
 
 
 @_pytest.mark.asyncio
