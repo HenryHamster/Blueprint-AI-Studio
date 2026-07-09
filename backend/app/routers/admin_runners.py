@@ -370,7 +370,7 @@ async def register_runner(
 @router.get("/projects/{project_id}/runners")
 async def list_runners(
     project_id: uuid.UUID,
-    limit: int = Query(default=100, ge=1, le=1000),
+    limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),

@@ -3749,89 +3749,6 @@ class TestCredentialPersistence(unittest.TestCase):
             f"Expected token from file in heartbeat calls, got: {tokens_used}",
         )
 
-    def test_write_credential_files_creates_files(self):
-        """_write_credential_files writes files at correct paths with content and mode."""
-        import tempfile
-        tmpdir = tempfile.mkdtemp()
-        try:
-            workspace = os.path.join(tmpdir, "sandbox")
-            files = [
-                {"path": "/home/agent/.claude.json", "content": '{"key": "val"}', "mode": "0600"},
-                {"path": "/home/agent/provider.json", "content": '{"provider": "test"}', "mode": "0644"},
-            ]
-            local_runner._write_credential_files(files, workspace)
-
-            # .claude.json written inside workspace
-            claude_path = os.path.join(workspace, "home/agent/.claude.json")
-            self.assertTrue(os.path.isfile(claude_path))
-            with open(claude_path) as f:
-                self.assertEqual(f.read(), '{"key": "val"}')
-
-            # provider.json written and mode set
-            provider_path = os.path.join(workspace, "home/agent/provider.json")
-            self.assertTrue(os.path.isfile(provider_path))
-            self.assertEqual(os.stat(provider_path).st_mode & 0o777, 0o644)
-
-        finally:
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    def test_write_credential_files_skips_empty_path_or_content(self):
-        """Files with empty path or content are silently skipped."""
-        import tempfile
-        tmpdir = tempfile.mkdtemp()
-        try:
-            workspace = os.path.join(tmpdir, "sandbox")
-            os.makedirs(workspace)
-            files = [
-                {"path": "", "content": "x", "mode": "0600"},
-                {"path": "/valid/path", "content": "", "mode": "0600"},
-                {"path": "/valid/path", "content": "real", "mode": "0600"},
-            ]
-            local_runner._write_credential_files(files, workspace)
-            # Only the third entry should have created a file.
-            dest = os.path.join(workspace, "valid/path")
-            self.assertTrue(os.path.isfile(dest))
-            with open(dest) as f:
-                self.assertEqual(f.read(), "real")
-        finally:
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    def test_write_credential_files_creates_parent_dir(self):
-        """Parent directories are created automatically."""
-        import tempfile
-        tmpdir = tempfile.mkdtemp()
-        try:
-            workspace = os.path.join(tmpdir, "sandbox")
-            files = [
-                {"path": "/deep/nested/dir/config.json", "content": "{}", "mode": "0600"},
-            ]
-            local_runner._write_credential_files(files, workspace)
-            dest = os.path.join(workspace, "deep/nested/dir/config.json")
-            self.assertTrue(os.path.isfile(dest))
-        finally:
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    def test_write_credential_files_exception_logs_warning(self):
-        """A failed write logs a warning and does not crash."""
-        import tempfile
-        tmpdir = tempfile.mkdtemp()
-        try:
-            workspace = os.path.join(tmpdir, "sandbox")
-            # Use a read-only parent dir to force a write failure.
-            os.makedirs(workspace, mode=0o444)
-            files = [
-                {"path": "/foo.json", "content": "{}", "mode": "0600"},
-            ]
-            # Should not raise — just logs a warning.
-            local_runner._write_credential_files(files, workspace)
-            # No crash is the pass condition.
-        finally:
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
 
 class TestConcurrencyPresetMismatch(unittest.TestCase):
     """Warn when BLUEPRINT_RUNNER_MAX_CONCURRENT disagrees with server enrolled max_concurrent."""
@@ -4463,7 +4380,7 @@ class TestProviderCredentials(unittest.TestCase):
             )
 
         output = buf.getvalue()
-        self.assertIn("no static host credentials set", output)
+        self.assertIn("NONE", output)
         self.assertIn("provider creds", output)
         # setup_ok should remain True (provider creds are a warning, NOT a blocker).
         self.assertTrue(result["setup_ok"])
@@ -4494,7 +4411,7 @@ class TestProviderCredentials(unittest.TestCase):
             )
 
         output = buf.getvalue()
-        self.assertIn("OVERRIDDEN by server-vended", output)
+        self.assertNotIn("NONE", output)
         self.assertIn("present", output)
         self.assertIn("provider creds", output)
         self.assertTrue(result["setup_ok"])

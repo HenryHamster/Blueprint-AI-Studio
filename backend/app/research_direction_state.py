@@ -1367,6 +1367,14 @@ async def apply_post_spawn_state(
             else ""
         )
     )
+    # Preserve capacity-degradation qualifier set by
+    # _handle_research_completion's _summarize_dispatch_outcome. That call
+    # runs before apply_post_spawn_state, but its result is overwritten when
+    # this function sets latest_status_message below — re-read the marker from
+    # context so users see "degraded: …" in the admin UI and task failures CLI.
+    _degraded_reason = (task.context or {}).get("degraded_by_capacity_reason")
+    if _degraded_reason:
+        status_msg += f" (degraded: {_degraded_reason} — results may be incomplete)"
 
     # Snapshot plain values for the final log/broadcast below: the
     # duplicate-spawn catch around the terminal transition rolls the session

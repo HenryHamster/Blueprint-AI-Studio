@@ -4513,7 +4513,7 @@ def test_large_pr_changed_files_not_silently_misclassified():
     # Control: without truncation the named_test gate is unaffected — a present,
     # verified test with a production seam still proves.
     small_signal = stamp_changed_files_signal(
-        ["backend/app/module_0.py", test_file]
+        ["backend/app/module_54.py", test_file]
     )
     assert "_pr_changed_files_truncated" not in small_signal
     small_task = Task(
