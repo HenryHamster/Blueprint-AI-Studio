@@ -9,8 +9,8 @@ import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { matchesTaskTypeFilter, resolveTaskCapabilities, TaskCapabilitiesProvider } from './taskCapabilities';
 import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
-import { ResearchBrowser } from './components/ResearchBrowser';
-import { KnowledgeBrowser } from './components/KnowledgeBrowser';
+const ResearchBrowser = lazy(() => import('./components/ResearchBrowser').then(m => ({ default: m.ResearchBrowser })));
+const KnowledgeBrowser = lazy(() => import('./components/KnowledgeBrowser').then(m => ({ default: m.KnowledgeBrowser })));
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask } from './api/tasks';
 import { apiFetch, API_BASE_URL } from './api/core';
@@ -2170,32 +2170,36 @@ export default function App() {
       )}
 
       {s.showResearchBrowser && (
-        <ResearchBrowser
-          tasks={s.tasks}
-          researchFeed={researchFeed.length > 0 ? researchFeed : undefined}
-          selectedProjectId={s.selectedProjectId}
-          initialDirectionId={researchBrowserDirectionId ?? undefined}
-          onClose={() => { s.setShowResearchBrowser(false); setResearchBrowserDirectionId(null); }}
-          onNavigateToTask={(taskId) => {
-            s.setShowResearchBrowser(false);
-            setResearchBrowserDirectionId(null);
-            handleViewTaskById(taskId);
-          }}
-        />
+        <Suspense fallback={<WorkspaceSkeleton />}>
+          <ResearchBrowser
+            tasks={s.tasks}
+            researchFeed={researchFeed.length > 0 ? researchFeed : undefined}
+            selectedProjectId={s.selectedProjectId}
+            initialDirectionId={researchBrowserDirectionId ?? undefined}
+            onClose={() => { s.setShowResearchBrowser(false); setResearchBrowserDirectionId(null); }}
+            onNavigateToTask={(taskId) => {
+              s.setShowResearchBrowser(false);
+              setResearchBrowserDirectionId(null);
+              handleViewTaskById(taskId);
+            }}
+          />
+        </Suspense>
       )}
 
       {s.showKnowledgeBrowser && (
-        <KnowledgeBrowser
-          selectedProjectId={s.selectedProjectId}
-          onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); setKnowledgeBrowserInitialDocId(null); }}
-          onLaunchWebResearchTask={s.openWebResearchTaskModal}
-          initialDirectionId={knowledgeBrowserDirectionId ?? undefined}
-          initialDocumentId={knowledgeBrowserInitialDocId ?? undefined}
-          onNavigateToTask={(taskId) => {
-            s.setShowKnowledgeBrowser(false);
-            handleViewTaskById(taskId);
-          }}
-        />
+        <Suspense fallback={<WorkspaceSkeleton />}>
+          <KnowledgeBrowser
+            selectedProjectId={s.selectedProjectId}
+            onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); setKnowledgeBrowserInitialDocId(null); }}
+            onLaunchWebResearchTask={s.openWebResearchTaskModal}
+            initialDirectionId={knowledgeBrowserDirectionId ?? undefined}
+            initialDocumentId={knowledgeBrowserInitialDocId ?? undefined}
+            onNavigateToTask={(taskId) => {
+              s.setShowKnowledgeBrowser(false);
+              handleViewTaskById(taskId);
+            }}
+          />
+        </Suspense>
       )}
 
       {s.logTask && (
