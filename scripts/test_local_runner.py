@@ -766,7 +766,7 @@ class TestGracefulShutdown(unittest.TestCase):
         drainer.start()
 
         start = time.monotonic()
-        local_runner._wait_for_compute_jobs(active, lock, timeout=5)
+        local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "test-token", timeout=5)
         elapsed = time.monotonic() - start
         drainer.join()
 
@@ -790,7 +790,7 @@ class TestGracefulShutdown(unittest.TestCase):
         active: set[str] = set()
 
         start = time.monotonic()
-        local_runner._wait_for_compute_jobs(active, lock, timeout=5)
+        local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "test-token", timeout=5)
         elapsed = time.monotonic() - start
 
         self.assertLess(elapsed, 0.5, "Should return immediately when no jobs active")
@@ -802,12 +802,33 @@ class TestGracefulShutdown(unittest.TestCase):
         buf = io.StringIO()
 
         with contextlib.redirect_stdout(buf):
-            local_runner._wait_for_compute_jobs(active, lock, timeout=0.05)
+            local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "test-token", timeout=0.05)
 
         output = buf.getvalue()
         self.assertIn("timeout", output, "Should log a timeout message")
-        self.assertIn("compute jobs", output)
+        self.assertIn("reporting as failed", output, "Should report stranded jobs as failed")
         self.assertIn("stuck-job", active, "Stuck job must remain in set")
+
+    def test_shutdown_reports_stranded_jobs_as_failed(self):
+        """Stranded compute jobs after shutdown deadline are reported as failed."""
+        lock = threading.Lock()
+        active: set[str] = {"stranded-job"}
+        reports = []
+
+        def fake_report(orchestrator_url, token, job_id, **kwargs):
+            reports.append((job_id, kwargs))
+            return True
+
+        with patch.object(local_runner, "_report_compute_job", fake_report):
+            local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "tok", timeout=0.05)
+
+        self.assertEqual(len(reports), 1, "Should have reported the stranded job")
+        reported_id, kwargs = reports[0]
+        self.assertEqual(reported_id, "stranded-job")
+        self.assertEqual(kwargs["exec_status"], "failed")
+        self.assertEqual(kwargs["exit_code"], 1)
+        self.assertIn("SIGTERM", kwargs["command_log"]["text"])
+        self.assertFalse(kwargs["command_log"]["truncated"])
 
 
 # ── Compute job report helper ─────────────────────────────────────────────────

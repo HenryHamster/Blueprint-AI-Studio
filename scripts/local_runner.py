@@ -938,14 +938,18 @@ def _handle_signal(signum, frame):  # noqa: ARG001
 def _wait_for_compute_jobs(
     active_compute_jobs: set[str],
     compute_lock: threading.Lock,
+    orchestrator_url: str,
+    token: str,
     timeout: float = 120,
 ) -> None:
     """Wait for active compute jobs to finish during graceful shutdown.
 
     Compute job worker threads are daemon threads (they would be killed on
     process exit).  This wait gives them a chance to finish their current
-    command and report a final status to the orchestrator so the job does not
-    appear ``running`` until a reaper sweep.
+    command and report a final status to the orchestrator.  Any jobs still
+    active after the deadline are reported as failed so they do not remain
+    in ``running`` status indefinitely — there is no server-side sweep for
+    stale ComputeJob rows.
     """
     with compute_lock:
         remaining = set(active_compute_jobs)
@@ -967,9 +971,28 @@ def _wait_for_compute_jobs(
     if remaining:
         print(
             f"[runner] timeout waiting for {len(remaining)} compute jobs "
-            "— exiting (daemon threads)",
+            "— reporting as failed",
             flush=True,
         )
+        for job_id in remaining:
+            try:
+                _report_compute_job(
+                    orchestrator_url,
+                    token,
+                    job_id,
+                    exec_status="failed",
+                    exit_code=1,
+                    command_log={
+                        "text": "Runner shut down (SIGTERM) before job completed",
+                        "truncated": False,
+                    },
+                )
+            except Exception:
+                print(
+                    f"[runner] failed to report stranded compute job {job_id} "
+                    "— continuing shutdown",
+                    flush=True,
+                )
 
 
 # ── Active task tracking (background thread) ──────────────────────────────────
@@ -3155,7 +3178,7 @@ def main() -> None:
 
     # Drain active compute jobs first — daemon threads would be killed on
     # process exit, so give them a chance to report their final status.
-    _wait_for_compute_jobs(active_compute_jobs, compute_lock)
+    _wait_for_compute_jobs(active_compute_jobs, compute_lock, orchestrator_url, token)
 
     # Graceful shutdown (monotonic clock so a wall-clock jump can't skew the wait).
     with lock:
