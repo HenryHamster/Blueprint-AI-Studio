@@ -1,5 +1,7 @@
 """Tests for scripts/local_runner.py."""
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -2772,6 +2774,262 @@ class TestHeartbeat401Streak(unittest.TestCase):
                       "heartbeat must use the reloaded token")
 
 
+class TestDescribeSha(unittest.TestCase):
+    """Unit tests for _describe_sha, which extracts abbreviated SHAs from
+    ``git describe`` output."""
+
+    def test_tag_commits_sha_format(self):
+        """``v1.2.3-5-g4f5a6b7`` → ``4f5a6b7`` (standard git describe)."""
+        self.assertEqual(local_runner._describe_sha("v1.2.3-5-g4f5a6b7"), "4f5a6b7")
+
+    def test_tag_commits_sha_dirty(self):
+        """``v1.2.3-5-g4f5a6b7-dirty`` → ``4f5a6b7`` (dirty tree suffixes)."""
+        self.assertEqual(
+            local_runner._describe_sha("v1.2.3-5-g4f5a6b7-dirty"), "4f5a6b7",
+        )
+
+    def test_tag_commits_long_sha(self):
+        """``release-v2-10-gabcdef0123456789`` → ``abcdef0123456789`` (longer SHA)."""
+        self.assertEqual(
+            local_runner._describe_sha("release-v2-10-gabcdef0123456789"),
+            "abcdef0123456789",
+        )
+
+    def test_bare_sha_format(self):
+        """``4f5a6b7`` → ``4f5a6b7`` (``--always`` fallback when no tags)."""
+        self.assertEqual(local_runner._describe_sha("4f5a6b7"), "4f5a6b7")
+
+    def test_bare_sha_dirty(self):
+        """``4f5a6b7-dirty`` → ``4f5a6b7`` (bare SHA with dirty suffix)."""
+        self.assertEqual(local_runner._describe_sha("4f5a6b7-dirty"), "4f5a6b7")
+
+    def test_pure_tag_returns_none(self):
+        """``v1.2.3`` → ``None`` (pure tag with no commit SHA)."""
+        self.assertIsNone(local_runner._describe_sha("v1.2.3"))
+
+    def test_pure_tag_with_dash_returns_none(self):
+        """``v1.0-rc1`` → ``None`` (tag containing dash but no ``-g`` SHA)."""
+        self.assertIsNone(local_runner._describe_sha("v1.0-rc1"))
+
+    def test_empty_string_returns_none(self):
+        """``""`` → ``None`` (empty input)."""
+        self.assertIsNone(local_runner._describe_sha(""))
+
+
+class TestHeartbeatVersionHintWarning(unittest.TestCase):
+    """Heartbeat response includes version_hint; runner warns when its own version
+    does not match the orchestrator's hint."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_version_hint_mismatch_logs_warning(self):
+        """When version_hint differs from runner version, a warning is printed."""
+        posted_bodies = []
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                "version_hint": "v99-abcdef01",
+            }
+
+        def fake_print(*args, **kwargs):
+            line = " ".join(str(a) for a in args)
+            output_lines.append(line)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v1-oldversion"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        warning_lines = [line for line in output_lines if "WARNING" in line and "version" in line.lower()]
+        self.assertTrue(
+            warning_lines,
+            "Expected a version mismatch warning in output",
+        )
+        self.assertIn("blueprint-runner update", str(warning_lines))
+
+    def test_version_hint_match_silent(self):
+        """When version_hint matches runner version, no warning is printed."""
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                "version_hint": "v1-current",
+            }
+
+        def fake_print(*args, **kwargs):
+            line = " ".join(str(a) for a in args)
+            output_lines.append(line)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v1-current"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        warning_lines = [line for line in output_lines if "WARNING" in line and "version" in line.lower()]
+        self.assertFalse(warning_lines, "No version-mismatch warning expected when versions match")
+
+    def test_version_hint_match_sha_based(self):
+        """SHA-based comparison: runner SHA matches orchestrator SHA prefix — no warning."""
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                # Orchestrator sends a full 40-char SHA that starts with the
+                # runner's abbreviated SHA (4f5a6b7).
+                "version_hint": "4f5a6b7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b",
+            }
+
+        def fake_print(*args, **kwargs):
+            line = " ".join(str(a) for a in args)
+            output_lines.append(line)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v1.2.3-5-g4f5a6b7"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        warning_lines = [line for line in output_lines if "WARNING" in line and "version" in line.lower()]
+        self.assertFalse(
+            warning_lines,
+            "No warning expected when runner SHA matches orchestrator SHA prefix",
+        )
+
+    def test_version_hint_mismatch_sha_based(self):
+        """SHA-based comparison: runner SHA differs from orchestrator SHA — warning."""
+        posted_bodies = []
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                # Orchestrator sends a full SHA that does NOT start with the
+                # runner's abbreviated SHA (4f5a6b7).
+                "version_hint": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+            }
+
+        def fake_print(*args, **kwargs):
+            line = " ".join(str(a) for a in args)
+            output_lines.append(line)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v1.2.3-5-g4f5a6b7"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        warning_lines = [line for line in output_lines if "WARNING" in line and "version" in line.lower()]
+        self.assertTrue(
+            warning_lines,
+            "Expected a version mismatch warning when SHA comparison fails",
+        )
+        self.assertIn("blueprint-runner update", str(warning_lines))
+
+    def test_no_version_hint_no_warning(self):
+        """When the response lacks version_hint, the runner never warns."""
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+            }
+
+        def fake_print(*args, **kwargs):
+            line = " ".join(str(a) for a in args)
+            output_lines.append(line)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v1-something"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        warning_lines = [line for line in output_lines if "WARNING" in line and "version" in line.lower()]
+        self.assertFalse(
+            warning_lines,
+            "No version-mismatch warning expected when version_hint is absent",
+        )
+
+
 class TestHeartbeatJitterAndNetworkFailureEscalation(unittest.TestCase):
     """Heartbeat loop: jitter spreads restarts; network failure streak escalates."""
 
@@ -3535,7 +3793,6 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
 
     def test_mismatch_warning_emitted(self):
         """main() warns when client max_concurrent != server enrolled_max_concurrent."""
-        import io
         fake_body = {
             "ok": True,
             "last_seen_at": "2026-01-01T00:00:00Z",
@@ -3581,7 +3838,7 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
             except SystemExit:
                 pass
 
-        warning_lines = [l for l in output_lines if "BLUEPRINT_RUNNER_MAX_CONCURRENT" in l and "enrolled" in l.lower()]
+        warning_lines = [line for line in output_lines if "BLUEPRINT_RUNNER_MAX_CONCURRENT" in line and "enrolled" in line.lower()]
         self.assertTrue(
             warning_lines,
             f"Expected mismatch warning in output. Got: {output_lines[:10]}",
@@ -3589,7 +3846,6 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
 
     def test_no_mismatch_warning_when_values_match(self):
         """No concurrency warning when client max_concurrent == server enrolled_max_concurrent."""
-        import io
         fake_body = {
             "ok": True,
             "last_seen_at": "2026-01-01T00:00:00Z",
@@ -3635,7 +3891,7 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
             except SystemExit:
                 pass
 
-        warning_lines = [l for l in output_lines if "disagrees" in l and "enrolled" in l.lower()]
+        warning_lines = [line for line in output_lines if "disagrees" in line and "enrolled" in line.lower()]
         self.assertFalse(
             warning_lines,
             f"Did not expect mismatch warning when values match. Got: {warning_lines}",
@@ -4061,6 +4317,104 @@ class TestStatusJson(unittest.TestCase):
         self.assertIn("OOM killer struck", status_writes[0]["last_heartbeat_status"])
         self.assertEqual(status_writes[0]["active_task_ids"], [])
         self.assertEqual(status_writes[0]["active_compute_job_ids"], [])
+
+
+# ── Provider credential check in --check preflight ────────────────────────────
+
+class TestProviderCredentials(unittest.TestCase):
+    """Provider credential detection for --check preflight."""
+
+    def test_no_creds_returns_empty(self):
+        """When no provider credential env vars are set, returns empty list."""
+        with patch.dict(os.environ, {}, clear=True):
+            result = local_runner._check_provider_credentials()
+        self.assertEqual(result, [])
+
+    def test_anthropic_key_found(self):
+        """ANTHROPIC_API_KEY appears in the found list."""
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-123"}):
+            result = local_runner._check_provider_credentials()
+        self.assertIn("ANTHROPIC_API_KEY", result)
+
+    def test_openai_key_found(self):
+        """OPENAI_API_KEY appears in the found list."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-456"}):
+            result = local_runner._check_provider_credentials()
+        self.assertIn("OPENAI_API_KEY", result)
+
+    def test_multiple_keys_found(self):
+        """Multiple provider creds all appear in the found list."""
+        with patch.dict(os.environ, {
+            "ANTHROPIC_API_KEY": "sk-ant-test",
+            "OPENAI_API_KEY": "sk-openai-test",
+            "GEMINI_API_KEY": "gemini-test",
+        }):
+            result = local_runner._check_provider_credentials()
+        self.assertEqual(len(result), 3)
+        self.assertIn("ANTHROPIC_API_KEY", result)
+        self.assertIn("OPENAI_API_KEY", result)
+        self.assertIn("GEMINI_API_KEY", result)
+
+    def test_preflight_no_provider_credentials_warns(self):
+        """Preflight --check warns when no provider credentials are set."""
+        caps = _bwrap_caps()
+        gpu_state = {"allowed": [], "in_use": set(), "per_job": 1}
+
+        def fake_post(url, token, body, **kwargs):
+            return 200, {"ok": True}
+
+        buf = io.StringIO()
+        with patch.dict(os.environ, _env(), clear=True), \
+             patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_detect_gpu",
+                          return_value={"has_gpu": False, "gpu_count": 0, "gpu_names": []}), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "_hostname", return_value="test-box"), \
+             patch.object(local_runner, "_runner_version", return_value="v1-test"), \
+             contextlib.redirect_stdout(buf):
+            result = local_runner._preflight(
+                "https://api.example.com", "tok-abcdefgh-1234",
+                agent_binary=["node", "/agent/dist/index.js"],
+                caps=caps, gpu_state=gpu_state,
+                max_concurrent=2, max_concurrent_compute=2,
+            )
+
+        output = buf.getvalue()
+        self.assertIn("NONE", output)
+        self.assertIn("provider creds", output)
+        # setup_ok should remain True (provider creds are a warning, NOT a blocker).
+        self.assertTrue(result["setup_ok"])
+
+    def test_preflight_with_provider_credentials_does_not_warn(self):
+        """Preflight does NOT warn when provider credentials are set."""
+        caps = _bwrap_caps()
+        gpu_state = {"allowed": [], "in_use": set(), "per_job": 1}
+
+        def fake_post(url, token, body, **kwargs):
+            return 200, {"ok": True}
+
+        buf = io.StringIO()
+        cred_env = _env(ANTHROPIC_API_KEY="sk-ant-test")
+        with patch.dict(os.environ, cred_env, clear=True), \
+             patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_detect_gpu",
+                          return_value={"has_gpu": False, "gpu_count": 0, "gpu_names": []}), \
+             patch.object(local_runner, "_workspace_writable", return_value=True), \
+             patch.object(local_runner, "_hostname", return_value="test-box"), \
+             patch.object(local_runner, "_runner_version", return_value="v1-test"), \
+             contextlib.redirect_stdout(buf):
+            result = local_runner._preflight(
+                "https://api.example.com", "tok-abcdefgh-1234",
+                agent_binary=["node", "/agent/dist/index.js"],
+                caps=caps, gpu_state=gpu_state,
+                max_concurrent=2, max_concurrent_compute=2,
+            )
+
+        output = buf.getvalue()
+        self.assertNotIn("NONE", output)
+        self.assertIn("present", output)
+        self.assertIn("provider creds", output)
+        self.assertTrue(result["setup_ok"])
 
 
 if __name__ == "__main__":

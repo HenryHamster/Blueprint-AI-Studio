@@ -365,6 +365,25 @@ def _runner_version() -> str | None:
     return version or None
 
 
+def _describe_sha(version_str: str) -> str | None:
+    """Extract the abbreviated commit SHA from a ``git describe`` output string.
+
+    Parses output like ``v1.2.3-5-g4f5a6b7`` → ``4f5a6b7`` so the runner can
+    compare against the orchestrator's full-SHA ``version_hint``.  Returns
+    ``None`` when no commit SHA is present (e.g. a pure tag like ``v1.2.3``),
+    in which case the caller falls back to a substring comparison.
+    """
+    clean = version_str.replace("-dirty", "")
+    # git describe format: <tag>-<N>-g<abbreviated-sha>
+    if "-g" in clean:
+        return clean.split("-g")[-1]
+    # --always fallback when no tags exist: bare abbreviated SHA
+    if clean and all(c in "0123456789abcdef" for c in clean):
+        return clean
+    # Pure tag — no commit SHA to compare
+    return None
+
+
 def _node_runtime_ok() -> bool:
     """Return True iff ``node --version`` actually runs (binary present + executable).
 
@@ -1146,10 +1165,26 @@ def _heartbeat_loop(
                 "gpu_utilization_pct": _gpu_utilization_pct() if has_gpu else None,
                 **gpu_capabilities,
             }
-            status, _ = _post(url, token, body)
+            status, resp_body = _post(url, token, body)
             if status in (200, 204):
                 consecutive_401 = 0
                 consecutive_network_failures = 0
+                # Parse orchestrator version hint so the runner can detect staleness.
+                if isinstance(resp_body, dict):
+                    version_hint = resp_body.get("version_hint")
+                    if version_hint and version:
+                        runner_sha = _describe_sha(version)
+                        if runner_sha:
+                            stale = not version_hint.startswith(runner_sha)
+                        else:
+                            stale = version_hint not in version
+                        if stale:
+                            print(
+                                f"[runner] WARNING: runner version {version!r} does not match "
+                                f"orchestrator version hint {version_hint!r} — consider running "
+                                "`blueprint-runner update` to update the agent.",
+                                flush=True,
+                            )
                 _write_status_json(
                     runner_id=hostname,
                     last_heartbeat_status="ok",
@@ -2215,6 +2250,40 @@ def _compute_backend_summary(caps: "iso.Capabilities") -> str:
     return ", ".join(parts) if parts else "none"
 
 
+# Provider credential env keys checked in --check preflight.
+# The agent task needs at least one provider credential to call an LLM. A green
+# --check with none set means every claimed agent task will immediately fail at
+# PRE_CLAIM_FAILED (no LLM provider to call). This is surfaced as a non-blocking
+# warning — the operator may add credentials after --check or use a provider path
+# not captured here.
+_PROVIDER_CREDENTIAL_KEYS: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ZAI_API_KEY",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+)
+
+
+def _check_provider_credentials() -> list[str]:
+    """Return env-var names of provider credentials that are set (non-empty value).
+
+    An agent task needs at least one provider credential to call an LLM. When none
+    are found the --check preflight warns so the operator catches the misconfiguration
+    before dispatching work.
+    """
+    found: list[str] = []
+    for key in _PROVIDER_CREDENTIAL_KEYS:
+        if os.environ.get(key, "").strip():
+            found.append(key)
+    return found
+
+
 def _preflight(
     orchestrator_url: str,
     token: str,
@@ -2370,6 +2439,19 @@ def _preflight(
     )
     for note in caps.notes:
         print(f"    note         : {note}", flush=True)
+
+    # Provider credential check (non-blocking warning).
+    provider_creds = _check_provider_credentials()
+    if provider_creds:
+        _fmt("provider creds", f"present ({len(provider_creds)} key(s))")
+    else:
+        print(
+            "  provider creds  : NONE — agent tasks WILL fail at claim unless a\n"
+            "                    provider credential (ANTHROPIC_API_KEY,\n"
+            "                    OPENAI_API_KEY, GEMINI_API_KEY, etc.) is set\n"
+            "                    in the environment.",
+            flush=True,
+        )
 
     print("  task classes:", flush=True)
     if claimable[iso.CLASS_AGENT]:

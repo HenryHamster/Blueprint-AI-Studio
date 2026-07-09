@@ -417,10 +417,14 @@ async def heartbeat(
                 "[RUNNERS] Failed to resolve runner-deactivated alert for %s",
                 runner_id,
             )
+    # Lazy import to avoid circular dependency (main.py imports this module).
+    from app.main import _current_sha
+
     return {
         "ok": True,
         "last_seen_at": runner.last_seen_at.isoformat(),
         "enrolled_max_concurrent": caps.get("max_concurrent"),
+        "version_hint": _current_sha,
     }
 
 
