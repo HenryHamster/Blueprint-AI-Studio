@@ -4496,19 +4496,39 @@
       "source_path": "backend/app/workbench_events.py",
       "workbench_action": null,
       "workbench_resource": null
+    },
+    {
+      "callee": "broadcast_to_project",
+      "canonical_callee": "broadcast_to_project",
+      "classification": "legacy_project_event",
+      "event": "project_paused",
+      "event_expression": null,
+      "event_is_literal": true,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "dict:project_id,reason",
+      "scope": "_filter_project_resource_dispatch_eligible",
+      "source_path": "backend/app/orchestrator.py",
+      "workbench_action": null,
+      "workbench_resource": null,
+      "lineno": 785
     }
   ],
   "schema_version": 1,
   "summary": {
-    "legacy_global_event": 14,
-    "legacy_project_event": 191,
-    "legacy_review_required": 18,
-    "message_v1_payload": 13,
-    "raw_websocket_control": 3,
-    "strategic_v1_emitter": 4,
-    "strategic_v1_helper": 21,
-    "transport": 5,
-    "workbench_v1_emitter": 1,
-    "workbench_v1_helper": 10
+    "total_emitters": 281,
+    "by_classification": {
+      "legacy_project_event": 192,
+      "legacy_review_required": 18,
+      "transport": 5,
+      "legacy_global_event": 14,
+      "strategic_v1_helper": 21,
+      "message_v1_payload": 13,
+      "workbench_v1_helper": 10,
+      "raw_websocket_control": 3,
+      "strategic_v1_emitter": 4,
+      "workbench_v1_emitter": 1
+    },
+    "unique_literal_events": 31
   }
 }

@@ -39,6 +39,7 @@ vi.mock('../providers/resident-session.js', () => ({
 vi.mock('./strategic-sections.js', () => ({
   buildDirSummaryText: vi.fn(() => ''),
   buildOpenMessagesText: vi.fn(() => ''),
+  buildPendingFollowupsSection: vi.fn(() => ''),
 }));
 
 // ── Import after mocks ────────────────────────────────────────────────────────

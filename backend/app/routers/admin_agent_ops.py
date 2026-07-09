@@ -44,7 +44,7 @@ from app.direction_lifecycle import (
     direction_has_churn_retirement_recommendation,
     reactivate_paused_direction,
 )
-from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
+from app.models import KnowledgeDocument, MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
     validate_internal_payload as _validate_internal_payload,
@@ -4791,6 +4791,119 @@ async def strategic_operation(
                 "entry": _debt_to_dict(entry),
             }
         )
+
+    elif payload.op == "consume_knowledge_followup":
+        # Strategist marks a pending knowledge follow-up (design/web_research
+        # doc) as consumed — meaning the strategist has acted on it (spawned a
+        # direction, incorporated the knowledge, etc.).
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400, detail="consume_knowledge_followup data must be an object"
+            )
+        document_id = data.get("document_id")
+        if not document_id:
+            raise HTTPException(
+                status_code=400, detail="document_id is required"
+            )
+        try:
+            doc_id_uuid = uuid.UUID(str(document_id))
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="document_id must be a valid UUID"
+            ) from None
+        doc = (
+            (await session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.id == doc_id_uuid,
+                    KnowledgeDocument.project_id == project.id,
+                )
+            ))
+            .scalars()
+            .first()
+        )
+        if doc is None:
+            raise HTTPException(
+                status_code=404, detail="Knowledge document not found"
+            )
+        if doc.lifecycle_status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot consume: lifecycle_status is '{doc.lifecycle_status}' (must be 'pending')",
+            )
+        doc.lifecycle_status = "consumed"
+        doc.consumed_at = _utcnow()
+        session.add(doc)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await session.refresh(doc)
+        return _resp({
+            "status": "ok",
+            "op": "consume_knowledge_followup",
+            "document_id": str(doc.id),
+            "lifecycle_status": doc.lifecycle_status,
+        })
+
+    elif payload.op == "dismiss_knowledge_followup":
+        # Strategist marks a pending knowledge follow-up as dismissed — meaning
+        # it's not actionable right now.
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400, detail="dismiss_knowledge_followup data must be an object"
+            )
+        document_id = data.get("document_id")
+        if not document_id:
+            raise HTTPException(
+                status_code=400, detail="document_id is required"
+            )
+        reason = str(data.get("reason") or "").strip()
+        if not reason:
+            raise HTTPException(
+                status_code=400, detail="reason is required (why not actionable)"
+            )
+        try:
+            doc_id_uuid = uuid.UUID(str(document_id))
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="document_id must be a valid UUID"
+            ) from None
+        doc = (
+            (await session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.id == doc_id_uuid,
+                    KnowledgeDocument.project_id == project.id,
+                )
+            ))
+            .scalars()
+            .first()
+        )
+        if doc is None:
+            raise HTTPException(
+                status_code=404, detail="Knowledge document not found"
+            )
+        if doc.lifecycle_status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot dismiss: lifecycle_status is '{doc.lifecycle_status}' (must be 'pending')",
+            )
+        doc.lifecycle_status = "dismissed"
+        doc.dismissed_at = _utcnow()
+        doc.dismissed_reason = reason
+        session.add(doc)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await session.refresh(doc)
+        return _resp({
+            "status": "ok",
+            "op": "dismiss_knowledge_followup",
+            "document_id": str(doc.id),
+            "lifecycle_status": doc.lifecycle_status,
+        })
 
     elif payload.op == "record_finding_resolution":
         if not isinstance(data, dict):

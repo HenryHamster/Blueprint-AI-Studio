@@ -369,6 +369,7 @@ def build_knowledge_documents_stmt(
     challenge_state: str | None = None,
     finding_hash: str | None = None,
     sweep_id: str | None = None,
+    lifecycle_status: str | None = None,
 ):
     """Build the project-scoped ``select`` for knowledge documents.
 
@@ -422,6 +423,8 @@ def build_knowledge_documents_stmt(
         stmt = stmt.where(KnowledgeDocument.origin_finding_hash == finding_hash)
     if sweep_id:
         stmt = stmt.where(KnowledgeDocument.sweep_id == sweep_id)
+    if lifecycle_status:
+        stmt = stmt.where(KnowledgeDocument.lifecycle_status == lifecycle_status)
     if tag:
         # tags is a JSON list; match the exact element via a cast-to-text scan
         # so it works on both Postgres (JSONB) and the SQLite test backend.
@@ -453,6 +456,7 @@ async def list_knowledge_documents(
     challenge_state: str | None = None,
     finding_hash: str | None = None,
     sweep_id: str | None = None,
+    lifecycle_status: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
@@ -472,6 +476,7 @@ async def list_knowledge_documents(
         challenge_state=challenge_state,
         finding_hash=finding_hash,
         sweep_id=sweep_id,
+        lifecycle_status=lifecycle_status,
     )
 
     total = (
@@ -642,6 +647,60 @@ async def build_knowledge_index(
         await _collect(direction_id)
     # Project-wide fill (also the sole pass when no direction is scoped).
     await _collect(None)
+    return entries
+
+
+# Maximum pending follow-ups shipped to the strategist payload. Like the knowledge
+# index, this is bounded so it cannot dominate the prompt budget as the store grows.
+_PENDING_LIFECYCLE_ITEMS_KEEP = 20
+# Per-entry summary character cap for the pending-followups section.
+_PENDING_LIFECYCLE_ITEMS_SUMMARY_CHARS = 200
+
+
+async def build_pending_followups(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    limit: int = _PENDING_LIFECYCLE_ITEMS_KEEP,
+    summary_chars: int = _PENDING_LIFECYCLE_ITEMS_SUMMARY_CHARS,
+) -> list[dict]:
+    """Return compact entries for knowledge docs that need strategist follow-up.
+
+    Only design and web_research docs participate in this lifecycle. Returns
+    pending (not yet consumed/dismissed) entries, newest-first. Each entry
+    carries id, title, summary (truncated), topic, source_kind, direction_id,
+    created_at, and tags — enough for the strategist to decide whether to
+    consume, dismiss, or spawn a direction.
+    """
+    stmt = (
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.project_id == project_id,
+            KnowledgeDocument.source_kind.in_(
+                [SourceKind.DESIGN.value, SourceKind.WEB_RESEARCH.value]
+            ),
+            KnowledgeDocument.lifecycle_status == "pending",
+        )
+        .order_by(KnowledgeDocument.created_at.desc())
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    entries: list[dict] = []
+    for doc in rows:
+        summary = doc.summary or ""
+        collapsed = " ".join(summary.split())
+        if len(collapsed) > summary_chars:
+            collapsed = collapsed[: summary_chars - 1].rstrip() + "…"
+        entries.append({
+            "id": str(doc.id),
+            "title": doc.title,
+            "summary": collapsed,
+            "topic": doc.topic,
+            "source_kind": doc.source_kind,
+            "direction_id": doc.direction_id,
+            "created_at": doc.created_at.isoformat() if doc.created_at else None,
+            "tags": doc.tags if isinstance(doc.tags, list) else [],
+        })
     return entries
 
 

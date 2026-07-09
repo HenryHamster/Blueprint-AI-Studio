@@ -2,7 +2,7 @@
 import { useState, useEffect, useMemo, useRef, type MutableRefObject } from 'react';
 import type { Task } from './types/task';
 import type { Project } from './types/project';
-import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
+import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api/core';
 import { useToasts } from './components/Toasts';
 import { usePersistedState } from './hooks/usePersistedState';
 import { usePoller } from './hooks/usePoller';

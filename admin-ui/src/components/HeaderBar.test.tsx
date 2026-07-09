@@ -4,12 +4,15 @@ import { act } from 'react';
 import { HeaderBar } from './HeaderBar';
 import type { Project } from '../types/project';
 
-vi.mock('../api', () => ({
-  apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
-  API_BASE_URL: 'http://localhost',
-  authHeaders: vi.fn(async () => ({})),
-  authGet: vi.fn(async () => new Response('{}', { status: 200 })),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
+    API_BASE_URL: 'http://localhost',
+    authHeaders: vi.fn(async () => ({})),
+    authGet: vi.fn(async () => new Response('{}', { status: 200 })),
+  });
+});
 
 const mockProjects: Project[] = [
   {

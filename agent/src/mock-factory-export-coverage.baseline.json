@@ -2085,6 +2085,7 @@
     ],
     "./strategic-sections.js": [
       "buildCompletionDebtSection",
+      "buildPendingFollowupsSection",
       "buildResidentExamLeadsSection"
     ],
     "../telemetry.js": [

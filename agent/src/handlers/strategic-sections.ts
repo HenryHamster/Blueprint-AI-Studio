@@ -1357,6 +1357,44 @@ export function buildCompletionDebtSection(debt: unknown): string {
   return lines.join('\n');
 }
 
+export function buildPendingFollowupsSection(followups: unknown): string {
+  const entries = Array.isArray(followups) ? followups as Array<Record<string, unknown>> : [];
+  if (entries.length === 0) return '';
+  const lines: string[] = ['\n## Pending Knowledge Follow-ups'];
+  lines.push(`${entries.length} design/web_research document(s) completed but not yet consumed or dismissed — the strategist should review and act on these:`);
+  const now = Date.now();
+  for (const e of entries) {
+    const id = strVal(e.id);
+    const title = strVal(e.title, '(no title)');
+    const summary = strVal(e.summary, '');
+    const sourceKind = strVal(e.source_kind, 'unknown');
+    const topic = strVal(e.topic);
+    const dirId = strVal(e.direction_id);
+    const createdAt = strVal(e.created_at);
+    let ageStr = '';
+    if (createdAt) {
+      const ageMs = now - new Date(createdAt).getTime();
+      const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+      ageStr = ageDays > 0 ? ` (${ageDays}d ago)` : ' (today)';
+    }
+    const tagList = Array.isArray(e.tags) ? (e.tags as string[]).slice(0, 5) : [];
+    const tagStr = tagList.length > 0 ? ` [${tagList.join(', ')}]` : '';
+    const topicStr = topic ? ` — topic: ${topic}` : '';
+    const idTag = id ? ` \`${id}\`` : '';
+    lines.push(`  - [${sourceKind}]${idTag} ${title}${ageStr}${topicStr}${tagStr}`);
+    if (summary) {
+      lines.push(`    ${summary}`);
+    }
+    if (dirId) {
+      lines.push(`    Direction: ${dirId}`);
+    }
+  }
+  lines.push('\n_To consume (acted on / direction spawned): `./strategic consume-knowledge-followup \'{"document_id":"<id>","reason":"<what was done / which direction was spawned>"}\'`_');
+  lines.push('_To dismiss (not actionable): `./strategic dismiss-knowledge-followup \'{"document_id":"<id>","reason":"<why not actionable>"}\'`_');
+  lines.push('_Consider spawning a direction to act on pending knowledge, or consuming it if already addressed._');
+  return lines.join('\n');
+}
+
 export function buildDirHealthSummary(
   directionsSummary: Array<Record<string, unknown>>,
   maxActiveDirections: number,

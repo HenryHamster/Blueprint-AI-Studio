@@ -2696,7 +2696,7 @@ class StrategicCycle(SQLModel, table=True):
     """
 
     id: str = Field(primary_key=True, max_length=36)  # cycle_id (UUID hex)
-    project_id: uuid.UUID = Field(foreign_key="project.id")
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
 
     # outcome enum-ish: in_progress | phase1_running | phase1_done |
     # phase2_running | completed | failed_phase1 | failed_phase2 |
@@ -2708,7 +2708,7 @@ class StrategicCycle(SQLModel, table=True):
 
     # Phase tracking. *_started_at = task creation time;
     # *_completed_at = terminal status.
-    phase1_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id")
+    phase1_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id", index=True)
     phase1_started_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
@@ -2717,7 +2717,7 @@ class StrategicCycle(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    phase2_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id")
+    phase2_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id", index=True)
     phase2_started_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -4031,7 +4031,7 @@ class MigrationReservation(SQLModel, table=True):
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    project_id: uuid.UUID = Field(foreign_key="project.id")
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
     # Detach-on-delete (SET NULL), NOT cascade: a reservation is durable
     # allocation history that must outlive its originating task so a merge-time
     # finalize/expiry can still reconcile the provisional id. Mirrors
@@ -4335,7 +4335,7 @@ class TaskWakeRegistration(SQLModel, table=True):
             index=True,
         ),
     )
-    project_id: uuid.UUID = Field(foreign_key="project.id")
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
 
     # Source identity. ``wake_source_kind`` is an open categorical string (the
     # first shipped value is "compute_job_terminal"); ``wake_source_ref`` is the

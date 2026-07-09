@@ -138,7 +138,7 @@
       "TS2741: Property 'mitigations_tried' is missing in type '{ id: string; name: string; status: \"resolved\"; description: string; seen_in: string[]; }' but required in type 'Friction'.": 1,
       "TS2739: Type '{ id: string; name: string; status: \"closed\"; closed: string; }' is missing the following properties from type 'Gap': size, priority, active_moves, past_moves, history": 1,
       "TS2322: Type '\"blueprint-agent\"' is not assignable to type '\"user\" | \"agent\" | null | undefined'.": 1,
-      "TS2322: Type '{ id: string; name: string; description: string; priority: \"low\" | \"medium\" | \"high\"; size: \"small\" | \"medium\" | \"large\"; tag: string | undefined; }[]' is not assignable to type 'Gap[]'.": 1
+      "TS2322: Type '{ id: string; name: string; description: string; priority: \"high\" | \"low\" | \"medium\"; size: \"small\" | \"medium\" | \"large\"; tag: string | undefined; }[]' is not assignable to type 'Gap[]'.": 1
     },
     "src/components/ProjectAutoRemediationSection.viewport.test.tsx": {
       "TS18047: 'root' is possibly 'null'.": 1
