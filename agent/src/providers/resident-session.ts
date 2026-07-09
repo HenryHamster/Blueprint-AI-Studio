@@ -6,7 +6,7 @@ import {
 import { writeAgentTokenFile } from '../token-file.js';
 import { PROCESS_KILL_GRACE_MS } from '../constants.js';
 import {
-  parseResidentLine, splitStreamChunk, encodeUserTurn, encodeInterrupt,
+  parseResidentLine, splitStreamChunk, encodeUserTurn, encodeUserTurnBlocks, encodeInterrupt,
   isStrategicMutation, isMessageSend, type ResidentStreamEvent,
 } from './resident-stream.js';
 import { getProviderRunner } from './runners.js';
@@ -86,10 +86,12 @@ export interface ResidentSessionEvent {
 
 export interface ResidentSession {
   /** Write one user turn; resolves on the turn's top-level `result` (or interrupt/close).
-   *  `opts.stallTimeoutMs` overrides the per-active-turn stall budget for THIS turn
-   *  only (autonomous turns get a deeper budget so a long read/verify step isn't
-   *  killed mid-thought); the absolute hard ceiling and interrupt ladder are unchanged. */
-  sendTurn(text: string, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult>;
+   *  Accepts a plain text string or an array of content blocks (text + image) for
+   *  multimodal operator messages. `opts.stallTimeoutMs` overrides the per-active-turn
+   *  stall budget for THIS turn only (autonomous turns get a deeper budget so a long
+   *  read/verify step isn't killed mid-thought); the absolute hard ceiling and interrupt
+   *  ladder are unchanged. */
+  sendTurn(textOrBlocks: string | Array<Record<string, unknown>>, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult>;
   /** Cooperatively pre-empt the in-flight turn (control_request, SIGINT fallback). */
   interrupt(): void;
   /** Subscribe to parsed stream events (text deltas, tool_use, errors). */
@@ -524,7 +526,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     resolveIdleWaiters();
   }
 
-  function sendTurn(text: string, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult> {
+  function sendTurn(textOrBlocks: string | Array<Record<string, unknown>>, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult> {
     if (!alive || closed) {
       return Promise.resolve({
         resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
@@ -557,7 +559,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       activeTurn = turn;
       try {
         if (child.stdin.destroyed) throw new Error('stdin closed');
-        child.stdin.write(encodeUserTurn(text));
+        if (typeof textOrBlocks === 'string') {
+          child.stdin.write(encodeUserTurn(textOrBlocks));
+        } else {
+          child.stdin.write(encodeUserTurnBlocks(textOrBlocks));
+        }
       } catch (e) {
         activeTurn = null;
         emit({ kind: 'error', text: `failed to write turn: ${String(e)}` });

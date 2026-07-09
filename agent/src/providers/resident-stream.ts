@@ -377,13 +377,26 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
 }
 
 /**
- * Build one NDJSON user-turn line for the resident session's stdin.
+ * Build one NDJSON user-turn line for the resident session's stdin with plain text.
  * Shape mirrors the Claude Code stream-json input protocol exactly.
  */
 export function encodeUserTurn(text: string): string {
   return JSON.stringify({
     type: 'user',
     message: { role: 'user', content: [{ type: 'text', text }] },
+  }) + '\n';
+}
+
+/**
+ * Build one NDJSON user-turn line with multiple content blocks (text + images).
+ * Supports the Messages API content block format for multimodal input so
+ * operator-attached images reach the LLM as image blocks rather than being
+ * silently dropped.
+ */
+export function encodeUserTurnBlocks(blocks: Array<Record<string, unknown>>): string {
+  return JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: blocks },
   }) + '\n';
 }
 

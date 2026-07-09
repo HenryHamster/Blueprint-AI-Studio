@@ -549,6 +549,58 @@ describe('MessageBubble', () => {
     expect(screen.getByText('abcdef01')).toBeTruthy();
   });
 
+  test('renders image attachment as inline thumbnail', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        context: {
+          attachments: [
+            { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=', name: 'screenshot.png' },
+          ],
+        },
+      }),
+    })} />);
+    const img = screen.getByAltText('screenshot.png') as HTMLImageElement;
+    expect(img).toBeTruthy();
+    expect(img.src).toContain('data:image/png;base64,iVBORw0KGgo=');
+  });
+
+  test('renders document attachment as file badge', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        context: {
+          attachments: [
+            { type: 'document', mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 12345 },
+          ],
+        },
+      }),
+    })} />);
+    expect(screen.getByText('report.pdf')).toBeTruthy();
+    expect(screen.getByText('(12 KB)')).toBeTruthy();
+  });
+
+  test('renders multiple attachments', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        context: {
+          attachments: [
+            { type: 'image', mime_type: 'image/jpeg', data: '/9j/4AAQ=', name: 'photo.jpg' },
+            { type: 'document', mime_type: 'text/plain', name: 'notes.txt', size_bytes: 500 },
+          ],
+        },
+      }),
+    })} />);
+    const img = screen.getByAltText('photo.jpg');
+    expect(img).toBeTruthy();
+    expect(screen.getByText('notes.txt')).toBeTruthy();
+  });
+
+  test('does not render attachment section when context has no attachments', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({ context: {} }),
+    })} />);
+    expect(screen.queryByAltText('')).toBeNull();
+  });
+
   test('copy message ref button copies to clipboard on click', async () => {
     const msgId = 'abcdef0123456789abcdef';
     const writeTextMock = vi.fn().mockResolvedValue(undefined);

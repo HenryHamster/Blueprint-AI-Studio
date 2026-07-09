@@ -1,9 +1,9 @@
-import { X, Check, AlertTriangle, HelpCircle, Bug, StickyNote, MessageSquare, PlusCircle, Trash2, CheckSquare, Reply, Copy } from 'lucide-react';
+import { X, Check, AlertTriangle, HelpCircle, Bug, StickyNote, MessageSquare, PlusCircle, Trash2, CheckSquare, Reply, Copy, FileText } from 'lucide-react';
 import { useState, useCallback, memo } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS } from './eventPrefs';
 import { MarkdownContent } from './MarkdownContent';
-import type { CitationState, ProjectMessage, ProjectMessageContext, ProvenanceWarnings } from '../types/messages';
+import type { CitationState, MessageAttachment, ProjectMessage, ProjectMessageContext, ProvenanceWarnings } from '../types/messages';
 import { buildMessageStrategicContextDescriptor } from '../utils/strategicContextDescriptor';
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
 
@@ -120,6 +120,35 @@ const CITATION_BADGE_CONFIG: Record<CitationState, { label: string; container: s
     refText: 'text-neutral-200/80',
   },
 };
+
+function AttachmentThumbnails({ attachments }: { attachments: MessageAttachment[] }) {
+  if (!attachments.length) return null;
+  return (
+    <div className="mt-2 flex flex-wrap gap-2">
+      {attachments.map((att, i) => {
+        if (att.mime_type?.startsWith('image/') && att.data) {
+          return (
+            <img
+              key={i}
+              src={`data:${att.mime_type};base64,${att.data}`}
+              alt={att.name || 'Image attachment'}
+              className="max-h-48 max-w-full rounded border border-neutral-700/60 object-contain"
+            />
+          );
+        }
+        return (
+          <div key={i} className="inline-flex items-center gap-1.5 rounded border border-neutral-700/60 bg-neutral-800/40 px-2.5 py-1.5 text-xs text-neutral-300">
+            <FileText className="h-3.5 w-3.5 shrink-0 text-neutral-500" />
+            <span className="max-w-[200px] truncate">{att.name || att.mime_type || 'File'}</span>
+            {att.size_bytes != null && (
+              <span className="text-neutral-500 shrink-0">({att.size_bytes < 1024 ? '<1' : (att.size_bytes / 1024).toFixed(0)} KB)</span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 function StaleCitationBadge({ msg }: { msg: ProjectMessage }) {
   if (msg.message_type !== 'BUG_REPORT' && msg.message_type !== 'BLOCKER') return null;
@@ -374,6 +403,9 @@ export const MessageBubble = memo(function MessageBubble({
             <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
               <MarkdownContent content={msg.content} />
             </div>
+          )}
+          {msg.context.attachments && Array.isArray(msg.context.attachments) && msg.context.attachments.length > 0 && (
+            <AttachmentThumbnails attachments={msg.context.attachments} />
           )}
           {showOpsChrome && <StaleCitationBadge msg={msg} />}
           {/* Context badges */}

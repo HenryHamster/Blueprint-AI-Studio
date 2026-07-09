@@ -79,6 +79,16 @@ export interface ProjectMessageCheckInContext extends Record<string, unknown> {
   captured_at?: string | null;
 }
 
+export interface MessageAttachment {
+  type: string;
+  mime_type: string;
+  data?: string;
+  name?: string;
+  size_bytes?: number;
+  url?: string;
+  thumbnail_url?: string;
+}
+
 export type ProjectMessageContext = Record<string, unknown> & {
   event_type?: string;
   user_event_type?: string;
@@ -95,6 +105,7 @@ export type ProjectMessageContext = Record<string, unknown> & {
   check_in?: ProjectMessageCheckInContext | string;
   strategic_session?: ProjectMessageStrategicSessionContext;
   _provenance_warnings?: ProvenanceWarnings;
+  attachments?: MessageAttachment[];
 };
 
 export interface ProjectMessage {

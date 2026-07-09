@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
-  BoundedSeenSet, dedupNewMessages, extractMessageContent,
-  combineOperatorMessages, buildBootstrapPrompt, buildAutonomousPrompt,
+  BoundedSeenSet, dedupNewMessages, extractMessageTurn, combineOperatorMessages,
+  buildBootstrapPrompt, buildAutonomousPrompt,
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
   buildRetiredContextText,
@@ -13,7 +13,8 @@ import {
   AUTONOMOUS_FLOOR_TICK_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
-  type ExamSurface, type ExamRecord,
+  MAX_IMAGE_BASE64_LENGTH, MAX_IMAGES_PER_TURN,
+  type ExamSurface, type ExamRecord, type ContentBlock,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -200,26 +201,127 @@ describe('MESSAGE_POLL_LIMIT', () => {
   });
 });
 
-describe('extractMessageContent / combineOperatorMessages', () => {
-  it('extracts and trims content', () => {
-    expect(extractMessageContent({ content: '  hello  ' })).toBe('hello');
-    expect(extractMessageContent({})).toBe('');
+describe('extractMessageTurn / combineOperatorMessages', () => {
+  it('extracts and trims content as a text block', () => {
+    const r1 = extractMessageTurn({ content: '  hello  ' });
+    expect(r1).toHaveLength(1);
+    expect(r1[0]).toEqual({ type: 'text', text: 'hello' });
+
+    const r2 = extractMessageTurn({});
+    expect(r2).toHaveLength(0);
+  });
+
+  it('extracts inline base64 image attachments from context', () => {
+    const r = extractMessageTurn({
+      content: 'see this',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=' },
+        ],
+      },
+    });
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'see this' });
+    expect(r[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } });
   });
 
   it('returns a single message verbatim', () => {
-    expect(combineOperatorMessages([{ content: 'just one' }])).toBe('just one');
+    const out = combineOperatorMessages([{ content: 'just one' }]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toEqual({ type: 'text', text: 'just one' });
   });
 
   it('batches multiple messages with headers', () => {
     const out = combineOperatorMessages([{ content: 'first' }, { content: 'second' }]);
-    expect(out).toContain('[operator message 1/2]');
-    expect(out).toContain('first');
-    expect(out).toContain('[operator message 2/2]');
-    expect(out).toContain('second');
+    expect(out.length).toBeGreaterThanOrEqual(2);
+    const texts = out.filter((b: ContentBlock): b is { type: 'text'; text: string } => b.type === 'text').map(b => b.text);
+    expect(texts.some(t => t.includes('first'))).toBe(true);
+    expect(texts.some(t => t.includes('second'))).toBe(true);
   });
 
   it('skips empty messages', () => {
-    expect(combineOperatorMessages([{ content: '' }, { content: '   ' }])).toBe('');
+    expect(combineOperatorMessages([{ content: '' }, { content: '   ' }])).toHaveLength(0);
+  });
+
+  it('preserves image blocks through combine', () => {
+    const out = combineOperatorMessages([
+      { content: 'check', context: { attachments: [{ type: 'image', mime_type: 'image/jpeg', data: '/9j/4AAQ=' }] } },
+    ]);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toEqual({ type: 'text', text: 'check' });
+    expect(out[1]).toHaveProperty('type', 'image');
+    expect((out[1] as { source: Record<string, unknown> }).source).toEqual({ type: 'base64', media_type: 'image/jpeg', data: '/9j/4AAQ=' });
+  });
+
+  it('preserves image blocks through combine batch path (2+ messages)', () => {
+    const out = combineOperatorMessages([
+      { content: 'first', context: { attachments: [{ type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=' }] } },
+      { content: 'second with attachment', context: { attachments: [{ type: 'image', mime_type: 'image/jpeg', data: '/9j/4AAQ=' }] } },
+    ]);
+    // First message: header + text + image (3 blocks).
+    // Separator + second header + second text + second image (4 more blocks).
+    expect(out.length).toBeGreaterThanOrEqual(6);
+    const texts = out.filter((b: ContentBlock) => b.type === 'text').map(b => b.text);
+    expect(texts.some(t => t.includes('first'))).toBe(true);
+    expect(texts.some(t => t.includes('second with attachment'))).toBe(true);
+    const images = out.filter((b: ContentBlock) => b.type === 'image');
+    expect(images).toHaveLength(2);
+    expect(images[0]).toHaveProperty('source.data', 'iVBORw0KGgo=');
+    expect(images[1]).toHaveProperty('source.data', '/9j/4AAQ=');
+  });
+
+  it('rejects non-image mime_types in extractMessageTurn', () => {
+    const r = extractMessageTurn({
+      content: 'file attached',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'application/pdf', data: 'JVBERi0=' },
+          { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=' },
+        ],
+      },
+    });
+    // Only the valid image/png block should be included.
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'file attached' });
+    expect(r[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } });
+  });
+
+  it('drops oversized image base64 data in extractMessageTurn', () => {
+    const oversized = 'x'.repeat(MAX_IMAGE_BASE64_LENGTH + 1);
+    const r = extractMessageTurn({
+      content: 'big image',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'image/png', data: oversized },
+          { type: 'image', mime_type: 'image/jpeg', data: '/9j/4AAQ=' },
+        ],
+      },
+    });
+    // Only the second (valid-size) image should be extracted alongside the text.
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'big image' });
+    expect(r[1]).toHaveProperty('type', 'image');
+    expect(r[1]).toHaveProperty('source.data', '/9j/4AAQ=');
+  });
+
+  it('caps the number of image attachments per turn', () => {
+    const attachments: Array<Record<string, string>> = Array.from({ length: MAX_IMAGES_PER_TURN + 3 }, (_, i) => ({
+      type: 'image',
+      mime_type: 'image/png',
+      data: `data${i}`,
+    }));
+    const r = extractMessageTurn({
+      content: 'many images',
+      context: { attachments },
+    });
+    // One text block + MAX_IMAGES_PER_TURN image blocks.
+    expect(r).toHaveLength(1 + MAX_IMAGES_PER_TURN);
+    expect(r[0]).toEqual({ type: 'text', text: 'many images' });
+    // All extracted image blocks should have distinct data values.
+    expect(r.filter(b => b.type === 'image')).toHaveLength(MAX_IMAGES_PER_TURN);
+    for (let i = 0; i < MAX_IMAGES_PER_TURN; i++) {
+      expect(r[i + 1]).toHaveProperty('source.data', `data${i}`);
+    }
   });
 });
 

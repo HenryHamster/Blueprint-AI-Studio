@@ -33,7 +33,7 @@ import {
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
-  type StreamFrameKind, type StreamFrameStatus, type ExamRecord,
+  type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -413,8 +413,29 @@ export async function handleStrategicResident(
   // the session; only stop_requested / 401 does.
   let authorityHeld = true;
 
-  const runTurn = async (text: string, operator: boolean): Promise<ResidentTurnResult> => {
-    const full = firstTurnSent ? text : `${bootstrapPrompt}\n\n---\n\n${text}`;
+  /**
+   * Convert ContentBlock[] to Array<Record<string, unknown>> for the session layer.
+   * Validates required fields at runtime so malformed blocks are caught early
+   * rather than silently producing garbled NDJSON. Each block is reconstructed
+   * as a plain object so TypeScript can widen it past the discriminated union.
+   */
+  function toRecordBlocks(blocks: ContentBlock[]): Array<Record<string, unknown>> {
+    const result: Array<Record<string, unknown>> = [];
+    for (const block of blocks) {
+      if (block.type === 'text') {
+        result.push({ type: 'text' as const, text: block.text });
+      } else {
+        // block.type is 'image' — validated at compile time by ContentBlock type
+        result.push({ type: 'image' as const, source: block.source });
+      }
+    }
+    return result;
+  }
+
+  const runTurn = async (content: string | ContentBlock[], operator: boolean): Promise<ResidentTurnResult> => {
+    const full: string | ContentBlock[] = typeof content === 'string'
+      ? (firstTurnSent ? content : `${bootstrapPrompt}\n\n---\n\n${content}`)
+      : (firstTurnSent ? content : [{ type: 'text', text: `${bootstrapPrompt}\n\n---\n\n` }, ...content]);
     firstTurnSent = true;
     statusRef.value = operator ? 'Responding to operator...' : 'Advancing project (autonomous)...';
     // Bracket BOTH operator and autonomous turns with lifecycle frames so the UI
@@ -429,7 +450,9 @@ export async function handleStrategicResident(
     }
     // Autonomous turns get a deeper per-turn stall budget so a long read/verify
     // step isn't killed mid-thought; operator turns keep the responsive default.
-    const r = await session.sendTurn(full, operator ? undefined : { stallTimeoutMs: cfg.autonomousTurnTimeoutMs });
+    const r = await session.sendTurn(
+      Array.isArray(full) ? toRecordBlocks(full) : full,
+      operator ? undefined : { stallTimeoutMs: cfg.autonomousTurnTimeoutMs });
     streamer.flush();
     streamer.done();
     recordResidentTurnLatency({

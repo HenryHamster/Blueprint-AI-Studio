@@ -9,6 +9,19 @@
 
 import { promptOps } from './strategic-ops-registry.js';
 
+/**
+ * Maximum base64-encoded image data length accepted in a message turn
+ * (~10 MB encoded corresponds to ~7.5 MB raw). Longer payloads are silently
+ * dropped to prevent excessive token usage and agent stalls.
+ */
+export const MAX_IMAGE_BASE64_LENGTH = 13_000_000;
+
+/**
+ * Maximum number of image attachment blocks extracted per message turn.
+ * Beyond this cap, additional images are silently dropped.
+ */
+export const MAX_IMAGES_PER_TURN = 8;
+
 export interface ResidentInboundMessage {
   id?: string;
   created_at?: string;
@@ -356,22 +369,70 @@ export function dedupNewMessages(
   return out;
 }
 
-/** Extract the human text of an inbound operator message. */
-export function extractMessageContent(msg: ResidentInboundMessage): string {
-  const content = str(msg.content).trim();
-  return content;
+/** Content block types for multimodal message delivery. */
+export interface TextBlock { type: 'text'; text: string; }
+export interface ImageBlock { type: 'image'; source: { type: 'base64'; media_type: string; data: string; }; }
+export type ContentBlock = TextBlock | ImageBlock;
+
+/**
+ * Extract message content as content blocks (text + inline base64 image attachments
+ * from context.attachments). Text-only messages produce a single text block.
+ */
+export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] {
+  const blocks: ContentBlock[] = [];
+  const text = str(msg.content).trim();
+  if (text) {
+    blocks.push({ type: 'text', text });
+  }
+  if (msg.context) {
+    const raw = msg.context.attachments;
+    if (Array.isArray(raw)) {
+      let imageCount = 0;
+      for (const att of raw as Array<Record<string, unknown>>) {
+        if (imageCount >= MAX_IMAGES_PER_TURN) break;
+        if (
+          str(att.type) === 'image'
+          && typeof att.data === 'string' && att.data
+          && typeof att.mime_type === 'string' && att.mime_type.startsWith('image/')
+          && att.data.length <= MAX_IMAGE_BASE64_LENGTH
+        ) {
+          blocks.push({
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: str(att.mime_type, 'image/png'),
+              data: att.data,
+            },
+          });
+          imageCount++;
+        }
+      }
+    }
+  }
+  return blocks;
 }
 
 /**
- * Combine one or more pending operator messages into a single turn payload. When
- * several arrive between polls they are concatenated in order with a short header
- * so the agent sees them as a batch rather than losing all but the last.
+ * Combine one or more pending operator messages into a single turn payload of
+ * content blocks. When several arrive between polls they are concatenated in
+ * order with a short header so the agent sees them as a batch rather than
+ * losing all but the last.
  */
-export function combineOperatorMessages(msgs: ResidentInboundMessage[]): string {
-  const texts = msgs.map(extractMessageContent).filter(Boolean);
-  if (texts.length === 0) return '';
-  if (texts.length === 1) return texts[0];
-  return texts.map((t, i) => `[operator message ${i + 1}/${texts.length}]\n${t}`).join('\n\n');
+export function combineOperatorMessages(msgs: ResidentInboundMessage[]): ContentBlock[] {
+  const nonEmpty = msgs.filter(m => {
+    if ((m.content || '').trim()) return true;
+    if (m.context && Array.isArray(m.context.attachments) && m.context.attachments.length > 0) return true;
+    return false;
+  });
+  if (nonEmpty.length === 0) return [];
+  if (nonEmpty.length === 1) return extractMessageTurn(nonEmpty[0]);
+  const result: ContentBlock[] = [];
+  for (let i = 0; i < nonEmpty.length; i++) {
+    if (i > 0) result.push({ type: 'text', text: '\n\n' });
+    result.push({ type: 'text', text: `[operator message ${i + 1}/${nonEmpty.length}]\n` });
+    result.push(...extractMessageTurn(nonEmpty[i]));
+  }
+  return result;
 }
 
 export interface BootstrapContext {

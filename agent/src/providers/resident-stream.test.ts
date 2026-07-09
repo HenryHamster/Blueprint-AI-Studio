@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   splitStreamChunk, extractDeltaText, isStrategicMutation, isMessageSend,
-  parseResidentLine, encodeUserTurn, encodeInterrupt, extractResultUsage,
-  extractResultTurns, describeToolUse, describeToolResult,
+  parseResidentLine, encodeUserTurn, encodeUserTurnBlocks, encodeInterrupt,
+  extractResultUsage, extractResultTurns, describeToolUse, describeToolResult,
 } from './resident-stream.js';
 
 describe('splitStreamChunk', () => {
@@ -327,12 +327,26 @@ describe('parseResidentLine', () => {
   });
 });
 
-describe('encodeUserTurn / encodeInterrupt', () => {
+describe('encodeUserTurn / encodeInterrupt / encodeUserTurnBlocks', () => {
   it('encodes a user turn as a single NDJSON line', () => {
     const line = encodeUserTurn('hi there');
     expect(line.endsWith('\n')).toBe(true);
     const obj = JSON.parse(line.trim()) as Record<string, unknown>;
     expect(obj).toEqual({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'hi there' }] } });
+  });
+
+  it('encodes a user turn with multiple content blocks (text + image)', () => {
+    const blocks: Array<Record<string, unknown>> = [
+      { type: 'text', text: 'see this image' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+    ];
+    const line = encodeUserTurnBlocks(blocks);
+    expect(line.endsWith('\n')).toBe(true);
+    const obj = JSON.parse(line.trim()) as Record<string, unknown>;
+    expect(obj).toEqual({
+      type: 'user',
+      message: { role: 'user', content: blocks },
+    });
   });
 
   it('encodes an interrupt control_request with a request id', () => {
