@@ -378,6 +378,31 @@ export interface ProviderRoutingShare {
   total_pr_eligible_run_count: number;
 }
 
+// Cost-telemetry reconciliation: structurally independent recomputation of LLM
+// cost and cache-hit rate compared against the primary cost-telemetry path.
+// Mirrors the backend ReconciliationResult.asdict() shape so the UI can render
+// a trust indicator alongside the efficiency breakdown.
+export interface CostTelemetryReconciliation {
+  total_cost_snapshot_path: number;
+  total_cost_direct_path: number;
+  absolute_delta: number;
+  relative_delta: number | null;
+  within_tolerance: boolean;
+  tolerance: number;
+  total_input_tokens_snapshot_path: number;
+  total_input_tokens_direct_path: number;
+  total_cache_read_input_tokens_snapshot_path: number;
+  total_cache_read_input_tokens_direct_path: number;
+  total_cache_creation_input_tokens_snapshot_path: number;
+  total_cache_creation_input_tokens_direct_path: number;
+  cache_hit_rate_snapshot_path: number;
+  cache_hit_rate_direct_path: number;
+  cache_hit_rate_delta: number;
+  cache_hit_rate_within_tolerance: boolean;
+  task_count: number;
+  per_task: Record<string, unknown>[];
+}
+
 export interface EffortModelEfficiency {
   by_effort: EffortEfficiencyRow[];
   by_model: ModelEfficiencyRow[];
@@ -389,6 +414,7 @@ export interface EffortModelEfficiency {
   };
   provider_routing_verdict?: ProviderRoutingVerdict;
   provider_routing_share?: ProviderRoutingShare;
+  cost_telemetry_reconciliation?: CostTelemetryReconciliation | null;
 }
 
 // Dependency/foundation-resolution observability (read-only). Mirrors the
@@ -593,6 +619,10 @@ export interface DigestData<DP = unknown> {
   // Per-effort-tier / per-actual-model efficiency rollup (additive; absent on
   // older backends that predate compute_effort_model_efficiency).
   effort_model_efficiency?: EffortModelEfficiency | null;
+  // Cost-telemetry reconciliation trust indicator (derived from the same task
+  // window as effort_model_efficiency). Absent on legacy payloads or when the
+  // task window is empty — the EffortEfficiencyPanel handles absence gracefully.
+  cost_telemetry_reconciliation?: CostTelemetryReconciliation | null;
 
   // ----- scope conversion -----
   scope_conversion_rates?: ScopeConversionRates | null;

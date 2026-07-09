@@ -7,6 +7,7 @@ import type {
   ModelEfficiencyRow,
   ProviderRoutingVerdict,
   ProviderRoutingShare,
+  CostTelemetryReconciliation,
 } from '../types/digest';
 
 function fmtTokens(n: number): string {
@@ -317,6 +318,80 @@ function ProviderRoutingShareBlock({ share }: { share: ProviderRoutingShare }) {
 }
 
 /**
+ * Compact trust indicator for cost-telemetry reconciliation: shows whether the
+ * primary cost-telemetry path agrees with a structurally independent direct-path
+ * recomputation within declared tolerance. Green when within_tolerance is true,
+ * amber with the absolute delta value when the paths diverge beyond tolerance.
+ * Follows the same badge-and-detail idiom as ProviderRoutingVerdictCallout.
+ */
+function CostTelemetryReconciliationCallout({
+  reconciliation,
+}: {
+  reconciliation: CostTelemetryReconciliation;
+}) {
+  const { within_tolerance, absolute_delta, cache_hit_rate_within_tolerance, task_count, tolerance } = reconciliation;
+
+  if (within_tolerance && cache_hit_rate_within_tolerance) {
+    return (
+      <div className="mb-2 rounded border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 text-ui-sm">
+        <div className="flex items-center gap-2">
+          <span className="inline-block px-1.5 py-px rounded text-ui-xs font-semibold border bg-emerald-500/20 text-emerald-300 border-emerald-500/40">
+            ✓ Reconciled
+          </span>
+          <span className="text-neutral-300 font-medium">Cost Telemetry</span>
+        </div>
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-500 mt-1">
+          <span>
+            Delta: <span className="text-emerald-300 tabular-nums">${absolute_delta.toFixed(7)}</span>
+          </span>
+          <span>
+            Tolerance: <span className="text-neutral-300 tabular-nums">${tolerance}</span>
+          </span>
+          <span>
+            Tasks: <span className="text-neutral-300 tabular-nums">{task_count}</span>
+          </span>
+        </div>
+        <div className="text-ui-xs text-emerald-600/70 mt-0.5">
+          Cache-hit rate and cost agree within tolerance — telemetry is trustworthy.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-ui-sm">
+      <div className="flex items-center gap-2">
+        <span className="inline-block px-1.5 py-px rounded text-ui-xs font-semibold border bg-amber-500/20 text-amber-300 border-amber-500/40">
+          ⚠ Mismatch
+        </span>
+        <span className="text-neutral-300 font-medium">Cost Telemetry</span>
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-500 mt-1">
+        <span>
+          Delta: <span className="text-amber-300 tabular-nums">${absolute_delta.toFixed(7)}</span>
+        </span>
+        {!within_tolerance && (
+          <span>
+            Cost tolerance: <span className="text-amber-300 tabular-nums">±${tolerance}</span>
+          </span>
+        )}
+        {!cache_hit_rate_within_tolerance && (
+          <span>
+            Cache-hit rate: <span className="text-amber-300 tabular-nums">diverged</span>
+          </span>
+        )}
+        <span>
+          Tasks: <span className="text-neutral-300 tabular-nums">{task_count}</span>
+        </span>
+      </div>
+      <div className="text-ui-xs text-amber-600/70 mt-0.5">
+        Cost telemetry paths diverge — investigate pricing or aggregation discrepancies.
+      </div>
+    </div>
+  );
+}
+
+/**
  * Operator view of cost & landed/merge-rate attributable by EFFORT tier and by
  * ACTUAL resolved model. Purely presentational — the rollup rides the digest
  * payload already fetched by DashboardHome (no extra fetch). Renders nothing
@@ -329,7 +404,7 @@ function ProviderRoutingShareBlock({ share }: { share: ProviderRoutingShare }) {
  */
 export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | null | undefined }) {
   if (!data) return null;
-  const { by_effort, by_model, totals, unpriced_combos, fallbacks, provider_routing_verdict, provider_routing_share } = data;
+  const { by_effort, by_model, totals, unpriced_combos, fallbacks, provider_routing_verdict, provider_routing_share, cost_telemetry_reconciliation } = data;
   if ((by_effort?.length ?? 0) === 0 && (by_model?.length ?? 0) === 0) return null;
   if (totals.run_count === 0) return null;
 
@@ -373,6 +448,7 @@ export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | 
 
       {provider_routing_verdict && <ProviderRoutingVerdictCallout verdict={provider_routing_verdict} />}
       {provider_routing_share && <ProviderRoutingShareBlock share={provider_routing_share} />}
+      {cost_telemetry_reconciliation && <CostTelemetryReconciliationCallout reconciliation={cost_telemetry_reconciliation} />}
 
       <EfficiencySubTable
         title="By Effective Effort Tier"

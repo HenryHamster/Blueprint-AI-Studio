@@ -8,6 +8,7 @@ import type {
   ModelEfficiencyRow,
   ProviderRoutingVerdict,
   ProviderRoutingShare,
+  CostTelemetryReconciliation,
 } from '../types/digest';
 
 function bucket(overrides: Partial<EfficiencyBucket> = {}): EfficiencyBucket {
@@ -407,5 +408,101 @@ describe('EffortEfficiencyPanel', () => {
   it('hides the verdict callout when provider_routing_verdict is absent', () => {
     render(<EffortEfficiencyPanel data={makeData({ provider_routing_verdict: undefined })} />);
     expect(screen.queryByText(/Provider Routing A\/B/)).not.toBeInTheDocument();
+  });
+
+  // --- Cost telemetry reconciliation trust indicator ---
+
+  function reconciliationData(
+    overrides: Partial<CostTelemetryReconciliation> = {},
+  ): CostTelemetryReconciliation {
+    return {
+      total_cost_snapshot_path: 50.0,
+      total_cost_direct_path: 50.000001,
+      absolute_delta: 0.000001,
+      relative_delta: 2e-8,
+      within_tolerance: true,
+      tolerance: 1e-6,
+      total_input_tokens_snapshot_path: 1000000,
+      total_input_tokens_direct_path: 1000000,
+      total_cache_read_input_tokens_snapshot_path: 200000,
+      total_cache_read_input_tokens_direct_path: 200000,
+      total_cache_creation_input_tokens_snapshot_path: 50000,
+      total_cache_creation_input_tokens_direct_path: 50000,
+      cache_hit_rate_snapshot_path: 0.2,
+      cache_hit_rate_direct_path: 0.2,
+      cache_hit_rate_delta: 0,
+      cache_hit_rate_within_tolerance: true,
+      task_count: 15,
+      per_task: [],
+      ...overrides,
+    };
+  }
+
+  it('renders cost telemetry reconciled badge when within tolerance', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({ cost_telemetry_reconciliation: reconciliationData() })}
+      />,
+    );
+    // Green badge indicates reconciliation passed.
+    expect(screen.getByText(/✓ Reconciled/)).toBeInTheDocument();
+    // Section label visible.
+    expect(screen.getByText(/Cost Telemetry/)).toBeInTheDocument();
+    // Delta = 0.0000010 (toFixed(7)) and tolerance = 0.000001 shown.
+    expect(screen.getAllByText(/\$0\.0000010?/).length).toBeGreaterThanOrEqual(2);
+    // Task count shown.
+    expect(screen.getByText('15')).toBeInTheDocument();
+    // Trustworthy message.
+    expect(screen.getByText(/telemetry is trustworthy/)).toBeInTheDocument();
+  });
+
+  it('renders cost telemetry warning badge when out of tolerance', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({
+          cost_telemetry_reconciliation: reconciliationData({
+            within_tolerance: false,
+            absolute_delta: 0.05,
+          }),
+        })}
+      />,
+    );
+    // Amber badge indicates mismatch.
+    expect(screen.getByText(/⚠ Mismatch/)).toBeInTheDocument();
+    // Diverged delta value.
+    expect(screen.getByText(/\$0\.0500000/)).toBeInTheDocument();
+    // Cost tolerance shown.
+    expect(screen.getByText(/±\$0\.000001/)).toBeInTheDocument();
+    // Investigate message.
+    expect(screen.getByText(/telemetry paths diverge/)).toBeInTheDocument();
+  });
+
+  it('renders cost telemetry warning when cache hit rate diverges but cost within tolerance', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({
+          cost_telemetry_reconciliation: reconciliationData({
+            within_tolerance: true,
+            cache_hit_rate_within_tolerance: false,
+            cache_hit_rate_delta: 0.15,
+          }),
+        })}
+      />,
+    );
+    // Mismatch badge (cache hit rate divergence overrides cost agreement).
+    expect(screen.getByText(/⚠ Mismatch/)).toBeInTheDocument();
+    // Cache-hit rate divergence noted.
+    expect(screen.getByText(/diverged/)).toBeInTheDocument();
+  });
+
+  it('hides cost telemetry callout when reconciliation is undefined', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({ cost_telemetry_reconciliation: undefined })}
+      />,
+    );
+    expect(screen.queryByText(/Cost Telemetry/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/✓ Reconciled/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/⚠ Mismatch/)).not.toBeInTheDocument();
   });
 });
