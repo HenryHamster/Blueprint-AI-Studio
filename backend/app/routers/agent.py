@@ -1989,11 +1989,13 @@ async def claim_task(
                     await session.rollback()
 
         direction_concurrent_files: list[str] = []
+        co_batch_sibling_count = 0
         if current_direction_id:
             _seen_files: set[str] = set()
             for _at in active_tasks:
                 if _at.get("direction_id") != current_direction_id:
                     continue
+                co_batch_sibling_count += 1
                 for _f in _at.get("related_files") or []:
                     if isinstance(_f, str) and _f and _f not in _seen_files:
                         _seen_files.add(_f)
@@ -2002,6 +2004,7 @@ async def claim_task(
         response["project_context"] = {
             "active_tasks": active_tasks,
             "direction_concurrent_files": direction_concurrent_files,
+            "co_batch_sibling_count": co_batch_sibling_count,
             "queued_tasks": queued_tasks,
             "recently_completed_tasks": recently_completed_tasks,
             "direction_recent_tasks": direction_recent_tasks
@@ -3006,6 +3009,10 @@ async def claim_task(
                     "top_first_review_issues": direction_top_first_review_issues,
                     "first_attempt_feedback": direction_first_attempt_feedback,
                 }
+                if co_batch_sibling_count >= 3:
+                    response["direction_context"]["co_batch_sibling_count"] = (
+                        co_batch_sibling_count
+                    )
                 if direction_implementation_constraints:
                     response["direction_context"]["implementation_constraints"] = (
                         direction_implementation_constraints
@@ -3222,6 +3229,10 @@ async def claim_task(
                     "success_patterns": success_summary,
                     "review_effectiveness": research_review_effectiveness,
                 }
+                if co_batch_sibling_count >= 3:
+                    response["direction_context"]["co_batch_sibling_count"] = (
+                        co_batch_sibling_count
+                    )
                 if prompt_quality_patterns:
                     response["direction_context"]["prompt_quality_patterns"] = (
                         prompt_quality_patterns

@@ -5532,9 +5532,9 @@ describe('thinker prompt contains criterion-coverage retirement warning', () => 
       efficiencySnapshotSection: '',
     };
     const prompt = buildThinkerPrompt(params);
-    expect(prompt).toContain('Criterion-coverage check before retirement');
+    expect(prompt).toContain('Criterion-coverage before retirement');
     expect(prompt).toContain('direction_owns_uncovered_criterion');
-    expect(prompt).toContain('retract the orphaned criterion via Section 8');
-    expect(prompt).toContain('Do NOT retire a criterion-carrying direction without first addressing its criterion');
+    expect(prompt).toContain('retract via Section 8');
+    expect(prompt).toContain('Do NOT retire criterion-carrying without addressing the criterion first');
   });
 });
