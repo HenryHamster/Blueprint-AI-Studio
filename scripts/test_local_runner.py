@@ -3624,6 +3624,13 @@ class BlueprintRunnerInstallTests(unittest.TestCase):
                       "burst count must be in rendered unit")
         self.assertIn("RestartSec=5", unit_text)
         self.assertIn("Restart=on-failure", unit_text)
+        # StartLimitIntervalSec and StartLimitBurst belong in [Unit], not [Service].
+        self.assertLess(
+            unit_text.index("StartLimitIntervalSec=60"), unit_text.index("[Service]"),
+            "StartLimitIntervalSec must appear in the [Unit] block")
+        self.assertLess(
+            unit_text.index("StartLimitBurst=3"), unit_text.index("[Service]"),
+            "StartLimitBurst must appear in the [Unit] block")
 
         # The comment block documents crash-loop recovery.
         self.assertIn("reset-failed", unit_text,
@@ -3672,6 +3679,13 @@ class BlueprintRunnerInstallTests(unittest.TestCase):
         unit_text = Path(sys_unit).read_text()
         self.assertIn("StartLimitIntervalSec=60", unit_text)
         self.assertIn("StartLimitBurst=3", unit_text)
+        # StartLimitIntervalSec and StartLimitBurst belong in [Unit], not [Service].
+        self.assertLess(
+            unit_text.index("StartLimitIntervalSec=60"), unit_text.index("[Service]"),
+            "StartLimitIntervalSec must appear in the [Unit] block")
+        self.assertLess(
+            unit_text.index("StartLimitBurst=3"), unit_text.index("[Service]"),
+            "StartLimitBurst must appear in the [Unit] block")
         self.assertIn("reset-failed", unit_text)
         self.assertIn("User=testop", unit_text)
         self.assertIn("WantedBy=multi-user.target", unit_text)

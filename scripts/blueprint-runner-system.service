@@ -37,6 +37,8 @@ Description=Blueprint local fleet runner
 Documentation=https://github.com/your-org/your-repo/blob/main/docs/runner-install.md
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -44,8 +46,6 @@ User=@USER@
 ExecStart=@PYTHON@ @LOCAL_RUNNER@
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=3
 # Load credentials and config from a 0600 file outside the repo (`-` = optional).
 EnvironmentFile=-@ENV_FILE@
 # Redirect stdout/stderr into the systemd journal (view with journalctl).

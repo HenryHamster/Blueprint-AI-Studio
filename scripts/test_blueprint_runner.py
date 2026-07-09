@@ -564,6 +564,13 @@ class RenderUnitTests(unittest.TestCase):
                           "StartLimitBurst=3", "KillSignal=SIGTERM",
                           "TimeoutStopSec=30", "WantedBy=default.target"):
             self.assertIn(directive, text)
+        # StartLimitIntervalSec and StartLimitBurst belong in [Unit], not [Service].
+        self.assertLess(
+            text.index("StartLimitIntervalSec=60"), text.index("[Service]"),
+            "StartLimitIntervalSec must appear in the [Unit] block")
+        self.assertLess(
+            text.index("StartLimitBurst=3"), text.index("[Service]"),
+            "StartLimitBurst must appear in the [Unit] block")
 
     def test_system_template_substitutes_user_and_wantedby(self):
         text = br.render_unit(
@@ -582,6 +589,13 @@ class RenderUnitTests(unittest.TestCase):
         self.assertIn("KillSignal=SIGTERM", text)
         self.assertIn("StartLimitIntervalSec=60", text)
         self.assertIn("StartLimitBurst=3", text)
+        # StartLimitIntervalSec and StartLimitBurst belong in [Unit], not [Service].
+        self.assertLess(
+            text.index("StartLimitIntervalSec=60"), text.index("[Service]"),
+            "StartLimitIntervalSec must appear in the [Unit] block")
+        self.assertLess(
+            text.index("StartLimitBurst=3"), text.index("[Service]"),
+            "StartLimitBurst must appear in the [Unit] block")
         # Comment block documents crash-loop guard recovery.
         self.assertIn("systemctl reset-failed", text)
 
