@@ -4683,6 +4683,7 @@ async def _handle_strategic_completion(
                 apply_agent_update,
                 normalize_active_moves_writeback as _normalize_active_moves_writeback,
             )
+            from app.research_direction_state import RETIRED_DIRECTION_STATUSES
 
             # Resolve the cycle's baseline problem model (snapshot at spawn) for
             # the 3-way operator-wins merge, mirroring the vision baseline
@@ -4709,6 +4710,11 @@ async def _handle_strategic_completion(
                             pm_baseline = snap
 
             _protected_gap_ids = _active_direction_gap_ids(project.directions)
+            _live_dir_ids = frozenset(
+                str(d.get("id"))
+                for d in (project.directions or [])
+                if d.get("status") not in RETIRED_DIRECTION_STATUSES
+            )
             try:
                 new_pm_raw, pm_diff = apply_agent_update(
                     current_raw=project.problem_model,
@@ -4716,6 +4722,7 @@ async def _handle_strategic_completion(
                     now_iso=_utcnow().isoformat(),
                     baseline_raw=pm_baseline,
                     protected_gap_ids=_protected_gap_ids,
+                    live_direction_ids=_live_dir_ids,
                 )
             except _PmValidationError as pm_err:
                 logger.warning(

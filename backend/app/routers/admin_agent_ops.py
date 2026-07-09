@@ -3609,6 +3609,7 @@ async def strategic_operation(
             normalize_active_moves_writeback as _normalize_active_moves_writeback,
             operator_owned_subset,
         )
+        from app.research_direction_state import RETIRED_DIRECTION_STATUSES
         from app.strategic_completion import (
             NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
             NEW_VERSION_GOAL_CONTEXT_KEY,
@@ -3682,6 +3683,11 @@ async def strategic_operation(
                     if snap:
                         baseline_pm = snap
         _protected_gap_ids = _active_direction_gap_ids(project.directions)
+        _live_dir_ids = frozenset(
+            str(d.get("id"))
+            for d in (project.directions or [])
+            if d.get("status") not in RETIRED_DIRECTION_STATUSES
+        )
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
@@ -3689,6 +3695,7 @@ async def strategic_operation(
                 now_iso=_utcnow().isoformat(),
                 baseline_raw=baseline_pm,
                 protected_gap_ids=_protected_gap_ids,
+                live_direction_ids=_live_dir_ids,
             )
         except _PmValidationError as ve:
             raise HTTPException(

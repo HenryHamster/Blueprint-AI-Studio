@@ -1396,6 +1396,127 @@ def lifecycle_bound_problem_model(
     return summary
 
 
+def auto_archive_stale_problem_model_items(
+    model: ProblemModel,
+    now_iso: str,
+    live_direction_ids: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Count-threshold-gated TTL auto-archival for gaps, friction, and capabilities.
+
+    Decays only items that are PROVABLY inert — no live direction staffing via
+    ``active_moves``, any deferral expired, age past a TTL, not recently
+    touched — and ONLY when counts exceed the healthy thresholds
+    (:data:`MODEL_SIZE_HEALTHY_GAPS`, :data:`MODEL_SIZE_HEALTHY_FRICTION`,
+    :data:`MODEL_SIZE_HEALTHY_CAPABILITIES`).  Err toward NOT archiving something
+    a strategist might still need; leave :func:`gc_problem_model` as the
+    backstop for byte-budget overflow, unchanged.
+
+    Mutates ``model`` in place and returns a small summary dict (empty on no-op).
+    Runs BEFORE the :func:`gc_problem_model` 200-item/byte backstop in
+    :func:`apply_agent_update` and composes cleanly with it.
+
+    Three actions, each touching ONLY terminal-ish / reference-only state:
+
+    1. **Aged-deferred, unstaffed gaps → archive.** Each ACTIVE gap that carries a
+       ``deferral``, has no live direction staffing (``active_moves`` has no
+       overlap with ``live_direction_ids``), and whose deferral has aged past
+       its revisit point is marked ``abandoned`` and moved into ``archived_gaps``.
+       A gap with active live staffing, a fresh/held deferral, or no deferral at
+       all is NEVER touched.  When ``live_direction_ids`` is empty the check falls
+       back to ``active_moves`` being empty (backward-compatible).
+    2. **Terminal friction surplus → drop.** Bounds total friction toward
+       :data:`MODEL_SIZE_HEALTHY_FRICTION` by dropping terminal
+       (``resolved`` then ``mitigated``) friction oldest-first, only as far as
+       needed.
+    3. **Stale planned capabilities surplus → drop.** Bounds capabilities toward
+       :data:`MODEL_SIZE_HEALTHY_CAPABILITIES` by dropping ``planned``
+       capabilities oldest-first.
+
+    Returns a dict like ``{"gaps_lifecycle_archived": ["g-x"],
+    "friction_lifecycle_evicted": ["f-y"],
+    "capabilities_lifecycle_evicted": ["cap-z"]}`` — only the keys that had
+    activity are present; an all-live model returns ``{}``.
+    """
+    summary: dict[str, Any] = {}
+    now = _parse_iso_to_naive_utc(now_iso)
+
+    # 1. Aged-deferred, unstaffed gaps → mark abandoned so archive_closed_gaps
+    #    moves them into archived_gaps (reversible, re-fetchable by id).
+    #    Gated on active gap count exceeding the healthy threshold — a model
+    #    at or under the threshold is never touched even if some gaps are inert.
+    #    A gap is inert only when NO member of its active_moves is a live
+    #    direction (provably no ongoing work).  When live_direction_ids is
+    #    unavailable the check conservatively falls back to active_moves being
+    #    empty — a gap with any move entries is skipped.
+    active_count = sum(1 for g in model.gaps if g.status == "active")
+    archived_gap_ids: list[str] = []
+    if active_count > MODEL_SIZE_HEALTHY_GAPS:
+        for gap in model.gaps:
+            if gap.status != "active" or gap.deferral is None:
+                continue
+            has_live_staff = (
+                bool(set(gap.active_moves) & live_direction_ids)
+                if live_direction_ids
+                else bool(gap.active_moves)
+            )
+            if has_live_staff:
+                continue
+            if not _deferral_is_stale(gap.deferral, now):
+                continue
+            gap.status = "abandoned"
+            gap.closed = now_iso
+            gap.history.append(
+                GapHistoryEvent(
+                    ts=now_iso,
+                    event="lifecycle_auto_archived",
+                    note=(
+                        "auto-archived: deferral aged past revisit point "
+                        "(lifecycle-bound pass)"
+                    ),
+                )
+            )
+            archived_gap_ids.append(gap.id)
+    if archived_gap_ids:
+        archive_closed_gaps(model)
+        summary["gaps_lifecycle_archived"] = archived_gap_ids
+
+    # 2. Terminal friction surplus → drop toward the healthy friction threshold,
+    #    resolved before mitigated, oldest-first. Active friction is never
+    #    dropped, so an all-active list stays untouched.
+    friction_overage = len(model.friction) - MODEL_SIZE_HEALTHY_FRICTION
+    if friction_overage > 0:
+        resolved = [i for i, f in enumerate(model.friction) if f.status == "resolved"]
+        mitigated = [i for i, f in enumerate(model.friction) if f.status == "mitigated"]
+        evict_idx = set((resolved + mitigated)[:friction_overage])
+        if evict_idx:
+            evicted_friction: list[str] = []
+            kept_friction: list[Friction] = []
+            for i, fric in enumerate(model.friction):
+                if i in evict_idx:
+                    evicted_friction.append(fric.id)
+                else:
+                    kept_friction.append(fric)
+            model.friction = kept_friction
+            summary["friction_lifecycle_evicted"] = evicted_friction
+
+    # 3. Stale planned capabilities surplus → drop toward the healthy capability
+    #    threshold, oldest-first. working/partial capabilities are never dropped.
+    cap_overage = len(model.capabilities) - MODEL_SIZE_HEALTHY_CAPABILITIES
+    if cap_overage > 0:
+        evicted_caps: list[str] = []
+        kept_caps: list[Capability] = []
+        for cap in model.capabilities:
+            if len(evicted_caps) < cap_overage and _is_evictable_capability(cap):
+                evicted_caps.append(cap.name)
+            else:
+                kept_caps.append(cap)
+        if evicted_caps:
+            model.capabilities = kept_caps
+            summary["capabilities_lifecycle_evicted"] = evicted_caps
+
+    return summary
+
+
 def append_revision_log(
     model: ProblemModel,
     summary: str,
@@ -2427,6 +2548,7 @@ def apply_agent_update(
     *,
     baseline_raw: dict | None = None,
     protected_gap_ids: set[str] | None = None,
+    live_direction_ids: frozenset[str] = frozenset(),
 ) -> tuple[dict, dict]:
     """Apply an agent-proposed problem_model update to the current state.
 
@@ -2629,7 +2751,9 @@ def apply_agent_update(
     # summary folds into the diff exactly like gc's, so the actions are observable
     # in the revision log; an all-live model returns {} and leaves the diff (and
     # the serialized model) byte-identical.
-    lifecycle_summary = lifecycle_bound_problem_model(proposed, now_iso)
+    lifecycle_summary = auto_archive_stale_problem_model_items(
+        proposed, now_iso, live_direction_ids
+    )
     if lifecycle_summary:
         diff.update(lifecycle_summary)
 

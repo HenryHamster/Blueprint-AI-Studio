@@ -40,6 +40,7 @@ from app.problem_model import (
     apply_agent_update,
     apply_user_intent_patch,
     archive_closed_gaps,
+    auto_archive_stale_problem_model_items,
     lifecycle_bound_problem_model,
     check_gap_id_write,
     classify_gap_link,
@@ -901,6 +902,183 @@ def test_lifecycle_empty_model_is_noop_byte_identical():
 
     assert lifecycle_bound_problem_model(model, _LB_NOW) == {}
     assert model.model_dump() == before
+
+
+# auto_archive_stale_problem_model_items — enhanced lifecycle with live_direction_ids
+# ---------------------------------------------------------------------------
+
+
+def test_auto_archive_gap_under_threshold_never_touched():
+    """A gap under the healthy threshold (≤12 active) is never archived even
+    if it is inert — the function is count-gated and errs conservative."""
+    # 3 active gaps (well under MODEL_SIZE_HEALTHY_GAPS=12), all deferred and aged.
+    gaps = [
+        _deferred_gap(
+            f"g-stale-{i}",
+            GapDeferral(rationale="later", hold_until="2020-01-01T00:00:00"),
+            active_moves=[],
+        )
+        for i in range(3)
+    ]
+    model = ProblemModel(gaps=gaps)
+    before = model.model_dump()
+
+    summary = auto_archive_stale_problem_model_items(model, _LB_NOW)
+
+    assert summary == {}
+    assert model.model_dump() == before
+    assert all(g.status == "active" for g in model.gaps)
+
+
+def test_auto_archive_gap_over_threshold_actively_staffed_never_archived():
+    """A gap over the healthy threshold (>12 active) that is still actively
+    staffed by a live direction is NEVER archived — the live_direction_ids
+    gate protects it."""
+    # Create 13 active gaps (1 over the healthy threshold), all aged-deferred.
+    # The first one is staffed by a live direction.
+    live_staffed = _deferred_gap(
+        "g-staffed",
+        GapDeferral(
+            rationale="active work",
+            hold_until="2020-01-01T00:00:00",  # aged past
+        ),
+        active_moves=["d-live-1"],
+    )
+    inert_gaps = [
+        _deferred_gap(
+            f"g-inert-{i}",
+            GapDeferral(rationale="later", hold_until="2020-01-01T00:00:00"),
+            active_moves=[],
+        )
+        for i in range(MODEL_SIZE_HEALTHY_GAPS)
+    ]
+    model = ProblemModel(gaps=[live_staffed] + inert_gaps)
+    live_ids = frozenset({"d-live-1"})
+
+    summary = auto_archive_stale_problem_model_items(model, _LB_NOW, live_ids)
+
+    # The staffed gap must survive.
+    staffed_gap = next(g for g in model.gaps if g.id == "g-staffed")
+    assert staffed_gap.status == "active"
+    # The inert ones should be archived.
+    assert "gaps_lifecycle_archived" in summary
+
+
+def test_auto_archive_gap_over_threshold_inert_ttl_expired_archived():
+    """A gap over the healthy threshold, inert (no live staffing), with an
+    expired deferral TTL, gets correctly auto-archived."""
+    # Create 13 active gaps (1 over the healthy threshold), one is aged-deferred
+    # and unstaffed — that one should be archived.
+    aged = _deferred_gap(
+        "g-aged",
+        GapDeferral(
+            rationale="forgotten",
+            hold_until="2020-01-01T00:00:00",  # well in the past
+        ),
+        active_moves=[],
+    )
+    healthy_active = [
+        Gap(
+            id=f"g-active-{i}",
+            name=f"active {i}",
+            status="active",
+            opened="2026-06-01T00:00:00",
+            active_moves=[],
+        )
+        for i in range(MODEL_SIZE_HEALTHY_GAPS)
+    ]
+    model = ProblemModel(gaps=[aged] + healthy_active)
+
+    summary = auto_archive_stale_problem_model_items(model, _LB_NOW)
+
+    assert summary == {"gaps_lifecycle_archived": ["g-aged"]}
+    assert aged.id not in {g.id for g in model.gaps}
+    assert aged.id in {g.id for g in model.archived_gaps}
+    moved = next(g for g in model.archived_gaps if g.id == aged.id)
+    assert moved.status == "abandoned"
+    assert moved.closed == _LB_NOW
+    assert moved.history[-1].event == "lifecycle_auto_archived"
+
+
+def test_auto_archive_gap_with_live_direction_ids_stale_moves_can_be_archived():
+    """A gap whose active_moves contains ONLY stale (non-live) direction IDs
+    can be archived — the live_direction_ids cross-check proves inertness
+    even when active_moves is non-empty."""
+    gap = _deferred_gap(
+        "g-stale-moves",
+        GapDeferral(rationale="later", hold_until="2020-01-01T00:00:00"),
+        active_moves=["d-retired-1", "d-expired-2"],
+    )
+    # 12 healthy active gaps to push past threshold
+    healthy_gaps = [
+        Gap(
+            id=f"g-h-{i}",
+            name=f"healthy {i}",
+            status="active",
+            opened="2026-06-01T00:00:00",
+            active_moves=[],
+        )
+        for i in range(MODEL_SIZE_HEALTHY_GAPS)
+    ]
+    model = ProblemModel(gaps=[gap] + healthy_gaps)
+    # Only "d-live-1" is live — the gap's moves are all stale, so it IS inert.
+    live_ids = frozenset({"d-live-1", "d-live-2"})
+
+    summary = auto_archive_stale_problem_model_items(model, _LB_NOW, live_ids)
+
+    assert "gaps_lifecycle_archived" in summary
+    assert "g-stale-moves" in summary["gaps_lifecycle_archived"]
+
+
+def test_auto_archive_gap_undeferred_active_never_archived():
+    """A gap with no deferral is never archived even when over threshold and
+    unstaffed — the deferral guard is mandatory."""
+    gaps = [
+        Gap(
+            id=f"g-no-def-{i}",
+            name=f"no deferral {i}",
+            status="active",
+            opened="2026-01-01T00:00:00",
+            active_moves=[],
+        )
+        for i in range(MODEL_SIZE_HEALTHY_GAPS + 2)
+    ]
+    model = ProblemModel(gaps=gaps)
+    before = model.model_dump()
+
+    summary = auto_archive_stale_problem_model_items(model, _LB_NOW)
+
+    assert summary == {}
+    assert model.model_dump() == before
+    assert all(g.status == "active" for g in model.gaps)
+
+
+def test_auto_archive_delegates_from_lifecycle_wrapper():
+    """lifecycle_bound_problem_model delegates to
+    auto_archive_stale_problem_model_items — same behavior with empty
+    live_direction_ids."""
+    gap = _deferred_gap(
+        "g-aged",
+        GapDeferral(rationale="later", hold_until="2020-01-01T00:00:00"),
+    )
+    healthy_gaps = [
+        Gap(
+            id=f"g-h-{i}",
+            name=f"healthy {i}",
+            status="active",
+            opened="2026-06-01T00:00:00",
+            active_moves=[],
+        )
+        for i in range(MODEL_SIZE_HEALTHY_GAPS)
+    ]
+    model1 = ProblemModel(gaps=[gap] + healthy_gaps)
+    model2 = model1.model_copy(deep=True)
+
+    s1 = lifecycle_bound_problem_model(model1, _LB_NOW)
+    s2 = auto_archive_stale_problem_model_items(model2, _LB_NOW)
+
+    assert s1 == s2
+    assert model1.model_dump() == model2.model_dump()
 
 
 def test_apply_agent_update_caps_archived_gaps():
