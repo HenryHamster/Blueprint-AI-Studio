@@ -19256,3 +19256,474 @@ class TestVerificationOnlyCycleProductivity:
             has_non_spawn_findings=True,
         )
         assert productive is False
+
+
+# ---------------------------------------------------------------------------
+# DB-backed integration: decay-threshold path populates _salvage_candidates
+# ---------------------------------------------------------------------------
+
+
+class TestDecayThresholdDBIntegration:
+    """DB-backed integration tests for the salvage-bundle decay-threshold path.
+
+    These tests call _handle_research_completion() against real in-memory
+    Task/Project rows (not simulated local logic) and assert which prior-deferred
+    findings get bundled into a salvage task vs kept in the pool vs dropped.
+
+    Decay rules (from research_completion.py):
+      - ultra_low_confidence:        count >= 4  → salvage
+      - degradation_gate:            count >= 3  → salvage
+      - adversarial_gate:            count >= 3  → salvage
+      - prereq_deferred_same_cycle:  count >= 3  → salvage
+      - low_actionability:           count >= 3  → salvage (when challenge disabled)
+      - originally_researched_at older than TTL  → dropped (NOT salvaged)
+    """
+
+    # ------------------------------------------------------------------
+    # Shared test-data helpers
+    # ------------------------------------------------------------------
+
+    def _prior_finding(
+        self,
+        title: str,
+        direction_id: str,
+        deferred_reason: str,
+        deferred_count: int,
+        *,
+        originally_researched_at: str | None = None,
+    ) -> dict:
+        """Return a minimal prior-deferred finding with the given decay state."""
+        f: dict = {
+            "title": title,
+            "description": f"Description of {title}",
+            "prompt": f"Fix: {title}",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction_id,
+            "deferred_reason": deferred_reason,
+            "deferred_count": deferred_count,
+            "originally_researched_at": (
+                originally_researched_at
+                if originally_researched_at is not None
+                else _utcnow().isoformat()
+            ),
+        }
+        return f
+
+    async def _run_completion(
+        self, task, mocker, db_session, direction_id: str
+    ) -> None:
+        """Wire standard mocks and run _handle_research_completion."""
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[_make_finding("Sentinel", direction_id=direction_id)],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+    async def _get_salvage_tasks(self, task, db_session) -> list:
+        """Return child tasks that are salvage bundles for *task*."""
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        children = result.scalars().all()
+        return [
+            t
+            for t in children
+            if (t.context or {}).get("salvage_source_task_id") == str(task.id)
+        ]
+
+    # ------------------------------------------------------------------
+    # Happy-path: each decay reason creates a salvage bundle
+    # ------------------------------------------------------------------
+
+    @_pytest.mark.asyncio
+    async def test_ultra_low_confidence_count4_creates_salvage(
+        self, db_session, mocker
+    ):
+        """ultra_low_confidence deferred 4 times hits threshold → salvage bundle created."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-ulc01"
+        )
+        f = self._prior_finding(
+            "Low-confidence finding",
+            direction["id"],
+            "ultra_low_confidence",
+            4,
+        )
+        task.context = {**(task.context or {}), "prior_deferred_findings": [f]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 1, (
+            "Exactly one salvage bundle task must be spawned for a decayed finding"
+        )
+        salvage = salvage_list[0]
+        assert salvage.context.get("salvage_finding_count") == 1
+        payload = salvage.first_payload
+        assert payload["type"] == "salvage_bundle"
+        assert len(payload["salvaged_findings"]) == 1
+        entry = payload["salvaged_findings"][0]
+        assert entry["discard_reason"] == "ultra_low_confidence"
+        assert "Low-confidence finding" in entry["title"]
+
+    @_pytest.mark.asyncio
+    async def test_degradation_gate_count3_creates_salvage(self, db_session, mocker):
+        """degradation_gate deferred 3 times hits threshold → salvage bundle created."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-deg01"
+        )
+        f = self._prior_finding(
+            "Degradation-gated finding", direction["id"], "degradation_gate", 3
+        )
+        task.context = {**(task.context or {}), "prior_deferred_findings": [f]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 1
+        payload = salvage_list[0].first_payload
+        assert payload["salvaged_findings"][0]["discard_reason"] == "degradation_gate"
+
+    @_pytest.mark.asyncio
+    async def test_adversarial_gate_count3_creates_salvage(self, db_session, mocker):
+        """adversarial_gate deferred 3 times hits threshold → salvage bundle created."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-adv01"
+        )
+        f = self._prior_finding(
+            "Adversarial-gated finding", direction["id"], "adversarial_gate", 3
+        )
+        task.context = {**(task.context or {}), "prior_deferred_findings": [f]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 1
+        payload = salvage_list[0].first_payload
+        assert payload["salvaged_findings"][0]["discard_reason"] == "adversarial_gate"
+
+    @_pytest.mark.asyncio
+    async def test_prereq_deferred_same_cycle_count3_creates_salvage(
+        self, db_session, mocker
+    ):
+        """prereq_deferred_same_cycle deferred 3 times hits threshold → salvage bundle."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-prq01"
+        )
+        f = self._prior_finding(
+            "Co-deferred prerequisite finding",
+            direction["id"],
+            "prereq_deferred_same_cycle",
+            3,
+        )
+        task.context = {**(task.context or {}), "prior_deferred_findings": [f]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 1
+        payload = salvage_list[0].first_payload
+        assert payload["salvaged_findings"][0]["discard_reason"] == "prereq_deferred_same_cycle"
+
+    @_pytest.mark.asyncio
+    async def test_low_actionability_count3_creates_salvage_challenge_disabled(
+        self, db_session, mocker
+    ):
+        """low_actionability deferred 3 times decays into salvage when challenge is disabled.
+
+        _finding_challenge_enabled returns False by default (no runtime config),
+        so the finding immediately decays to salvage without spawning a challenge task.
+        """
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-low01"
+        )
+        f = self._prior_finding(
+            "Low-actionability finding", direction["id"], "low_actionability", 3
+        )
+        task.context = {**(task.context or {}), "prior_deferred_findings": [f]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 1, (
+            "low_actionability at count=3 must decay to salvage when challenge is disabled"
+        )
+        payload = salvage_list[0].first_payload
+        assert payload["salvaged_findings"][0]["discard_reason"] == "low_actionability"
+
+    # ------------------------------------------------------------------
+    # Edge cases: below threshold → kept; stale TTL → dropped (not salvaged)
+    # ------------------------------------------------------------------
+
+    @_pytest.mark.asyncio
+    async def test_ultra_low_confidence_count3_below_threshold_not_salvaged(
+        self, db_session, mocker
+    ):
+        """ultra_low_confidence at count=3 is NOT at threshold (needs >=4) → no salvage."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-ulc-below"
+        )
+        below = self._prior_finding(
+            "Not-yet-decayed ULC finding", direction["id"], "ultra_low_confidence", 3
+        )
+        task.context = {**(task.context or {}), "prior_deferred_findings": [below]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 0, (
+            "ultra_low_confidence at count=3 must NOT trigger salvage; threshold is >=4"
+        )
+        assert (task.context or {}).get("salvage_activity") is None
+
+    @_pytest.mark.asyncio
+    async def test_degradation_gate_count2_below_threshold_not_salvaged(
+        self, db_session, mocker
+    ):
+        """degradation_gate at count=2 is below threshold (needs >=3) → no salvage."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-deg-below"
+        )
+        below = self._prior_finding(
+            "Below-threshold degradation finding",
+            direction["id"],
+            "degradation_gate",
+            2,
+        )
+        task.context = {**(task.context or {}), "prior_deferred_findings": [below]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 0, (
+            "degradation_gate at count=2 must NOT trigger salvage; threshold is >=3"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_stale_ttl_finding_dropped_not_salvaged(self, db_session, mocker):
+        """Findings older than the TTL are silently dropped, NOT bundled into salvage.
+
+        The stale-discard gate (lines 1968-1997) removes findings before the
+        count-based decay check, so they never reach _salvage_candidates.
+        """
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-stale01"
+        )
+        stale = self._prior_finding(
+            "Stale finding",
+            direction["id"],
+            "ultra_low_confidence",
+            0,
+            # 10 days old: well past the 7-day default TTL
+            originally_researched_at=(
+                _utcnow() - timedelta(days=10)
+            ).isoformat(),
+        )
+        task.context = {**(task.context or {}), "prior_deferred_findings": [stale]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 0, (
+            "Stale-discarded findings (beyond TTL) must NOT enter the salvage bundle; "
+            "only count-threshold decayed findings are salvaged"
+        )
+        assert (task.context or {}).get("salvage_activity") is None
+
+    # ------------------------------------------------------------------
+    # Mixed-findings: only decayed ones enter the bundle
+    # ------------------------------------------------------------------
+
+    @_pytest.mark.asyncio
+    async def test_mixed_findings_only_decayed_enter_salvage(
+        self, db_session, mocker
+    ):
+        """Mix: decayed → salvage; below-threshold → kept; stale → silently dropped."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-mix01"
+        )
+        at_threshold = self._prior_finding(
+            "Decayed finding", direction["id"], "degradation_gate", 3
+        )
+        below_threshold = self._prior_finding(
+            "Kept finding", direction["id"], "degradation_gate", 2
+        )
+        stale = self._prior_finding(
+            "Stale finding",
+            direction["id"],
+            "ultra_low_confidence",
+            0,
+            originally_researched_at=(
+                _utcnow() - timedelta(days=10)
+            ).isoformat(),
+        )
+        task.context = {
+            **(task.context or {}),
+            "prior_deferred_findings": [at_threshold, below_threshold, stale],
+        }
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 1, (
+            "Exactly one salvage bundle should exist; only the at-threshold finding decays"
+        )
+        payload = salvage_list[0].first_payload
+        assert len(payload["salvaged_findings"]) == 1, (
+            "Only the at-threshold finding should appear in the salvage payload"
+        )
+        assert "Decayed finding" in payload["salvaged_findings"][0]["title"]
+        assert payload["salvaged_findings"][0]["discard_reason"] == "degradation_gate"
+
+    @_pytest.mark.asyncio
+    async def test_multiple_decay_reasons_bundled_into_one_task(
+        self, db_session, mocker
+    ):
+        """Multiple findings with different decay reasons are consolidated into ONE salvage task."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-multi01"
+        )
+        findings = [
+            self._prior_finding("ULC finding", direction["id"], "ultra_low_confidence", 4),
+            self._prior_finding("DG finding", direction["id"], "degradation_gate", 3),
+            self._prior_finding("Adv finding", direction["id"], "adversarial_gate", 3),
+        ]
+        task.context = {**(task.context or {}), "prior_deferred_findings": findings}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 1, (
+            "All decayed findings must be consolidated into ONE salvage task"
+        )
+        salvage = salvage_list[0]
+        assert salvage.context.get("salvage_finding_count") == 3
+        payload = salvage.first_payload
+        assert len(payload["salvaged_findings"]) == 3
+        reasons = {f["discard_reason"] for f in payload["salvaged_findings"]}
+        assert reasons == {"ultra_low_confidence", "degradation_gate", "adversarial_gate"}
+
+    # ------------------------------------------------------------------
+    # Payload fidelity: rich context is preserved in salvage entries
+    # ------------------------------------------------------------------
+
+    @_pytest.mark.asyncio
+    async def test_salvage_payload_preserves_rich_finding_context(
+        self, db_session, mocker
+    ):
+        """The salvage payload preserves title, prompt, description, direction_id,
+        related_files, and discard_reason for each decayed finding."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-ctx01"
+        )
+        decayed: dict = {
+            "title": "Cache miss in list view",
+            "description": "Every page load misses the Redis cache",
+            "prompt": "Add Redis caching to the list endpoint",
+            "priority": "high",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+            "direction_id": direction["id"],
+            "related_files": ["backend/app/routers/admin_digest.py"],
+            "deferred_reason": "ultra_low_confidence",
+            "deferred_count": 4,
+            "originally_researched_at": _utcnow().isoformat(),
+        }
+        task.context = {**(task.context or {}), "prior_deferred_findings": [decayed]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 1
+        entry = salvage_list[0].first_payload["salvaged_findings"][0]
+        assert entry["title"] == "Cache miss in list view"
+        assert entry["discard_reason"] == "ultra_low_confidence"
+        assert entry["direction_id"] == direction["id"]
+        assert entry["prompt"] == "Add Redis caching to the list endpoint"
+        assert entry["description"] == "Every page load misses the Redis cache"
+        assert entry["related_files"] == ["backend/app/routers/admin_digest.py"]
+
+    # ------------------------------------------------------------------
+    # Parent-task context: salvage_activity is recorded after decay
+    # ------------------------------------------------------------------
+
+    @_pytest.mark.asyncio
+    async def test_salvage_activity_recorded_on_parent_task_after_decay(
+        self, db_session, mocker
+    ):
+        """salvage_activity context key is populated on the research task after decay salvage."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-act01"
+        )
+        f = self._prior_finding(
+            "Repeatedly deferred", direction["id"], "degradation_gate", 3
+        )
+        task.context = {**(task.context or {}), "prior_deferred_findings": [f]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        assert salvage_activity is not None, (
+            "salvage_activity must be written to the parent task context after decay salvage"
+        )
+        assert salvage_activity["salvaged_count"] == 1
+        assert "salvage_task_id" in salvage_activity
+        assert "salvaged_at" in salvage_activity
+
+    @_pytest.mark.asyncio
+    async def test_no_salvage_activity_when_all_below_threshold(
+        self, db_session, mocker
+    ):
+        """No salvage_activity is recorded when no findings reach the decay threshold."""
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dcyint-noact01"
+        )
+        # count=2 for degradation_gate — one short of the threshold
+        f = self._prior_finding("Near-miss finding", direction["id"], "degradation_gate", 2)
+        task.context = {**(task.context or {}), "prior_deferred_findings": [f]}
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_completion(task, mocker, db_session, direction["id"])
+
+        assert (task.context or {}).get("salvage_activity") is None, (
+            "salvage_activity must NOT appear when no findings were salvaged"
+        )
+        salvage_list = await self._get_salvage_tasks(task, db_session)
+        assert len(salvage_list) == 0
