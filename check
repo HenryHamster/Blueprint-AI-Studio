@@ -250,23 +250,6 @@ if touches "backend/"; then
   fi
 fi
 
-if touches "local-domexception/"; then
-  run "local-domexception install" bash -c 'cd "local-domexception" && npm ci'
-  if [ "$FULL_SCOPE" = "1" ]; then
-    run "local-domexception lint" bash -c 'cd "local-domexception" && npx eslint .'
-  else
-    : > /tmp/check_local-domexception_lint.txt
-    printf '%s\n' "$CHANGED" | grep -E '^local-domexception/.*\.(ts|tsx|js|jsx|cjs|mjs)$' | while IFS= read -r f; do
-      [ -f "$f" ] && printf '%s\0' "${f#local-domexception/}" >> /tmp/check_local-domexception_lint.txt
-    done
-    if [ -s /tmp/check_local-domexception_lint.txt ]; then
-      run "local-domexception lint (changed)" bash -c 'cd "local-domexception" && xargs -0 -a /tmp/check_local-domexception_lint.txt npx eslint 2>&1'
-    else
-      echo "[check] no changed JS/TS files in local-domexception, skipping lint"
-    fi
-  fi
-  run "local-domexception build" bash -c 'cd "local-domexception" && npm run build'
-fi
 
 if [ ${#FAILED[@]} -eq 0 ]; then
   echo ""
