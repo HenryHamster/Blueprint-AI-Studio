@@ -6492,6 +6492,81 @@ class TestWarmVMSkipProvision:
             assert "project spend budget" in (row.latest_status_message or "")
 
     @pytest.mark.asyncio
+    async def test_monthly_budget_defers_dispatch(self, orch_warm_db, mocker):
+        """When the monthly budget is exhausted, queued tasks are deferred with a
+        per-project message via _project_resource_dispatch_defer_message."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        # Mock the monthly budget check to report exhaustion (150% of target).
+        budget_mock = mocker.patch(
+            "app.orchestrator.check_monthly_budget",
+            new_callable=AsyncMock,
+            return_value=(True, 1.5),
+        )
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Budget Capped",
+                    user_id=_TEST_USER,
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                queued = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    context={},
+                )
+                session.add(queued)
+                await session.commit()
+                await session.refresh(queued)
+                queued_id = queued.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        prov_mock.assert_not_called()
+        budget_mock.assert_awaited_once()
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .one()
+            )
+            assert row.status == TaskStatus.QUEUED
+            assert "monthly budget" in (row.latest_status_message or "")
+
+    @pytest.mark.asyncio
     async def test_no_resource_envelope_dispatches_under_global_gate(
         self, orch_warm_db, mocker
     ):

@@ -98,6 +98,7 @@ from app.state_persistence import (
     _persist_self_healing_state_bundle,
 )
 from app.storage import upload_json_payload  # noqa: F401 — app.orchestrator patch surface
+from app.monthly_budget_alerts import check_monthly_budget  # noqa: F401 — re-export for tests patching app.orchestrator.check_monthly_budget
 import app.shared_state as _shared_state
 from app.shared_state import (
     runtime_config as _runtime_config,
@@ -631,6 +632,7 @@ async def _project_resource_dispatch_defer_message(
     *,
     project_cache: dict[uuid.UUID, Project | None] | None = None,
     spend_cache: dict[uuid.UUID, tuple[float, float, int]] | None = None,
+    budget_exhausted: bool = False,
 ) -> str | None:
     """Return an operator-readable resource-envelope deferral reason, if any."""
     if project_cache is not None and task.project_id in project_cache:
@@ -654,30 +656,41 @@ async def _project_resource_dispatch_defer_message(
             )
 
     spend_ceiling = resolve_project_spend_ceiling(project)
-    if spend_ceiling is None:
-        return None
 
-    spend_window_days = resolve_project_spend_window_days(project)
-    if spend_cache is not None and task.project_id in spend_cache:
-        recent_spend, spend_ceiling, spend_window_days = spend_cache[task.project_id]
-    else:
-        spend_breakdown = await get_project_recent_spend_usd(
-            session,
-            project_id=task.project_id,
-            window_days=spend_window_days,
-        )
-        recent_spend = spend_breakdown["total"]
-        if spend_cache is not None:
-            spend_cache[task.project_id] = (
-                recent_spend,
-                spend_ceiling,
-                spend_window_days,
+    # Per-project spend ceiling check — only runs when a ceiling is configured.
+    if spend_ceiling is not None:
+        spend_window_days = resolve_project_spend_window_days(project)
+        if spend_cache is not None and task.project_id in spend_cache:
+            recent_spend, spend_ceiling, spend_window_days = spend_cache[task.project_id]
+        else:
+            spend_breakdown = await get_project_recent_spend_usd(
+                session,
+                project_id=task.project_id,
+                window_days=spend_window_days,
             )
-    if recent_spend >= spend_ceiling:
+            recent_spend = spend_breakdown["total"]
+            if spend_cache is not None:
+                spend_cache[task.project_id] = (
+                    recent_spend,
+                    spend_ceiling,
+                    spend_window_days,
+                )
+        if recent_spend >= spend_ceiling:
+            return (
+                "Waiting for project spend budget — "
+                f"${recent_spend:.2f}/${spend_ceiling:.2f} spent in the last "
+                f"{spend_window_days} day(s)"
+            )
+
+    # Monthly budget gate: when fleet-wide month-to-date spend has reached 100%
+    # of monthly_budget_target_usd, defer all projects with queued tasks until
+    # the budget resets or the target is raised. Operates independently of the
+    # per-project spend ceiling above so projects without a spend_ceiling_usd
+    # (the default) are still gated when the fleet-wide budget is exhausted.
+    if budget_exhausted:
         return (
-            "Waiting for project spend budget — "
-            f"${recent_spend:.2f}/${spend_ceiling:.2f} spent in the last "
-            f"{spend_window_days} day(s)"
+            "Waiting for monthly budget — "
+            "fleet-wide spend has exceeded the monthly budget target"
         )
     return None
 
@@ -688,6 +701,8 @@ async def _filter_project_resource_dispatch_eligible(
     candidate_tasks: list[Task],
     project_active_counts: dict[uuid.UUID, int],
     broadcast_to_project,
+    *,
+    budget_exhausted: bool = False,
 ) -> list[uuid.UUID]:
     """Drop resource-deferred tasks before the global slot slice."""
     task_by_id = {task.id: task for task in candidate_tasks}
@@ -710,6 +725,7 @@ async def _filter_project_resource_dispatch_eligible(
                 projected_counts,
                 project_cache=project_cache,
                 spend_cache=spend_cache,
+                budget_exhausted=budget_exhausted,
             )
         except Exception as exc:
             logger.exception(
@@ -761,6 +777,36 @@ async def _filter_project_resource_dispatch_eligible(
         except Exception:
             logger.exception("[ORCHESTRATOR] Failed to broadcast ceiling_restored for %s", _pid)
     _shared_state.project_ceiling_deferred_ids = _current_ceiling_deferred
+
+    # Broadcast per-project monthly-budget state transitions.  When the
+    # fleet-wide monthly budget is exhausted, every project that has queued
+    # tasks is deferred.  Transitions mirror the spend_ceiling pattern above
+    # so the admin-ui surfaces the same throttle indicators.
+    _current_monthly_deferred: set[str] = set()
+    if budget_exhausted:
+        _current_monthly_deferred = {
+            str(t.project_id) for t in task_by_id.values() if t is not None
+        }
+    _prev_monthly = _shared_state.monthly_budget_deferred_project_ids
+    for _pid in _current_monthly_deferred - _prev_monthly:
+        try:
+            await broadcast_to_project(
+                _pid, "project_monthly_budget_deferred", {"project_id": _pid}
+            )
+        except Exception:
+            logger.exception(
+                "[ORCHESTRATOR] Failed to broadcast monthly_budget_deferred for %s", _pid
+            )
+    for _pid in _prev_monthly - _current_monthly_deferred:
+        try:
+            await broadcast_to_project(
+                _pid, "project_monthly_budget_restored", {"project_id": _pid}
+            )
+        except Exception:
+            logger.exception(
+                "[ORCHESTRATOR] Failed to broadcast monthly_budget_restored for %s", _pid
+            )
+    _shared_state.monthly_budget_deferred_project_ids = _current_monthly_deferred
 
     if session.dirty:
         await session.commit()
@@ -934,7 +980,6 @@ async def orchestrator_worker():
     from app.evergreen_backlog import check_evergreen_fill as _check_evergreen_fill
     from app.rollup_management import _verify_pr_merged
     from app.broadcast import broadcast_to_project, manager as ws_manager
-    from app.monthly_budget_alerts import check_monthly_budget
     from app.services import (
         _recover_orphaned_tasks,
         _sweep_post_commit_pending,
@@ -2360,18 +2405,9 @@ async def orchestrator_worker():
                     eligible_ids, candidate_tasks, _runtime_config, slots_available
                 )
 
-                eligible_ids = await _filter_project_resource_dispatch_eligible(
-                    session,
-                    eligible_ids,
-                    candidate_tasks,
-                    project_active_counts,
-                    broadcast_to_project,
-                )
-
-                # Monthly budget gate: if month-to-date spend has reached 100% of
-                # monthly_budget_target_usd, defer all remaining eligible tasks with a
-                # message indicating the budget gate is active. This check is fail-open
-                # (any exception silently passes through).
+                # Monthly budget gate: check BEFORE the resource dispatch filter
+                # so budget_exhausted is available for per-project deferral
+                # decisions. Fail-open (any exception silently passes through).
                 try:
                     budget_exhausted, usage_ratio = await check_monthly_budget(session)
                 except Exception:
@@ -2380,19 +2416,26 @@ async def orchestrator_worker():
                         "[ORCHESTRATOR] Monthly budget check failed — treating as not exhausted"
                     )
 
-                if budget_exhausted and eligible_ids:
+                eligible_ids = await _filter_project_resource_dispatch_eligible(
+                    session,
+                    eligible_ids,
+                    candidate_tasks,
+                    project_active_counts,
+                    broadcast_to_project,
+                    budget_exhausted=budget_exhausted,
+                )
+
+                # Fleet-wide monthly-budget informational broadcast (follows
+                # the zone-exhaustion pattern). Per-project deferral messaging
+                # and state transitions are handled inside
+                # _filter_project_resource_dispatch_eligible above.
+                if budget_exhausted:
                     _shared_state.monthly_budget_gate_engaged = True
-                    _deferred_count = len(eligible_ids)
-                    eligible_ids = []
-                    # Use a broad WS broadcast so the admin UI / agent surfaces
-                    # see the throttle signal regardless of which project triggered
-                    # the exhaustion (follows the zone-exhaustion pattern).
                     if _is_cadence_due(_last_budget_gate_log, 60, _utcnow()):
                         _last_budget_gate_log = _utcnow()
                         logger.info(
-                            "[ORCHESTRATOR] Monthly budget exhausted (%.1f%% of target) — deferring %d queued tasks",
+                            "[ORCHESTRATOR] Monthly budget exhausted (%.1f%% of target) — deferring eligible tasks",
                             usage_ratio * 100 if usage_ratio else 100.0,
-                            _deferred_count,
                         )
                         try:
                             await ws_manager.broadcast_to_all(

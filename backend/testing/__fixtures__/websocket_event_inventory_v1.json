@@ -1186,6 +1186,38 @@
       "workbench_resource": null
     },
     {
+      "callee": "broadcast_to_project",
+      "canonical_callee": "broadcast_to_project",
+      "classification": "legacy_project_event",
+      "event": "project_monthly_budget_deferred",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 795,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "dict:project_id",
+      "scope": "_filter_project_resource_dispatch_eligible",
+      "source_path": "backend/app/orchestrator.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
+      "callee": "broadcast_to_project",
+      "canonical_callee": "broadcast_to_project",
+      "classification": "legacy_project_event",
+      "event": "project_monthly_budget_restored",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 802,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "dict:project_id",
+      "scope": "_filter_project_resource_dispatch_eligible",
+      "source_path": "backend/app/orchestrator.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
       "callee": "ws_manager.broadcast_to_all",
       "canonical_callee": "broadcast_to_all",
       "classification": "legacy_global_event",
