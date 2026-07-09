@@ -5008,3 +5008,315 @@ async def test_lifecycle_status_query_filter_works(
     assert consumed_after.status_code == 200
     consumed_after_ids = [d["id"] for d in consumed_after.json()["documents"]]
     assert str(doc.id) in consumed_after_ids
+
+
+# ── build_pending_followups: additional edge-case coverage ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_cross_project_isolation(db_session):
+    """Pending docs from a different project must NOT appear in another project's followups."""
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project_a = make_project(name="BPF-cross-A")
+    project_b = make_project(name="BPF-cross-B")
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = make_task(
+        project_id=project_a.id,
+        title="task in project A",
+        status=TaskStatus.COMPLETED,
+    )
+    task_b = make_task(
+        project_id=project_b.id,
+        title="task in project B",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task_a)
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # A pending design doc owned by project B
+    doc_b = KnowledgeDocument(
+        project_id=project_b.id,
+        source_task_id=task_b.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Project B Design",
+        summary="Belongs to project B.",
+        body="# B",
+        lifecycle_status="pending",
+    )
+    # A pending web_research doc owned by project A
+    doc_a = KnowledgeDocument(
+        project_id=project_a.id,
+        source_task_id=task_a.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Project A Research",
+        summary="Belongs to project A.",
+        body="# A",
+        lifecycle_status="pending",
+    )
+    db_session.add(doc_a)
+    db_session.add(doc_b)
+    await db_session.commit()
+
+    entries_a = await build_pending_followups(db_session, project_a.id)
+    ids_a = {e["id"] for e in entries_a}
+    assert str(doc_a.id) in ids_a
+    assert str(doc_b.id) not in ids_a, "doc from project B must NOT appear in project A's followups"
+
+    entries_b = await build_pending_followups(db_session, project_b.id)
+    ids_b = {e["id"] for e in entries_b}
+    assert str(doc_b.id) in ids_b
+    assert str(doc_a.id) not in ids_b, "doc from project A must NOT appear in project B's followups"
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_newest_first_ordering(db_session):
+    """Pending followups are returned newest-first by created_at."""
+    from datetime import datetime, timedelta
+
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-order")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = make_task(project_id=project.id, title="task 1", status=TaskStatus.COMPLETED)
+    t2 = make_task(project_id=project.id, title="task 2", status=TaskStatus.COMPLETED)
+    t3 = make_task(project_id=project.id, title="task 3", status=TaskStatus.COMPLETED)
+    db_session.add(t1)
+    db_session.add(t2)
+    db_session.add(t3)
+    await db_session.commit()
+    await db_session.refresh(t1)
+    await db_session.refresh(t2)
+    await db_session.refresh(t3)
+
+    base = datetime(2026, 3, 1, 10, 0, 0)
+    d_old = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t1.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Oldest doc",
+        summary="Oldest",
+        body="# old",
+        lifecycle_status="pending",
+        created_at=base,
+    )
+    d_mid = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t2.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Middle doc",
+        summary="Middle",
+        body="# mid",
+        lifecycle_status="pending",
+        created_at=base + timedelta(hours=1),
+    )
+    d_new = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t3.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Newest doc",
+        summary="Newest",
+        body="# new",
+        lifecycle_status="pending",
+        created_at=base + timedelta(hours=2),
+    )
+    db_session.add(d_old)
+    db_session.add(d_mid)
+    db_session.add(d_new)
+    await db_session.commit()
+
+    entries = await build_pending_followups(db_session, project.id)
+    titles = [e["title"] for e in entries]
+    assert titles == ["Newest doc", "Middle doc", "Oldest doc"]
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_summary_truncation(db_session):
+    """Summaries longer than the cap are collapsed (whitespace) and truncated with '…'."""
+    from app.knowledge_query import (
+        _PENDING_LIFECYCLE_ITEMS_SUMMARY_CHARS,
+        build_pending_followups,
+    )
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-trunc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id, title="trunc task", status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Build a summary longer than the cap; pad with spaces so whitespace collapse doesn't help
+    long_summary = "word " * 200  # ~1000 chars when collapsed
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Design with long summary",
+        summary=long_summary,
+        body="# Body",
+        lifecycle_status="pending",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    entries = await build_pending_followups(db_session, project.id)
+    assert len(entries) == 1
+    summary = entries[0]["summary"]
+    # Must end with the ellipsis sentinel
+    assert summary.endswith("…"), f"Expected truncated summary ending with '…', got: {summary!r}"
+    # Must not exceed the cap
+    assert len(summary) <= _PENDING_LIFECYCLE_ITEMS_SUMMARY_CHARS, (
+        f"Truncated summary length {len(summary)} exceeds cap {_PENDING_LIFECYCLE_ITEMS_SUMMARY_CHARS}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_respects_limit_cap(db_session):
+    """build_pending_followups returns at most `limit` entries."""
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-limit")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create 5 tasks + docs
+    tasks = []
+    for i in range(5):
+        t = make_task(project_id=project.id, title=f"limit task {i}", status=TaskStatus.COMPLETED)
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.commit()
+    for t in tasks:
+        await db_session.refresh(t)
+
+    for i, t in enumerate(tasks):
+        d = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=t.id,
+            source_kind=SourceKind.DESIGN.value,
+            title=f"Doc {i}",
+            summary=f"Summary {i}",
+            body=f"# {i}",
+            lifecycle_status="pending",
+        )
+        db_session.add(d)
+    await db_session.commit()
+
+    # Default limit (20) returns all 5
+    entries_all = await build_pending_followups(db_session, project.id)
+    assert len(entries_all) == 5
+
+    # Custom limit of 2 returns at most 2
+    entries_limited = await build_pending_followups(db_session, project.id, limit=2)
+    assert len(entries_limited) == 2
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_entry_fields_shape(db_session):
+    """Each entry carries id, title, summary, topic, source_kind, direction_id, created_at, and tags."""
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-shape")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id, title="shape task", status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Field-shape check",
+        summary="Summary for shape check.",
+        body="# Body",
+        topic="shape-topic",
+        direction_id="d-aabbccdd",
+        tags=["tag1", "tag2"],
+        lifecycle_status="pending",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    entries = await build_pending_followups(db_session, project.id)
+    assert len(entries) == 1
+    e = entries[0]
+
+    assert e["id"] == str(doc.id)
+    assert e["title"] == "Field-shape check"
+    assert e["summary"] == "Summary for shape check."
+    assert e["topic"] == "shape-topic"
+    assert e["source_kind"] == SourceKind.WEB_RESEARCH.value
+    assert e["direction_id"] == "d-aabbccdd"
+    assert e["tags"] == ["tag1", "tag2"]
+    assert e["created_at"] is not None  # ISO timestamp string
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_excludes_research_audit(db_session):
+    """research_audit docs are excluded from the follow-up lifecycle (only design + web_research appear)."""
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-audit")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t_audit = make_task(project_id=project.id, title="audit task", status=TaskStatus.COMPLETED)
+    t_design = make_task(project_id=project.id, title="design task", status=TaskStatus.COMPLETED)
+    db_session.add(t_audit)
+    db_session.add(t_design)
+    await db_session.commit()
+    await db_session.refresh(t_audit)
+    await db_session.refresh(t_design)
+
+    doc_audit = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t_audit.id,
+        source_kind=SourceKind.RESEARCH_AUDIT.value,
+        title="Research audit doc",
+        summary="Audit output.",
+        body="# Audit",
+        lifecycle_status="pending",
+    )
+    doc_design = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t_design.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Regular design doc",
+        summary="Design output.",
+        body="# Design",
+        lifecycle_status="pending",
+    )
+    db_session.add(doc_audit)
+    db_session.add(doc_design)
+    await db_session.commit()
+
+    entries = await build_pending_followups(db_session, project.id)
+    ids = {e["id"] for e in entries}
+    assert str(doc_design.id) in ids, "design doc should appear"
+    assert str(doc_audit.id) not in ids, "research_audit doc must NOT appear in lifecycle followups"

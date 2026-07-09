@@ -23,6 +23,7 @@ import {
   buildSweepComparisonSection,
   buildPayloadStalenessSection,
   buildCompletionDebtSection,
+  buildPendingFollowupsSection,
 } from './strategic-sections.js';
 import { buildThinkerPrompt } from '../prompts/thinker.js';
 
@@ -2580,5 +2581,246 @@ describe('buildDirectionPortfolioSection', () => {
     expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
     expect(result).not.toContain('ALL_SATURATED');
     expect(result).toContain('BELOW_MINIMUM');
+  });
+});
+
+describe('buildPendingFollowupsSection', () => {
+  it('returns empty string for undefined input', () => {
+    expect(buildPendingFollowupsSection(undefined)).toBe('');
+  });
+
+  it('returns empty string for null input', () => {
+    expect(buildPendingFollowupsSection(null)).toBe('');
+  });
+
+  it('returns empty string for empty array', () => {
+    expect(buildPendingFollowupsSection([])).toBe('');
+  });
+
+  it('returns empty string for non-array (object) input', () => {
+    expect(buildPendingFollowupsSection({ id: 'x', title: 'Y' })).toBe('');
+  });
+
+  it('renders header and entry count for a single pending doc', () => {
+    const followups = [
+      {
+        id: 'abc-123',
+        title: 'Performance Analysis',
+        summary: 'Summary of performance findings.',
+        source_kind: 'design',
+        topic: 'perf',
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('## Pending Knowledge Follow-ups');
+    expect(result).toContain('1 design/web_research document(s)');
+    expect(result).toContain('abc-123');
+    expect(result).toContain('Performance Analysis');
+    expect(result).toContain('[design]');
+  });
+
+  it('renders topic when present', () => {
+    const followups = [
+      {
+        id: 'doc-1',
+        title: 'Caching Study',
+        summary: 'Overview.',
+        source_kind: 'web_research',
+        topic: 'caching-layer',
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('topic: caching-layer');
+  });
+
+  it('renders tags when present (up to 5)', () => {
+    const followups = [
+      {
+        id: 'doc-tags',
+        title: 'Tagged Doc',
+        summary: 'A tagged doc.',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: ['alpha', 'beta', 'gamma'],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('[alpha, beta, gamma]');
+  });
+
+  it('omits topic when null', () => {
+    const followups = [
+      {
+        id: 'doc-notopic',
+        title: 'No Topic Doc',
+        summary: 'No topic here.',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).not.toContain('topic:');
+  });
+
+  it('renders direction_id when present', () => {
+    const followups = [
+      {
+        id: 'doc-dir',
+        title: 'Direction-linked Doc',
+        summary: 'Has a direction.',
+        source_kind: 'web_research',
+        topic: null,
+        direction_id: 'd-11223344',
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('Direction: d-11223344');
+  });
+
+  it('omits direction line when direction_id is null', () => {
+    const followups = [
+      {
+        id: 'doc-nodir',
+        title: 'No Direction Doc',
+        summary: 'Has no direction.',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).not.toContain('Direction:');
+  });
+
+  it('renders summary when non-empty', () => {
+    const followups = [
+      {
+        id: 'doc-sum',
+        title: 'Doc with summary',
+        summary: 'This is the summary text.',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('This is the summary text.');
+  });
+
+  it('renders age as "(today)" for a same-day timestamp', () => {
+    const followups = [
+      {
+        id: 'doc-today',
+        title: 'Today Doc',
+        summary: '',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('(today)');
+  });
+
+  it('renders age as "(Nd ago)" for an older timestamp', () => {
+    const pastDate = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const followups = [
+      {
+        id: 'doc-old',
+        title: 'Old Doc',
+        summary: '',
+        source_kind: 'web_research',
+        topic: null,
+        direction_id: null,
+        created_at: pastDate,
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('d ago');
+  });
+
+  it('includes consume and dismiss action hints', () => {
+    const followups = [
+      {
+        id: 'doc-action',
+        title: 'Action Hints Doc',
+        summary: '',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('consume-knowledge-followup');
+    expect(result).toContain('dismiss-knowledge-followup');
+  });
+
+  it('renders all entries when multiple followups are provided', () => {
+    const followups = [
+      {
+        id: 'doc-multi-1',
+        title: 'First Doc',
+        summary: 'First summary.',
+        source_kind: 'design',
+        topic: 'auth',
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: ['x'],
+      },
+      {
+        id: 'doc-multi-2',
+        title: 'Second Doc',
+        summary: 'Second summary.',
+        source_kind: 'web_research',
+        topic: 'billing',
+        direction_id: 'd-abcdef01',
+        created_at: new Date().toISOString(),
+        tags: ['y', 'z'],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('2 design/web_research document(s)');
+    expect(result).toContain('doc-multi-1');
+    expect(result).toContain('First Doc');
+    expect(result).toContain('doc-multi-2');
+    expect(result).toContain('Second Doc');
+    expect(result).toContain('Direction: d-abcdef01');
+  });
+
+  it('handles entry with no optional fields gracefully (no topic, no direction, no summary, no tags)', () => {
+    const followups = [
+      {
+        id: 'doc-bare',
+        title: 'Bare Doc',
+        source_kind: 'design',
+        // no summary, topic, direction_id, created_at, tags
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('Bare Doc');
+    expect(result).not.toContain('topic:');
+    expect(result).not.toContain('Direction:');
   });
 });
