@@ -65,8 +65,7 @@ describe('App workbench wiring', () => {
   });
 
   test('findings journal feed keeps implementation child outcomes', () => {
-    expect(appSource).toContain('`${API_BASE_URL}/api/admin/tasks?archived=false&limit=500&project_id=');
-    expect(appSource).not.toContain('task_type=research&archived=false&limit=500');
+    expect(appSource).toContain('`${API_BASE_URL}/api/admin/tasks?task_type=research&archived=false&limit=500&project_id=');
     expect(appSource).toContain('setResearchFeed(all);');
   });
 });

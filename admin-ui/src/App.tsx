@@ -328,7 +328,7 @@ export default function App() {
     const pid = selectedProjectId;
     let cancelled = false;
     apiFetch(
-      `${API_BASE_URL}/api/admin/tasks?archived=false&limit=500&project_id=${encodeURIComponent(pid)}`,
+      `${API_BASE_URL}/api/admin/tasks?task_type=research&archived=false&limit=500&project_id=${encodeURIComponent(pid)}`,
     )
       .then(async res => {
         if (!res.ok || cancelled) return;
