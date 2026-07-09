@@ -1388,6 +1388,7 @@ async def apply_post_spawn_state(
             file_overlap_count=file_overlap_count,
             type_filtered_count=type_filtered_count,
             empty_prompt_count=empty_prompt_count,
+            filtered_findings=filtered_findings,
         )
     except IntegrityError as _dup_exc:
         if "ux_task_active_idempotency_key" not in str(_dup_exc):
@@ -1454,6 +1455,7 @@ async def _apply_terminal_transition(
     file_overlap_count: int,
     type_filtered_count: int,
     empty_prompt_count: int,
+    filtered_findings: List[Dict[str, Any]] | None = None,
 ) -> None:
     """Flip the research task to its post-spawn status and commit.
 
@@ -1529,9 +1531,26 @@ async def _apply_terminal_transition(
         _note_filter = (
             ("; ".join(_note_parts) + ".") if _note_parts else "not actionable."
         )
+        # Surface individual filtered finding titles + reasons (up to 10) so
+        # the strategist can distinguish correctly-filtered noise from findings
+        # wrongly dropped — aggregate counts alone are not enough.
+        _filtered_detail_parts = []
+        if filtered_findings:
+            _ff_list = list(filtered_findings)
+            _cap = 10
+            for i, ff in enumerate(_ff_list[:_cap]):
+                _title = (ff.get("title") or "?")[:120]
+                _reason = (ff.get("reason") or "")[:80]
+                _filtered_detail_parts.append(f"'{_title}' ({_reason})")
+            if len(_ff_list) > _cap:
+                _filtered_detail_parts.append(f"and {len(_ff_list) - _cap} more")
+            _detail_line = " Filtered: " + "; ".join(_filtered_detail_parts) + "."
+        else:
+            _detail_line = ""
         note = (
             f"Research cycle {task.id} found {len(findings)} findings but created 0 tasks: "
             + _note_filter
+            + _detail_line
         )
         project = await session.get(Project, task.project_id)
         if project and str(direction_id) != "?" and direction_id != "crosscutting":
