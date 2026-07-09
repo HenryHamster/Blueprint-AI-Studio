@@ -753,11 +753,14 @@ async def _resolve_quality_grader_completion(
     # Registry-driven (keyed by TaskCapability.completion_handler) so any
     # blast-radius knowledge type can opt into the same escalation/resume path
     # without another hardcoded entry.
+    from app.task_completion import _handle_compute_experiment_completion
+
     _resume_handlers = {
         "research": _handle_research_completion,
         "security_audit": _handle_security_audit_completion,
         "web_research": _handle_web_research_completion,
         "design": _handle_design_completion,
+        "compute_experiment": _handle_compute_experiment_completion,
     }
     source_type = (source.first_payload or {}).get("type")
     cap = get_task_capability(source_type)

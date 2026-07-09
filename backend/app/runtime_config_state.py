@@ -301,6 +301,27 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # Independent adversarial verification for compute experiment results.
+    # Checkpoint 1 from the v18 Verified Delivery design.  When enabled, a
+    # compute-experiment task whose criterion is self-declared as met is
+    # independently graded by an adversarial grader BEFORE it completes, to
+    # catch common failure modes (measurable=False reported as SUCCESS, score
+    # inflation, infra-vs-capability confusion).
+    # DARK by default (False) — must be explicitly enabled per project.
+    "compute_verification_enabled": os.getenv(
+        "COMPUTE_VERIFICATION_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    # Verification mode for compute experiment grading.
+    #   "advisory"  — (default) record the verdict + notifiy, never block.
+    #   "soft_gate" — record + notify, warn prominently on reject.
+    #   "hard_gate" — block SUCCESS when the grader rejects (future use).
+    "compute_verification_mode": os.getenv(
+        "COMPUTE_VERIFICATION_MODE", "advisory"
+    ).lower()
+    if os.getenv("COMPUTE_VERIFICATION_MODE", "advisory").lower()
+    in ("advisory", "soft_gate", "hard_gate")
+    else "advisory",
     # Graduated rollout mode for the safeguard merge-gate challenge.
     # Mirrors strategic_retirement_challenge_gate_mode.
     #   "off"     — no challenge; gate held unconditionally on any
