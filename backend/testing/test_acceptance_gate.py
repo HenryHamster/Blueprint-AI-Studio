@@ -259,6 +259,28 @@ def test_named_test_several_seams_one_matches_passes():
     assert "semantically grounded" in verdict.reason
 
 
+def test_named_test_cross_cutting_invariants_passes_semantic_grounding():
+    """A named_test declaring test_invariants.py — a cross-cutting test whose
+    stem 'invariants' does not match any single production module — passes
+    semantic grounding because the test validates invariants spanning multiple
+    modules and is intrinsically grounded when the PR ships a non-test change."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_invariants.py",
+        },
+        changed_files=[
+            "backend/app/research_direction_state.py",
+            "backend/testing/test_invariants.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "semantically grounded" in verdict.reason
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # observable_behavior / downstream_artifact — checkable subset
 # ─────────────────────────────────────────────────────────────────────────────

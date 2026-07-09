@@ -218,6 +218,16 @@ def _paths_match(changed: str, declared: str) -> bool:
     return changed.rsplit("/", 1)[-1] == declared.rsplit("/", 1)[-1]
 
 
+# Cross-cutting/shared test files that validate invariants or integrations
+# spanning multiple production modules (not tied to any single module).
+# These are exempt from the per-module stem-match heuristic in
+# _test_semantically_grounded because their name does not follow the
+# test_<module>.py convention — add new cross-cutting entries here.
+_CROSS_CUTTING_TEST_FILES: frozenset[str] = frozenset({
+    "backend/testing/test_invariants.py",
+})
+
+
 def _test_semantically_grounded(
     declared_test_path: str, seam_files: list[str]
 ) -> bool:
@@ -243,6 +253,12 @@ def _test_semantically_grounded(
     for path in seam_files:
         prod_basename = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         if prod_basename == test_stem:
+            return True
+    # Cross-cutting test files (e.g., test_invariants.py) do not map to a
+    # single production module — accept them as intrinsically grounded when
+    # any non-test production seam exists (already verified by the caller).
+    for known in _CROSS_CUTTING_TEST_FILES:
+        if _paths_match(known, declared_test_path):
             return True
     return False
 
