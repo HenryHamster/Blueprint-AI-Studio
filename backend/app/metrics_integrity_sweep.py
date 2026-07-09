@@ -77,6 +77,7 @@ Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -1671,7 +1672,7 @@ async def check_near_cap_size_warning(ctx: SweepContext) -> List[CheckResult]:
 
         # Near-cap: apply chronic classification.
         try:
-            history = parse_bump_history(rel, "backend")
+            history = await asyncio.to_thread(parse_bump_history, rel, "backend")
             is_chronic = _is_chronic_offender(history)
         except Exception:  # noqa: BLE001 — classification is advisory; never propagate
             is_chronic = False

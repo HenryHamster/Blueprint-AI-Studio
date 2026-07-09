@@ -810,6 +810,10 @@ class Project(SQLModel, table=True):
         current = (self.running_update or "").rstrip()
         self.running_update = f"{current}\n{line}" if current else line
 
+    __table_args__ = (
+        Index("ix_project_github_owner_repo", "github_owner", "github_repo"),
+    )
+
     @classmethod
     def not_archived(cls):
         """Canonical "project is not archived" filter expression.

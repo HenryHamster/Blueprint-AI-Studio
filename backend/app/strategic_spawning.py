@@ -4515,7 +4515,8 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
             routine_violations.append(v)
             continue
         try:
-            verdict = classify_breach(
+            verdict = await asyncio.to_thread(
+                classify_breach,
                 module_key=v["rel"],
                 current_size=v["count"],
                 section=v.get("section", "backend"),

@@ -1,5 +1,5 @@
 /* eslint-disable react-refresh/only-export-components */
-import { useState } from 'react';
+import { memo, useMemo, useState } from 'react';
 import { ChevronRight, ChevronDown, AlertTriangle, ArrowDownRight, ArrowUpRight, Search, Loader2, TrendingUp, TrendingDown, Minus } from 'lucide-react';
 import type { SrCatchRateHealthResponse } from '../api';
 import {
@@ -870,28 +870,29 @@ function CategoryRow({
   );
 }
 
-export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClick, srCatchRateTargets, onConfigureTargets, onSpawnSrInvestigation, activeInvestigationTaskIds, srCatchRateHealth }: SrTrendBreakdownProps) {
+export const SrTrendBreakdown = memo(function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClick, srCatchRateTargets, onConfigureTargets, onSpawnSrInvestigation, activeInvestigationTaskIds, srCatchRateHealth }: SrTrendBreakdownProps) {
   const categories = trends?.categories;
-  if (!categories || Object.keys(categories).length === 0) return null;
-  const entries = sortedEntries(categories);
+  const entries = useMemo(() => categories ? sortedEntries(categories) : [], [categories]);
 
-  const cycleLabel = (() => {
+  const cycleLabel = useMemo(() => {
     if (trends?.bucket_mode === 'cycle' && trends.current_cycle_id) {
       const cur = trends.current_cycle_id.slice(-6);
       const prev = trends.previous_cycle_id ? trends.previous_cycle_id.slice(-6) : '–';
       return `cycle ${cur} vs ${prev}`;
     }
     return null;
-  })();
+  }, [trends]);
   const promptVersionLabel = trends?.prompt_version
     ? `prompt v=${trends.prompt_version.slice(0, 7)}`
     : null;
 
   const skipRate = trends?.sr_skip_rate;
   const skipDist = trends?.sr_skip_reason_distribution;
-  const topSkipReason = skipDist && Object.keys(skipDist).length > 0
+  const topSkipReason = useMemo(() => skipDist && Object.keys(skipDist).length > 0
     ? Object.entries(skipDist).sort(([, a], [, b]) => b - a)[0]
-    : null;
+    : null, [skipDist]);
+
+  if (!categories || Object.keys(categories).length === 0) return null;
 
   if (variant === 'card') {
     return (
@@ -1049,4 +1050,4 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClic
       ))}
     </div>
   );
-}
+});

@@ -5,6 +5,7 @@ size cap. All HTTP routes, request/response schemas, and authentication rules
 are unchanged.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -718,7 +719,8 @@ async def agent_annotate(
         assert file_path is not None
         assert change_summary is not None
 
-        verdict = _classify_breach_policy(
+        verdict = await asyncio.to_thread(
+            _classify_breach_policy,
             file_path.strip(),
             current_size,
             payload.section,

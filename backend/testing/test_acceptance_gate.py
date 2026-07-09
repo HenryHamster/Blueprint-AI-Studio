@@ -211,6 +211,55 @@ def test_named_test_unverified_merge_fails_closed():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# named_test — semantic grounding
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_named_test_unrelated_seam_fails_closed():
+    """A declared test whose module name does not match the changed production
+    seam fails closed — test_widget.py cannot be proven by a change to
+    unrelated_module.py, even though the diff has both test + production files
+    and CI ran green."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=[
+            "backend/app/unrelated_module.py",
+            "backend/testing/test_widget.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert "does not semantically correspond" in verdict.reason
+    assert verdict.proven is False
+
+
+def test_named_test_several_seams_one_matches_passes():
+    """When multiple production files change and at least one matches the test
+    module name, the semantic grounding check passes."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=[
+            "backend/app/unrelated_module.py",
+            "backend/app/widget.py",
+            "backend/testing/test_widget.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "semantically grounded" in verdict.reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # observable_behavior / downstream_artifact — checkable subset
 # ─────────────────────────────────────────────────────────────────────────────
 
