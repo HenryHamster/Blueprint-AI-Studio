@@ -541,8 +541,15 @@ async def fleet_runners_health_summary(
     """
     now = _utcnow()
 
+    # Cap the detailed breakdown at a sensible limit to prevent unbounded
+    # payload growth as the fleet scales. The aggregate counts reflect only
+    # the loaded subset; if the fleet exceeds this cap, ``limit_reached``
+    # is set so consumers know the details are a sample.
+    _MAX_HEALTH_RUNNERS = 1000
     result = await session.execute(
-        select(LocalRunner).where(LocalRunner.status != "deleted")
+        select(LocalRunner)
+        .where(LocalRunner.status != "deleted")
+        .limit(_MAX_HEALTH_RUNNERS)
     )
     all_runners = result.scalars().all()
 
@@ -596,4 +603,6 @@ async def fleet_runners_health_summary(
     fleet["per_project"] = per_project_entries
     fleet["generated_at"] = now.isoformat()
     fleet["project_count"] = len(per_project_entries)
+    fleet["limit_reached"] = len(all_runners) >= _MAX_HEALTH_RUNNERS
+    fleet["max_runners"] = _MAX_HEALTH_RUNNERS
     return fleet

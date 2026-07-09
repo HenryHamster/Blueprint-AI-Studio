@@ -1,5 +1,6 @@
 """Unified health overview endpoint."""
 
+import asyncio
 import time
 import uuid
 import logging
@@ -435,7 +436,7 @@ async def _compute_health_overview(
 
     # Zone health (needed for remediation hints)
     try:
-        zone_summary = get_zone_health_summary()
+        zone_summary = await asyncio.to_thread(get_zone_health_summary)
     except Exception:  # noqa: BLE001 — best-effort hint input, never fail the overview
         zone_summary = {"available": 0, "exhausted": []}
 

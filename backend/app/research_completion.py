@@ -2876,11 +2876,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         ]
                     ),
                 )
+                .limit(500)
+                .order_by(Task.updated_at.desc())
             )
         )
         .scalars()
         .all()
     )
+    if len(existing_tasks) >= 500:
+        logger.warning(
+            "[SPAWN] active-tasks scan hit cap=500 — word-overlap dedup "
+            "is truncated; consider filtering by project to reduce result size"
+        )
     # Build compact active-task overlap candidates for region-identity dedup:
     # (direction_id, title, task_type, related_files, claims). The related_files
     # (4th element) are the necessary signal for region matching — a spawned task
@@ -2907,11 +2914,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     Task.project_id == task.project_id,
                     Task.created_at >= ninety_days_ago,
                 )
+                .limit(500)
             )
         )
         .scalars()
         .all()
     )
+    if len(recent_tasks_for_dedup) >= 500:
+        logger.warning(
+            "[SPAWN] recent-tasks scan hit cap=500 — hash-based dedup "
+            "is truncated; consider adding index or reducing window"
+        )
     # Bounded projecting query for memo dedup — avoids filtering the full 90-day
     # task scan in Python by projecting only the JSONB field we need.
     _memo_hash_rows = (

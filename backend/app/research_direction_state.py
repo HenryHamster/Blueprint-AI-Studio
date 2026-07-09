@@ -341,7 +341,7 @@ async def _maybe_autocomplete_exhausted_direction(
     )
 
     if await direction_owns_uncovered_criterion(session, task.project_id, did):
-        logger.info(
+        logger.warning(
             f"[RESEARCH] Exhaustion auto-complete deferred for direction {did}: "
             f"owns uncovered acceptance criteria (task {task.id})"
         )
@@ -1067,7 +1067,7 @@ async def apply_post_spawn_state(
                                     f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
                                 )
                         elif total_merged >= 3 and _owns_uncovered:
-                            logger.info(
+                            logger.warning(
                                 f"[RESEARCH] Criterion-coverage gate: direction {did} "
                                 f"saturated ({total_merged} verified merges) but owns "
                                 f"an uncovered acceptance criterion — staying active"

@@ -1365,7 +1365,7 @@ async def get_project_diagnostics(
     circuit_breaker = _format_circuit_breaker(cb_raw)
 
     try:
-        zone_health = get_zone_health_summary()
+        zone_health = await asyncio.to_thread(get_zone_health_summary)
     except Exception:
         zone_health = {"available": 0, "exhausted": []}
 
@@ -1566,7 +1566,7 @@ async def get_global_diagnostics(
     }
 
     try:
-        zone_health = get_zone_health_summary()
+        zone_health = await asyncio.to_thread(get_zone_health_summary)
     except Exception:
         zone_health = {"available": 0, "exhausted": []}
 

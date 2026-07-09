@@ -1694,6 +1694,24 @@ async def orchestrator_worker():
                 # 50 NULL-launcher candidates = 50 redundant Project SELECTs
                 # every cycle.
                 _project_user_cache: Dict[uuid.UUID, str] = {}
+                # Pre-warm the project cache for tasks without a launcher so the
+                # eligibility loop and dispatch section never issue per-task
+                # Project SELECTs.
+                _null_launcher_pids = {
+                    t.project_id
+                    for t in candidate_tasks
+                    if not t.launched_by_user_id
+                }
+                if _null_launcher_pids:
+                    _proj_rows = (
+                        await session.execute(
+                            select(Project.id, Project.user_id).where(
+                                Project.id.in_(_null_launcher_pids)
+                            )
+                        )
+                    ).all()
+                    for _pid, _uid in _proj_rows:
+                        _project_user_cache[_pid] = _uid
 
                 async def _user_has_available_account(task: Task) -> bool:
                     user_id = task.launched_by_user_id
@@ -1793,6 +1811,10 @@ async def orchestrator_worker():
                 # distinct failed prerequisite (flushed after the loop), rather
                 # than one alert per cancelled dependent.
                 _cascade_cancel_by_prereq: dict[uuid.UUID, dict] = {}
+                # Batch collect status-message updates for pending-dep tasks so
+                # they can be flushed in one query after the loop instead of N
+                # individual _dep_session.get() calls (one per pending-dep task).
+                _pending_dep_msg_updates: list[tuple[uuid.UUID, str]] = []
                 from app.failure_classification import (
                     is_non_death_cancellation as _is_non_death_cancellation,
                 )
@@ -1982,20 +2004,42 @@ async def orchestrator_worker():
                         ]
                         dep_msg = f"Waiting on {len(pending)} dep{'s' if len(pending) != 1 else ''}: {', '.join(pending[:3])}"
                         if pending and task.latest_status_message != dep_msg:
-                            try:
-                                async with AsyncSessionLocal() as _dep_session:
-                                    _dep_task = await _dep_session.get(Task, task.id)
-                                    if (
-                                        _dep_task
-                                        and _dep_task.latest_status_message != dep_msg
-                                    ):
-                                        _dep_task.latest_status_message = dep_msg
-                                        _dep_session.add(_dep_task)
-                                        await _dep_session.commit()
-                            except Exception:
-                                logger.exception(
-                                    f"[ORCHESTRATOR] Failed to update dep wait message for task {task.id}"
+                            # Defer the DB write — batch-flush below in one
+                            # session/query instead of N individual queries.
+                            _pending_dep_msg_updates.append((task.id, dep_msg))
+
+                # Batch flush pending-dep status-message updates: one query for
+                # all tasks instead of N individual _dep_session.get() calls.
+                if _pending_dep_msg_updates:
+                    try:
+                        async with AsyncSessionLocal() as _dep_batch_session:
+                            dep_ids = [tid for tid, _ in _pending_dep_msg_updates]
+                            _dep_rows = (
+                                (
+                                    await _dep_batch_session.execute(
+                                        select(Task).where(Task.id.in_(dep_ids))
+                                    )
                                 )
+                                .scalars()
+                                .all()
+                            )
+                            _dep_task_by_id = {t.id: t for t in _dep_rows}
+                            _to_add = []
+                            for tid, msg in _pending_dep_msg_updates:
+                                _t = _dep_task_by_id.get(tid)
+                                if _t is not None and _t.latest_status_message != msg:
+                                    _t.latest_status_message = msg
+                                    _to_add.append(_t)
+                            if _to_add:
+                                for _t in _to_add:
+                                    _dep_batch_session.add(_t)
+                                await _dep_batch_session.commit()
+                    except Exception:
+                        logger.exception(
+                            "[ORCHESTRATOR] Failed to batch flush dep wait messages "
+                            "for %d tasks",
+                            len(_pending_dep_msg_updates),
+                        )
 
                 # Flush accumulated cascade-cancels: raise ONE deduplicated
                 # operator alert per distinct failed prerequisite that cancelled

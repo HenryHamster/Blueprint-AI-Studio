@@ -15300,6 +15300,84 @@ async def test_criterion_gate_query_error_defers_autocomplete(
 
 
 @_pytest.mark.asyncio
+async def test_criterion_gate_failure_logs_warning(db_session, mocker, caplog):
+    """When direction_owns_uncovered_criterion encounters a DB error, the
+    fail-closed block must emit a WARNING log so operators can distinguish
+    transient-query-failure blocks from legitimate uncovered-criterion defers."""
+    from app.models import Direction
+    from app.research_direction_state import apply_post_spawn_state
+
+    direction_id = "d-cov-fail-warn"
+    project, task, _direction = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row's criterion_keys at the real (uncovered) criterion.
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    # Ensure task context carries direction_id so apply_post_spawn_state can
+    # find the current direction for the no-findings cycle entry.
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Force the coverage resolution to raise; the helper must swallow it and
+    # return True (fail-closed), deferring retirement.
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(side_effect=RuntimeError("transient DB error")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.research_direction_state"):
+        await apply_post_spawn_state(
+            db_session,
+            task,
+            [],   # findings
+            [],   # child_tasks
+            [],   # deduplicated
+            [],   # insights
+            [],   # direction_notes
+            [],   # direction_proposals
+            0,    # hash_dedup_count
+            0,    # word_overlap_count
+            0,    # file_overlap_count
+            0,    # evidence_overlap_count
+            0,    # type_filtered_count
+            0,    # empty_prompt_count
+            "research-branch",
+            "main",
+            0,    # research_depth
+            None, # parent_research_task_id
+        )
+
+    assert "Criterion-coverage gate" in caplog.text, (
+        "A criterion-gate block on DB error must emit a WARNING log "
+        "so operators can distinguish transient failures from legitimate defers"
+    )
+    # Verify the direction was NOT auto-completed (fail-closed).
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "A coverage-query error must fail closed (defer), never auto-complete "
+        "a saturated direction on a transient failure"
+    )
+    assert target.get("auto_completed") is not True
+
+
+@_pytest.mark.asyncio
 async def test_no_findings_exhausted_direction_with_uncovered_criterion_stays_active(
     db_session,
 ):

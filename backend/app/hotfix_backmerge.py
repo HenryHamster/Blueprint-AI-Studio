@@ -280,6 +280,45 @@ async def _emit_size_violation_alerts(
     ERROR alerts the title is stable (no bucket) so the dedup is project-wide
     and persistent until dismissed.
     """
+    # ── Pre-load existing alert titles for dedup ──────────────────────
+    all_possible_titles: list[str] = []
+    for _v in violations:
+        _section = _v["section"]
+        _rel = _v["rel"]
+        _count = _v["count"]
+        _cap = _v["cap"]
+        if _cap is None:
+            _bucket = (_count // 100) * 100
+            all_possible_titles.append(
+                f"Uncapped module in back-merge: {_section}/{_rel} (~{_bucket} lines, no cap)"
+            )
+        else:
+            _bucket = (_count // 100) * 100
+            all_possible_titles.append(
+                f"Module size violation in back-merge: {_section}/{_rel} (~{_bucket} lines, cap {_cap})"
+            )
+            all_possible_titles.append(
+                f"Chronic size offender: {_section}/{_rel} (decomposition required)"
+            )
+
+    existing_titles: set[str] = set()
+    if all_possible_titles:
+        _rows = (
+            (
+                await session.execute(
+                    select(Alert.title).where(
+                        Alert.project_id == project_id,
+                        Alert.title.in_(all_possible_titles),
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        existing_titles = set(_rows)
+        _rows = None  # Free result set before the main loop
+
     for v in violations:
         section = v["section"]
         rel = v["rel"]
@@ -295,20 +334,7 @@ async def _emit_size_violation_alerts(
                 f"Uncapped module in back-merge: {section}/{rel} "
                 f"(~{bucket} lines, no cap)"
             )
-            existing_uncapped = (
-                (
-                    await session.execute(
-                        select(Alert).where(
-                            Alert.project_id == project_id,
-                            Alert.title == uncapped_title,
-                            Alert.dismissed_at.is_(None),
-                        )
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if existing_uncapped is not None:
+            if uncapped_title in existing_titles:
                 logger.debug(
                     "[BACKMERGE] uncapped module alert already open for %s/%s; skipping",
                     section,
@@ -383,20 +409,7 @@ async def _emit_size_violation_alerts(
             )
             severity = AlertSeverity.WARNING
 
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.title == alert_title,
-                        Alert.dismissed_at.is_(None),
-                    )
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if existing is not None:
+        if alert_title in existing_titles:
             logger.debug(
                 "[BACKMERGE] size violation alert already open for %s/%s; skipping",
                 section,

@@ -57,6 +57,12 @@ _TERMINAL_RECORD_B64 = base64.b64encode(
 
 logger = logging.getLogger(__name__)
 
+
+def _load_result_json(result_path: str) -> Any:
+    """Synchronous helper for run_preflight_smoke — offloaded via asyncio.to_thread
+    so that file I/O and json.loads don't block the event loop."""
+    return json.loads(Path(result_path).read_text(encoding="utf-8"))
+
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
 _SERIAL_REASON_PREFIX = "BLUEPRINT_COMPUTE_REASON="
@@ -393,7 +399,9 @@ async def run_preflight_smoke(
         declared_metric_value: float | None = None
         if declared_metric and os.path.exists(result_path):
             try:
-                parsed = json.loads(Path(result_path).read_text(encoding="utf-8"))
+                parsed = await asyncio.to_thread(
+                    _load_result_json, result_path
+                )
                 if isinstance(parsed, dict):
                     val = parsed.get(declared_metric)
                     if isinstance(val, (int, float)) and not isinstance(val, bool):
@@ -531,34 +539,32 @@ class LocalSubprocessComputeBackend:
                 metadata=metadata,
             )
         started_at = _utcnow()
-        os.makedirs(_local_state_dir_for_external_id(external_id), exist_ok=True)
-        _write_local_state_text(
-            _local_started_at_path_for_external_id(external_id),
-            started_at.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+        started_at_iso = started_at.replace(tzinfo=timezone.utc).isoformat().replace(
+            "+00:00", "Z"
         )
-        _remove_local_terminal_status_for_external_id(external_id)
+        # Offload sync file I/O (os.makedirs, _write_local_state_text, os.remove)
+        # to a thread-pool thread so the event loop is not blocked during job launch.
+        await asyncio.to_thread(_launch_setup_state_dir, external_id, started_at_iso)
         env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
         env.update(spec.env or {})
-        proc = subprocess.Popen(
-            [
-                "bash",
-                "-lc",
-                _build_local_wrapper_command(
-                    spec.command,
-                    external_id=external_id,
-                    setup_step=spec.setup_step,
-                    container_image=spec.container_image,
-                    container_registry_auth=spec.container_registry_auth,
-                    cwd=spec.cwd,
-                    env=spec.env,
-                    repo_clone=spec.repo_clone,
-                ),
-            ],
-            cwd=spec.cwd or None,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+        wrapper_command = _build_local_wrapper_command(
+            spec.command,
+            external_id=external_id,
+            setup_step=spec.setup_step,
+            container_image=spec.container_image,
+            container_registry_auth=spec.container_registry_auth,
+            cwd=spec.cwd,
+            env=spec.env,
+            repo_clone=spec.repo_clone,
+        )
+        # Offload subprocess.Popen to a thread-pool thread — Popen itself is fast
+        # but its preexec_fn / env setup can block the event loop.
+        _cmd = ["bash", "-lc", wrapper_command]
+        proc = await asyncio.to_thread(
+            _launch_spawn_subprocess,
+            _cmd,
+            spec.cwd or None,
+            env,
         )
         self._processes[external_id] = _LocalProcessHandle(
             proc=proc, started_at=started_at
@@ -574,7 +580,8 @@ class LocalSubprocessComputeBackend:
     async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
         handle = self._processes.get(job.external_compute_id or "")
         if handle is None:
-            terminal = _read_local_terminal_status(job)
+            # Offload sync file I/O to a thread-pool thread.
+            terminal = await asyncio.to_thread(_read_local_terminal_status, job)
             if terminal is not None:
                 return terminal
             pid = _local_subprocess_pid(job)
@@ -584,12 +591,13 @@ class LocalSubprocessComputeBackend:
                     message="local subprocess no longer tracked and no pid was persisted",
                     finished_at=_utcnow(),
                 )
-            if _is_pid_running(pid):
+            if await asyncio.to_thread(_is_pid_running, pid):
+                live_output = await asyncio.to_thread(_read_local_live_tail, job)
                 return ComputeStatusResult(
                     status=ComputeJobStatus.RUNNING,
-                    live_output=_read_local_live_tail(job),
+                    live_output=live_output,
                 )
-            terminal = _read_local_terminal_status(job)
+            terminal = await asyncio.to_thread(_read_local_terminal_status, job)
             if terminal is not None:
                 return terminal
             return ComputeStatusResult(
@@ -599,12 +607,13 @@ class LocalSubprocessComputeBackend:
             )
         return_code = handle.proc.poll()
         if return_code is None:
+            live_output = await asyncio.to_thread(_read_local_live_tail, job)
             return ComputeStatusResult(
                 status=ComputeJobStatus.RUNNING,
-                live_output=_read_local_live_tail(job),
+                live_output=live_output,
             )
         self._processes.pop(job.external_compute_id or "", None)
-        terminal = _read_local_terminal_status(job)
+        terminal = await asyncio.to_thread(_read_local_terminal_status, job)
         if terminal is not None:
             return terminal
         if return_code == 0:
@@ -2314,3 +2323,37 @@ async def _reconcile_from_durable_terminal_record(
     if not record:
         return None
     return _reconcile_terminal_record_to_status(record)
+
+
+# ---------------------------------------------------------------------------
+# Thread-pool helpers for LocalComputeBackend (avoids blocking the event loop
+# on sync file I/O and subprocess.Popen).
+# ---------------------------------------------------------------------------
+
+
+def _launch_setup_state_dir(external_id: str, started_at_iso: str) -> None:
+    """Bundle os.makedirs + _write_local_state_text + os.remove into one
+    thread-pool call so the event loop is not blocked three times."""
+    os.makedirs(_local_state_dir_for_external_id(external_id), exist_ok=True)
+    _write_local_state_text(
+        _local_started_at_path_for_external_id(external_id),
+        started_at_iso,
+    )
+    _remove_local_terminal_status_for_external_id(external_id)
+
+
+def _launch_spawn_subprocess(
+    cmd: list[str],
+    cwd: str | None,
+    env: dict[str, str],
+) -> subprocess.Popen:
+    """Spawn a subprocess inside a thread-pool thread so Popen's fork+exec
+    (and any preexec_fn/env setup overhead) does not block the event loop."""
+    return subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )

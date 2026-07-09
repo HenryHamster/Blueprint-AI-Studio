@@ -362,7 +362,7 @@ async def github_webhook(
                     _webhook_delivery_ids.popitem(last=False)
 
     event_type = request.headers.get("x-github-event")
-    data = json.loads(payload)
+    data = await asyncio.to_thread(json.loads, payload)
 
     logger.info(f"[WEBHOOK] Received {event_type} event (delivery={delivery_id})")
 

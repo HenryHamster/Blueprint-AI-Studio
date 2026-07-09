@@ -638,11 +638,10 @@ async def check_criterion_merge_evidence_gap(
 
     from app.acceptance_criteria import (
         get_criteria_for_version,
-        get_evidence_for_criterion,
     )
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY, acceptance_is_proven
     from app.landed_signal import has_landed_signal
-    from app.models import Project, Task, TaskStatus
+    from app.models import CriterionEvidence, Project, Task, TaskStatus
     from app.release_version import current_open_version
 
     projects = (
@@ -689,16 +688,24 @@ async def check_criterion_merge_evidence_gap(
 
         active_keys = {c.criterion_key for c in active_criteria}
         task_ids_with_task_merge_evidence: set[str] = set()
-        for criterion in active_criteria:
-            evidence = await get_evidence_for_criterion(ctx.session, criterion.id)
-            for row in evidence:
-                if (
-                    row.source_kind == "task_merge"
-                    and row.source_id
-                    and isinstance(row.detail, dict)
-                    and row.detail.get("proven") is True
-                ):
-                    task_ids_with_task_merge_evidence.add(str(row.source_id))
+        # Batch-fetch evidence for all active criteria in one query instead of
+        # issuing N individual queries (one per criterion).
+        active_criterion_ids = [c.id for c in active_criteria]
+        all_evidence = (
+            await ctx.session.execute(
+                select(CriterionEvidence)
+                .where(CriterionEvidence.criterion_id.in_(active_criterion_ids))
+                .order_by(CriterionEvidence.criterion_id, CriterionEvidence.recorded_at)
+            )
+        ).scalars().all()
+        for row in all_evidence:
+            if (
+                row.source_kind == "task_merge"
+                and row.source_id
+                and isinstance(row.detail, dict)
+                and row.detail.get("proven") is True
+            ):
+                task_ids_with_task_merge_evidence.add(str(row.source_id))
 
         tasks = (
             await ctx.session.execute(
@@ -3208,18 +3215,21 @@ async def check_criterion_evidence_count_integrity(
             summary_by_key[c_summary["criterion_key"]] = c_summary["evidence_count"]
 
         # Independently count CriterionEvidence rows per criterion (ground truth).
+        # Use a single GROUP BY query instead of N individual COUNT(*) queries.
         flagged_criteria: list[str] = []
         ok_count = 0
+        criterion_ids = [c.id for c in criteria]
+        count_rows = (
+            await ctx.session.execute(
+                select(CriterionEvidence.criterion_id, func.count().label("cnt"))
+                .where(CriterionEvidence.criterion_id.in_(criterion_ids))
+                .group_by(CriterionEvidence.criterion_id)
+            )
+        ).all()
+        count_by_cid: dict = {row[0]: row[1] for row in count_rows}
         for criterion in criteria:
             self_reported = summary_by_key.get(criterion.criterion_key, 0)
-            # Direct COUNT(*) — the simplest possible ground truth.
-            ground_truth = (
-                await ctx.session.execute(
-                    select(func.count())
-                    .select_from(CriterionEvidence)
-                    .where(CriterionEvidence.criterion_id == criterion.id)
-                )
-            ).scalar() or 0
+            ground_truth = count_by_cid.get(criterion.id, 0)
 
             if self_reported != ground_truth:
                 flagged_criteria.append(criterion.criterion_key)

@@ -2198,6 +2198,16 @@ class PoolVm(SQLModel, table=True):
     __table_args__ = (
         # Lease hot path: WHERE project_id = ? AND state = 'IDLE' AND <identity>.
         Index("ix_poolvm_project_state", "project_id", "state"),
+        # Standalone index for queries filtering only on state without project_id
+        # (warm_pool.py dispatcher queries PoolVm.state IN (...) without project_id).
+        Index("ix_poolvm_state", "state"),
+        # Index for JOINs on leased_task_id (warm_pool.py dispatching JOIN path).
+        Index("ix_poolvm_leased_task_id", "leased_task_id"),
+        # Index for idle-sweeper ordering/filtering on idle_since.
+        Index("ix_poolvm_idle_since", "idle_since"),
+        # Reversed composite for per-project-by-state queries (warm_pool.py
+        # lines 244-247, 302, 341-344) where state is the leading column.
+        Index("ix_poolvm_state_project", "state", "project_id"),
     )
 
 
