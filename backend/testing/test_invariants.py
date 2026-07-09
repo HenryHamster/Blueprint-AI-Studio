@@ -11908,3 +11908,54 @@ def test_retire_direction_op_gates_on_criterion_coverage():
         "The retire_direction op must gate on criterion coverage before retiring a "
         "direction."
     )
+
+
+def test_record_task_merge_evidence_gates_on_acceptance_is_proven():
+    """record_task_merge_evidence must gate on acceptance_is_proven before writing CriterionEvidence rows.
+
+    Regression guard: the evidence-quality gate (``_reject_unproven_merge_evidence``
+    wrapping ``acceptance_is_proven``) must be called inside
+    ``record_task_merge_evidence`` before any ``record_evidence`` call. This
+    ensures that only machine-checked proven tasks can record CriterionEvidence.
+    """
+    import ast
+    from pathlib import Path
+
+    ac_path = Path(__file__).resolve().parents[1] / "app" / "acceptance_criteria.py"
+    source = ac_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(ac_path))
+
+    gate_func_name = "_reject_unproven_merge_evidence"
+
+    # Find the record_task_merge_evidence async function
+    func: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "record_task_merge_evidence":
+            func = node
+            break
+
+    assert func is not None, (
+        "record_task_merge_evidence is no longer defined in acceptance_criteria.py. "
+        "Restore this function or update the invariant."
+    )
+
+    # Walk the function body to find calls to _reject_unproven_merge_evidence
+    gate_called = False
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call):
+            name = _ast_called_name(node)
+            if name == gate_func_name:
+                gate_called = True
+                break
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            name = _ast_called_name(node.value)
+            if name == gate_func_name:
+                gate_called = True
+                break
+
+    assert gate_called, (
+        f"'{gate_func_name}' is not called inside "
+        "record_task_merge_evidence in acceptance_criteria.py. "
+        "The acceptance_is_proven gate before recording CriterionEvidence rows "
+        "has been removed or renamed. Restore it."
+    )
