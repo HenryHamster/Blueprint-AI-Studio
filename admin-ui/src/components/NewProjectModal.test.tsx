@@ -237,3 +237,91 @@ describe('NewProjectModal onboarding steering', () => {
     );
   });
 });
+
+describe('NewProjectModal installation error banner', () => {
+  beforeEach(() => {
+    mocks.apiFetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('/auto-remediation')) {
+        return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
+      }
+      if (url.includes('/issue-implementation')) {
+        return new Response(JSON.stringify({ config: { enabled: false, trigger_label: 'auto:implement', max_per_hour: 5, max_concurrent: 2, base_branch: 'main', default_effort: 'medium' } }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+    mocks.previewOnboardProjectMock.mockResolvedValue({
+      build_config: {
+        language: 'python',
+        has_ci: false,
+        requires_ci_checks: true,
+        directories: [
+          {
+            path: 'backend/',
+            type: 'python',
+            lint_cmd: 'ruff check',
+            build_cmd: '',
+            test_cmd: '',
+            install_cmd: '',
+          },
+        ],
+      },
+      default_branch: 'main',
+      merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
+    });
+    mocks.onboardProjectMock.mockResolvedValue({
+      project_id: 'project-12345',
+      build_config: {},
+      default_branch: 'main',
+    });
+  });
+
+  it('renders actionable message and preserves raw error on preview failure when error contains "installation token"', async () => {
+    const user = userEvent.setup();
+    mocks.previewOnboardProjectMock.mockRejectedValue(
+      new Error('No installation token available -- cannot detect default branch.')
+    );
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+    const repoInput = await screen.findByPlaceholderText('owner/repo or https://github.com/owner/repo');
+    await user.type(repoInput, 'acme/platform');
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+
+    // Custom actionable message replaces the raw error (includes repo reference)
+    await screen.findByText(/Blueprint GitHub App isn't installed on acme\/platform/);
+    // Raw backend error is preserved as secondary text (with reduced opacity)
+    expect(screen.getByText(/No installation token available/)).toBeInTheDocument();
+  });
+
+  it('renders actionable message and preserves raw error on submit failure when error contains "installation token"', async () => {
+    const user = userEvent.setup();
+    mocks.onboardProjectMock.mockRejectedValue(
+      new Error('No installation token available -- cannot detect default branch.')
+    );
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+    const repoInput = await screen.findByPlaceholderText('owner/repo or https://github.com/owner/repo');
+    await user.type(repoInput, 'acme/platform');
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    await screen.findByText('Merge-gate draft');
+    await user.click(await screen.findByRole('button', { name: 'Create Project' }));
+
+    // Custom actionable message replaces the raw error (includes repo reference)
+    await screen.findByText(/Blueprint GitHub App isn't installed on acme\/platform/);
+    // Raw backend error is preserved as secondary text
+    expect(screen.getByText(/No installation token available/)).toBeInTheDocument();
+  });
+
+  it('renders raw error unchanged for errors that do not contain "installation token"', async () => {
+    const user = userEvent.setup();
+    mocks.previewOnboardProjectMock.mockRejectedValue(
+      new Error('Repository not found or access denied')
+    );
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+    const repoInput = await screen.findByPlaceholderText('owner/repo or https://github.com/owner/repo');
+    await user.type(repoInput, 'acme/platform');
+    await user.click(screen.getByRole('button', { name: 'Continue' }));
+
+    // The raw error is displayed unchanged (not transformed)
+    await screen.findByText('Repository not found or access denied');
+    // Custom message must NOT appear
+    expect(screen.queryByText(/Blueprint GitHub App isn't installed/)).toBeNull();
+  });
+});
