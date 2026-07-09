@@ -22,6 +22,7 @@ from app.efficiency_snapshot import (
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
     AXIS_PROMPT_STATIC_BYTES,
+    AXIS_TOTAL_COST_PER_VERIFIED_TASK,
     AXIS_REWORK_COST_SHARE,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
@@ -41,17 +42,20 @@ from app.efficiency_snapshot import (
     SELF_REPAIR_BURN_SHARE_KEY,
     SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
+    VERIFIED_TASK_DRIFT_MIN_COUNT,
     _PROMPT_STATIC_CONST_NAMES,
     _PROMPT_STATIC_PLAIN_CONST_NAMES,
     _TASK_TYPE_FOCUS_CONST_NAMES,
     _compute_checkpoint_loss_rate,
-    _extract_ts_plain_string_length,
-    _extract_ts_template_literal_length,
-    _compute_cold_start_breakdown_p50,
+    _compute_llm_cost_pricing_coverage,
     _compute_lane_cost_per_merged_pr,
     _compute_lane_warm_resume_rate,
-    _compute_llm_cost_pricing_coverage,
+    _compute_cold_start_breakdown_p50,
     _compute_prompt_static_bytes,
+    _compute_total_cost_per_verified_task,
+    _compute_verified_merge_count,
+    _extract_ts_plain_string_length,
+    _extract_ts_template_literal_length,
     _last_run_due,
     _task_llm_attempts,
     compute_current_axes,
@@ -1292,6 +1296,190 @@ def test_merged_count_excludes_rollup_parent():
     by_type = compute_vm_cost_by_task_type(tasks)
     total_merged = sum(b["merged_count"] for b in by_type)
     assert total_merged == 2, f"Expected 2 merged across types, got {total_merged}"
+
+
+def test_verified_merge_count_excludes_rollup_parent():
+    """Rollup parents must not be counted as verified merges alongside their children.
+
+    When a rollup lands, is_verified_merge is True on the parent AND on every
+    child. Counting the parent inflates the denominator of
+    AXIS_TOTAL_COST_PER_VERIFIED_TASK. The fix: exclude parent_task_id owners.
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+    parent_id = uuid.uuid4()
+
+    now = _utcnow()
+
+    # Rollup parent: verified merge, but should be excluded from count.
+    parent = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    parent.id = parent_id
+
+    # Two children: each verified merge, both should count.
+    child1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=3),
+        vm_stopped_at=now,
+        vm_spot=False,
+        parent_task_id=parent_id,
+    )
+    child2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=4),
+        vm_stopped_at=now,
+        vm_spot=False,
+        parent_task_id=parent_id,
+    )
+
+    tasks = [parent, child1, child2]
+
+    # Verified merge count must be 2 (children only), not 3.
+    verified = _compute_verified_merge_count(tasks)
+    assert verified == 2, f"Expected 2 verified merges (children only), got {verified}"
+
+    # Axis value must use verified denominator of 2.
+    value = _compute_total_cost_per_verified_task(tasks)
+    assert value is not None
+    # 3 tasks * 300s on-demand = 900s; rate ~0.0532/s => ~47.88 + 0 LLM
+    # Quick sanity: value > 0 and uses denominator 2.
+    assert value > 0
+
+
+def test_total_cost_per_verified_task_uses_verified_merge_not_merged_completion():
+    """Denominator is is_verified_merge, NOT is_merged_completion.
+
+    A task with pr_merged=True + unverified_merge_reason (degraded fall-open
+    merge) is is_merged_completion but NOT is_verified_merge. It must be excluded
+    from the AXIS_TOTAL_COST_PER_VERIFIED_TASK denominator.
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+    now = _utcnow()
+
+    # Verified merge: pr_merged=True, no unverified_merge_reason.
+    verified_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+
+    # Degraded fall-open merge: pr_merged=True WITH unverified_merge_reason.
+    # This is is_merged_completion=True but is_verified_merge=False.
+    unverified_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "ci_unavailable"},
+        },
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+
+    tasks = [verified_task, unverified_task]
+
+    # Verified count must be 1 (only the verified task), not 2.
+    verified = _compute_verified_merge_count(tasks)
+    assert verified == 1, (
+        f"Expected 1 verified merge (unverified fall-open excluded), got {verified}"
+    )
+
+    # Axis value exists and uses denominator 1.
+    value = _compute_total_cost_per_verified_task(tasks)
+    assert value is not None
+
+
+@pytest.mark.asyncio
+async def test_total_cost_per_verified_task_drift_suppression(db_session):
+    """Drift_pct is suppressed when verified_merge_count < 20, emitted at >= 20."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # Seed 19 verified-merge tasks (below the VERIFIED_TASK_DRIFT_MIN_COUNT floor).
+    for i in range(19):
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            vm_spot=False,
+        )
+        db_session.add(t)
+    await db_session.commit()
+
+    # Write first snapshot — becomes baseline.
+    snap1 = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    # Verify the denominator is recorded as 19 and axis has a value.
+    assert snap1.get("total_cost_per_verified_task_denominator") == 19
+    assert snap1.get(AXIS_TOTAL_COST_PER_VERIFIED_TASK) is not None
+
+    # Read drift: drift_pct must be None (below floor of 20).
+    drift_below = await read_baseline_with_drift(db_session, project.id)
+    axis_below = drift_below["axes"][AXIS_TOTAL_COST_PER_VERIFIED_TASK]
+    assert axis_below["current"] is not None
+    assert axis_below["baseline"] is not None
+    assert axis_below["drift_pct"] is None, (
+        f"Expected drift_pct=None when verified_count=19 < {VERIFIED_TASK_DRIFT_MIN_COUNT}"
+    )
+
+    # Add one more verified-merge task to reach 20.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    # Write second snapshot — now has 20 verified merges.
+    snap2 = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    assert snap2.get("total_cost_per_verified_task_denominator") == 20
+
+    # Read drift: drift_pct must be emitted (at floor).
+    drift_at = await read_baseline_with_drift(db_session, project.id)
+    axis_at = drift_at["axes"][AXIS_TOTAL_COST_PER_VERIFIED_TASK]
+    assert axis_at["current"] is not None
+    assert axis_at["baseline"] is not None
+    assert axis_at["drift_pct"] is not None, (
+        f"Expected drift_pct emitted when verified_count=20 >= {VERIFIED_TASK_DRIFT_MIN_COUNT}"
+    )
+    assert isinstance(axis_at["drift_pct"], (int, float))
+
+
+def test_total_cost_per_verified_task_in_all_axes():
+    """The new axis must be registered in ALL_AXES and AXIS_CONSUMERS."""
+    assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in ALL_AXES
+    assert AXIS_TOTAL_COST_PER_VERIFIED_TASK == "total_cost_per_verified_task"
+    assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in AXIS_CONSUMERS
 
 
 @pytest.mark.asyncio

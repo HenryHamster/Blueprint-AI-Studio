@@ -122,6 +122,14 @@ AXIS_LANE_WARM_RESUME_RATE = "lane_warm_resume_rate"
 AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 AXIS_PROMPT_STATIC_BYTES = "prompt_static_bytes"
 AXIS_LLM_CACHE_HIT_RATE = "llm_cache_hit_rate"
+AXIS_TOTAL_COST_PER_VERIFIED_TASK = "total_cost_per_verified_task"
+
+# Minimum verified-merge count before drift_pct is emitted for
+# AXIS_TOTAL_COST_PER_VERIFIED_TASK. Below this threshold the ratio is too noisy
+# (small denominator) and drift_pct is suppressed to None to avoid phantom
+# regression signals from early low-N windows.
+VERIFIED_TASK_DRIFT_MIN_COUNT = 20
+
 AXIS_REWORK_COST_SHARE = "rework_cost_share"
 
 # Guard threshold for prompt_static_bytes: alert when static prompt size exceeds
@@ -156,6 +164,7 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_CHECKPOINT_LOSS_RATE,
     AXIS_PROMPT_STATIC_BYTES,
     AXIS_LLM_CACHE_HIT_RATE,
+    AXIS_TOTAL_COST_PER_VERIFIED_TASK,
     AXIS_REWORK_COST_SHARE,
 )
 
@@ -211,6 +220,9 @@ AXIS_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_LLM_CACHE_HIT_RATE: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_TOTAL_COST_PER_VERIFIED_TASK: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_REWORK_COST_SHARE: {
@@ -294,6 +306,9 @@ _SNAPSHOT_HISTORY_MAX = 365
 #      constants in agent/src/prompt.ts) as a leading indicator for token budget growth.
 # v11: LLM spend axes became provider-cache-aware and pricing rows were refreshed
 #      for current Opus/Haiku/OpenAI Codex proxy rates.
+# v12: AXIS_TOTAL_COST_PER_VERIFIED_TASK added — total LLM+VM cost per verified
+#      merge (is_verified_merge denominator, rollup parents excluded), with a
+#      drift floor of ≥20 verified merges.
 # v12: rework_cost_share axis added — fraction of total LLM spend consumed by fix/
 #      re-attempt tasks, computed from the existing per-PR chain breakdown.
 METRIC_DEF_VERSION = "v12"
@@ -2560,6 +2575,47 @@ def _compute_llm_cache_hit_rate(tasks: list[Task]) -> float | None:
     return round(total_cache_read / total_input, 4)
 
 
+
+def _compute_total_cost_per_verified_task(tasks: list[Task]) -> float | None:
+    """Total LLM + VM cost / verified merge count (is_verified_merge, rollup parents excluded).
+
+    Mirrors the numerator aggregation of the existing cost axes (VM cost from
+    :func:`get_task_total_vm_cost_usd` + LLM cost from :func:`_task_llm_cost`)
+    but divides by the VERIFIED merge count — the subset of merged completions
+    whose PR was gated by a real CI/test verdict, excluding degraded fall-open
+    merges. Rollup parents are excluded so each rollup counts as N child
+    landings, not N+1.
+
+    Returns None when no verified merges exist in the window.
+    """
+    total_cost = 0.0
+    verified = 0
+    parent_ids = _rollup_parent_ids(tasks)
+    for t in tasks:
+        total_cost += get_task_total_vm_cost_usd(t)
+        llm_cost, _ = _task_llm_cost(t)
+        total_cost += llm_cost
+        if is_verified_merge(t) and t.id not in parent_ids:
+            verified += 1
+    if not verified:
+        return None
+    return round(total_cost / verified, 4)
+
+
+def _compute_verified_merge_count(tasks: list[Task]) -> int:
+    """Return the verified merge count (is_verified_merge, rollup parents excluded).
+
+    Companion to :func:`_compute_total_cost_per_verified_task` — stored alongside
+    the axis value in each snapshot so :func:`read_baseline_with_drift` can
+    suppress drift_pct when the denominator is below
+    :data:`VERIFIED_TASK_DRIFT_MIN_COUNT`.
+    """
+    parent_ids = _rollup_parent_ids(tasks)
+    return sum(
+        1 for t in tasks if is_verified_merge(t) and t.id not in parent_ids
+    )
+
+
 def _compute_rework_cost_share(tasks: list[Task]) -> float | None:
     """Fraction of total LLM spend consumed by fix/re-attempt (rework) tasks.
 
@@ -2575,6 +2631,8 @@ def _compute_rework_cost_share(tasks: list[Task]) -> float | None:
     """
     breakdown = compute_pr_rework_chain_breakdown(tasks)
     return breakdown.get("rework_share_of_total_llm_cost")
+
+
 
 
 def _compute_prompt_static_bytes() -> int | None:
@@ -2721,6 +2779,8 @@ async def compute_current_axes(
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
         AXIS_PROMPT_STATIC_BYTES: _compute_prompt_static_bytes(),
         AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
+        AXIS_TOTAL_COST_PER_VERIFIED_TASK: _compute_total_cost_per_verified_task(tasks),
+        "total_cost_per_verified_task_denominator": _compute_verified_merge_count(tasks),
         AXIS_REWORK_COST_SHARE: _compute_rework_cost_share(tasks),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
@@ -3421,6 +3481,14 @@ async def read_baseline_with_drift(
                     break
 
     axes: Dict[str, Dict[str, Any]] = {}
+    # Drift-suppression guard for AXIS_TOTAL_COST_PER_VERIFIED_TASK: when the
+    # verified-merge denominator in the latest snapshot is below the floor, suppress
+    # drift_pct so early low-N windows do not emit noisy drift. Mirrors the
+    # SELF_REPAIR_MIN_ATTEMPTS guard for self_repair_success_rate.
+    _verified_denom = latest.get("total_cost_per_verified_task_denominator", 0)
+    _suppress_verified_drift = (
+        isinstance(_verified_denom, int) and _verified_denom < VERIFIED_TASK_DRIFT_MIN_COUNT
+    )
     for axis in ALL_AXES:
         cur = latest.get(axis)
         base = baseline.get(axis)
@@ -3432,6 +3500,8 @@ async def read_baseline_with_drift(
             or not isinstance(base, (int, float))
             or base == 0
         ):
+            drift_pct = None
+        elif axis == AXIS_TOTAL_COST_PER_VERIFIED_TASK and _suppress_verified_drift:
             drift_pct = None
         else:
             drift_pct = round(((cur - base) / base) * 100.0, 2)
