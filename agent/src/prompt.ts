@@ -553,8 +553,8 @@ Guidelines:
 // shared by code-change handlers (standard.ts, review-fix.ts fix path).
 // Centralized so block order, inclusion, and future additions only need
 // to change in one place.
-export function assembleFailureGuidanceBlocks(): string {
-  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING + EDGES_CONSIDERED_GUIDANCE;
+export function assembleFailureGuidanceBlocks(includeRetryGuidance = true): string {
+  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + (includeRetryGuidance ? PRIOR_ATTEMPT_DIVERGENCE : '') + BEYOND_SCOPE_REPORTING + EDGES_CONSIDERED_GUIDANCE;
 }
 
 // Compute a stable 12-hex-char fingerprint of the static prompt guidance for
@@ -1089,16 +1089,16 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
   headroom (the memory guard auto-exempts single-file runs).
 `;
 
-const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`, commits
+export const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`, commits
   changes, pushes branch, creates PR. Writes /tmp/pr_url_<task_id> on success.
   Pass \`--with-tests\` to run \`./check test\` instead. **Exit 4 = conflicts.**
   Rebase onto origin/<base>, resolve via Edit or \`git checkout --theirs\`,
   \`./check\`, then \`./pr open\` again. If unresolved after ~2 attempts, \`./blocked\`.
 - \`./done\` — marks COMPLETED with the PR URL. Requires \`./pr open\` first.
   - \`./done --already-done "<reason>"\` — Deliverable EXISTS on base branch.
-    Reason MUST name concrete artifact (≥30 chars), e.g.,
-    "0133_poolvm_registry.py + PoolVm model + EXPECTED_SCHEMA_REVISION=0133
-    already on base via sibling PR #6978". Does NOT require \`./pr open\`.
+    Reason MUST name concrete artifact (≥30 chars), e.g.
+    "migration 0133 + EXPECTED_SCHEMA_REVISION on base via sibling PR #6978".
+    Does NOT require \`./pr open\`.
   - \`./done --warn-out-of-scope "<reason>"\` — \`./check\` fails on
     pre-existing issues in your edited files (not your changes). Reason MUST be
     specific (≥30 chars): gates, files, why unfixable. Posts FEEDBACK message.
@@ -1109,26 +1109,23 @@ const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<bod
   identically despite changes, (2) toolchain/system error, or (3) repo-wide gate
   fails on untouched files. Routes to strategic. Does NOT burn iteration cap.
 
-Required exit pattern (every code-change task):
-  edit -> ./check -> (if green) ./pr open --title ... --body ... -> ./done
+Exit: edit -> ./check -> ./pr open -> ./done
 
 ## You MUST end every run with a terminal verb
 
 ALWAYS call exactly ONE: \`./done\`, \`./done --already-done\`, \`./fail\`, or
 \`./blocked\`. There is NO external monitor that will resume this session —
-run is OVER after you emit a final message with no tool call. Phrases like
-"I'll wait for the monitor" cause the task to be marked not-shipped ("Task
-did not ship"). No "exit with no diff = success" fallback — call
-\`./done --already-done\` if deliverable exists. DO use \`git status\`/\`git diff\`.
-DON'T call \`git commit\`/\`git push\`/\`gh pr create\` — use \`./pr open\`.
+run ends when you emit a final message. Phrases like "I'll wait for the monitor"
+cause the task to be marked not-shipped. DO \`git status\`/\`git diff\`.
+DON'T \`git commit\`/\`git push\`/\`gh pr create\`.
 
 ## Required: self-review before \`./done\` (code-change tasks)
 
-For create/fix/refactor/migrate tasks, write a structured self-review JSON to
-\`/tmp/self_review_<task_id>.json\` before \`./done\`. Included in COMPLETED payload
-as \`self_review_outcome\` for retry context and metrics.
+Write structured self-review JSON to \`/tmp/self_review_<task_id>.json\`.
+Fields: \`check_results\` (category → {passed, reasoning}), \`blind_spots\`,
+\`fixes_applied\`, \`edges_considered\`, \`truncated_files_read\`.
 
-Use these canonical category IDs in \`check_results\`:
+Categories:
 <!-- SR_CATEGORIES_START -->
 - \`correctness\`
 - \`error-handling\`
@@ -1144,56 +1141,23 @@ Use these canonical category IDs in \`check_results\`:
 - \`cross-system-contract\`
 <!-- SR_CATEGORIES_END -->
 
-**Scope-drift check (required):** TWO triggers → if EITHER fires, \`passed: false\`.
-*Trigger A — diff size:* Run \`git diff --stat HEAD\`; count lines/files.
-small 50/2; medium 200/5; large 800/15 (lines/files).
-*Trigger B — files:* Run \`git diff --name-only HEAD\`; compare against
-\`related_files\`. Allowlisted incidentals: \`package-lock.json\`, \`poetry.lock\`,
-\`Cargo.lock\`, \`go.sum\`, \`yarn.lock\`, \`pnpm-lock.yaml\`, and sibling test files
-(\`.test.ts\`, \`.spec.ts\`, \`test_*.py\`). Off-scope issue format:
-\`"modified files outside declared scope: <file> — declared related_files: [...]"\`.
+**Scope-drift (required):** TWO triggers → FAIL if EITHER. Trigger A: \`git diff --stat HEAD\` (small≤50/2, medium≤200/5, large≤800/15 lines/files). Trigger B: \`git diff --name-only HEAD\` vs related_files. Allow: lockfiles (\`package-lock.json\`, \`poetry.lock\`, \`Cargo.lock\`, \`go.sum\`, \`yarn.lock\`, \`pnpm-lock.yaml\`) and sibling test files (\`.test.ts\`, \`.spec.ts\`, \`test_*.py\`). Format: "modified files outside declared scope: <file> — declared related_files: [...]".
 
-**Regression-risk check (conditional):** If \`/tmp/test_baseline_<TASK_ID>.json\`
-exists, failures not in it are regressions. If absent, omit the baseline check;
-flag risky when ≥80 source lines + 0 test lines, or removed exports.
-Append \`[heuristic-derived]\`.
+**Regression-risk (conditional):** If \`/tmp/test_baseline_<TASK_ID>.json\` exists, failures not in it are regressions. If absent, omit the baseline check; flag risky when ≥80 source lines + 0 test lines, or removed exports. \`[heuristic-derived]\`.
 
-**Cross-system-contract check (required when diff touches ≥2 of {admin-ui,
-backend, agent} OR changes HTTP paths/decorators):** Enumerate new/changed URL
-paths, DTO fields, shared types. grep the other side(s) for matching definitions. Record
-\`passed: false\` with \`"major"\` for URL/route mismatches, \`"minor"\` for
-type-name drift. If not cross-system: \`"issue": "diff does not cross system boundaries"\`.
+**Cross-system-contract (required when diff ≥2 of {admin-ui, backend, agent} OR HTTP path changes):** Enumerate URL paths, DTO fields, shared types. grep other sides for matching defs. \`"major"\` for URL/route mismatch, \`"minor"\` for type drift. Else: "diff does not cross system boundaries".
 
-**Regressing-category reasoning (required for Self-Review Blind Spots categories):**
-For every regressing category, add a \`"reasoning"\` field describing what you inspected
-and the evidence supporting the call. Required for BOTH pass and fail outcomes.
-If \`./done\` exits with "Regressing categories need a reasoning field", update SR JSON
-and re-run \`./done\`.
+**Reasoning:** Every regressing (Self-Review Blind Spots) category needs a reasoning field ("reasoning") describing what you inspected and the evidence. Required for BOTH pass and fail. \`./done\` enforces.
 
-**Evidence anchors** are required for high-stakes PASS verdicts (\`correctness\`,
-\`error-handling\`, \`security\`, \`regression_risk\`, \`scope-drift\`). Each PASS
-needs a concrete evidence anchor in \`reasoning\`: a file:line reference
-(\`path/to/file.ts:42\`), a backtick-quoted code snippet (≥10 chars), or a named
-test file. Lower-stakes categories (style-conventions, documentation, performance,
-architecture) do not require an anchor.
-For \`scope-drift\`: cite Trigger A diff stats (lines/files) and the Trigger B
-file-set check vs. related_files. PASS without an anchor on high-stakes =
-unsubstantiated → downgrade to FAIL.
+**Evidence anchors:** Required for high-stakes PASS (\`correctness\`, \`error-handling\`, \`security\`, \`regression_risk\`, \`scope-drift\`). Each PASS needs an evidence anchor: file:line, code snippet (≥10 chars), or named test. \`scope-drift\`: cite A+B results. No anchor → FAIL. lower-stakes need no anchors.
 
-\`fixes_applied: true\` = you caught and fixed issues. File MUST exist for
-code-change tasks (may be degraded \`{"verdict":"unknown"}\`).
+\`fixes_applied: true\` = caught/fixed issues. File MUST exist (may degrade to \`{"verdict":"unknown"}\`).
 
-**\`blind_spots\`:** Specific unverified risks — untested paths, unhandled edge
-cases, uncertain assumptions. NOT: CI running full suite; intentional scope
-decisions. Examples: "did not re-read c.ts after truncation", "concurrent calls
-unsure". Empty if none.
+**\`blind_spots\`:** Unverified risks (NOT CI/scope decisions). Empty if none.
 
-**Optional:** \`truncated_files_read\` = changed files you re-read (fine if
-subset). Set \`categories: ["incomplete_review"]\` when diff truncated.
+**Optional:** \`truncated_files_read\` = subset re-read. \`["incomplete_review"]\` when diff truncated.
 
-**Fresh-reviewer pass:** Second session may augment JSON with \`reviewer_findings\`
-array. Reviewer findings override passing attestations. Auto-fires for
-\`"incomplete_review"\`.
+**Fresh-reviewer pass:** May add \`reviewer_findings\` (overrides passing). Auto-fires for \`"incomplete_review"\`.
 `;
 
 /** Config-driven ./check description for a project that supplied a build_config
@@ -1307,21 +1271,11 @@ export const CODE_CHANGE_HELPER_GUIDANCE =
 
 export const PLAYBOOK_GUIDANCE = `
 ## Operational Playbook — Active Collective Memory
-The playbook is shared, mutable knowledge across all agents in this project — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge OR overwrite an existing entry, and \`./playbook get\` to review. If an existing entry led you astray, overwrite it with corrected guidance so the next agent benefits from the latest version.
+The playbook is shared, mutable knowledge across all agents — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge or overwrite an existing entry, and \`./playbook get\` to review. If an entry led you astray, overwrite it.
 
-**When to save (trigger conditions):**
-- After fixing a lint, build, or test error, or discovering undocumented linting rules: save the root cause pattern and fix
-- After discovering non-obvious configuration, paths, workarounds, or wasting time on a wrong approach: save what you found and why
-- After successfully running build/test commands or setting up a new repo environment: save the exact commands, required flags, and any version/setup prerequisites not in README/CLAUDE.md
-- After learning repo-specific test setup, fixtures, or patterns: save the setup steps and mock helpers unique to this codebase
-- After finding undocumented module dependencies or key architectural patterns: save the relationship or pattern so future agents write consistent code
+**When to save:** after fixing a build/test error, discovering non-obvious configuration, running successful commands, or finding undocumented patterns. Check \`./playbook get\` first to avoid duplicates.
 
-**What NOT to save:**
-- Anything already in CLAUDE.md (check first)
-- Task-specific details (PR numbers, branch names, specific bug descriptions)
-- Obvious patterns that any developer would know
-
-**Before completing your task**, reflect on repo-level knowledge you gained: Did you discover build/test commands, environment setup steps, architectural patterns, or conventions specific to this repo? If so, save them now — the next agent starts cold, and one good entry compounds across hundreds of tasks.
+**Before completing your task:** reflect on repo-level knowledge you gained and save it — the next agent starts cold, and one good entry compounds across hundreds of tasks.
 
 \`\`\`bash
 ./playbook set "key-name" "Concise operational knowledge here."

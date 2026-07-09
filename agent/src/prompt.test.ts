@@ -87,6 +87,7 @@ import {
   BEYOND_SCOPE_REPORTING,
   READ_ONLY_BASH_WRITE_NOTE,
   SELF_REVIEW_PROMPT_VERSION,
+  SHARED_LIFECYCLE_REMAINDER,
   assembleFailureGuidanceBlocks,
   type FixAttempt,
 } from './prompt.js';
@@ -4278,7 +4279,8 @@ describe('TASK_TYPE_HINTS dispatch parity', () => {
 // fingerprint strings to the source constants so a rename here fails immediately
 // rather than silently invalidating the downstream assertions.
 describe('cross-cutting guidance-block fingerprints — structural invariants for prompt.ts', () => {
-  it('PLAYBOOK_GUIDANCE contains fingerprint used by handler structural tests', () => {
+  it('PLAYBOOK_GUIDANCE is under 800 bytes and contains ./playbook set', () => {
+    expect(Buffer.byteLength(PLAYBOOK_GUIDANCE)).toBeLessThan(800);
     expect(PLAYBOOK_GUIDANCE).toContain('./playbook set');
   });
 
@@ -5471,7 +5473,25 @@ describe('writePlaybookHelper live token resolution', () => {
   });
 });
 
-// ── thinker prompt contains criterion-coverage retirement warning ─────────────
+// ── SHARED_LIFECYCLE_REMAINDER — byte size and category coverage ──────────────
+describe('SHARED_LIFECYCLE_REMAINDER — byte size and category coverage', () => {
+  const CATEGORIES = [
+    'correctness', 'error-handling', 'security', 'style-conventions',
+    'type-safety', 'documentation', 'performance', 'architecture',
+    'test-coverage', 'scope-drift', 'regression_risk', 'cross-system-contract',
+  ];
+
+  it('contains all 12 review category IDs', () => {
+    for (const cat of CATEGORIES) {
+      expect(SHARED_LIFECYCLE_REMAINDER).toContain(cat);
+    }
+  });
+
+  it('is under 4500 bytes', () => {
+    const byteLen = Buffer.byteLength(SHARED_LIFECYCLE_REMAINDER, 'utf-8');
+    expect(byteLen).toBeLessThan(4500);
+  });
+});
 describe('thinker prompt contains criterion-coverage retirement warning', () => {
   it('includes criterion-coverage check before retirement guidance in Section 3 (Moves)', () => {
     const params: ThinkerPromptParams = {

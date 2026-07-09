@@ -406,7 +406,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // before trusting a possibly-stale finding. Empty string when no warnings
   // fired, so the prompt is byte-unchanged for non-finding-derived tasks.
   const provenanceNotice = formatProvenanceWarnings(ctx);
-  const finalPrompt = claudeMdPrefix + acceptanceEvidenceNotice + playbookSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + reservedRevisionGuidance + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
+  const isRetry = !!retryContext;
+  const finalPrompt = claudeMdPrefix + acceptanceEvidenceNotice + playbookSection + retryContext + provenanceNotice + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + reservedRevisionGuidance + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks(isRetry) + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${stdFetchGuidance}${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
@@ -824,7 +825,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     + executionEvidenceSection;
   const guidanceFooter = PLAYBOOK_GUIDANCE
     + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n`
-    + assembleFailureGuidanceBlocks()
+    + assembleFailureGuidanceBlocks(isRetry)
     + VIEWPORT_INFRA_SKIP_GUIDANCE;
   const taskNotices = acceptanceEvidenceNotice + provenanceNotice;
   const taskGuidance = taskTypeHint + firstTaskSection + taskTypeFocusBlock;

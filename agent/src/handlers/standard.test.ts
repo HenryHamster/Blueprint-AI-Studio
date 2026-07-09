@@ -111,7 +111,13 @@ vi.mock('../prompt.js', async (importOriginal) => {
     writeViewportLiveHelper: vi.fn(),
     writeCodeChangeHelpers: vi.fn(),
     formatPlaybook: vi.fn().mockReturnValue(''),
-    buildRetryContext: vi.fn().mockReturnValue(''),
+    buildRetryContext: vi.fn().mockImplementation((task: Record<string, unknown>) => {
+      const ctx = (task.context || {}) as Record<string, unknown>;
+      const attemptNumber = ctx._attempt_number;
+      return typeof attemptNumber === 'number' && attemptNumber > 1
+        ? 'mock retry context for testing'
+        : '';
+    }),
     buildRepoMap: vi.fn().mockReturnValue(''),
     buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
     parseAnalysisPlanFiles: vi.fn().mockReturnValue([]),
@@ -3204,9 +3210,19 @@ describe('code-change handler structural prompt invariants', () => {
     expect(p).toContain('./playbook set');                                // PLAYBOOK_GUIDANCE
     expect(p).toContain('Read The Failure Message Literally');            // READ_THE_FAILURE_MESSAGE
     expect(p).toContain('Size Guardrails Are Advisory');                  // SIZE_GUARDRAIL_GUIDANCE
-    expect(p).toContain("If You're Retrying");                           // PRIOR_ATTEMPT_DIVERGENCE
+    expect(p).not.toContain("If You're Retrying");                       // PRIOR_ATTEMPT_DIVERGENCE omitted on first attempt
     expect(p).toContain('When You Find Bigger Problems Than Your Task');  // BEYOND_SCOPE_REPORTING
     expect(p).toContain('Use Grep/Glob for code search');                // DEFAULT_TOOL_GUIDANCE
+  });
+
+  it('handleCreate prompt includes PRIOR_ATTEMPT_DIVERGENCE on retry', async () => {
+    const RETRY_TASK = {
+      ...TASK,
+      context: { _attempt_number: 2, _max_attempts: 3, _previous_error: 'test error' },
+    };
+    await handleCreate(TASK_ID, PAYLOAD, RETRY_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain("If You're Retrying");                           // PRIOR_ATTEMPT_DIVERGENCE included on retry
   });
 
   it('handleRefactor prompt includes required code-change guidance blocks', async () => {
