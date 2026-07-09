@@ -27,8 +27,7 @@ import { StrategicSessionEvents } from './StrategicSessionEvents';
 import { StrategicActivityStrip } from './StrategicLiveTurn';
 import type { StrategicAccountSpendStatus } from './StrategicSessionControl';
 import { WorkbenchPanel } from './WorkbenchLayout';
-import { computeLayout, VIEWBOX_WIDTH } from './StrategicContextMap';
-import type { StrategicContextCanvasNode, StrategicContextCanvasEdge } from '../strategicStateApi';
+import { RailMiniCanvas } from './RailMiniCanvas';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
 type TaskFocusBucketKey = 'needs_judgment' | 'active' | 'friction' | 'queued' | 'recent_completed';
@@ -704,32 +703,6 @@ function TaskFocusBlock({
   );
 }
 
-function RailMiniCanvas({ canvas }: { canvas: { nodes?: StrategicContextCanvasNode[]; edges?: StrategicContextCanvasEdge[] } }) {
-  const layout = useMemo(() => computeLayout(canvas.nodes ?? [], canvas.edges ?? []), [canvas.nodes, canvas.edges]);
-  if (layout.positionedNodes.length === 0) return null;
-
-  function miniFill(s?: string | null): string {
-    const c = s?.toLowerCase() ?? '';
-    if (/active|running|building|pending/.test(c)) return '#22d3ee';
-    if (/blocked|failed|error|critical/.test(c)) return '#fb7185';
-    if (/done|ready|complete|resolved/.test(c)) return '#34d399';
-    return '#525252';
-  }
-
-  return (
-    <div className="mb-2 overflow-hidden rounded border border-neutral-800 bg-[#080d13]" style={{ maxHeight: 120 }} data-testid="rail-mini-canvas">
-      <svg className="w-full" viewBox={`0 0 ${VIEWBOX_WIDTH} ${layout.height}`} preserveAspectRatio="xMidYMin meet" style={{ pointerEvents: 'none' }} aria-hidden="true">
-        {layout.positionedEdges.map((e, i) => (
-          <path key={i} d={e.path} fill="none" stroke="#3f3f46" strokeWidth="1" />
-        ))}
-        {layout.positionedNodes.map(pn => (
-          <circle key={pn.node.id} cx={pn.x} cy={pn.y} r={5} fill={miniFill(pn.node.status)} />
-        ))}
-      </svg>
-    </div>
-  );
-}
-
 function ContextPackageBlock({
   contextPackage,
   sessionRefs,
@@ -774,9 +747,6 @@ function ContextPackageBlock({
           <p className="mt-1 line-clamp-1 text-xs leading-relaxed text-neutral-400">
             {contextPackage.title}
           </p>
-          {contextPackage.canvas?.nodes?.length ? (
-            <RailMiniCanvas canvas={contextPackage.canvas} />
-          ) : null}
           {summaryItems.length > 0 && (
             <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
               {summaryItems.map(item => <span key={item}>{item}</span>)}
@@ -1251,6 +1221,12 @@ export const StrategicContextRail = memo(function StrategicContextRail({
               </div>
             </div>
           </div>
+          <RailMiniCanvas
+            canvas={state?.context_package?.canvas}
+            strategistActive={isWorking}
+            activeTaskLabel={state?.strategic.active_task?.title ?? null}
+            activeDirectionLabel={state?.directions.primary?.text ?? null}
+          />
           <ContextPackageBlock
             contextPackage={state?.context_package}
             sessionRefs={selectedRefDescriptors}

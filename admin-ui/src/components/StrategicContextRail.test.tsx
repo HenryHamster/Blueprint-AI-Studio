@@ -2121,4 +2121,50 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).not.toContain('Needs operator');
     expect(host.textContent).not.toContain('Question waiting');
   });
+
+  test('renders mini-canvas working indicator when canvas is absent and strategist is active', () => {
+    const { host } = mount({ state: { ...STATE, context_package: null } });
+
+    const working = host.querySelector('[data-testid="rail-mini-canvas-working"]');
+    expect(working).toBeTruthy();
+    expect(working?.textContent).toContain('Strategic review');
+    expect(working?.textContent).toContain('Unblock the operator workbench');
+  });
+
+  test('renders mini-canvas working indicator with fallback label when neither task nor direction label is available', () => {
+    const noLabelsState: StrategicStateResponse = {
+      ...STATE,
+      context_package: null,
+      strategic: {
+        ...STATE.strategic,
+        active_task: null,
+      },
+      directions: {
+        ...STATE.directions,
+        primary: null,
+      },
+    };
+    const { host } = mount({ state: noLabelsState });
+
+    const working = host.querySelector('[data-testid="rail-mini-canvas-working"]');
+    expect(working).toBeTruthy();
+    expect(working?.textContent).toContain('Working…');
+  });
+
+  test('renders mini-canvas idle placeholder when canvas is absent and strategist is inactive', () => {
+    const idleState: StrategicStateResponse = {
+      ...STATE,
+      context_package: null,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: null,
+        active_task: null,
+      },
+    };
+    const { host } = mount({ state: idleState, strategistActive: false });
+
+    const idle = host.querySelector('[data-testid="rail-mini-canvas-idle"]');
+    expect(idle).toBeTruthy();
+    expect(idle?.textContent).toContain('No map data');
+  });
 });
