@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-004",
+  "name": "Review a small PR for correctness",
+  "description": "A 'review' task: review a small pull request for correctness and style issues.",
+  "task_type": "review",
+  "prompt": "Review PR #13613 for correctness and style. Focus on: (1) Does the change actually solve the stated problem? (2) Are there edge cases not handled? (3) Are test additions adequate?",
+  "effort": "medium",
+  "source_info": "Pattern from common review tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "review_verdict"
+  },
+  "tags": ["review", "medium", "cost-baseline"]
+}

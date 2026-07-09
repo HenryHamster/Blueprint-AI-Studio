@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-010",
+  "name": "Plan task decomposition for large feature",
+  "description": "A 'plan' task: decompose a large feature request into ordered subtasks.",
+  "task_type": "plan",
+  "prompt": "Decompose this feature into ordered plan subtasks: 'Add a rate-limiting middleware to the backend that reads per-user limits from runtime config and returns 429 when exceeded.' Each subtask should be independently testable and have a clear acceptance criterion.",
+  "effort": "medium",
+  "source_info": "Pattern from plan tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "read_only_unclassified"
+  },
+  "tags": ["plan", "medium", "cost-baseline"]
+}

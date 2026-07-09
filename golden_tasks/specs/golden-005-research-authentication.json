@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-005",
+  "name": "Research authentication patterns",
+  "description": "A 'research' task: research how JWT authentication is implemented across the backend and identify consolidation opportunities.",
+  "task_type": "research",
+  "prompt": "Research how JWT authentication is implemented across the backend. Find all places where tokens are verified, users are authenticated, or auth middleware is applied. Identify any duplication, inconsistency, or security gaps. Summarize findings with file references.",
+  "effort": "medium",
+  "source_info": "Pattern from research tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "research_quality"
+  },
+  "tags": ["research", "medium", "cost-baseline"]
+}

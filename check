@@ -250,6 +250,14 @@ if touches "backend/"; then
   fi
 fi
 
+if touches "golden_tasks/"; then
+  printf '%s\n' "$CHANGED" | grep -E '^golden_tasks/.*\.py$' | while IFS= read -r f; do
+    if [ -f "$f" ]; then
+      run "golden_tasks py_compile ${f#golden_tasks/}" bash -c "python3 -m py_compile '$f' 2>&1"
+    fi
+  done
+fi
+
 
 if [ ${#FAILED[@]} -eq 0 ]; then
   echo ""

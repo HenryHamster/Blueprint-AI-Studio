@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-012",
+  "name": "Write tests for efficiency snapshot",
+  "description": "A 'qa' task: add unit tests for the efficiency_snapshot module.",
+  "task_type": "qa",
+  "prompt": "Add unit tests for the compute_efficiency_snapshot function in backend/app/efficiency_snapshot.py. Cover: (1) empty task list returns zeroed axes, (2) single completed task populates headline axes, (3) failed tasks are excluded from success-rate calculation, (4) ALL_AXES list matches the expected set.",
+  "effort": "medium",
+  "source_info": "Pattern from QA tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "code_merge"
+  },
+  "tags": ["qa", "medium", "cost-baseline"]
+}

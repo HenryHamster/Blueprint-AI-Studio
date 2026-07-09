@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-014",
+  "name": "Memo: design rationale for task routing",
+  "description": "A 'memo' task: produce a reasoning memo on task routing architecture tradeoffs.",
+  "task_type": "memo",
+  "prompt": "Write a design memo analyzing the task routing architecture in the orchestrator. Compare: (1) current queue-based dispatch, (2) priority DAG scheduler, (3) event-driven push. Analyze tradeoffs for latency, fairness, and cost at 500+ concurrent tasks. Recommend a direction with evidence.",
+  "effort": "high",
+  "source_info": "Pattern from memo tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "memo_artifact"
+  },
+  "tags": ["memo", "expensive", "cost-baseline"]
+}
