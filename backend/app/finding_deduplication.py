@@ -950,6 +950,7 @@ def deduplicate_findings(
                     "title": title[:120],
                     "direction_id": finding_dir_id,
                     "reason": "hash match with prior task"[:80],
+                    "finding": finding,
                 }
             )
             continue
@@ -973,6 +974,7 @@ def deduplicate_findings(
                     "title": title[:120],
                     "direction_id": finding_dir_id,
                     "reason": reason[:80],
+                    "finding": finding,
                 }
             )
             continue
@@ -993,6 +995,7 @@ def deduplicate_findings(
                         "title": title[:120],
                         "direction_id": finding_dir_id,
                         "reason": reason[:80],
+                        "finding": finding,
                     }
                 )
                 continue
@@ -1017,6 +1020,7 @@ def deduplicate_findings(
                         "title": title[:120],
                         "direction_id": finding_dir_id,
                         "reason": reason[:80],
+                        "finding": finding,
                     }
                 )
                 continue
@@ -1036,6 +1040,7 @@ def deduplicate_findings(
                         "title": title[:120],
                         "direction_id": finding_dir_id,
                         "reason": reason[:80],
+                        "finding": finding,
                     }
                 )
                 continue
@@ -1051,6 +1056,7 @@ def deduplicate_findings(
                     "title": title[:120],
                     "direction_id": finding_dir_id,
                     "reason": "all files covered by open PR"[:80],
+                    "finding": finding,
                 }
             )
             continue
@@ -1072,6 +1078,7 @@ def deduplicate_findings(
                     "title": title[:120],
                     "direction_id": finding_dir_id,
                     "reason": reason[:80],
+                    "finding": finding,
                 }
             )
             continue

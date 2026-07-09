@@ -585,6 +585,94 @@ async def test_salvage_activity_context_recorded_on_parent_task(db_session, mock
     assert "salvaged_at" in salvage
 
 
+@_pytest.mark.asyncio
+async def test_dedup_filtered_perf_finding_enters_salvage(db_session, mocker):
+    """A perf-type finding dropped by the hash-dedup gate is captured in the
+    salvage buffer and spawns a consolidated salvage-bundle task."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.finding_deduplication import DedupOutcome
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-salvage-perf"
+    )
+
+    # A perf-type finding that will be rejected by hash-dedup.
+    perf_finding = _make_finding(
+        "Perf: slow database query in user lookup",
+        direction_id=direction["id"],
+        finding_type="perf",
+    )
+
+    # Mock deduplicate_findings so the perf finding appears in the dedup
+    # filtered list (simulating a hash-match discard). The full finding
+    # dict is carried in the "finding" key so the salvage logic can
+    # inspect the type and build the salvage payload.
+    mock_outcome = DedupOutcome(
+        filtered=[
+            {
+                "title": perf_finding["title"][:120],
+                "direction_id": direction["id"],
+                "reason": "hash match with prior task",
+                "finding": perf_finding,
+            }
+        ]
+    )
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion.deduplicate_findings",
+        return_value=mock_outcome,
+    )
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[perf_finding],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # ── Assert salvage activity is recorded on the parent task ──
+    salvage = (task.context or {}).get("salvage_activity")
+    assert salvage is not None, (
+        "salvage_activity must be recorded on parent task"
+    )
+    assert "salvage_task_id" in salvage, (
+        "salvage_activity must carry salvage_task_id"
+    )
+    assert salvage["salvaged_count"] >= 1, (
+        "salvage must capture at least one dedup-filtered perf finding"
+    )
+
+    # ── Assert a salvage-bundle child task was spawned ──
+    result = await db_session.execute(
+        _select(_Task).where(_Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    salvage_tasks = [
+        ct
+        for ct in child_tasks
+        if (ct.first_payload or {}).get("type") == "salvage_bundle"
+    ]
+    assert len(salvage_tasks) >= 1, (
+        "A salvage_bundle task must be spawned when dedup-filtered "
+        "perf findings are captured"
+    )
+
+    # ── Assert the salvage payload carries the perf finding context ──
+    payload = salvage_tasks[0].first_payload or {}
+    assert payload.get("total_discarded") == 1
+    salvaged = payload.get("salvaged_findings", [])
+    assert len(salvaged) == 1
+    assert str(salvaged[0].get("title", "")).startswith("Perf:"), (
+        f"Expected salvaged finding title to start with 'Perf:', "
+        f"got {salvaged[0].get('title')!r}"
+    )
+
+
 class TestDeferredFindingStaleDiscard:
     """Stale-discard path: deferred findings older than the configured TTL are dropped."""
 

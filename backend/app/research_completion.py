@@ -3328,6 +3328,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     file_overlap_count = _dedup_outcome.file_overlap_count
     evidence_overlap_count = _dedup_outcome.evidence_overlap_count
     filtered_findings = _dedup_outcome.filtered
+    # Capture dedup-filtered PERF findings into the salvage buffer so they
+    # are durably captured as a consolidated task instead of silently vanishing
+    # through the dedup pipeline (hash-match, region-identity, file-overlap,
+    # evidence-overlap, retired-approach, archived-diagnosis gates). Per-finding
+    # actionability thresholds are NOT relaxed — bundling filtered findings via
+    # salvage avoids flooding the pipeline with individual tasks.
+    for _filtered_entry in _dedup_outcome.filtered:
+        _inner_finding = _filtered_entry.get("finding")
+        if _inner_finding and _inner_finding.get("type") == "perf":
+            _inner_finding["deferred_reason"] = (
+                _filtered_entry.get("reason", "dedup_filtered")[:80]
+            )
+            _salvage_candidates.append(_inner_finding)
+
     type_filtered_count = 0
     type_filtered_by_dir: dict[str, int] = {}
     empty_prompt_count = 0
