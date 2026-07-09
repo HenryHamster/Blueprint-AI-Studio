@@ -6191,6 +6191,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         research_depth=research_depth,
         parent_research_task_id=parent_research_task_id,
         filtered_findings=filtered_findings,
+        salvage_count=len(_salvage_candidates),
     )
 
     # Persist per-cycle deferred-finding counts on the direction's latest

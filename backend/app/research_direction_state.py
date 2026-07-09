@@ -419,6 +419,7 @@ async def apply_post_spawn_state(
     batch_cap_applied_count: int = 0,
     filtered_findings: List[Dict[str, Any]] | None = None,
     type_filtered_by_dir: dict | None = None,
+    salvage_count: int = 0,
 ) -> None:
     """Apply all direction-state updates after research child tasks have been spawned.
 
@@ -717,6 +718,7 @@ async def apply_post_spawn_state(
                             ),
                             "type_filtered": (type_filtered_by_dir or {}).get(did, 0),
                             "empty_prompt": empty_prompt_count,
+                            "salvage_count": salvage_count,
                         },
                     }
                     # If the parent research task spawned a salvage-bundle subtask,

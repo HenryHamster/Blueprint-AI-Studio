@@ -19119,6 +19119,65 @@ async def test_zero_children_note_idempotent_on_replay(db_session):
     assert matching_notes_second[0].get("added_by_task") == str(task.id)
 
 
+@_pytest.mark.asyncio
+async def test_salvage_count_recorded_in_filter_breakdown(db_session):
+    """salvage_count must be recorded in filter_breakdown when
+    apply_post_spawn_state receives a non-zero salvage_count, so the
+    research agent can see that findings were captured by the salvage
+    buffer rather than silently dropped."""
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-salvage-count-filter"
+    direction = _active_direction(direction_id, "Salvage count test direction")
+    project = _Project(
+        name="Salvage Count Filter Test",
+        user_id="test-user-salvage-cnt",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    SALVAGE_COUNT = 3
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None,  # parent_research_task_id
+        salvage_count=SALVAGE_COUNT,
+    )
+    await db_session.refresh(project)
+
+    history = project.directions[0]["research_history"]
+    assert history, "Expected at least one history entry"
+    fb = history[-1].get("filter_breakdown", {})
+    assert fb.get("salvage_count") == SALVAGE_COUNT, (
+        f"Expected salvage_count={SALVAGE_COUNT} in filter_breakdown, "
+        f"got {fb.get('salvage_count')}"
+    )
+
+
 class TestVerificationOnlyCycleProductivity:
     """_compute_direction_productivity: verification-only cycles are credited productive."""
 
