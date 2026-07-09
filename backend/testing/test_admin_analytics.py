@@ -1906,7 +1906,7 @@ class TestTaskCostBreakdown:
         )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["max_tasks"] == 5000
+        assert body["max_tasks"] == 1000
         assert body["truncated"] is False
 
 

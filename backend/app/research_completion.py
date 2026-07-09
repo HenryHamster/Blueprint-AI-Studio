@@ -5210,6 +5210,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             priority=TASK_PRIORITY_MAP.get("medium", 50),
         )
         session.add(_salvage_task)
+        # Record salvage activity on the parent research task context so
+        # downstream consumers (strategist, operator, admin UI) can see
+        # that salvage was triggered and trace to the spawned bundle.
+        _salvage_ctx = dict(task.context or {})
+        _salvage_ctx["salvage_activity"] = {
+            "salvage_task_id": str(_salvage_task.id),
+            "salvaged_count": len(_salvage_candidates),
+            "salvaged_at": _utcnow().isoformat(),
+        }
+        task.context = _salvage_ctx
+        flag_modified(task, "context")
+        session.add(task)
         logger.info(
             "[RESEARCH] Spawned consolidated salvage-bundle task for %d decayed finding(s) (task %s)",
             len(_salvage_candidates),

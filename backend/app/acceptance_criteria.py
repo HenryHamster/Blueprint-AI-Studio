@@ -563,6 +563,7 @@ async def direction_owns_uncovered_criterion(
         return True
 
 
+
 def _reject_unproven_merge_evidence(
     verdict: Any,
     task: Any,

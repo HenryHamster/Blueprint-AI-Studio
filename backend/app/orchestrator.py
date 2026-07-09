@@ -1760,7 +1760,7 @@ async def orchestrator_worker():
                     _proj_rows = (
                         await session.execute(
                             select(Project.id, Project.user_id).where(
-                                Project.id.in_(_all_candidate_pids)
+                                Project.id.in_(_all_candidate_pids
                             )
                         )
                     ).all()
