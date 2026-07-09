@@ -496,11 +496,13 @@ class _TelemetryState:
         self._lock = threading.Lock()
         self.last_successful_job_at: str | None = None
         self.consecutive_job_failures: int = 0
+        self._pause_start_at: float | None = None
 
     def record_success(self) -> None:
         with self._lock:
             self.last_successful_job_at = _utc_now_iso()
             self.consecutive_job_failures = 0
+            self._pause_start_at = None
 
     def record_failure(self) -> None:
         with self._lock:
@@ -509,6 +511,32 @@ class _TelemetryState:
     def snapshot(self) -> tuple[str | None, int]:
         with self._lock:
             return self.last_successful_job_at, self.consecutive_job_failures
+
+    def pause_remaining(self, threshold: int, pause_seconds: float) -> float | None:
+        """Check and update the circuit-breaker pause state.
+
+        Returns None if no pause should apply (threshold disabled or
+        consecutive failures below threshold). Returns the remaining
+        pause duration in seconds (> 0) when the circuit-breaker is active,
+        meaning the caller should NOT claim new agent work.
+
+        The caller must sleep for at least ``min(remaining, poll_interval)``
+        before re-checking; when the pause expires this method returns None,
+        allowing claiming to resume. A successful task (``record_success()``)
+        clears both the failure count and the pause state.
+        """
+        with self._lock:
+            if threshold <= 0 or self.consecutive_job_failures < threshold:
+                self._pause_start_at = None
+                return None
+            if self._pause_start_at is None:
+                self._pause_start_at = time.monotonic()
+                return pause_seconds
+            elapsed = time.monotonic() - self._pause_start_at
+            if elapsed >= pause_seconds:
+                self._pause_start_at = None
+                return None
+            return pause_seconds - elapsed
 
 
 def _supervise_threads(threads: dict) -> None:
@@ -747,6 +775,11 @@ _RUNNER_MAX_COMMAND_LOG_BYTES = 65536
 # downstream verdict needs.
 _RUNNER_COMMAND_LOG_HEAD_BYTES = 8192
 _RUNNER_HEARTBEAT_INTERVAL = 30.0
+# Minimum pause duration for the task-claiming circuit-breaker.
+# When BLUEPRINT_RUNNER_FAILURE_PAUSE_THRESHOLD consecutive job failures are
+# reached, the runner pauses claiming new agent tasks for this many seconds.
+# A successful task clears the failure count and resumes normal claiming.
+_FAILURE_PAUSE_SECONDS = 60.0
 # v1 cap on durable artifact uploads. The runner skips (does not fail) any run
 # whose artifact dir exceeds this; the backend mirrors the cap and 413s.
 _RUNNER_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB
@@ -2978,6 +3011,7 @@ def main() -> None:
     )
     max_auth_failures = _env_int("BLUEPRINT_RUNNER_MAX_AUTH_FAILURES", 20, minimum=0)
     max_network_failures = _env_int("BLUEPRINT_RUNNER_MAX_NETWORK_FAILURES", 20, minimum=0)
+    failure_pause_threshold = _env_int("BLUEPRINT_RUNNER_FAILURE_PAUSE_THRESHOLD", 0, minimum=0)
 
     # Prod agent container image (agent/Dockerfile). The default agent backend is bwrap
     # (host toolchain); the docker backend is used only on an explicit opt-in:
@@ -3253,6 +3287,24 @@ def main() -> None:
                 )
                 time.sleep(poll_interval)
                 continue
+
+            # Circuit-breaker: pause claiming after N consecutive task failures.
+            if failure_pause_threshold > 0:
+                pause_rem = telemetry.pause_remaining(failure_pause_threshold, _FAILURE_PAUSE_SECONDS)
+                if pause_rem is not None and pause_rem > 0:
+                    _release_capacity(agent_capacity)
+                    # Log on the first iteration of each pause cycle (when
+                    # pause_rem is close to the full pause_seconds duration).
+                    if pause_rem >= _FAILURE_PAUSE_SECONDS - 1.0:
+                        print(
+                            f"[runner] CIRCUIT BREAKER: consecutive task failures "
+                            f"(threshold={failure_pause_threshold}) — "
+                            f"pausing task claiming for {_FAILURE_PAUSE_SECONDS:.0f}s. "
+                            "A successful task will clear the circuit.",
+                            flush=True,
+                        )
+                    time.sleep(min(pause_rem, poll_interval, 10.0))
+                    continue
 
             try:
                 resp = _post(next_task_url, token, {}, return_headers=True)

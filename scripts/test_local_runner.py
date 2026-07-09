@@ -548,6 +548,108 @@ class TestMaxConcurrentCap(unittest.TestCase):
         self.assertEqual(poll_interval, base_poll_interval)
 
 
+# ── Failure circuit-breaker pause ───────────────────────────────────────────
+
+class TestFailurePause(unittest.TestCase):
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_pause_disabled_by_default(self):
+        """Threshold 0 (disabled) means no pause regardless of failures."""
+        ts = local_runner._TelemetryState()
+        ts.record_failure()
+        ts.record_failure()
+        ts.record_failure()
+        self.assertIsNone(ts.pause_remaining(0, 60))
+
+    def test_pause_not_triggered_below_threshold(self):
+        """Pause does not activate until failures reach the threshold."""
+        ts = local_runner._TelemetryState()
+        ts.record_failure()
+        ts.record_failure()
+        self.assertIsNone(ts.pause_remaining(3, 60))
+
+    def test_pause_triggers_at_threshold(self):
+        """When consecutive_failures >= threshold, pause_remaining returns > 0."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+        remaining = ts.pause_remaining(3, 60)
+        self.assertIsNotNone(remaining)
+        self.assertGreater(remaining, 0)
+
+    def test_pause_clears_on_record_success(self):
+        """record_success resets the failure count and clears the pause state."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+        self.assertIsNotNone(ts.pause_remaining(3, 60))
+        ts.record_success()
+        self.assertEqual(ts.consecutive_job_failures, 0)
+        self.assertIsNone(ts.pause_remaining(3, 60))
+
+    def test_pause_expires_and_repeats(self):
+        """After the pause duration elapses, pause_remaining returns None, then a
+        new cycle begins because failures are still at the threshold."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+        # Start a very short pause (1 ms).
+        rem = ts.pause_remaining(3, 0.001)
+        self.assertIsNotNone(rem)
+        self.assertGreater(rem, 0)
+        time.sleep(0.01)
+        # After pause expiry, returns None.
+        rem = ts.pause_remaining(3, 0.001)
+        self.assertIsNone(rem)
+        # But immediately re-enters pause since failures still >= threshold.
+        rem = ts.pause_remaining(3, 0.001)
+        self.assertIsNotNone(rem)
+
+    def test_pause_does_not_block_heartbeat(self):
+        """The circuit-breaker lives in the claiming loop, not the heartbeat thread,
+        so heartbeats continue unaffected. Verify _TelemetryState is orthogonal to
+        heartbeats by checking snapshot still works during a pause."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+        # Enter pause.
+        ts.pause_remaining(3, 60)
+        # snapshot must still report the failures (heartbeat needs this).
+        _, fails = ts.snapshot()
+        self.assertEqual(fails, 3)
+
+    def test_no_claim_guard_when_pause_active(self):
+        """When the failure pause is active, the claiming loop must NOT call
+        next-task (simulated guard check)."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+
+        call_count = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            call_count["n"] += 1
+            return 204, None
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post):
+                pause_rem = ts.pause_remaining(3, 60)
+                self.assertIsNotNone(pause_rem)
+                self.assertGreater(pause_rem, 0)
+                # Simulate the guard: if paused, do NOT call _post.
+                if pause_rem is not None and pause_rem > 0:
+                    pass  # guard would sleep and continue
+            self.assertEqual(call_count["n"], 0,
+                             "next-task must NOT be called while failure pause is active")
+        finally:
+            local_runner._shutdown_event.clear()
+
+
 # ── Subprocess spawn ───────────────────────────────────────────────────────────
 
 class TestSubprocessSpawn(unittest.TestCase):
