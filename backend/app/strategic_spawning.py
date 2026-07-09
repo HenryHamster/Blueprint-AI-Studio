@@ -2056,6 +2056,49 @@ def _build_prune_candidates(
     }
 
 
+# Threshold for gap history + past_moves entry count that triggers a
+# compaction hint. Gaps whose combined entries reach this level are candidates
+# for ``_compactions`` watermark compaction — the strategist should review and
+# emit a compaction directive rather than letting the history grow unbounded.
+_COMPACTION_HISTORY_ENTRY_THRESHOLD = 15
+
+
+def _build_compaction_hints(problem_model: dict | None) -> list[dict] | None:
+    """Identify active gaps warranting ``_compactions`` watermark compaction.
+
+    Resident sessions accumulate problem-model gap history entries over time;
+    this returns a list of hints — one per active gap whose combined history
+    and past_moves entries exceed the threshold — so the strategist can apply
+    targeted compaction without exhaustive manual inspection.
+
+    Returns None when no gap qualifies (no field emitted on the payload).
+    Pure and side-effect free.
+    """
+    pm = problem_model if isinstance(problem_model, dict) else {}
+    hints: list[dict] = []
+    for g in pm.get("gaps") or []:
+        if not isinstance(g, dict) or g.get("status") != "active":
+            continue
+        history = g.get("history")
+        if not isinstance(history, list):
+            history = []
+        past_moves = g.get("past_moves")
+        if not isinstance(past_moves, list):
+            past_moves = []
+        total = len(history) + len(past_moves)
+        if total >= _COMPACTION_HISTORY_ENTRY_THRESHOLD:
+            hints.append(
+                {
+                    "gap_id": str(g.get("id") or ""),
+                    "name": str(g.get("name") or "")[:_RECON_LABEL_MAXLEN],
+                    "history_entry_count": len(history),
+                    "past_moves_count": len(past_moves),
+                    "total_entries": total,
+                }
+            )
+    return hints if hints else None
+
+
 _OPERATOR_STEERING_QUOTE_MAX_CHARS = 600
 _OPERATOR_STEERING_QUOTE_COUNT = 2
 
@@ -5616,6 +5659,14 @@ async def _spawn_strategic_review(
                     # set_memory strategic op. Already capped at 100 entries by the
                     # handler, so budget-footprint is bounded.
                     "strategic_memory_notes": project.strategic_memory_notes or [],
+                    # Gaps whose history entries warrant compaction — surfaced
+                    # directly in the payload so the strategist sees an automatic
+                    # signal without manual inspection. Pure in-memory computation.
+                    **(
+                        {"compaction_hints": _rm_compaction_hints}
+                        if (_rm_compaction_hints := _build_compaction_hints(project.problem_model))
+                        else {}
+                    ),
                 },
                 _STRATEGIC_REVIEW_SCHEMA,
             ),
@@ -7356,6 +7407,13 @@ async def _spawn_strategic_review(
             # Concrete prune candidates — present only when the model is
             # large/oversized AND something is actually prunable. Advisory list.
             **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
+            # Gaps whose history entries warrant compaction — surfaced so the
+            # strategist can apply targeted compaction without manual inspection.
+            **(
+                {"compaction_hints": _cadence_compaction_hints}
+                if (_cadence_compaction_hints := _build_compaction_hints(_verified_problem_model))
+                else {}
+            ),
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
             **({"pending_followups": _pending_followups} if _pending_followups else {}),
             **({"compute_experiment_sweeps": _compute_sweep_groups} if _compute_sweep_groups else {}),

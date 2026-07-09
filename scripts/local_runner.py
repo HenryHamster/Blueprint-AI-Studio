@@ -79,6 +79,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 import runner_isolation as iso
+import blueprint_runner as br
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -927,6 +928,9 @@ def _detect_gpu() -> dict:
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
 _shutdown_event = threading.Event()
+# Separate from _shutdown_event — used during auto-update so background
+# threads (reaper, compute poller, main loop) are NOT signaled to exit.
+_update_in_progress = threading.Event()
 
 
 def _handle_signal(signum, frame):  # noqa: ARG001
@@ -1256,12 +1260,58 @@ def _heartbeat_loop(
                         else:
                             stale = version_hint not in version
                         if stale:
-                            print(
-                                f"[runner] WARNING: runner version {version!r} does not match "
-                                f"orchestrator version hint {version_hint!r} — consider running "
-                                "`blueprint-runner update` to update the agent.",
-                                flush=True,
-                            )
+                            # Check if runner is completely idle before attempting
+                            # auto-update (no active tasks and no compute jobs).
+                            with lock:
+                                has_tasks = bool(active_tasks)
+                            if active_compute_jobs is not None and compute_lock is not None:
+                                with compute_lock:
+                                    has_compute = bool(active_compute_jobs)
+                            else:
+                                has_compute = False
+
+                            if not has_tasks and not has_compute:
+                                print(
+                                    f"[runner] version mismatch ({version!r} vs "
+                                    f"{version_hint!r}) and runner is idle — "
+                                    "auto-updating...",
+                                    flush=True,
+                                )
+                                _update_in_progress.set()
+                                try:
+                                    result = br.do_update()
+                                except Exception:
+                                    _update_in_progress.clear()
+                                    raise
+                                if result == 0:
+                                    # Update succeeded. _restart_runner_service
+                                    # (called inside do_update) will kill this
+                                    # process via systemctl restart if a service
+                                    # unit is installed. If still alive (no
+                                    # systemd), exit cleanly so any process
+                                    # supervisor restarts the updated runner.
+                                    print(
+                                        "[runner] auto-update complete — "
+                                        "exiting for restart.",
+                                        flush=True,
+                                    )
+                                    os._exit(0)
+                                else:
+                                    print(
+                                        f"[runner] auto-update failed "
+                                        f"(exit={result}) — continuing with "
+                                        "current version.",
+                                        flush=True,
+                                    )
+                                    _update_in_progress.clear()
+                            else:
+                                print(
+                                    f"[runner] WARNING: runner version {version!r} "
+                                    f"does not match orchestrator version hint "
+                                    f"{version_hint!r} — not auto-updating because "
+                                    "tasks are still executing.",
+                                    flush=True,
+                                )
                 _write_status_json(
                     runner_id=hostname,
                     last_heartbeat_status="ok",
@@ -3022,6 +3072,14 @@ def main() -> None:
                 # No agent sandbox (no bwrap, no docker+image) — never claim agent
                 # work. Wait for shutdown.
                 time.sleep(1)
+                continue
+
+            # During an auto-update, don't claim new work — the update may restart
+            # the process on success. Unlike _shutdown_event, this event is scoped
+            # only to work claiming: reaper, compute poller, and supervise continue
+            # running, so a transient update failure never kills healthy threads.
+            if _update_in_progress.is_set():
+                time.sleep(poll_interval)
                 continue
 
             with lock:

@@ -4121,3 +4121,56 @@ async def test_session_restart_loads_session_summary(db_session):
     assert ctx.get("_session_summary") == (
         "Research revealed three key gap areas to investigate."
     )
+
+
+# ---------------------------------------------------------------------------
+# Compaction hints: gap history threshold-based signal for the strategist
+# ---------------------------------------------------------------------------
+
+
+def test_compaction_hints_surfaced_when_gap_history_exceeds_threshold():
+    """_build_compaction_hints returns a list of hints when any active gap's
+    combined history + past_moves entries cross the threshold, and None when
+    no gap qualifies."""
+    from app.strategic_spawning import (
+        _COMPACTION_HISTORY_ENTRY_THRESHOLD,
+        _build_compaction_hints,
+    )
+
+    # Below threshold — no hints expected.
+    thin_history = [{"ts": "2026-01-01T00:00:00Z"} for _ in range(_COMPACTION_HISTORY_ENTRY_THRESHOLD - 2)]
+    below = _build_compaction_hints(
+        {"gaps": [{"id": "g-ok", "name": "Safe gap", "status": "active", "history": thin_history}]}
+    )
+    assert below is None, f"Expected None below threshold, got {below}"
+
+    # At threshold — should produce a hint.
+    at_threshold = [{"ts": "2026-01-01T00:00:00Z"} for _ in range(_COMPACTION_HISTORY_ENTRY_THRESHOLD)]
+    at = _build_compaction_hints(
+        {"gaps": [{"id": "g-heavy", "name": "Heavy gap", "status": "active", "history": at_threshold, "past_moves": []}]}
+    )
+    assert at is not None
+    assert at[0]["gap_id"] == "g-heavy"
+    assert at[0]["history_entry_count"] == _COMPACTION_HISTORY_ENTRY_THRESHOLD
+    assert at[0]["past_moves_count"] == 0
+    assert at[0]["total_entries"] == _COMPACTION_HISTORY_ENTRY_THRESHOLD
+
+    # Past_moves also count toward the total.
+    with_history = [{"ts": "2026-01-01T00:00:00Z"} for _ in range(5)]
+    with_moves = [{"move": "reviewed"} for _ in range(_COMPACTION_HISTORY_ENTRY_THRESHOLD - 5 + 1)]
+    combined = _build_compaction_hints(
+        {"gaps": [{"id": "g-combined", "name": "Combined gap", "status": "active", "history": with_history, "past_moves": with_moves}]}
+    )
+    assert combined is not None
+    assert combined[0]["gap_id"] == "g-combined"
+    assert combined[0]["total_entries"] == len(with_history) + len(with_moves)
+
+    # Non-active gaps are ignored.
+    non_active = _build_compaction_hints(
+        {"gaps": [{"id": "g-closed", "name": "Closed gap", "status": "closed", "history": at_threshold}]}
+    )
+    assert non_active is None
+
+    # None / empty input.
+    assert _build_compaction_hints(None) is None
+    assert _build_compaction_hints({}) is None

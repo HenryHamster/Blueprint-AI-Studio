@@ -2906,7 +2906,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         local_runner._shutdown_event.clear()
 
     def test_version_hint_mismatch_logs_warning(self):
-        """When version_hint differs from runner version, a warning is printed."""
+        """When version_hint differs and tasks are executing, a warning is printed."""
         posted_bodies = []
         output_lines = []
 
@@ -2924,7 +2924,9 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             line = " ".join(str(a) for a in args)
             output_lines.append(line)
 
-        active_tasks: dict = {}
+        # Non-empty active_tasks so the runner appears busy and does NOT
+        # auto-update — the idle path triggers update instead of warning.
+        active_tasks = {"task-1": MagicMock()}
         lock = threading.Lock()
         local_runner._shutdown_event.clear()
 
@@ -2945,7 +2947,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             warning_lines,
             "Expected a version mismatch warning in output",
         )
-        self.assertIn("blueprint-runner update", str(warning_lines))
+        self.assertIn("not auto-updating", str(warning_lines))
 
     def test_version_hint_match_silent(self):
         """When version_hint matches runner version, no warning is printed."""
@@ -3046,7 +3048,9 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             line = " ".join(str(a) for a in args)
             output_lines.append(line)
 
-        active_tasks: dict = {}
+        # Non-empty active_tasks so the runner appears busy and does NOT
+        # auto-update — the idle path triggers update instead of warning.
+        active_tasks = {"task-1": MagicMock()}
         lock = threading.Lock()
         local_runner._shutdown_event.clear()
 
@@ -3068,7 +3072,97 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             warning_lines,
             "Expected a version mismatch warning when SHA comparison fails",
         )
-        self.assertIn("blueprint-runner update", str(warning_lines))
+        self.assertIn("not auto-updating", str(warning_lines))
+
+    def test_version_hint_mismatch_triggers_auto_update_when_idle(self):
+        """When version_hint differs and runner is idle, auto-update is triggered."""
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                "version_hint": "v99-abcdef01",
+            }
+
+        def fake_print(*args, **kwargs):
+            line = " ".join(str(a) for a in args)
+            output_lines.append(line)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v1-oldversion"), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=0), \
+                 patch.object(os, "_exit"), \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        combined = " ".join(output_lines).lower()
+        self.assertIn(
+            "auto-updating",
+            combined,
+            "Expected auto-update message when runner is idle and version differs",
+        )
+
+    def test_version_hint_mismatch_skips_auto_update_when_compute_busy(self):
+        """When version_hint differs but compute jobs are active, no auto-update."""
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                "version_hint": "v99-abcdef01",
+            }
+
+        def fake_print(*args, **kwargs):
+            line = " ".join(str(a) for a in args)
+            output_lines.append(line)
+
+        active_tasks: dict = {}
+        active_compute_jobs = {"job-1"}
+        task_lock = threading.Lock()
+        compute_lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v1-oldversion"), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, task_lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    active_compute_jobs, compute_lock,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        warning_lines = [line for line in output_lines if "WARNING" in line and "version" in line.lower()]
+        self.assertTrue(
+            warning_lines,
+            "Expected a warning when compute jobs are active and version differs",
+        )
+        self.assertIn("not auto-updating", str(warning_lines))
 
     def test_no_version_hint_no_warning(self):
         """When the response lacks version_hint, the runner never warns."""

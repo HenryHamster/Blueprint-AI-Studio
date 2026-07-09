@@ -114,6 +114,7 @@ function buildStrategicFingerprintPrompt(
     availableCapabilitiesSection: p.availableCapabilitiesSection ? '<available-capabilities>' : '',
     sweepComparisonSection: p.sweepComparisonSection ? '<sweep-comparison>' : '',
     localRunnerSection: p.localRunnerSection ? '<local-runner>' : '',
+    compactionHintsSection: p.compactionHintsSection ? '<compaction-hints>' : '',
     payloadStalenessSection: p.payloadStalenessSection ? '<payload-staleness>' : '',
   };
   const prompt = buildThinkerPrompt(canonical);
@@ -271,6 +272,14 @@ export interface ThinkerPromptParams {
    * '' renders nothing (also omitted when staleness is absent or indeterminate).
    */
   payloadStalenessSection?: string;
+  /**
+   * Gap compaction candidates: active gaps whose combined history + past_moves
+   * entries exceed the threshold. Renders a list of gap names + entry counts so
+   * the strategist can apply targeted ``_compactions`` watermarks without
+   * manually inspecting every gap. Optional so existing tests that omit it
+   * still compile; '' renders nothing.
+   */
+  compactionHintsSection?: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -332,7 +341,7 @@ ${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; reta
 ${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
 ${p.directionPortfolioSection}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.residentExamLeadsSection ? `\n${p.residentExamLeadsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.residentExamLeadsSection ? `\n${p.residentExamLeadsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
 ${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 

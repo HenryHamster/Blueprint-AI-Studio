@@ -173,6 +173,36 @@ export function buildLocalRunnerSection(status: unknown): string {
 }
 
 /**
+ * Build a prompt section listing gaps whose history entries warrant compaction.
+ * Takes the backend's ``compaction_hints`` list (each item has gap_id, name,
+ * history_entry_count, past_moves_count, total_entries) and renders a compact
+ * advisory block so the strategist can apply targeted ``_compactions``
+ * watermarks. Returns '' when the list is absent or empty.
+ */
+function buildCompactionHintsSection(
+  hints: Array<Record<string, unknown>> | undefined,
+): string {
+  if (!hints || !Array.isArray(hints) || hints.length === 0) return '';
+
+  const lines: string[] = [
+    '## Gap compaction candidates',
+    'The following gaps have accumulated enough history entries to warrant `_compactions` watermark compaction. Run `./fetch problem-model` (or `./fetch gap <gap_id>`) to review the full durable history before emitting compaction directives.',
+  ];
+  for (const h of hints) {
+    const id = strVal(h.gap_id, '');
+    const name = strVal(h.name, '');
+    const hist = Number(h.history_entry_count ?? 0);
+    const pm = Number(h.past_moves_count ?? 0);
+    lines.push(`- ${id}: "${name}" (${hist} history entries, ${pm} past_moves)`);
+  }
+  lines.push(
+    '',
+    'Emit `_compactions` directives in your problem-model update to permanently compact the history you have verified. See the "Model-size hygiene" section for the compaction contract.',
+  );
+  return lines.join('\n');
+}
+
+/**
  * Render the compact design-doc INDEX as a clean architecture overview — NOT a
  * raw JSON dump. The backend now ships the design doc as a navigation index
  * (`{ sections: [{ key, summary?, status?, modules?, presence_warning? }] }`,
@@ -333,6 +363,9 @@ export async function handleStrategic(
     const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
     const completionDebtSection = buildCompletionDebtSection(payload.open_completion_debt);
     const pendingFollowupsSection = buildPendingFollowupsSection(payload.pending_followups);
+    const compactionHintsSection = buildCompactionHintsSection(
+      payload.compaction_hints as Array<Record<string, unknown>> | undefined,
+    );
 
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
     const outcomeSection = buildOutcomeSection(outcomeEval);
@@ -760,6 +793,7 @@ prompts, schemas, tools, or orchestration.` : '';
       ciComplianceSection,
       completionDebtSection,
       pendingFollowupsSection,
+      compactionHintsSection,
       // Shared capability vocabulary + uniform provides_capability / prerequisite
       // declaration guidance, so the strategist draws cross-lane capability refs
       // from the same registry namespace every other task type uses.
@@ -836,6 +870,7 @@ prompts, schemas, tools, or orchestration.` : '';
       ['pending_followups', thinkerParams.pendingFollowupsSection || ''],
       ['sweep_comparison', thinkerParams.sweepComparisonSection || ''],
       ['local_runner', thinkerParams.localRunnerSection || ''],
+      ['compaction_hints', thinkerParams.compactionHintsSection || ''],
       ['payload_staleness', thinkerParams.payloadStalenessSection || ''],
     ];
     const thinkerTelemetry = buildPromptSizeTelemetry(thinkerPromptWithSuffix, thinkerPromptSectionTuples);
