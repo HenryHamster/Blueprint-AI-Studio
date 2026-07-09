@@ -1200,6 +1200,58 @@ def test_coverage_delta_populated_from_verify_tests_artifact():
     assert "achieved" in verdict.reason
 
 
+def test_coverage_delta_uses_line_coverage_not_test_pass_rate():
+    """coverage_pct reflects the fraction of changed lines hit by the test
+    (line coverage), not the test pass rate.
+
+    The orchestrator stores line_coverage_pct (from pytest-cov) as
+    coverage_pct in test_coverage_result. When line coverage differs from
+    the test pass rate (passed/total), the acceptance gate evaluates against
+    the line coverage value — NOT the pass rate.
+
+    This verifies the coverage_delta acceptance evidence kind fixes the
+    semantic bug where coverage_pct was computed as (passed/total)*100,
+    which is test pass rate, not changed-line coverage.
+    """
+    # Simulate a MERGE_TEST_RESULT coverage block where line coverage (90%)
+    # differs from test pass rate (passed=8, total=10 → 80%).
+    # The orchestrator reads line_coverage_pct and stores it as coverage_pct.
+    line_cov = 90.0
+    pass_rate = round((8 / 10) * 100.0, 2)  # 80.0
+    assert line_cov != pass_rate  # 90 != 80 — coverage differs from pass rate
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 85,  # threshold between pass_rate and line_cov
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    # The coverage_pct is the line coverage value, NOT the test pass rate.
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": line_cov}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True  # 90 >= 85 passes
+    assert verdict.proven is True
+
+    # Prove it's NOT pass rate: with the same test counts (8/10 = 80%),
+    # using pass rate as coverage_pct would give coverage_pct=80, which
+    # is below the threshold of 85 and would fail.
+    task2 = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 85,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task2.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": pass_rate}
+    pass_verdict = evaluate_code_acceptance(task2)
+    assert pass_verdict.satisfied is False  # 80 < 85 fails
+    assert pass_verdict.proven is False
+
+
 def test_acceptance_was_declared_and_is_proven_contract():
     # Undeclared / legacy / garbage rows are never declared and never proven.
     for bad in (None, "garbage", 123, []):

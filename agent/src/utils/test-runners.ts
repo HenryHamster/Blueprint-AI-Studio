@@ -290,7 +290,7 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
     // backend's `n.endswith('.sln') or n.endswith('.csproj')`).
     let dotnetEntries: string[] = [];
     try {
-      const entries = _readdir(absDir) as unknown as string[];
+      const entries = _readdir(absDir);
       if (Array.isArray(entries)) dotnetEntries = entries;
     } catch { /* unreadable — skip */ }
     if (dotnetEntries.some(n => typeof n === 'string' && (n.endsWith('.sln') || n.endsWith('.csproj')))) {
@@ -592,7 +592,7 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
 
       let topLevelEntries: string[];
       try {
-        topLevelEntries = readdirSync(WORKSPACE) as unknown as string[];
+        topLevelEntries = readdirSync(WORKSPACE);
       } catch { topLevelEntries = []; /* unreadable workspace — skip nested scan */ }
       if (Array.isArray(topLevelEntries)) {
         for (const entry of topLevelEntries) {
@@ -604,7 +604,7 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
           // top-level file (not a dir) makes readdirSync throw → caught → skip.
           let children: string[];
           try {
-            children = readdirSync(`${WORKSPACE}/${entry}`) as unknown as string[];
+            children = readdirSync(`${WORKSPACE}/${entry}`);
           } catch { continue; /* not a directory / unreadable — skip */ }
           if (!Array.isArray(children)) continue;
           for (const child of children) {
@@ -644,7 +644,7 @@ export function detectAutoTestRunners(): TestRunner[] {
 // checking a fixed manifest. Defensive against fs errors (treated as "absent").
 function hasDotnetProject(absDir: string): boolean {
   try {
-    const entries = fs.readdirSync(absDir) as unknown as string[];
+    const entries = fs.readdirSync(absDir);
     return Array.isArray(entries) && entries.some(
       n => typeof n === 'string' && (n.endsWith('.sln') || n.endsWith('.csproj')),
     );
@@ -1233,7 +1233,7 @@ export function detectAcceptanceProbes(buildConfig?: BuildConfig): AcceptancePro
   const SKIP_DIRS = new Set(['node_modules', 'vendor', '.venv', 'venv', 'target', 'dist', 'build']);
   const skip = (name: string): boolean => name.startsWith('.') || SKIP_DIRS.has(name);
   let entries: string[] = [];
-  try { entries = readdirSync(WORKSPACE) as unknown as string[]; } catch { entries = []; }
+  try { entries = readdirSync(WORKSPACE); } catch { entries = []; }
   if (Array.isArray(entries)) {
     let inspected = 0;
     for (const entry of entries) {
@@ -1864,6 +1864,26 @@ export function extractTestCoverage(
   const total = passed + skipped + failed;
   if (total <= 0) return null;
   return { passed, skipped, total };
+}
+
+/**
+ * Extract TOTAL line/statement coverage percentage from pytest-cov terminal output.
+ *
+ * Parses the final coverage summary line emitted by ``--cov-report=term-missing``:
+ * ``TOTAL    350    30    91%``.  Returns the percentage (91) as a number, or null
+ * when no coverage summary line is found (no coverage instrumentation active).
+ *
+ * The returned percentage is a FIRST-PASS TOTAL over all instrumented modules, not
+ * a diff-aware "coverage of changed lines" metric.  A per-file union with the PR
+ * diff is a future refinement.
+ */
+export function extractLineCoverage(output: string): number | null {
+  if (!output) return null;
+  // Match "TOTAL" summary line from pytest-cov. Captures the coverage %.
+  const match = output.match(/^\s*TOTAL\s+\d+\s+\d+\s+(\d+(?:\.\d+)?)%/im);
+  if (!match) return null;
+  const pct = parseFloat(match[1]);
+  return isFinite(pct) ? pct : null;
 }
 
 /**

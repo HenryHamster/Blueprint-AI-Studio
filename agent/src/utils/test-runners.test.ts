@@ -13,6 +13,7 @@ import { readFile } from 'node:fs/promises';
 import {
   detectTestRunners, detectAutoTestRunners, describeRunnerDirectory,
   classifySetupFailure, classifyTestExecution, extractTestCoverage,
+  extractLineCoverage,
   matchesEnvironmentFailureSignature,
   detectAcceptanceProbes, classifyProbeOutcome, buildWroteNewOutput,
   detectProvisioningSteps,
@@ -2147,6 +2148,79 @@ describe('extractTestCoverage — pass/skip/total parsing', () => {
   });
 });
 
+describe('extractLineCoverage — pytest-cov TOTAL line parser', () => {
+  describe('valid TOTAL line (happy path)', () => {
+    it('basic integer percentage → number', () => {
+      expect(extractLineCoverage('TOTAL    350    30    91%')).toBe(91);
+    });
+
+    it('case-insensitive match (lowercase total)', () => {
+      expect(extractLineCoverage('total    100    50    50%')).toBe(50);
+    });
+
+    it('decimal percentage → parsed float', () => {
+      expect(extractLineCoverage('TOTAL    200    1    99.5%')).toBe(99.5);
+    });
+
+    it('leading/trailing whitespace does not prevent match', () => {
+      expect(extractLineCoverage('  TOTAL    500    200    60%  ')).toBe(60);
+    });
+
+    it('multi-line output with coverage summary at the end', () => {
+      expect(extractLineCoverage([
+        'collected 42 items',
+        '',
+        'tests/test_foo.py ....                                   [ 50%]',
+        'tests/test_bar.py ....                                   [100%]',
+        '',
+        '---------- coverage: platform linux, python 3.11-final-0 -----------',
+        'Name                       Stmts   Miss  Cover',
+        '--------------------------------------------------',
+        'src/module.py                 50      5    90%',
+        'src/cli.py                    30      3    90%',
+        '--------------------------------------------------',
+        'TOTAL                         80      8    90%',
+      ].join('\n'))).toBe(90);
+    });
+  });
+
+  describe('boundary values', () => {
+    it('0% coverage', () => {
+      expect(extractLineCoverage('TOTAL    50    50    0%')).toBe(0);
+    });
+
+    it('100% coverage', () => {
+      expect(extractLineCoverage('TOTAL    100    0    100%')).toBe(100);
+    });
+
+    it('decimal coverage at boundary (0.5%)', () => {
+      expect(extractLineCoverage('TOTAL    200    199    0.5%')).toBe(0.5);
+    });
+  });
+
+  describe('null/edge-case inputs', () => {
+    it('empty string → null', () => {
+      expect(extractLineCoverage('')).toBeNull();
+    });
+
+    it('whitespace-only string → null', () => {
+      expect(extractLineCoverage('   \n  \n  ')).toBeNull();
+    });
+
+    it('output without TOTAL line → null', () => {
+      expect(extractLineCoverage('some random build log\nNo coverage data.')).toBeNull();
+    });
+
+    it('missing percentage after TOTAL → null', () => {
+      expect(extractLineCoverage('TOTAL    100    50')).toBeNull();
+    });
+
+    it('malformed TOTAL line (no number after stats) → null', () => {
+      expect(extractLineCoverage('TOTAL    --    --    n/a%')).toBeNull();
+    });
+  });
+});
+
 describe('classifySetupFailure — bootstrap/setup infrastructure detection', () => {
   it('detects missing runtimes and package-manager tools via line-anchored command-not-found output', () => {
     expect(classifySetupFailure('bash: python3: command not found')).toBe(true);
@@ -2538,7 +2612,7 @@ describe('detectAcceptanceProbes', () => {
   it('build_config python directory → compileall probe (type hint, no manifest needed)', () => {
     const probes = detectAcceptanceProbes({
       directories: [{ path: 'backend', type: 'python', test_cmd: 'pytest' }],
-    } as BuildConfig);
+    });
     const py = probes.find(p => p.ecosystem === 'python');
     expect(py).toBeDefined();
     expect(py?.cmd).toBe('python3');
@@ -2627,7 +2701,7 @@ describe('detectAcceptanceProbes', () => {
     mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/pyproject.toml`);
     const probes = detectAcceptanceProbes({
       directories: [{ path: '', type: 'python', test_cmd: 'pytest' }],
-    } as BuildConfig);
+    });
     expect(probes.filter(p => p.ecosystem === 'python' && p.cwd === WORKSPACE)).toHaveLength(1);
   });
 
@@ -2635,7 +2709,7 @@ describe('detectAcceptanceProbes', () => {
   it('build_config dir with build_cmd → declared probe (plain command tokenized)', () => {
     const probes = detectAcceptanceProbes({
       directories: [{ path: 'admin-ui', type: 'node', build_cmd: 'npm run build' }],
-    } as BuildConfig);
+    });
     const declared = probes.find(p => p.declared);
     expect(declared).toBeDefined();
     expect(declared?.cmd).toBe('npm');
@@ -2648,7 +2722,7 @@ describe('detectAcceptanceProbes', () => {
   it('build_cmd with shell operators → bash -c wrapped declared probe', () => {
     const probes = detectAcceptanceProbes({
       directories: [{ path: '', type: 'rust', build_cmd: 'make && cargo build --features x' }],
-    } as BuildConfig);
+    });
     const declared = probes.find(p => p.declared);
     expect(declared).toBeDefined();
     expect(declared?.cmd).toBe('bash');
@@ -2660,7 +2734,7 @@ describe('detectAcceptanceProbes', () => {
   it('build_cmd on a dir type without a language bucket → ecosystem "build"', () => {
     const probes = detectAcceptanceProbes({
       directories: [{ path: 'svc', type: 'other', build_cmd: 'make release' }],
-    } as BuildConfig);
+    });
     const declared = probes.find(p => p.declared);
     expect(declared?.ecosystem).toBe('build');
   });
@@ -2670,7 +2744,7 @@ describe('detectAcceptanceProbes', () => {
     // declared probe is emitted — no competing generic compileall probe.
     const probes = detectAcceptanceProbes({
       directories: [{ path: 'backend', type: 'python', build_cmd: 'make build', test_cmd: 'pytest' }],
-    } as BuildConfig);
+    });
     const forBackend = probes.filter(p => p.cwd === `${WORKSPACE}/backend`);
     expect(forBackend).toHaveLength(1);
     expect(forBackend[0].declared).toBe(true);
@@ -2683,7 +2757,7 @@ describe('detectAcceptanceProbes', () => {
     mockFs.existsSync.mockImplementation((p: string) => p === `${WORKSPACE}/pyproject.toml`);
     const probes = detectAcceptanceProbes({
       directories: [{ path: '', type: 'python', build_cmd: 'make build' }],
-    } as BuildConfig);
+    });
     const atRoot = probes.filter(p => p.cwd === WORKSPACE);
     expect(atRoot).toHaveLength(1);
     expect(atRoot[0].declared).toBe(true);
@@ -2692,7 +2766,7 @@ describe('detectAcceptanceProbes', () => {
   it('a dir with only test_cmd (no build_cmd) still emits the generic probe', () => {
     const probes = detectAcceptanceProbes({
       directories: [{ path: 'backend', type: 'python', test_cmd: 'pytest' }],
-    } as BuildConfig);
+    });
     expect(probes.some(p => p.declared)).toBe(false);
     expect(probes.find(p => p.ecosystem === 'python')?.cmd).toBe('python3');
   });
@@ -2700,7 +2774,7 @@ describe('detectAcceptanceProbes', () => {
   it('empty/whitespace build_cmd is ignored (no declared probe)', () => {
     const probes = detectAcceptanceProbes({
       directories: [{ path: 'backend', type: 'python', build_cmd: '   ', test_cmd: 'pytest' }],
-    } as BuildConfig);
+    });
     expect(probes.some(p => p.declared)).toBe(false);
   });
 });

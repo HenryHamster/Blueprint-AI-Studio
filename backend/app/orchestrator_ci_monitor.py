@@ -2166,20 +2166,36 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     ci_loop["verify_tests_verdict"] = _outcome
                     # Extract coverage data from the verify-tests verdict for the
                     # coverage_delta acceptance gate. The MERGE_TEST_RESULT artifact
-                    # carries a ``coverage`` block with test counts (passed/skipped/total);
-                    # compute a coverage_pct and store it so the merge propagation path
-                    # can bridge it into the original code task's context.
+                    # carries a ``coverage`` block with test-count fields
+                    # (passed/skipped/total). When the test runner includes coverage
+                    # instrumentation (pytest-cov or c8), an additional
+                    # ``line_coverage_pct`` field carries the actual line/statement
+                    # coverage percentage from the instrumentation tool — prefer this
+                    # over the test-pass-rate fallback computed from passed/total.
                     if isinstance(_verdict, dict):
                         _cov = _verdict.get("coverage")
                         if isinstance(_cov, dict):
-                            _total = _cov.get("total", 0) or 0
-                            _passed = _cov.get("passed", 0) or 0
-                            if _total > 0:
+                            # Prefer line_coverage_pct from coverage
+                            # instrumentation (pytest-cov / c8) when present.
+                            _line_cov = _cov.get("line_coverage_pct")
+                            if (
+                                isinstance(_line_cov, (int, float))
+                                and not isinstance(_line_cov, bool)
+                            ):
                                 ci_loop["test_coverage_result"] = {
                                     "coverage_pct": round(
-                                        (_passed / _total) * 100.0, 2
+                                        float(_line_cov), 2
                                     )
                                 }
+                            else:
+                                _total = _cov.get("total", 0) or 0
+                                _passed = _cov.get("passed", 0) or 0
+                                if _total > 0:
+                                    ci_loop["test_coverage_result"] = {
+                                        "coverage_pct": round(
+                                            (_passed / _total) * 100.0, 2
+                                        )
+                                    }
                     # Auto-heal a stale stored test command: when the
                     # verify run discovered the stored command was
                     # stale and ran a real replacement suite, persist

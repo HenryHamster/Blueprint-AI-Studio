@@ -122,8 +122,15 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 
 # Context key where the verify-tests handler stores the coverage measurement
 # result for the coverage_delta acceptance gate to consume. The value is a dict
-# with at least ``{"coverage_pct": <float>}`` — the percentage of changed
-# production lines exercised by the declared test.
+# with at least ``{"coverage_pct": <float>}``.
+#
+# ``coverage_pct`` represents LINE / STATEMENT coverage (the fraction of source
+# lines exercised by the test suite), NOT the test pass rate. When coverage
+# instrumentation (pytest-cov, c8) is active, the value is the actual line
+# coverage percentage from the instrumentation tool. When no instrumentation is
+# active, the orchestrator falls back to the "test suite execution coverage" —
+# the percentage of tests that passed — as a less meaningful but always-available
+# proxy.
 TEST_COVERAGE_RESULT_KEY = "test_coverage_result"
 
 ACCEPTANCE_AGGREGATE_BUCKETS: tuple[str, ...] = (

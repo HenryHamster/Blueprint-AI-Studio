@@ -40,7 +40,7 @@ import {
   detectTestRunners, isDockerRunner, describeRunnerDirectory,
   parseFailingTests, buildTargetedPytestRunners,
   classifySetupFailure, classifyTestExecution, matchesEnvironmentFailureSignature,
-  extractTestCoverage, runnerFromCommand,
+  extractTestCoverage, extractLineCoverage, runnerFromCommand,
 } from './test-runners.js';
 
 // Build + buffer a FixLoopEvent from one wrapper-loop iteration. Centralized
@@ -539,7 +539,7 @@ export async function testFixLoop(
   relatedFiles?: string[],
   analysisContext?: string,
   options: TestFixLoopOptions = {},
-): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number } }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number }; line_coverage_pct?: number }> {
   let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
   const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
@@ -864,6 +864,12 @@ export async function testFixLoop(
     // the field is simply omitted from the verdict. Visibility only — never
     // changes pass/fail or detected.
     const coverage = extractTestCoverage(runnerOutputs.join('\n')) ?? undefined;
+    // Line/statement coverage percentage from pytest-cov terminal output.
+    // Populated only when the test runner includes coverage instrumentation
+    // (--cov-report=term-missing). When absent (no instrumentation active),
+    // line_coverage_pct is undefined and the backend falls back to the
+    // test-count-based coverage computation.
+    const lineCoveragePct = extractLineCoverage(runnerOutputs.join('\n')) ?? undefined;
 
     // Partial-setup detection: at least one runner ran AND at least one OTHER
     // runner failed setup/environment. The failed runner's suite never
@@ -926,6 +932,7 @@ export async function testFixLoop(
         passed: true, testFailuresDetected: false, noTestsExecuted,
         noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
         coverage,
+        line_coverage_pct: lineCoveragePct,
       };
     }
 
@@ -985,7 +992,7 @@ export async function testFixLoop(
       });
       sendLog(ws, `Test failures unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
       const failureSummary = combinedFailures.slice(-8000) + setupNote;
-      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, coverage };
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, line_coverage_pct: lineCoveragePct, coverage };
     }
     fingerprintHistory.push(fingerprint);
     errorTextHistory.push(combinedFailures);
@@ -998,7 +1005,7 @@ export async function testFixLoop(
       });
       sendLog(ws, `Test fix loop divergence detected (${divergence}) — abandoning to avoid wasted iterations.\n`);
       const failureSummary = combinedFailures.slice(-8000) + setupNote;
-      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, coverage };
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, line_coverage_pct: lineCoveragePct, coverage };
     }
     // On retry (attempt >= 1), record what the previous Claude call
     // actually changed + the test failures that persisted, so the next
@@ -1101,6 +1108,7 @@ export async function testFixLoop(
         noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
         partialSetupFailed: partialSetupFailed || undefined,
         coverage,
+        line_coverage_pct: lineCoveragePct,
       };
     }
   }
