@@ -12,6 +12,7 @@ existing ``from app.strategic_spawning import ...`` call sites and tests keep
 resolving unchanged.
 """
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any
@@ -857,3 +858,55 @@ def _summarize_self_reflection_log(v: Any) -> Any:
                 item[field] = _bounded_text(item.get(field), _SELF_REFLECTION_TEXT_CAP)
         out.append(item)
     return out
+
+
+_SELF_REFLECTION_MIN_OCCURRENCES = 3
+"""Minimum distinct entries a word must appear in to qualify as a theme."""
+
+_SELF_REFLECTION_THEME_STOPWORDS: frozenset[str] = frozenset({
+    "about", "after", "all", "also", "among", "are", "around", "because",
+    "before", "been", "being", "but", "can", "could", "did", "does", "done",
+    "each", "even", "everything", "from", "get", "gets", "getting", "got",
+    "has", "have", "how", "into", "its", "just", "let", "like", "made",
+    "make", "making", "may", "might", "more", "much", "need", "needs",
+    "not", "over", "see", "seen", "should", "some", "something", "still",
+    "such", "take", "than", "that", "their", "them", "thing", "things",
+    "the", "this", "too", "use", "used", "using", "very", "way", "ways",
+    "well", "were", "what", "when", "where", "which", "while", "who",
+    "will", "with", "without", "within", "would",
+})
+
+
+def _build_self_reflection_themes(log: list | None) -> list[dict]:
+    """Extract recurring themes from the full self-reflection log.
+
+    When the log has more than 5 entries, words appearing in at least
+    ``_SELF_REFLECTION_MIN_OCCURRENCES`` distinct entries' ``what_was_hard``
+    are surfaced as compact theme entries — one per word with an occurrence
+    count — so the strategist agent can spot patterns the recent-only log
+    summary would hide.
+
+    Returns up to 5 theme dicts sorted by descending occurrence count, or an
+    empty list when the log is too short or no word meets the threshold.
+    """
+    if not isinstance(log, list) or len(log) <= 5:
+        return []
+    word_entry_count: dict[str, int] = {}
+    for entry in log:
+        if not isinstance(entry, dict):
+            continue
+        text = (entry.get("what_was_hard") or "").lower()
+        words = set()
+        for m in re.finditer(r"[a-z]{3,}", text):
+            w = m.group()
+            if w not in _SELF_REFLECTION_THEME_STOPWORDS:
+                words.add(w)
+        for w in words:
+            word_entry_count[w] = word_entry_count.get(w, 0) + 1
+    themes = [
+        {"theme": w, "occurrences": c}
+        for w, c in word_entry_count.items()
+        if c >= _SELF_REFLECTION_MIN_OCCURRENCES
+    ]
+    themes.sort(key=lambda x: (-x["occurrences"], x["theme"]))
+    return themes[:5]

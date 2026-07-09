@@ -19232,6 +19232,103 @@ def test_summarize_self_reflection_log_malformed_never_raises():
     assert _summarize_self_reflection_log(["str", 1]) == ["str", 1]
 
 
+def test_build_self_reflection_themes_finds_common_theme():
+    """Themes are extracted when >5 entries share a recurring word in what_was_hard."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    log = [
+        {"what_was_hard": "Missing context on async patterns"},
+        {"what_was_hard": "Needed more context for the change"},
+        {"what_was_hard": "Hard to follow without broader context"},
+        {"what_was_hard": "Confused by missing context in schema"},
+        {"what_was_hard": "Struggled with test context setup"},
+        {"what_was_hard": "Ran out of context for large refactor"},
+    ]
+    result = _build_self_reflection_themes(log)
+    assert isinstance(result, list)
+    assert len(result) >= 1
+    context_themes = [t for t in result if t["theme"] == "context"]
+    assert len(context_themes) == 1
+    assert context_themes[0]["occurrences"] >= 5
+
+
+def test_build_self_reflection_themes_empty_under_six():
+    """Empty result when log has 5 or fewer entries."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    assert _build_self_reflection_themes([]) == []
+    assert _build_self_reflection_themes([{"what_was_hard": "x"}]) == []
+    assert _build_self_reflection_themes([{"what_was_hard": str(i)} for i in range(5)]) == []
+
+
+def test_build_self_reflection_themes_no_commonality():
+    """Empty result when >5 entries have no overlapping significant words."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    log = [
+        {"what_was_hard": "Struggled with python packaging"},
+        {"what_was_hard": "Hard to debug kubernetes networking"},
+        {"what_was_hard": "Confused by react rendering lifecycle"},
+        {"what_was_hard": "Missing documentation for build steps"},
+        {"what_was_hard": "Unexpected behavior in database migrations"},
+        {"what_was_hard": "Could not reproduce flaky integration test"},
+    ]
+    result = _build_self_reflection_themes(log)
+    assert isinstance(result, list)
+    assert result == []
+
+
+def test_build_self_reflection_themes_malformed():
+    """Malformed or None input returns empty list."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    assert _build_self_reflection_themes(None) == []
+    assert _build_self_reflection_themes("x") == []
+    assert _build_self_reflection_themes(42) == []
+    assert _build_self_reflection_themes([123]) == []
+
+
+def test_build_self_reflection_themes_non_dict_entries_in_long_log():
+    """Non-dict entries in a >5-entry log are skipped without raising AttributeError."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    log = [
+        {"what_was_hard": "Missing context for the async change"},
+        {"what_was_hard": "Hard to follow without broader context"},
+        "not a dict",
+        {"what_was_hard": "Confused by missing context in schema"},
+        42,
+        {"what_was_hard": "Struggled with test context setup"},
+        None,
+        {"what_was_hard": "Ran out of context for large refactor"},
+    ]
+    result = _build_self_reflection_themes(log)
+    assert isinstance(result, list)
+    context_themes = [t for t in result if t["theme"] == "context"]
+    assert len(context_themes) == 1
+    assert context_themes[0]["occurrences"] >= 5
+
+
+def test_build_self_reflection_themes_sorts_by_frequency():
+    """Themes are sorted descending by occurrence count, at most 5 returned."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    log = [
+        {"what_was_hard": "Something about schema design testing"},
+        {"what_was_hard": "Schema migration was painful testing"},
+        {"what_was_hard": "Could not validate schema testing"},
+        {"what_was_hard": "Schema changes broke everything testing"},
+        {"what_was_hard": "Schema testing took too long"},
+        {"what_was_hard": "Schema and testing both frustrating"},
+    ]
+    result = _build_self_reflection_themes(log)
+    assert len(result) <= 5
+    # Should have schema (6) first, then testing (6)
+    assert result[0]["theme"] == "schema"
+    occurrences = [t["occurrences"] for t in result]
+    assert occurrences == sorted(occurrences, reverse=True)
+
+
 def _oversized_section_fixtures() -> dict:
     """Realistic oversized values for the six previously-exempt sections."""
     return {

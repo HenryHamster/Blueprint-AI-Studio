@@ -224,6 +224,7 @@ from app.strategic_payload_summaries import (  # noqa: F401 — re-exported for 
     _SELF_REFLECTION_KEEP,
     _SELF_REFLECTION_TEXT_CAP,
     _SELF_REFLECTION_TEXT_FIELDS,
+    _build_self_reflection_themes,
     _summarize_self_reflection_log,
 )
 
@@ -7380,6 +7381,15 @@ async def _spawn_strategic_review(
             ),
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
+            **(
+                {"self_reflection_themes": _self_reflection_themes}
+                if (
+                    _self_reflection_themes := _build_self_reflection_themes(
+                        project.self_reflection_log
+                    )
+                )
+                else {}
+            ),
             "strategic_memory_notes": project.strategic_memory_notes or [],
             # De-gated from the raw project.is_self_repo column to the deploy-repo
             # predicate: the strategist's self-improvement framing (modify your own
