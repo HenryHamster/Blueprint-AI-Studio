@@ -1416,3 +1416,46 @@ async def agent_fetch_gap(
                     "from_archive": archived_flag,
                 }
     raise HTTPException(status_code=404, detail="Gap not found")
+
+
+@router.get("/projects/{project_id}/spend-ceiling")
+@limiter.limit("60/minute")
+async def agent_fetch_spend_ceiling(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return per-project spend ceiling context including whether the ceiling
+    has been reached.  Returns ``spend_ceiling_usd``, ``spend_recent_usd``, and
+    ``spend_ceiling_reached``.  The ceiling is read from the project's resource
+    envelope; when no ceiling is configured all three fields are null.
+
+    Read-only; cross-project access returns 404."""
+    project = await _resolve_agent_project(project_id, token, session)
+    from app.resource_envelope import (  # noqa: PLC0415
+        get_project_recent_spend_usd,
+        resolve_project_spend_ceiling,
+    )
+
+    ceiling = resolve_project_spend_ceiling(project)
+    if ceiling is None:
+        return {
+            "status": "success",
+            "data": {
+                "spend_ceiling_usd": None,
+                "spend_recent_usd": None,
+                "spend_ceiling_reached": None,
+            },
+        }
+
+    spend = await get_project_recent_spend_usd(session, project_id=project_id)
+    recent_total = spend["total"]
+    return {
+        "status": "success",
+        "data": {
+            "spend_ceiling_usd": ceiling,
+            "spend_recent_usd": recent_total,
+            "spend_ceiling_reached": recent_total >= ceiling,
+        },
+    }

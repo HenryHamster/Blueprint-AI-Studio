@@ -742,6 +742,26 @@ async def _filter_project_resource_dispatch_eligible(
         filtered.append(task_id)
         projected_counts[task.project_id] = projected_counts.get(task.project_id, 0) + 1
 
+    # Broadcast per-project spend-ceiling state transitions for caller
+    # (admin-ui) to surface ceiling-deferred indicators without waiting
+    # for the next resource-envelope API fetch.
+    _current_ceiling_deferred: set[str] = set()
+    for _pid, (_recent, _ceiling, _) in spend_cache.items():
+        if _recent >= _ceiling:
+            _current_ceiling_deferred.add(str(_pid))
+    _prev = _shared_state.project_ceiling_deferred_ids
+    for _pid in _current_ceiling_deferred - _prev:
+        try:
+            await broadcast_to_project(_pid, "project_spend_ceiling_deferred", {"project_id": _pid})
+        except Exception:
+            logger.exception("[ORCHESTRATOR] Failed to broadcast ceiling_deferred for %s", _pid)
+    for _pid in _prev - _current_ceiling_deferred:
+        try:
+            await broadcast_to_project(_pid, "project_spend_ceiling_restored", {"project_id": _pid})
+        except Exception:
+            logger.exception("[ORCHESTRATOR] Failed to broadcast ceiling_restored for %s", _pid)
+    _shared_state.project_ceiling_deferred_ids = _current_ceiling_deferred
+
     if session.dirty:
         await session.commit()
     return filtered
@@ -2610,6 +2630,13 @@ async def orchestrator_worker():
                 # on each committed pin so one idle runner is never over-pinned
                 # beyond its max_concurrent in a single burst.
                 _runner_pins_this_cycle: dict[uuid.UUID, int] = {}
+                # Per-cycle project/spend caches for the resource-envelope check
+                # in the per-task dispatch loop below.  Avoids redundant DB queries
+                # (get_project_recent_spend_usd, session.get(Project)) when multiple
+                # tasks from the same project are dispatched in one cycle — mirrors
+                # the caching pattern in _filter_project_resource_dispatch_eligible.
+                _project_cache_for_dispatch: dict[uuid.UUID, Project | None] = {}
+                _spend_cache_for_dispatch: dict[uuid.UUID, tuple[float, float, int]] = {}
 
                 for _qt_id, _task_type_for_gate in _queued_task_gate_info:
                     # Per-type failure gate: skip tasks whose type is currently failing
@@ -2664,7 +2691,9 @@ async def orchestrator_worker():
                             continue
                         resource_defer_msg = (
                             await _project_resource_dispatch_defer_message(
-                                session, task, project_active_counts
+                                session, task, project_active_counts,
+                                project_cache=_project_cache_for_dispatch,
+                                spend_cache=_spend_cache_for_dispatch,
                             )
                         )
                         if resource_defer_msg:

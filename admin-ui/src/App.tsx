@@ -1638,6 +1638,7 @@ export default function App() {
         health={s.orchestratorHealth}
         detailedHealth={s.detailedHealth}
         pipelineThrottle={s.pipelineThrottle}
+        ceilingDeferredProjectIds={s.ceilingDeferredProjectIds}
         gatedTaskTypes={s.gatedTaskTypes}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
       />

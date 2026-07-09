@@ -298,6 +298,106 @@ def reset_max_plan_pool():
     _account_by_id.update(orig_by_id)
 
 
+# ── Per-project spend ceiling dispatch gate ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dispatch_gate_ceiling_exceeded_defers_tasks(db_session, mocker):
+    """Per-project spend ceiling in resource_envelope prevents dispatch when
+    recent spend exceeds the configured ceiling.
+
+    _project_resource_dispatch_defer_message reads spend_ceiling_usd from the
+    project's build_config and compares it against get_project_recent_spend_usd.
+    When total spend >= ceiling, a human-readable deferral reason is returned.
+    When spend < ceiling (or no ceiling is set), None is returned and the task
+    remains eligible.
+    """
+    from app.orchestrator import _project_resource_dispatch_defer_message
+
+    project = make_project(
+        name="ceiling-test",
+        user_id=_TEST_USER,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Case 1: spend exceeds ceiling → deferral message returned
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 150.0, "compute": 100.0, "agent_vm": 50.0, "idle": 0.0}),
+    )
+    msg = await _project_resource_dispatch_defer_message(
+        db_session, task, {},
+        project_cache={},
+        spend_cache={},
+    )
+    assert msg is not None, (
+        "expected deferral message when spend ($150) exceeds ceiling ($100)"
+    )
+    assert "spend budget" in msg.lower(), (
+        f"defer message should mention spend budget; got: {msg}"
+    )
+    assert "150.00" in msg and "100.00" in msg, (
+        f"defer message should include spend/ceiling values; got: {msg}"
+    )
+
+    # Case 2: spend well under ceiling → no deferral
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 30.0, "compute": 20.0, "agent_vm": 10.0, "idle": 0.0}),
+    )
+    msg2 = await _project_resource_dispatch_defer_message(
+        db_session, task, {},
+        project_cache={},
+        spend_cache={},
+    )
+    assert msg2 is None, (
+        "expected no deferral when spend ($30) is under ceiling ($100)"
+    )
+
+    # Case 3: no spend ceiling set → no deferral
+    project_no_ceiling = make_project(
+        name="no-ceiling",
+        user_id=_TEST_USER,
+        build_config={},
+    )
+    db_session.add(project_no_ceiling)
+    await db_session.commit()
+    await db_session.refresh(project_no_ceiling)
+
+    task2 = make_task(
+        project_id=project_no_ceiling.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "test"}],
+    )
+    db_session.add(task2)
+    await db_session.commit()
+
+    msg3 = await _project_resource_dispatch_defer_message(
+        db_session, task2, {},
+        project_cache={},
+        spend_cache={},
+    )
+    assert msg3 is None, (
+        "expected no deferral when no spend ceiling is configured"
+    )
+
+
 # ── Degraded-runner dispatch deprioritization ─────────────────────────────────
 
 

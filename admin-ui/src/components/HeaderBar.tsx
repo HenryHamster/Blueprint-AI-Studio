@@ -46,6 +46,7 @@ export interface HeaderBarProps {
   detailedHealth: DetailedHealth | null;
   pipelineThrottle?: PipelineThrottle | null;
   gatedTaskTypes?: FailingTaskTypeEntry[];
+  ceilingDeferredProjectIds?: Set<string>;
   costSectionAvailable?: boolean;
   /** Opens the ProjectManagementModal (archive/delete/unarchive + new-project). */
   onManageProjects?: () => void;
@@ -220,6 +221,14 @@ export function HeaderBar(props: HeaderBarProps) {
             selectedProjectId={props.selectedProjectId}
             onSelectProject={props.onSelectProject}
           />
+          {props.selectedProjectId && props.ceilingDeferredProjectIds?.has(props.selectedProjectId) && (
+            <span
+              className="inline-flex items-center gap-1 rounded-full bg-amber-950/60 px-2 py-0.5 text-xs text-amber-400"
+              title="Spend ceiling exceeded — tasks are deferred"
+            >
+              ⚠ ceiling
+            </span>
+          )}
           {props.onManageProjects && (
             /* eslint-disable-next-line viewport/min-touch-target */
             <button
