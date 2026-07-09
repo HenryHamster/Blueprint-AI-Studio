@@ -4378,6 +4378,44 @@ def _format_rework_attribution(rework_breakdown: Dict[str, Any]) -> Dict[str, An
     }
 
 
+def _compute_llm_cost_by_account(tasks: list[Task]) -> list[Dict[str, Any]]:
+    """Per-account LLM token/cost rollup — groups tasks by llm_account_id, sorted by cost descending."""
+    from collections import defaultdict
+    from app.max_plan_pool import get_task_llm_account_id
+
+    buckets: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"input_tokens": 0, "output_tokens": 0, "llm_call_count": 0,
+                 "task_count": 0, "cost_usd": 0.0}
+    )
+    for t in tasks:
+        account_id = get_task_llm_account_id(t) or "unknown"
+        b = buckets[account_id]
+        seen_this_task = False
+        for (provider, model, it, ot, cc, cache_cr, cache_rd) in _task_llm_attempts(t):
+            if it <= 0 and ot <= 0:
+                continue
+            key = (provider.lower(), model.lower()) if provider and model else None
+            pricing = LLM_TOKEN_PRICING.get(key) if key else None
+            if pricing:
+                cost = _price_llm_attempt(it, ot, cache_cr, cache_rd, *pricing,
+                                           provider=provider, model=model)
+            else:
+                cost = 0.0
+            b["input_tokens"] += int(it)
+            b["output_tokens"] += int(ot)
+            b["llm_call_count"] += cc
+            b["cost_usd"] += cost
+            seen_this_task = True
+        if seen_this_task:
+            b["task_count"] += 1
+    for v in buckets.values():
+        v["cost_usd"] = round(v["cost_usd"], 6)
+    return [
+        {"account_id": aid, **data}
+        for aid, data in sorted(buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True)
+    ]
+
+
 @router.get("/projects/{project_id}/llm-cost-breakdown")
 async def get_llm_cost_breakdown(
     project_id: uuid.UUID,
@@ -4458,6 +4496,7 @@ async def get_llm_cost_breakdown(
         "generated_at": _utcnow().isoformat(),
         **breakdown,
         "by_task_type": compute_llm_cost_by_task_type(tasks),
+        "by_account": _compute_llm_cost_by_account(tasks),
         "rework_attribution": _format_rework_attribution(rework_breakdown),
     }
 

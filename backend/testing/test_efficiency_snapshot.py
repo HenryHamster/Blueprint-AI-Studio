@@ -47,6 +47,7 @@ from app.efficiency_snapshot import (
     _PROMPT_STATIC_PLAIN_CONST_NAMES,
     _TASK_TYPE_FOCUS_CONST_NAMES,
     _compute_checkpoint_loss_rate,
+    _compute_llm_cost_by_account,
     _compute_llm_cost_pricing_coverage,
     _compute_lane_cost_per_merged_pr,
     _compute_lane_warm_resume_rate,
@@ -5376,6 +5377,200 @@ def test_compute_llm_cost_by_task_type():
     # Verify merged task is counted correctly
     assert create_row["merged_count"] == 1
     assert create_row["verified_merged_count"] == 1
+
+
+def test_compute_llm_cost_by_account():
+    """Per-account LLM cost rollup: grouping, pricing, sorting, unknown fallback, zero-token exclusion."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # Account A: 2 tasks, one with multiple call rows — expected to rank #1.
+    input_rate_a, output_rate_a = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    # Task A1: 1000 in @ 3e-6 + 500 out @ 15e-6 = 0.009 + 0.0075 = 0.0105
+    task_a1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        llm_account_id="acct-a",
+    )
+    # Task A2: 200 in @ 3e-6 + 100 out @ 15e-6 = 0.0006 + 0.0015 = 0.0021
+    # Total for acct-a: 0.0105 + 0.0021 = 0.0126, 2 tasks.
+    task_a2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 200,
+            "total_output_tokens": 100,
+            "llm_call_count": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        llm_account_id="acct-a",
+    )
+
+    # Account B: higher cost overall — expected to rank #2 (less than acct-c).
+    input_rate_b, output_rate_b = LLM_TOKEN_PRICING[("openai", "gpt-5.4")]
+    # Task B1: 5000 in @ 2.5e-6 + 2000 out @ 15e-6 = 0.0125 + 0.03 = 0.0425
+    task_b1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 5000,
+            "total_output_tokens": 2000,
+            "llm_call_count": 10,
+        },
+        provider="openai",
+        model="gpt-5.4",
+        llm_account_id="acct-b",
+    )
+
+    # Account C: highest cost — expected to rank #1.
+    input_rate_c, output_rate_c = LLM_TOKEN_PRICING[("gemini", "gemini-2.5-flash")]
+    # Task C1: 8000 in @ 0.15e-6 + 4000 out @ 0.6e-6 = 0.0012 + 0.0024 = 0.0036
+    task_c1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 8000,
+            "total_output_tokens": 4000,
+            "llm_call_count": 12,
+        },
+        provider="gemini",
+        model="gemini-2.5-flash",
+        llm_account_id="acct-c",
+    )
+
+    # Unknown account: task without llm_account_id — falls to "unknown".
+    input_rate_u, output_rate_u = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    task_unknown = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 1500,
+            "llm_call_count": 9,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        # llm_account_id deliberately absent
+    )
+
+    # Zero-token task: should NOT be counted in any bucket's task_count.
+    task_no_tokens = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "llm_call_count": 0,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        llm_account_id="acct-a",
+    )
+
+    rows = _compute_llm_cost_by_account(
+        [task_a1, task_a2, task_b1, task_c1, task_unknown, task_no_tokens]
+    )
+
+    # (c) sorted output by cost descending
+    assert len(rows) == 4
+    for i in range(len(rows) - 1):
+        assert rows[i]["cost_usd"] >= rows[i + 1]["cost_usd"], (
+            f"rows not sorted by cost descending at index {i}: "
+            f"{rows[i]['cost_usd']} < {rows[i+1]['cost_usd']}"
+        )
+
+    by_account = {r["account_id"]: r for r in rows}
+
+    # (a) basic grouping by account_id
+    assert set(by_account.keys()) == {"acct-a", "acct-b", "acct-c", "unknown"}
+
+    # (d) unknown fallback: task without llm_account_id lands in "unknown"
+    cost_unknown = round(3000 * input_rate_u + 1500 * output_rate_u, 6)
+    assert by_account["unknown"]["account_id"] == "unknown"
+    assert by_account["unknown"]["input_tokens"] == 3000
+    assert by_account["unknown"]["output_tokens"] == 1500
+    assert by_account["unknown"]["cost_usd"] == cost_unknown
+    assert by_account["unknown"]["task_count"] == 1
+
+    # (e) zero-token tasks excluded from task_count
+    # acct-a has 2 tasks with tokens (A1, A2), and 1 zero-token task excluded
+    assert by_account["acct-a"]["task_count"] == 2
+
+    # (b) correct cost computation
+    cost_a = round(1000 * input_rate_a + 500 * output_rate_a, 6) + round(200 * input_rate_a + 100 * output_rate_a, 6)
+    cost_a_rounded = round(cost_a, 6)
+    assert by_account["acct-a"]["cost_usd"] == cost_a_rounded
+    assert by_account["acct-a"]["input_tokens"] == 1200
+    assert by_account["acct-a"]["output_tokens"] == 600
+    assert by_account["acct-a"]["llm_call_count"] == 7
+
+    cost_b = round(5000 * input_rate_b + 2000 * output_rate_b, 6)
+    assert by_account["acct-b"]["cost_usd"] == cost_b
+    assert by_account["acct-b"]["task_count"] == 1
+
+    cost_c = round(8000 * input_rate_c + 4000 * output_rate_c, 6)
+    assert by_account["acct-c"]["cost_usd"] == cost_c
+
+
+def test_compute_llm_cost_by_account_empty():
+    """Empty task list returns empty list."""
+    rows = _compute_llm_cost_by_account([])
+    assert rows == []
+
+
+def test_compute_llm_cost_by_account_unknown_only():
+    """Tasks without llm_account_id all bubble up to 'unknown'."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    t1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"total_input_tokens": 100, "total_output_tokens": 50, "llm_call_count": 1},
+        provider="anthropic", model="claude-sonnet-4-6",
+    )
+    t2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"total_input_tokens": 200, "total_output_tokens": 100, "llm_call_count": 2},
+        provider="anthropic", model="claude-sonnet-4-6",
+    )
+
+    rows = _compute_llm_cost_by_account([t1, t2])
+    assert len(rows) == 1
+    assert rows[0]["account_id"] == "unknown"
+    assert rows[0]["task_count"] == 2
+    expected_cost = round(100 * input_rate + 50 * output_rate, 6) + round(200 * input_rate + 100 * output_rate, 6)
+    assert rows[0]["cost_usd"] == round(expected_cost, 6)
+
+
+def test_compute_llm_cost_by_account_unpriced_no_crash():
+    """Task with unknown provider/model yields zero cost, does not crash."""
+    import uuid
+
+    t = make_task(
+        project_id=uuid.uuid4(),
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"total_input_tokens": 500, "total_output_tokens": 200, "llm_call_count": 3},
+        provider="nonexistent", model="fake-model",
+        llm_account_id="some-acct",
+    )
+    rows = _compute_llm_cost_by_account([t])
+    assert len(rows) == 1
+    assert rows[0]["account_id"] == "some-acct"
+    assert rows[0]["cost_usd"] == 0.0
+    assert rows[0]["task_count"] == 1
 
 
 def test_compact_llm_cost_attribution():

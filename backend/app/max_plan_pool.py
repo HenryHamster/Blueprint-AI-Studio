@@ -2567,6 +2567,8 @@ async def select_llm_runtime_for_task(
         explicit_model, runtime_config
     )
     routing_task_type = _task_type(task)
+    project_id = str(getattr(task, "project_id", None) or "unknown")
+    logger.info("[LLM_SELECT] project=%s user=%s task_type=%s", project_id, user_id, routing_task_type)
 
     # If the inferred explicit_provider isn't allowed by the resolved
     # routing, drop the pin so category_routing wins. Catches:
@@ -2614,6 +2616,7 @@ async def select_llm_runtime_for_task(
                 runtime_config=runtime_config,
             )
             if account:
+                logger.info("[LLM_SELECT] project=%s account=%s provider=%s model=%s", project_id, account.get("id"), provider_name, model_name)
                 return LLMSelectionResult(
                     provider=provider_name,
                     auth_mode=_normalize_auth_mode(account.get("auth_mode"))
@@ -2777,8 +2780,9 @@ async def select_llm_runtime_for_task(
             )
             if account:
                 logger.warning(
-                    "[LLM_SELECT] No pool account has %s; falling back to GA "
-                    "counterpart %s on %s. Recorded on task.context.model_fallback.",
+                    "[LLM_SELECT] project=%s No pool account has %s; falling back to GA "
+                    "counterpart %s on %s.",
+                    project_id,
                     model,
                     fallback,
                     provider_name,
