@@ -1343,6 +1343,120 @@ class PrintNoSystemdGuidanceTests(unittest.TestCase):
         self.assertIn("install --system", output)
 
 
+class StatusCommandTests(unittest.TestCase):
+    """Tests for the ``blueprint-runner status`` command."""
+
+    def test_status_routed_from_main(self):
+        """``main(["status"])`` routes to ``do_status``."""
+        with patch.object(br, "do_status", return_value=0) as status_mock:
+            rc = br.main(["status"])
+        self.assertEqual(rc, 0)
+        status_mock.assert_called_once()
+
+    def test_status_command_reads_status_json(self):
+        """do_status reads ~/.blueprint/status.json and prints a human-readable summary."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "status.json")
+            with open(status_path, "w") as f:
+                json.dump({
+                    "runner_id": "test-runner-1",
+                    "last_heartbeat_at": "2026-07-09T12:00:00+00:00",
+                    "last_heartbeat_status": "ok",
+                    "active_task_ids": ["task-1", "task-2"],
+                    "active_compute_job_ids": ["job-1"],
+                    "bwrap_ok": True,
+                    "docker_usable": False,
+                    "agent_backend": "bwrap",
+                    "compute_backend": "process",
+                }, f)
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+            self.assertEqual(rc, 0)
+            output = fake_stdout.getvalue()
+            self.assertIn("runner_id", output)
+            self.assertIn("test-runner-1", output)
+            self.assertIn("last_heartbeat_at", output)
+            self.assertIn("2026-07-09T12:00:00+00:00", output)
+            self.assertIn("last_heartbeat_status", output)
+            self.assertIn("ok", output)
+            self.assertIn("task-1", output)
+            self.assertIn("task-2", output)
+            self.assertIn("job-1", output)
+            self.assertIn("bwrap_ok", output)
+            self.assertIn("True", output)
+
+    def test_status_missing_file_returns_1(self):
+        """do_status returns 1 when status.json does not exist."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stderr = io.StringIO()
+                with patch.object(br.sys, "stderr", fake_stderr):
+                    rc = br.do_status()
+            self.assertEqual(rc, 1)
+            self.assertIn("status file not found", fake_stderr.getvalue())
+
+    def test_status_bad_json_returns_1(self):
+        """do_status returns 1 when status.json contains invalid JSON."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "status.json")
+            with open(status_path, "w") as f:
+                f.write("not valid json")
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stderr = io.StringIO()
+                with patch.object(br.sys, "stderr", fake_stderr):
+                    rc = br.do_status()
+            self.assertEqual(rc, 1)
+            self.assertIn("could not parse", fake_stderr.getvalue())
+
+    def test_status_empty_active_ids(self):
+        """do_status handles empty active_task_ids / active_compute_job_ids gracefully."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "status.json")
+            with open(status_path, "w") as f:
+                json.dump({
+                    "runner_id": "r1",
+                    "last_heartbeat_at": "2026-07-09T12:00:00+00:00",
+                    "last_heartbeat_status": "ok",
+                    "active_task_ids": [],
+                    "active_compute_job_ids": [],
+                    "bwrap_ok": True,
+                    "docker_usable": False,
+                }, f)
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+            self.assertEqual(rc, 0)
+            output = fake_stdout.getvalue()
+            self.assertIn("none", output)
+
+    def test_status_oserror_returns_1(self):
+        """do_status returns 1 when the status file exists but cannot be read."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "status.json")
+            with open(status_path, "w") as f:
+                f.write("{}")
+            # Make file unreadable
+            os.chmod(status_path, 0o000)
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stderr = io.StringIO()
+                with patch.object(br.sys, "stderr", fake_stderr):
+                    rc = br.do_status()
+            self.assertEqual(rc, 1)
+            self.assertIn("could not read", fake_stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -935,6 +935,43 @@ def _handle_signal(signum, frame):  # noqa: ARG001
         _shutdown_event.set()
 
 
+def _wait_for_compute_jobs(
+    active_compute_jobs: set[str],
+    compute_lock: threading.Lock,
+    timeout: float = 120,
+) -> None:
+    """Wait for active compute jobs to finish during graceful shutdown.
+
+    Compute job worker threads are daemon threads (they would be killed on
+    process exit).  This wait gives them a chance to finish their current
+    command and report a final status to the orchestrator so the job does not
+    appear ``running`` until a reaper sweep.
+    """
+    with compute_lock:
+        remaining = set(active_compute_jobs)
+
+    if not remaining:
+        return
+
+    print(
+        f"[runner] Shutdown requested — waiting for {len(remaining)} "
+        "active compute jobs...",
+        flush=True,
+    )
+    deadline = time.monotonic() + timeout
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.5)
+        with compute_lock:
+            remaining = set(active_compute_jobs)
+
+    if remaining:
+        print(
+            f"[runner] timeout waiting for {len(remaining)} compute jobs "
+            "— exiting (daemon threads)",
+            flush=True,
+        )
+
+
 # ── Active task tracking (background thread) ──────────────────────────────────
 
 def _release_capacity(capacity: threading.Semaphore | None) -> None:
@@ -3083,6 +3120,10 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 — a transient error must not crash the runner
             print(f"[runner] agent poll loop error (continuing): {exc}", flush=True)
             time.sleep(5)
+
+    # Drain active compute jobs first — daemon threads would be killed on
+    # process exit, so give them a chance to report their final status.
+    _wait_for_compute_jobs(active_compute_jobs, compute_lock)
 
     # Graceful shutdown (monotonic clock so a wall-clock jump can't skew the wait).
     with lock:

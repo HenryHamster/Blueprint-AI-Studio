@@ -751,6 +751,64 @@ class TestGracefulShutdown(unittest.TestCase):
 
         proc.terminate.assert_called_once()
 
+    def test_shutdown_waits_for_compute_jobs(self):
+        """Shutdown waits for active compute jobs to complete before exiting."""
+        lock = threading.Lock()
+        active: set[str] = {"job-a", "job-b"}
+
+        def _drain() -> None:
+            """Simulate a worker completing and removing itself from the set."""
+            time.sleep(0.3)
+            with lock:
+                active.clear()
+
+        drainer = threading.Thread(target=_drain)
+        drainer.start()
+
+        start = time.monotonic()
+        local_runner._wait_for_compute_jobs(active, lock, timeout=5)
+        elapsed = time.monotonic() - start
+        drainer.join()
+
+        # Must have waited for the drainer to clear the set (not instant).
+        self.assertGreaterEqual(
+            elapsed,
+            0.15,
+            "Should have waited at least ~300 ms for compute jobs to finish",
+        )
+        # Must NOT have hit the full 5 s timeout.
+        self.assertLess(
+            elapsed,
+            3,
+            "Should have returned as soon as all jobs finished, not waited full timeout",
+        )
+        self.assertFalse(active, "All jobs should have been drained")
+
+    def test_shutdown_no_compute_jobs_returns_immediately(self):
+        """Shutdown with zero active compute jobs returns without delay."""
+        lock = threading.Lock()
+        active: set[str] = set()
+
+        start = time.monotonic()
+        local_runner._wait_for_compute_jobs(active, lock, timeout=5)
+        elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 0.5, "Should return immediately when no jobs active")
+
+    def test_shutdown_compute_jobs_timeout_logs_message(self):
+        """Shutdown logs a timeout message when jobs do not finish in time."""
+        lock = threading.Lock()
+        active: set[str] = {"stuck-job"}
+        buf = io.StringIO()
+
+        with contextlib.redirect_stdout(buf):
+            local_runner._wait_for_compute_jobs(active, lock, timeout=0.05)
+
+        output = buf.getvalue()
+        self.assertIn("timeout", output, "Should log a timeout message")
+        self.assertIn("compute jobs", output)
+        self.assertIn("stuck-job", active, "Stuck job must remain in set")
+
 
 # ── Compute job report helper ─────────────────────────────────────────────────
 

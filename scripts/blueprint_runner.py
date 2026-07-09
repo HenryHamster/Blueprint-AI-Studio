@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 # Baked-in production orchestrator base URL. Keep in sync with the admin-UI
 # constant DEFAULT_ORCHESTRATOR_URL in admin-ui/src/components/FleetRunnersPanel.utils.ts
@@ -925,6 +927,94 @@ def do_update(
     return 0
 
 
+def do_status() -> int:
+    """Read and print ``~/.blueprint/status.json`` in a human-readable summary.
+
+    The status file is written by the runner on every heartbeat (see
+    ``local_runner._write_status_json``).  It contains no secrets — only the
+    runner identity, last heartbeat timestamp, active work, and detected
+    isolation capabilities.
+
+    Returns 0 on success, 1 when the file is missing or unreadable.
+    """
+    path = os.path.join(_credential_dir(), "status.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(
+            f"ERROR: status file not found at {path}",
+            file=sys.stderr,
+        )
+        print(
+            "  The runner may not have started yet, or ~/.blueprint is empty.",
+            file=sys.stderr,
+        )
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: could not parse {path}: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"ERROR: could not read {path}: {exc}", file=sys.stderr)
+        return 1
+
+    # ── Compute how long ago the last heartbeat was ──
+    last_hb = str(data.get("last_heartbeat_at", "") or "")
+    time_ago_str = ""
+    hb_seconds_ago: int | None = None
+    if last_hb:
+        try:
+            hb_dt = datetime.fromisoformat(last_hb)
+            if hb_dt.tzinfo is None:
+                hb_dt = hb_dt.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - hb_dt
+            seconds = int(delta.total_seconds())
+            hb_seconds_ago = seconds
+            if seconds < 0:
+                time_ago_str = " (in the future — clock skew?)"
+            elif seconds < 60:
+                time_ago_str = f" ({seconds}s ago)"
+            elif seconds < 3600:
+                time_ago_str = f" ({seconds // 60}m {seconds % 60}s ago)"
+            else:
+                hrs = seconds // 3600
+                mins = (seconds % 3600) // 60
+                time_ago_str = f" ({hrs}h {mins}m ago)" if hrs < 24 else f" ({hrs // 24}d {hrs % 24}h ago)"
+        except (ValueError, TypeError):
+            time_ago_str = " (unparseable timestamp)"
+
+    active_tasks = data.get("active_task_ids") or []
+    active_compute = data.get("active_compute_job_ids") or []
+    bwrap = data.get("bwrap_ok")
+    docker = data.get("docker_usable")
+
+    print("blueprint-runner status", flush=True)
+    print(f"  runner_id              : {data.get('runner_id', 'N/A')}", flush=True)
+    print(f"  last_heartbeat_at      : {last_hb}{time_ago_str}", flush=True)
+    print(f"  last_heartbeat_status  : {data.get('last_heartbeat_status', 'N/A')}", flush=True)
+    print(f"  active_task_ids        : {', '.join(str(t) for t in active_tasks) if active_tasks else 'none'}", flush=True)
+    print(f"  active_compute_job_ids : {', '.join(str(j) for j in active_compute) if active_compute else 'none'}", flush=True)
+    if bwrap is not None:
+        print(f"  bwrap_ok               : {bwrap}", flush=True)
+    if docker is not None:
+        print(f"  docker_usable          : {docker}", flush=True)
+    agent = data.get("agent_backend")
+    compute = data.get("compute_backend")
+    if agent:
+        print(f"  agent_backend          : {agent}", flush=True)
+    if compute:
+        print(f"  compute_backend        : {compute}", flush=True)
+
+    # Health assessment
+    if hb_seconds_ago is not None:
+        if hb_seconds_ago > 120:
+            print(f"  health                 : STALE (no heartbeat in {hb_seconds_ago}s)", flush=True)
+        else:
+            print("  health                 : OK", flush=True)
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="blueprint-runner",
@@ -934,7 +1024,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(
-        dest="command", metavar="{start,check,install,uninstall,update}"
+        dest="command", metavar="{start,check,install,uninstall,update,status}"
     )
     for name, help_text in (
         ("start", "Run the runner (blocks; Ctrl-C for graceful shutdown)."),
@@ -1045,6 +1135,10 @@ def build_parser() -> argparse.ArgumentParser:
         "update",
         help="Update the local checkout and reinstall dependencies only when needed.",
     )
+    sub.add_parser(
+        "status",
+        help="Show runner process status from ~/.blueprint/status.json.",
+    )
     return parser
 
 
@@ -1064,6 +1158,9 @@ def main(argv: list[str] | None = None) -> int:
             system=getattr(args, "system", False),
             dry_run=getattr(args, "dry_run", False),
         )
+
+    if args.command == "status":
+        return do_status()
 
     if args.command == "install":
         # The token is OPTIONAL for install: if omitted, the service reads the
