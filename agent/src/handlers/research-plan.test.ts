@@ -569,6 +569,36 @@ describe('aggregateDirectionStats', () => {
     const result = aggregateDirectionStats(history, {});
     expect(result).not.toContain('conversion:');
   });
+
+  it('includes salvage counts when salvage metadata present in history', () => {
+    const history = [
+      {
+        tasks_created: 2,
+        prs_merged: 0,
+        salvage: { salvage_task_id: 'task-1', salvaged_count: 3, salvaged_at: '2026-07-09T00:00:00' },
+        filter_breakdown: { hash_dedup: 1, salvaged: 3 },
+      },
+      {
+        tasks_created: 1,
+        prs_merged: 0,
+        salvage: { salvage_task_id: 'task-2', salvaged_count: 2, salvaged_at: '2026-07-09T00:00:00' },
+        filter_breakdown: { salvaged: 2 },
+      },
+    ];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).toContain('filtered: 1');
+    expect(result).toContain('hash 1');
+    expect(result).toContain('5 findings salvaged across 2 cycles');
+    expect(result).toContain('bundled for consolidated action');
+  });
+
+  it('omits salvage section when no salvage metadata in history', () => {
+    const history = [{ tasks_created: 1, prs_merged: 0 }];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).not.toContain('salvaged');
+    expect(result).not.toContain('salvage');
+    expect(result).not.toContain('bundled for consolidated action');
+  });
 });
 
 describe('buildStrategicCompletionLogs', () => {

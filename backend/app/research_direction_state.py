@@ -629,6 +629,14 @@ async def apply_post_spawn_state(
                     _dedup_deadlock_alert_messages.append(_alert.message or "")
                 elif _alert.title == "Already-fixed deadlock detected":
                     _af_deadlock_alert_messages.append(_alert.message or "")
+            # Read salvage activity from parent task context (set by
+            # research_completion.py when salvage-bundle subtask was spawned).
+            # Shared across all direction entries for this research cycle.
+            _salvage_from_ctx: dict[str, Any] | None = (
+                (task.context or {}).get("salvage_activity")
+                if hasattr(task, "context")
+                else None
+            )
             for d in directions:
                 did = d.get("id")
                 if did in direction_ids_with_findings:
@@ -711,6 +719,16 @@ async def apply_post_spawn_state(
                             "empty_prompt": empty_prompt_count,
                         },
                     }
+                    # If the parent research task spawned a salvage-bundle subtask,
+                    # record the salvage metadata in the direction history so that
+                    # downstream consumers (research agent prompt, strategist,
+                    # admin UI) can see that discarded findings were durably
+                    # captured rather than silently dropped.
+                    if _salvage_from_ctx:
+                        entry["salvage"] = _salvage_from_ctx
+                        entry["filter_breakdown"]["salvaged"] = (
+                            _salvage_from_ctx.get("salvaged_count", 0)
+                        )
                     # Record exact titles+reasons so the research agent can be
                     # shown what was filtered and steer to different approaches
                     # on its next cycle. Cap at 5 per cycle to bound prompt

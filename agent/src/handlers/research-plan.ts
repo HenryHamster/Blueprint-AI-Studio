@@ -165,6 +165,24 @@ export function aggregateDirectionStats(
     parts.push(`filtered: ${filterTotal} (${segs.join(', ')})`);
   }
 
+  // Salvage activity across last 3 cycles — surfaced separately from filters
+  // because salvage captures findings for consolidated action rather than
+  // discarding them. This tells the agent that findings dropped by dedup/decay
+  // gates were durably captured and bundled.
+  let salvageCount = 0;
+  let salvageCycles = 0;
+  for (const h of recent) {
+    const s = h.salvage as { salvaged_count?: number } | undefined;
+    if (s && typeof s.salvaged_count === 'number' && s.salvaged_count > 0) {
+      salvageCount += s.salvaged_count;
+      salvageCycles++;
+    }
+  }
+  if (salvageCount > 0) {
+    const cycleLabel = salvageCycles === 1 ? '1 cycle' : `${salvageCycles} cycles`;
+    parts.push(`${salvageCount} findings salvaged across ${cycleLabel} — dropped by dedup/decay gates and bundled for consolidated action`);
+  }
+
   // Per-scope (finding-type) success rates across last 3 cycles — surfaces
   // whether certain scopes/types land more reliably than others.
   const typeAgg: Record<string, {created: number; merged: number}> = {};

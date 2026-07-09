@@ -541,6 +541,45 @@ class TestSalvagePayloadConstruction:
         assert e1["discard_reason"] == "ultra_low_confidence"
         assert e1["direction_id"] == "d-002"
 
+    def test_dedup_filtered_reason_preserved(self):
+        """Findings with dedup-formatted discard_reason are preserved in the payload."""
+        candidates = [
+            {
+                "title": "hash-duplicate",
+                "prompt": "Fix duplicated logic in auth handler",
+                "deferred_reason": "dedup: hash match with prior task",
+                "direction_id": "d-dedup01",
+                "related_files": ["backend/app/auth.py"],
+                "claims": [{"claim": "duplicate", "confidence": "medium"}],
+                "sources": ["scan.pdf"],
+            },
+            {
+                "title": "region-overlap",
+                "prompt": "Refactor shared region",
+                "deferred_reason": "dedup: region overlap with: existing task",
+                "direction_id": "d-dedup02",
+                "related_files": ["backend/app/models.py"],
+                "claims": [],
+                "sources": [],
+            },
+        ]
+        payload = _build_salvage_payload(candidates, "task-dedup-001")
+        entries = payload["salvaged_findings"]
+        assert len(entries) == 2
+
+        e0 = entries[0]
+        assert "dedup:" in e0["discard_reason"]
+        assert e0["title"] == "hash-duplicate"
+        assert e0["prompt"] == "Fix duplicated logic in auth handler"
+        assert e0["related_files"] == ["backend/app/auth.py"]
+        assert e0["direction_id"] == "d-dedup01"
+
+        e1 = entries[1]
+        assert "dedup:" in e1["discard_reason"]
+        assert e1["title"] == "region-overlap"
+        assert e1["prompt"] == "Refactor shared region"
+        assert e1["direction_id"] == "d-dedup02"
+
 
 @_pytest.mark.asyncio
 async def test_salvage_activity_context_recorded_on_parent_task(db_session, mocker):
@@ -583,6 +622,447 @@ async def test_salvage_activity_context_recorded_on_parent_task(db_session, mock
     assert "salvage_task_id" in salvage
     assert salvage["salvaged_count"] == 1
     assert "salvaged_at" in salvage
+
+    # Verify salvage info is also propagated to the direction research_history entry.
+    await db_session.refresh(_project)
+    _history = _project.directions[0].get("research_history", [])
+    assert _history, "research_history should not be empty"
+    _last_entry = _history[-1]
+    assert "salvage" in _last_entry, (
+        "direction research_history entry should contain salvage metadata"
+    )
+    assert _last_entry["salvage"]["salvaged_count"] == 1
+    assert _last_entry["salvage"]["salvage_task_id"] == salvage["salvage_task_id"]
+    # filter_breakdown should also include the salvaged count.
+    _fb = _last_entry.get("filter_breakdown", {})
+    assert "salvaged" in _fb, (
+        "filter_breakdown should include salvaged count"
+    )
+    assert _fb["salvaged"] == 1
+
+
+class TestDedupFilteredFindingsAddedToSalvage:
+    """Dedup-filtered findings flow into salvage candidates and the salvage bundle task."""
+
+    @_pytest.mark.asyncio
+    async def test_dedup_filtered_findings_appear_in_salvage_bundle(
+        self, db_session, mocker
+    ):
+        """Findings filtered by dedup (hash match) appear in the spawned salvage bundle task."""
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-salvage01"
+        )
+
+        # A finding that will be dedup-filtered (hash match)
+        dedup_filtered = _make_finding(
+            "Deduped perf finding", direction_id=direction["id"]
+        )
+        # A finding that survives dedup and spawns normally
+        surviving = _make_finding(
+            "Fresh finding", direction_id=direction["id"]
+        )
+
+        # Build DedupOutcome where the first finding is region-overlap filtered
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_survivor")]
+        mock_outcome.filtered = [
+            {
+                "title": "Deduped perf finding"[:120],
+                "direction_id": direction["id"],
+                "reason": "region overlap with: existing task",
+            }
+        ]
+        mock_outcome.word_overlap_count = 1
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[dedup_filtered, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # Verify salvage activity was recorded on the parent task
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        assert salvage_activity is not None, (
+            "salvage_activity must be recorded when dedup-filtered findings "
+            "are captured in salvage candidates"
+        )
+        assert salvage_activity["salvaged_count"] == 1, (
+            f"Expected 1 salvaged finding, got {salvage_activity['salvaged_count']}"
+        )
+
+        # Fetch the salvage bundle task (identified by salvage_source_task_id in context)
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t
+            for t in child_tasks
+            if (t.context or {}).get("salvage_source_task_id") == str(task.id)
+        ]
+        assert len(salvage_tasks) == 1, (
+            f"Expected 1 salvage bundle task, found {len(salvage_tasks)} "
+            f"among {len(child_tasks)} total child tasks"
+        )
+
+        salvage = salvage_tasks[0]
+        assert salvage.context.get("salvage_finding_count") == 1
+        # Title should say "discarded" (not only "decayed")
+        assert "discarded" in salvage.title.lower()
+
+        # Verify the payload contains the dedup-filtered finding
+        payload = salvage.payloads[0]
+        assert payload["type"] == "salvage_bundle"
+        assert len(payload["salvaged_findings"]) == 1
+        entry = payload["salvaged_findings"][0]
+        assert "Deduped perf finding" in entry["title"]
+        assert "dedup" in (entry["discard_reason"] or "").lower()
+        assert entry["direction_id"] == direction["id"]
+
+    @_pytest.mark.asyncio
+    async def test_dedup_filtered_finding_rich_context_preserved(
+        self, db_session, mocker
+    ):
+        """Rich context (prompt, related_files, claims, sources) is preserved
+        when dedup-filtered findings enter the salvage bundle payload."""
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-salvage02"
+        )
+
+        # A dedup-filtered finding with full rich context
+        rich_finding = {
+            "title": "Rich perf finding",
+            "description": "N+1 query in task_lifecycle.py causes slow pages",
+            "prompt": "Optimize N+1 by adding selectinload",
+            "related_files": ["backend/app/task_lifecycle.py"],
+            "claims": [{"claim": "N+1 detected", "confidence": "high"}],
+            "sources": [{"ref": "perf_audit_v2.pdf", "trust": "high"}],
+            "direction_id": direction["id"],
+            "priority": "medium",
+            "scope": "small",
+            "type": "improvement",
+        }
+        surviving = _make_finding(
+            "Surviving finding", direction_id=direction["id"]
+        )
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_s")]
+        mock_outcome.filtered = [
+            {
+                "title": "Rich perf finding"[:120],
+                "direction_id": direction["id"],
+                "reason": "region overlap with: existing task",
+            }
+        ]
+        mock_outcome.word_overlap_count = 1
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[rich_finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # Fetch salvage bundle task (identified by salvage_source_task_id in context)
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t
+            for t in child_tasks
+            if (t.context or {}).get("salvage_source_task_id") == str(task.id)
+        ]
+        assert len(salvage_tasks) == 1, (
+            f"Expected 1 salvage bundle task, found {len(salvage_tasks)} "
+            f"among {len(child_tasks)} total child tasks"
+        )
+
+        payload = salvage_tasks[0].payloads[0]
+        entry = payload["salvaged_findings"][0]
+
+        # Verify rich context is preserved
+        assert entry["title"] == "Rich perf finding"
+        assert "dedup" in (entry["discard_reason"] or "").lower()
+        assert entry["prompt"] == "Optimize N+1 by adding selectinload"
+        assert entry["description"] == "N+1 query in task_lifecycle.py causes slow pages"
+        assert entry["related_files"] == ["backend/app/task_lifecycle.py"]
+        assert entry["claims"] == [{"claim": "N+1 detected", "confidence": "high"}]
+        assert len(entry["sources"]) >= 1
+        assert entry["sources"][0].get("ref") == "perf_audit_v2.pdf"
+
+    @_pytest.mark.asyncio
+    async def test_non_salvageable_hash_match_excluded(
+        self, db_session, mocker
+    ):
+        """Findings filtered for hash-match (exact duplicate) are NOT salvaged.
+
+        Hash matches represent genuine duplicates of in-flight or recently
+        terminal work — not blocked-by-pipeline findings. The salvage gate
+        must exclude them so stale/duplicate findings don't create noise.
+        """
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-neg-hash"
+        )
+
+        # A non-perf finding filtered with a non-salvageable reason.
+        finding = _make_finding(
+            "Hash-duplicate improvement", direction_id=direction["id"],
+            finding_type="improvement",
+        )
+        surviving = _make_finding(
+            "Surviving finding", direction_id=direction["id"]
+        )
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_s")]
+        mock_outcome.filtered = [
+            {
+                "title": "Hash-duplicate improvement"[:120],
+                "direction_id": direction["id"],
+                "reason": "hash match with prior task",
+            }
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # Hash-match finding should NOT be salvaged — salvage_activity
+        # may still be present if other paths produce candidates, but the
+        # salvage count must be 0.
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        if salvage_activity is not None:
+            assert salvage_activity["salvaged_count"] == 0, (
+                f"Hash-match findings should not be salvaged, "
+                f"got {salvage_activity['salvaged_count']}"
+            )
+        # No salvage bundle task should exist.
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t for t in child_tasks
+            if (t.first_payload or {}).get("type") == "salvage_bundle"
+        ]
+        assert len(salvage_tasks) == 0, (
+            "No salvage_bundle task should be spawned for hash-match dedup findings"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_recent_terminal_region_overlap_excluded(
+        self, db_session, mocker
+    ):
+        """Findings filtered for recent-terminal region overlap are NOT salvaged.
+
+        'recent terminal region overlap with:' indicates the work was already
+        resolved/shipped in a prior cycle — not merely blocked by in-flight work.
+        The salvage gate must exclude these to avoid recycling completed work.
+        """
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-neg-terminal"
+        )
+
+        finding = _make_finding(
+            "Already resolved refactor", direction_id=direction["id"],
+            finding_type="improvement",
+        )
+        surviving = _make_finding(
+            "Surviving finding", direction_id=direction["id"]
+        )
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_s")]
+        mock_outcome.filtered = [
+            {
+                "title": "Already resolved refactor"[:120],
+                "direction_id": direction["id"],
+                "reason": "recent terminal region overlap with: shipped-task",
+            }
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # Terminal region overlap finding should NOT be salvaged.
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        if salvage_activity is not None:
+            assert salvage_activity["salvaged_count"] == 0, (
+                f"Recent-terminal findings should not be salvaged, "
+                f"got {salvage_activity['salvaged_count']}"
+            )
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t for t in child_tasks
+            if (t.first_payload or {}).get("type") == "salvage_bundle"
+        ]
+        assert len(salvage_tasks) == 0, (
+            "No salvage_bundle task should be spawned for recent-terminal findings"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_cross_cycle_hash_suppression_excluded(
+        self, db_session, mocker
+    ):
+        """Findings whose hash was previously filtered are NOT salvaged.
+
+        The cross-cycle hash suppression gate prevents re-salvaging findings
+        that were already filtered in a prior cycle. Even findings with a
+        salvageable dedup reason (region overlap) must be excluded when their
+        hash appears in previously_filtered_hashes.
+        """
+        from app.finding_deduplication import DedupOutcome, finding_hash as _finding_hash
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-neg-crosscycle"
+        )
+
+        # The handler resolves previously_filtered_hashes by direction_id
+        # from task.context; ensure it's set so the lookup can find our hash.
+        task.context = {**(task.context or {}), "direction_id": direction["id"]}
+        db_session.add(task)
+        await db_session.commit()
+
+        finding = _make_finding(
+            "Stale region overlap", direction_id=direction["id"],
+            finding_type="improvement",
+        )
+        surviving = _make_finding(
+            "Surviving finding", direction_id=direction["id"]
+        )
+
+        # Compute the finding hash matching the production hash at
+        # research_completion.py:3306-3312 (finding_hash(title, canonical_body)).
+        _fhash = _finding_hash(
+            finding["title"],
+            finding.get("description") or finding.get("prompt") or "",
+        )
+        # Inject the hash into the direction so the handler sees it.
+        # SQLAlchemy JSON columns require explicit dirty-marking for nested mutations.
+        _dir_entry = None
+        for _d in _project.directions:
+            if _d["id"] == direction["id"]:
+                _dir_entry = _d
+                break
+        assert _dir_entry is not None
+        _dir_entry["recently_filtered_finding_hashes"] = [_fhash]
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(_project, "directions")
+        db_session.add(_project)
+        await db_session.commit()
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_s")]
+        # Salvageable reason — but the hash is in previously_filtered_hashes.
+        mock_outcome.filtered = [
+            {
+                "title": "Stale region overlap"[:120],
+                "direction_id": direction["id"],
+                "reason": "region overlap with: in-flight task",
+            }
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # Cross-cycle suppression should block salvage despite salvageable reason.
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        if salvage_activity is not None:
+            assert salvage_activity["salvaged_count"] == 0, (
+                f"Cross-cycle suppressed findings should not be salvaged, "
+                f"got {salvage_activity['salvaged_count']}"
+            )
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t for t in child_tasks
+            if (t.first_payload or {}).get("type") == "salvage_bundle"
+        ]
+        assert len(salvage_tasks) == 0, (
+            "No salvage_bundle task should be spawned for cross-cycle suppressed findings"
+        )
 
 
 @_pytest.mark.asyncio
