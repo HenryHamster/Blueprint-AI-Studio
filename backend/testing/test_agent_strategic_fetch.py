@@ -3324,8 +3324,10 @@ async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
     assert body["status"] == "success"
     data = body["data"]
     assert "cost_per_merged_pr" in data
+    assert "cost_per_verified_task" in data
     assert "vm_reuse_rate" in data
     assert "llm_cost_per_merged_pr" in data
+    assert "llm_cost_per_verified_task" in data
     assert "format_compliance" in data
     assert data["window_days"] == 7
 
@@ -3383,7 +3385,9 @@ async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
 
     # Existing scalar fields still present
     assert "cost_per_merged_pr" in data
+    assert "cost_per_verified_task" in data
     assert "llm_cost_per_merged_pr" in data
+    assert "llm_cost_per_verified_task" in data
     assert "format_compliance" in data
     assert data["window_days"] == 7
 
