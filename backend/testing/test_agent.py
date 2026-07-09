@@ -14652,6 +14652,273 @@ async def test_agent_status_malformed_pr_url_returns_400(
 
 
 @pytest.mark.asyncio
+async def test_agent_status_pr_base_branch_mismatch_rejected(
+    client: AsyncClient, db_session, mocker
+):
+    """When the task expects base_branch X but the PR's actual base branch is Y,
+    the submission must be rejected with HTTP 400 and a clear error message,
+    and no Artifact row must be persisted."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"ref": "main"},  # PR targets main
+            }
+        ),
+    )
+
+    project = Project(
+        name="PR Base Branch Mismatch", user_id="test-user-branch-mismatch"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do thing",
+                "base_branch": "automain",  # task expects automain
+            }
+        ],
+        vm_instance_id="agent-vm-branch-mismatch",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-branch-mismatch")
+    headers = {"x-agent-token": token}
+
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/12345",
+        "logs": "Task complete.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 400, f"Expected 400, got {resp.status_code}: {resp.text[:500]}"
+    data = resp.json()
+    err = data.get("error", {})
+    assert "message" in err, f"Response has no error.message: {data}"
+    assert "targets branch" in err["message"], f"message: {err['message']}"
+    assert "expects base branch" in err["message"], f"message: {err['message']}"
+    assert "Retarget the PR" in err["message"], f"message: {err['message']}"
+
+    # No Artifact row must have been created.
+    from sqlmodel import select as sql_select
+    from app.models import Artifact, ArtifactType
+
+    artifacts = (
+        (
+            await db_session.execute(
+                sql_select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert artifacts == [], "Rejected PR must not persist an Artifact row"
+
+
+@pytest.mark.asyncio
+async def test_agent_status_pr_base_branch_match_accepted(
+    client: AsyncClient, db_session, mocker
+):
+    """When the PR's actual base branch matches the task's expected base_branch,
+    the submission must be accepted and the Artifact persisted."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"ref": "automain"},  # PR targets automain
+            }
+        ),
+    )
+
+    project = Project(
+        name="PR Base Branch Match", user_id="test-user-branch-match"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do thing",
+                "base_branch": "automain",
+            }
+        ],
+        vm_instance_id="agent-vm-branch-match",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-branch-match")
+    headers = {"x-agent-token": token}
+
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/12346",
+        "logs": "Task complete.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    # Artifact must have been persisted.
+    from sqlmodel import select as sql_select
+    from app.models import Artifact, ArtifactType
+
+    artifacts = (
+        (
+            await db_session.execute(
+                sql_select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    assert (
+        artifacts[0].pr_url
+        == "https://github.com/HenryHamster/BlueprintAIStudio/pull/12346"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_status_pr_base_branch_absent_skips_check(
+    client: AsyncClient, db_session, mocker
+):
+    """When the task payload has no base_branch, base branch validation is skipped
+    and the submission is accepted without calling the GitHub API."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    # NOT mocking get_github_token_for_task or get_pull_request — if the
+    # validation fires despite absent base_branch the test will crash (good).
+
+    project = Project(
+        name="PR Base Branch Absent", user_id="test-user-branch-absent"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],  # no base_branch
+        vm_instance_id="agent-vm-branch-absent",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-branch-absent")
+    headers = {"x-agent-token": token}
+
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/12347",
+        "logs": "Task complete.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_agent_status_pr_base_branch_gh_fail_open(
+    client: AsyncClient, db_session, mocker
+):
+    """When the GitHub API call to fetch PR details fails (transient error),
+    the submission is accepted (fail open) rather than blocking the agent."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=ConnectionError("GitHub API unreachable")),
+    )
+
+    project = Project(
+        name="PR Base Branch GH Fail", user_id="test-user-branch-gh-fail"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do thing",
+                "base_branch": "automain",
+            }
+        ],
+        vm_instance_id="agent-vm-branch-gh-fail",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-branch-gh-fail")
+    headers = {"x-agent-token": token}
+
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/12348",
+        "logs": "Task complete.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_agent_status_failed_error_log_does_not_stamp_or_deliver_downstream_artifact(
     client: AsyncClient, db_session, mocker
 ):
