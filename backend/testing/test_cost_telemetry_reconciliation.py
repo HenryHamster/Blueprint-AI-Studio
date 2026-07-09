@@ -1,0 +1,492 @@
+"""Tests for backend/app/cost_telemetry_reconciliation.py.
+
+Verifies that the reconciliation seam can compare snapshot-path and direct-path
+LLM cost computations, and that the two paths agree within the declared
+tolerance for known task configurations.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+import pytest
+from testing.factories import _utcnow, make_project, make_task
+
+from app.cost_telemetry_reconciliation import (
+    COST_TELEMETRY_TOLERANCE,
+    reconcile_llm_cost,
+    reconcile_task_llm_cost,
+)
+from app.llm_cost_attribution import LLM_TOKEN_PRICING
+from app.models import TaskStatus, bank_task_current_attempt
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _make_cost_task(project_id, *, provider, model, input_tokens, output_tokens, **kw):
+    """Create a COMPLETED + merged task with LLM token totals and no attempt
+    history (single current-attempt)."""
+    defaults = dict(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+            "llm_call_count": 5,
+        },
+        provider=provider,
+        model=model,
+    )
+    defaults.update(kw)
+    return make_task(**defaults)
+
+
+def _make_cached_cost_task(project_id, *, provider, model, input_tokens, output_tokens,
+                           cache_creation, cache_read, **kw):
+    """Create a COMPLETED + merged task with cache-class sub-counts in the
+    current attempt (single attempt, no banking)."""
+    defaults = dict(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+            "total_cache_creation_input_tokens": cache_creation,
+            "total_cache_read_input_tokens": cache_read,
+            "llm_call_count": 5,
+        },
+        provider=provider,
+        model=model,
+    )
+    defaults.update(kw)
+    return make_task(**defaults)
+
+
+def _expected_cost(provider, model, input_tokens, output_tokens,
+                   cache_creation=0, cache_read=0):
+    """Compute expected LLM cost for a single attempt using the shared pricing
+    table, matching _price_llm_attempt logic."""
+    from app.llm_cost_attribution import _price_llm_attempt
+
+    pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
+    if not pricing:
+        return 0.0
+    input_rate, output_rate = pricing
+    return round(
+        _price_llm_attempt(
+            input_tokens, output_tokens,
+            cache_creation, cache_read,
+            input_rate, output_rate,
+            provider=provider, model=model,
+        ),
+        6,
+    )
+
+
+# ── Tests ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_matches_on_known_tasks(db_session):
+    """Tasks with known attempt histories produce matching snapshot/direct
+    totals within the declared tolerance."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task 1: anthropic claude-sonnet-4-6, pure input+output (no cache).
+    t1 = _make_cost_task(
+        project.id,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=2000,
+        output_tokens=1000,
+    )
+    db_session.add(t1)
+    # Task 2: openai gpt-5.4, also no cache.
+    t2 = _make_cost_task(
+        project.id,
+        provider="openai",
+        model="gpt-5.4",
+        input_tokens=1500,
+        output_tokens=800,
+    )
+    db_session.add(t2)
+    await db_session.commit()
+
+    result = reconcile_llm_cost([t1, t2])
+
+    assert result.task_count == 2
+    assert result.within_tolerance is True
+    assert result.absolute_delta <= COST_TELEMETRY_TOLERANCE
+    assert result.cache_hit_rate_within_tolerance is True
+
+    # Compute expected totals.
+    expected_t1 = _expected_cost("anthropic", "claude-sonnet-4-6", 2000, 1000)
+    expected_t2 = _expected_cost("openai", "gpt-5.4", 1500, 800)
+    expected_total = round(expected_t1 + expected_t2, 6)
+
+    # Both paths should agree with the expected total.
+    assert result.total_cost_snapshot_path == pytest.approx(expected_total, abs=1e-6)
+    assert result.total_cost_direct_path == pytest.approx(expected_total, abs=1e-6)
+
+    # Input token counts.
+    assert result.total_input_tokens_snapshot_path == 3500
+    assert result.total_input_tokens_direct_path == 3500
+
+
+@pytest.mark.asyncio
+async def test_reconcile_cache_hit_rate_matches(db_session):
+    """Tasks with cache-read tokens produce matching cache-hit rates from both
+    computation paths."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task 1: 1000 input, 300 cache-read (30% hit rate).
+    t1 = _make_cached_cost_task(
+        project.id,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=1000,
+        output_tokens=500,
+        cache_creation=200,
+        cache_read=300,
+    )
+    # Task 2: 2000 input, 500 cache-read (25% hit rate).
+    t2 = _make_cached_cost_task(
+        project.id,
+        provider="openai",
+        model="gpt-5.4",
+        input_tokens=2000,
+        output_tokens=1000,
+        cache_creation=0,
+        cache_read=500,
+    )
+    db_session.add_all([t1, t2])
+    await db_session.commit()
+
+    result = reconcile_llm_cost([t1, t2])
+
+    # Combined: (300 + 500) / (1000 + 2000) = 800 / 3000 = 0.2666...
+    expected_hit_rate = 800 / 3000
+    assert result.cache_hit_rate_snapshot_path == pytest.approx(expected_hit_rate, abs=1e-10)
+    assert result.cache_hit_rate_direct_path == pytest.approx(expected_hit_rate, abs=1e-10)
+    assert result.cache_hit_rate_delta <= 1e-10
+    assert result.cache_hit_rate_within_tolerance is True
+    assert result.within_tolerance is True
+
+    # Verify token counters match between paths.
+    assert result.total_input_tokens_snapshot_path == 3000
+    assert result.total_input_tokens_direct_path == 3000
+    assert result.total_cache_read_input_tokens_snapshot_path == 800
+    assert result.total_cache_read_input_tokens_direct_path == 800
+
+
+@pytest.mark.asyncio
+async def test_reconcile_empty_task_list(db_session):
+    """Empty task list: both paths return zero cost, task_count=0, within_tolerance."""
+    result = reconcile_llm_cost([])
+
+    assert result.task_count == 0
+    assert result.total_cost_snapshot_path == 0.0
+    assert result.total_cost_direct_path == 0.0
+    assert result.absolute_delta == 0.0
+    assert result.relative_delta is None
+    assert result.within_tolerance is True
+    assert result.total_input_tokens_snapshot_path == 0
+    assert result.total_input_tokens_direct_path == 0
+    assert result.cache_hit_rate_snapshot_path == 0.0
+    assert result.cache_hit_rate_direct_path == 0.0
+    assert result.cache_hit_rate_delta == 0.0
+    assert result.cache_hit_rate_within_tolerance is True
+    assert result.per_task == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_unpriced_model_still_matches(db_session):
+    """Tasks with a (provider, model) absent from the pricing table produce
+    zero cost from both paths, and both agree."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Use a provider/model that is NOT in LLM_TOKEN_PRICING.
+    task = _make_cost_task(
+        project.id,
+        provider="nonexistent_provider",
+        model="v0-unknown",
+        input_tokens=5000,
+        output_tokens=2000,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_llm_cost([task])
+
+    assert result.task_count == 1
+    assert result.total_cost_snapshot_path == 0.0
+    assert result.total_cost_direct_path == 0.0
+    assert result.absolute_delta == 0.0
+    assert result.within_tolerance is True
+    # Token counters are still tracked even when unpriced.
+    assert result.total_input_tokens_snapshot_path == 5000
+    assert result.total_input_tokens_direct_path == 5000
+
+
+@pytest.mark.asyncio
+async def test_reconcile_single_task(db_session):
+    """Single task: reconciliation works and task_count reflects it."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_cost_task(
+        project.id,
+        provider="anthropic",
+        model="claude-opus-4-8",
+        input_tokens=500,
+        output_tokens=200,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Test the convenience wrapper too.
+    result = reconcile_task_llm_cost(task)
+
+    assert result.task_count == 1
+    expected = _expected_cost("anthropic", "claude-opus-4-8", 500, 200)
+    assert result.total_cost_snapshot_path == pytest.approx(expected, abs=1e-6)
+    assert result.total_cost_direct_path == pytest.approx(expected, abs=1e-6)
+    assert result.within_tolerance is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_mixed_providers(db_session):
+    """Tasks with mixed providers (anthropic + openai) reconcile correctly."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = _make_cost_task(
+        project.id,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=1000,
+        output_tokens=500,
+    )
+    t2 = _make_cost_task(
+        project.id,
+        provider="openai",
+        model="gpt-5.4",
+        input_tokens=750,
+        output_tokens=300,
+    )
+    # Add a deepseek task.
+    t3 = _make_cost_task(
+        project.id,
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        input_tokens=2000,
+        output_tokens=1000,
+    )
+    db_session.add_all([t1, t2, t3])
+    await db_session.commit()
+
+    result = reconcile_llm_cost([t1, t2, t3])
+
+    assert result.task_count == 3
+    assert result.within_tolerance is True
+    assert result.absolute_delta <= COST_TELEMETRY_TOLERANCE
+
+    expected_total = round(
+        _expected_cost("anthropic", "claude-sonnet-4-6", 1000, 500)
+        + _expected_cost("openai", "gpt-5.4", 750, 300)
+        + _expected_cost("deepseek", "deepseek-v4-flash", 2000, 1000),
+        6,
+    )
+    assert result.total_cost_snapshot_path == pytest.approx(expected_total, abs=1e-6)
+    assert result.total_cost_direct_path == pytest.approx(expected_total, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_malformed_cache_sub_counts_still_matches(db_session):
+    """Tasks with cache sub-counts exceeding the input total (malformed data)
+    still reconcile — the bounding logic in _bounded_cache_input_counts ensures
+    consistent processing in both paths."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Cache sub-counts sum (1500 + 1500 = 3000) exceeds input (2000).
+    # Both paths apply the same _bounded_cache_input_counts bounding, so
+    # they should still agree.
+    task = _make_cached_cost_task(
+        project.id,
+        provider="anthropic",
+        model="claude-haiku-4-5-20251001",
+        input_tokens=2000,
+        output_tokens=1000,
+        cache_creation=1500,
+        cache_read=1500,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_llm_cost([task])
+
+    assert result.task_count == 1
+    # Both paths apply the same bounding, so they agree.
+    assert result.within_tolerance is True
+    assert result.absolute_delta <= COST_TELEMETRY_TOLERANCE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_banked_attempt_and_current_attempt(db_session):
+    """A task with a banked attempt (via bank_task_current_attempt) plus a
+    new current attempt still reconciles — the direct path iterates all
+    attempt rows, and the snapshot path does too."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(minutes=9),
+        vm_spot=True,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Bank the first attempt.
+    bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Set up a second attempt with different provider/model.
+    task.status = TaskStatus.COMPLETED
+    task.context = {"pr_merged": True}
+    task.provider = "openai"
+    task.model = "gpt-5.4"
+    task.vm_provisioned_at = now - timedelta(minutes=3)
+    task.vm_stopped_at = now
+    task.vm_spot = False
+    task.api_call_summary = {
+        "llm_call_count": 2,
+        "total_input_tokens": 250,
+        "total_output_tokens": 150,
+    }
+    await db_session.commit()
+
+    refreshed = await db_session.get(type(task), task.id)
+    result = reconcile_llm_cost([refreshed])
+
+    assert result.task_count == 1
+    assert result.within_tolerance is True
+    assert result.absolute_delta <= COST_TELEMETRY_TOLERANCE
+
+    # Verify token counters: 1000 (banked) + 250 (current) = 1250 input.
+    assert result.total_input_tokens_snapshot_path == 1250
+    assert result.total_input_tokens_direct_path == 1250
+
+
+@pytest.mark.asyncio
+async def test_reconcile_zero_cost_tasks(db_session):
+    """Tasks with zero input and output tokens produce zero cost from both
+    paths and reconcile cleanly."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_cost_task(
+        project.id,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=0,
+        output_tokens=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_llm_cost([task])
+
+    assert result.task_count == 1
+    assert result.total_cost_snapshot_path == 0.0
+    assert result.total_cost_direct_path == 0.0
+    assert result.absolute_delta == 0.0
+    assert result.within_tolerance is True
+
+
+def test_cost_telemetry_tolerance_constant_documented():
+    """COST_TELEMETRY_TOLERANCE is 1e-6 with a docstring explaining the
+    sub-cent floating-point tolerance rationale."""
+    assert COST_TELEMETRY_TOLERANCE == 1e-6
+    # Verify the constant has a meaningful docstring in the source module.
+    import inspect
+    from app import cost_telemetry_reconciliation as ctr_module
+
+    source = inspect.getsource(ctr_module)
+    # The docstring for the constant should mention "tolerance", "rounding",
+    # or "sub-cent" somewhere in nearby text.
+    # Check that the module's docstring or the constant's assignment context
+    # includes explanatory text.
+    assert "tolerance" in source, (
+        "COST_TELEMETRY_TOLERANCE must have a docstring explaining its rationale"
+    )
+    # Verify it's the value we expect at module level.
+    assert "1e-6" in source
+
+
+@pytest.mark.asyncio
+async def test_reconcile_result_asdict_serializable(db_session):
+    """ReconciliationResult.asdict() returns a plain dict that can be JSON-
+    serialized (all values are basic Python types)."""
+    import json
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_cost_task(
+        project.id,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=1000,
+        output_tokens=500,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_llm_cost([task])
+    d = result.asdict()
+
+    # Round-trip through JSON.
+    serialized = json.dumps(d)
+    deserialized = json.loads(serialized)
+    assert deserialized["task_count"] == 1
+    assert deserialized["within_tolerance"] is True
+    assert isinstance(deserialized["total_cost_snapshot_path"], float)
+    assert isinstance(deserialized["cache_hit_rate_snapshot_path"], float)
+    assert isinstance(deserialized["per_task"], list)

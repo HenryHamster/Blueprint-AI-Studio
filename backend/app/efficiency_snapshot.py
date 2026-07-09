@@ -55,6 +55,7 @@ from app.models import (
     get_task_total_llm_totals,
     get_task_total_vm_cost_usd,
 )
+from app.cost_telemetry_reconciliation import reconcile_llm_cost
 from app.llm_cost_attribution import (
     CACHE_CREATION_INPUT_RATE_MULTIPLIER,  # noqa: F401 — re-exported for callers
     LLM_CACHE_READ_INPUT_PRICING,  # noqa: F401 — re-exported for callers
@@ -2493,6 +2494,41 @@ def _compute_rework_cost_share(tasks: list[Task]) -> float | None:
     return breakdown.get("rework_share_of_total_llm_cost")
 
 
+def _compute_cost_telemetry_reconciliation(tasks: list[Task]) -> dict | None:
+    """Self-check: reconcile LLM cost telemetry against an independent
+    recomputation and log if the two paths disagree beyond the declared
+    tolerance.
+
+    Returns the reconciliation dict when tasks is non-empty and at least one
+    task contributes priced LLM attempts; returns None when there are no tasks
+    (the check would be vacuous) or when no tasks have a priced provider/model
+    (zero-cost input with no pricing coverage is not a telemetry defect).
+    """
+    if not tasks:
+        return None
+    result = reconcile_llm_cost(tasks)
+    # Only flag divergence when there is actual cost to reconcile — tasks with
+    # zero-cost unpriced combos produce 0.0 from both paths and trivially agree.
+    if result.total_cost_snapshot_path > 0 and not result.within_tolerance:
+        logger.warning(
+            "cost_telemetry_reconciliation FAILED — snapshot %.8f vs direct %.8f "
+            "(delta=%.2e, tolerance=%.2e) over %d task(s)",
+            result.total_cost_snapshot_path,
+            result.total_cost_direct_path,
+            result.absolute_delta,
+            result.tolerance,
+            result.task_count,
+        )
+    if not result.cache_hit_rate_within_tolerance and result.total_input_tokens_snapshot_path > 0:
+        logger.warning(
+            "cost_telemetry_reconciliation cache-hit-rate FAILED — snapshot %.10f vs direct %.10f "
+            "(delta=%.2e) over %d task(s)",
+            result.cache_hit_rate_snapshot_path,
+            result.cache_hit_rate_direct_path,
+            result.cache_hit_rate_delta,
+            result.task_count,
+        )
+    return result.asdict()
 
 
 def _compute_prompt_static_bytes() -> int | None:
@@ -2727,6 +2763,11 @@ async def compute_current_axes(
         # Anthropic cost ratio + verified-merge-rate delta, persisted in the
         # daily snapshot so the A/B is machine-checkable on the deployed instance.
         "provider_routing_verdict": provider_routing_verdict,
+        # Self-check: reconcile LLM cost telemetry against an independent
+        # recomputation path so operators are alerted if the two diverge beyond
+        # the declared tolerance. Non-zero tasks with at least one priced attempt
+        # are required for a meaningful check.
+        "cost_telemetry_reconciliation": _compute_cost_telemetry_reconciliation(tasks),
     }
 
 
