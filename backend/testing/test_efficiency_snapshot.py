@@ -24,6 +24,8 @@ from app.efficiency_snapshot import (
     AXIS_PROMPT_STATIC_BYTES,
     AXIS_TOTAL_COST_PER_VERIFIED_TASK,
     AXIS_REWORK_COST_SHARE,
+    AXIS_SALVAGE_COUNT,
+    AXIS_SALVAGE_MERGE_RATE,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
     CACHE_CREATION_INPUT_RATE_MULTIPLIER,
@@ -704,6 +706,62 @@ async def test_compute_current_axes_empty_returns_none(db_session):
     assert axes[AXIS_PROMPT_STATIC_BYTES] is None or isinstance(
         axes[AXIS_PROMPT_STATIC_BYTES], int
     )
+
+
+@pytest.mark.asyncio
+async def test_salvage_axes(db_session):
+    """Salvage axes reflect salvage_bundle task count and merge rate in the window."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    salvage_payload = [{"type": "salvage_bundle"}]
+
+    # Task 1: merged salvage bundle.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=salvage_payload,
+            updated_at=now,
+        )
+    )
+    # Task 2: completed salvage bundle that did NOT merge.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=salvage_payload,
+            updated_at=now,
+        )
+    )
+    # Task 3: failed salvage bundle.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            context={},
+            payloads=salvage_payload,
+            updated_at=now,
+        )
+    )
+    # Non-salvage task (should not affect salvage axes).
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            updated_at=now,
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    assert axes[AXIS_SALVAGE_COUNT] == 3
+    assert axes[AXIS_SALVAGE_MERGE_RATE] == round(1 / 3, 4)
 
 
 @pytest.mark.asyncio

@@ -132,6 +132,8 @@ AXIS_TOTAL_COST_PER_VERIFIED_TASK = "total_cost_per_verified_task"
 VERIFIED_TASK_DRIFT_MIN_COUNT = 20
 
 AXIS_REWORK_COST_SHARE = "rework_cost_share"
+AXIS_SALVAGE_COUNT = "salvage_count"
+AXIS_SALVAGE_MERGE_RATE = "salvage_merge_rate"
 
 # Guard threshold for prompt_static_bytes: alert when static prompt size exceeds
 # this many source characters. Set well above the current measured value (~31k chars)
@@ -167,6 +169,8 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_LLM_CACHE_HIT_RATE,
     AXIS_TOTAL_COST_PER_VERIFIED_TASK,
     AXIS_REWORK_COST_SHARE,
+    AXIS_SALVAGE_COUNT,
+    AXIS_SALVAGE_MERGE_RATE,
 )
 
 # ---------------------------------------------------------------------------
@@ -227,6 +231,12 @@ AXIS_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_REWORK_COST_SHARE: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_SALVAGE_COUNT: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_SALVAGE_MERGE_RATE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
 }
@@ -2667,6 +2677,47 @@ def _compute_prompt_static_bytes() -> int | None:
     return total
 
 
+async def _compute_salvage_axes(
+    session: AsyncSession, project_id: uuid.UUID
+) -> dict[str, int | float | None]:
+    """Query salvage-bundle tasks created in the axis window.
+
+    Returns a dict with ``salvage_count`` (total salvage_bundle tasks created
+    in the window) and ``salvage_merge_rate`` (fraction of COMPLETED salvage
+    bundles that have ``pr_merged == true``).  Both are ``None`` when there
+    are no salvage bundles in the window.
+    """
+    cutoff = _utcnow() - timedelta(days=_AXIS_WINDOW_DAYS)
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.updated_at >= cutoff,
+            Task.payloads[0]["type"].as_string() == "salvage_bundle",
+        )
+        .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
+    )
+    salvage_tasks = list((await session.execute(stmt)).scalars().all())
+
+    if not salvage_tasks:
+        return {"salvage_count": None, "salvage_merge_rate": None}
+
+    total = len(salvage_tasks)
+    completed_merged = sum(
+        1
+        for t in salvage_tasks
+        if t.status == TaskStatus.COMPLETED
+        and (t.context or {}).get("pr_merged")
+    )
+
+    return {
+        "salvage_count": total,
+        "salvage_merge_rate": (
+            round(completed_merged / total, 4) if total > 0 else None
+        ),
+    }
+
+
 async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
@@ -2739,6 +2790,10 @@ async def compute_current_axes(
     if _peff_post_deploy is not None:
         _peff_post_deploy["gate_health"] = compute_gate_health_verdict(_peff_post_deploy)
 
+    # Salvage-bundle effectiveness: count of salvage tasks spawned in the
+    # window and the fraction that reached a merged state.
+    _salvage = await _compute_salvage_axes(session, project_id)
+
     return {
         AXIS_COST_PER_MERGED_PR: _compute_cost_per_merged_pr(tasks),
         AXIS_VM_COLD_START_P50_MS: _compute_vm_cold_start_p50_ms(tasks),
@@ -2761,6 +2816,8 @@ async def compute_current_axes(
         AXIS_TOTAL_COST_PER_VERIFIED_TASK: _compute_total_cost_per_verified_task(tasks),
         "total_cost_per_verified_task_denominator": _compute_verified_merge_count(tasks),
         AXIS_REWORK_COST_SHARE: _compute_rework_cost_share(tasks),
+        AXIS_SALVAGE_COUNT: _salvage["salvage_count"],
+        AXIS_SALVAGE_MERGE_RATE: _salvage["salvage_merge_rate"],
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
