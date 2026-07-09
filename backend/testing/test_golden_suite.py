@@ -55,6 +55,7 @@ VALID_TASK_TYPES: set[str] = {
     "web_research",
     "design",
     "repo_bootstrap",
+    "salvage_bundle",
 }
 
 VALID_EFFORTS: set[str] = {"low", "medium", "high", "max"}
@@ -466,6 +467,22 @@ class TestSuiteIntegrity:
         if failures:
             msg = "\n".join(f"  {sid}: {errs}" for sid, errs in failures)
             pytest.fail(f"{len(failures)} spec(s) failed validation:\n{msg}")
+
+    def test_valid_task_types_superset_of_backend_registry(self):
+        """VALID_TASK_TYPES must be a superset of the backend's ALL_TASK_TYPES.
+
+        When a new task type is registered in backend/app/task_capabilities.py
+        this test fails until the golden-task runner's VALID_TASK_TYPES (and
+        this inline copy) are updated in lockstep.
+        """
+        from app.task_capabilities import ALL_TASK_TYPES as backend_types  # noqa: PLC0415
+        missing = backend_types - VALID_TASK_TYPES
+        assert not missing, (
+            f"VALID_TASK_TYPES is missing task type(s) registered in "
+            f"backend/app/task_capabilities.py: {sorted(missing)}. "
+            f"Add each missing type to VALID_TASK_TYPES in "
+            f"golden_tasks/runner.py and update this inline copy."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

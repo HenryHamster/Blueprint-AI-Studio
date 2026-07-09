@@ -83,6 +83,7 @@ VALID_TASK_TYPES: set[str] = {
     "web_research",
     "design",
     "repo_bootstrap",
+    "salvage_bundle",
 }
 
 VALID_EFFORTS: set[str] = {"low", "medium", "high", "max"}
