@@ -624,6 +624,32 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             project, session, "paused while no model accounts are available"
         )
         return
+
+    # Monthly budget gate: if fleet-wide month-to-date spend has reached 100% of
+    # monthly_budget_target_usd, skip autonomous spawning entirely (not just for
+    # this project — the fleet-wide budget is exhausted). This prevents autonomous
+    # research from starting new work while the budget is maxed out.
+    try:
+        from app.monthly_budget_alerts import check_monthly_budget  # noqa: PLC0415
+
+        budget_exhausted, _usage_ratio = await check_monthly_budget(session)
+    except Exception:
+        budget_exhausted = False
+        logger.exception(
+            "[AUTONOMOUS] Monthly budget check failed — treating as not exhausted"
+        )
+    if budget_exhausted:
+        logger.info(
+            "[AUTONOMOUS] Skipping research spawn for project %s — monthly budget exhausted",
+            project.id,
+        )
+        await _maybe_notify_operator_refresh_deferred(
+            project,
+            session,
+            "paused while the monthly budget target is exhausted",
+        )
+        return
+
     spend_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
         project, session
     )
@@ -3028,6 +3054,17 @@ async def _run_idle_research_for_project(
         and not vision_needs_bootstrap
         and not strategic_recovery_needed
     ):
+        return
+
+    # Monthly budget gate: skip idle-research spawning when the fleet-wide
+    # monthly budget is exhausted. Since this runs for every project in the
+    # idle-research sweep, avoid recomputing the budget per-project by
+    # checking the shared-state flag the orchestrator sets on each cycle.
+    if _shared_state.monthly_budget_gate_engaged:
+        logger.info(
+            "[AUTONOMOUS] Skipping idle research for project %s — monthly budget exhausted",
+            project.id,
+        )
         return
 
     if vm_consuming < _runtime_config["max_concurrent_vms"]:

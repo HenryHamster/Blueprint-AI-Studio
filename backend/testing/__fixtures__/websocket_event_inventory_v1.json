@@ -1202,6 +1202,22 @@
       "workbench_resource": null
     },
     {
+      "callee": "ws_manager.broadcast_to_all",
+      "canonical_callee": "broadcast_to_all",
+      "classification": "legacy_global_event",
+      "event": "pipeline_throttle",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 2381,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "dict:detail,reason",
+      "scope": "orchestrator_worker",
+      "source_path": "backend/app/orchestrator.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
       "classification": "legacy_project_event",

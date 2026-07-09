@@ -370,3 +370,101 @@ async def test_monthly_budget_zero_spend_no_alert(
 async def test_threshold_constants_are_correct():
     """Verify _BUDGET_THRESHOLDS matches the documented 50/90/100% shape."""
     assert _BUDGET_THRESHOLDS == (0.50, 0.90, 1.00)
+
+
+# ---------------------------------------------------------------------------
+# Return-value contract tests (dispatch-gate interface)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_monthly_budget_returns_exhausted_true_at_100pct(
+    budget_db, project_with_id
+):
+    """When MTD spend >= target, check_monthly_budget returns (True, >= 1.0)."""
+    pid_str = str(project_with_id)
+    target = 1000.0
+    spend = 1000.0  # exactly 100%
+
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"monthly_budget_target_usd": target},
+    ):
+        with patch(
+            "app.monthly_budget_alerts._compute_month_to_date_spend",
+            new_callable=AsyncMock,
+            return_value=_mock_spend(spend, pid_str),
+        ):
+            exhausted, ratio = await check_monthly_budget(budget_db)
+
+    assert exhausted is True
+    assert ratio == 1.0
+
+
+@pytest.mark.asyncio
+async def test_check_monthly_budget_returns_exhausted_false_below_100pct(
+    budget_db, project_with_id
+):
+    """When MTD spend < target, check_monthly_budget returns (False, < 1.0)."""
+    pid_str = str(project_with_id)
+    target = 1000.0
+    spend = 500.0  # exactly 50%
+
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"monthly_budget_target_usd": target},
+    ):
+        with patch(
+            "app.monthly_budget_alerts._compute_month_to_date_spend",
+            new_callable=AsyncMock,
+            return_value=_mock_spend(spend, pid_str),
+        ):
+            exhausted, ratio = await check_monthly_budget(budget_db)
+
+    assert exhausted is False
+    assert ratio == 0.5
+
+
+@pytest.mark.asyncio
+async def test_check_monthly_budget_returns_none_when_disabled(
+    budget_db, project_with_id
+):
+    """When monthly_budget_target_usd is 0 (disabled), returns (False, None)."""
+    pid_str = str(project_with_id)
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"monthly_budget_target_usd": 0},
+    ):
+        with patch(
+            "app.monthly_budget_alerts._compute_month_to_date_spend",
+            new_callable=AsyncMock,
+            return_value=_mock_spend(500.0, pid_str),
+        ):
+            exhausted, ratio = await check_monthly_budget(budget_db)
+
+    assert exhausted is False
+    assert ratio is None
+
+
+@pytest.mark.asyncio
+async def test_check_monthly_budget_returns_none_when_zero_spend(
+    budget_db, project_with_id
+):
+    """When month-to-date spend is zero, returns (False, None)."""
+    pid_str = str(project_with_id)
+    target = 1000.0
+    spend = 0.0
+
+    with patch.dict(
+        _shared_state.runtime_config,
+        {"monthly_budget_target_usd": target},
+    ):
+        with patch(
+            "app.monthly_budget_alerts._compute_month_to_date_spend",
+            new_callable=AsyncMock,
+            return_value=_mock_spend(spend, pid_str),
+        ):
+            exhausted, ratio = await check_monthly_budget(budget_db)
+
+    assert exhausted is False
+    assert ratio is None

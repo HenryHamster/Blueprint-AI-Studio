@@ -198,6 +198,13 @@ from app.pipeline_health_state import (  # noqa: F401
 # facade so a rebind on one side is observed by the other.
 # =========================================================================
 
+# --- Monthly budget gate ---
+# Set to True by the orchestrator when month-to-date spend reaches 100%
+# of monthly_budget_target_usd. Cleared when spend drops below 100%
+# (month rollover or target raised). Consumers (orchestrator dispatch,
+# autonomous research spawn) check this before starting new work.
+monthly_budget_gate_engaged: bool = False
+
 # --- Autonomous loop / anomaly timing ---
 last_idle_check: datetime | None = None
 # Throttle anchor for the orchestrator's _check_evergreen_fill() sibling

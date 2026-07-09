@@ -374,6 +374,7 @@ _last_runner_escalation_sweep: datetime = _utcnow()
 _last_local_runner_hold_sweep: datetime = _utcnow()
 _last_deadlock_check: datetime | None = None
 _last_zone_exhaustion_log: datetime | None = None
+_last_budget_gate_log: datetime | None = None
 _last_concurrency_broadcast: datetime | None = None
 _last_type_throttle_broadcast: dict[str, datetime | None] = {}
 _last_type_unthrottle_broadcast: dict[str, datetime | None] = {}
@@ -913,6 +914,7 @@ async def orchestrator_worker():
     from app.evergreen_backlog import check_evergreen_fill as _check_evergreen_fill
     from app.rollup_management import _verify_pr_merged
     from app.broadcast import broadcast_to_project, manager as ws_manager
+    from app.monthly_budget_alerts import check_monthly_budget
     from app.services import (
         _recover_orphaned_tasks,
         _sweep_post_commit_pending,
@@ -934,7 +936,8 @@ async def orchestrator_worker():
         _last_runner_deactivation_sweep, \
         _last_runner_degraded_sweep, \
         _last_runner_escalation_sweep, \
-        _last_local_runner_hold_sweep
+        _last_local_runner_hold_sweep, \
+        _last_budget_gate_log
     while True:
         queued_tasks = []
         # Reset at the very top of the loop body (before the try) — REQUIRED for
@@ -2347,6 +2350,47 @@ async def orchestrator_worker():
                     project_active_counts,
                     broadcast_to_project,
                 )
+
+                # Monthly budget gate: if month-to-date spend has reached 100% of
+                # monthly_budget_target_usd, defer all remaining eligible tasks with a
+                # message indicating the budget gate is active. This check is fail-open
+                # (any exception silently passes through).
+                try:
+                    budget_exhausted, usage_ratio = await check_monthly_budget(session)
+                except Exception:
+                    budget_exhausted = False
+                    logger.exception(
+                        "[ORCHESTRATOR] Monthly budget check failed — treating as not exhausted"
+                    )
+
+                if budget_exhausted and eligible_ids:
+                    _shared_state.monthly_budget_gate_engaged = True
+                    _deferred_count = len(eligible_ids)
+                    eligible_ids = []
+                    # Use a broad WS broadcast so the admin UI / agent surfaces
+                    # see the throttle signal regardless of which project triggered
+                    # the exhaustion (follows the zone-exhaustion pattern).
+                    if _is_cadence_due(_last_budget_gate_log, 60, _utcnow()):
+                        _last_budget_gate_log = _utcnow()
+                        logger.info(
+                            "[ORCHESTRATOR] Monthly budget exhausted (%.1f%% of target) — deferring %d queued tasks",
+                            usage_ratio * 100 if usage_ratio else 100.0,
+                            _deferred_count,
+                        )
+                        try:
+                            await ws_manager.broadcast_to_all(
+                                "pipeline_throttle",
+                                {
+                                    "reason": "monthly_budget",
+                                    "detail": "Monthly budget target exhausted",
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[ORCHESTRATOR] Failed to broadcast monthly_budget throttle"
+                            )
+                elif not budget_exhausted:
+                    _shared_state.monthly_budget_gate_engaged = False
 
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]

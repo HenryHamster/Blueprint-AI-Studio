@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 _BUDGET_THRESHOLDS: tuple[float, ...] = (0.50, 0.90, 1.00)
 
 
-async def check_monthly_budget(session: AsyncSession) -> None:
+async def check_monthly_budget(
+    session: AsyncSession,
+) -> tuple[bool, float | None]:
     """Compute fleet-wide month-to-date spend and fire alerts at threshold crossings.
 
     Reads ``monthly_budget_target_usd`` from runtime config.  When the target is
@@ -45,10 +47,15 @@ async def check_monthly_budget(session: AsyncSession) -> None:
     creates an Alert on the project with the highest spend, since the Alert model
     requires a ``project_id`` FK.  The alert's ``dedupe_key`` encodes the
     threshold fraction so each level alerts at most once until dismissed.
+
+    Returns ``(exhausted, usage_ratio)`` where ``exhausted`` is True when
+    month-to-date spend has reached or exceeded 100% of the target, and
+    ``usage_ratio`` is the ratio of spend to target (or None when the check
+    is disabled / there is no spend to compare).
     """
     target = float(_runtime_config.get("monthly_budget_target_usd", 0))
     if target <= 0:
-        return
+        return False, None
 
     month_start = _utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
@@ -58,7 +65,7 @@ async def check_monthly_budget(session: AsyncSession) -> None:
     )
 
     if month_to_date_total <= 0:
-        return
+        return False, None
 
     usage_ratio = month_to_date_total / target
 
@@ -132,6 +139,8 @@ async def check_monthly_budget(session: AsyncSession) -> None:
             top_project_id,
             alert.id,
         )
+
+    return usage_ratio >= 1.0, usage_ratio
 
 
 async def _compute_month_to_date_spend(
