@@ -36,7 +36,7 @@ import { Pagination } from './components/Pagination';
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
-import { MessagesPanel } from './components/MessagesPanel';
+const MessagesPanel = lazy(() => import('./components/MessagesPanel').then(m => ({ default: m.MessagesPanel })));
 import { StrategicContextRail } from './components/StrategicContextRail';
 import { StrategicContextWorkspace } from './components/StrategicContextWorkspace';
 import { StrategicSessionControl, type StrategicAccountSpendStatus, type StrategicInteractionMode } from './components/StrategicSessionControl';
@@ -1796,6 +1796,7 @@ export default function App() {
         >
           <WorkbenchSplit
             main={(
+              <Suspense fallback={<WorkspaceSkeleton />}>
               <MessagesPanel
                 selectedProjectId={s.selectedProjectId}
                 githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
@@ -1820,6 +1821,7 @@ export default function App() {
                 onOpenCommandPalette={openCommandPalette}
                 onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
               />
+              </Suspense>
             )}
             rail={(
               <StrategicContextRail
