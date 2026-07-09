@@ -16,7 +16,7 @@ import uuid
 from datetime import timedelta
 from typing import Callable, Dict, Optional
 
-from sqlalchemy import or_
+from sqlalchemy import inspect, or_
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -170,6 +170,36 @@ async def sweep_evaluating_parents(
                 _children_snapshot_by_parent.setdefault(
                     _c.parent_task_id, []
                 ).append((_c.id, _c.status, _c.context or {}))
+
+        # ── Step 3 batch-fetch children ──
+        # Collect all completed and nudge-pending child IDs from the snapshot
+        # and batch-fetch them in a single query to avoid N+1 session.get
+        # calls inside the per-parent loop. After a commit/rollback inside
+        # _check_and_trigger_rollup, cached instances may be expired — fall
+        # back to session.get for the affected row (covers all parents in a
+        # fresh batch when no commit happens between iterations).
+        _all_trigger_child_ids: set[uuid.UUID] = set()
+        _all_nudge_child_ids: set[uuid.UUID] = set()
+        for _pid in _parent_ids:
+            for _cid, _c_status, _c_ctx in _children_snapshot_by_parent.get(_pid, []):
+                if _c_status == TaskStatus.COMPLETED:
+                    _all_trigger_child_ids.add(_cid)
+                if (_c_ctx or {}).get("_rollup_nudge_pending"):
+                    _all_nudge_child_ids.add(_cid)
+        _all_child_ids = _all_trigger_child_ids | _all_nudge_child_ids
+        _child_map: dict[uuid.UUID, Task] = {}
+        if _all_child_ids:
+            _child_rows = (
+                (
+                    await session.execute(
+                        select(Task).where(Task.id.in_(_all_child_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            _child_map = {c.id: c for c in _child_rows}
+
         for parent_id in _parent_ids:
             # Heartbeat: Step 3 calls _check_and_trigger_rollup per
             # parent (serial GitHub I/O) — the other dominant per-cycle
@@ -218,7 +248,12 @@ async def sweep_evaluating_parents(
             trigger_child_id = completed_child_id or _nudge_child_id
             if trigger_child_id is not None:
                 try:
-                    child = await session.get(Task, trigger_child_id)
+                    # Use batch-cached child if available; re-fetch only
+                    # when the cached instance was expired by a prior
+                    # commit/rollback inside _check_and_trigger_rollup.
+                    child = _child_map.get(trigger_child_id)
+                    if child is not None and inspect(child).expired:
+                        child = await session.get(Task, trigger_child_id)
                     if child is not None:
                         # C3: pass the heartbeat so _check_and_trigger_rollup's
                         # per-child PR-verify loop keeps the reaper
@@ -235,9 +270,11 @@ async def sweep_evaluating_parents(
                         # is self-healing (next sweep re-runs an
                         # idempotent check).
                         if _nudge_child_id is not None:
-                            _nudged = await session.get(
-                                Task, _nudge_child_id
-                            )
+                            _nudged = _child_map.get(_nudge_child_id)
+                            if _nudged is not None and inspect(_nudged).expired:
+                                _nudged = await session.get(
+                                    Task, _nudge_child_id
+                                )
                             if _nudged is not None and (
                                 _nudged.context or {}
                             ).get("_rollup_nudge_pending"):
@@ -285,6 +322,24 @@ async def sweep_evaluating_parents(
     # live ORM children here.
     try:
         rescued = 0
+
+        # Batch-fetch all parents for Step 4 rescue loop to avoid N+1
+        # session.get calls. Step 3 may have committed/rolled back, expiring
+        # the live evaluating_parents batch — fall back to session.get if
+        # the cached instance is expired.
+        _parent_map: dict[uuid.UUID, Task] = {}
+        if _parent_ids:
+            _parent_rows = (
+                (
+                    await session.execute(
+                        select(Task).where(Task.id.in_(_parent_ids))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            _parent_map = {p.id: p for p in _parent_rows}
+
         for parent_id in _parent_ids:
             # Heartbeat: this rescue loop calls _requeue_parent_task
             # (child clone + dep remap, multiple queries) per parent —
@@ -306,7 +361,11 @@ async def sweep_evaluating_parents(
             # exhausted it marks the parent FAILED and fires a failure alert.
             # Re-fetch the parent fresh — Step 3 may have committed or
             # rolled back, expiring the live ``evaluating_parents`` batch.
-            parent = await session.get(Task, parent_id)
+            # Use batch-cached parent; re-fetch only when expired by a prior
+            # commit/rollback inside Step 3's _check_and_trigger_rollup.
+            parent = _parent_map.get(parent_id)
+            if parent is not None and inspect(parent).expired:
+                parent = await session.get(Task, parent_id)
             if parent is None:
                 continue
             failed_children = [

@@ -374,6 +374,57 @@ async def next_task(
     }
 
 
+class DeclineTaskRequest(BaseModel):
+    task_id: str
+
+
+@router.post("/decline-task")
+async def decline_task(
+    payload: DeclineTaskRequest,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Runner declines a previously-dispatched task — release it back to QUEUED.
+
+    A runner may decline a task after claiming it from /next-task if the
+    isolation backend cannot build a sandbox for the task type (no bwrap,
+    read-only docker image on a write task, etc.).  Without this notification
+    the task strands in PROVISIONING until the stale-runner sweep fires — which
+    only happens when THIS runner goes offline.
+    """
+    pinned_vm_id = f"runner:{runner.id}"
+    result = await session.execute(
+        select(Task).where(
+            Task.id == payload.task_id,
+            Task.status == TaskStatus.PROVISIONING,
+            Task.vm_instance_id == pinned_vm_id,
+        )
+    )
+    task = result.scalars().first()
+    if task is None:
+        # Task doesn't exist, isn't in PROVISIONING, or isn't pinned to this
+        # runner — no pin to release.  Return ok so the runner doesn't retry
+        # (idempotent; the stale-runner sweep is the safety net).
+        return {"ok": True}
+
+    task.status = TaskStatus.QUEUED
+    task.vm_instance_id = None
+    task.vm_provisioned_at = None
+    task.started_at = None
+    new_ctx = dict(task.context or {})
+    new_ctx.pop("runner_target_id", None)
+    task.context = new_ctx
+    session.add(task)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Runner %s declined task %s — released back to QUEUED",
+        runner.id,
+        payload.task_id,
+    )
+    return {"ok": True}
+
+
 @router.post("/heartbeat")
 async def heartbeat(
     payload: HeartbeatRequest,

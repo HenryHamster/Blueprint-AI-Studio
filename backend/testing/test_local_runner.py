@@ -1212,6 +1212,68 @@ class TestRunnerEndpoints:
             _clear_pool()
 
     @pytest.mark.asyncio
+    async def test_decline_task_releases_back_to_queued(
+        self, client: AsyncClient, db_session
+    ):
+        """Runner-declined task moves from PROVISIONING back to QUEUED.
+
+        Edge cases covered inline: wrong runner → no-op, wrong status → no-op."""
+        project = await _make_project(db_session)
+        r1, t1 = await _make_runner(db_session, project.id)
+        r2, _ = await _make_runner(db_session, project.id, hostname="other")
+
+        # ── Happy path: decline own PROVISIONING task ──
+        task1 = Task(
+            project_id=project.id, payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{r1.id}",
+            context={"runner_target_id": str(r1.id)},
+            started_at=_utcnow(),
+        )
+        # Pinned to r2 — r1 can't release it.
+        task2 = Task(
+            project_id=project.id, payloads=[{"type": "review"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{r2.id}",
+            context={"runner_target_id": str(r2.id)},
+            started_at=_utcnow(),
+        )
+        # Wrong status — decline only releases PROVISIONING.
+        task3 = Task(
+            project_id=project.id, payloads=[{"type": "fix"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=f"runner:{r1.id}",
+            context={"runner_target_id": str(r1.id)},
+            started_at=_utcnow(),
+        )
+        db_session.add_all([task1, task2, task3])
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/decline-task",
+            json={"task_id": str(task1.id)},
+            headers={"Authorization": f"Bearer {t1}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+
+        await db_session.refresh(task1)
+        assert task1.status == TaskStatus.QUEUED
+        assert task1.vm_instance_id is None
+        assert task1.vm_provisioned_at is None
+        assert task1.started_at is None
+        assert "runner_target_id" not in (task1.context or {})
+
+        # task2 pinned to r2 — NOT released by r1's decline.
+        await db_session.refresh(task2)
+        assert task2.status == TaskStatus.PROVISIONING
+        assert task2.vm_instance_id == f"runner:{r2.id}"
+
+        # task3 in IN_PROGRESS — NOT released by decline.
+        await db_session.refresh(task3)
+        assert task3.status == TaskStatus.IN_PROGRESS
+
+    @pytest.mark.asyncio
     async def test_heartbeat_updates_last_seen(
         self, client: AsyncClient, db_session
     ):

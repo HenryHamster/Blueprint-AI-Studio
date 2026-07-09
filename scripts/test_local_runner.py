@@ -3320,6 +3320,30 @@ class TestDockerAgentBackend(unittest.TestCase):
         self.assertEqual(teardown, {})
         plan_mock.assert_not_called()
 
+    def test_notify_decline_posts_to_orchestrator(self):
+        """_notify_decline POSTs the task_id to the decline-task endpoint."""
+        from unittest.mock import patch
+
+        with patch.object(local_runner, "_post") as post_mock:
+            local_runner._notify_decline(
+                "https://api.example.com", "tok-123", "task-abc"
+            )
+        post_mock.assert_called_once_with(
+            "https://api.example.com/api/runner/decline-task",
+            "tok-123",
+            {"task_id": "task-abc"},
+        )
+
+    def test_notify_decline_swallows_exceptions(self):
+        """_notify_decline is best-effort — exceptions must not propagate."""
+        from unittest.mock import patch
+
+        with patch.object(
+            local_runner, "_post", side_effect=OSError("network down")
+        ):
+            # Must not raise.
+            local_runner._notify_decline("https://api", "tok", "t1")
+
     # ---- docker-aware teardown (reaper deadline path) ------------------------
 
     def _reap_once_past_deadline(self, teardown_entry):

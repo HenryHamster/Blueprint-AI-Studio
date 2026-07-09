@@ -86,7 +86,7 @@ function NoDataMessage() {
 
 function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: number }) {
   const [now] = useState(Date.now);
-  const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const filtered = useMemo(() => points.filter((p) => p.timestamp >= now - windowMs), [points, now, windowMs]);
   const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
@@ -109,7 +109,7 @@ function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: num
 
 function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[]; maxConcurrentVMs: number; windowMs: number }) {
   const [now] = useState(Date.now);
-  const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const filtered = useMemo(() => points.filter((p) => p.timestamp >= now - windowMs), [points, now, windowMs]);
   const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
@@ -173,15 +173,19 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
 
 function FailureRateChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: number }) {
   const [now] = useState(Date.now);
-  const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const { filtered, ratePoints } = useMemo(() => {
+    const f = points.filter((p) => p.timestamp >= now - windowMs);
+    return {
+      filtered: f,
+      ratePoints: f.map((p) => {
+        const total = p.completedCount + p.failedCount;
+        const failureRate = total > 0 ? (p.failedCount / total) * 100 : 0;
+        return { timestamp: p.timestamp, failureRate };
+      }),
+    };
+  }, [points, now, windowMs]);
   const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
-
-  const ratePoints = filtered.map((p) => {
-    const total = p.completedCount + p.failedCount;
-    const failureRate = total > 0 ? (p.failedCount / total) * 100 : 0;
-    return { timestamp: p.timestamp, failureRate };
-  });
 
   return (
     <ResponsiveContainer width="100%" height={160}>
@@ -1089,7 +1093,7 @@ export default function MetricsDashboard({
   }
 
   const cardClass = 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4';
-  const filteredMetrics = metricsHistory.filter((p) => p.timestamp >= now - windowMs);
+  const filteredMetrics = useMemo(() => metricsHistory.filter((p) => p.timestamp >= now - windowMs), [metricsHistory, now, windowMs]);
   const exportMetrics = (format: 'csv' | 'json') => {
     const rows = filteredMetrics.map((p) => ({
       timestamp: new Date(p.timestamp).toISOString(),

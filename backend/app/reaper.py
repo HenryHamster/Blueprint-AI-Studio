@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Dict
 
+from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -823,6 +824,23 @@ async def reaper_service():
                     for _child in _all_children:
                         _children_by_parent[_child.parent_task_id].append(_child)
 
+                # Batch-fetch all orphan tasks before the loop to
+                # avoid N+1 session.get calls.  After a per-row commit
+                # (line ~2209) all cached instances are expired — fall
+                # back to session.get for the affected row.
+                _orphan_task_map: dict[uuid.UUID, Task] = {}
+                if _orphaned_task_ids:
+                    _orphan_rows = (
+                        (
+                            await session.execute(
+                                select(Task).where(Task.id.in_(_orphaned_task_ids))
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    _orphan_task_map = {t.id: t for t in _orphan_rows}
+
                 for _orphan_loop_idx, task_id in enumerate(_orphaned_task_ids):
                     # Stop taking NEW orphans once the wall-time budget is spent.
                     # The remainder re-qualify next cycle via the Step-1 scan, so no
@@ -864,8 +882,12 @@ async def reaper_service():
                     _orphan_merge_refresh_needed = False
                     try:
                         # Re-validate status before acting — task may have completed/been cancelled
-                        # between the initial query and now
-                        fresh_task = await session.get(Task, task_id)
+                        # between the initial query and now.
+                        # Use batch-cached task; re-fetch only when the cached
+                        # instance was expired by a prior iteration's commit/rollback.
+                        fresh_task = _orphan_task_map.get(task_id)
+                        if fresh_task is None or inspect(fresh_task).expired:
+                            fresh_task = await session.get(Task, task_id)
                         if fresh_task is None or fresh_task.status not in (
                             TaskStatus.PROVISIONING,
                             TaskStatus.IN_PROGRESS,

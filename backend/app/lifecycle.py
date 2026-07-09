@@ -14,6 +14,7 @@ from typing import Dict, List
 
 from sqlalchemy import func as _func
 from sqlalchemy import text as _text
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 import app.shared_state as _shared_state
@@ -346,11 +347,16 @@ async def _seed_routing_verdict_from_snapshot():
         from app.efficiency_snapshot import DESIGN_DOC_KEY
 
         async with AsyncSessionLocal() as seed_session:
-            project_ids = (
-                (await seed_session.execute(select(Project.id))).scalars().all()
+            project_rows = (
+                (
+                    await seed_session.execute(
+                        select(Project).options(load_only(Project.id, Project.design_doc, raiseload=True))
+                    )
+                )
+                .scalars()
+                .all()
             )
-            for project_id in project_ids:
-                project = await seed_session.get(Project, project_id)
+            for project in project_rows:
                 if not project or not project.design_doc:
                     continue
                 container = project.design_doc.get(DESIGN_DOC_KEY)
@@ -385,7 +391,7 @@ async def _seed_routing_verdict_from_snapshot():
                     logger.info(
                         "[STARTUP] Seeded provider_routing_verdict_state=%s from project %s",
                         state,
-                        project_id,
+                        project.id,
                     )
                     return  # First project with a verdict is sufficient
     except Exception:

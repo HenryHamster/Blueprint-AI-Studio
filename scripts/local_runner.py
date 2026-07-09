@@ -942,6 +942,23 @@ def _release_capacity(capacity: threading.Semaphore | None) -> None:
         capacity.release()
 
 
+def _notify_decline(orchestrator_url: str, token: str, task_id: str) -> None:
+    """Best-effort: tell the orchestrator this runner declined a claimed task.
+
+    When the runner claims a task from /next-task but then declines it at the
+    isolation-backend level (no bwrap, no docker, capability mismatch), the
+    orchestrator still has it pinned in PROVISIONING.  Without this notification
+    the task strands until the stale-runner sweep fires when THIS runner goes
+    offline — which may be hours or never.  This call releases the pin so the
+    dispatch loop can re-pin it next cycle.
+    """
+    try:
+        url = f"{orchestrator_url}/api/runner/decline-task"
+        _post(url, token, {"task_id": task_id})
+    except Exception:
+        pass  # best-effort — the stale-runner sweep is the safety net
+
+
 def _try_acquire_capacity(capacity: threading.Semaphore | None) -> bool:
     if capacity is None:
         return True
@@ -3058,6 +3075,9 @@ def main() -> None:
                 # DECLINE / spawn failure — the reaper never sees this task, so the
                 # permit must be released here.
                 _release_capacity(agent_capacity)
+                # Notify the orchestrator so the task returns to QUEUED instead of
+                # stranding in PROVISIONING until the runner goes offline.
+                _notify_decline(orchestrator_url, token, task_id)
                 time.sleep(poll_interval)
                 continue
         except Exception as exc:  # noqa: BLE001 — a transient error must not crash the runner
