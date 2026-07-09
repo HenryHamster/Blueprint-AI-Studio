@@ -3198,6 +3198,160 @@ async def test_dedup_deadlock_exhaustion_deferred_when_owns_uncovered_criterion(
     assert d.get("auto_completed") is not True, (
         "auto_completed must NOT be set when exhaustion is gated on uncovered criteria"
     )
+    assert d.get("_exhaustion_gated_by_criterion") is True, (
+        "_exhaustion_gated_by_criterion must be set when the criterion gate "
+        "blocks dedup-deadlock auto-completion"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_already_fixed_deadlock_with_uncovered_criterion_defers_completion(
+    db_session,
+):
+    """The already-fixed-deadlock exhaustion path (line 890 call site of
+    _maybe_autocomplete_exhausted_direction) must defer auto-complete when the
+    direction owns an uncovered acceptance criterion.
+
+    Mirrors the dedup-deadlock exhaustion-gate test
+    (test_dedup_deadlock_exhaustion_deferred_when_owns_uncovered_criterion).
+    The already-fixed-deadlock variant (where spawned tasks all terminated as
+    SCOPE_EMPTY because the work was already on HEAD) is a separate code path
+    from dedup-deadlock (where cycles produce findings rejected by hash/word-overlap).
+    Both route through _maybe_autocomplete_exhausted_direction and must be gated.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import (
+        _active_direction,
+        _make_research_task,
+        _map_direction_to_criterion,
+    )
+
+    direction_id = "d-af-uncovered-criterion"
+    # Already-fixed-deadlock history: 3 consecutive research cycles whose spawned
+    # tasks all terminated as SCOPE_EMPTY (work already done on HEAD).
+    old_history = [
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=15)
+            ).isoformat(),
+            "task_id": "t-af-crit1",
+            "tasks_created": 1,
+            "scope_empty_noop_count": 1,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "all tasks SCOPE_EMPTY",
+        },
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)
+            ).isoformat(),
+            "task_id": "t-af-crit2",
+            "tasks_created": 2,
+            "scope_empty_noop_count": 2,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "all tasks SCOPE_EMPTY",
+        },
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)
+            ).isoformat(),
+            "task_id": "t-af-crit3",
+            "tasks_created": 1,
+            "scope_empty_noop_count": 1,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "all tasks SCOPE_EMPTY",
+        },
+    ]
+    direction = {
+        **_active_direction(
+            direction_id, "Already-fixed deadlock + uncovered criterion"
+        ),
+        "research_history": old_history,
+    }
+    project = _Project(
+        name="Already-Fixed Deadlock Criterion Gate Test",
+        user_id="test-user-afcrit",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Map the direction to an UNCOVERED criterion so the gate fires.
+    await _map_direction_to_criterion(
+        db_session, project, direction_id, covered=False
+    )
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Trigger already-fixed deadlock via a 3rd consecutive scope-empty cycle.
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        0,  # hash_dedup_count — no dedup activity (this is already-fixed, not dedup)
+        0,  # word_overlap_count
+        0,  # file_overlap_count
+        0,  # evidence_overlap_count
+        0,  # type_filtered_count
+        0,  # empty_prompt_count
+        "research-branch",
+        "main",
+        0,  # research_depth
+        None,  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    # The criterion gate defers exhaustion auto-complete; the direction must NOT
+    # be terminal-completed.
+    assert d["status"] != "completed", (
+        "already-fixed-deadlocked direction with uncovered criterion must NOT be "
+        f"terminal-completed (gate must defer exhaustion auto-complete), "
+        f"got status={d['status']!r}"
+    )
+    assert d.get("auto_completed") is not True, (
+        "auto_completed must NOT be set when exhaustion is gated on uncovered criteria"
+    )
+    assert d.get("_exhaustion_gated_by_criterion") is True, (
+        "_exhaustion_gated_by_criterion must be set when the criterion gate "
+        "blocks already-fixed-deadlock auto-completion"
+    )
 
 
 @_pytest.mark.asyncio

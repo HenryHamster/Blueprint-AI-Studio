@@ -345,6 +345,7 @@ async def _maybe_autocomplete_exhausted_direction(
             f"[RESEARCH] Exhaustion auto-complete deferred for direction {did}: "
             f"owns uncovered acceptance criteria (task {task.id})"
         )
+        d["_exhaustion_gated_by_criterion"] = True
         return False
 
     reason = _exhaustion_complete_reason(d)

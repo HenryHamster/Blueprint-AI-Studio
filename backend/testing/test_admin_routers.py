@@ -22642,6 +22642,10 @@ class TestStrategistSpawnCriterionIds:
                     "prompt": "Research the coverage gap for the active criterion",
                     # Active key should survive; inactive should be dropped.
                     "criterion_ids": [active_key, inactive_key],
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_admin_routers.py",
+                    },
                 },
             },
         )
@@ -22739,6 +22743,10 @@ class TestStrategistSpawnCriterionIds:
                     "prompt": "Investigate both criterion areas",
                     "direction_id": direction_id_str,
                     "criterion_ids": [explicit_key],
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_admin_routers.py",
+                    },
                 },
             },
         )
@@ -22916,6 +22924,139 @@ class TestStrategistSpawnCriterionIds:
         )
         assert resp.status_code == 400
         assert "criterion_ids" in resp.json().get("error", {}).get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_criterion_ids_requires_acceptance_evidence(
+        self, client: AsyncClient, db_session
+    ):
+        """criterion_ids without named_test acceptance_evidence is rejected (400).
+
+        A strategist who passes criterion_ids but omits acceptance_evidence (or
+        passes a non-named_test kind) creates a task that can never record a
+        proven-verdict for those criteria — silently defeating the
+        criterion-coverage gate. The endpoint must reject this at spawn time
+        rather than let the task proceed to a merge that records nothing.
+        """
+        import uuid as _uuid
+        from app.auth import create_agent_token
+        from app.models import VersionAcceptanceCriterion
+
+        project = Project(name="CritIdsReqAESpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        rv = await _make_open_version(db_session, project.id)
+        active_key = f"c-active-{_uuid.uuid4().hex[:8]}"
+        db_session.add(
+            VersionAcceptanceCriterion(
+                project_id=project.id,
+                release_version_id=rv.id,
+                criterion_key=active_key,
+                status="active",
+                text="Active criterion requiring evidence",
+            )
+        )
+        await db_session.commit()
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for criterion-ids-no-evidence",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-crit-no-ae-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-crit-no-ae-test",
+            task_type="strategic_review",
+        )
+
+        # Case 1: criterion_ids without acceptance_evidence → 400
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with criteria but no evidence",
+                    "prompt": "Investigate the criterion coverage gap",
+                    "criterion_ids": [active_key],
+                },
+            },
+        )
+        assert resp.status_code == 400, (
+            f"expected 400 when criterion_ids lacks acceptance_evidence, "
+            f"got {resp.status_code}: {resp.text}"
+        )
+        msg = resp.json().get("detail") or resp.json().get("error", {}).get("message", "")
+        assert "acceptance_evidence" in msg, (
+            f"error must mention acceptance_evidence, got: {msg!r}"
+        )
+        assert "named_test" in msg, (
+            f"error must mention named_test, got: {msg!r}"
+        )
+        assert "criterion_ids" in msg, (
+            f"error must mention criterion_ids, got: {msg!r}"
+        )
+
+        # Case 2: criterion_ids with non-named_test acceptance_evidence → 400
+        resp2 = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with criteria and wrong evidence kind",
+                    "prompt": "Investigate the criterion coverage gap",
+                    "criterion_ids": [active_key],
+                    "acceptance_evidence": {
+                        "kind": "observable_behavior",
+                        "description": "the task produces a test that passes",
+                    },
+                },
+            },
+        )
+        assert resp2.status_code == 400, (
+            f"expected 400 when criterion_ids has non-named_test acceptance_evidence, "
+            f"got {resp2.status_code}: {resp2.text}"
+        )
+        msg2 = resp2.json().get("detail") or resp2.json().get("error", {}).get("message", "")
+        assert "named_test" in msg2, (
+            f"error must mention named_test, got: {msg2!r}"
+        )
+
+        # Case 3: criterion_ids with named_test acceptance_evidence → 200
+        resp3 = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with criteria and named_test evidence",
+                    "prompt": "Investigate the criterion coverage gap",
+                    "criterion_ids": [active_key],
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_admin_routers.py",
+                    },
+                },
+            },
+        )
+        assert resp3.status_code == 200, (
+            f"expected 200 when criterion_ids has named_test acceptance_evidence, "
+            f"got {resp3.status_code}: {resp3.text}"
+        )
 
 
 @pytest.mark.asyncio

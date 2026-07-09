@@ -3027,6 +3027,24 @@ async def strategic_operation(
                     "acceptance_evidence must be a dict; ignored"
                 )
 
+        # Cross-field guard: explicit criterion_ids require named_test acceptance
+        # evidence so the acceptance pipeline can record a proven-verdict at merge
+        # time. Without this, a strategist can spawn a criterion-carrying task that
+        # will never close the coverage loop — silently defeating the
+        # criterion-coverage gate that direction d-7cd4170b put in place.
+        if explicit_criterion_ids and (
+            not isinstance(spawn_payload.get("acceptance_evidence"), dict)
+            or spawn_payload["acceptance_evidence"].get("kind") != "named_test"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "criterion_ids requires acceptance_evidence with "
+                    'kind "named_test" so the merge of this task can record '
+                    "a proven-verdict for the criterion(s)"
+                ),
+            )
+
         # compute_experiment requires a validated launch contract with spend-gate.
         spawn_requires_approval: bool | None = None
         if spawn_type == "compute_experiment":

@@ -132,6 +132,7 @@ export function buildPromptSizeTelemetry(
 } {
   const sized = sections
     .map(([name, text]) => ({ name, bytes: Buffer.byteLength(text, 'utf8') }))
+    .filter(s => s.bytes > 0)
     .sort((a, b) => b.bytes - a.bytes);
   return {
     prompt_size_bytes: Buffer.byteLength(fullPrompt, 'utf8'),
