@@ -198,6 +198,7 @@ def review_is_high_stakes(
     trunk_branches: Collection[str],
     diff_non_test_lines: int | None = None,
     diff_non_test_file_count: int | None = None,
+    is_observable_behavior: bool = False,
 ) -> bool:
     """Predicate: does this ordinary ``review`` verdict warrant a second opinion?
 
@@ -220,6 +221,12 @@ def review_is_high_stakes(
     source task's ``_pr_diff_summary`` / ``_pr_changed_files`` context; when
     absent the size exemption is skipped (fail-open toward challenging).
 
+    Override: when ``is_observable_behavior`` is True (the reviewed task's
+    acceptance evidence is ``observable_behavior`` — the self-reported proof
+    path with no machine-checkable assertion), the small-diff exemption is
+    skipped and the review is always treated as high-stakes regardless of
+    diff size.
+
     Kept as a single function so operators can re-broaden or further narrow it
     without touching the lifecycle wiring.
     """
@@ -229,6 +236,14 @@ def review_is_high_stakes(
         and base_branch in trunk_branches
     ):
         return False
+
+    # observable_behavior tasks always warrant a second opinion regardless of
+    # diff size — they are the only evidence kind that produces
+    # satisfied=True, proven=False (entirely self-reported with no
+    # machine-checkable assertion). A small diff does not make that weaker
+    # proof path more trustworthy.
+    if is_observable_behavior:
+        return True
 
     if diff_non_test_lines is not None and diff_non_test_file_count is not None:
         min_lines = int(_runtime_config.get("review_second_opinion_min_lines", 50))

@@ -53,7 +53,7 @@ from app.json_extract import scan_balanced_json_objects
 from app.task_blocked import reset_task_for_fresh_attempt
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project, _sanitize_log
-from app.payload_schemas import validate_internal_payload
+from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
     _genuine_blocking_issue_exists,
@@ -3163,6 +3163,7 @@ async def _process_post_commit(
                     # when original_task_id is unavailable (fail-open: challenge).
                     _so_diff_lines: int | None = None
                     _so_file_count: int | None = None
+                    _is_observable_behavior: bool = False
                     if original_task_id:
                         try:
                             _so_source = await session.get(
@@ -3180,6 +3181,23 @@ async def _process_post_commit(
                                     for f in _so_files
                                     if not _is_test_file(f)
                                 )
+                                # Check whether the source task declared
+                                # observable_behavior acceptance evidence.
+                                # These tasks always get a second opinion
+                                # regardless of diff size — their proof is
+                                # entirely self-reported with no
+                                # machine-checkable assertion.
+                                try:
+                                    _evidence = read_acceptance_evidence(
+                                        _so_source.first_payload
+                                    )
+                                    if (
+                                        _evidence is not None
+                                        and _evidence.kind == "observable_behavior"
+                                    ):
+                                        _is_observable_behavior = True
+                                except Exception:
+                                    pass
                         except Exception:
                             logger.debug(
                                 "[REVIEW PIPELINE] PR #%s: could not load source task "
@@ -3201,6 +3219,7 @@ async def _process_post_commit(
                         ),
                         diff_non_test_lines=_so_diff_lines,
                         diff_non_test_file_count=_so_file_count,
+                        is_observable_behavior=_is_observable_behavior,
                     ):
                         _sample_rate = float(
                             _runtime_config.get(

@@ -4075,6 +4075,59 @@ def test_review_is_high_stakes_small_diff_at_exact_threshold():
     )
 
 
+def test_review_is_high_stakes_observable_behavior_overrides_small_diff():
+    """An observable_behavior task is always high-stakes regardless of diff size."""
+    from app.task_evaluators import review_is_high_stakes
+
+    review_task = make_task(payloads=[{"type": "review"}])
+    # Small diff with observable_behavior — should still be high-stakes
+    assert (
+        review_is_high_stakes(
+            "APPROVE",
+            [],
+            [],
+            review_task,
+            base_branch="automain",
+            trunk_branches=("automain", "main"),
+            diff_non_test_lines=10,
+            diff_non_test_file_count=1,
+            is_observable_behavior=True,
+        )
+        is True
+    )
+    # Same small diff without observable_behavior — exempt as usual
+    assert (
+        review_is_high_stakes(
+            "APPROVE",
+            [],
+            [],
+            review_task,
+            base_branch="automain",
+            trunk_branches=("automain", "main"),
+            diff_non_test_lines=10,
+            diff_non_test_file_count=1,
+            is_observable_behavior=False,
+        )
+        is False
+    )
+    # non-APPROVE with observable_behavior — still not high-stakes
+    # (only APPROVE triggers the challenge, even for observable_behavior)
+    assert (
+        review_is_high_stakes(
+            "REQUEST_CHANGES",
+            [],
+            [],
+            review_task,
+            base_branch="automain",
+            trunk_branches=("automain", "main"),
+            diff_non_test_lines=10,
+            diff_non_test_file_count=1,
+            is_observable_behavior=True,
+        )
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_spawn_review_second_opinion_uses_opus_quality_tier(db_session):
     """spawn_review_second_opinion must NOT set quality_tier in the spawned
