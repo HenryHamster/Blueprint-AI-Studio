@@ -85,6 +85,36 @@ async def _sweep_runner_deactivated_escalations(session: AsyncSession) -> None:
         )
     ).scalars().all()
 
+    # Batch-fetch all referenced runners in a single query
+    runner_ids: set[uuid.UUID] = set()
+    for alert in rows:
+        if not alert.dedupe_key:
+            continue
+        parts = alert.dedupe_key.split(":", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            runner_ids.add(uuid.UUID(parts[1]))
+        except ValueError:
+            continue
+
+    runners_map: dict[str, LocalRunner] = {}
+    if runner_ids:
+        runners = (
+            await session.execute(
+                select(LocalRunner).where(LocalRunner.id.in_(list(runner_ids)))
+            )
+        ).scalars().all()
+        runners_map = {str(r.id): r for r in runners}
+
+    # Extract plain fields before the loop; _maybe_escalate_runner_deactivated_alert
+    # commits (runner_health_alerts.py:260), expiring all LocalRunner ORM objects,
+    # and the rollback handler also expires them. Reading an expired object's
+    # attributes triggers MissingGreenlet on subsequent loop iterations.
+    runner_info: dict[str, dict[str, str | None]] = {}
+    for rid, r in runners_map.items():
+        runner_info[rid] = {"status": r.status, "hostname": r.hostname}
+
     for alert in rows:
         if not alert.dedupe_key:
             continue
@@ -96,15 +126,15 @@ async def _sweep_runner_deactivated_escalations(session: AsyncSession) -> None:
             runner_id = uuid.UUID(parts[1])
         except ValueError:
             continue
-        runner = await session.get(LocalRunner, runner_id)
-        if runner is None or runner.status == "active":
+        info = runner_info.get(str(runner_id))
+        if info is None or info["status"] == "active":
             continue
         try:
             await _maybe_escalate_runner_deactivated_alert(
                 session,
                 project_id=alert.project_id,
                 runner_id=runner_id,
-                hostname=runner.hostname,
+                hostname=info["hostname"],
             )
         except Exception:
             logger.exception(

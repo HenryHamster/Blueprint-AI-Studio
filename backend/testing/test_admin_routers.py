@@ -28066,3 +28066,48 @@ class TestStrategistCancelTask:
             },
         )
         assert cancel_resp.status_code == 400, cancel_resp.text
+
+
+# ---------------------------------------------------------------------------
+# Spend accounting — LLM costs in project spend
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_project_recent_spend_includes_llm_costs(db_session):
+    """LLM API costs are included in get_project_recent_spend_usd total."""
+    from app.models import TaskStatus, _utcnow
+    from app.resource_envelope import get_project_recent_spend_usd
+    from testing.factories import make_project, make_task
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-opus-4-8",
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+        },
+        vm_runtime_cost_banked_db=5.0,
+        updated_at=now - timedelta(days=1),
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project.id, window_days=30
+    )
+
+    # LLM cost: 1000 input @ 5e-6 + 200 output @ 25e-6 = 0.01
+    assert result["llm"] == pytest.approx(0.01, abs=1e-6)
+    # Separate VM cost
+    assert result["agent_vm"] == pytest.approx(5.0, abs=1e-6)
+    # Total includes both cost types
+    assert result["total"] == pytest.approx(5.01, abs=1e-6)

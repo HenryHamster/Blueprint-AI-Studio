@@ -3423,6 +3423,7 @@ async def recheck_disabled_accounts():
     lazily once cooldown elapses, and clear_rate_limit_state_on_success drops
     entries after a successful probe task."""
     from app.models import MaxPlanAccount
+    from sqlmodel import select as sql_select
 
     changed_accounts = []
     async with _max_plan_pool_lock:
@@ -3474,10 +3475,20 @@ async def recheck_disabled_accounts():
     if changed_accounts:
         try:
             async with AsyncSessionLocal() as rl_session:
-                for acct in changed_accounts:
-                    db_acct = await rl_session.get(
-                        MaxPlanAccount, uuid.UUID(acct["id"])
+                # Batch-fetch all changed accounts in a single query
+                acct_ids = [uuid.UUID(a["id"]) for a in changed_accounts]
+                db_accounts = {
+                    str(a.id): a
+                    for a in (
+                        await rl_session.execute(
+                            sql_select(MaxPlanAccount).where(MaxPlanAccount.id.in_(acct_ids))
+                        )
                     )
+                    .scalars()
+                    .all()
+                }
+                for acct in changed_accounts:
+                    db_acct = db_accounts.get(acct["id"])
                     if db_acct:
                         db_acct.rate_limit_state = _build_rate_limit_state_blob(acct)
                         db_acct.enabled = acct.get("enabled", True)
@@ -3511,12 +3522,24 @@ async def recheck_disabled_accounts():
         flush_ids = list(_pending_cap_persists)
         try:
             async with AsyncSessionLocal() as cap_session:
+                # Batch-fetch all accounts in a single query
+                cap_ids = [uuid.UUID(a) for a in flush_ids]
+                cap_accounts = {
+                    str(a.id): a
+                    for a in (
+                        await cap_session.execute(
+                            sql_select(MaxPlanAccount).where(MaxPlanAccount.id.in_(cap_ids))
+                        )
+                    )
+                    .scalars()
+                    .all()
+                }
                 for acct_id in flush_ids:
                     acct = _account_by_id.get(acct_id)
                     if not acct:
                         _pending_cap_persists.discard(acct_id)
                         continue
-                    db_acct = await cap_session.get(MaxPlanAccount, uuid.UUID(acct_id))
+                    db_acct = cap_accounts.get(acct_id)
                     if db_acct is None:
                         _pending_cap_persists.discard(acct_id)
                         continue

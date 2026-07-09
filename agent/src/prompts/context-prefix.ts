@@ -541,8 +541,15 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
       if (directionId) meta.push(`direction: ${directionId}`);
       const sourceKind = strVal(entry.source_kind);
       if (sourceKind) meta.push(sourceKind);
+      const lifecycleStatus = strVal(entry.lifecycle_status);
+      if (lifecycleStatus && lifecycleStatus !== 'pending') {
+        meta.push(`lifecycle: ${lifecycleStatus}`);
+      }
       const metaSuffix = meta.length > 0 ? ` (${meta.join(', ')})` : '';
       let badges = '';
+      if (lifecycleStatus === 'pending') {
+        badges += ' [PENDING]';
+      }
       if (sourceKind === 'compute_experiment') {
         const criterionMet = entry.criterion_met;
         const unavailableCause = strVal(entry.unavailable_cause);

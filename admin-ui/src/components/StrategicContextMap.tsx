@@ -1,4 +1,4 @@
-import { useId } from 'react';
+import { useId, useMemo } from 'react';
 import { ArrowUpRight } from 'lucide-react';
 import type {
   StrategicContextCanvasEdge,
@@ -284,7 +284,7 @@ export function StrategicContextMap({ canvas, onOpenTarget }: StrategicContextMa
   const markerId = useId().replace(/:/g, '');
   const nodes = canvas?.nodes ?? [];
   const edges = canvas?.edges ?? [];
-  const layout = computeLayout(nodes, edges);
+  const layout = useMemo(() => computeLayout(nodes, edges), [nodes, edges]);
   const hiddenEdgeCount = Math.max(0, edges.length - layout.visibleEdges.length);
 
   if (nodes.length === 0) {

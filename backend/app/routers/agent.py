@@ -5433,7 +5433,7 @@ async def agent_list_knowledge_documents(
         default=None, description="Exact sweep_id filter (compute experiment sweeps)"
     ),
     lifecycle_status: str | None = Query(
-        default=None, description="Exact lifecycle_status filter (pending/consumed/dismissed)"
+        default=None, description="Filter by lifecycle status: pending, consumed, dismissed"
     ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),

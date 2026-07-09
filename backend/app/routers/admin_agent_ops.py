@@ -30,7 +30,7 @@ from app.capability_trial_verdict import (
 )
 from app.direction_referential_guard import build_retired_direction_grounding
 from app.database import get_session
-from app.knowledge_query import fetch_retirement_memo
+from app.knowledge_query import fetch_retirement_memo, get_knowledge_document
 from app.strategic_events import (
     STRATEGIC_KIND_DIRECTIONS,
     STRATEGIC_KIND_PROBLEM_MODEL,
@@ -170,6 +170,8 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "set_evidence_progress",
     "set_acceptance_criteria",
     "record_finding_resolution",
+    "consume_knowledge",
+    "dismiss_knowledge",
 })
 
 
@@ -5142,6 +5144,103 @@ async def strategic_operation(
                 "op": "cancel_task",
                 "target_task_id": str(target_task.id),
                 "previous_status": previous_status,
+            }
+        )
+
+    elif payload.op == "consume_knowledge":
+        # Mark a knowledge document as consumed — the strategist has read and
+        # acted on it. Once consumed, it is excluded from the pending-follow-up
+        # surface in the strategic context package evidence section.
+        if not isinstance(data, dict) or not isinstance(
+            data.get("knowledge_document_id"), str
+        ) or not data["knowledge_document_id"].strip():
+            raise HTTPException(
+                status_code=400,
+                detail='consume_knowledge: data must be {"knowledge_document_id": "<uuid>"}',
+            )
+        raw_id = data["knowledge_document_id"].strip()
+        try:
+            doc_id = uuid.UUID(raw_id)
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"consume_knowledge: invalid knowledge_document_id: {raw_id}",
+            )
+        doc = await get_knowledge_document(session, project.id, doc_id)
+        if doc is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Knowledge document {doc_id} not found in this project",
+            )
+        doc.lifecycle_status = "consumed"
+        doc.consumed_at = _utcnow()
+        session.add(doc)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] Consumed knowledge document %s for project %s",
+            doc_id,
+            project.id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "consume_knowledge",
+                "document_id": str(doc_id),
+            }
+        )
+
+    elif payload.op == "dismiss_knowledge":
+        # Mark a knowledge document as dismissed — the strategist has reviewed
+        # it and determined it is not actionable. An optional reason can be
+        # recorded for auditability.
+        if not isinstance(data, dict) or not isinstance(
+            data.get("knowledge_document_id"), str
+        ) or not data["knowledge_document_id"].strip():
+            raise HTTPException(
+                status_code=400,
+                detail='dismiss_knowledge: data must be {"knowledge_document_id": "<uuid>", "reason": "<optional string>"}',
+            )
+        raw_id = data["knowledge_document_id"].strip()
+        try:
+            doc_id = uuid.UUID(raw_id)
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"dismiss_knowledge: invalid knowledge_document_id: {raw_id}",
+            )
+        doc = await get_knowledge_document(session, project.id, doc_id)
+        if doc is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Knowledge document {doc_id} not found in this project",
+            )
+        reason = str(data.get("reason") or "").strip() or None
+        doc.lifecycle_status = "dismissed"
+        doc.dismissed_at = _utcnow()
+        doc.dismissed_reason = (
+            reason[:500] if reason else None
+        )
+        session.add(doc)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] Dismissed knowledge document %s for project %s (reason=%s)",
+            doc_id,
+            project.id,
+            reason,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "dismiss_knowledge",
+                "document_id": str(doc_id),
             }
         )
 

@@ -121,6 +121,10 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'set_strategic_challenge', alias: null, cli: false, prompt: false,
     internalReason: 'Persists the independent adversarial challenge record; invoked programmatically by the cycle, not via the CLI.',
     description: "Persist the independent adversarial second-opinion record over the strategist's self-judgments." },
+  { op: 'consume_knowledge', alias: 'consume-knowledge', cli: true, prompt: true, internalReason: null,
+    description: 'Mark a knowledge document as consumed — the strategist has read and acted on it.' },
+  { op: 'dismiss_knowledge', alias: 'dismiss-knowledge', cli: true, prompt: true, internalReason: null,
+    description: 'Mark a knowledge document as dismissed — not actionable, with an optional reason.' },
 ];
 
 /** Registry entries surfaced on the `./strategic` CLI, in canonical order. */

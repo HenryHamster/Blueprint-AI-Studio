@@ -246,5 +246,21 @@
     "cli": false,
     "prompt": false,
     "internal_reason": "Persists the independent adversarial challenge record; invoked programmatically by the cycle, not via the CLI."
+  },
+  {
+    "op": "consume_knowledge",
+    "alias": "consume-knowledge",
+    "description": "Mark a knowledge document as consumed — the strategist has read and acted on it.",
+    "cli": true,
+    "prompt": true,
+    "internal_reason": null
+  },
+  {
+    "op": "dismiss_knowledge",
+    "alias": "dismiss-knowledge",
+    "description": "Mark a knowledge document as dismissed — not actionable, with an optional reason.",
+    "cli": true,
+    "prompt": true,
+    "internal_reason": null
   }
 ]

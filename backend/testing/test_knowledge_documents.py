@@ -4699,3 +4699,312 @@ async def test_dismiss_already_dismissed_returns_409(client: AsyncClient, db_ses
         },
     )
     assert resp.status_code == 409, resp.text
+
+
+# ── lifecycle ops: consume_knowledge / dismiss_knowledge ──────────────────────
+
+
+@pytest.fixture
+async def _lifecycle_setup(db_session):
+    """Create project + strategic review task + pending knowledge doc for lifecycle tests."""
+    from app.auth import create_agent_token
+
+    project = make_project(name="Lifecycle Test")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review for lifecycle",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="vm-lifecycle-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = KnowledgeDocument(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind="design",
+        title="Test Design Document",
+        summary="A test design doc awaiting consumption",
+        body="# Test Design\n\nThis is a test.",
+        topic="testing",
+        forward_quality_verdict={},
+        lifecycle_status="pending",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+
+    token = create_agent_token(str(task.id), "vm-lifecycle-test", task_type="strategic_review")
+    return project, task, doc, token
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_transitions_pending_to_consumed(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """consume_knowledge sets lifecycle_status=consumed and consumed_at timestamp."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": str(doc.id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "consume_knowledge"
+    assert body["document_id"] == str(doc.id)
+
+    # Verify durable DB state
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "consumed"
+    assert doc.consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_404_on_wrong_project(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """consume_knowledge returns 404 when the document belongs to a different project."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    # Use a random UUID that doesn't exist in this project
+    unknown_id = uuid.uuid4()
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": str(unknown_id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_transitions_pending_to_dismissed(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge sets lifecycle_status=dismissed with timestamp and reason."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {
+                "knowledge_document_id": str(doc.id),
+                "reason": "Design is already covered by direction d-abc123",
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "dismiss_knowledge"
+    assert body["document_id"] == str(doc.id)
+
+    # Verify durable DB state
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "dismissed"
+    assert doc.dismissed_at is not None
+    assert doc.dismissed_reason == "Design is already covered by direction d-abc123"
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_without_reason(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge works without an optional reason."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {"knowledge_document_id": str(doc.id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "dismissed"
+    assert doc.dismissed_at is not None
+    assert doc.dismissed_reason is None
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_404_on_missing_doc(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge returns 404 when the document does not exist."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    unknown_id = uuid.uuid4()
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {"knowledge_document_id": str(unknown_id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_rejects_malformed_payload(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """consume_knowledge returns 400 when data is not a dict with knowledge_document_id."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    # Missing knowledge_document_id entirely
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+    # Invalid UUID
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": "not-a-uuid"},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_rejects_malformed_payload(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge returns 400 when data is not a dict with knowledge_document_id."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    # Missing knowledge_document_id entirely
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+    # Invalid UUID
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {"knowledge_document_id": "not-a-uuid"},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_ops_set_strategic_api_called_on_task_context(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """Both consume_knowledge and dismiss_knowledge set _strategic_api_called on task context."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": str(doc.id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_api_called") is True
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_status_query_filter_works(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """The lifecycle_status query param filters the list endpoint correctly."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    # Doc starts as "pending" — it should appear when filtering for pending
+    pending_resp = await client.get(
+        "/api/agent/knowledge-documents?lifecycle_status=pending",
+        headers=headers,
+    )
+    assert pending_resp.status_code == 200, pending_resp.text
+    pending_ids = [d["id"] for d in pending_resp.json()["documents"]]
+    assert str(doc.id) in pending_ids
+
+    # It should NOT appear when filtering for "consumed"
+    consumed_resp = await client.get(
+        "/api/agent/knowledge-documents?lifecycle_status=consumed",
+        headers=headers,
+    )
+    assert consumed_resp.status_code == 200, consumed_resp.text
+    consumed_ids = [d["id"] for d in consumed_resp.json()["documents"]]
+    assert str(doc.id) not in consumed_ids
+
+    # After consuming the doc, it should appear in the "consumed" filter
+    await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": str(doc.id)},
+        },
+        headers=headers,
+    )
+    consumed_after = await client.get(
+        "/api/agent/knowledge-documents?lifecycle_status=consumed",
+        headers=headers,
+    )
+    assert consumed_after.status_code == 200
+    consumed_after_ids = [d["id"] for d in consumed_after.json()["documents"]]
+    assert str(doc.id) in consumed_after_ids

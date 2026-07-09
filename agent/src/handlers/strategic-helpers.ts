@@ -200,8 +200,9 @@ const KNOWLEDGE_FETCH_CASE = `  knowledge)
           --sweep-id)    QARGS+=(--data-urlencode "sweep_id=\${2:-}"); shift 2 ;;
           --q)           QARGS+=(--data-urlencode "q=\${2:-}"); shift 2 ;;
           --tag)         QARGS+=(--data-urlencode "tag=\${2:-}"); shift 2 ;;
-          --followups)   QARGS+=(--data-urlencode "lifecycle_status=pending"); shift ;;
-          *) echo "[ERROR] fetch knowledge: unknown flag '$1' (use --topic/--direction/--q/--source-kind/--sweep-id/--tag/--followups or a document id)" >&2; exit 1 ;;
+          --lifecycle-status) QARGS+=(--data-urlencode "lifecycle_status=\${2:-}"); shift 2 ;;
+          --followups)  QARGS+=(--data-urlencode "lifecycle_status=pending"); shift ;;
+          *) echo "[ERROR] fetch knowledge: unknown flag '$1' (use --topic/--direction/--q/--source-kind/--sweep-id/--tag/--lifecycle-status/--followups or a document id)" >&2; exit 1 ;;
         esac
       done
       kresp=$(curl -sS --max-time 20 --connect-timeout 10 --get \\
@@ -224,7 +225,7 @@ export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'gap':           '`./fetch gap <id>` — a full gap record',
   'message':       '`./fetch message [ref]` — compact listing of open messages (no id), or full detail for one message by short ref or UUID',
   'section':       '`./fetch section <key>` — a full design-doc section',
-  'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--sweep-id S] [--tag T] [--followups]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body; `./fetch knowledge --followups` for pending follow-ups',
+  'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--sweep-id S] [--tag T] [--lifecycle-status S] [--followups]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body; `--followups` is shorthand for `--lifecycle-status pending`',
   'compute-sweeps': '`./fetch compute-sweeps [sweep_id]` — list completed compute experiment sweeps, or fetch one sweep by id',
   'qualification': '`./fetch qualification` — latest qualification verdict for the open version: candidate SHA, confidence, sub_scores, and full audit findings list (no id)',
   'version-phase': '`./fetch version-phase` — compact current version phase/lifecycle context, qualification state, serving/deploy status, and recent closed versions (no id)',

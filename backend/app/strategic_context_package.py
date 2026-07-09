@@ -718,7 +718,16 @@ async def load_strategic_context_evidence(
     ).all()
 
     knowledge_items = []
+    pending_count = 0
     for doc in knowledge_rows:
+        lc_status = doc.lifecycle_status or "pending"
+        if lc_status == "pending":
+            pending_count += 1
+        # Only surface pending (unconsumed, undismissed) docs in the evidence
+        # section so the strategist sees actionable follow-ups, not already-
+        # processed documents.
+        if lc_status != "pending":
+            continue
         knowledge_items.append(
             _with_target(
                 {
@@ -732,6 +741,7 @@ async def load_strategic_context_evidence(
                     "source_task_id": (
                         str(doc.source_task_id) if doc.source_task_id else None
                     ),
+                    "lifecycle_status": lc_status,
                     "created_at": doc.created_at.isoformat()
                     if doc.created_at
                     else None,
@@ -785,6 +795,7 @@ async def load_strategic_context_evidence(
     return {
         "knowledge": {
             "total": int(knowledge_total or 0),
+            "pending_count": pending_count,
             "items": knowledge_items,
         },
         "artifacts": {

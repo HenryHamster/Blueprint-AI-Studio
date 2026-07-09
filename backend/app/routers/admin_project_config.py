@@ -848,6 +848,7 @@ def _resource_envelope_response(
         "recent_spend_usd": float(recent_spend_usd),
         "recent_spend_compute_usd": float(spend_breakdown["compute"]),
         "recent_spend_agent_vm_usd": float(spend_breakdown["agent_vm"]),
+        "recent_spend_llm_usd": float(spend_breakdown["llm"]),
         "recent_spend_idle_usd": float(spend_breakdown["idle"]),
         "is_throttled": (
             spend_ceiling_usd is not None and recent_spend_usd >= spend_ceiling_usd
