@@ -31,6 +31,7 @@ import {
 } from '../prompt.js';
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 
 // Reads the web-research progress markdown the agent writes for retry context.
 // Mirrors readProgressArtifact in research-plan.ts but for the web_research kind
@@ -254,7 +255,7 @@ export async function handleWebResearch(
   const retryContext = buildRetryContext(task);
   const webResearchPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const claudeMd = readClaudeMd();
-  const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const topicLine = topic ? `Topic: ${topic}\n\n` : '';
 

@@ -69,6 +69,7 @@ export {
   buildTypeCheckInstructions,
 } from '../prompts/review-prompt.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 
 // ── Extracted helper modules ──────────────────────────────────────────────────
 import { annotateResolvedIssues, fmtAnnotatedIssue } from './review-fix-issue-dedup.js';
@@ -576,7 +577,7 @@ export async function handleReview(
 
   // Read CLAUDE.md for codebase instructions
   const reviewClaudeMd = readClaudeMd();
-  const reviewClaudeMdPrefix = reviewClaudeMd
+  const reviewClaudeMdPrefix = (reviewClaudeMd && !providerAutoInjectsClaudeMd())
     ? `${REVIEW_CLAUDEMD_PROMPT_HEADER}${reviewClaudeMd}${REVIEW_CLAUDEMD_PROMPT_FOOTER}`
     : '';
 
@@ -1362,7 +1363,7 @@ export async function handleFix(
   const fixPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const fixRetryContext = buildRetryContext(task);
   const fixFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
-  if (fixClaudeMd) {
+  if (fixClaudeMd && !providerAutoInjectsClaudeMd()) {
     enrichedPrompt = `## Codebase Instructions\n${fixClaudeMd}\n\n${fixPlaybookSection}${fixRetryContext}${enrichedPrompt}`;
   } else if (fixPlaybookSection || fixRetryContext) {
     enrichedPrompt = `${fixPlaybookSection}${fixRetryContext}${enrichedPrompt}`;

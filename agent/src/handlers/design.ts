@@ -31,6 +31,7 @@ import {
   DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix, buildRetryContext, readClaudeMd,
   writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, type PlaybookEntry,
 } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import {
   writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS,
 } from './strategic-helpers.js';
@@ -261,7 +262,7 @@ export async function handleDesign(
   const retryContext = buildRetryContext(task);
   const designPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const claudeMd = readClaudeMd();
-  const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const fileTreeSection = buildFileTree(ws);
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const topicLine = topic ? `Topic: ${topic}\n\n` : '';

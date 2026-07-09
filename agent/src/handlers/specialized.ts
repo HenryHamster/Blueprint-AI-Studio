@@ -42,6 +42,7 @@ import {
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
   formatAcceptanceEvidence, formatInvestigateCitationProvenance,
 } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 import { isParallelAuditEnabled, resolveCandidateSha } from './audits.js';
@@ -313,7 +314,7 @@ CRITICAL RULES:
 - Document any data loss risks prominently using inline comments in the migration file`;
 
   const migrateClaudeMd = readClaudeMd();
-  const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
+  const migrateClaudeMdSection = (migrateClaudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
   const migratePlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   // Shared launch-context block (sibling/queued tasks, the served direction,
   // quality signals). Degrades to '' when absent, so it is safe even when the
@@ -624,7 +625,7 @@ export async function handleDebug(
   const debugRetryContext = buildRetryContext(task);
   const debugFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
-  const debugClaudeMdSection = claudeMd ? `\n## Codebase Instructions\n${claudeMd}\n` : '';
+  const debugClaudeMdSection = (claudeMd && !providerAutoInjectsClaudeMd()) ? `\n## Codebase Instructions\n${claudeMd}\n` : '';
   const debugContextSection = contextPrefix ? `\n${contextPrefix}` : '';
   const debugFileTreeSection = fileTree ? `\n## Repository File Tree\n${fileTree}\n` : '';
   const debugCoreBody = `You are a debug analysis agent. Your job is to analyze a task failure and produce a structured root cause analysis. Do NOT make any code changes.
@@ -1224,7 +1225,7 @@ export async function handleRepoBootstrap(
     : 'repo_overview';
 
   const claudeMdContent = readClaudeMd();
-  const claudeMdSection = claudeMdContent ? `\n\n## Project Instructions (CLAUDE.md)\n${claudeMdContent}` : '';
+  const claudeMdSection = (claudeMdContent && !providerAutoInjectsClaudeMd()) ? `\n\n## Project Instructions (CLAUDE.md)\n${claudeMdContent}` : '';
 
   const bootstrapCoreBody = `You are performing a first-cycle repository bootstrap for ${owner}/${repo}.
 

@@ -52,6 +52,7 @@ import {
   type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import type { BuildConfig } from '../index.js';
 import {
   buildLensScopedChecklistSection,
@@ -542,7 +543,7 @@ export async function handlePanelReview(
     )
     : '';
   const claudeMd = readClaudeMd();
-  const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
 
   const promptFingerprint = computePromptFingerprint('panel_review', buildConfig);
   setCurrentPromptFingerprint(promptFingerprint);

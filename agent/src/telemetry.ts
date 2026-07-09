@@ -119,7 +119,7 @@ export function setPromptSizeTelemetry(
 }
 
 /** Build prompt-size telemetry from the assembled prompt and its named sections.
- *  Sorts sections descending by byte size and caps at the top 3 for heartbeat
+ *  Sorts sections descending by byte size and caps at the top 10 for heartbeat
  *  payload size. Returns an object suitable for destructuring into
  *  setPromptSizeTelemetry. */
 export function buildPromptSizeTelemetry(
@@ -137,7 +137,7 @@ export function buildPromptSizeTelemetry(
   return {
     prompt_size_bytes: Buffer.byteLength(fullPrompt, 'utf8'),
     prompt_section_count: sized.length,
-    prompt_section_sizes: sized.slice(0, 3),
+    prompt_section_sizes: sized.slice(0, 10),
   };
 }
 

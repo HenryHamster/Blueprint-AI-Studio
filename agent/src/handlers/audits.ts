@@ -35,6 +35,7 @@ import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import {
   writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS,
 } from './strategic-helpers.js';
@@ -283,7 +284,7 @@ export async function handleSecurityAudit(
   const contextPrefix = buildContextPrefix(task);
 
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd())
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
 
@@ -416,7 +417,7 @@ export async function handleSelfAudit(
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const fileTreeSection = buildFileTree(ws);
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const retryContext = buildRetryContext(task);
@@ -826,7 +827,7 @@ export async function handleReleaseAudit(
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const fileTreeSection = buildFileTree(ws);
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const retryContext = buildRetryContext(task);

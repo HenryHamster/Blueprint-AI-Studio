@@ -44,6 +44,7 @@ import {
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
   formatProvenanceWarnings, formatAcceptanceEvidence,
 } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import {
   fetchKnowledgeDocumentById,
@@ -361,7 +362,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     : '';
 
   const claudeMd = readClaudeMd();
-  const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';

@@ -562,14 +562,14 @@ describe('viewport infra skip guidance in prompt', () => {
   });
 });
 
-// ── Prompt section ordering (prefix cache) ─────────────────────────────────
-describe('prompt section order puts claudeMd before acceptance evidence', () => {
+// ── ClaudeMd guard: anthropic provider auto-injects CLAUDE.md ─────────────────
+describe('claudeMd guard with providerAutoInjectsClaudeMd', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(readClaudeMd).mockReturnValue('Mock CLAUDE.md instructions for testing');
   });
 
-  it('handleCreate puts ## Codebase Instructions before ## Acceptance Evidence', async () => {
+  it('handleCreate omits ## Codebase Instructions when provider auto-injects ClaudeMd', async () => {
     const task = { title: 'Task', description: '' };
     const payload = {
       prompt: 'Do something',
@@ -580,14 +580,13 @@ describe('prompt section order puts claudeMd before acceptance evidence', () => 
     };
     await handleCreate(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
-    const claudeMdIdx = prompt.indexOf('## Codebase Instructions');
-    const acceptanceIdx = prompt.indexOf('## Acceptance Evidence');
-    expect(claudeMdIdx).toBeGreaterThanOrEqual(0);
-    expect(acceptanceIdx).toBeGreaterThanOrEqual(0);
-    expect(claudeMdIdx).toBeLessThan(acceptanceIdx);
+    // Anthropic provider (default) auto-injects full CLAUDE.md as system prompt,
+    // so the truncated user-message copy should be absent.
+    expect(prompt).not.toContain('## Codebase Instructions');
+    expect(prompt).toContain('## Acceptance Evidence');
   });
 
-  it('handleRefactor puts ## Codebase Instructions before ## Acceptance Evidence', async () => {
+  it('handleRefactor omits ## Codebase Instructions when provider auto-injects ClaudeMd', async () => {
     const task = { title: 'Refactor task', description: '' };
     const payload = {
       prompt: 'Improve it',
@@ -598,11 +597,8 @@ describe('prompt section order puts claudeMd before acceptance evidence', () => 
     };
     await handleRefactor(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
-    const claudeMdIdx = prompt.indexOf('## Codebase Instructions');
-    const acceptanceIdx = prompt.indexOf('## Acceptance Evidence');
-    expect(claudeMdIdx).toBeGreaterThanOrEqual(0);
-    expect(acceptanceIdx).toBeGreaterThanOrEqual(0);
-    expect(claudeMdIdx).toBeLessThan(acceptanceIdx);
+    expect(prompt).not.toContain('## Codebase Instructions');
+    expect(prompt).toContain('## Acceptance Evidence');
   });
 });
 
@@ -4950,24 +4946,39 @@ describe('prompt size telemetry', () => {
     }
   });
 
-  it('buildPromptSizeTelemetry sorts sections descending and caps at 3', () => {
-    const prompt = 'section-a-content\nsection-b-longer-content\nsection-c-even-longer-stuff-here\nsection-d-short';
+  it('buildPromptSizeTelemetry sorts sections descending and caps at 10', () => {
+    // 12 sections — only the top 10 by size should survive the cap
     const sections: Array<[string, string]> = [
-      ['d', 'short'],
-      ['a', 'content'],
-      ['b', 'longer-content'],
-      ['c', 'even-longer-stuff-here'],
+      ['s1', 'x'.repeat(200)],
+      ['s2', 'x'.repeat(180)],
+      ['s3', 'x'.repeat(160)],
+      ['s4', 'x'.repeat(140)],
+      ['s5', 'x'.repeat(120)],
+      ['s6', 'x'.repeat(100)],
+      ['s7', 'x'.repeat(80)],
+      ['s8', 'x'.repeat(60)],
+      ['s9', 'x'.repeat(40)],
+      ['s10', 'x'.repeat(20)],
+      ['s11', 'x'.repeat(10)],  // smallest, should be dropped
+      ['s12', 'x'.repeat(5)],   // smallest, should be dropped
     ];
+    const prompt = sections.map(([, text]) => text).join('\n');
     const result = buildPromptSizeTelemetry(prompt, sections);
     expect(result.prompt_size_bytes).toBe(Buffer.byteLength(prompt, 'utf8'));
-    expect(result.prompt_section_count).toBe(4);
-    expect(result.prompt_section_sizes).toHaveLength(3);
-    // Sorted descending: c (largest), b, a
-    expect(result.prompt_section_sizes[0].name).toBe('c');
-    expect(result.prompt_section_sizes[1].name).toBe('b');
-    expect(result.prompt_section_sizes[2].name).toBe('a');
-    expect(result.prompt_section_sizes[0].bytes).toBeGreaterThanOrEqual(result.prompt_section_sizes[1].bytes);
-    expect(result.prompt_section_sizes[1].bytes).toBeGreaterThanOrEqual(result.prompt_section_sizes[2].bytes);
+    expect(result.prompt_section_count).toBe(12);
+    expect(result.prompt_section_sizes).toHaveLength(10);
+    // Sorted descending: s1 (largest) .. s10
+    expect(result.prompt_section_sizes[0].name).toBe('s1');
+    expect(result.prompt_section_sizes[9].name).toBe('s10');
+    // Every entry has bytes >= the next
+    for (let i = 0; i < result.prompt_section_sizes.length - 1; i++) {
+      expect(result.prompt_section_sizes[i].bytes)
+        .toBeGreaterThanOrEqual(result.prompt_section_sizes[i + 1].bytes);
+    }
+    // The dropped sections (s11, s12) must NOT be in the result
+    const names = result.prompt_section_sizes.map((s: { name: string; bytes: number }) => s.name);
+    expect(names).not.toContain('s11');
+    expect(names).not.toContain('s12');
   });
 
   it('setPromptSizeTelemetry persists sections into getLlmTelemetry', () => {

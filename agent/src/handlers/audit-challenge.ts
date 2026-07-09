@@ -24,6 +24,7 @@ import {
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
 import {
@@ -352,7 +353,7 @@ export async function handleReleaseAuditChallenge(
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const fileTreeSection = buildFileTree(ws);
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const retryContext = buildRetryContext(task);

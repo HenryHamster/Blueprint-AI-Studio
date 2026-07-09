@@ -36,6 +36,7 @@ import { parseBackendTimestamp } from '../utils/time.js';
 import {
   writeFetchHelper, buildFetchGuidance, DESIGN_DOC_FETCH_VERBS,
 } from './strategic-helpers.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 
 // ── Handler: Design Doc Update (Phase 1 of strategic cycle) ──
 // Analyzes codebase architecture and incrementally updates the design doc
@@ -61,7 +62,7 @@ export async function handleDesignDocUpdate(
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd())
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
   const fileTreeSection = buildFileTree(ws);
