@@ -4045,5 +4045,6 @@ describe('shared prompt boilerplate blocks', () => {
     expect(CAPABILITY_DECLARATION_DOC).toMatch(/never rejected/);
     expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('named_test');
     expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('observable_behavior');
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('coverage_delta');
   });
 });

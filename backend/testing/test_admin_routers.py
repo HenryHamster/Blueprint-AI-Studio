@@ -8697,6 +8697,37 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_blind_multi_reviewer_gate_enabled(self, client: AsyncClient):
+        """blind_multi_reviewer_gate_enabled accepts booleans, rejects
+        non-booleans, and round-trips on GET (operator enablement for the
+        independent multi-reviewer redundancy path). Guards all wiring points."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"blind_multi_reviewer_gate_enabled": True},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["blind_multi_reviewer_gate_enabled"] is True
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"blind_multi_reviewer_gate_enabled": False},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["blind_multi_reviewer_gate_enabled"] is False
+
+        bad = await client.patch(
+            "/api/admin/settings",
+            json={"blind_multi_reviewer_gate_enabled": "true"},
+        )
+        assert bad.status_code == 400
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"blind_multi_reviewer_gate_enabled": 1}
+        )
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_patch_review_second_opinion_sample_rate_round_trip(
         self, client: AsyncClient
     ):

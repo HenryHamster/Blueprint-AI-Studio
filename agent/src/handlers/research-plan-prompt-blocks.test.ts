@@ -21,8 +21,8 @@ describe('CAPABILITY_DECLARATION_DOC', () => {
 });
 
 describe('ACCEPTANCE_EVIDENCE_RUBRIC', () => {
-  it('documents exactly the four payload/merge-gate kinds', () => {
-    for (const kind of ['named_test', 'observable_behavior', 'downstream_artifact', 'visual']) {
+  it('documents exactly the five payload/merge-gate kinds', () => {
+    for (const kind of ['named_test', 'observable_behavior', 'downstream_artifact', 'visual', 'coverage_delta']) {
       expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain(`"kind": "${kind}"`);
     }
   });
