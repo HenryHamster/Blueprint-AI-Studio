@@ -223,7 +223,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
 
   // ── Projects domain ──────────────────────────────────────────────────────
   const {
-    projects, setProjects, projectsFetchError,
+    projects, setProjects, projectsFetchError, projectsLoaded,
     fetchProjects, handlePauseAllAutonomous, handleClearWaveDeps,
   } = useProjectsState(addToast, fetchTasksRef);
 
@@ -571,7 +571,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     // Search/filter
     searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter, directionFilter, setDirectionFilter,
     // Projects
-    projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects,
+    projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects, projectsLoaded,
     // Log viewer
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer,
     // Research browser

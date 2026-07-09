@@ -22,6 +22,7 @@ import { AlertsPopover } from './components/AlertsPopover';
 import { FleetDetailDrawer } from './components/FleetDetailDrawer';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
+import { WelcomeScreen } from './components/WelcomeScreen';
 import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
@@ -1617,6 +1618,8 @@ export default function App() {
     );
   }
 
+  const showWelcomeScreen = s.projectsLoaded && s.projects.length === 0 && !s.projectsFetchError;
+
   return (
     <ErrorBoundary>
     <TaskCapabilitiesProvider contract={s.taskCapabilityContract}>
@@ -1721,7 +1724,13 @@ export default function App() {
         </div>
       )}
 
-      <WorkbenchFrame>
+      {showWelcomeScreen ? (
+        <WelcomeScreen
+          onCreateProject={() => setShowNewProjectModal(true)}
+          onSignOut={() => signOut(auth)}
+        />
+      ) : (
+        <WorkbenchFrame>
       {s.showUserManagement && s.userRole === 'admin' ? (
         <UserManagement
           users={s.allowedUsers}
@@ -2036,6 +2045,7 @@ export default function App() {
         </Suspense>
       )}
       </WorkbenchFrame>
+      )}
 
       <PrimaryTabNav
         activeTab={activeTab}
