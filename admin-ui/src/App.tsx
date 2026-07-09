@@ -180,7 +180,7 @@ export default function App() {
     }
     const pid = selectedProjectId;
     try {
-      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(pid)}/directions`, undefined, 2, 30000, signal);
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(pid)}/directions?lite=1`, undefined, 2, 30000, signal);
       if (signal.aborted) return;
       if (!res.ok) {
         return;
