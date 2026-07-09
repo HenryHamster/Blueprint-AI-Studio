@@ -10187,6 +10187,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "web_research": "forward-quality",
         "design": "forward-quality",
         "repo_bootstrap": "none",
+        "salvage_bundle": "code-ci-review",
     }
     assert EVALUATION_STRATEGY_BY_TASK_TYPE == expected_registry, (
         "TaskType evaluation registry has drifted from the locked spec. "

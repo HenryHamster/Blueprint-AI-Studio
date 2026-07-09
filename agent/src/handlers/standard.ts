@@ -1432,3 +1432,41 @@ IMPORTANT: Only update minor/patch versions. If a package would require a major 
     runTestFix: false,
   });
 }
+
+// ── Handler: Salvage Bundle (consolidated fix for decayed findings) ──────
+/**
+ * Handle a 'salvage_bundle' task: consolidate multiple decayed/discarded research
+ * findings into a SINGLE pull request.
+ *
+ * Extracts the salvaged findings from the payload, builds a prompt instructing
+ * the agent to produce ONE consolidated PR addressing all findings, then
+ * delegates to the standard create handler flow.
+ */
+export async function handleSalvageBundle(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+): Promise<void> {
+  const rawFindings = payload.salvaged_findings;
+  const salvagedFindings = Array.isArray(rawFindings)
+    ? rawFindings as Array<Record<string, unknown>>
+    : [];
+  const findingsText = salvagedFindings.length > 0
+    ? salvagedFindings.map((f, i) =>
+        `${i + 1}. ${strVal(f.title) || '(untitled)'} (reason: ${strVal(f.discard_reason) || 'unknown'})`
+      ).join('\n')
+    : 'No specific findings provided.';
+  const prompt = `SALVAGE BUNDLE — ${salvagedFindings.length} decayed finding(s)
+
+Salvaged findings:
+${findingsText}
+
+INSTRUCTIONS:
+- Fix ALL of the above findings in a SINGLE pull request.
+- Do NOT split this into multiple PRs.
+- Address each finding with an appropriate code change.
+- Run the project's checks and open one PR with all fixes integrated.`;
+
+  const enrichedPayload = { ...payload, prompt };
+  return handleCreate(taskId, enrichedPayload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+}

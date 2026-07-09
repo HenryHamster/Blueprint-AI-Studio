@@ -8,7 +8,7 @@ import { formatProjectContext } from './project-context.js';
 // (self-review calibration + first-review rejection patterns) are only
 // meaningful for reviewed code work, so both render for exactly these types.
 // Cannot import the Python frozenset cross-language; kept as a mirrored literal.
-export const REVIEW_GATED_TASK_TYPES = ['create', 'fix', 'refactor', 'migrate', 'qa', 'docs', 'deps'];
+export const REVIEW_GATED_TASK_TYPES = ['create', 'fix', 'refactor', 'migrate', 'qa', 'docs', 'deps', 'salvage_bundle'];
 
 // Utility task types that should receive only durable operator steering
 // (user_purpose + constraints) and NOT the rolling agent current_focus narrative.

@@ -273,6 +273,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'release_audit_challenge', // Uses audit-challenge.ts bespoke prompt assembly (advisory second opinion)
   'release_merge_grade', // Uses merge-grade.ts bespoke prompt assembly (blind goal-coverage grader)
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
+  'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
