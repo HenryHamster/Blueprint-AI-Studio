@@ -574,6 +574,7 @@ def build_agent_env(
     source_env: dict[str, str],
     injected: dict[str, str],
     tool_dirs: list[str] | None = None,
+    per_task_creds: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Build an agent task's env from the ALLOWLIST only — never a copy.
 
@@ -582,13 +583,30 @@ def build_agent_env(
     from the bound tool dirs + system dirs; HOME defaults to the tmpfs sandbox
     home. BLUEPRINT_RUNNER_TOKEN / BLUEPRINT_ORCHESTRATOR_URL are structurally
     excluded (absent from AGENT_ENV_ALLOWLIST).
+
+    When ``per_task_creds`` is provided (server-vended per-task credentials), the
+    LLM credential keys from per_task_creds REPLACE any matching keys from
+    source_env.  This is the SINGLE credential code path: no fallback to static
+    host env vars for credential keys.  Non-credential keys (LANG, TERM, PATH,
+    NODE_EXTRA_CA_CERTS, etc.) still flow from source_env.  per_task_creds values
+    are still filtered through AGENT_ENV_ALLOWLIST for defense-in-depth.
     """
     env: dict[str, str] = {}
     for key in AGENT_ENV_ALLOWLIST:
         val = source_env.get(key)
         if val:
             env[key] = val
+    # Apply the runner-set identity vars (injected) first, then overlay the
+    # server-vended per-task credentials so per_task_creds REPLACES any matching
+    # keys from both source_env and injected (e.g. injected's llm_env falls back
+    # to a static host value but per_task_creds carries the true per-task value).
+    # Only keys in AGENT_ENV_ALLOWLIST pass through; everything else is dropped
+    # (defense-in-depth).
     env.update({k: v for k, v in injected.items() if v is not None})
+    if per_task_creds:
+        for key, val in per_task_creds.items():
+            if key in AGENT_ENV_ALLOWLIST and val:
+                env[key] = val
     env["PATH"] = _sandbox_path(tool_dirs or [])
     env.setdefault("HOME", SANDBOX_HOME)
     # Defense in depth: strip anything forbidden that slipped through injected.
@@ -1081,11 +1099,19 @@ def plan_agent_execution(
     source_env: dict[str, str],
     task_type: str | None = None,
     agent_image: str | None = None,
+    per_task_creds: dict[str, str] | None = None,
 ) -> ExecutionPlan:
     """Build the isolation plan for an agent task, or DECLINE (fail-closed).
 
     ``injected_env`` = the runner-set identity vars (AGENT_SECRET_TOKEN,
     ORCHESTRATOR_URL, TASK_ID, VM_INSTANCE_ID).
+
+    ``per_task_creds`` = server-vended per-task LLM credential env vars (optional).
+    When provided, these REPLACE any matching credential keys from source_env AND
+    injected_env — this is the SINGLE credential code path with no fallback to
+    static host env vars.  Non-credential keys (LANG, TERM, PATH,
+    NODE_EXTRA_CA_CERTS, etc.) still flow from source_env.  Applied to both bwrap
+    and docker backends.
 
     When ``agent_image`` is supplied and docker is usable for an eligible
     ``task_type`` (see :func:`decide_agent_backend` / :data:`AGENT_DOCKER_TYPES`),
@@ -1121,7 +1147,15 @@ def plan_agent_execution(
             val = source_env.get(key)
             if val:
                 forwarded[key] = val
+        # Apply the runner-set identity vars (injected_env) first, then overlay
+        # server-vended per-task credentials so per_task_creds REPLACES any
+        # matching keys from both source_env and injected_env.  Mirrors the
+        # bwrap path in build_agent_env.
         forwarded.update({k: v for k, v in injected_env.items() if v is not None})
+        if per_task_creds:
+            for key, val in per_task_creds.items():
+                if key in AGENT_ENV_ALLOWLIST and val:
+                    forwarded[key] = val
         for forbidden in FORBIDDEN_ENV_KEYS:
             forwarded.pop(forbidden, None)
         argv = build_docker_argv(
@@ -1181,6 +1215,7 @@ def plan_agent_execution(
             "HOME": SANDBOX_HOME,
         },
         tool_dirs_for(tools),
+        per_task_creds=per_task_creds,
     )
 
     argv = build_bwrap_argv(

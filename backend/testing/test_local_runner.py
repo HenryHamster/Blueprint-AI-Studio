@@ -2042,7 +2042,6 @@ class TestRunnerEndpoints:
             prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"] == old_at
         )
 
-
 # ── Durable artifact upload endpoint (FIX M1, backend side) ───────────────────
 
 

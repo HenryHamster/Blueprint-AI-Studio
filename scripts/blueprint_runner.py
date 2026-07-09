@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import re
 import shutil
@@ -466,6 +467,30 @@ def _credential_dir() -> str:
     )
 
 
+def _status_json_path() -> str:
+    """Absolute path of the on-box runner status file written by local_runner.py."""
+    return os.path.join(_credential_dir(), "status.json")
+
+
+def _log_dir() -> str:
+    """Directory for per-task agent log files.
+
+    Mirrors local_runner._log_dir() so CLI commands resolve the same path.
+    """
+    return os.path.join(_credential_dir(), "logs")
+
+
+def _agent_log_path(task_id: str) -> str:
+    """Derive the per-task log file path for *task_id*.
+
+    Mirrors local_runner._agent_log_path().
+    """
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in task_id)
+    if not safe:
+        safe = "unknown"
+    return os.path.join(_log_dir(), f"{safe}.log")
+
+
 def _env_file_path() -> str:
     """Absolute path of the EnvironmentFile the installed unit loads."""
     return os.path.join(_credential_dir(), "runner.env")
@@ -894,6 +919,148 @@ def do_update(
     return 0
 
 
+def do_status(args: argparse.Namespace) -> int:
+    """Print a human-readable snapshot of the local runner's current state.
+
+    Reads ``~/.blueprint/status.json`` (respecting BLUEPRINT_CREDENTIAL_DIR),
+    written by local_runner.py after every heartbeat and on shutdown.
+    Supports ``--json`` for machine-readable output.
+
+    Returns 0 on success, 1 if the status file is missing (runner not running).
+    """
+    path = _status_json_path()
+    if not os.path.isfile(path):
+        print(
+            "Runner status file not found -- the runner is not running, or has never\n"
+            "started on this machine. Start it with:  blueprint-runner start --token <token>",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR: could not read status file {path}: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json_output", False):
+        print(json.dumps(data, indent=2))
+        return 0
+
+    runner_id = data.get("runner_id") or "(not yet enrolled)"
+    hb_status = data.get("last_heartbeat_status", "unknown")
+    hb_at = data.get("last_heartbeat_at", "(never)")
+    active_tasks = data.get("active_task_ids", [])
+    active_compute = data.get("active_compute_job_ids", [])
+    agent_backend = data.get("agent_backend") or "(unknown)"
+    compute_backend = data.get("compute_backend") or "(unknown)"
+    bwrap_ok = data.get("bwrap_ok")
+    docker_ok = data.get("docker_usable")
+
+    isolation_parts: list[str] = []
+    if bwrap_ok is True:
+        isolation_parts.append("bwrap")
+    if docker_ok is True:
+        isolation_parts.append("docker")
+    isolation_str = ", ".join(isolation_parts) if isolation_parts else "(none detected)"
+
+    print(f"Runner ID:       {runner_id}", flush=True)
+    print(f"Last heartbeat:  {hb_at}  ({hb_status})", flush=True)
+    print(f"Agent backend:   {agent_backend}", flush=True)
+    print(f"Compute backend: {compute_backend}", flush=True)
+    print(f"Isolation:       {isolation_str}", flush=True)
+    print(f"Active tasks:    {len(active_tasks)}", flush=True)
+    if active_tasks:
+        for tid in active_tasks:
+            print(f"  - {tid}", flush=True)
+    print(f"Active compute:  {len(active_compute)}", flush=True)
+    if active_compute:
+        for jid in active_compute:
+            print(f"  - {jid}", flush=True)
+
+    return 0
+
+
+def do_tail(args: argparse.Namespace) -> int:
+    """Tail a per-task log file, or list available logs when no task_id is given.
+
+    ``blueprint-runner tail <task-id>``  tails the log for that task (follow mode
+    by default, or ``--no-follow`` to print-and-exit). A missing log produces a
+    clear message listing the available logs (if any).
+
+    ``blueprint-runner tail`` (no args) lists available log files with their
+    task IDs, sizes, and last-modified times.
+    """
+    task_id = args.task_id
+
+    if not task_id:
+        # List available logs
+        log_dir = _log_dir()
+        if not os.path.isdir(log_dir):
+            print("No agent logs directory found (the runner has not run any tasks yet).", flush=True)
+            return 0
+        try:
+            entries: list[tuple[float, str, int]] = []
+            for name in os.listdir(log_dir):
+                if not name.endswith(".log"):
+                    continue
+                path = os.path.join(log_dir, name)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    st = os.stat(path)
+                    task_label = name[:-4]  # strip .log suffix
+                    entries.append((st.st_mtime, task_label, st.st_size))
+                except OSError:
+                    continue
+
+            if not entries:
+                print("No per-task log files found.", flush=True)
+                return 0
+
+            # Sort newest-first
+            entries.sort(key=lambda e: e[0], reverse=True)
+            print(f"{'Task ID':<48} {'Size':>8}  {'Modified'}", flush=True)
+            print("-" * 75, flush=True)
+            for mtime, label, size in entries:
+                from datetime import datetime as _dt
+                when = _dt.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                size_str = f"{size:,}" if size > 0 else "0"
+                print(f"{label:<48} {size_str:>8}  {when}", flush=True)
+        except OSError as exc:
+            print(f"ERROR: could not list log directory {log_dir}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    # Tail a specific task
+    log_path = _agent_log_path(task_id)
+    if not os.path.isfile(log_path):
+        print(
+            f"No log file found for task {task_id}.",
+            file=sys.stderr,
+        )
+        print(f"  Looked at: {log_path}", file=sys.stderr)
+        # Suggest checking available logs.
+        print("  Run `blueprint-runner tail` (no args) to list available logs.", file=sys.stderr)
+        return 1
+
+    follow = getattr(args, "follow", True)
+    try:
+        if follow:
+            # Real-time follow (like tail -f). Uses subprocess so Ctrl-C works cleanly.
+            return subprocess.call(["tail", "-f", log_path])
+        else:
+            # Print the full file and exit.
+            with open(log_path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    sys.stdout.write(line)
+            return 0
+    except OSError as exc:
+        print(f"ERROR: could not read log file {log_path}: {exc}", file=sys.stderr)
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="blueprint-runner",
@@ -903,7 +1070,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(
-        dest="command", metavar="{start,check,install,uninstall,update}"
+        dest="command", metavar="{start,check,install,uninstall,update,status,tail}"
     )
     for name, help_text in (
         ("start", "Run the runner (blocks; Ctrl-C for graceful shutdown)."),
@@ -1014,6 +1181,36 @@ def build_parser() -> argparse.ArgumentParser:
         "update",
         help="Update the local checkout and reinstall dependencies only when needed.",
     )
+
+    status_parser = sub.add_parser(
+        "status",
+        help="Show the local runner's current state from status.json.",
+    )
+    status_parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=False,
+        help="Output raw JSON instead of a formatted summary.",
+    )
+
+    tail_parser = sub.add_parser(
+        "tail",
+        help="Tail a per-task agent log file, or list available logs.",
+    )
+    tail_parser.add_argument(
+        "task_id",
+        nargs="?",
+        default=None,
+        help="Task ID whose log to tail. Omit to list available logs.",
+    )
+    tail_parser.add_argument(
+        "--no-follow",
+        dest="follow",
+        action="store_false",
+        default=True,
+        help="Print the full log file and exit (no tail -f).",
+    )
     return parser
 
 
@@ -1043,6 +1240,12 @@ def main(argv: list[str] | None = None) -> int:
             url=resolve_url(getattr(args, "url", None)),
             dry_run=getattr(args, "dry_run", False),
         )
+
+    if args.command == "status":
+        return do_status(args)
+
+    if args.command == "tail":
+        return do_tail(args)
 
     token = resolve_token(getattr(args, "token", None))
     if not token:

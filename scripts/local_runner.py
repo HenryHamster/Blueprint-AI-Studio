@@ -77,6 +77,8 @@ import urllib.error
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone
+import typing
+from typing import Any
 
 import runner_isolation as iso
 
@@ -250,6 +252,80 @@ def _save_runner_token(token: str) -> None:
             f"[runner] WARNING: could not persist runner token to {path}: {exc}",
             flush=True,
         )
+
+
+def _log_dir() -> str:
+    """Directory for per-task agent log files.
+
+    Derives from BLUEPRINT_CREDENTIAL_DIR (defaults to ``~/.blueprint/logs/``).
+    Subdirectory of the credential dir so they share the same override mechanism.
+    """
+    return os.path.join(_credential_dir(), "logs")
+
+
+def _ensure_log_dir() -> str:
+    """Create and return the per-task log directory. Best-effort (never fatal)."""
+    path = _log_dir()
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def _agent_log_path(task_id: str) -> str:
+    """Derive the per-task log file path for *task_id* WITHOUT creating it."""
+    safe_task_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in task_id)
+    if not safe_task_id:
+        safe_task_id = "unknown"
+    return os.path.join(_log_dir(), f"{safe_task_id}.log")
+
+
+_AGENT_LOG_RETENTION = 50
+
+
+def _prune_logs() -> None:
+    """Keep at most _AGENT_LOG_RETENTION log files, removing oldest first."""
+    log_dir = _log_dir()
+    if not os.path.isdir(log_dir):
+        return
+    try:
+        entries: list[tuple[float, str]] = []
+        for name in os.listdir(log_dir):
+            if not name.endswith(".log"):
+                continue
+            path = os.path.join(log_dir, name)
+            try:
+                mtime = os.stat(path).st_mtime
+                entries.append((mtime, path))
+            except OSError:
+                continue
+        if len(entries) > _AGENT_LOG_RETENTION:
+            entries.sort(key=lambda e: e[0])
+            for _, path in entries[: len(entries) - _AGENT_LOG_RETENTION]:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+# Module-level dict tracking open per-task log file handles so the reaper loop
+# can close them before the file is removed. Guarded by _task_log_files_lock.
+_task_log_files: dict[str, typing.BinaryIO] = {}
+_task_log_files_lock = threading.Lock()
+
+
+def _close_task_log(task_id: str) -> None:
+    """Close the open log file handle for *task_id*, if any (best-effort)."""
+    with _task_log_files_lock:
+        fh = _task_log_files.pop(task_id, None)
+    if fh is not None:
+        try:
+            fh.close()
+        except OSError:
+            pass
 
 
 def _load_runner_token() -> str | None:
@@ -637,7 +713,7 @@ def _agent_workspace_for_task(task_id: str) -> str:
 
 
 def _cleanup_agent_workspace(task_id: str) -> None:
-    """Best-effort removal of a finished task's per-task workspace.
+    """Best-effort removal of a finished task's per-task workspace and log file.
 
     Unlike compute-job scratch dirs (rmtree'd after each job), per-task agent
     workspaces are never reused once the agent exits. Leaving them behind on a
@@ -645,15 +721,25 @@ def _cleanup_agent_workspace(task_id: str) -> None:
     degraded-runner health path and takes the runner offline. Reap the workspace
     when the agent finishes. Set BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 to retain
     them for post-mortem debugging.
+
+    The per-task log file is also closed and removed, unless the workspace
+    retention flag is set (keep logs alongside workspaces for debugging).
     """
-    if os.environ.get("BLUEPRINT_RUNNER_KEEP_WORKSPACES", "").strip().lower() in (
+    _close_task_log(task_id)
+
+    keep = os.environ.get("BLUEPRINT_RUNNER_KEEP_WORKSPACES", "").strip().lower() in (
         "1", "true", "yes",
-    ):
-        return
-    try:
-        shutil.rmtree(_agent_workspace_path(task_id), ignore_errors=True)
-    except Exception as exc:  # noqa: BLE001 — cleanup is strictly best-effort
-        print(f"[runner] workspace cleanup error for task {task_id}: {exc}", flush=True)
+    )
+    if not keep:
+        try:
+            shutil.rmtree(_agent_workspace_path(task_id), ignore_errors=True)
+        except Exception as exc:  # noqa: BLE001 — cleanup is strictly best-effort
+            print(f"[runner] workspace cleanup error for task {task_id}: {exc}", flush=True)
+        # Also remove the log file (best-effort).
+        try:
+            os.remove(_agent_log_path(task_id))
+        except OSError:
+            pass
 
 
 def _min_free_disk_bytes() -> int:
@@ -2284,6 +2370,54 @@ def _check_provider_credentials() -> list[str]:
     return found
 
 
+def _write_credential_files(
+    credential_files: list[dict[str, Any]], workspace: str
+) -> None:
+    """Write server-vended credential files into the agent workspace.
+
+    Each file is a dict with ``path`` (absolute, e.g. ``/home/agent/.claude.json``),
+    ``content`` (string), and ``mode`` (e.g. ``"0600"``).  The path's leading ``/``
+    is stripped and the file is written relative to *workspace* so it lands inside
+    the sandbox bind mount.  Parent directories are created as needed.
+
+    Best-effort — a failed write logs a warning but does not crash the runner.
+    """
+    for f in credential_files:
+        try:
+            file_path = f.get("path", "")
+            content = f.get("content", "")
+            mode_str = f.get("mode", "0600")
+            if not file_path or not content:
+                continue
+            # Strip leading / so the path is relative to the workspace (which is
+            # bound at the sandbox root).
+            rel = file_path.lstrip("/")
+            dest = os.path.normpath(os.path.join(workspace, rel))
+            # Defense-in-depth: verify the resolved path stays inside the
+            # workspace — os.path.normpath resolves ../ components that could
+            # escape.  The data comes from a trusted server (orchestrator), but
+            # sandbox escapes should be structurally impossible.
+            workspace_root = os.path.normpath(workspace) + os.sep
+            if not dest.startswith(workspace_root):
+                print(
+                    f"[runner] warning: credential file path {file_path} would "
+                    f"escape workspace {workspace}, skipping",
+                    flush=True,
+                )
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w") as fh:
+                fh.write(content)
+            if mode_str and len(mode_str) == 4:
+                os.chmod(dest, int(mode_str, 8))
+        except Exception as exc:
+            print(
+                f"[runner] warning: failed to write credential file "
+                f"{f.get('path', '?')} for task in {workspace}: {exc}",
+                flush=True,
+            )
+
+
 def _preflight(
     orchestrator_url: str,
     token: str,
@@ -2441,15 +2575,40 @@ def _preflight(
         print(f"    note         : {note}", flush=True)
 
     # Provider credential check (non-blocking warning).
+    # Credentials are now SERVER-VENDED per-task via /next-task.  Static host env
+    # vars are overridden by server-vended per_task_creds when present, but serve
+    # as a fallback when per_task_creds is absent or lacks the credential key.
+    # The warning flags that static credentials are redundant when the server
+    # vends them, not that they are useless.
     provider_creds = _check_provider_credentials()
     if provider_creds:
-        _fmt("provider creds", f"present ({len(provider_creds)} key(s))")
+        print(
+            f"  provider creds  : {len(provider_creds)} static key(s) present "
+            f"({', '.join(sorted(provider_creds)[:4])}"
+            f"{'...' if len(provider_creds) > 4 else ''})",
+            flush=True,
+        )
+        print(
+            "                    ⚠ Static credentials are OVERRIDDEN by server-vended\n"
+            "                    per-task credentials via /next-task when present, but\n"
+            "                    serve as a fallback otherwise. Remove them to simplify\n"
+            "                    if the server always vends credentials.",
+            flush=True,
+        )
     else:
         print(
-            "  provider creds  : NONE — agent tasks WILL fail at claim unless a\n"
-            "                    provider credential (ANTHROPIC_API_KEY,\n"
-            "                    OPENAI_API_KEY, GEMINI_API_KEY, etc.) is set\n"
-            "                    in the environment.",
+            "  provider creds  : server-vended (per-task via /next-task) —\n"
+            "                    no static host credentials set (expected).",
+            flush=True,
+        )
+    # Additional check: if the heartbeat succeeded (token_valid) but there's no
+    # enrolled_max_concurrent, the server may not have the pool configured.  This
+    # is non-blocking — the first task claim will surface the real error.
+    if token_valid and enrolled_max_concurrent is None:
+        print(
+            "  ⚠ server enrolled_max_concurrent not set — the server may not have\n"
+            "    a configured account pool.  Tasks will fail at claim if no pool\n"
+            "    is available.",
             flush=True,
         )
 
@@ -2512,6 +2671,7 @@ def _spawn_agent_task(
     lock: threading.Lock,
     llm_env: dict[str, str] | None = None,
     llm_files: list[dict[str, str]] | None = None,
+    per_task_creds: dict[str, str] | None = None,
 ) -> bool:
     """Plan (fail-closed) + spawn one claimed agent task; record it for reaping.
 
@@ -2602,6 +2762,7 @@ def _spawn_agent_task(
         source_env=dict(os.environ),
         task_type=task_type,
         agent_image=plan_image,
+        per_task_creds=per_task_creds,
     )
     if plan.declined:
         print(
@@ -2610,14 +2771,88 @@ def _spawn_agent_task(
         )
         return False
 
-    popen_kwargs: dict = {"env": plan.env, "stdout": sys.stdout, "stderr": sys.stderr}
+    # ── Per-task log file ──────────────────────────────────────────────────
+    # Open the log file before spawning so output is captured from line 1.
+    # The log path is derived deterministically from task_id so it can be
+    # tailed by ``blueprint-runner tail <task_id>``.
+    log_path = _agent_log_path(task_id)
+    _ensure_log_dir()
+    try:
+        # Use os.open + os.fdopen so the file is created with explicit
+        # restrictive permissions (0o600) regardless of the process umask.
+        # Agent stdout/stderr may contain sensitive LLM response data.
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        log_fp = os.fdopen(fd, "ab", buffering=0)
+    except OSError as exc:
+        print(f"[runner] WARNING: could not open log file {log_path}: {exc}", flush=True)
+        log_fp = None
+    if log_fp is not None:
+        with _task_log_files_lock:
+            _task_log_files[task_id] = log_fp
+
+    popen_kwargs: dict = {"env": plan.env, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
     if hasattr(os, "setsid"):
         popen_kwargs["start_new_session"] = True
     try:
         proc = subprocess.Popen(plan.argv, **popen_kwargs)
     except Exception as exc:
         print(f"[runner] failed to spawn agent for task {task_id}: {exc}", flush=True)
+        _close_task_log(task_id)
         return False
+
+    # ── Daemon reader threads (tee stdout/stderr to log file + runner output) ──
+    # Each thread reads from the subprocess pipe and writes to both the per-task
+    # log file and the runner's own stdout/stderr (so ``journalctl -fu
+    # blueprint-runner`` still shows agent output). Daemon threads are
+    # automatically cleaned up when the process exits.
+    def _tee_reader(
+        stream: "typing.BinaryIO | None",
+        log_fh: "typing.BinaryIO | None",
+        tee_fh: "typing.BinaryIO",
+    ) -> None:
+        try:
+            if stream is None:
+                return
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                # Guard against non-bytes reads (e.g. from mocked Popen in tests).
+                if not isinstance(chunk, bytes):
+                    continue
+                if log_fh is not None:
+                    try:
+                        log_fh.write(chunk)
+                        log_fh.flush()
+                    except OSError:
+                        pass
+                try:
+                    tee_fh.write(chunk)
+                    tee_fh.flush()
+                except OSError:
+                    pass
+        except (ValueError, OSError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    stdout_thread = threading.Thread(
+        target=_tee_reader,
+        args=(proc.stdout, log_fp, sys.stdout.buffer),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_tee_reader,
+        args=(proc.stderr, log_fp, sys.stderr.buffer),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    # Prune old log files opportunistically after every spawn.
+    _prune_logs()
 
     with lock:
         active_tasks[task_id] = proc
@@ -3007,6 +3242,35 @@ def main() -> None:
             llm_env = body.get("llm_env") or {}
             llm_files = body.get("llm_files") or []
 
+            # Per-task server-vended LLM credentials (single code path — no static
+            # host env fallback).  credential_env carries the env vars the agent
+            # subprocess needs (PROVIDER, AUTH_MODE, LLM_MODEL, API keys, etc.).
+            # credential_files are files to write into the workspace before launch
+            # (e.g. .claude.json, provider settings files).
+            credential_env: dict[str, str] = body.get("credential_env") or {}
+            credential_files: list[dict[str, Any]] = body.get("credential_files") or []
+            if credential_env:
+                account_id = body.get("llm_account_id", "")
+                account_name = body.get("llm_account_name", "")
+                provider = body.get("llm_provider", "")
+                model = body.get("llm_model", "")
+                print(
+                    f"[runner] task {task_id}: server-vended credentials "
+                    f"account={account_name} ({account_id}) "
+                    f"provider={provider} model={model} "
+                    f"env_keys={sorted(credential_env.keys())}",
+                    flush=True,
+                )
+            elif not any(
+                os.environ.get(k, "").strip() for k in _PROVIDER_CREDENTIAL_KEYS
+            ):
+                print(
+                    f"[runner] task {task_id}: NO credentials — server returned no "
+                    f"credential_env and no static host provider credentials are set. "
+                    f"The agent WILL fail at LLM call.",
+                    flush=True,
+                )
+
             with lock:
                 already_active = task_id in active_tasks
             if already_active:
@@ -3030,6 +3294,11 @@ def main() -> None:
                 time.sleep(poll_interval)
                 continue
 
+            # Write server-vended credential files into the workspace so they land
+            # inside the sandbox bind mount at the expected paths.
+            if credential_files:
+                _write_credential_files(credential_files, workspace)
+
             spawned = _spawn_agent_task(
                 task_id=task_id,
                 task_type=task_type,
@@ -3046,6 +3315,7 @@ def main() -> None:
                 lock=lock,
                 llm_env=llm_env,
                 llm_files=llm_files,
+                per_task_creds=credential_env,
             )
             if not spawned:
                 # DECLINE / spawn failure — the reaper never sees this task, so the
