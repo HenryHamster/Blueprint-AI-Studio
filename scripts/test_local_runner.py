@@ -3367,6 +3367,9 @@ class TestDockerAgentBackend(unittest.TestCase):
         agent_teardown: dict = {}
         fake_proc = MagicMock()
         fake_proc.pid = 4321
+        # Provide a real BytesIO for stdout so the tee reader thread exits
+        # cleanly instead of crashing on a MagicMock.
+        fake_proc.stdout = io.BytesIO(b"")
 
         plan = iso.ExecutionPlan(
             backend=backend,
@@ -3439,6 +3442,7 @@ class TestDockerAgentBackend(unittest.TestCase):
         teardown: dict = {}
         fake_proc = MagicMock()
         fake_proc.pid = 999
+        fake_proc.stdout = io.BytesIO(b"")
         with patch.object(local_runner.subprocess, "Popen", return_value=fake_proc):
             spawned = local_runner._spawn_agent_task(
                 task_id="abc123def456ghi",  # >12 chars → container name truncates it
@@ -3595,6 +3599,65 @@ class TestDockerAgentBackend(unittest.TestCase):
         self.assertFalse(
             self._heartbeat_agent_available(caps=_docker_caps(), agent_image=None)
         )
+
+    def test_spawn_writes_agent_output_to_per_task_log_file(self):
+        """A spawned agent task's stdout output must be persisted to a per-task
+        log file on disk — the core regression test for per-task log persistence."""
+        import io as _io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_LOG_DIR": log_dir}):
+                active_tasks: dict = {}
+                agent_started_at: dict = {}
+                agent_teardown: dict = {}
+                fake_proc = MagicMock()
+                fake_proc.pid = 7777
+                fake_proc.stdout = _io.BytesIO(
+                    b"task output line 1\ntask output line 2\n"
+                )
+
+                plan = iso.ExecutionPlan(
+                    backend=iso.BACKEND_BWRAP,
+                    argv=["bash", "-c", "echo test"],
+                    env={"AGENT_SECRET_TOKEN": "s"},
+                    container_name=None,
+                )
+                decide_mock = MagicMock(return_value=iso.BACKEND_BWRAP)
+                plan_mock = MagicMock(return_value=plan)
+
+                with patch.object(local_runner.iso, "decide_agent_backend", decide_mock), \
+                     patch.object(local_runner.iso, "plan_agent_execution", plan_mock), \
+                     patch.object(local_runner.subprocess, "Popen",
+                                 return_value=fake_proc):
+                    spawned = local_runner._spawn_agent_task(
+                        task_id="task-log-test",
+                        task_type="research",
+                        agent_token="tok",
+                        vm_instance_id="vm",
+                        orchestrator_url="https://api",
+                        workspace="/tmp/ws",
+                        caps=_bwrap_caps(),
+                        agent_binary="/usr/bin/node",
+                        agent_image=None,
+                        active_tasks=active_tasks,
+                        agent_started_at=agent_started_at,
+                        agent_teardown=agent_teardown,
+                        lock=threading.Lock(),
+                    )
+
+                self.assertTrue(spawned)
+
+                log_path = local_runner._task_log_path("task-log-test")
+                self.assertTrue(
+                    os.path.isfile(log_path),
+                    f"Log file should exist at {log_path}",
+                )
+
+                with open(log_path, "rb") as f:
+                    content = f.read()
+                self.assertIn(b"task output line 1", content)
+                self.assertIn(b"task output line 2", content)
 
 
 class TestAgentImagePresence(unittest.TestCase):
@@ -4679,6 +4742,104 @@ class TestProviderCredentials(unittest.TestCase):
         self.assertIn("present", output)
         self.assertIn("provider creds", output)
         self.assertTrue(result["setup_ok"])
+
+
+# ── Per-task log persistence ────────────────────────────────────────────────
+
+
+class TestTaskLogPersistence(unittest.TestCase):
+    """Unit tests for per-task log file path, rotation, and cleanup."""
+
+    def test_task_log_dir_defaults_to_credential_dir(self):
+        """Default log dir is <credential_dir>/task-logs/."""
+        with patch.object(local_runner, "_credential_dir",
+                          return_value="/tmp/.blueprint"):
+            log_dir = local_runner._task_log_dir()
+        self.assertEqual(log_dir, "/tmp/.blueprint/task-logs")
+
+    def test_task_log_dir_respects_override_env(self):
+        """BLUEPRINT_RUNNER_LOG_DIR overrides the default log directory."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ,
+                            {"BLUEPRINT_RUNNER_LOG_DIR": tmpdir}):
+                log_dir = local_runner._task_log_dir()
+            self.assertEqual(log_dir, os.path.abspath(tmpdir))
+
+    def test_task_log_path_generates_safe_filename(self):
+        """_task_log_path uses a sanitized task ID as the filename."""
+        with patch.object(local_runner, "_task_log_dir",
+                          return_value="/logs"):
+            path = local_runner._task_log_path("task/abc:123")
+        self.assertEqual(path, "/logs/task_abc_123.log")
+
+    def test_task_log_path_with_unsafe_chars(self):
+        """Unsafe chars in task IDs are replaced with underscores."""
+        with patch.object(local_runner, "_task_log_dir",
+                          return_value="/logs"):
+            path = local_runner._task_log_path("task@#$%")
+        self.assertEqual(path, "/logs/task____.log")
+
+    def test_task_log_path_fallback_for_empty_id(self):
+        """An empty or all-unsafe task ID falls back to 'unknown'."""
+        with patch.object(local_runner, "_task_log_dir",
+                          return_value="/logs"):
+            path = local_runner._task_log_path("")
+        self.assertEqual(path, "/logs/unknown.log")
+
+    def test_cleanup_removes_old_log_files(self):
+        """_cleanup_stale_task_logs removes .log files older than max_age."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_path = os.path.join(tmpdir, "old_task.log")
+            new_path = os.path.join(tmpdir, "new_task.log")
+            with open(old_path, "w") as f:
+                f.write("old")
+            with open(new_path, "w") as f:
+                f.write("new")
+            # Set old file's mtime far in the past.
+            old_mtime = time.time() - 1000
+            os.utime(old_path, (old_mtime, old_mtime))
+
+            with patch.object(local_runner, "_task_log_dir",
+                              return_value=tmpdir):
+                removed = local_runner._cleanup_stale_task_logs(
+                    max_age_seconds=500, max_files=100
+                )
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(os.path.exists(old_path))
+            self.assertTrue(os.path.exists(new_path))
+
+    def test_cleanup_respects_file_count_cap(self):
+        """_cleanup_stale_task_logs removes oldest files when count exceeds cap."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for i in range(5):
+                p = os.path.join(tmpdir, f"task_{i}.log")
+                with open(p, "w") as f:
+                    f.write(str(i))
+                paths.append(p)
+                time.sleep(0.01)  # ensure distinct mtimes
+
+            with patch.object(local_runner, "_task_log_dir",
+                              return_value=tmpdir):
+                removed = local_runner._cleanup_stale_task_logs(
+                    max_age_seconds=99999, max_files=2
+                )
+
+            # Should remove the 3 oldest, keep the 2 newest.
+            self.assertEqual(removed, 3)
+            remaining = sorted(os.listdir(tmpdir))
+            self.assertEqual(len(remaining), 2)
+
+    def test_cleanup_skips_nonexistent_dir(self):
+        """Cleanup is a no-op when the log directory does not exist."""
+        with patch.object(local_runner, "_task_log_dir",
+                          return_value="/tmp/nonexistent-log-dir-xyz"):
+            removed = local_runner._cleanup_stale_task_logs()
+        self.assertEqual(removed, 0)
 
 
 if __name__ == "__main__":

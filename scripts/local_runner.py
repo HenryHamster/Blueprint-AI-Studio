@@ -61,6 +61,7 @@ Flags:
 
 import io
 import json
+import typing
 import os
 import shutil
 import signal
@@ -1122,6 +1123,11 @@ def _reap_loop(
                 removed = _cleanup_stale_workspaces(active_ids)
                 if removed:
                     print(f"[runner] cleaned up {removed} stale workspace(s)", flush=True)
+            # Periodic stale task log cleanup (every ~5 min) — 150 ticks × 2 s.
+            if _cleanup_tick % 150 == 0:
+                log_removed = _cleanup_stale_task_logs()
+                if log_removed:
+                    print(f"[runner] cleaned up {log_removed} stale task log(s)", flush=True)
         except Exception as exc:  # noqa: BLE001 — never let the reaper thread die silently
             print(f"[runner] reap loop error (continuing): {exc}", flush=True)
         time.sleep(2)
@@ -2366,6 +2372,101 @@ def _cleanup_stale_workspaces(active_task_ids: set, max_age_seconds: float = 300
     return removed
 
 
+# ── Per-task log file persistence ─────────────────────────────────────────────
+
+# Default max age for task log files before cleanup (7 days).
+_MAX_TASK_LOG_AGE_SECONDS = 7 * 24 * 3600  # 7 days
+# Max number of task log files to retain (safety cap).
+_MAX_TASK_LOG_FILES = 200
+
+
+def _task_log_dir() -> str:
+    """Directory for per-task log files.
+
+    Defaults to ``<credential_dir>/task-logs/`` so logs live alongside the
+    runner's credential/status files. Override via ``BLUEPRINT_RUNNER_LOG_DIR``
+    for testing or non-standard installs.
+    """
+    override = os.environ.get("BLUEPRINT_RUNNER_LOG_DIR", "").strip()
+    if override:
+        return os.path.abspath(override)
+    return os.path.join(_credential_dir(), "task-logs")
+
+
+def _task_log_path(task_id: str) -> str:
+    """Return the per-task log file path for *task_id*.
+
+    The filename is the sanitized task ID with a ``.log`` extension, stored
+    inside the task log directory (``_task_log_dir()``).
+    """
+    safe_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in task_id)
+    if not safe_id:
+        safe_id = "unknown"
+    return os.path.join(_task_log_dir(), f"{safe_id}.log")
+
+
+def _cleanup_stale_task_logs(
+    max_age_seconds: float = _MAX_TASK_LOG_AGE_SECONDS,
+    max_files: int = _MAX_TASK_LOG_FILES,
+) -> int:
+    """Remove stale task log files to prevent unbounded disk growth.
+
+    Two-phase cleanup:
+      1. Remove all ``.log`` files in the task log directory whose mtime is
+         older than *max_age_seconds*.
+      2. After age-based removal, if the file count still exceeds *max_files*,
+         remove the oldest files until within the limit.
+
+    Returns the number of files removed. Best-effort — never raises.
+    """
+    log_dir = _task_log_dir()
+    if not os.path.isdir(log_dir):
+        return 0
+    now = time.time()
+    removed = 0
+    # Collect all .log files with their mtime (oldest first).
+    entries: list[tuple[float, str]] = []
+    try:
+        for name in os.listdir(log_dir):
+            if not name.endswith(".log"):
+                continue
+            path = os.path.join(log_dir, name)
+            try:
+                st = os.stat(path)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                entries.append((st.st_mtime, path))
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    if not entries:
+        return 0
+    entries.sort(key=lambda x: x[0])
+
+    # Phase 1: remove files older than max_age_seconds.
+    surviving: list[tuple[float, str]] = []
+    for mtime, path in entries:
+        if (now - mtime) >= max_age_seconds:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                surviving.append((mtime, path))
+        else:
+            surviving.append((mtime, path))
+
+    # Phase 2: if still over the file cap, remove oldest.
+    while len(surviving) > max_files:
+        _mtime, path = surviving.pop(0)
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def _compute_backend_summary(caps: "iso.Capabilities") -> str:
     """Human summary of which compute backends this host can build."""
     parts: list[str] = []
@@ -2754,14 +2855,61 @@ def _spawn_agent_task(
         )
         return False
 
-    popen_kwargs: dict = {"env": plan.env, "stdout": sys.stdout, "stderr": sys.stderr}
+    # Open a per-task log file to persist the agent's stdout/stderr output
+    # on disk (best-effort - a write failure must never prevent the task from
+    # running).  The reader thread below tees output to both this log file and
+    # the runner's stdout (terminal/journal).
+    _log_file_handle: "typing.BinaryIO | None" = None
+    try:
+        _log_path = _task_log_path(task_id)
+        os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+        _log_file_handle = open(_log_path, "ab")
+    except Exception as exc:
+        print(
+            f"[runner] warning: could not open log file for task {task_id}: {exc}",
+            flush=True,
+        )
+
+    popen_kwargs: dict = {"env": plan.env, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
     if hasattr(os, "setsid"):
         popen_kwargs["start_new_session"] = True
     try:
         proc = subprocess.Popen(plan.argv, **popen_kwargs)
     except Exception as exc:
+        if _log_file_handle is not None:
+            try:
+                _log_file_handle.close()
+            except Exception:
+                pass
         print(f"[runner] failed to spawn agent for task {task_id}: {exc}", flush=True)
         return False
+
+    # Reader thread: tee the agent's stdout to both the per-task log file and
+    # the runner's stdout (so output still appears in the terminal / systemd
+    # journal, just as it did before with stdout=sys.stdout).
+    def _tee_agent_output() -> None:
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(8192)
+                if not chunk:
+                    break
+                if _log_file_handle is not None:
+                    _log_file_handle.write(chunk)
+                    _log_file_handle.flush()
+                sys.stdout.write(chunk.decode("utf-8", "replace"))
+                sys.stdout.flush()
+        except (ValueError, OSError):
+            return  # stdout closed underneath us (normal on teardown)
+        finally:
+            if _log_file_handle is not None:
+                try:
+                    _log_file_handle.close()
+                except Exception:
+                    pass
+
+    _log_reader = threading.Thread(target=_tee_agent_output, daemon=True)
+    _log_reader.start()
 
     with lock:
         active_tasks[task_id] = proc
