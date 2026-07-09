@@ -1430,6 +1430,35 @@ async def _commit_or_handle_duplicate_spawn(
     return True
 
 
+def _build_salvage_payload(
+    salvage_candidates: list[dict],
+    source_task_id: uuid.UUID | str,
+) -> dict:
+    """Build the salvage bundle payload dict from decayed/discarded findings.
+
+    Each finding entry carries rich context (prompt, description, related_files,
+    claims, sources) so the consuming agent can address all findings in one PR.
+    """
+    return {
+        "type": "salvage_bundle",
+        "source_task_id": str(source_task_id),
+        "salvaged_findings": [
+            {
+                "title": f.get("title") or (f.get("description") or "")[:80],
+                "discard_reason": f.get("deferred_reason") or "unknown",
+                "direction_id": f.get("direction_id"),
+                "prompt": f.get("prompt"),
+                "description": (f.get("description") or "")[:500] if f.get("description") else None,
+                "related_files": f.get("related_files"),
+                "claims": f.get("claims"),
+                "sources": f.get("sources"),
+            }
+            for f in salvage_candidates
+        ],
+        "total_discarded": len(salvage_candidates),
+    }
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them.
 
@@ -5177,19 +5206,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # adversarial_gate >=3, prereq_deferred >=3). This aggregates them into one
     # actionable task rather than only individual memo tasks or silent drops.
     if _salvage_candidates:
-        _salvage_payload = {
-            "type": "salvage_bundle",
-            "source_task_id": str(task.id),
-            "salvaged_findings": [
-                {
-                    "title": f.get("title") or (f.get("description") or "")[:80],
-                    "discard_reason": f.get("deferred_reason") or "unknown",
-                    "direction_id": f.get("direction_id"),
-                }
-                for f in _salvage_candidates
-            ],
-            "total_discarded": len(_salvage_candidates),
-        }
+        _salvage_payload = _build_salvage_payload(_salvage_candidates, task.id)
         _salvage_task = Task(
             project_id=task.project_id,
             title=f"Salvage bundle: {len(_salvage_candidates)} decayed finding(s)",

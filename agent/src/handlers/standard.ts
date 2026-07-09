@@ -1452,9 +1452,19 @@ export async function handleSalvageBundle(
     ? rawFindings as Array<Record<string, unknown>>
     : [];
   const findingsText = salvagedFindings.length > 0
-    ? salvagedFindings.map((f, i) =>
-        `${i + 1}. ${strVal(f.title) || '(untitled)'} (reason: ${strVal(f.discard_reason) || 'unknown'})`
-      ).join('\n')
+    ? salvagedFindings.map((f, i) => {
+        let text = `${i + 1}. ${strVal(f.title) || '(untitled)'} (reason: ${strVal(f.discard_reason) || 'unknown'})`;
+        const desc = strVal(f.description);
+        if (desc) text += `\n   Description: ${desc.slice(0, 200)}`;
+        const files = f.related_files;
+        if (Array.isArray(files) && files.length > 0) {
+          const fileList = files.map((rf: unknown) =>
+            strVal(typeof rf === 'string' ? rf : (rf as Record<string, unknown>).path ?? (rf as Record<string, unknown>).file ?? '')
+          ).filter(Boolean).join(', ');
+          if (fileList) text += `\n   Related files: ${fileList}`;
+        }
+        return text;
+      }).join('\n')
     : 'No specific findings provided.';
   const prompt = `SALVAGE BUNDLE — ${salvagedFindings.length} decayed finding(s)
 
@@ -1464,7 +1474,15 @@ ${findingsText}
 INSTRUCTIONS:
 - Fix ALL of the above findings in a SINGLE pull request.
 - Do NOT split this into multiple PRs.
-- Address each finding with an appropriate code change.
+- For each finding, scan its "Related files" — those files are the most
+  likely locations for the needed change. Start by reading them.
+- When a fix changes logic (not just comments/whitespace/formatting),
+  add or update tests that cover the changed behavior.
+- In the PR description, include a table mapping every finding to the
+  change that addresses it. Example format:
+  | Finding | Change | Files |
+  |---------|--------|-------|
+  | ...     | ...    | ...   |
 - Run the project's checks and open one PR with all fixes integrated.`;
 
   const enrichedPayload = { ...payload, prompt };

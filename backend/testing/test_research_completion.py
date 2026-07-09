@@ -29,6 +29,7 @@ from app.research_completion import (
     VALID_VERIFICATION_BASES,
     _annotate_capability_declarations,
     _apply_structural_actionability_downgrade,
+    _build_salvage_payload,
     _handle_research_completion,
     _reconcile_verification_basis,
     _record_research_survival_signal,
@@ -373,8 +374,8 @@ class TestLowActionabilityDecay:
         assert stamped["title"] == "new-low-finding"
 
 
-class TestSalvageBundleTask:
-    """Salvage-bundle task consolidates decay-discarded findings into one actionable task."""
+class TestSalvagePayloadConstruction:
+    """Salvage-bundle payload construction preserves full finding context."""
 
     def _simulate_salvage_payload(self, candidates: list[dict], source_task_id: str) -> dict:
         """Simulate the salvage bundle payload construction from research_completion.py."""
@@ -386,6 +387,11 @@ class TestSalvageBundleTask:
                     "title": f.get("title") or (f.get("description") or "")[:80],
                     "discard_reason": f.get("deferred_reason") or "unknown",
                     "direction_id": f.get("direction_id"),
+                    "prompt": f.get("prompt"),
+                    "description": (f.get("description") or "")[:500] if f.get("description") else None,
+                    "related_files": f.get("related_files"),
+                    "claims": f.get("claims"),
+                    "sources": f.get("sources"),
                 }
                 for f in candidates
             ],
@@ -418,18 +424,49 @@ class TestSalvageBundleTask:
         assert "prereq-deferred" in titles
 
     def test_each_finding_has_reason_and_title(self):
-        """Every salvaged finding entry has a title and discard_reason."""
+        """Every salvaged finding entry has a title, discard_reason, and rich context."""
         candidates = [
-            {"title": "only-title", "deferred_reason": "low_actionability",
-             "direction_id": "d-1"},
-            {"title": "", "description": "desc-based title",
-             "deferred_reason": "ultra_low_confidence",
-             "direction_id": "d-2"},
+            {
+                "title": "perf-finding",
+                "prompt": "Optimize the query hot path",
+                "description": "The N+1 query pattern in task_lifecycle.py causes slow page loads",
+                "related_files": ["backend/app/task_lifecycle.py"],
+                "claims": [{"claim": "N+1 detected in loop", "confidence": "high"}],
+                "sources": ["task_audit_report_2026.pdf"],
+                "deferred_reason": "low_actionability",
+                "direction_id": "d-1",
+            },
+            {
+                "title": "",
+                "description": "desc-based title with rich context",
+                "prompt": "Refactor the stale handler",
+                "related_files": ["backend/app/reaper.py", "backend/app/orchestrator.py"],
+                "deferred_reason": "ultra_low_confidence",
+                "direction_id": "d-2",
+            },
         ]
         payload = self._simulate_salvage_payload(candidates, "task-002")
-        for entry in payload["salvaged_findings"]:
-            assert entry["discard_reason"] in ("low_actionability", "ultra_low_confidence")
-            assert entry["title"]
+        entries = payload["salvaged_findings"]
+
+        # First finding: all rich fields preserved
+        e0 = entries[0]
+        assert e0["title"] == "perf-finding"
+        assert e0["discard_reason"] == "low_actionability"
+        assert e0["prompt"] == "Optimize the query hot path"
+        assert e0["description"] == "The N+1 query pattern in task_lifecycle.py causes slow page loads"
+        assert e0["related_files"] == ["backend/app/task_lifecycle.py"]
+        assert e0["claims"] == [{"claim": "N+1 detected in loop", "confidence": "high"}]
+        assert e0["sources"] == ["task_audit_report_2026.pdf"]
+        assert e0["direction_id"] == "d-1"
+
+        # Second finding: title fallback from description, rich fields preserved
+        e1 = entries[1]
+        assert e1["title"].startswith("desc-based title")
+        assert e1["discard_reason"] == "ultra_low_confidence"
+        assert e1["prompt"] == "Refactor the stale handler"
+        assert e1["description"] == "desc-based title with rich context"
+        assert e1["related_files"] == ["backend/app/reaper.py", "backend/app/orchestrator.py"]
+        assert e1["direction_id"] == "d-2"
 
     def test_empty_candidates_produce_no_task(self):
         """Empty salvage candidates means no bundle entries."""
@@ -438,10 +475,12 @@ class TestSalvageBundleTask:
         assert payload["salvaged_findings"] == []
 
     def test_fallback_for_missing_title(self):
-        """Finding missing title falls back to description snippet."""
+        """Finding missing title falls back to description snippet; rich context preserved."""
         candidates = [
             {
                 "description": "A very long description that serves as the fallback title",
+                "prompt": "Implement the fallback-handling logic",
+                "related_files": ["backend/app/fallback.py"],
                 "deferred_reason": "low_actionability",
                 "direction_id": "d-x",
             }
@@ -450,6 +489,57 @@ class TestSalvageBundleTask:
         entry = payload["salvaged_findings"][0]
         assert entry["title"].startswith("A very long description")
         assert entry["discard_reason"] == "low_actionability"
+        assert entry["prompt"] == "Implement the fallback-handling logic"
+        assert entry["description"] == "A very long description that serves as the fallback title"
+        assert entry["related_files"] == ["backend/app/fallback.py"]
+
+    def test_real_function_preserves_prompt_and_related_files(self):
+        """The production _build_salvage_payload preserves prompt and related_files."""
+        candidates = [
+            {
+                "title": "n-plus-one",
+                "prompt": "Fix N+1 query in task_lifecycle.py by adding selectinload",
+                "description": "Task detail resolution issues N+1 in the loop",
+                "related_files": ["backend/app/task_lifecycle.py"],
+                "claims": [{"claim": "N+1 detected", "confidence": "high"}],
+                "sources": ["perf_report_v3.pdf"],
+                "deferred_reason": "low_actionability",
+                "direction_id": "d-001",
+            },
+            {
+                "title": "unused-index",
+                "prompt": "Drop unused composite index on task.status",
+                "related_files": ["backend/app/models.py", "backend/alembic/versions/0421_poolvm_hot_path_indexes.py"],
+                "deferred_reason": "ultra_low_confidence",
+                "direction_id": "d-002",
+            },
+        ]
+        payload = _build_salvage_payload(candidates, "task-real-001")
+        assert payload["type"] == "salvage_bundle"
+        assert payload["source_task_id"] == "task-real-001"
+        assert payload["total_discarded"] == 2
+        entries = payload["salvaged_findings"]
+        assert len(entries) == 2
+
+        e0 = entries[0]
+        assert e0["title"] == "n-plus-one"
+        assert e0["prompt"] == "Fix N+1 query in task_lifecycle.py by adding selectinload"
+        assert e0["description"] == "Task detail resolution issues N+1 in the loop"
+        assert e0["related_files"] == ["backend/app/task_lifecycle.py"]
+        assert e0["claims"] == [{"claim": "N+1 detected", "confidence": "high"}]
+        assert e0["sources"] == ["perf_report_v3.pdf"]
+        assert e0["discard_reason"] == "low_actionability"
+        assert e0["direction_id"] == "d-001"
+
+        e1 = entries[1]
+        assert e1["title"] == "unused-index"
+        assert e1["prompt"] == "Drop unused composite index on task.status"
+        assert e1["related_files"] == [
+            "backend/app/models.py",
+            "backend/alembic/versions/0421_poolvm_hot_path_indexes.py",
+        ]
+        assert e1["discard_reason"] == "ultra_low_confidence"
+        assert e1["direction_id"] == "d-002"
 
 
 @_pytest.mark.asyncio
