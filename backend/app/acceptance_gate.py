@@ -218,6 +218,35 @@ def _paths_match(changed: str, declared: str) -> bool:
     return changed.rsplit("/", 1)[-1] == declared.rsplit("/", 1)[-1]
 
 
+def _test_semantically_grounded(
+    declared_test_path: str, seam_files: list[str]
+) -> bool:
+    """Whether a declared test path semantically corresponds to a changed seam.
+
+    A heuristic that the test file's module name (its basename minus the
+    ``test_`` prefix and file extension) must match at least one changed
+    non-test file's module name exactly.  A declaration of
+    ``test_acceptance_gate.py`` must co-occur with a change to
+    ``acceptance_gate.py`` — not just any production file.
+
+    Files that do not follow the ``test_`` prefix convention (e.g.
+    ``foo_test.py`` or non-Python files) fail closed: the heuristic cannot
+    ground them, so the gate errs on the side of not granting machine-checked
+    proof.
+    """
+    test_basename = declared_test_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    if not test_basename.startswith("test_"):
+        return False
+    test_stem = test_basename[len("test_"):]
+    if not test_stem:
+        return False
+    for path in seam_files:
+        prod_basename = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if prod_basename == test_stem:
+            return True
+    return False
+
+
 def _merge_was_test_verified(task: Task) -> bool:
     """Whether the merge was gated by a REAL test verdict (fail-closed).
 
@@ -296,12 +325,21 @@ def _evaluate_named_test(
             f"declared named_test {declared_path!r} ships no production code "
             "change it could exercise (the diff is test-only)",
         )
+    if not _test_semantically_grounded(declared_path, seam_files):
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            f"declared named_test {declared_path!r} exercises a production seam "
+            "that does not semantically correspond to the declared test module — "
+            "none of the changed production files match the test file's module name",
+        )
     return AcceptanceGateVerdict(
         True,
         True,
         evidence.kind,
         f"named_test {declared_path!r} was added/modified, ran green under a "
-        f"verified merge, and exercises a changed production seam "
+        f"verified merge, and exercises a semantically grounded production seam "
         f"({len(seam_files)} non-test file(s))",
         proven=True,
         proof_ref=evidence.test_path or declared_path or None,

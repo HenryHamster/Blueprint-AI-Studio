@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-007",
+  "name": "Investigate VM crash loop",
+  "description": "An 'investigate' task: investigate repeated VM crash for a specific task type in production logs.",
+  "task_type": "investigate",
+  "prompt": "Investigate repeated VM crashes for 'research' tasks over the last 48 hours. Look for common patterns in: OOM signals, timeout exits, error log signatures. Identify the root cause, affected task types, and recommend a fix.",
+  "effort": "medium",
+  "source_info": "Pattern from investigate tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "read_only_unclassified"
+  },
+  "tags": ["investigate", "medium", "cost-baseline"]
+}

@@ -149,6 +149,7 @@ from app.anomaly_detection import (  # noqa: E402, F401
     get_anomaly_tracker_snapshot,
 )
 from app.efficiency_snapshot import (  # noqa: E402, F401
+    compute_provider_routing_verdict,
     get_efficiency_axes,
     get_llm_cost_breakdown,
 )
@@ -1317,6 +1318,12 @@ async def _compute_digest(
     effort_model_efficiency = compute_effort_model_efficiency(
         completed_tasks + failed_tasks + cancelled_tasks,
         runtime_config=_runtime_config,
+    )
+    # Provider routing A/B verdict derived from the per-model efficiency breakdown.
+    # Injected into the same payload so live consumers see ADOPT/REJECT/INSUFFICIENT_DATA
+    # alongside the per-model rows that informed it.
+    effort_model_efficiency["provider_routing_verdict"] = (
+        compute_provider_routing_verdict(effort_model_efficiency["by_model"])
     )
 
     # --- Scope mismatch diagnostics ---

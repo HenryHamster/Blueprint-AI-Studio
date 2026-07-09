@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-011",
+  "name": "Add last_login_at column to users",
+  "description": "A 'migrate' task: add a nullable last_login_at timestamp column to the user model.",
+  "task_type": "migrate",
+  "prompt": "Add a nullable 'last_login_at' column (DateTime, timezone-aware) to the User model in backend/app/models.py. Create the Alembic migration. Bump EXPECTED_SCHEMA_REVISION.",
+  "effort": "low",
+  "source_info": "Pattern from migration tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "code_merge"
+  },
+  "tags": ["migrate", "simple", "cost-baseline"]
+}

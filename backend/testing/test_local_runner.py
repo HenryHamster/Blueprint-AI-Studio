@@ -20,6 +20,7 @@ from sqlmodel import select
 from app import alert_dispatch
 from app import auth as auth_mod
 from app import compute_backends as compute_backends_mod
+from app import max_plan_pool as mpp
 from app import orchestrator as orch
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.models import (
@@ -79,6 +80,58 @@ async def _make_runner(session, project_id, **kwargs):
     await session.refresh(runner)
     return runner, token
 
+
+def _seed_pool_account(
+    user_id: str = TEST_USER_ID,
+    *,
+    account_id: str | None = None,
+    provider: str = "anthropic",
+    auth_mode: str = "oauth",
+    runtime_secret: str = "sk-ant-test-secret-token",
+    active_tasks: int = 0,
+    enabled: bool = True,
+):
+    """Seed a single LLM account into the in-memory pool so
+    select_llm_runtime_for_task() can resolve one in tests."""
+    acct_id = account_id or str(uuid.uuid4())
+    entry: dict = {
+        "id": acct_id,
+        "user_id": user_id,
+        "name": f"test-acct-{acct_id[:8]}",
+        "provider": provider,
+        "auth_mode": auth_mode,
+        "secret_blob_ref": None,
+        "provider_metadata": {},
+        "runtime_secret": runtime_secret,
+        "oauth_token": runtime_secret if provider == "anthropic" and auth_mode == "oauth" else None,
+        "runtime_ready": True,
+        "claude_config_json": None,
+        "enabled": enabled,
+        "active_tasks": int(active_tasks),
+        "total_tasks": 0,
+        "daily_task_cap": None,
+        "max_concurrent_tasks": None,
+        "auto_disable_after_rate_limits": 3,
+        "daily_task_count": 0,
+        "daily_task_count_reset_at": None,
+        "disabled_reason": None,
+        "disabled_at": None,
+        "token_created_at": None,
+        "rate_limit_state": {},
+        "routing_tags": [],
+        "target_utilization_pct": None,
+        "gpu_count": None,
+        "gpu_names": None,
+    }
+    mpp._account_by_id[acct_id] = entry
+    mpp._max_plan_pools.setdefault(user_id, []).append(entry)
+    return entry
+
+
+def _clear_pool():
+    """Remove all seeded accounts from the in-memory pool."""
+    mpp._max_plan_pools.clear()
+    mpp._account_by_id.clear()
 
 def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
@@ -857,40 +910,51 @@ class TestRunnerEndpoints:
         """
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
+        _seed_pool_account(TEST_USER_ID)
+        try:
 
-        task = Task(
-            project_id=project.id,
-            payloads=[{"type": "create", "title": "do a thing"}],
-            status=TaskStatus.PROVISIONING,
-            vm_instance_id=f"runner:{runner.id}",
-            context={"runner_target_id": str(runner.id)},
-        )
-        db_session.add(task)
-        await db_session.commit()
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "title": "do a thing"}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={"runner_target_id": str(runner.id)},
+            )
+            db_session.add(task)
+            await db_session.commit()
 
-        resp = await client.post(
-            "/api/runner/next-task",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["task_id"] == str(task.id)
-        assert body["task_type"] == "create"
-        assert body["agent_token"]
-        assert body["vm_instance_id"] == f"runner:{runner.id}"
-        assert body["payload"] == [{"type": "create", "title": "do a thing"}]
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["task_id"] == str(task.id)
+            assert body["task_type"] == "create"
+            assert body["agent_token"]
+            assert body["vm_instance_id"] == f"runner:{runner.id}"
+            assert body["payload"] == [{"type": "create", "title": "do a thing"}]
 
-        # The minted JWT is task-scoped to this runner's vm id.
-        claims = auth_mod.verify_agent_jwt(body["agent_token"])
-        assert claims["sub"] == str(task.id)
-        assert claims["vm_instance_id"] == f"runner:{runner.id}"
+            # The minted JWT is task-scoped to this runner's vm id.
+            claims = auth_mod.verify_agent_jwt(body["agent_token"])
+            assert claims["sub"] == str(task.id)
+            assert claims["vm_instance_id"] == f"runner:{runner.id}"
 
-        # Task MUST still be in PROVISIONING — claim (not next-task) does the
-        # PROVISIONING → IN_PROGRESS transition.  started_at is set by next-task
-        # as a dispatch marker so re-polls skip this task until claim completes.
-        await db_session.refresh(task)
-        assert task.status == TaskStatus.PROVISIONING
-        assert task.started_at is not None
+            # Task MUST still be in PROVISIONING — claim (not next-task) does the
+            # PROVISIONING → IN_PROGRESS transition.  started_at is set by next-task
+            # as a dispatch marker so re-polls skip this task until claim completes.
+            await db_session.refresh(task)
+            assert task.status == TaskStatus.PROVISIONING
+            assert task.started_at is not None
+
+            # Verify the response includes pooled credential info.
+            assert body.get("provider") == "anthropic"
+            assert body.get("auth_mode") == "oauth"
+            assert isinstance(body.get("llm_env"), dict)
+            assert "CLAUDE_CODE_OAUTH_TOKEN" in body["llm_env"]
+            assert body["llm_env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test-secret-token"
+        finally:
+            _clear_pool()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -905,33 +969,37 @@ class TestRunnerEndpoints:
     ):
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
+        _seed_pool_account(TEST_USER_ID)
+        try:
 
-        task = Task(
-            project_id=project.id,
-            payloads=[{"type": task_type}],
-            status=TaskStatus.PROVISIONING,
-            vm_instance_id=f"runner:{runner.id}",
-            context={"runner_target_id": str(runner.id)},
-        )
-        db_session.add(task)
-        await db_session.commit()
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": task_type}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={"runner_target_id": str(runner.id)},
+            )
+            db_session.add(task)
+            await db_session.commit()
 
-        resp = await client.post(
-            "/api/runner/next-task",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["task_type"] == task_type
-        capability = body["capability_slice"]
-        assert capability["id"] == task_type
-        assert capability["agent_mode"] == "read_only"
-        assert capability["run_shape"] == "single_agent"
-        assert capability["output_kind"] == output_kind
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["task_type"] == task_type
+            capability = body["capability_slice"]
+            assert capability["id"] == task_type
+            assert capability["agent_mode"] == "read_only"
+            assert capability["run_shape"] == "single_agent"
+            assert capability["output_kind"] == output_kind
 
-        claims = auth_mod.verify_agent_jwt(body["agent_token"])
-        assert claims["task_type"] == task_type
-        assert claims["project_id"] == str(project.id)
+            claims = auth_mod.verify_agent_jwt(body["agent_token"])
+            assert claims["task_type"] == task_type
+            assert claims["project_id"] == str(project.id)
+        finally:
+            _clear_pool()
 
     @pytest.mark.asyncio
     async def test_next_task_repoll_returns_204_after_dispatch(
@@ -946,37 +1014,41 @@ class TestRunnerEndpoints:
         """
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
+        _seed_pool_account(TEST_USER_ID)
+        try:
 
-        task = Task(
-            project_id=project.id,
-            payloads=[{"type": "create", "title": "no double dispatch"}],
-            status=TaskStatus.PROVISIONING,
-            vm_instance_id=f"runner:{runner.id}",
-            context={"runner_target_id": str(runner.id)},
-        )
-        db_session.add(task)
-        await db_session.commit()
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "title": "no double dispatch"}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={"runner_target_id": str(runner.id)},
+            )
+            db_session.add(task)
+            await db_session.commit()
 
-        # First poll: dispatched.
-        resp1 = await client.post(
-            "/api/runner/next-task",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp1.status_code == 200
-        assert resp1.json()["task_id"] == str(task.id)
+            # First poll: dispatched.
+            resp1 = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp1.status_code == 200
+            assert resp1.json()["task_id"] == str(task.id)
 
-        # Verify started_at is now set (dispatch marker).
-        await db_session.refresh(task)
-        assert task.started_at is not None
-        assert task.status == TaskStatus.PROVISIONING
+            # Verify started_at is now set (dispatch marker).
+            await db_session.refresh(task)
+            assert task.started_at is not None
+            assert task.status == TaskStatus.PROVISIONING
 
-        # Second poll while task is still PROVISIONING (agent hasn't claimed yet):
-        # must return 204 — no duplicate dispatch.
-        resp2 = await client.post(
-            "/api/runner/next-task",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp2.status_code == 204
+            # Second poll while task is still PROVISIONING (agent hasn't claimed yet):
+            # must return 204 — no duplicate dispatch.
+            resp2 = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp2.status_code == 204
+        finally:
+            _clear_pool()
 
     @pytest.mark.asyncio
     async def test_agent_claim_after_runner_dispatch_transitions_to_in_progress(
@@ -990,36 +1062,40 @@ class TestRunnerEndpoints:
         """
         project = await _make_project(db_session)
         runner, runner_token = await _make_runner(db_session, project.id)
+        _seed_pool_account(TEST_USER_ID)
+        try:
 
-        task = Task(
-            project_id=project.id,
-            payloads=[{"type": "create", "title": "runner claim test"}],
-            status=TaskStatus.PROVISIONING,
-            vm_instance_id=f"runner:{runner.id}",
-            context={"runner_target_id": str(runner.id)},
-        )
-        db_session.add(task)
-        await db_session.commit()
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "title": "runner claim test"}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={"runner_target_id": str(runner.id)},
+            )
+            db_session.add(task)
+            await db_session.commit()
 
-        # Step 1: runner polls next-task.
-        next_resp = await client.post(
-            "/api/runner/next-task",
-            headers={"Authorization": f"Bearer {runner_token}"},
-        )
-        assert next_resp.status_code == 200
-        agent_token = next_resp.json()["agent_token"]
+            # Step 1: runner polls next-task.
+            next_resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {runner_token}"},
+            )
+            assert next_resp.status_code == 200
+            agent_token = next_resp.json()["agent_token"]
 
-        # Step 2: agent binary calls /api/agent/claim with the minted JWT.
-        claim_resp = await client.post(
-            "/api/agent/claim",
-            headers={"x-agent-token": agent_token},
-        )
-        assert claim_resp.status_code == 200, claim_resp.text
+            # Step 2: agent binary calls /api/agent/claim with the minted JWT.
+            claim_resp = await client.post(
+                "/api/agent/claim",
+                headers={"x-agent-token": agent_token},
+            )
+            assert claim_resp.status_code == 200, claim_resp.text
 
-        # Step 3: task is now IN_PROGRESS with last_heartbeat set.
-        await db_session.refresh(task)
-        assert task.status == TaskStatus.IN_PROGRESS
-        assert task.last_heartbeat is not None
+            # Step 3: task is now IN_PROGRESS with last_heartbeat set.
+            await db_session.refresh(task)
+            assert task.status == TaskStatus.IN_PROGRESS
+            assert task.last_heartbeat is not None
+        finally:
+            _clear_pool()
 
     @pytest.mark.asyncio
     async def test_next_task_204_when_nothing_pinned(
@@ -1040,6 +1116,100 @@ class TestRunnerEndpoints:
             headers={"Authorization": "Bearer not-a-real-token"},
         )
         assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_next_task_includes_pooled_credential_in_response(
+        self, client: AsyncClient, db_session
+    ):
+        """The /next-task response must include provider, auth_mode, model,
+        llm_env (with the resolved credential env vars), and llm_files from
+        the pool-selected account — NOT from any static local env var."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        # Seed a DeepSeek account so the response proves it comes from the pool,
+        # not from a statically-configured Anthropic credential.
+        _seed_pool_account(
+            TEST_USER_ID,
+            provider="deepseek",
+            auth_mode="api_key",
+            runtime_secret="sk-deepseek-pool-assigned-key",
+        )
+        try:
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "title": "pool credential test"}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={"runner_target_id": str(runner.id)},
+            )
+            db_session.add(task)
+            await db_session.commit()
+
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+
+            # Provider/model/auth_mode are from the POOL, not from any local env.
+            assert body["provider"] == "deepseek"
+            assert body["auth_mode"] == "api_key"
+            # llm_env carries the credential env vars the runner must inject.
+            assert isinstance(body["llm_env"], dict)
+            assert body["llm_env"]["PROVIDER"] == "deepseek"
+            assert body["llm_env"]["AUTH_MODE"] == "api_key"
+            assert body["llm_env"]["DEEPSEEK_API_KEY"] == "sk-deepseek-pool-assigned-key"
+            # llm_files is present (even if empty for api_key providers).
+            assert isinstance(body["llm_files"], list)
+
+            # The task context must carry the resolved account identity so the
+            # completion handler can release the account slot.
+            await db_session.refresh(task)
+            ctx = task.context or {}
+            assert ctx.get("llm_provider") == "deepseek"
+            assert ctx.get("llm_auth_mode") == "api_key"
+            assert ctx.get("llm_account_id") is not None
+            # Promoted column must also be populated (D2 over-fetch fix).
+            assert task.llm_account_id is not None
+        finally:
+            _clear_pool()
+
+    @pytest.mark.asyncio
+    async def test_next_task_returns_204_when_pool_exhausted(
+        self, client: AsyncClient, db_session
+    ):
+        """When no eligible account exists in the pool, /next-task must return
+        204 and leave started_at unset so the task remains claimable once an
+        account frees up.  A 204 is the correct "nothing available" signal,
+        not a 5xx or a task dispatched without credentials."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        # Do NOT seed any account — the pool is empty.
+        _clear_pool()
+        try:
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "title": "exhausted pool test"}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={"runner_target_id": str(runner.id)},
+            )
+            db_session.add(task)
+            await db_session.commit()
+
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 204
+
+            # started_at must NOT be set — the task was not dispatched.
+            await db_session.refresh(task)
+            assert task.started_at is None
+            assert task.status == TaskStatus.PROVISIONING
+        finally:
+            _clear_pool()
 
     @pytest.mark.asyncio
     async def test_heartbeat_updates_last_seen(

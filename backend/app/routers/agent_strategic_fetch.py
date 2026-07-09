@@ -1051,11 +1051,16 @@ async def agent_fetch_efficiency_snapshot(
     Read-only; cross-project access returns 404."""
     from app.efficiency_snapshot import (  # noqa: PLC0415
         AXIS_COST_PER_MERGED_PR,
+        AXIS_COST_PER_VERIFIED_TASK,
+        AXIS_LLM_CACHE_HIT_RATE,
         AXIS_LLM_COST_PER_MERGED_PR,
+        AXIS_LLM_COST_PER_VERIFIED_TASK,
         AXIS_VM_REUSE_RATE,
         FORMAT_COMPLIANCE_KEY,
         _AXIS_WINDOW_DAYS,
         _compute_cost_per_merged_pr,
+        _compute_cost_per_verified_task,
+        _compute_llm_cache_hit_rate,
         _compute_vm_reuse_rate,
         _load_recent_tasks,
         _resolve_deploy_since,
@@ -1065,6 +1070,7 @@ async def agent_fetch_efficiency_snapshot(
     from app.llm_cost_attribution import (  # noqa: PLC0415
         _compact_llm_cost_attribution,
         _compute_llm_cost_per_merged_pr,
+        _compute_llm_cost_per_verified_task,
     )
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
 
@@ -1100,8 +1106,11 @@ async def agent_fetch_efficiency_snapshot(
         "status": "success",
         "data": {
             AXIS_COST_PER_MERGED_PR: _compute_cost_per_merged_pr(tasks),
+            AXIS_COST_PER_VERIFIED_TASK: _compute_cost_per_verified_task(tasks),
             AXIS_VM_REUSE_RATE: _compute_vm_reuse_rate(tasks),
             AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
+            AXIS_LLM_COST_PER_VERIFIED_TASK: _compute_llm_cost_per_verified_task(tasks),
+            AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
             FORMAT_COMPLIANCE_KEY: format_compliance,
             "llm_cost_attribution": llm_cost_attribution,
             "panel_review_effectiveness": panel_review_effectiveness,

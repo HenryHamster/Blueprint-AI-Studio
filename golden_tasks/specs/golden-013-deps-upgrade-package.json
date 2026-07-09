@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-013",
+  "name": "Upgrade httpx to latest minor",
+  "description": "A 'deps' task: upgrade the httpx dependency to the latest minor version.",
+  "task_type": "deps",
+  "prompt": "Upgrade httpx in backend/pyproject.toml from the current version to the latest minor. Run the test suite to check for regressions. If any tests fail, fix compatibility issues.",
+  "effort": "medium",
+  "source_info": "Pattern from deps tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "code_merge"
+  },
+  "tags": ["deps", "medium", "cost-baseline"]
+}

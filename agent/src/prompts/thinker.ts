@@ -15,7 +15,7 @@ export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'):
       'You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.',
       '1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.',
       '2. Decompose into substantial subtasks. Prefer fewer, larger subtasks over many tiny ones.',
-      '3. Identify dependencies between subtasks — which must complete before others can start.',
+      '3. Identify dependencies between subtasks — only order true producer→consumer relationships. Minimize unnecessary dependencies so independent subtasks can run in parallel; each dependency you add serializes work that could have been concurrent.',
       '4. Write clear, self-contained prompts for each subtask.',
       'Output EXACTLY one JSON block as the VERY LAST thing in your response:',
       'GREENFIELD MODE — this repository is empty or near-empty (only config/scaffolding, no real source).',
@@ -414,7 +414,11 @@ Walk the current problem_model section by section. What's accurate, stale, missi
 For each existing gap: open, progressing, or closed? For each new gap you're opening: name, description, evidence, size (small/medium/large), priority (high/medium/low), and source (if one exists).
 
 ## 3. Moves
-Directions to retire (one-sentence reason each) and to create (name the gap_id each closes, a \`success_evidence\` string describing the observable outcome that proves the direction is done, a \`retirement_condition\` string describing the measurable trigger for retirement, and a \`dedup_reasoning\` object naming the 0–3 closest existing or retired directions you considered and a one-line justification why the new direction is distinct). Parallel moves are fine and encouraged when non-clashing. When two directions are genuinely independent (no shared files, no logical dependency, no real conflict risk), create/dispatch BOTH now rather than staging one behind the other — dispatched work runs concurrently in the pipeline and there is no context-switching cost to you; sequence only when there is a real dependency.
+Directions to retire (one-sentence reason each) and to create (name the gap_id each closes, a \`success_evidence\` string describing the observable outcome that proves the direction is done, a \`retirement_condition\` string describing the measurable trigger for retirement, and a \`dedup_reasoning\` object naming the 0–3 closest existing or retired directions you considered and a one-line justification why the new direction is distinct).
+
+**Criterion-coverage check before retirement.** When proposing to retire a direction, first check whether it is the sole covering direction for any acceptance criterion. A direction with a \`criterion_keys\` field in the direction list, or the sole mapper for a criterion in the acceptance-criteria block, is criterion-carrying — retiring it would leave that criterion permanently uncoverable (the backend gate \`direction_owns_uncovered_criterion\` will block the retirement). Before retiring such a direction, either: (a) retract the orphaned criterion via Section 8 with a \`reason\` explaining why it is permanently uncoverable and no realistic path to covering it remains, or (b) keep the direction active until another direction covers the criterion. Do NOT retire a criterion-carrying direction without first addressing its criterion — a retirement that silently orphans a criterion will be rejected.
+
+Parallel moves are fine and encouraged when non-clashing. When two directions are genuinely independent (no shared files, no logical dependency, no real conflict risk), create/dispatch BOTH now rather than staging one behind the other — dispatched work runs concurrently in the pipeline and there is no context-switching cost to you; sequence only when there is a real dependency.
 
 **Knowledge commissions.** You can also direct the Executor to spawn a \`web_research\` or \`design\` knowledge task (it has the spawn-task command). These are HIGH-ROI and chronically under-used: one durable, citation-grounded document de-risks every later task in its area and compounds across cycles. Plan one when a direction hinges on external facts nobody has documented (APIs, vendors, pricing/quotas, standards, how mature OSS solves the same problem), when an area keeps producing failed or churning implementation work (settle the structure once in a design doc instead of re-deriving it per task), or when the knowledge index is thin for a direction you are actively advancing. Name the task type, title, and what the document must answer.
 
@@ -586,6 +590,7 @@ export async function runThinkerWithGate(
   model: string | undefined,
   effort: string | undefined,
   disallowedTools: string[],
+  currentPurpose?: string,
 ): Promise<{ ok: true; analysisText: string; newVersionGoal?: string } | { ok: false }> {
   const problemModelPath = `/tmp/problem_model_${taskId}.json`;
   const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
@@ -728,6 +733,12 @@ export async function runThinkerWithGate(
         lastResultText: thinkerResult.lastResultText,
       },
       reopenPrompt: [
+        ...(currentPurpose
+          ? [
+              `CRITICAL: The operator-set durable intent.purpose for this project is: "${currentPurpose}". In your problem_model JSON output, set intent.purpose to exactly this string — do NOT substitute it with "...", "&lt;...&gt;", or an empty string. This value is authoritative; the prior analysis below may omit it, but your output MUST include it.`,
+              '',
+            ]
+          : []),
         'Your strategic run completed cleanly, but the required problem_model JSON was not parseable.',
         'IMPORTANT: this is a FRESH session — you do NOT have the previous conversation.',
         'Your previous analysis output is reproduced verbatim below.',
@@ -778,6 +789,12 @@ export async function runThinkerWithGate(
     // JSON is usually emitted before the final summary text.
     const priorOutput = (problemModelRepair?.retry?.allOutput || thinkerResult.allOutput).slice(-80_000);
     const retryPrompt = [
+      ...(currentPurpose
+        ? [
+            `CRITICAL: The operator-set durable intent.purpose for this project is: "${currentPurpose}". In your problem_model JSON output, set intent.purpose to exactly this string — do NOT substitute it with "...", "&lt;...&gt;", or an empty string. This value is authoritative; the prior analysis below may omit it, but your output MUST include it.`,
+            '',
+          ]
+        : []),
       'Your previous strategic analysis completed but the required handoff files',
       'were not written to disk. IMPORTANT: this is a FRESH session — you do NOT',
       'have the previous conversation. Your previous analysis output is reproduced',

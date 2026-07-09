@@ -604,7 +604,7 @@ class TestAgentPlan(unittest.TestCase):
     def test_decline_without_bwrap(self):
         plan = iso.plan_agent_execution(
             caps=_caps(docker_usable=True),
-            agent_binary="/opt/agent/dist/index.js",
+            agent_binary=["node", "/opt/agent/dist/index.js"],
             workspace_host="/tmp/ws/t1",
             injected_env={"AGENT_SECRET_TOKEN": "jwt"},
             source_env={"PATH": "/usr/bin"},
@@ -625,7 +625,7 @@ class TestAgentPlan(unittest.TestCase):
     def test_agent_plan_bwrap_no_token_on_argv(self):
         plan = iso.plan_agent_execution(
             caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
-            agent_binary="/opt/agent/dist/index.js",
+            agent_binary=["node", "/opt/agent/dist/index.js"],
             workspace_host="/tmp/ws/t1",
             injected_env={
                 "AGENT_SECRET_TOKEN": "SUPER-SECRET-JWT",
@@ -700,7 +700,7 @@ class TestAgentPlan(unittest.TestCase):
         # and container_name unchanged (container_name stays None on bwrap).
         plan = iso.plan_agent_execution(
             caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
-            agent_binary="/opt/agent/dist/index.js",
+            agent_binary=["node", "/opt/agent/dist/index.js"],
             workspace_host="/tmp/ws/t1",
             injected_env={"AGENT_SECRET_TOKEN": "jwt", "TASK_ID": "t1"},
             source_env={"PATH": "/usr/bin"},

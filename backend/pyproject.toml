@@ -50,6 +50,10 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 "app/alert_dispatch.py" = ["BLE001", "E402"]
 "app/notification.py" = ["BLE001"]
 "app/deploy_health_alerts.py" = ["BLE001"]
+# runner.py was extracted from compute.py/main.py; the intentional broad-except
+# guards in next-compute-job (repo-token mint) and LLM account selection are
+# "log and continue — never crash the runner poll loop" paths.
+"app/routers/runner.py" = ["BLE001"]
 # services.py is entirely background workers (cleanup, persist, timeout sweep, orphan
 # recovery). Every except Exception is the intentional "log and continue — never crash
 # the background loop" pattern; narrowing risks missing an exception type and killing

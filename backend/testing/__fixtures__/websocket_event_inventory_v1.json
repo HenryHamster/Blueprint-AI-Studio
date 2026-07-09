@@ -1202,6 +1202,22 @@
       "workbench_resource": null
     },
     {
+      "callee": "ws_manager.broadcast_to_all",
+      "canonical_callee": "broadcast_to_all",
+      "classification": "legacy_global_event",
+      "event": "pipeline_throttle",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 2381,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "dict:detail,reason",
+      "scope": "orchestrator_worker",
+      "source_path": "backend/app/orchestrator.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
       "classification": "legacy_project_event",
@@ -4404,6 +4420,22 @@
     {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
+      "classification": "legacy_project_event",
+      "event": "alert_created",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 96,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "dict:alert_id,severity,title",
+      "scope": "check_monthly_budget",
+      "source_path": "backend/app/monthly_budget_alerts.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
+      "callee": "broadcast_to_project",
+      "canonical_callee": "broadcast_to_project",
       "classification": "workbench_v1_emitter",
       "event": "<dynamic>",
       "event_expression": "event_name",
@@ -4421,7 +4453,7 @@
   "schema_version": 1,
   "summary": {
     "legacy_global_event": 13,
-    "legacy_project_event": 188,
+    "legacy_project_event": 189,
     "legacy_review_required": 17,
     "message_v1_payload": 13,
     "raw_websocket_control": 3,

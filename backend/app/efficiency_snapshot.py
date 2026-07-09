@@ -64,6 +64,7 @@ from app.llm_cost_attribution import (
     _UNPRICED_COMBOS_CAP,
     _compact_llm_cost_attribution,
     _compute_llm_cost_per_merged_pr,
+    _compute_llm_cost_per_verified_task,
     _compute_llm_cost_pricing_coverage,
     _price_llm_attempt,
     _task_llm_attempts,
@@ -114,10 +115,22 @@ AXIS_VM_REUSE_RATE = "vm_reuse_rate"
 AXIS_MEDIAN_API_CALLS_PER_TASK = "median_api_calls_per_task"
 AXIS_MEDIAN_REVIEW_ITERATIONS = "median_review_iterations"
 AXIS_LLM_COST_PER_MERGED_PR = "llm_cost_per_merged_pr"
+AXIS_COST_PER_VERIFIED_TASK = "cost_per_verified_task"
+AXIS_LLM_COST_PER_VERIFIED_TASK = "llm_cost_per_verified_task"
 AXIS_LANE_COST_PER_MERGED_PR = "lane_cost_per_merged_pr"
 AXIS_LANE_WARM_RESUME_RATE = "lane_warm_resume_rate"
 AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 AXIS_PROMPT_STATIC_BYTES = "prompt_static_bytes"
+AXIS_LLM_CACHE_HIT_RATE = "llm_cache_hit_rate"
+AXIS_TOTAL_COST_PER_VERIFIED_TASK = "total_cost_per_verified_task"
+
+# Minimum verified-merge count before drift_pct is emitted for
+# AXIS_TOTAL_COST_PER_VERIFIED_TASK. Below this threshold the ratio is too noisy
+# (small denominator) and drift_pct is suppressed to None to avoid phantom
+# regression signals from early low-N windows.
+VERIFIED_TASK_DRIFT_MIN_COUNT = 20
+
+AXIS_REWORK_COST_SHARE = "rework_cost_share"
 
 # Guard threshold for prompt_static_bytes: alert when static prompt size exceeds
 # this many source characters. Set well above the current measured value (~31k chars)
@@ -144,10 +157,15 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
     AXIS_LLM_COST_PER_MERGED_PR,
+    AXIS_COST_PER_VERIFIED_TASK,
+    AXIS_LLM_COST_PER_VERIFIED_TASK,
     AXIS_LANE_COST_PER_MERGED_PR,
     AXIS_LANE_WARM_RESUME_RATE,
     AXIS_CHECKPOINT_LOSS_RATE,
     AXIS_PROMPT_STATIC_BYTES,
+    AXIS_LLM_CACHE_HIT_RATE,
+    AXIS_TOTAL_COST_PER_VERIFIED_TASK,
+    AXIS_REWORK_COST_SHARE,
 )
 
 # ---------------------------------------------------------------------------
@@ -183,6 +201,12 @@ AXIS_CONSUMERS: dict[str, dict] = {
     AXIS_LLM_COST_PER_MERGED_PR: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
+    AXIS_COST_PER_VERIFIED_TASK: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_LLM_COST_PER_VERIFIED_TASK: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
     AXIS_LANE_COST_PER_MERGED_PR: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
@@ -193,6 +217,15 @@ AXIS_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_PROMPT_STATIC_BYTES: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_LLM_CACHE_HIT_RATE: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_TOTAL_COST_PER_VERIFIED_TASK: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_REWORK_COST_SHARE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
 }
@@ -273,7 +306,12 @@ _SNAPSHOT_HISTORY_MAX = 365
 #      constants in agent/src/prompt.ts) as a leading indicator for token budget growth.
 # v11: LLM spend axes became provider-cache-aware and pricing rows were refreshed
 #      for current Opus/Haiku/OpenAI Codex proxy rates.
-METRIC_DEF_VERSION = "v11"
+# v12: AXIS_TOTAL_COST_PER_VERIFIED_TASK added — total LLM+VM cost per verified
+#      merge (is_verified_merge denominator, rollup parents excluded), with a
+#      drift floor of ≥20 verified merges.
+# v12: rework_cost_share axis added — fraction of total LLM spend consumed by fix/
+#      re-attempt tasks, computed from the existing per-PR chain breakdown.
+METRIC_DEF_VERSION = "v12"
 
 
 async def _load_recent_tasks(
@@ -459,6 +497,24 @@ def _compute_cost_per_merged_pr(tasks: list[Task]) -> float | None:
     if not merged:
         return None
     return round(total_cost / merged, 4)
+
+
+def _compute_cost_per_verified_task(tasks: list[Task]) -> float | None:
+    """Total VM cost / CI-verified merge count over the window.
+
+    Uses :func:`is_verified_merge` as the denominator so fall-open (CI-bypassed)
+    merges do not dilute the per-task cost. Returns None when no verified merges.
+    """
+    total_cost = 0.0
+    verified = 0
+    parent_ids = _rollup_parent_ids(tasks)
+    for t in tasks:
+        total_cost += get_task_total_vm_cost_usd(t)
+        if is_verified_merge(t) and t.id not in parent_ids:
+            verified += 1
+    if not verified:
+        return None
+    return round(total_cost / verified, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +843,31 @@ POOL_PAYOFF_COST_TOLERANCE_PCT = 5.0
 # payoff transition.
 POOL_PAYOFF_PROVEN_MIN_WARM_STARTS = 5
 
+# ---------------------------------------------------------------------------
+# Provider routing A/B verdict (direction d-cf39cb40)
+# ---------------------------------------------------------------------------
+# Verdict states for the DeepSeek-vs-Anthropic routing A/B: is routing
+# low/medium-effort tasks to DeepSeek cutting cost without regressing quality
+# (verified-merge rate)?
+
+PROVIDER_ROUTING_ADOPT = "ADOPT"
+PROVIDER_ROUTING_REJECT = "REJECT"
+PROVIDER_ROUTING_INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+# Minimum PR-eligible tasks per provider before a verdict can be issued.
+PROVIDER_ROUTING_MIN_PR_ELIGIBLE_TASKS = 20
+
+# Cost-ratio threshold: DeepSeek cost-per-merge must be strictly below this
+# fraction of Anthropic's to count as meaningfully cheaper.  0.90 = at least
+# 10 % cheaper.  Below 1.0 the raw direction is "cheaper"; the 0.90 bar
+# filters out near-parity noise so the verdict is actionable.
+PROVIDER_ROUTING_COST_RATIO_THRESHOLD = 0.90
+
+# Maximum allowable verified-merge-rate regression in *percentage points*.
+# DeepSeek's verified_landed_rate may be at most this many points below
+# Anthropic's.  -5.0 means "5 percentage points lower is acceptable."
+PROVIDER_ROUTING_QUALITY_FLOOR_PCT = -5.0
+
 
 def compute_pool_payoff_verdict(
     origin_breakdown: Dict[str, Any] | None,
@@ -896,6 +977,145 @@ def compute_pool_payoff_verdict(
         POOL_PAYOFF_PROVEN,
         "Keep the pool — it is serving warm starts without regressing cost per "
         "merged PR. Consider widening scope.",
+    )
+
+
+def compute_provider_routing_verdict(
+    by_model_rows: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Synthesize the DeepSeek-vs-Anthropic routing A/B verdict.
+
+    Takes the ``by_model`` rows from :func:`compute_effort_model_efficiency`
+    (each row carries ``provider``, ``model``, ``run_count``,
+    ``pr_eligible_run_count``, ``verified_landed_count``,
+    ``verified_landed_rate``, ``total_cost_usd``, ``cost_per_merge``) and
+    aggregates by provider, then classifies the routing payoff.
+
+    Returns ``{state, supporting, recommended_action}`` where ``state`` is one of
+    the ``PROVIDER_ROUTING_*`` constants and ``supporting`` carries the per-provider
+    numbers the classification was read off.
+
+    Classification (checked in order):
+
+    * ``INSUFFICIENT_DATA`` — fewer than the minimum PR-eligible tasks on either
+      provider side.  Not enough signal to judge; keep measuring.
+    * ``REJECT`` — verified-merge rate on DeepSeek is materially below the
+      Anthropic baseline (rate delta below the quality floor), OR DeepSeek
+      cost-per-merge is not meaningfully cheaper than Anthropic.
+    * ``ADOPT`` — DeepSeek is cheaper AND verified-merge rate is within the
+      quality guardrail.  The routing is paying off.
+    """
+    # -- aggregate by provider ------------------------------------------------
+    _deepseek: Dict[str, Any] = {
+        "run_count": 0,
+        "pr_eligible_run_count": 0,
+        "verified_landed_count": 0,
+        "total_cost_usd": 0.0,
+    }
+    _anthropic: Dict[str, Any] = {
+        "run_count": 0,
+        "pr_eligible_run_count": 0,
+        "verified_landed_count": 0,
+        "total_cost_usd": 0.0,
+    }
+
+    for row in by_model_rows:
+        provider = str(row.get("provider") or "").lower()
+        if provider == "deepseek":
+            b = _deepseek
+        elif provider == "anthropic":
+            b = _anthropic
+        else:
+            continue
+        b["run_count"] += int(row.get("run_count", 0))
+        b["pr_eligible_run_count"] += int(row.get("pr_eligible_run_count", 0))
+        b["verified_landed_count"] += int(row.get("verified_landed_count", 0))
+        b["total_cost_usd"] += float(row.get("total_cost_usd", 0))
+
+    # -- derived metrics ------------------------------------------------------
+    def _cost_per_merge(b: Dict[str, Any]) -> float | None:
+        v = b["verified_landed_count"]
+        return round(b["total_cost_usd"] / v, 6) if v else None
+
+    def _verified_rate(b: Dict[str, Any]) -> float | None:
+        p = b["pr_eligible_run_count"]
+        return round(b["verified_landed_count"] / p, 4) if p else None
+
+    ds_cpm = _cost_per_merge(_deepseek)
+    an_cpm = _cost_per_merge(_anthropic)
+    ds_rate = _verified_rate(_deepseek)
+    an_rate = _verified_rate(_anthropic)
+
+    cost_ratio: float | None = (
+        round(ds_cpm / an_cpm, 4)
+        if (ds_cpm is not None and an_cpm is not None and an_cpm > 0)
+        else None
+    )
+    rate_delta_pct: float | None = (
+        round((ds_rate - an_rate) * 100, 2)
+        if (ds_rate is not None and an_rate is not None)
+        else None
+    )
+
+    supporting: Dict[str, Any] = {
+        "deepseek_run_count": _deepseek["run_count"],
+        "deepseek_pr_eligible_run_count": _deepseek["pr_eligible_run_count"],
+        "deepseek_verified_landed_count": _deepseek["verified_landed_count"],
+        "deepseek_verified_landed_rate": ds_rate,
+        "deepseek_cost_per_merge": ds_cpm,
+        "deepseek_total_cost_usd": round(_deepseek["total_cost_usd"], 6),
+        "anthropic_run_count": _anthropic["run_count"],
+        "anthropic_pr_eligible_run_count": _anthropic["pr_eligible_run_count"],
+        "anthropic_verified_landed_count": _anthropic["verified_landed_count"],
+        "anthropic_verified_landed_rate": an_rate,
+        "anthropic_cost_per_merge": an_cpm,
+        "anthropic_total_cost_usd": round(_anthropic["total_cost_usd"], 6),
+        "cost_ratio": cost_ratio,
+        "verified_rate_delta_pct": rate_delta_pct,
+    }
+
+    def _result(state: str, recommended_action: str) -> Dict[str, Any]:
+        return {
+            "state": state,
+            "supporting": supporting,
+            "recommended_action": recommended_action,
+        }
+
+    # -- classify -------------------------------------------------------------
+    if (
+        _deepseek["pr_eligible_run_count"] < PROVIDER_ROUTING_MIN_PR_ELIGIBLE_TASKS
+        or _anthropic["pr_eligible_run_count"] < PROVIDER_ROUTING_MIN_PR_ELIGIBLE_TASKS
+    ):
+        return _result(
+            PROVIDER_ROUTING_INSUFFICIENT_DATA,
+            "Keep measuring — not enough PR-eligible tasks per provider to judge "
+            "routing payoff.",
+        )
+
+    # Quality regression: DeepSeek verified rate materially below Anthropic.
+    if (
+        rate_delta_pct is not None
+        and rate_delta_pct < PROVIDER_ROUTING_QUALITY_FLOOR_PCT
+    ):
+        return _result(
+            PROVIDER_ROUTING_REJECT,
+            "Reject DeepSeek routing — verified-merge rate regressed materially "
+            "below the Anthropic baseline.",
+        )
+
+    # Cost not meaningfully cheaper.
+    if cost_ratio is None or cost_ratio >= PROVIDER_ROUTING_COST_RATIO_THRESHOLD:
+        return _result(
+            PROVIDER_ROUTING_REJECT,
+            "Reject DeepSeek routing — cost per merge is not meaningfully lower "
+            "than Anthropic.",
+        )
+
+    # Cheaper AND quality held → adopt.
+    return _result(
+        PROVIDER_ROUTING_ADOPT,
+        "Adopt DeepSeek routing for low/medium-effort tasks — cost is lower with "
+        "no quality regression.",
     )
 
 
@@ -2181,6 +2401,93 @@ _TASK_TYPE_FOCUS_CONST_NAMES: tuple[str, ...] = (
 )
 
 
+def _compute_llm_cache_hit_rate(tasks: list[Task]) -> float | None:
+    """LLM prompt cache hit fraction: cache-read input tokens / total input tokens.
+
+    Computed from the same per-attempt token data as
+    :func:`compute_llm_cost_breakdown` so the two stay consistent.
+    Returns ``None`` when there are no input tokens in the window.
+    """
+    total_input = 0
+    total_cache_read = 0
+    for t in tasks:
+        for (
+            _provider,
+            _model,
+            input_tokens,
+            _output_tokens,
+            _call_count,
+            _cache_creation,
+            cache_read,
+        ) in _task_llm_attempts(t):
+            if input_tokens > 0:
+                total_input += int(input_tokens)
+                total_cache_read += int(cache_read)
+    if total_input <= 0:
+        return None
+    return round(total_cache_read / total_input, 4)
+
+
+
+def _compute_total_cost_per_verified_task(tasks: list[Task]) -> float | None:
+    """Total LLM + VM cost / verified merge count (is_verified_merge, rollup parents excluded).
+
+    Mirrors the numerator aggregation of the existing cost axes (VM cost from
+    :func:`get_task_total_vm_cost_usd` + LLM cost from :func:`_task_llm_cost`)
+    but divides by the VERIFIED merge count — the subset of merged completions
+    whose PR was gated by a real CI/test verdict, excluding degraded fall-open
+    merges. Rollup parents are excluded so each rollup counts as N child
+    landings, not N+1.
+
+    Returns None when no verified merges exist in the window.
+    """
+    total_cost = 0.0
+    verified = 0
+    parent_ids = _rollup_parent_ids(tasks)
+    for t in tasks:
+        total_cost += get_task_total_vm_cost_usd(t)
+        llm_cost, _ = _task_llm_cost(t)
+        total_cost += llm_cost
+        if is_verified_merge(t) and t.id not in parent_ids:
+            verified += 1
+    if not verified:
+        return None
+    return round(total_cost / verified, 4)
+
+
+def _compute_verified_merge_count(tasks: list[Task]) -> int:
+    """Return the verified merge count (is_verified_merge, rollup parents excluded).
+
+    Companion to :func:`_compute_total_cost_per_verified_task` — stored alongside
+    the axis value in each snapshot so :func:`read_baseline_with_drift` can
+    suppress drift_pct when the denominator is below
+    :data:`VERIFIED_TASK_DRIFT_MIN_COUNT`.
+    """
+    parent_ids = _rollup_parent_ids(tasks)
+    return sum(
+        1 for t in tasks if is_verified_merge(t) and t.id not in parent_ids
+    )
+
+
+def _compute_rework_cost_share(tasks: list[Task]) -> float | None:
+    """Fraction of total LLM spend consumed by fix/re-attempt (rework) tasks.
+
+    Delegates to :func:`compute_pr_rework_chain_breakdown` for the per-PR
+    first-pass-vs-rework split and returns the aggregate
+    ``rework_share_of_total_llm_cost``. Returns ``None`` when there are no
+    priced tasks in the window (total LLM cost is zero).
+
+    Rework is a direct cost multiplier — high rework means the same PR
+    consumed 2-3x the tokens it should have. Making it driftable lets the
+    direction drift detector catch cost regressions caused by review-loop
+    inflation, which is orthogonal to routing savings.
+    """
+    breakdown = compute_pr_rework_chain_breakdown(tasks)
+    return breakdown.get("rework_share_of_total_llm_cost")
+
+
+
+
 def _compute_prompt_static_bytes() -> int | None:
     """Sum the source character lengths of all static code-change prompt sections.
 
@@ -2251,6 +2558,21 @@ async def compute_current_axes(
     lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
 
+    # Provider routing A/B verdict (direction d-cf39cb40): derive from the
+    # per-model efficiency breakdown so the verdict carries BOTH cost ratio AND
+    # verified-merge-rate delta — the two halves of the A/B guardrail.
+    _effort_model = compute_effort_model_efficiency(tasks)
+    provider_routing_verdict = compute_provider_routing_verdict(_effort_model["by_model"])
+
+    # Propagate verdict state to live routing so the dispatch path reorders
+    # providers without waiting for a config deploy (direction d-cf39cb40).
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        _rc["provider_routing_verdict_state"] = provider_routing_verdict["state"]
+    except Exception:
+        pass
+
     # Deploy-scoped boundary: the earliest snapshot captured under the current
     # serving SHA, so panel_review_effectiveness can be computed for
     # post-deployment traffic only. None when the SHA is unknown or this is the
@@ -2303,10 +2625,16 @@ async def compute_current_axes(
         AXIS_MEDIAN_API_CALLS_PER_TASK: _compute_median_api_calls_per_task(tasks),
         AXIS_MEDIAN_REVIEW_ITERATIONS: _compute_median_review_iterations(tasks),
         AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
+        AXIS_COST_PER_VERIFIED_TASK: _compute_cost_per_verified_task(tasks),
+        AXIS_LLM_COST_PER_VERIFIED_TASK: _compute_llm_cost_per_verified_task(tasks),
         AXIS_LANE_COST_PER_MERGED_PR: _compute_lane_cost_per_merged_pr(lanes),
         AXIS_LANE_WARM_RESUME_RATE: _compute_lane_warm_resume_rate(lanes),
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
         AXIS_PROMPT_STATIC_BYTES: _compute_prompt_static_bytes(),
+        AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
+        AXIS_TOTAL_COST_PER_VERIFIED_TASK: _compute_total_cost_per_verified_task(tasks),
+        "total_cost_per_verified_task_denominator": _compute_verified_merge_count(tasks),
+        AXIS_REWORK_COST_SHARE: _compute_rework_cost_share(tasks),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
@@ -2388,6 +2716,10 @@ async def compute_current_axes(
         "panel_review_recommended_sample_rate": compute_recommended_challenger_sample_rate(
             _peff
         ),
+        # Provider routing A/B verdict (direction d-cf39cb40): DeepSeek vs
+        # Anthropic cost ratio + verified-merge-rate delta, persisted in the
+        # daily snapshot so the A/B is machine-checkable on the deployed instance.
+        "provider_routing_verdict": provider_routing_verdict,
     }
 
 
@@ -3002,6 +3334,14 @@ async def read_baseline_with_drift(
                     break
 
     axes: Dict[str, Dict[str, Any]] = {}
+    # Drift-suppression guard for AXIS_TOTAL_COST_PER_VERIFIED_TASK: when the
+    # verified-merge denominator in the latest snapshot is below the floor, suppress
+    # drift_pct so early low-N windows do not emit noisy drift. Mirrors the
+    # SELF_REPAIR_MIN_ATTEMPTS guard for self_repair_success_rate.
+    _verified_denom = latest.get("total_cost_per_verified_task_denominator", 0)
+    _suppress_verified_drift = (
+        isinstance(_verified_denom, int) and _verified_denom < VERIFIED_TASK_DRIFT_MIN_COUNT
+    )
     for axis in ALL_AXES:
         cur = latest.get(axis)
         base = baseline.get(axis)
@@ -3013,6 +3353,8 @@ async def read_baseline_with_drift(
             or not isinstance(base, (int, float))
             or base == 0
         ):
+            drift_pct = None
+        elif axis == AXIS_TOTAL_COST_PER_VERIFIED_TASK and _suppress_verified_drift:
             drift_pct = None
         else:
             drift_pct = round(((cur - base) / base) * 100.0, 2)
@@ -3296,6 +3638,10 @@ async def read_baseline_with_drift(
         "panel_review_effectiveness_post_deploy": latest.get(
             "panel_review_effectiveness_post_deploy"
         ),
+        # Provider routing A/B verdict (direction d-cf39cb40): DeepSeek-vs-Anthropic
+        # cost ratio + verified-merge-rate delta, persisted in the daily snapshot and
+        # surfaced here from the latest snapshot so the A/B is machine-checkable.
+        "provider_routing_verdict": latest.get("provider_routing_verdict"),
         # Recommended sample_rate for the challenger gate, computed on-the-fly from
         # the latest snapshot's panel_review_effectiveness so operators always see a
         # fresh recommendation without waiting for the next daily snapshot write.

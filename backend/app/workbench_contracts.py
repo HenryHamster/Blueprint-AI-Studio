@@ -188,6 +188,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/hotfix_backmerge.py",
         "backend/app/knowledge_completion.py",
         "backend/app/message_supersession.py",
+        "backend/app/monthly_budget_alerts.py",
         "backend/app/orchestrator.py",
         "backend/app/orchestrator_ci_monitor.py",
         "backend/app/orchestrator_provision.py",

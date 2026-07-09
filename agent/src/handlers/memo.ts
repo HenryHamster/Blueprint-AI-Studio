@@ -28,6 +28,7 @@ import {
   recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess,
   recordFormatRepairMiss,
   type FormatMissReason,
+  buildPromptSizeTelemetry, setPromptSizeTelemetry,
 } from '../telemetry.js';
 import { attemptStructuredRepair } from './structured-repair.js';
 
@@ -259,11 +260,24 @@ Rules:
     return sources;
   };
 
+  const memoFullPrompt = memoPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  const memoTelemetry = buildPromptSizeTelemetry(memoFullPrompt, [
+    ['context_prefix', contextPrefix],
+    ['topic', topicSection],
+    ['reasoning_kind', kindSection],
+    ['direction', directionSection],
+    ['source_task', sourceTaskSection],
+    ['source_finding', sourceFindingSection],
+    ['prompt', promptSection],
+    ['tool_guidance', DEFAULT_TOOL_GUIDANCE],
+  ]);
+  setPromptSizeTelemetry(memoTelemetry.prompt_size_bytes, memoTelemetry.prompt_section_count, memoTelemetry.prompt_section_sizes);
+
   const {
     exitCode, allOutput, lastResultText,
     codexTurnCompleted, stderrTail,
   } = await runClaudeCode(
-    memoPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
+    memoFullPrompt,
     ws, statusRef, model, effort, disallowedTools,
   );
 

@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-009",
+  "name": "Document public API endpoints",
+  "description": "A 'docs' task: add docstrings to all public API endpoint handlers.",
+  "task_type": "docs",
+  "prompt": "Add Google-style docstrings to all public endpoint handler functions in backend/app/routers/. Cover: what the endpoint does, required auth, request body shape, response shape, error codes.",
+  "effort": "low",
+  "source_info": "Pattern from docs tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "code_merge"
+  },
+  "tags": ["docs", "simple", "cost-baseline"]
+}

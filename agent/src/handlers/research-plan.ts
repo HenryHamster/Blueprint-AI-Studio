@@ -50,7 +50,7 @@ import { repairStructuredOutput } from './structured-output-repair.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { resolveMigrationLayout } from './specialized.js';
-import { setPromptSizeTelemetry } from '../telemetry.js';
+import { setPromptSizeTelemetry, buildPromptSizeTelemetry } from '../telemetry.js';
 
 export const PR_INELIGIBLE_TASK_TYPES = [
   'compute_experiment', 'debug', 'design', 'design_doc_update',
@@ -395,17 +395,6 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
 
   if (!line1 && !line2 && !line3 && !line4 && !line5 && !line6 && !line7 && !priorFailuresLine) return '';
   return line1 + line2 + line3 + line4 + line5 + line6 + line7 + priorFailuresLine;
-}
-
-function buildPromptSizeTelemetry(fullPrompt: string, sections: Array<[string, string]>): Record<string, unknown> {
-  const sized = sections
-    .map(([name, text]) => ({ name, bytes: Buffer.byteLength(text, 'utf8') }))
-    .sort((a, b) => b.bytes - a.bytes);
-  return {
-    prompt_size_bytes: Buffer.byteLength(fullPrompt, 'utf8'),
-    prompt_section_count: sized.length,
-    prompt_section_sizes: sized.slice(0, 3),
-  };
 }
 
 /**
@@ -1913,7 +1902,7 @@ ${greenfieldBranch}
 ${planAvailableCapabilitiesSection}Instructions:
 1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.${isGreenfield ? ' (On a greenfield repo there is little to read — lean on the project goal and design-doc specs to decide the foundation.)' : ''}
 2. Decompose into substantial subtasks. Prefer fewer, larger subtasks over many tiny ones. A single subtask that modifies 200+ lines across 5+ files is fine — the implementing agent is capable. Only split when subtasks are genuinely independent or have different risk profiles.
-3. Identify dependencies between subtasks — which must complete before others can start.
+3. Identify dependencies between subtasks — only order true producer→consumer relationships. Minimize unnecessary dependencies so independent subtasks can run in parallel; each dependency you add serializes work that could have been concurrent.
 4. Write clear, self-contained prompts for each subtask. Describe the PROBLEM and desired outcome — do not prescribe exact line numbers. The implementing agent has full repo access and will figure out the details.
 
 Output EXACTLY one JSON block as the VERY LAST thing in your response:
@@ -2001,9 +1990,9 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     ['greenfield', greenfieldBranch],
   ]);
   setPromptSizeTelemetry(
-    planPromptTelemetry.prompt_size_bytes as number,
-    planPromptTelemetry.prompt_section_count as number,
-    planPromptTelemetry.prompt_section_sizes as Array<{ name: string; bytes: number }>,
+    planPromptTelemetry.prompt_size_bytes,
+    planPromptTelemetry.prompt_section_count,
+    planPromptTelemetry.prompt_section_sizes,
   );
   if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
@@ -2724,9 +2713,9 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
     ['anomaly', anomalySection],
   ]);
   setPromptSizeTelemetry(
-    researchPromptTelemetry.prompt_size_bytes as number,
-    researchPromptTelemetry.prompt_section_count as number,
-    researchPromptTelemetry.prompt_section_sizes as Array<{ name: string; bytes: number }>,
+    researchPromptTelemetry.prompt_size_bytes,
+    researchPromptTelemetry.prompt_section_count,
+    researchPromptTelemetry.prompt_section_sizes,
   );
   if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
   statusRef.value = 'Running codebase research...';

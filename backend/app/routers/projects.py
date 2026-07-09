@@ -967,20 +967,37 @@ async def cancel_project(
             ]
         ),
     )
-    active_tasks = (await session.execute(tasks_stmt)).scalars().all()
 
-    vm_ids_to_delete = []
-    for task in active_tasks:
-        task.status = TaskStatus.CANCELLED
-        session.add(task)
-        if task.vm_instance_id:
-            vm_ids_to_delete.append(task.vm_instance_id)
-
-        await broadcast_to_project(
-            str(project_id),
-            "task_updated",
-            {"task_id": str(task.id), "status": TaskStatus.CANCELLED},
+    # Paginated fetch to avoid unbounded in-memory load for projects with
+    # thousands of active tasks.
+    _CANCEL_BATCH_SIZE = 5000
+    active_tasks: list[Task] = []
+    vm_ids_to_delete: list[str] = []
+    _last_seen_id: Optional[int] = None
+    while True:
+        stmt = tasks_stmt
+        if _last_seen_id is not None:
+            stmt = stmt.where(Task.id > _last_seen_id)
+        stmt = stmt.order_by(Task.id).limit(_CANCEL_BATCH_SIZE)
+        _batch = (
+            (await session.execute(stmt))
+            .scalars()
+            .all()
         )
+        if not _batch:
+            break
+        for task in _batch:
+            task.status = TaskStatus.CANCELLED
+            session.add(task)
+            if task.vm_instance_id:
+                vm_ids_to_delete.append(task.vm_instance_id)
+            await broadcast_to_project(
+                str(project_id),
+                "task_updated",
+                {"task_id": str(task.id), "status": TaskStatus.CANCELLED},
+            )
+        _last_seen_id = _batch[-1].id
+        active_tasks.extend(_batch)
 
     await session.commit()
     await broadcast_to_project(

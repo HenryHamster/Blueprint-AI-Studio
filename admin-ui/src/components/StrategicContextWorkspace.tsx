@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from 'react';
+import { useEffect, useMemo, type ReactNode } from 'react';
 import { Activity, ArrowUpRight, CircleAlert, Cpu, GitBranch, Link2, Network, Plus, Server, X } from 'lucide-react';
 import type {
   StrategicContextArtifactEvidence,
@@ -614,65 +614,125 @@ export function StrategicContextWorkspace({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose, open]);
 
-  if (!open) return null;
+  // ── Hooks and memoised derivations (must be before early return for hooks rules) ──
 
   const contextPackage = state?.context_package ?? null;
-  const selectedRefs = workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [];
-  const workSessionDescriptors = state?.work_session?.selected_ref_descriptors ?? [];
-  const descriptorByRef = new Map(workSessionDescriptors.map(descriptor => [contextRefKey(descriptor), descriptor]));
-  const selectedRefDescriptors = selectedRefs.map(ref => descriptorByRef.get(contextRefKey(ref)) ?? fallbackRefDescriptor(ref));
-  const selectedKeys = new Set(selectedRefs.map(contextRefKey));
   const canvas = contextPackage?.canvas ?? null;
-  const nodeLabelById = new Map((canvas?.nodes ?? []).map(node => [node.id, node.label]));
-  const tone = contextStatusTone(contextPackage?.status);
-  const resources = contextPackage?.resources ?? [];
-  const contextMapDescriptor = (contextPackage?.descriptors ?? []).find(descriptor => descriptor.kind === 'context_map') ?? null;
-  const artifactDescriptors = (contextPackage?.descriptors ?? []).filter(descriptor => descriptor.kind !== 'context_map');
-  const nodes = canvas?.nodes ?? [];
-  const edges = canvas?.edges ?? [];
-  const canvasResources = resources.filter(resource => resource.kind === 'canvas');
-  const listedResources = resources.filter(resource => resource.kind !== 'canvas');
-  const syntheticCanvasRef = canvas ? selectedRefFromCanvas(canvas) : null;
-  const canvasResourceRows = canvasResources.length > 0
-    ? canvasResources
-    : syntheticCanvasRef
-      ? [{
-          kind: syntheticCanvasRef.kind,
-          id: syntheticCanvasRef.id,
-          label: syntheticCanvasRef.label ?? 'Strategic context map',
-          summary: canvasSummaryDetail(canvas, nodes.length, edges.length),
-        } satisfies StrategicContextResourceRef]
-      : [];
-  const drilldowns = [...(contextPackage?.drilldowns ?? []), ...(canvas?.drilldowns ?? [])];
-  const knowledgeEvidence = contextPackage?.evidence?.knowledge?.items ?? [];
-  const artifactEvidence = contextPackage?.evidence?.artifacts?.items ?? [];
   const itemCount = contextPackage?.item_count ?? 0;
   const tokenCount = contextPackage?.token_count ?? 0;
-  const packageMeta = [
-    itemCount > 0 ? `${formatCompactNumber(itemCount)} items` : null,
-    tokenCount > 0 ? `${formatCompactNumber(tokenCount)} tokens` : null,
-    contextPackage?.updated_at ? `updated ${contextPackage.updated_at}` : null,
-  ].filter(Boolean).join(' / ');
+  const attentionCounts = state?.attention?.counts ?? null;
   const workSession = state?.work_session ?? null;
+
+  const selectedRefs = useMemo(
+    () => workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [],
+    [workbenchState?.selected_refs, state?.work_session?.selected_refs, state?.workbench?.selected_refs],
+  );
+  const resources = useMemo(
+    () => contextPackage?.resources ?? [],
+    [contextPackage?.resources],
+  );
+
+  const descriptorByRef = useMemo(() => {
+    const descriptors = state?.work_session?.selected_ref_descriptors ?? [];
+    return new Map(descriptors.map(descriptor => [contextRefKey(descriptor), descriptor]));
+  }, [state?.work_session?.selected_ref_descriptors]);
+
+  const selectedRefDescriptors = useMemo(
+    () => selectedRefs.map(ref => descriptorByRef.get(contextRefKey(ref)) ?? fallbackRefDescriptor(ref)),
+    [selectedRefs, descriptorByRef],
+  );
+  const selectedKeys = useMemo(
+    () => new Set(selectedRefs.map(contextRefKey)),
+    [selectedRefs],
+  );
+  const nodeLabelById = useMemo(
+    () => new Map((canvas?.nodes ?? []).map(node => [node.id, node.label])),
+    [canvas?.nodes],
+  );
+  const contextMapDescriptor = useMemo(
+    () => (contextPackage?.descriptors ?? []).find(d => d.kind === 'context_map') ?? null,
+    [contextPackage?.descriptors],
+  );
+  const artifactDescriptors = useMemo(
+    () => (contextPackage?.descriptors ?? []).filter(d => d.kind !== 'context_map'),
+    [contextPackage?.descriptors],
+  );
+  const canvasResources = useMemo(
+    () => resources.filter(r => r.kind === 'canvas'),
+    [resources],
+  );
+  const listedResources = useMemo(
+    () => resources.filter(r => r.kind !== 'canvas'),
+    [resources],
+  );
+  const syntheticCanvasRef = useMemo(
+    () => (canvas ? selectedRefFromCanvas(canvas) : null),
+    [canvas],
+  );
+  const nodes = canvas?.nodes ?? [];
+  const edges = canvas?.edges ?? [];
+  const canvasResourceRows = useMemo(
+    () => (canvasResources.length > 0
+      ? canvasResources
+      : syntheticCanvasRef
+        ? [{
+            kind: syntheticCanvasRef.kind,
+            id: syntheticCanvasRef.id,
+            label: syntheticCanvasRef.label ?? 'Strategic context map',
+            summary: canvasSummaryDetail(canvas, canvas?.nodes?.length ?? 0, canvas?.edges?.length ?? 0),
+          } satisfies StrategicContextResourceRef]
+        : []),
+    [canvasResources, syntheticCanvasRef, canvas],
+  );
+  const drilldowns = useMemo(
+    () => [...(contextPackage?.drilldowns ?? []), ...(canvas?.drilldowns ?? [])],
+    [contextPackage?.drilldowns, canvas?.drilldowns],
+  );
+  const packageMeta = useMemo(
+    () => [
+      itemCount > 0 ? `${formatCompactNumber(itemCount)} items` : null,
+      tokenCount > 0 ? `${formatCompactNumber(tokenCount)} tokens` : null,
+      contextPackage?.updated_at ? `updated ${contextPackage.updated_at}` : null,
+    ].filter(Boolean).join(' / '),
+    [itemCount, tokenCount, contextPackage?.updated_at],
+  );
+  const workSessionActions = useMemo(
+    () => (workSession?.actions ?? []).slice(0, 4),
+    [workSession?.actions],
+  );
+  const workSessionMetrics = useMemo(
+    () => rankStrategicWorkSessionMetrics(workSession?.curated_metrics ?? [], 6),
+    [workSession?.curated_metrics],
+  );
+  const attentionPills = useMemo(
+    () => (attentionCounts
+      ? [
+          { label: 'needs', value: attentionCounts.needs_operator },
+          { label: 'watch', value: attentionCounts.watch },
+          { label: 'unread', value: attentionCounts.unread },
+          { label: 'questions', value: attentionCounts.questions },
+          { label: 'approvals', value: attentionCounts.approvals },
+          { label: 'blocked', value: attentionCounts.blocked_tasks },
+          { label: 'failed', value: attentionCounts.failed_tasks },
+        ].filter(item => item.value > 0).slice(0, 6)
+      : []),
+    [attentionCounts],
+  );
+
+  // Early return when panel is closed
+  if (!open) return null;
+
+  // Non-memoised simple derivations (cheap lookups, single access)
+  const tone = contextStatusTone(contextPackage?.status);
+  const knowledgeEvidence = contextPackage?.evidence?.knowledge?.items ?? [];
+  const artifactEvidence = contextPackage?.evidence?.artifacts?.items ?? [];
   const sessionMode = normalizeStrategicInteractionMode(workbenchState?.interaction_mode ?? workSession?.mode);
   const localRunner = state?.runtime?.local_runner ?? null;
   const runtimeWork = state?.runtime?.work ?? null;
   const localRunnerStatus = localRunner ? localRunnerTone(localRunner) : null;
   const runtimeWorkStatus = runtimeWork ? runtimeWorkTone(runtimeWork) : null;
-  const workSessionActions = (workSession?.actions ?? []).slice(0, 4);
-  const workSessionMetrics = rankStrategicWorkSessionMetrics(workSession?.curated_metrics ?? [], 6);
   const workSessionEvents = workSession?.events?.items ?? [];
   const showDescriptorOnlyContextMap = Boolean(contextMapDescriptor && !canvas);
-  const attentionCounts = state?.attention?.counts ?? null;
-  const attentionPills = attentionCounts ? [
-    { label: 'needs', value: attentionCounts.needs_operator },
-    { label: 'watch', value: attentionCounts.watch },
-    { label: 'unread', value: attentionCounts.unread },
-    { label: 'questions', value: attentionCounts.questions },
-    { label: 'approvals', value: attentionCounts.approvals },
-    { label: 'blocked', value: attentionCounts.blocked_tasks },
-    { label: 'failed', value: attentionCounts.failed_tasks },
-  ].filter(item => item.value > 0).slice(0, 6) : [];
 
   const handleOpenTarget = (
     target?: StrategicContextTarget | null,

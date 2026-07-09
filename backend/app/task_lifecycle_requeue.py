@@ -436,6 +436,39 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     retried_count = 0
     blocked_count = 0  # FAILED children skipped because of BLOCKED_PRECONDITION
 
+    # Batch pre-collect all _debug_fix_spawned_task_id values so the per-child
+    # loop below can use a set lookup instead of issuing N separate SELECT queries
+    # (one per child with a debug-fix marker).
+    _debug_fix_ids = [
+        (child.context or {}).get("_debug_fix_spawned_task_id")
+        for child in children
+    ]
+    _debug_fix_uuids = set()
+    for fid in _debug_fix_ids:
+        if fid:
+            try:
+                _debug_fix_uuids.add(uuid.UUID(fid))
+            except ValueError:
+                pass
+    _active_debug_fix_tasks: set[uuid.UUID] = set()
+    if _debug_fix_uuids:
+        rows = (
+            await session.execute(
+                select(Task.id).where(
+                    Task.id.in_(_debug_fix_uuids),
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                        ]
+                    ),
+                )
+            )
+        ).scalars().all()
+        _active_debug_fix_tasks = set(rows)
+
     for child in children:
         if child.status != TaskStatus.FAILED:
             continue
@@ -474,22 +507,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         if _debug_fix_id:
             try:
                 _debug_fix_uuid = uuid.UUID(_debug_fix_id)
-                _debug_fix_task = (
-                    await session.execute(
-                        select(Task).where(
-                            Task.id == _debug_fix_uuid,
-                            Task.status.in_(
-                                [
-                                    TaskStatus.QUEUED,
-                                    TaskStatus.PROVISIONING,
-                                    TaskStatus.IN_PROGRESS,
-                                    TaskStatus.EVALUATING,
-                                ]
-                            ),
-                        )
-                    )
-                ).scalar_one_or_none()
-                if _debug_fix_task is not None:
+                if _debug_fix_uuid in _active_debug_fix_tasks:
                     logger.info(
                         "[REQUEUE] Skipping clone of child %s — debug-fix task %s already active",
                         str(child.id)[:8],

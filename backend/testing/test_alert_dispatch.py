@@ -683,7 +683,7 @@ async def test_runner_degraded_escalation_cadence_survives_restart(db_session, m
     assert dispatch.call_count == 1
     # Confirm the follow-up page carries the escalation marker.
     _args, _kwargs = dispatch.call_args
-    assert _args[1] == "RUNNER_DEGRADED"
+    assert _args[1] == "RUNNER_DEGRADED_ESCALATED"
     assert _args[2]["escalation"] is True
 
     await db_session.refresh(alert)
@@ -702,6 +702,66 @@ async def test_runner_degraded_escalation_cadence_survives_restart(db_session, m
         dispatched_after_restart == 0
     ), "After restart, cadence should survive — no re-page inside the 4h window"
     assert dispatch.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_degraded_escalation_dispatches_distinct_event_type(db_session, mocker):
+    """The initial degraded alert dispatches RUNNER_DEGRADED, but the escalation
+    re-page sweep dispatches RUNNER_DEGRADED_ESCALATED — a distinct event type
+    matching the RUNNER_OUTAGE_ESCALATED / RUNNER_DEACTIVATED outage-path pattern.
+
+    Operators can distinguish a fresh degradation from a still-degraded re-page
+    and route them to different priority buckets.
+    """
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    dispatch = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+
+    # 1) Initial creation → must dispatch RUNNER_DEGRADED (NOT escalated).
+    dispatch.reset_mock()
+    created = await _maybe_create_runner_degraded_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="runner-degraded-02",
+        consecutive_failures=3,
+        seconds_since_last_success=900,
+    )
+    assert created is True
+    assert dispatch.call_count == 1
+    init_args, _init_kwargs = dispatch.call_args
+    assert init_args[1] == "RUNNER_DEGRADED", (
+        f"initial alert must dispatch RUNNER_DEGRADED, got {init_args[1]}"
+    )
+    assert init_args[2].get("escalation", None) is None
+
+    # 2) Age the alert past the 1h re-page threshold.
+    alerts = await _runner_degraded_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    alert.created_at = _utcnow() - _timedelta(hours=2)
+    db_session.add(alert)
+    await db_session.commit()
+
+    # 3) Escalation sweep → must dispatch RUNNER_DEGRADED_ESCALATED.
+    dispatch.reset_mock()
+    dispatched = await _maybe_escalate_runner_degraded_alerts(db_session)
+    assert dispatched == 1
+    assert dispatch.call_count == 1
+    esc_args, _esc_kwargs = dispatch.call_args
+    assert esc_args[1] == "RUNNER_DEGRADED_ESCALATED", (
+        f"escalation re-page must dispatch RUNNER_DEGRADED_ESCALATED, got {esc_args[1]}"
+    )
+    assert esc_args[2].get("escalation") is True
 
 
 @pytest.mark.asyncio
@@ -848,7 +908,7 @@ async def test_runner_degraded_escalation_via_check_degraded_runners(db_session,
     await _check_degraded_runners(db_session)
     escalation_calls = [
         c for c in dispatch.call_args_list
-        if c.args[1] == "RUNNER_DEGRADED" and c.args[2].get("escalation") is True
+        if c.args[1] == "RUNNER_DEGRADED_ESCALATED" and c.args[2].get("escalation") is True
     ]
     assert escalation_calls, "still-degraded runner should re-page through the sweep"
 

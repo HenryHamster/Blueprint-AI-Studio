@@ -52,6 +52,7 @@ import {
   type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import type { BuildConfig } from '../index.js';
 import {
   buildLensScopedChecklistSection,
@@ -61,7 +62,7 @@ import {
 } from '../prompts/review-prompt.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { downloadViewportShots } from '../utils/viewport-shot-download.js';
-import { recordViewportScreenshotDownload } from '../telemetry.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry, recordViewportScreenshotDownload } from '../telemetry.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
 
 export const PANEL_REVIEW_LENSES = [
@@ -302,6 +303,7 @@ ${viewportScreenshotSection}Rules for your lens pass:
 - Use severities \`critical\`, \`major\`, or \`minor\`.
 - Only include substantiated issues with a concrete description, scoped to your lens.
 - Return \`REQUEST_CHANGES\` only for a blocking defect inside your lens's scope; otherwise \`APPROVE\`.
+- Before finalizing, check that your verdict matches your summary: if your summary describes no blocking defect, your verdict must be \`APPROVE\`, not \`REQUEST_CHANGES\`.
 - Use an empty \`issues\` array when your lens is clean.
 
 ${buildReviewDiffAccessHint(baseBranch)}
@@ -541,7 +543,7 @@ export async function handlePanelReview(
     )
     : '';
   const claudeMd = readClaudeMd();
-  const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
 
   const promptFingerprint = computePromptFingerprint('panel_review', buildConfig);
   setCurrentPromptFingerprint(promptFingerprint);
@@ -642,6 +644,14 @@ export async function handlePanelReview(
       fetchGuidance: panelFetchGuidance,
     });
 
+    const parentPanelTelemetry = buildPromptSizeTelemetry(parentPrompt, [
+      ['claude_md', claudeMdPrefix],
+      ['playbook', playbookSection],
+      ['project_context', projectContextSection],
+      ['core_prompt', parentPrompt],
+    ]);
+    setPromptSizeTelemetry(parentPanelTelemetry.prompt_size_bytes, parentPanelTelemetry.prompt_section_count, parentPanelTelemetry.prompt_section_sizes);
+
     const { exitCode, allOutput, lastResultText } = await runClaudeCode(
       parentPrompt,
       ws,
@@ -720,6 +730,14 @@ export async function handlePanelReview(
         playbookSection,
         claudeMdPrefix,
       });
+
+      const lensTelemetry = buildPromptSizeTelemetry(lensPrompt, [
+        ['claude_md', claudeMdPrefix],
+        ['playbook', playbookSection],
+        ['project_context', projectContextSection],
+        ['core_prompt', lensPrompt],
+      ]);
+      setPromptSizeTelemetry(lensTelemetry.prompt_size_bytes, lensTelemetry.prompt_section_count, lensTelemetry.prompt_section_sizes);
 
       const { exitCode, allOutput, lastResultText } = await runClaudeCode(
         lensPrompt,

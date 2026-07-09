@@ -35,10 +35,12 @@ import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import {
   writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS,
 } from './strategic-helpers.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
 
 // Read the read-only mid-run helper guidance for an audit handler. project_id is
@@ -282,7 +284,7 @@ export async function handleSecurityAudit(
   const contextPrefix = buildContextPrefix(task);
 
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd())
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
 
@@ -294,7 +296,7 @@ export async function handleSecurityAudit(
   const auditScope = strVal(payload.prompt) || strVal(payload.description);
   const auditScopeSection = auditScope ? `Audit focus: ${auditScope}\n\n` : '';
 
-  const securityPrompt = `${codebaseSummary}${secPlaybookSection}${secRetryContext}${contextPrefix}${fileTreeSection}${auditScopeSection}You are a security audit agent. You have full access to this repository. Your job is to analyze the codebase for security vulnerabilities and produce structured findings.
+  const secCorePrompt = `You are a security audit agent. You have full access to this repository. Your job is to analyze the codebase for security vulnerabilities and produce structured findings.
 
 Analyze the codebase for the following vulnerability categories:
 1. OWASP Top 10 vulnerabilities
@@ -335,12 +337,25 @@ Rules:
   const securityPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const secTypeHints = getTaskTypeHints(secBuildConfig);
   const secTypeHint = secTypeHints['security_audit'] ? '\n\n' + secTypeHints['security_audit'] : '';
+  const secParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const secSuffixBlock = secTypeHint + secFirstTaskSection + securityPromptSuffix + secParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${secFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const securityPrompt = `${codebaseSummary}${secPlaybookSection}${secRetryContext}${contextPrefix}${fileTreeSection}${auditScopeSection}${secCorePrompt}${secSuffixBlock}`;
+  const secTelemetry = buildPromptSizeTelemetry(securityPrompt, [
+    ['claude_md', codebaseSummary],
+    ['playbook', secPlaybookSection],
+    ['retry_context', secRetryContext],
+    ['context_prefix', contextPrefix],
+    ['file_tree', fileTreeSection],
+    ['audit_scope', auditScopeSection],
+    ['core_prompt', secCorePrompt],
+    ['suffix', secSuffixBlock],
+  ]);
+  setPromptSizeTelemetry(secTelemetry.prompt_size_bytes, secTelemetry.prompt_section_count, secTelemetry.prompt_section_sizes);
   statusRef.value = 'Running security audit...';
   const secFingerprint = computePromptFingerprint('security_audit', secBuildConfig);
   setCurrentPromptFingerprint(secFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: secFingerprint });
-  const secParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + secParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${secFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt, ws, statusRef, model, effort, disallowedTools);
 
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
@@ -402,7 +417,7 @@ export async function handleSelfAudit(
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const fileTreeSection = buildFileTree(ws);
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const retryContext = buildRetryContext(task);
@@ -438,7 +453,7 @@ export async function handleSelfAudit(
     }
   }
 
-  const selfAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}${driftSection}${focusSection}You are a self-audit agent. You have full read access to this repository. Your job is to score the maturity of one or more systems on four objective signals and output a structured findings report.
+  const selfAuditCorePrompt = `You are a self-audit agent. You have full read access to this repository. Your job is to score the maturity of one or more systems on four objective signals and output a structured findings report.
 
 For each system, score four components (each 0-100, where 100 is healthy and 0 is broken):
 
@@ -492,12 +507,24 @@ Rules:
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const typeHints = getTaskTypeHints(buildConfig);
   const typeHint = typeHints['self_audit'] ? '\n\n' + typeHints['self_audit'] : '';
+  const selfAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const selfAuditSuffixBlock = typeHint + firstTaskSection + promptSuffix + selfAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${selfAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const selfAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}${driftSection}${focusSection}${selfAuditCorePrompt}${selfAuditSuffixBlock}`;
+  const selfAuditTelemetry = buildPromptSizeTelemetry(selfAuditPrompt, [
+    ['claude_md', codebaseSummary],
+    ['playbook', playbookSection],
+    ['retry_context', retryContext],
+    ['context_prefix', contextPrefix],
+    ['file_tree', fileTreeSection],
+    ['core_prompt', selfAuditCorePrompt],
+    ['suffix', selfAuditSuffixBlock],
+  ]);
+  setPromptSizeTelemetry(selfAuditTelemetry.prompt_size_bytes, selfAuditTelemetry.prompt_section_count, selfAuditTelemetry.prompt_section_sizes);
   statusRef.value = 'Running self audit...';
   const selfAuditFingerprint = computePromptFingerprint('self_audit', buildConfig);
   setCurrentPromptFingerprint(selfAuditFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: selfAuditFingerprint });
-  const selfAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + selfAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${selfAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Parse findings: prefer structured file output, then a {findings:[...]} object
   // anywhere in the output, then a bare array of findings (wrapped on our side).
@@ -800,7 +827,7 @@ export async function handleReleaseAudit(
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const fileTreeSection = buildFileTree(ws);
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const retryContext = buildRetryContext(task);
@@ -821,7 +848,7 @@ export async function handleReleaseAudit(
     ? `\n- Authorized migration revision-identity divergences are owned by a separate deterministic gate, NOT the audit. If the diff renumbers or reuses a migration revision id that is an authorized, reconciled divergence, do NOT raise a finding for the revision-identity/renumber itself — the qualifier's migration-identity gate evaluates it and deploy-time reconciliation handles it. You SHOULD still flag genuinely broken migration BODIES (bad DDL, missing/incorrect downgrade, destructive re-apply, data-loss risk) on those same files.`
     : '';
 
-  const releaseAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}You are a release audit agent. You have been cloned onto \`${baseBranch}\` — the last known-good LTS branch — and your job is to review the incoming diff range \`${diffRange}\` against \`${baseBranch}\`'s standards. \`${candidateSha}\` is the PINNED release candidate commit (a snapshot of the integration branch); it has already been fetched into this clone, so the diff range resolves.
+  const releaseAuditCorePrompt = `You are a release audit agent. You have been cloned onto \`${baseBranch}\` — the last known-good LTS branch — and your job is to review the incoming diff range \`${diffRange}\` against \`${baseBranch}\`'s standards. \`${candidateSha}\` is the PINNED release candidate commit (a snapshot of the integration branch); it has already been fetched into this clone, so the diff range resolves.
 
 IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge the incoming changes by \`${baseBranch}\`'s standards, NOT by the new code's standards. This asymmetry is the entire point of the audit.
 
@@ -892,13 +919,25 @@ Rules:
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const typeHints = getTaskTypeHints(buildConfig);
   const typeHint = typeHints['release_audit'] ? '\n\n' + typeHints['release_audit'] : '';
+  const releaseAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const releaseAuditSuffixBlock = typeHint + firstTaskSection + promptSuffix + releaseAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${releaseAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const releaseAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}${releaseAuditCorePrompt}${releaseAuditSuffixBlock}`;
+  const releaseAuditTelemetry = buildPromptSizeTelemetry(releaseAuditPrompt, [
+    ['claude_md', codebaseSummary],
+    ['playbook', playbookSection],
+    ['retry_context', retryContext],
+    ['context_prefix', contextPrefix],
+    ['file_tree', fileTreeSection],
+    ['core_prompt', releaseAuditCorePrompt],
+    ['suffix', releaseAuditSuffixBlock],
+  ]);
+  setPromptSizeTelemetry(releaseAuditTelemetry.prompt_size_bytes, releaseAuditTelemetry.prompt_section_count, releaseAuditTelemetry.prompt_section_sizes);
   statusRef.value = 'Running release audit...';
   const releaseAuditFingerprint = computePromptFingerprint('release_audit', buildConfig);
   setCurrentPromptFingerprint(releaseAuditFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: releaseAuditFingerprint });
-  const releaseAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + releaseAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${releaseAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
+    releaseAuditPrompt,
     ws, statusRef, model, effort, disallowedTools,
   );
 

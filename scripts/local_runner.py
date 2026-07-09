@@ -15,7 +15,10 @@ Optional environment variables:
     BLUEPRINT_RUNNER_MAX_CONCURRENT_COMPUTE_JOBS
                                       Max simultaneous compute jobs (default: 2, floor 1).
                                       Agents and compute have SEPARATE capacity pools.
-    BLUEPRINT_AGENT_BINARY            Path to node agent entry point (auto-detected if absent)
+    BLUEPRINT_AGENT_BINARY            Path to agent entry point (auto-detected if absent).
+                                        When unset, the runner first looks for
+                                        agent/dist/index.js (node) then falls back to
+                                        agent/src/index.ts via tsx.
     BLUEPRINT_AGENT_IMAGE             Prod agent container image (e.g. agent/Dockerfile build).
                                       When set AND docker is usable, read-only agent task
                                       types run in this image (prod-parity, non-root) instead
@@ -362,6 +365,25 @@ def _runner_version() -> str | None:
     return version or None
 
 
+def _describe_sha(version_str: str) -> str | None:
+    """Extract the abbreviated commit SHA from a ``git describe`` output string.
+
+    Parses output like ``v1.2.3-5-g4f5a6b7`` → ``4f5a6b7`` so the runner can
+    compare against the orchestrator's full-SHA ``version_hint``.  Returns
+    ``None`` when no commit SHA is present (e.g. a pure tag like ``v1.2.3``),
+    in which case the caller falls back to a substring comparison.
+    """
+    clean = version_str.replace("-dirty", "")
+    # git describe format: <tag>-<N>-g<abbreviated-sha>
+    if "-g" in clean:
+        return clean.split("-g")[-1]
+    # --always fallback when no tags exist: bare abbreviated SHA
+    if clean and all(c in "0123456789abcdef" for c in clean):
+        return clean
+    # Pure tag — no commit SHA to compare
+    return None
+
+
 def _node_runtime_ok() -> bool:
     """Return True iff ``node --version`` actually runs (binary present + executable).
 
@@ -506,33 +528,60 @@ def _supervise_threads(threads: dict) -> None:
             )
 
 
-def _locate_agent_binary() -> str | None:
-    """Locate the node agent entry point, or return None if it is unavailable.
+def _locate_agent_binary() -> list[str] | None:
+    """Locate the agent entry argv, or return None if it is unavailable.
 
     Non-fatal counterpart to ``_find_agent_binary``.  The runner main loop uses
     this to resolve the agent LAZILY — only when an AGENT task is actually
     claimed — so a compute/GPU-only runner can boot and run compute jobs without
     a built agent.  A missing binary is therefore not an error at startup; it is
     only a problem the moment an agent task needs to run.
+
+    Returns the full argv (``["node", "/path/...js"]`` or
+    ``["/path/tsx", "/path/...ts"]``) so callers can use it directly as the
+    subprocess command.
+
+    Resolution order:
+      1. ``BLUEPRINT_AGENT_BINARY`` env var (an explicit path — run with node).
+      2. ``<script_dir>/../agent/dist/index.js`` — compiled dist artifact.
+      3. ``<cwd>/agent/dist/index.js`` — same, relative to working directory.
+      4. ``<script_dir>/../agent/src/index.ts`` via
+         ``<agent_dir>/node_modules/.bin/tsx`` — tsx-based fallback.
+      5. ``<cwd>/agent/src/index.ts`` via ``tsx`` on PATH — same, cwd-relative.
     """
     explicit = os.environ.get("BLUEPRINT_AGENT_BINARY", "").strip()
     if explicit:
-        return explicit if os.path.isfile(explicit) else None
+        return (
+            ["node", explicit]
+            if os.path.isfile(explicit)
+            else None
+        )
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(script_dir, "..", "agent", "dist", "index.js"),
-        os.path.join(os.getcwd(), "agent", "dist", "index.js"),
-    ]
-    for path in candidates:
-        normalized = os.path.normpath(path)
-        if os.path.isfile(normalized):
-            return normalized
+
+    # Check for compiled dist/index.js first (node, fast).
+    for base in [os.path.join(script_dir, ".."), os.getcwd()]:
+        dist_path = os.path.normpath(os.path.join(base, "agent", "dist", "index.js"))
+        if os.path.isfile(dist_path):
+            return ["node", dist_path]
+
+    # tsx fallback: resolve tsx from agent/node_modules/.bin/tsx, or rely on PATH.
+    for base in [os.path.join(script_dir, ".."), os.getcwd()]:
+        agent_dir = os.path.normpath(os.path.join(base, "agent"))
+        entry_ts = os.path.join(agent_dir, "src", "index.ts")
+        if not os.path.isfile(entry_ts):
+            continue
+        tsx_candidate = os.path.join(agent_dir, "node_modules", ".bin", "tsx")
+        if os.path.isfile(tsx_candidate):
+            return [tsx_candidate, entry_ts]
+        # Fallback: hope tsx is on PATH.
+        return ["tsx", entry_ts]
+
     return None
 
 
-def _find_agent_binary() -> str:
-    """Resolve the agent entry point or exit(1) (strict, hard-fail variant).
+def _find_agent_binary() -> list[str]:
+    """Resolve the agent entry argv or exit(1) (strict, hard-fail variant).
 
     Retained for callers/tests that require a hard failure when the binary is
     absent.  The runner main loop no longer calls this at startup — it resolves
@@ -549,9 +598,11 @@ def _find_agent_binary() -> str:
         sys.exit(1)
 
     print(
-        "ERROR: could not find agent/dist/index.js. "
-        "Build the agent first (cd agent && npm run build) "
-        "or set BLUEPRINT_AGENT_BINARY to its path.",
+        "ERROR: could not locate the agent entry point. "
+        "If a compiled dist/index.js exists, it will be used with node. "
+        "Otherwise the runner looks for agent/src/index.ts and runs it via tsx "
+        "(from agent/node_modules/.bin/tsx or PATH). "
+        "Set BLUEPRINT_AGENT_BINARY to the entry point path to override auto-detection.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -1114,10 +1165,26 @@ def _heartbeat_loop(
                 "gpu_utilization_pct": _gpu_utilization_pct() if has_gpu else None,
                 **gpu_capabilities,
             }
-            status, _ = _post(url, token, body)
+            status, resp_body = _post(url, token, body)
             if status in (200, 204):
                 consecutive_401 = 0
                 consecutive_network_failures = 0
+                # Parse orchestrator version hint so the runner can detect staleness.
+                if isinstance(resp_body, dict):
+                    version_hint = resp_body.get("version_hint")
+                    if version_hint and version:
+                        runner_sha = _describe_sha(version)
+                        if runner_sha:
+                            stale = not version_hint.startswith(runner_sha)
+                        else:
+                            stale = version_hint not in version
+                        if stale:
+                            print(
+                                f"[runner] WARNING: runner version {version!r} does not match "
+                                f"orchestrator version hint {version_hint!r} — consider running "
+                                "`blueprint-runner update` to update the agent.",
+                                flush=True,
+                            )
                 _write_status_json(
                     runner_id=hostname,
                     last_heartbeat_status="ok",
@@ -2183,10 +2250,44 @@ def _compute_backend_summary(caps: "iso.Capabilities") -> str:
     return ", ".join(parts) if parts else "none"
 
 
+# Provider credential env keys checked in --check preflight.
+# The agent task needs at least one provider credential to call an LLM. A green
+# --check with none set means every claimed agent task will immediately fail at
+# PRE_CLAIM_FAILED (no LLM provider to call). This is surfaced as a non-blocking
+# warning — the operator may add credentials after --check or use a provider path
+# not captured here.
+_PROVIDER_CREDENTIAL_KEYS: tuple[str, ...] = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ZAI_API_KEY",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+)
+
+
+def _check_provider_credentials() -> list[str]:
+    """Return env-var names of provider credentials that are set (non-empty value).
+
+    An agent task needs at least one provider credential to call an LLM. When none
+    are found the --check preflight warns so the operator catches the misconfiguration
+    before dispatching work.
+    """
+    found: list[str] = []
+    for key in _PROVIDER_CREDENTIAL_KEYS:
+        if os.environ.get(key, "").strip():
+            found.append(key)
+    return found
+
+
 def _preflight(
     orchestrator_url: str,
     token: str,
-    agent_binary: str | None,
+    agent_binary: list[str] | None,
     caps: "iso.Capabilities",
     gpu_state: dict,
     max_concurrent: int,
@@ -2339,6 +2440,19 @@ def _preflight(
     for note in caps.notes:
         print(f"    note         : {note}", flush=True)
 
+    # Provider credential check (non-blocking warning).
+    provider_creds = _check_provider_credentials()
+    if provider_creds:
+        _fmt("provider creds", f"present ({len(provider_creds)} key(s))")
+    else:
+        print(
+            "  provider creds  : NONE — agent tasks WILL fail at claim unless a\n"
+            "                    provider credential (ANTHROPIC_API_KEY,\n"
+            "                    OPENAI_API_KEY, GEMINI_API_KEY, etc.) is set\n"
+            "                    in the environment.",
+            flush=True,
+        )
+
     print("  task classes:", flush=True)
     if claimable[iso.CLASS_AGENT]:
         if caps.bwrap_ok:
@@ -2390,12 +2504,14 @@ def _spawn_agent_task(
     orchestrator_url: str,
     workspace: str,
     caps: "iso.Capabilities",
-    agent_binary: str | None,
+    agent_binary: list[str] | None,
     agent_image: str | None,
     active_tasks: dict,
     agent_started_at: dict,
     agent_teardown: dict,
     lock: threading.Lock,
+    llm_env: dict[str, str] | None = None,
+    llm_files: list[dict[str, str]] | None = None,
 ) -> bool:
     """Plan (fail-closed) + spawn one claimed agent task; record it for reaping.
 
@@ -2427,8 +2543,9 @@ def _spawn_agent_task(
     if backend != iso.BACKEND_DOCKER and not agent_binary:
         print(
             f"[runner] agent binary unavailable — cannot run agent task {task_id}; "
-            "skipping (build it with `cd agent && npm run build` or set "
-            "BLUEPRINT_AGENT_BINARY). Compute jobs are unaffected.",
+            "skipping (run `cd agent && npm install` so tsx can start "
+            "agent/src/index.ts, or set BLUEPRINT_AGENT_BINARY to override "
+            "auto-detection). Compute jobs are unaffected.",
             flush=True,
         )
         return False
@@ -2437,19 +2554,51 @@ def _spawn_agent_task(
     # bwrap-eligible task on a docker+image box still takes the bwrap path.
     plan_image = agent_image if backend == iso.BACKEND_DOCKER else None
 
+    # Write backend-supplied credential files into the agent's home / sandbox.
+    # The LLM provider CLI (Claude, Codex, Gemini) reads config files from
+    # well-known paths (e.g. ~/.claude.json); the runner materializes them here
+    # per-task so the agent finds exactly the credential the pool assigned.
+    if llm_files:
+        for f in llm_files:
+            try:
+                fpath = f["path"]
+                fcontent = f["content"]
+                fmode = f.get("mode", "0600")
+                parent = os.path.dirname(fpath)
+                os.makedirs(parent, exist_ok=True)
+                with open(fpath, "w") as fh:
+                    fh.write(fcontent)
+                # Parse octal mode string to int and apply.
+                try:
+                    mode_bits = int(fmode, 8)
+                    os.chmod(fpath, mode_bits)
+                except (ValueError, TypeError):
+                    os.chmod(fpath, 0o600)
+            except Exception as exc:
+                print(
+                    f"[runner] warning: failed to write credential file "
+                    f"{f.get('path', '?')} for task {task_id}: {exc}",
+                    flush=True,
+                )
+
     # Build the FAIL-CLOSED sandbox plan. The env is assembled from an explicit
     # allowlist (never os.environ.copy) and NEVER carries BLUEPRINT_RUNNER_TOKEN /
-    # BLUEPRINT_ORCHESTRATOR_URL into the task.
+    # BLUEPRINT_ORCHESTRATOR_URL into the task.  The backend-assigned pooled LLM
+    # credentials flow through injected_env so they reach the agent without the
+    # runner needing its own static LLM credentials.
+    injected_env = {
+        "AGENT_SECRET_TOKEN": agent_token,
+        "ORCHESTRATOR_URL": orchestrator_url,
+        "TASK_ID": task_id,
+        "VM_INSTANCE_ID": vm_instance_id,
+    }
+    if llm_env:
+        injected_env.update(llm_env)
     plan = iso.plan_agent_execution(
         caps=caps,
         agent_binary=agent_binary,
         workspace_host=workspace,
-        injected_env={
-            "AGENT_SECRET_TOKEN": agent_token,
-            "ORCHESTRATOR_URL": orchestrator_url,
-            "TASK_ID": task_id,
-            "VM_INSTANCE_ID": vm_instance_id,
-        },
+        injected_env=injected_env,
         source_env=dict(os.environ),
         task_type=task_type,
         agent_image=plan_image,
@@ -2855,6 +3004,8 @@ def main() -> None:
             agent_token = body.get("agent_token", "")
             task_type = body.get("task_type", "unknown")
             vm_instance_id = body.get("vm_instance_id") or "runner:local"
+            llm_env = body.get("llm_env") or {}
+            llm_files = body.get("llm_files") or []
 
             with lock:
                 already_active = task_id in active_tasks
@@ -2893,6 +3044,8 @@ def main() -> None:
                 agent_started_at=agent_started_at,
                 agent_teardown=agent_teardown,
                 lock=lock,
+                llm_env=llm_env,
+                llm_files=llm_files,
             )
             if not spawned:
                 # DECLINE / spawn failure — the reaper never sees this task, so the

@@ -2706,25 +2706,34 @@ def test_apply_agent_update_lifecycle_runs_before_gc_backstop():
     """Lifecycle archival lands in archived_gaps and is NOT then rolled off by
     the gc backstop: with archived_gaps well under the 200-item cap, a
     lifecycle-archived gap remains re-fetchable in the durable model."""
-    from app.problem_model import apply_agent_update
+    from app.problem_model import (
+        MODEL_SIZE_HEALTHY_GAPS,
+        apply_agent_update,
+    )
 
-    gaps = [
-        {
-            "id": "g-aged",
-            "name": "aged",
-            "status": "active",
-            "deferral": {"rationale": "old", "hold_until": "2026-01-01T00:00:00"},
-        }
+    # One aged-deferred gap plus enough active healthy gaps to exceed the count
+    # threshold so the lifecycle pass triggers.
+    aged = {
+        "id": "g-aged",
+        "name": "aged",
+        "status": "active",
+        "deferral": {"rationale": "old", "hold_until": "2026-01-01T00:00:00"},
+    }
+    healthy_gaps = [
+        {"id": f"g-h-{i}", "name": f"healthy {i}", "status": "active"}
+        for i in range(MODEL_SIZE_HEALTHY_GAPS)
     ]
     current = {
         "revision": 5,
-        "gaps": gaps,
+        "gaps": [aged] + healthy_gaps,
         "archived_gaps": [
             {"id": "g-prior", "name": "prior", "status": "closed",
              "closed": "2026-02-01T00:00:00"}
         ],
     }
-    new_raw, diff = apply_agent_update(current, {"gaps": gaps}, _LB_NOW)
+    new_raw, diff = apply_agent_update(
+        current, {"gaps": [aged] + healthy_gaps}, _LB_NOW
+    )
 
     assert diff["gaps_lifecycle_archived"] == ["g-aged"]
     # No gc eviction (well under the cap) — both the prior and the newly

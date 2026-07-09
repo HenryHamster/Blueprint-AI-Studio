@@ -1,6 +1,7 @@
 import fs from 'fs';
 import type WebSocket from 'ws';
 import { sendLog, runClaudeCode, git, apiPost } from '../index.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import type { BuildConfig } from '../index.js';
 
 // ── Fresh-reviewer constants ──────────────────────────────────────────────────
@@ -389,17 +390,14 @@ export async function runFreshReviewerPass(
   const diffSnippet = diff.length > MAX_DIFF ? diff.slice(0, MAX_DIFF) + '\n...[truncated]' : diff;
   const calibrationSection = formatFreshReviewerCalibrationSection(projectContext);
   const viewportSection = buildViewportSection(taskId);
-  const prompt = `You are reviewing a PR for a colleague. The author thinks it is done. Find what they missed.
-
-Task: ${taskTitle}
+  const taskInfo = `Task: ${taskTitle}
 Description: ${taskDescription.slice(0, 800)}
-Declared scope: ${relatedFiles.join(', ') || 'unspecified'}
+Declared scope: ${relatedFiles.join(', ') || 'unspecified'}`;
 
-${calibrationSection}Diff:
-${diffSnippet}
-${viewportSection}
+  const diffBlock = `${calibrationSection}Diff:
+${diffSnippet}`;
 
-Check specifically for:
+  const checklistBlock = `Check specifically for:
 - regression_risk: removed exports, changed defaults, removed null guards, broken contracts
 - scope-drift: any modified file outside the Declared scope set above is off-scope, UNLESS it is an incidental allowlisted file — lockfiles (package-lock.json, poetry.lock, Cargo.lock, go.sum, yarn.lock, pnpm-lock.yaml), build-generated outputs, .gitignore, or a sibling test file mirroring a declared source file (e.g. foo.test.ts next to foo.ts, test_foo.py next to foo.py). Flag every off-scope file by path under scope-drift.
 - correctness: logic bugs, off-by-one errors, race conditions, edge cases
@@ -408,19 +406,46 @@ Check specifically for:
 - type-safety: unsafe casts, any-typed externals, missing null guards in TypeScript
 - architecture: boundary violations, coupling regressions, abstraction leaks
 - test-coverage: new behavior without tests, untested edge cases or error paths
-- test_assertion_quality: for each test added or modified, does the assertion verify the specific behavior changed (a particular output value, side-effect, error type/message), or is it smoke-only ("returns something", "no exception", truthiness)? Flag tests that mock the unit under test so thoroughly that the changed logic is effectively unverified.
+- test_assertion_quality: for each test added or modified, does the assertion verify the specific behavior changed (a particular output value, side-effect, error type/message), or is it smoke-only ("returns something", "no exception", truthiness)? Flag tests that mock the unit under test so thoroughly that the changed logic is effectively unverified.`;
 
-Also enumerate edge cases YOU spot from a fresh read of the diff. Use the SAME shape the
+  const edgesBlock = `Also enumerate edge cases YOU spot from a fresh read of the diff. Use the SAME shape the
 implementing author uses for their \`edges_considered\` field — \`{case, handled, evidence?, blind_spot?}\`.
 List cases the author may have missed entirely, cases the author marked handled where you
 disagree (set \`handled: false\` and explain in \`blind_spot\`), and any additional unhandled
-cases. Cite file + line in \`evidence\` when claiming an edge is handled.
+cases. Cite file + line in \`evidence\` when claiming an edge is handled.`;
 
-Output ONLY a JSON object:
+  const outputFormatBlock = `Output ONLY a JSON object:
 {"reviewer_findings": [{"category": "<id>", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "description": "..."}],
  "reviewer_edges_considered": [{"case": "...", "handled": true|false, "evidence": "...", "blind_spot": "..."}]}
 Category IDs: correctness, error-handling, security, type-safety, scope-drift, regression_risk, architecture, test-coverage, test_assertion_quality
 If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
+
+  const prompt = `You are reviewing a PR for a colleague. The author thinks it is done. Find what they missed.
+
+${taskInfo}
+
+${diffBlock}
+${viewportSection}
+
+${checklistBlock}
+
+${edgesBlock}
+
+${outputFormatBlock}`;
+
+  const reviewTelemetry = buildPromptSizeTelemetry(prompt, [
+    ['task_info', taskInfo],
+    ['diff', diffBlock],
+    ['viewport', viewportSection],
+    ['checklist', checklistBlock],
+    ['edges_guidance', edgesBlock],
+    ['output_format', outputFormatBlock],
+  ]);
+  setPromptSizeTelemetry(
+    reviewTelemetry.prompt_size_bytes,
+    reviewTelemetry.prompt_section_count,
+    reviewTelemetry.prompt_section_sizes,
+  );
 
   const changedFiles = extractChangedFilesFromDiff(diff);
   const effort = pickFreshReviewerEffort({

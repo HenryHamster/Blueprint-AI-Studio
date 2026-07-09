@@ -29,10 +29,14 @@ import {
   writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, buildRetryContext, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
   computePromptFingerprint,
 } from '../prompt.js';
+import {
+  buildPromptSizeTelemetry, setPromptSizeTelemetry,
+} from '../telemetry.js';
 import { parseBackendTimestamp } from '../utils/time.js';
 import {
   writeFetchHelper, buildFetchGuidance, DESIGN_DOC_FETCH_VERBS,
 } from './strategic-helpers.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 
 // ── Handler: Design Doc Update (Phase 1 of strategic cycle) ──
 // Analyzes codebase architecture and incrementally updates the design doc
@@ -58,7 +62,7 @@ export async function handleDesignDocUpdate(
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd())
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
   const fileTreeSection = buildFileTree(ws);
@@ -240,8 +244,24 @@ Skip full re-analysis of systems with no files in the manifest.
   const promptFingerprint = computePromptFingerprint('design_doc_update');
   setCurrentPromptFingerprint(promptFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
+  const fullPrompt = prompt + designDocFirstTaskSection + `\n\n${PLAYBOOK_GUIDANCE}\n\n${designDocFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const ddTelemetry = buildPromptSizeTelemetry(fullPrompt, [
+    ['context_prefix', contextPrefix],
+    ['retry_context', designDocRetryContext],
+    ['existing_pages', existingPagesText],
+    ['vision', visionSection],
+    ['open_messages', openMessagesText],
+    ['shipped_changes', shippedManifestSection],
+    ['codebase_summary', codebaseSummary],
+    ['file_tree', fileTreeSection],
+    ['first_task', designDocFirstTaskSection],
+    ['playbook', PLAYBOOK_GUIDANCE],
+    ['fetch_guidance', designDocFetchGuidance],
+    ['tool_guidance', DEFAULT_TOOL_GUIDANCE],
+  ]);
+  setPromptSizeTelemetry(ddTelemetry.prompt_size_bytes, ddTelemetry.prompt_section_count, ddTelemetry.prompt_section_sizes);
   let { exitCode } = await runClaudeCode(
-    prompt + designDocFirstTaskSection + `\n\n${PLAYBOOK_GUIDANCE}\n\n${designDocFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
+    fullPrompt,
     ws, statusRef, model, effort, disallowedTools,
   );
 
@@ -257,12 +277,17 @@ Skip full re-analysis of systems with no files in the manifest.
       const pageCount = Object.keys(doc).filter(k => !k.startsWith('_')).length;
       if (exitCode === 0 && pageCount === 0) {
         sendLog(ws, '\n[WARNING] Architecture review completed but no ./design-doc calls were made. Retrying...\n');
-        const retryResult = await runClaudeCode(
-          'You completed your analysis but did NOT call ./design-doc to save any pages. Your text was discarded.\n\n' +
+        const retryPrompt = 'You completed your analysis but did NOT call ./design-doc to save any pages. Your text was discarded.\n\n' +
           'You MUST call ./design-doc set now to save your findings.\n' +
           'The ./design-doc command is a bash script in the current directory. Run it via Bash.\n' +
           'Start with: ./design-doc set "summary" \'"Your project summary"\'\n' +
-          'Then save systems, capabilities, and risks.',
+          'Then save systems, capabilities, and risks.';
+        const retryTelemetry = buildPromptSizeTelemetry(retryPrompt, [
+          ['retry_body', retryPrompt],
+        ]);
+        setPromptSizeTelemetry(retryTelemetry.prompt_size_bytes, retryTelemetry.prompt_section_count, retryTelemetry.prompt_section_sizes);
+        const retryResult = await runClaudeCode(
+          retryPrompt,
           ws, statusRef, model, effort, disallowedTools
         );
         exitCode = retryResult.exitCode;

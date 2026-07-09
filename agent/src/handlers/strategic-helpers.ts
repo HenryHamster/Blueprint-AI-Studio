@@ -4,7 +4,7 @@ import type WebSocket from 'ws';
 import { excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
 import { extractJsonObject } from '../json-extract.js';
 import { VmConfigMissingError } from '../providers/runners.js';
-import { agentTokenShellFn } from '../token-file.js';
+import { agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
 import { cliOps } from './strategic-ops-registry.js';
 
 // Strategic shell-helper generators
@@ -25,7 +25,9 @@ const SPECIAL_CLI_CASE_BODIES: Record<string, string> = {
     # the file contents as {markdown: "..."} before the usual body build.
     FILE="$DATA"
     [ -f "$FILE" ] || { echo "[ERROR] set-running-update: file not found: $FILE" >&2; exit 1; }
-    DATA=$(jq -Rs '{markdown: .}' < "$FILE")
+    # Portable JSON encoding via python3 (preferred) or node — no jq dependency.
+    # Read the file's raw text and wrap as {"markdown": "..."} for the API.
+    DATA=$(printf '{"markdown":%s}' "$(_json_str "$(cat "$FILE")")")
     _call "set_running_update"
     ;;`,
 };
@@ -58,6 +60,7 @@ OP="\${1:?Usage: strategic ${usageAliases} <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
+${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
 DATA="$1"

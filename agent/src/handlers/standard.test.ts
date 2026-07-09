@@ -111,7 +111,13 @@ vi.mock('../prompt.js', async (importOriginal) => {
     writeViewportLiveHelper: vi.fn(),
     writeCodeChangeHelpers: vi.fn(),
     formatPlaybook: vi.fn().mockReturnValue(''),
-    buildRetryContext: vi.fn().mockReturnValue(''),
+    buildRetryContext: vi.fn().mockImplementation((task: Record<string, unknown>) => {
+      const ctx = (task.context || {}) as Record<string, unknown>;
+      const attemptNumber = ctx._attempt_number;
+      return typeof attemptNumber === 'number' && attemptNumber > 1
+        ? 'mock retry context for testing'
+        : '';
+    }),
     buildRepoMap: vi.fn().mockReturnValue(''),
     buildAnalysisPrompt: vi.fn().mockReturnValue('analysis-prompt'),
     parseAnalysisPlanFiles: vi.fn().mockReturnValue([]),
@@ -207,8 +213,9 @@ vi.mock('ws', () => ({
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance } from './standard.js';
 import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner } from '../index.js';
+import { resetLlmTelemetry, getLlmTelemetry, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
-import { extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
+import { readClaudeMd, extractModuleInterfaces, discoverRelatedTests, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt, buildRepoMap } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
 import { writeFetchHelper, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { expectCalledWith, expectNotCalledWith } from '../utils/typed-mock-call.js';
@@ -552,6 +559,46 @@ describe('viewport infra skip guidance in prompt', () => {
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const prompt = capturedPrompt();
     expect(prompt).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
+  });
+});
+
+// ── ClaudeMd guard: anthropic provider auto-injects CLAUDE.md ─────────────────
+describe('claudeMd guard with providerAutoInjectsClaudeMd', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(readClaudeMd).mockReturnValue('Mock CLAUDE.md instructions for testing');
+  });
+
+  it('handleCreate omits ## Codebase Instructions when provider auto-injects ClaudeMd', async () => {
+    const task = { title: 'Task', description: '' };
+    const payload = {
+      prompt: 'Do something',
+      acceptance_evidence: {
+        kind: 'named_test',
+        test_path: 'agent/src/handlers/standard.test.ts',
+      },
+    };
+    await handleCreate(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    // Anthropic provider (default) auto-injects full CLAUDE.md as system prompt,
+    // so the truncated user-message copy should be absent.
+    expect(prompt).not.toContain('## Codebase Instructions');
+    expect(prompt).toContain('## Acceptance Evidence');
+  });
+
+  it('handleRefactor omits ## Codebase Instructions when provider auto-injects ClaudeMd', async () => {
+    const task = { title: 'Refactor task', description: '' };
+    const payload = {
+      prompt: 'Improve it',
+      acceptance_evidence: {
+        kind: 'named_test',
+        test_path: 'agent/src/handlers/standard.test.ts',
+      },
+    };
+    await handleRefactor(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).not.toContain('## Codebase Instructions');
+    expect(prompt).toContain('## Acceptance Evidence');
   });
 });
 
@@ -3159,9 +3206,19 @@ describe('code-change handler structural prompt invariants', () => {
     expect(p).toContain('./playbook set');                                // PLAYBOOK_GUIDANCE
     expect(p).toContain('Read The Failure Message Literally');            // READ_THE_FAILURE_MESSAGE
     expect(p).toContain('Size Guardrails Are Advisory');                  // SIZE_GUARDRAIL_GUIDANCE
-    expect(p).toContain("If You're Retrying");                           // PRIOR_ATTEMPT_DIVERGENCE
+    expect(p).not.toContain("If You're Retrying");                       // PRIOR_ATTEMPT_DIVERGENCE omitted on first attempt
     expect(p).toContain('When You Find Bigger Problems Than Your Task');  // BEYOND_SCOPE_REPORTING
     expect(p).toContain('Use Grep/Glob for code search');                // DEFAULT_TOOL_GUIDANCE
+  });
+
+  it('handleCreate prompt includes PRIOR_ATTEMPT_DIVERGENCE on retry', async () => {
+    const RETRY_TASK = {
+      ...TASK,
+      context: { _attempt_number: 2, _max_attempts: 3, _previous_error: 'test error' },
+    };
+    await handleCreate(TASK_ID, PAYLOAD, RETRY_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    expect(p).toContain("If You're Retrying");                           // PRIOR_ATTEMPT_DIVERGENCE included on retry
   });
 
   it('handleRefactor prompt includes required code-change guidance blocks', async () => {
@@ -4858,5 +4915,116 @@ describe('resolveVisualAcceptance', () => {
   it('returns undefined when acceptance_evidence is a string (not an object)', () => {
     const payload = { acceptance_evidence: 'visual' };
     expect(resolveVisualAcceptance(payload, {})).toBeUndefined();
+  });
+});
+
+describe('prompt size telemetry', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetLlmTelemetry();
+  });
+
+  it('records prompt size telemetry in the standard handler', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const telemetry = getLlmTelemetry();
+
+    // prompt_size_bytes must be the real assembled-prompt byte length — positive
+    expect(telemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_sizes).not.toBeNull();
+    // 'prompt_body' must NOT appear as a section (the whole prompt is not a component of itself)
+    expect((telemetry.prompt_section_sizes ?? []).map(s => s.name)).not.toContain('prompt_body');
+    // Component sections summed must not exceed the total (no double-counting)
+    const sectionSum = (telemetry.prompt_section_sizes ?? []).reduce((s, e) => s + e.bytes, 0);
+    expect(sectionSum).toBeLessThanOrEqual(telemetry.prompt_size_bytes ?? 0);
+    // Top 3 sections should have named entries with positive byte counts
+    expect((telemetry.prompt_section_sizes ?? []).length).toBeGreaterThan(0);
+    for (const s of (telemetry.prompt_section_sizes ?? [])) {
+      expect(s.bytes).toBeGreaterThan(0);
+      expect(typeof s.name).toBe('string');
+    }
+  });
+
+  it('buildPromptSizeTelemetry sorts sections descending and caps at 10', () => {
+    // 12 sections — only the top 10 by size should survive the cap
+    const sections: Array<[string, string]> = [
+      ['s1', 'x'.repeat(200)],
+      ['s2', 'x'.repeat(180)],
+      ['s3', 'x'.repeat(160)],
+      ['s4', 'x'.repeat(140)],
+      ['s5', 'x'.repeat(120)],
+      ['s6', 'x'.repeat(100)],
+      ['s7', 'x'.repeat(80)],
+      ['s8', 'x'.repeat(60)],
+      ['s9', 'x'.repeat(40)],
+      ['s10', 'x'.repeat(20)],
+      ['s11', 'x'.repeat(10)],  // smallest, should be dropped
+      ['s12', 'x'.repeat(5)],   // smallest, should be dropped
+    ];
+    const prompt = sections.map(([, text]) => text).join('\n');
+    const result = buildPromptSizeTelemetry(prompt, sections);
+    expect(result.prompt_size_bytes).toBe(Buffer.byteLength(prompt, 'utf8'));
+    expect(result.prompt_section_count).toBe(12);
+    expect(result.prompt_section_sizes).toHaveLength(10);
+    // Sorted descending: s1 (largest) .. s10
+    expect(result.prompt_section_sizes[0].name).toBe('s1');
+    expect(result.prompt_section_sizes[9].name).toBe('s10');
+    // Every entry has bytes >= the next
+    for (let i = 0; i < result.prompt_section_sizes.length - 1; i++) {
+      expect(result.prompt_section_sizes[i].bytes)
+        .toBeGreaterThanOrEqual(result.prompt_section_sizes[i + 1].bytes);
+    }
+    // The dropped sections (s11, s12) must NOT be in the result
+    const names = result.prompt_section_sizes.map((s: { name: string; bytes: number }) => s.name);
+    expect(names).not.toContain('s11');
+    expect(names).not.toContain('s12');
+  });
+
+  it('setPromptSizeTelemetry persists sections into getLlmTelemetry', () => {
+    resetLlmTelemetry();
+    setPromptSizeTelemetry(500, 3, [
+      { name: 'core', bytes: 200 },
+      { name: 'claude_md', bytes: 150 },
+      { name: 'guidance', bytes: 100 },
+    ]);
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.prompt_size_bytes).toBe(500);
+    expect(telemetry.prompt_section_count).toBe(3);
+    expect(telemetry.prompt_section_sizes).toEqual([
+      { name: 'core', bytes: 200 },
+      { name: 'claude_md', bytes: 150 },
+      { name: 'guidance', bytes: 100 },
+    ]);
+  });
+
+  it('runCodeChangeTask does not set telemetry — callers set richer per-section decompositions', async () => {
+    // runCodeChangeTask no longer calls setPromptSizeTelemetry. The comment at
+    // code-change.ts:9-11 explains that callers (standard.ts, review-fix.ts,
+    // specialized.ts) set richer per-section decompositions before invoking
+    // runCodeChangeTask.  This test confirms runCodeChangeTask does NOT
+    // overwrite caller-set telemetry.
+    const real = await vi.importActual<typeof import('./code-change.js')>('./code-change.js');
+    const realRunCodeChangeTask = real.runCodeChangeTask;
+
+    await realRunCodeChangeTask({
+      taskId: 'test-telemetry-cc',
+      prompt: 'Test code-change prompt for telemetry verification',
+      ws: null,
+      statusRef: { value: '' },
+      workBranch: 'task-cc-telemetry',
+      baseBranch: 'main',
+      owner: 'owner',
+      repo: 'repo',
+      testsOnMainBranch: false,
+      baseCommit: 'abc123',
+    });
+
+    // Telemetry should remain in its reset state — runCodeChangeTask
+    // no longer owns prompt-size reporting; callers do.
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.prompt_size_bytes).toBeNull();
+    expect(telemetry.prompt_section_count).toBeNull();
+    expect(telemetry.prompt_section_sizes).toBeNull();
   });
 });

@@ -58,7 +58,7 @@ variable "billing_account_id" {
 }
 
 variable "monthly_budget_usd" {
-  description = "Monthly budget cap in USD. Email alerts fire at 50/90/100%% of this amount. Does NOT auto-stop spend — only warns. Default $200 matches the Path A cost target."
+  description = "Monthly budget cap in USD (GCP-native backstop). The PRIMARY budget signal is the app-level check against runtime_config monthly_budget_target_usd — see backend/app/monthly_budget_alerts.py. This GCP resource is a deliberately-high backstop: default $5k ('something is broken' level). Email alerts fire at 50/90/100%% of this amount. Does NOT auto-stop spend — only warns."
   type        = number
-  default     = 200
+  default     = 5000
 }

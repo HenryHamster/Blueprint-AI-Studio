@@ -42,12 +42,14 @@ import {
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
   formatAcceptanceEvidence, formatInvestigateCitationProvenance,
 } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 import { isParallelAuditEnabled, resolveCandidateSha } from './audits.js';
 import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from './review-fix-migration.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 export { resolveCandidateSha, handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 
 // Provision the read-only ./fetch helper (direction|section|playbook) so a
@@ -312,7 +314,7 @@ CRITICAL RULES:
 - Document any data loss risks prominently using inline comments in the migration file`;
 
   const migrateClaudeMd = readClaudeMd();
-  const migrateClaudeMdSection = migrateClaudeMd ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
+  const migrateClaudeMdSection = (migrateClaudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${migrateClaudeMd}\n\n` : '';
   const migratePlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   // Shared launch-context block (sibling/queued tasks, the served direction,
   // quality signals). Degrades to '' when absent, so it is safe even when the
@@ -329,13 +331,31 @@ CRITICAL RULES:
     schemaRevisionFile: migrateLayout.schemaRevisionFile,
     schemaRevisionConst: migrateLayout.schemaRevisionConst,
   });
-  const finalMigratePrompt = migrateAcceptanceEvidenceNotice + migrateClaudeMdSection + migrateContextSection + migratePlaybookSection + migrateRetryContext
-    + migrateReservedGuidance + migratePrompt + migrateFirstTaskSection
-    + buildCodeChangeHelperGuidance({ buildConfig: migrateBuildConfig, owner, repo }) + migrateFocusBlock + PLAYBOOK_GUIDANCE
-    + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
-    + migratePromptSuffix + `
+  const migrateCodeChangeHelper = buildCodeChangeHelperGuidance({ buildConfig: migrateBuildConfig, owner, repo });
+  const migrateGuidanceFooter = PLAYBOOK_GUIDANCE + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE
+    + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING;
+  const migrateFetchBlock = `
 
 ${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const finalMigratePrompt = migrateClaudeMdSection + migrateAcceptanceEvidenceNotice + migrateContextSection
+    + migratePlaybookSection + migrateRetryContext + migrateReservedGuidance + migratePrompt
+    + migrateFirstTaskSection + migrateCodeChangeHelper + migrateFocusBlock + migrateGuidanceFooter
+    + migratePromptSuffix + migrateFetchBlock;
+  const migrateTelemetry = buildPromptSizeTelemetry(finalMigratePrompt, [
+    ['claude_md', migrateClaudeMdSection],
+    ['context', migrateContextSection],
+    ['playbook', migratePlaybookSection],
+    ['retry_context', migrateRetryContext],
+    ['reserved_revision', migrateReservedGuidance],
+    ['core_prompt', migratePrompt],
+    ['first_task', migrateFirstTaskSection],
+    ['code_change_helper', migrateCodeChangeHelper],
+    ['focus_block', migrateFocusBlock],
+    ['guidance', migrateGuidanceFooter],
+    ['prompt_suffix', migratePromptSuffix],
+    ['fetch_tool', migrateFetchBlock],
+  ]);
+  setPromptSizeTelemetry(migrateTelemetry.prompt_size_bytes, migrateTelemetry.prompt_section_count, migrateTelemetry.prompt_section_sizes);
   const migrateFingerprint = computePromptFingerprint('migrate', migrateBuildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: migrateBuildConfig, owner, repo }),
   });
@@ -444,7 +464,7 @@ export async function handleSmoketest(
   // Shared launch-context block; degrades to '' when absent (graceful).
   const smoketestContextPrefix = buildContextPrefix(task);
   const smoketestContextSection = smoketestContextPrefix ? `${smoketestContextPrefix}\n` : '';
-  const smoketestPrompt = `${smoketestContextSection}${smoketestRetryContext}You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
+  const smoketestCoreBody = `You are a smoke test agent. Your job is to run structured health checks on this codebase using the smoketest configuration.
 
 Follow these steps:
 
@@ -483,15 +503,27 @@ Follow these steps:
 
 Set top-level "passed" to true only if ALL suites passed and there are no guardrail violations.
 
-IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.${smoketestFirstTaskSection}
+IMPORTANT: Always write /tmp/smoketest_result_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} even if you cannot run any tests (use status "skip" with a message explaining why). Never leave the file unwritten.`;
+  const smoketestFetchBlock = `
 
 ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const smoketestPrompt = `${smoketestContextSection}${smoketestRetryContext}${smoketestCoreBody}${smoketestFirstTaskSection}${smoketestFetchBlock}`;
+  const smoketestFullPrompt = smoketestPrompt + PLAYBOOK_GUIDANCE;
 
   statusRef.value = 'Running smoke tests...';
+  const smoketestTelemetry = buildPromptSizeTelemetry(smoketestFullPrompt, [
+    ['context', smoketestContextSection],
+    ['retry_context', smoketestRetryContext],
+    ['core_prompt', smoketestCoreBody],
+    ['first_task', smoketestFirstTaskSection],
+    ['fetch_tool', smoketestFetchBlock],
+    ['playbook', PLAYBOOK_GUIDANCE],
+  ]);
+  setPromptSizeTelemetry(smoketestTelemetry.prompt_size_bytes, smoketestTelemetry.prompt_section_count, smoketestTelemetry.prompt_section_sizes);
   const smoketestFingerprint = computePromptFingerprint('smoketest', smoketestBuildConfig);
   setCurrentPromptFingerprint(smoketestFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: smoketestFingerprint });
-  const { exitCode, allOutput } = await runClaudeCode(smoketestPrompt + PLAYBOOK_GUIDANCE, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput } = await runClaudeCode(smoketestFullPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Read result file written by Claude
   const smoketestResult = readHandlerOutput(taskId, 'smoketest_result', ws) as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> } | null;
@@ -593,8 +625,11 @@ export async function handleDebug(
   const debugRetryContext = buildRetryContext(task);
   const debugFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
-  const debugPrompt = `You are a debug analysis agent. Your job is to analyze a task failure and produce a structured root cause analysis. Do NOT make any code changes.
-${claudeMd ? `\n## Codebase Instructions\n${claudeMd}\n` : ''}${debugRetryContext}${contextPrefix ? `\n${contextPrefix}` : ''}${fileTree ? `\n## Repository File Tree\n${fileTree}\n` : ''}
+  const debugClaudeMdSection = (claudeMd && !providerAutoInjectsClaudeMd()) ? `\n## Codebase Instructions\n${claudeMd}\n` : '';
+  const debugContextSection = contextPrefix ? `\n${contextPrefix}` : '';
+  const debugFileTreeSection = fileTree ? `\n## Repository File Tree\n${fileTree}\n` : '';
+  const debugCoreBody = `You are a debug analysis agent. Your job is to analyze a task failure and produce a structured root cause analysis. Do NOT make any code changes.
+
 ## Failed Task
 Title: ${failedTaskTitle}
 ${failedTaskId ? `Task ID: ${failedTaskId}` : ''}
@@ -644,13 +679,30 @@ Set confidence to:
 - "low" if the root cause is unclear or spans many systems
 
 IMPORTANT: Always write /tmp/debug_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} even if you cannot determine the root cause (use confidence "low" and explain what you found in root_cause). Never leave the file unwritten.`;
+  const debugPrompt = debugClaudeMdSection + debugRetryContext + debugContextSection + debugFileTreeSection + debugCoreBody;
 
   statusRef.value = 'Analyzing failure...';
   const debugFingerprint = computePromptFingerprint('debug');
   setCurrentPromptFingerprint(debugFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: debugFingerprint });
   const debugParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + debugParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${debugFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const debugPlaybookNote = '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n';
+  const debugFetchBlock = `\n\n${debugFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const debugFullPrompt = debugPrompt + debugFirstTaskSection + debugParallelGuidance + PLAYBOOK_GUIDANCE + debugPlaybookNote + debugFetchBlock;
+  const debugTelemetry = buildPromptSizeTelemetry(debugFullPrompt, [
+    ['claude_md', debugClaudeMdSection],
+    ['retry_context', debugRetryContext],
+    ['context', debugContextSection],
+    ['file_tree', debugFileTreeSection],
+    ['core_prompt', debugCoreBody],
+    ['first_task', debugFirstTaskSection],
+    ['parallel_audit', debugParallelGuidance],
+    ['playbook', PLAYBOOK_GUIDANCE],
+    ['playbook_note', debugPlaybookNote],
+    ['fetch_tool', debugFetchBlock],
+  ]);
+  setPromptSizeTelemetry(debugTelemetry.prompt_size_bytes, debugTelemetry.prompt_section_count, debugTelemetry.prompt_section_sizes);
+  const { allOutput } = await runClaudeCode(debugFullPrompt, ws, statusRef, model, effort, disallowedTools);
 
   const debugResult = readHandlerOutput(taskId, 'debug_report', ws) as { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null;
 
@@ -714,7 +766,7 @@ export async function handlePerf(
   const perfContextPrefix = buildContextPrefix(task);
   const perfContextSection = perfContextPrefix ? `${perfContextPrefix}\n` : '';
 
-  const perfPrompt = `${perfContextSection}${perfRetryContext}You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
+  const perfCoreBody = `You are a performance analysis agent. You have full access to this repository. Your job is to analyze the codebase for demonstrable performance bottlenecks and produce structured, evidence-based findings.
 
 Analyze the codebase for the following performance anti-patterns. Only flag issues you can directly observe in the code — do NOT speculate about theoretical problems.
 
@@ -753,6 +805,7 @@ Rules:
 - Limit to 15 findings maximum, prioritized by severity
 - IMPORTANT: Write your findings JSON array to /tmp/perf_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} (NOT in the repository). The file should contain ONLY the JSON array, no markdown wrapping.
 - Also output the same JSON array as the final output in your logs.`;
+  const perfPrompt = `${perfContextSection}${perfRetryContext}${perfCoreBody}`;
 
   const perfPerfSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const perfTypeHints = getTaskTypeHints(perfBuildConfig);
@@ -762,7 +815,21 @@ Rules:
   setCurrentPromptFingerprint(perfFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: perfFingerprint });
   const perfParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + perfParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${perfFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const perfFetchBlock = `\n\n${perfFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const perfFullPrompt = perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + perfParallelGuidance + PLAYBOOK_GUIDANCE + perfFetchBlock;
+  const perfTelemetry = buildPromptSizeTelemetry(perfFullPrompt, [
+    ['context', perfContextSection],
+    ['retry_context', perfRetryContext],
+    ['core_prompt', perfCoreBody],
+    ['type_hint', perfTypeHint],
+    ['first_task', perfFirstTaskSection],
+    ['prompt_suffix', perfPerfSuffix],
+    ['parallel_audit', perfParallelGuidance],
+    ['playbook', PLAYBOOK_GUIDANCE],
+    ['fetch_tool', perfFetchBlock],
+  ]);
+  setPromptSizeTelemetry(perfTelemetry.prompt_size_bytes, perfTelemetry.prompt_section_count, perfTelemetry.prompt_section_sizes);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfFullPrompt, ws, statusRef, model, effort, disallowedTools);
 
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
   let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
@@ -864,8 +931,15 @@ export async function handleInvestigate(
     const challengeFingerprint = computePromptFingerprint('investigate');
     setCurrentPromptFingerprint(challengeFingerprint);
     sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: challengeFingerprint });
+    const challengeFetchBlock = `\n\n${investigateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+    const challengeFullPrompt = `${userPrompt}${challengeFetchBlock}`;
+    const challengeTelemetry = buildPromptSizeTelemetry(challengeFullPrompt, [
+      ['user_prompt', userPrompt],
+      ['fetch_tool', challengeFetchBlock],
+    ]);
+    setPromptSizeTelemetry(challengeTelemetry.prompt_size_bytes, challengeTelemetry.prompt_section_count, challengeTelemetry.prompt_section_sizes);
     const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-      `${userPrompt}\n\n${investigateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
+      challengeFullPrompt,
       ws, statusRef, model, effort, disallowedTools
     );
     // Locally validate the output is a parseable [{hash, verdict, reason}] array.
@@ -959,7 +1033,7 @@ The "verdict" value MUST be exactly "pass" or "fail" — no other values are acc
     return;
   }
 
-  const investigatePrompt = `${investigateContextSection}${investigateRetryContext}You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
+  const investigateCoreBody = `You are an investigation agent. You have full read access to this repository. Your job is to analyze the issue described below and produce a structured diagnosis report.
 Use the Recent changes section first to correlate the issue with the latest deploy window and recently merged changes.
 
 Issue to investigate:
@@ -1010,13 +1084,28 @@ IMPORTANT:
 - Also output the same JSON object as the final output in your logs.
 - Do NOT modify any files in the repository.
 - Base every claim on code you have actually read.`;
+  const investigatePrompt = `${investigateContextSection}${investigateRetryContext}${investigateCoreBody}`;
 
   statusRef.value = 'Running investigation...';
   const investigateFingerprint = computePromptFingerprint('investigate');
   setCurrentPromptFingerprint(investigateFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: investigateFingerprint });
   const investigateParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + investigateParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${investigateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const investigatePlaybookNote = '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n';
+  const investigateFetchBlock = `\n\n${investigateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const investigateFullPrompt = investigatePrompt + investigateFirstTaskSection + investigateParallelGuidance + PLAYBOOK_GUIDANCE + investigatePlaybookNote + investigateFetchBlock;
+  const investigateTelemetry = buildPromptSizeTelemetry(investigateFullPrompt, [
+    ['context', investigateContextSection],
+    ['retry_context', investigateRetryContext],
+    ['core_prompt', investigateCoreBody],
+    ['first_task', investigateFirstTaskSection],
+    ['parallel_audit', investigateParallelGuidance],
+    ['playbook', PLAYBOOK_GUIDANCE],
+    ['playbook_note', investigatePlaybookNote],
+    ['fetch_tool', investigateFetchBlock],
+  ]);
+  setPromptSizeTelemetry(investigateTelemetry.prompt_size_bytes, investigateTelemetry.prompt_section_count, investigateTelemetry.prompt_section_sizes);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigateFullPrompt, ws, statusRef, model, effort, disallowedTools);
 
   let investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {
@@ -1136,9 +1225,9 @@ export async function handleRepoBootstrap(
     : 'repo_overview';
 
   const claudeMdContent = readClaudeMd();
-  const claudeMdSection = claudeMdContent ? `\n\n## Project Instructions (CLAUDE.md)\n${claudeMdContent}` : '';
+  const claudeMdSection = (claudeMdContent && !providerAutoInjectsClaudeMd()) ? `\n\n## Project Instructions (CLAUDE.md)\n${claudeMdContent}` : '';
 
-  const bootstrapPrompt = `${contextSection}You are performing a first-cycle repository bootstrap for ${owner}/${repo}.
+  const bootstrapCoreBody = `You are performing a first-cycle repository bootstrap for ${owner}/${repo}.
 
 Your goal: read the repository structure, understand the tech stack and build system, confirm working build/test commands, and write a repo overview so the first strategic cycle starts with grounded repo knowledge.
 
@@ -1191,16 +1280,29 @@ Also read any detected build/CI manifests you find.
    \`\`\`
    Read docs/**/*.md, ARCHITECTURE.md, DESIGN.md, OVERVIEW.md, openapi.yaml in addition to the files listed above. Cap the total at ~4000 characters. If README is absent or fewer than 200 characters, scan docs/ and top-level source docstrings. If nothing useful is found, produce a minimal stub: \`{"purpose": "No documentation found.", "key_concepts": {}, "critical_user_flows": [], "architectural_gotchas": [], "source": "none-found"}\`. The file must contain ONLY the JSON object, no markdown wrapping. Include the same object as \`domain_overview\` in the terminal COMPLETED status payload.
 
-5. **Status**: After completing the steps above, post COMPLETED status with \`${completionPayloadField}\` and \`domain_overview\` populated. If you cannot read the repo or run commands, still complete with whatever you found.
+5. **Status**: After completing the steps above, post COMPLETED status with \`${completionPayloadField}\` and \`domain_overview\` populated. If you cannot read the repo or run commands, still complete with whatever you found.`;
 
-${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
+  const bootstrapPrompt = `${contextSection}${bootstrapCoreBody}\n${DEFAULT_TOOL_GUIDANCE}${fetchGuidance}${claudeMdSection}${retryContext}`;
 
   const promptFingerprint = computePromptFingerprint('repo_bootstrap');
   setCurrentPromptFingerprint(promptFingerprint);
   sendHeartbeatSync(taskId, 'Running repo bootstrap...', { prompt_fingerprint: promptFingerprint });
 
+  const bootstrapPlaybookNote = '\nNote: Save reusable setup/environment knowledge to the playbook — environment setup steps, build quirks, version requirements, install workarounds, required env vars, and test-setup knowledge a future agent would otherwise rediscover.\n';
+  const bootstrapFullPrompt = bootstrapPrompt + PLAYBOOK_GUIDANCE + bootstrapPlaybookNote;
+  const bootstrapTelemetry = buildPromptSizeTelemetry(bootstrapFullPrompt, [
+    ['context', contextSection],
+    ['core_prompt', bootstrapCoreBody],
+    ['default_tool', DEFAULT_TOOL_GUIDANCE],
+    ['fetch_guidance', fetchGuidance],
+    ['claude_md', claudeMdSection],
+    ['retry_context', retryContext],
+    ['playbook', PLAYBOOK_GUIDANCE],
+    ['playbook_note', bootstrapPlaybookNote],
+  ]);
+  setPromptSizeTelemetry(bootstrapTelemetry.prompt_size_bytes, bootstrapTelemetry.prompt_section_count, bootstrapTelemetry.prompt_section_sizes);
   const { exitCode, allOutput } = await runClaudeCode(
-    bootstrapPrompt + PLAYBOOK_GUIDANCE + '\nNote: Save reusable setup/environment knowledge to the playbook — environment setup steps, build quirks, version requirements, install workarounds, required env vars, and test-setup knowledge a future agent would otherwise rediscover.\n',
+    bootstrapFullPrompt,
     ws, statusRef, model, effort, disallowedTools
   );
 

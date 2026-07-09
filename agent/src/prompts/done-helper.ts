@@ -281,64 +281,53 @@ else
   SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review skipped — investigate"],"skip_reason":"'"$SKIP_REASON"'"}'
 fi
 
-# Regressing-category reasoning gate: require non-trivial reasoning for categories
-# that have above-floor miss rates for this task type (embedded at write time).
-# If any are missing, print the gap and exit so Claude can fix the SR JSON first.
-${cfg.regressingCategories && cfg.regressingCategories.length > 0
-  ? `REGRESSING_CATS=(${cfg.regressingCategories.map((c) => `"${c}"`).join(' ')})
+# ── Self-review gates (single python3 pass) ────────────────────────────
+# One python3 invocation validates both regressing-category reasoning and
+# high-stakes evidence anchors. Output: gate:cat:result lines.
+REGRESSING_CATS=(${cfg.regressingCategories && cfg.regressingCategories.length > 0 ? cfg.regressingCategories.map((c) => `"${c}"`).join(' ') : ''})
+HIGH_STAKES_CATS=("correctness" "error-handling" "security" "regression_risk" "scope-drift")
 MISSING_REASONING=()
-for _CAT in "\${REGRESSING_CATS[@]}"; do
-  _R=$(printf '%s' "$SELF_REVIEW_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); c=sys.argv[1]; print(d.get("check_results",{}).get(c,{}).get("reasoning",""))' "$_CAT" 2>/dev/null || echo "")
-  if [ "\${#_R}" -lt 10 ]; then
-    # Short reasoning passes if it contains a file:line evidence anchor
-    _HAS_ANCHOR=0
-    if printf '%s' "$_R" | grep -qE '[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+' 2>/dev/null; then
-      _HAS_ANCHOR=1
-    fi
-    if [ "\${_HAS_ANCHOR}" = "0" ]; then
-      MISSING_REASONING+=("$_CAT")
-    fi
+MISSING_EVIDENCE=()
+while IFS=: read -r _GATE _CAT _RESULT; do
+  if [ "$_RESULT" = "missing" ]; then
+    case "$_GATE" in
+      reasoning) MISSING_REASONING+=("$_CAT") ;;
+      evidence) MISSING_EVIDENCE+=("$_CAT") ;;
+    esac
   fi
-done
+done < <(printf '%s' "$SELF_REVIEW_JSON" | python3 -c '
+import json, sys, re
+d = json.loads(sys.stdin.read())
+args = sys.argv[1:]
+sep = args.index("--") if "--" in args else len(args)
+regressing = args[:sep]
+high_stakes = args[sep+1:] if sep < len(args) else []
+anchor_re = re.compile(r"[a-zA-Z0-9._/-]+\\.[a-z]+:[0-9]+")
+diff_re = re.compile(r"diff.*lines|files|threshold", re.IGNORECASE)
+filelist_re = re.compile(r"related_files|modified files|checked.*files?", re.IGNORECASE)
+for cat in regressing:
+    reasoning = d.get("check_results",{}).get(cat,{}).get("reasoning","")
+    if len(reasoning) >= 10 or anchor_re.search(reasoning):
+        print(f"reasoning:{cat}:ok")
+    else:
+        print(f"reasoning:{cat}:missing")
+for cat in high_stakes:
+    cr = d.get("check_results",{}).get(cat,{})
+    passed = str(cr.get("passed", False)).lower() == "true"
+    if not passed:
+        print(f"evidence:{cat}:ok")
+        continue
+    reasoning = cr.get("reasoning", "")
+    has_anchor = (anchor_re.search(reasoning) or diff_re.search(reasoning) or
+                  filelist_re.search(reasoning) or (reasoning and len(reasoning) >= 20))
+    print(f"evidence:{cat}:{'ok' if has_anchor else 'missing'}")
+' "\${REGRESSING_CATS[@]}" -- "\${HIGH_STAKES_CATS[@]}" 2>/dev/null || true)
 if [ "\${#MISSING_REASONING[@]}" -gt 0 ]; then
   echo "[done] Regressing categories need a reasoning field (>=10 chars, or a file:line anchor) in check_results:" >&2
   for _CAT in "\${MISSING_REASONING[@]}"; do echo "  - $_CAT" >&2; done
   echo "Update /tmp/self_review_${cfg.taskId}.json and re-run ./done." >&2
   exit 1
-fi`
-  : '# No regressing categories for this task type — reasoning check skipped.'}
-
-# High-stakes-category evidence-anchor gate: require concrete evidence anchors for PASS verdicts
-# on correctness, error-handling, security, regression_risk, and scope-drift. Anchors must be
-# file:line, diff stats reference, or file-list reference. If any are missing, print the gap and
-# exit so Claude can fix the SR JSON.
-HIGH_STAKES_CATS=("correctness" "error-handling" "security" "regression_risk" "scope-drift")
-MISSING_EVIDENCE=()
-for _CAT in "\${HIGH_STAKES_CATS[@]}"; do
-  _PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); c=sys.argv[1]; print(str(d.get("check_results",{}).get(c,{}).get("passed",False)).lower())' "$_CAT" 2>/dev/null || echo "false")
-  _REASONING=$(printf '%s' "$SELF_REVIEW_JSON" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); c=sys.argv[1]; print(d.get("check_results",{}).get(c,{}).get("reasoning",""))' "$_CAT" 2>/dev/null || echo "")
-
-  if [ "$_PASSED" = "true" ]; then
-    # Check if reasoning has evidence anchor: file:line format, diff stats, or file list reference
-    _HAS_ANCHOR=0
-    # File:line reference (e.g., path/to/file.ts:42)
-    if printf '%s' "$_REASONING" | grep -E '[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+' > /dev/null 2>&1; then
-      _HAS_ANCHOR=1
-    # Diff-stat reference (e.g., "lines / files" or "diff:")
-    elif printf '%s' "$_REASONING" | grep -iE 'diff.*lines|files|threshold' > /dev/null 2>&1; then
-      _HAS_ANCHOR=1
-    # File-list reference (e.g., "related_files" or list of files)
-    elif printf '%s' "$_REASONING" | grep -iE 'related_files|modified files|checked.*files?' > /dev/null 2>&1; then
-      _HAS_ANCHOR=1
-    # Substantial reasoning (20+ chars)
-    elif printf '%s' "$_REASONING" | grep '.' > /dev/null 2>&1 && [ "\${#_REASONING}" -ge 20 ]; then
-      _HAS_ANCHOR=1
-    fi
-    if [ "\${_HAS_ANCHOR}" = "0" ]; then
-      MISSING_EVIDENCE+=("$_CAT")
-    fi
-  fi
-done
+fi
 if [ "\${#MISSING_EVIDENCE[@]}" -gt 0 ]; then
   echo "[done] PASS verdicts on high-stakes categories must include evidence anchors (file:line, diff stats, or file list):" >&2
   for _CAT in "\${MISSING_EVIDENCE[@]}"; do echo "  - $_CAT" >&2; done

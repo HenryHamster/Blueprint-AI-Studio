@@ -301,6 +301,27 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
+    # Independent adversarial verification for compute experiment results.
+    # Checkpoint 1 from the v18 Verified Delivery design.  When enabled, a
+    # compute-experiment task whose criterion is self-declared as met is
+    # independently graded by an adversarial grader BEFORE it completes, to
+    # catch common failure modes (measurable=False reported as SUCCESS, score
+    # inflation, infra-vs-capability confusion).
+    # DARK by default (False) — must be explicitly enabled per project.
+    "compute_verification_enabled": os.getenv(
+        "COMPUTE_VERIFICATION_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
+    # Verification mode for compute experiment grading.
+    #   "advisory"  — (default) record the verdict + notifiy, never block.
+    #   "soft_gate" — record + notify, warn prominently on reject.
+    #   "hard_gate" — block SUCCESS when the grader rejects (future use).
+    "compute_verification_mode": os.getenv(
+        "COMPUTE_VERIFICATION_MODE", "advisory"
+    ).lower()
+    if os.getenv("COMPUTE_VERIFICATION_MODE", "advisory").lower()
+    in ("advisory", "soft_gate", "hard_gate")
+    else "advisory",
     # Graduated rollout mode for the safeguard merge-gate challenge.
     # Mirrors strategic_retirement_challenge_gate_mode.
     #   "off"     — no challenge; gate held unconditionally on any
@@ -718,6 +739,12 @@ runtime_config: Dict = {
     "max_retained_images": 5,  # Agent VM image family pruning (keep N most recent; GCP per-project image quota is tight)
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
+    # Monthly budget target (USD). 0 = disabled. When >0, Blueprint's own cost
+    # telemetry compares month-to-date total spend (VM + compute + pool idle)
+    # against this target and fires Alerts at 50/90/100% thresholds — live from
+    # the admin UI, no deploy needed. The GCP-native billing budget in
+    # infra/terraform/budget.tf stays as a high backstop ($5000 default).
+    "monthly_budget_target_usd": 0,  # 0 = disabled; positive float enables monthly budget alerts
     # Proposed compute_experiment spend cap (USD) above which an autonomously
     # authored launch is HELD for operator approval (requires_approval=True at
     # spawn) rather than dispatched. A per-direction override is honored when a
@@ -1508,6 +1535,31 @@ def _ensure_route_defaults(
     return entry
 
 
+def _validate_deepseek_routing_invariant(config: Dict[str, Any]) -> list[str]:
+    """Return warnings when DeepSeek is not first for low/medium-effort categories.
+
+    Categories _default, initiative, build, and ops route low/medium-effort
+    tasks and should prefer DeepSeek as the primary provider. This invariant
+    guards against silent regression in the provider ordering, which matters
+    when ``provider_selection_mode`` is ``"preferred"`` (the default).
+    """
+    warnings: list[str] = []
+    cat_routing = config.get("category_routing", {})
+    deepseek_first = {"_default", "initiative", "build", "ops"}
+    for category in sorted(deepseek_first):
+        entry = cat_routing.get(category)
+        if not isinstance(entry, dict):
+            continue
+        providers = entry.get("providers")
+        if not isinstance(providers, list) or not providers:
+            continue
+        if providers[0] != "deepseek":
+            warnings.append(
+                f"category_routing.{category}: expected DeepSeek first, got {providers[0]}"
+            )
+    return warnings
+
+
 def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
     """Add provider defaults introduced after the settings-bag migration.
 
@@ -1596,6 +1648,12 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
         "exclusive",
     ):
         config["provider_selection_mode"] = runtime_config["provider_selection_mode"]
+
+    routing_warnings = _validate_deepseek_routing_invariant(config)
+    if routing_warnings:
+        logger.warning(
+            "DeepSeek routing invariant violated: %s", "; ".join(routing_warnings)
+        )
 
 
 def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -1888,6 +1946,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "daily_cost_ceiling_usd",
                         float(config_json["daily_cost_ceiling_usd"]),
+                    )
+                if "monthly_budget_target_usd" in config_json:
+                    _set(
+                        "monthly_budget_target_usd",
+                        float(config_json["monthly_budget_target_usd"]),
                     )
                 if "compute_experiment_spend_threshold_usd" in config_json:
                     _set(

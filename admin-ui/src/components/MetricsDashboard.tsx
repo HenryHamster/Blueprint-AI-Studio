@@ -133,28 +133,25 @@ function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[
 
 function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]; tasks: Task[]; windowMs: number }) {
   const [now] = useState(Date.now);
-  const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const filtered = useMemo(() => points.filter((p) => p.timestamp >= now - windowMs), [points, now, windowMs]);
   const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
-  if (filtered.length < 2) return <NoDataMessage />;
-
-  const baselineCompleted = tasks.filter((t) => t.status === 'COMPLETED').length;
-  const baselineFailed = tasks.filter((t) => t.status === 'FAILED').length;
-
-  const totalDeltaCompleted = filtered.reduce((s, p) => s + p.completedCount, 0);
-  const totalDeltaFailed = filtered.reduce((s, p) => s + p.failedCount, 0);
-
-  const offsetCompleted = Math.max(0, baselineCompleted - totalDeltaCompleted);
-  const offsetFailed = Math.max(0, baselineFailed - totalDeltaFailed);
-
-  const cumPoints = filtered.reduce<{ timestamp: number; cumCompleted: number; cumFailed: number }[]>(
+  const baselineCompleted = useMemo(() => tasks.filter((t) => t.status === 'COMPLETED').length, [tasks]);
+  const baselineFailed = useMemo(() => tasks.filter((t) => t.status === 'FAILED').length, [tasks]);
+  const totalDeltaCompleted = useMemo(() => filtered.reduce((s, p) => s + p.completedCount, 0), [filtered]);
+  const totalDeltaFailed = useMemo(() => filtered.reduce((s, p) => s + p.failedCount, 0), [filtered]);
+  const offsetCompleted = useMemo(() => Math.max(0, baselineCompleted - totalDeltaCompleted), [baselineCompleted, totalDeltaCompleted]);
+  const offsetFailed = useMemo(() => Math.max(0, baselineFailed - totalDeltaFailed), [baselineFailed, totalDeltaFailed]);
+  const cumPoints = useMemo(() => filtered.reduce<{ timestamp: number; cumCompleted: number; cumFailed: number }[]>(
     (acc, p) => {
       const prev = acc[acc.length - 1];
       const cumCompleted = Math.max(0, (prev?.cumCompleted ?? offsetCompleted) + p.completedCount);
       const cumFailed = Math.max(0, (prev?.cumFailed ?? offsetFailed) + p.failedCount);
-      return [...acc, { timestamp: p.timestamp, cumCompleted, cumFailed }];
+      acc.push({ timestamp: p.timestamp, cumCompleted, cumFailed });
+      return acc;
     },
     [],
-  );
+  ), [filtered, offsetCompleted, offsetFailed]);
+  if (filtered.length < 2) return <NoDataMessage />;
 
   return (
     <ResponsiveContainer width="100%" height={160}>

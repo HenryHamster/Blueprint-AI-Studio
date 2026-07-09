@@ -56,10 +56,13 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
 from app.direction_outcomes import credit_gate_merged_count
 from app.failure_classification import (
     CO_DEFERRED_SHELVED,
+    EXTERNAL_API,
+    EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
     GRADER_CAUSE_REFUSAL,
     GRADER_TIMEOUT_CAUSES,
     GRADER_TRANSIENT_INFRA_CAUSES,
     INFRA_CLASSES,
+    classify_external_api_subtype,
     classify_failure,
 )
 from app.finding_deduplication import (
@@ -242,6 +245,7 @@ _RESEARCH_SPAWN_COUNTED_IDS_MAX = 200
 # so strategic review can tell "the cited code is unambiguously gone" — the
 # strongest truthfulness signal — apart from a merely deferred finding.
 _REPRODUCE_REJECTED_DROP_REASON = "reproduce_on_head_absent"
+_CRITERION_EVIDENCE_REJECTED_DROP_REASON = "criterion_evidence_missing"
 
 _FINDING_CHALLENGE_HISTORY_KEY = "finding_challenge_records"
 _FINDING_CHALLENGE_RECORD_KEY = "finding_challenge"
@@ -283,6 +287,20 @@ _SPAWN_GATE_REASONS_SAMPLE_CAP = 5
 _SPAWN_GATE_REASON_MAX_LEN = 200
 _ADVERSARIAL_WHOLESALE_RETRY_KEY = "_adversarial_wholesale_retry_count"
 _ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
+# Declares which auto-complete code paths inside _stamp_no_findings_refractory
+# gate on criterion coverage before retiring a direction, plus the
+# strategist-authored retire_direction path in strategic_completion.py.
+# This frozenset MUST match the one in research_direction_state.py.
+# test_all_autocomplete_paths_gate_on_criterion_coverage in test_invariants.py
+# verifies structurally that all declared paths contain the gate call.
+_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
+    {
+        "exhaustion",  # _stamp_no_findings_refractory exhaustion complete (L840)
+        "proven_merge",  # _stamp_no_findings_refractory >=3-merge completion (L824)
+        "no_findings",  # _stamp_no_findings_refractory overall site (research_completion.py)
+        "strategist_retire",  # _handle_strategic_completion retire_direction op (strategic_completion.py)
+    }
+)
 # Targeted retry: used when the non-response cause is time-based (timeout/stall).
 # A reduced-manifest grader is spawned BEFORE falling back to the wholesale retry,
 # so the total grader budget is: initial + at most one targeted + at most one wholesale.
@@ -751,8 +769,10 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     # apply_post_spawn_state). The coverage query is async, but the completion
     # decision runs inside the SYNCHRONOUS with_directions_locked closure below,
     # so we resolve the verdict here (outside the lock) and thread the boolean
-    # in. Fail-open: the helper returns False when the direction owns no criteria
-    # or the query errors, preserving current behavior.
+    # in. Fail-closed: the helper returns True on query errors (blocking
+    # completion until resolved) and False only when the direction owns no keys,
+    # no open version, no active owned criteria, or all owned active criteria
+    # are covered.
     from app.acceptance_criteria import (  # noqa: PLC0415
         direction_owns_uncovered_criterion,
     )
@@ -803,12 +823,13 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 ) - int(agg.get("total_stranded_prs_merged", 0) or 0),
             )
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
-            # Gated: a saturated direction with >= 3 verified merges whose owned
-            # acceptance outcome is still uncovered is withheld from the SUCCESS
-            # route — AND must not slip through the exhaustion route either
-            # (that declares deadlock, which a productive-but-unmet direction is
-            # not). It stays active. The < 3 exhaustion fallback is unaffected.
-            _proven_gated = total_merged >= 3 and _owns_uncovered
+            # Gated: a direction (regardless of merge count) whose owned
+            # acceptance outcome is still uncovered is withheld from BOTH the
+            # SUCCESS route AND the exhaustion route — a criterion-carrying
+            # direction with an unmet outcome is neither proven NOR deadlocked;
+            # it stays active. The exhaustion route declares deadlock, which a
+            # productive-but-unmet direction is not.
+            _proven_gated = _owns_uncovered
             if total_merged >= 3 and not _owns_uncovered:
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
@@ -825,7 +846,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                         "total_cycles": total_cycles,
                     }
                 )
-            elif not _proven_gated and _should_autocomplete_exhausted(target):
+            elif not _proven_gated and not _owns_uncovered and _should_autocomplete_exhausted(target):
                 reason = _exhaustion_complete_reason(target)
                 target["status"] = "completed"
                 target["completed_at"] = now_iso
@@ -908,11 +929,17 @@ def _summarize_dispatch_outcome(
     total_findings: int,
     dedup_outcome: Any | None,
     deferred_reason_parts: list[str] | None = None,
+    degraded_reason: str | None = None,
 ) -> str:
     """Build the post-dispatch status_message that surfaces spawn / dedup / defer
     counts. Today these stats live only in logs and task.context; surfacing them
     on the task itself lets the admin UI and ./tasks failures CLI show why a
-    research cycle produced N children instead of M."""
+    research cycle produced N children instead of M.
+
+    When ``degraded_reason`` is set, appends a degradation qualifier so readers
+    can distinguish a genuinely thorough empty result from one truncated by a
+    provider capacity/rate-limit error mid-run.
+    """
     parts: list[str] = [f"spawned {spawned}/{total_findings} findings"]
     if dedup_outcome is not None:
         dedup_breakdown: list[str] = []
@@ -938,7 +965,62 @@ def _summarize_dispatch_outcome(
             parts.append("dedup filtered: " + ", ".join(dedup_breakdown))
     if deferred_reason_parts:
         parts.append("deferred: " + " + ".join(deferred_reason_parts))
+    if degraded_reason:
+        parts.append(f"degraded: {degraded_reason} — results may be incomplete")
     return " | ".join(parts)[:500]
+
+
+def _check_capacity_degradation(task: Task, logs: str = "") -> str | None:
+    """Check whether a research task encountered a provider capacity/rate-limit
+    error during its run that may have degraded its output.
+
+    Examines (1) the task context for a persisted ``EXTERNAL_API`` /
+    ``provider_quota`` failure classification (set by
+    :func:`persist_failure_category` during a terminal-FAILED path on a prior
+    pass, or mid-run by the agent-status router), and (2) the task's current
+    ``latest_status_message`` plus the ``logs`` string for provider-quota
+    signal keywords via :func:`_external_api_subtype_from_message`.
+
+    Returns a short human-readable reason string when degradation is detected,
+    or ``None`` when the task shows no capacity-signal evidence.
+    """
+    if task is None:
+        return None
+    # 1. Persisted failure classification on task context.
+    ctx = task.context or {}
+    fc = ctx.get("failure_category")
+    est = ctx.get("external_api_subtype")
+    if fc == EXTERNAL_API and est == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA:
+        return "provider capacity/rate-limit error"
+
+    # Compute the message subtype once from status + logs for steps 2-3.
+    subtype = classify_external_api_subtype(task, logs)
+
+    # 2. Agent self-reported failure category — cross-check against message text
+    #    to avoid false positives from unrelated ``claude_code_failed`` events.
+    raw_fc = ctx.get("agent_failure_category_raw", "")
+    if raw_fc in ("rate_limited", "claude_code_failed") and subtype == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA:
+        return "provider capacity/rate-limit error"
+
+    # 3. Current status message + logs — catches errors the agent reported
+    #    mid-run that weren't separately persisted to task context.
+    if subtype == EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA:
+        return "provider capacity/rate-limit error"
+
+    return None
+
+
+def _mark_capacity_degraded(task: Task, reason: str) -> None:
+    """Record a capacity-degradation signal on a task's context dict.
+
+    Used by both the no-findings path and the dispatch path so the structured
+    indicator stays consistent across both sites.
+    """
+    _ctx = dict(task.context or {})
+    _ctx["degraded_by_capacity"] = True
+    _ctx["degraded_by_capacity_reason"] = reason
+    task.context = _ctx
+    flag_modified(task, "context")
 
 
 # Finding ``type`` values that are processed separately and never spawn an
@@ -1464,6 +1546,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             session, task.project_id, _increment_research_spawn_count
         )
 
+    # Assess whether this research task encountered a provider capacity/rate-limit
+    # error mid-run but still completed (rather than hard-failing). When detected,
+    # the reason is surfaced in the completion message and task context so
+    # downstream readers (strategist, operator, future research cycles) can
+    # distinguish thin-but-honest results from capacity-truncated ones.
+    _capacity_degradation_reason = _check_capacity_degradation(task, logs)
+
     # Depth guard: prevent infinite research recursion
     MAX_RESEARCH_DEPTH = 3
     research_depth = (task.context or {}).get("research_depth", 0)
@@ -1555,7 +1644,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     f"{len(_stored_findings)} stored finding(s)"
                 )[:500]
     if not findings:
-        task.latest_status_message = "Research completed with no actionable findings"
+        if _capacity_degradation_reason:
+            task.latest_status_message = (
+                "Research completed with no actionable findings "
+                f"(degraded: {_capacity_degradation_reason} — results may be incomplete)"
+            )
+            _mark_capacity_degraded(task, _capacity_degradation_reason)
+        else:
+            task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
         _record_research_survival_signal(task, surviving=0)
         # Stamp refractory on the direction before committing — this path skips
@@ -1831,6 +1927,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _finding_give_up: dict | None = None
     _low_actionability_decayed: list[dict] = []
     _low_actionability_refinement_deferred: list[dict] = []
+    _salvage_candidates: list[dict] = []
     if prior_deferred:
         # Filter out non-actionable types that would have been handled separately above
         prior_actionable = [
@@ -1984,6 +2081,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 f.get("deferred_reason") == "adversarial_gate" for f in _decayed
             ):
                 _finding_give_up["adversarial_gate_cause"] = _give_up_cause
+            _salvage_candidates.extend(_decayed)
         prior_actionable = _kept
         # Stale-targeting: a deferred finding carries the integration HEAD it was
         # generated against. On re-dispatch, ask whether any cited file changed
@@ -2858,11 +2956,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         ]
                     ),
                 )
+                .limit(500)
+                .order_by(Task.updated_at.desc())
             )
         )
         .scalars()
         .all()
     )
+    if len(existing_tasks) >= 500:
+        logger.warning(
+            "[SPAWN] active-tasks scan hit cap=500 — word-overlap dedup "
+            "is truncated; consider filtering by project to reduce result size"
+        )
     # Build compact active-task overlap candidates for region-identity dedup:
     # (direction_id, title, task_type, related_files, claims). The related_files
     # (4th element) are the necessary signal for region matching — a spawned task
@@ -2889,11 +2994,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     Task.project_id == task.project_id,
                     Task.created_at >= ninety_days_ago,
                 )
+                .limit(500)
             )
         )
         .scalars()
         .all()
     )
+    if len(recent_tasks_for_dedup) >= 500:
+        logger.warning(
+            "[SPAWN] recent-tasks scan hit cap=500 — hash-based dedup "
+            "is truncated; consider adding index or reducing window"
+        )
     # Bounded projecting query for memo dedup — avoids filtering the full 90-day
     # task scan in Python by projecting only the JSONB field we need.
     _memo_hash_rows = (
@@ -3222,6 +3333,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # (a retry loop), and they are excluded from the surviving-finding success
     # signal so the cycle scores neutral, never a spurious success/failure.
     _reproduce_rejected: list[dict] = []
+    # Findings rejected because they belong to a criterion-carrying direction but
+    # lack acceptance_evidence:{kind:named_test}. Hard rejection (not deferred) —
+    # the finding cannot close the criterion coverage loop without a named-test
+    # proof declaration.
+    _criterion_evidence_rejected: list[dict] = []
     # compute_experiment findings whose authored launch contract was incomplete
     # or malformed — deferred loudly rather than spawning a broken compute job.
     _compute_contract_deferred: list[dict] = []
@@ -4315,6 +4431,31 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _combined_suffix = (
                 _combined_suffix + ("\n" if _combined_suffix else "") + type_suffix
             )
+        # When the direction carries active acceptance criteria, inject a
+        # criterion_keys warning into the spawned task's prompt_suffix so the
+        # implementing agent knows findings must declare named_test evidence.
+        # Without this upfront signal the research agent unknowingly omits the
+        # evidence field and the spawn loop hard-rejects the finding, wasting
+        # one full research cycle per occurrence.
+        _suffix_crit_dir_id = direction_id or _parent_direction_id
+        _suffix_criterion_ids = _direction_criterion_cache.get(
+            _suffix_crit_dir_id or "", []
+        )
+        if _suffix_criterion_ids:
+            _criterion_suffix = (
+                "\n\nCRITICAL: This direction has active acceptance criteria. "
+                "Every finding must declare acceptance_evidence with "
+                "kind 'named_test' and a test_path naming the test that "
+                "verifies the change. Findings without this evidence are "
+                "rejected at spawn time.\n"
+                'Include in each finding:\n'
+                '  acceptance_evidence: {kind: "named_test", test_path: "path/to/test.py"}'
+            )
+            _combined_suffix = (
+                _combined_suffix + _criterion_suffix
+                if _combined_suffix
+                else _criterion_suffix.lstrip("\n")
+            )
         # Scope-aware effort override for implementation task types: the scope
         # (calibrated through history/heuristic/low-confidence/retry) drives the
         # baseline effort — small→low, medium→medium, large→high — replacing
@@ -4394,6 +4535,34 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _payload_acceptance_evidence, _context_acceptance_evidence = (
             normalize_acceptance_evidence(finding.get("acceptance_evidence"))
         )
+
+        # Reject criterion-carrying findings that lack named_test acceptance
+        # evidence. The spawned task inherits criterion_ids from the direction,
+        # but without a named_test declaration the acceptance pipeline records 0
+        # proven-verdict rows, leaving criterion coverage perpetually uncovered.
+        # PR #13528 added a non-blocking provenance warning here; the direction's
+        # retirement condition requires a hard rejection so the spawn is blocked
+        # and the finding never becomes work that cannot close the coverage loop.
+        _crit_eff_dir_id = direction_id or parent_direction_id
+        _crit_criterion_ids = _direction_criterion_cache.get(
+            _crit_eff_dir_id or "", []
+        )
+        if _crit_criterion_ids:
+            _has_named_test = (
+                _payload_acceptance_evidence is not None
+                and _payload_acceptance_evidence.get("kind") == "named_test"
+            )
+            if not _has_named_test:
+                _criterion_evidence_rejected.append(finding)
+                logger.warning(
+                    "[RESEARCH] Rejecting finding %r (task %s): criterion-carrying "
+                    "direction %s but finding lacks acceptance_evidence:{kind:named_test}; "
+                    "not spawning.",
+                    finding.get("title") or finding.get("description", "")[:60],
+                    task.id,
+                    _crit_eff_dir_id,
+                )
+                continue
 
         if task_type == "compute_experiment":
             # Build + validate the compute_experiment payload from the launch
@@ -4877,6 +5046,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         [(f, "low_actionability") for f in _low_actionability_deferred]
         + [(f, "degradation_gate") for f in _degradation_gate_deferred]
         + [(f, _REPRODUCE_REJECTED_DROP_REASON) for f in _reproduce_rejected]
+        + [
+            (f, _CRITERION_EVIDENCE_REJECTED_DROP_REASON)
+            for f in _criterion_evidence_rejected
+        ]
     )
     if _finding_challenge_enabled(CHALLENGE_BOUNDARY_LOW_ACTIONABILITY_DECAY):
         _memo_candidates.extend(
@@ -4999,6 +5172,62 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 exc_info=True,
             )
 
+    # Spawn a consolidated salvage-bundle task if any findings were discarded
+    # via decay (ultra_low_confidence >=4, low_actionability >=3, degradation_gate >=3,
+    # adversarial_gate >=3, prereq_deferred >=3). This aggregates them into one
+    # actionable task rather than only individual memo tasks or silent drops.
+    if _salvage_candidates:
+        _salvage_payload = {
+            "type": "salvage_bundle",
+            "source_task_id": str(task.id),
+            "salvaged_findings": [
+                {
+                    "title": f.get("title") or (f.get("description") or "")[:80],
+                    "discard_reason": f.get("deferred_reason") or "unknown",
+                    "direction_id": f.get("direction_id"),
+                }
+                for f in _salvage_candidates
+            ],
+            "total_discarded": len(_salvage_candidates),
+        }
+        _salvage_task = Task(
+            project_id=task.project_id,
+            title=f"Salvage bundle: {len(_salvage_candidates)} decayed finding(s)",
+            description=(
+                f"Consolidated fix batch for {len(_salvage_candidates)} research finding(s) "
+                "discarded via repeated deferral decay."
+            ),
+            parent_task_id=task.id,
+            payloads=[_salvage_payload],
+            context={
+                "research_task_id": str(task.id),
+                "salvage_source_task_id": str(task.id),
+                "salvage_finding_count": len(_salvage_candidates),
+            },
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            depends_on=[],
+            priority=TASK_PRIORITY_MAP.get("medium", 50),
+        )
+        session.add(_salvage_task)
+        # Record salvage activity on the parent research task context so
+        # downstream consumers (strategist, operator, admin UI) can see
+        # that salvage was triggered and trace to the spawned bundle.
+        _salvage_ctx = dict(task.context or {})
+        _salvage_ctx["salvage_activity"] = {
+            "salvage_task_id": str(_salvage_task.id),
+            "salvaged_count": len(_salvage_candidates),
+            "salvaged_at": _utcnow().isoformat(),
+        }
+        task.context = _salvage_ctx
+        flag_modified(task, "context")
+        session.add(task)
+        logger.info(
+            "[RESEARCH] Spawned consolidated salvage-bundle task for %d decayed finding(s) (task %s)",
+            len(_salvage_candidates),
+            task.id,
+        )
+
     _deferral_reasons: list[str] = []
     if _low_actionability_deferred:
         _deferral_reasons.append(
@@ -5030,6 +5259,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         or _spawned_memo_ids
         or _finding_give_up
         or _reproduce_rejected
+        or _criterion_evidence_rejected
         or _spawn_gate_challenged_count
         or _spawn_gate_manifest_excluded_count
     ):
@@ -5047,6 +5277,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # rejected this cycle. Excluded from deferred_findings (no retry) and
             # from the surviving-finding signal (neutral, not success/failure).
             ctx["research_reproduce_rejected"] = len(_reproduce_rejected)
+        if _criterion_evidence_rejected:
+            # Machine-readable count of findings the criterion-evidence gate
+            # rejected this cycle. Follows the same pattern as reproduce_rejected:
+            # excluded from deferred_findings (no retry) and from the surviving-
+            # finding signal (neutral).
+            ctx["research_criterion_evidence_rejected"] = len(
+                _criterion_evidence_rejected
+            )
         if _spawn_gate_challenged_count:
             if _spawn_gate_healthy_cycle:
                 for _retry_key in (
@@ -5121,7 +5359,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         total_findings=len(findings),
         dedup_outcome=_dedup_outcome,
         deferred_reason_parts=_deferral_reasons,
+        degraded_reason=_capacity_degradation_reason,
     )
+    # Structured indicator for downstream consumers: when a research task hit a
+    # provider capacity/rate-limit error mid-run but still completed (did not
+    # hard-fail), mark it so the strategist / operator / future research cycles
+    # can distinguish thin-but-honest results from capacity-truncated ones.
+    if _capacity_degradation_reason:
+        _mark_capacity_degraded(task, _capacity_degradation_reason)
     # Honest success signal: count findings that SURVIVED ingestion validation +
     # dedup + actionability and were routed to work — spawned, or deferred only
     # for capacity/health reasons (batch cap, pipeline degradation). Findings

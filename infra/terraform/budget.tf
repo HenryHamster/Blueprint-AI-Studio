@@ -1,9 +1,20 @@
 # ------------------------------------------------------------------------------
-# Budget alert
+# Budget alert (BACKSTOP — the app-level check is the primary signal).
 #
 # Emails the alert_email at 50%, 90%, 100% of monthly_budget_usd. This DOES NOT
-# auto-stop spend — it only warns. Combined with var.monthly_budget_usd default
-# of $200, the alert fires before bills exceed the Path A cost target.
+# auto-stop spend — it only warns.
+#
+# The PRIMARY budget signal is now the application-level monthly budget check
+# (backend/app/monthly_budget_alerts.py), which monitors Blueprint's own cost
+# telemetry against the operator-configurable runtime_config knob
+# ``monthly_budget_target_usd`` — editable live from the admin UI, no deploy
+# needed.  This GCP-native resource is a deliberately-high backstop so there
+# is still a hard platform-level circuit-breaker-adjacent signal even if the
+# application-level check has a bug.
+#
+# Combined with var.monthly_budget_usd default of $5000, the GCP backstop fires
+# at a 'something is actually broken' level — well above the real target set
+# via runtime config.
 #
 # Gated on both billing_account_id (required by API) and alert_email
 # (the only configured notification target). Setting either to "" disables.
@@ -17,7 +28,7 @@
 # `roles/billing.costsManager` (or roles/monitoring.notificationChannelEditor)
 # on the project to write to the Cloud Monitoring channel. If the budget
 # resource creates successfully but you never get email, that's the cause —
-# bind the Cloud Billing budget service agent
+# bind the Cloud Billing budget service account
 # (service-<NUMBER>@gcp-sa-billingbudgets.iam.gserviceaccount.com) to the
 # missing role. GCP usually handles this auto-binding on first budget create.
 # ------------------------------------------------------------------------------

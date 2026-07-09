@@ -46,6 +46,14 @@ def _default_no_migration_pr(mocker):
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         AsyncMock(return_value=("ok", None)),
     )
+    # Prevent the status handler from hitting the real GitHub API to verify
+    # PR base branches when a task completes with a PULL_REQUEST artifact.
+    # In test, the repo doesn't exist and the token is fake — mock it to
+    # return a valid base branch on the task payload so validation passes.
+    mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(return_value={"base": {"ref": "main"}}),
+    )
 
 
 def _naive_utcnow() -> datetime:

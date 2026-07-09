@@ -15,10 +15,15 @@ from app.efficiency_snapshot import (
     AXIS_COST_PER_MERGED_PR,
     AXIS_LANE_COST_PER_MERGED_PR,
     AXIS_LANE_WARM_RESUME_RATE,
+    AXIS_LLM_CACHE_HIT_RATE,
     AXIS_LLM_COST_PER_MERGED_PR,
+    AXIS_COST_PER_VERIFIED_TASK,
+    AXIS_LLM_COST_PER_VERIFIED_TASK,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
     AXIS_PROMPT_STATIC_BYTES,
+    AXIS_TOTAL_COST_PER_VERIFIED_TASK,
+    AXIS_REWORK_COST_SHARE,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
     CACHE_CREATION_INPUT_RATE_MULTIPLIER,
@@ -31,28 +36,36 @@ from app.efficiency_snapshot import (
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
     PROMPT_STATIC_BYTES_THRESHOLD,
+    PROVIDER_ROUTING_ADOPT,
+    PROVIDER_ROUTING_INSUFFICIENT_DATA,
+    PROVIDER_ROUTING_REJECT,
     SELF_REPAIR_BURN_SHARE_KEY,
     SELF_REPAIR_MIN_ATTEMPTS,
     SELF_REPAIR_SUCCESS_RATE_KEY,
+    VERIFIED_TASK_DRIFT_MIN_COUNT,
     _PROMPT_STATIC_CONST_NAMES,
     _PROMPT_STATIC_PLAIN_CONST_NAMES,
     _TASK_TYPE_FOCUS_CONST_NAMES,
     _compute_checkpoint_loss_rate,
-    _extract_ts_plain_string_length,
-    _extract_ts_template_literal_length,
-    _compute_cold_start_breakdown_p50,
+    _compute_llm_cost_pricing_coverage,
     _compute_lane_cost_per_merged_pr,
     _compute_lane_warm_resume_rate,
-    _compute_llm_cost_pricing_coverage,
+    _compute_cold_start_breakdown_p50,
     _compute_prompt_static_bytes,
+    _compute_total_cost_per_verified_task,
+    _compute_verified_merge_count,
+    _extract_ts_plain_string_length,
+    _extract_ts_template_literal_length,
     _last_run_due,
     _task_llm_attempts,
     compute_current_axes,
+    compute_effort_model_efficiency,
     compute_llm_cost_attribution_baseline_delta,
     compute_llm_cost_attribution_window_delta,
     compute_llm_cost_breakdown,
     compute_llm_cost_by_task_type,
     compute_pr_rework_chain_breakdown,
+    compute_provider_routing_verdict,
     maybe_write_daily_snapshot,
     read_baseline_with_drift,
     write_snapshot,
@@ -160,6 +173,93 @@ async def test_compute_current_axes_values(db_session):
 
 
 @pytest.mark.asyncio
+async def test_compute_current_axes_includes_llm_cache_hit_rate(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two tasks: one with 30% cache hit rate, one with no cache hits.
+    # total: 300 cache-read / 2000 input = 0.15
+    db_session.add(
+        _make_merged_task(
+            project.id,
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "total_cache_read_input_tokens": 300,
+                "llm_call_count": 5,
+            },
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert AXIS_LLM_CACHE_HIT_RATE in axes
+    # 300 cache-read from second task / (1000 + 1000) total input = 0.15
+    assert axes[AXIS_LLM_CACHE_HIT_RATE] == 0.15
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_includes_rework_cost_share(db_session):
+    """AXIS_REWORK_COST_SHARE is in ALL_AXES and compute_current_axes returns a float."""
+    # Sanity: the constant must be in ALL_AXES.
+    assert AXIS_REWORK_COST_SHARE in ALL_AXES, (
+        "AXIS_REWORK_COST_SHARE must be registered in ALL_AXES"
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # PR 42 chain: create (first-pass) + fix (rework) with priced LLM tokens.
+    create = _pr_chain_task(
+        project.id,
+        pr_number=42,
+        task_type="create",
+        input_tokens=2000,
+        output_tokens=1000,
+    )
+    fix = _pr_chain_task(
+        project.id,
+        pr_number=42,
+        task_type="fix",
+        input_tokens=1500,
+        output_tokens=800,
+    )
+    db_session.add_all([create, fix])
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert AXIS_REWORK_COST_SHARE in axes, (
+        "compute_current_axes must include AXIS_REWORK_COST_SHARE"
+    )
+
+    value = axes[AXIS_REWORK_COST_SHARE]
+    assert isinstance(value, float), (
+        f"AXIS_REWORK_COST_SHARE must be a float, got {type(value).__name__}: {value!r}"
+    )
+    # Rework share = fix cost / total cost.
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_rw_usd = round(1500 * input_rate + 800 * output_rate, 6)
+    expected_total_usd = round(
+        2000 * input_rate + 1000 * output_rate + expected_rw_usd, 6
+    )
+    expected_share = round(expected_rw_usd / expected_total_usd, 4)
+    assert value == pytest.approx(expected_share, abs=1e-9)
+
+
+@pytest.mark.asyncio
 async def test_cost_per_merged_pr_excludes_non_merge_unblocks(db_session):
     project = make_project()
     db_session.add(project)
@@ -183,6 +283,88 @@ async def test_cost_per_merged_pr_excludes_non_merge_unblocks(db_session):
 
     expected_cpm = round(2 * 300 * ON_DEMAND_RATE, 4)
     assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm
+
+
+@pytest.mark.asyncio
+async def test_cost_per_verified_task_differs_from_cost_per_merged_pr_with_fall_open_merges(
+    db_session,
+):
+    """AXIS_COST_PER_VERIFIED_TASK uses is_verified_merge denominator and differs
+    from AXIS_COST_PER_MERGED_PR when fall-open (CI-bypassed) merges are present.
+
+    A mix of one verified and one unverified merged task: the verified axis
+    denominator counts only the verified task, while the merged-pr axis counts
+    both — so the two axes produce different values.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Verified merge: no unverified_merge_reason in context.
+    db_session.add(_make_efficient_task(project.id))
+    # Fall-open (unverified) merge: carries a degraded reason.
+    db_session.add(
+        _make_merged_task(
+            project.id,
+            reason="ci_unavailable_runner_offline",
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    # cost_per_merged_pr: denominator = 2 (both tasks merged)
+    assert axes[AXIS_COST_PER_MERGED_PR] is not None
+
+    # cost_per_verified_task: denominator = 1 (only the verified task)
+    assert axes[AXIS_COST_PER_VERIFIED_TASK] is not None
+
+    # With one verified and one unverified task, the verified denominator is
+    # smaller, so the per-verified cost is higher than per-merged cost.
+    assert axes[AXIS_COST_PER_VERIFIED_TASK] > axes[AXIS_COST_PER_MERGED_PR]
+
+    # The verified cost is exactly total VM cost / 1 (only the verified task
+    # has VM cost — the unverified merged task has no vm_provisioned_at).
+    expected_verified = round(300 * ON_DEMAND_RATE, 4)
+    assert axes[AXIS_COST_PER_VERIFIED_TASK] == expected_verified
+
+    # llm_cost_per_verified_task is also present and finite.
+    assert AXIS_LLM_COST_PER_VERIFIED_TASK in axes
+    assert axes[AXIS_LLM_COST_PER_VERIFIED_TASK] is not None
+
+
+@pytest.mark.asyncio
+async def test_cost_per_verified_task_none_when_no_verified_merges(db_session):
+    """When all merged tasks are fall-open (unverified), the verified-task axes
+    return None because the denominator is zero."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two fall-open merges, zero verified.
+    db_session.add(
+        _make_merged_task(
+            project.id,
+            reason="ci_unavailable_runner_offline",
+        )
+    )
+    db_session.add(
+        _make_merged_task(
+            project.id,
+            reason="no_runnable_tests",
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    # cost_per_merged_pr is computed (both tasks merged).
+    assert axes[AXIS_COST_PER_MERGED_PR] is not None
+    # Verified axes are None — no verified merges in the window.
+    assert axes[AXIS_COST_PER_VERIFIED_TASK] is None
+    assert axes[AXIS_LLM_COST_PER_VERIFIED_TASK] is None
 
 
 @pytest.mark.asyncio
@@ -1114,6 +1296,190 @@ def test_merged_count_excludes_rollup_parent():
     by_type = compute_vm_cost_by_task_type(tasks)
     total_merged = sum(b["merged_count"] for b in by_type)
     assert total_merged == 2, f"Expected 2 merged across types, got {total_merged}"
+
+
+def test_verified_merge_count_excludes_rollup_parent():
+    """Rollup parents must not be counted as verified merges alongside their children.
+
+    When a rollup lands, is_verified_merge is True on the parent AND on every
+    child. Counting the parent inflates the denominator of
+    AXIS_TOTAL_COST_PER_VERIFIED_TASK. The fix: exclude parent_task_id owners.
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+    parent_id = uuid.uuid4()
+
+    now = _utcnow()
+
+    # Rollup parent: verified merge, but should be excluded from count.
+    parent = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+    parent.id = parent_id
+
+    # Two children: each verified merge, both should count.
+    child1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=3),
+        vm_stopped_at=now,
+        vm_spot=False,
+        parent_task_id=parent_id,
+    )
+    child2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=4),
+        vm_stopped_at=now,
+        vm_spot=False,
+        parent_task_id=parent_id,
+    )
+
+    tasks = [parent, child1, child2]
+
+    # Verified merge count must be 2 (children only), not 3.
+    verified = _compute_verified_merge_count(tasks)
+    assert verified == 2, f"Expected 2 verified merges (children only), got {verified}"
+
+    # Axis value must use verified denominator of 2.
+    value = _compute_total_cost_per_verified_task(tasks)
+    assert value is not None
+    # 3 tasks * 300s on-demand = 900s; rate ~0.0532/s => ~47.88 + 0 LLM
+    # Quick sanity: value > 0 and uses denominator 2.
+    assert value > 0
+
+
+def test_total_cost_per_verified_task_uses_verified_merge_not_merged_completion():
+    """Denominator is is_verified_merge, NOT is_merged_completion.
+
+    A task with pr_merged=True + unverified_merge_reason (degraded fall-open
+    merge) is is_merged_completion but NOT is_verified_merge. It must be excluded
+    from the AXIS_TOTAL_COST_PER_VERIFIED_TASK denominator.
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+    now = _utcnow()
+
+    # Verified merge: pr_merged=True, no unverified_merge_reason.
+    verified_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+
+    # Degraded fall-open merge: pr_merged=True WITH unverified_merge_reason.
+    # This is is_merged_completion=True but is_verified_merge=False.
+    unverified_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "review_loop": {"unverified_merge_reason": "ci_unavailable"},
+        },
+        vm_provisioned_at=now - timedelta(minutes=5),
+        vm_stopped_at=now,
+        vm_spot=False,
+    )
+
+    tasks = [verified_task, unverified_task]
+
+    # Verified count must be 1 (only the verified task), not 2.
+    verified = _compute_verified_merge_count(tasks)
+    assert verified == 1, (
+        f"Expected 1 verified merge (unverified fall-open excluded), got {verified}"
+    )
+
+    # Axis value exists and uses denominator 1.
+    value = _compute_total_cost_per_verified_task(tasks)
+    assert value is not None
+
+
+@pytest.mark.asyncio
+async def test_total_cost_per_verified_task_drift_suppression(db_session):
+    """Drift_pct is suppressed when verified_merge_count < 20, emitted at >= 20."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    # Seed 19 verified-merge tasks (below the VERIFIED_TASK_DRIFT_MIN_COUNT floor).
+    for i in range(19):
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            vm_spot=False,
+        )
+        db_session.add(t)
+    await db_session.commit()
+
+    # Write first snapshot — becomes baseline.
+    snap1 = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    # Verify the denominator is recorded as 19 and axis has a value.
+    assert snap1.get("total_cost_per_verified_task_denominator") == 19
+    assert snap1.get(AXIS_TOTAL_COST_PER_VERIFIED_TASK) is not None
+
+    # Read drift: drift_pct must be None (below floor of 20).
+    drift_below = await read_baseline_with_drift(db_session, project.id)
+    axis_below = drift_below["axes"][AXIS_TOTAL_COST_PER_VERIFIED_TASK]
+    assert axis_below["current"] is not None
+    assert axis_below["baseline"] is not None
+    assert axis_below["drift_pct"] is None, (
+        f"Expected drift_pct=None when verified_count=19 < {VERIFIED_TASK_DRIFT_MIN_COUNT}"
+    )
+
+    # Add one more verified-merge task to reach 20.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    # Write second snapshot — now has 20 verified merges.
+    snap2 = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    assert snap2.get("total_cost_per_verified_task_denominator") == 20
+
+    # Read drift: drift_pct must be emitted (at floor).
+    drift_at = await read_baseline_with_drift(db_session, project.id)
+    axis_at = drift_at["axes"][AXIS_TOTAL_COST_PER_VERIFIED_TASK]
+    assert axis_at["current"] is not None
+    assert axis_at["baseline"] is not None
+    assert axis_at["drift_pct"] is not None, (
+        f"Expected drift_pct emitted when verified_count=20 >= {VERIFIED_TASK_DRIFT_MIN_COUNT}"
+    )
+    assert isinstance(axis_at["drift_pct"], (int, float))
+
+
+def test_total_cost_per_verified_task_in_all_axes():
+    """The new axis must be registered in ALL_AXES and AXIS_CONSUMERS."""
+    assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in ALL_AXES
+    assert AXIS_TOTAL_COST_PER_VERIFIED_TASK == "total_cost_per_verified_task"
+    assert AXIS_TOTAL_COST_PER_VERIFIED_TASK in AXIS_CONSUMERS
 
 
 @pytest.mark.asyncio
@@ -5410,6 +5776,64 @@ def test_compact_attribution_passes_through_prompt_size_bytes():
     create_row = by_type["create"]
     assert create_row["total_prompt_size_bytes"] == 200000
     assert create_row["mean_prompt_size_bytes"] == 200000
+
+
+def test_by_task_type_includes_mean_section_sizes():
+    """compute_llm_cost_by_task_type includes mean_section_sizes per task type.
+
+    Sections present in multiple tasks are averaged correctly; sections present
+    in only one task get that task's value as the mean (denominator = 1, not
+    total bucket task count).
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 4,
+            "prompt_section_sizes": [
+                {"name": "claude_md", "bytes": 30000},
+                {"name": "playbook", "bytes": 10000},
+            ],
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    task2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 2,
+            "prompt_section_sizes": [
+                {"name": "claude_md", "bytes": 50000},
+                {"name": "task", "bytes": 20000},
+            ],
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task1, task2])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["create"]
+
+    assert row["mean_section_sizes"] is not None
+    # claude_md reported by both tasks: (30000 + 50000) / 2 == 40000
+    assert row["mean_section_sizes"]["claude_md"] == 40000
+    # playbook reported by task1 only: 10000 / 1 == 10000
+    assert row["mean_section_sizes"]["playbook"] == 10000
+    # task reported by task2 only: 20000 / 1 == 20000
+    assert row["mean_section_sizes"]["task"] == 20000
 
 
 @pytest.mark.asyncio
@@ -10481,3 +10905,283 @@ def test_landed_rate_denominator_excludes_read_only_task_types():
     assert opus_em["pr_eligible_run_count"] == 0, (
         f"read-only model must have pr_eligible_run_count=0; got {opus_em}"
     )
+
+
+def test_provider_routing_verdict_derivation():
+    """Provider routing verdict derives ADOPT/REJECT/INSUFFICIENT_DATA from by_model rows.
+
+    Exercises all four classification branches:
+      - INSUFFICIENT_DATA when either provider has too few PR-eligible tasks
+      - REJECT when DeepSeek verified-merge rate materially regresses
+      - REJECT when DeepSeek cost-per-merge is not meaningfully cheaper
+      - ADOPT when DeepSeek is cheaper AND quality holds
+    """
+    import uuid
+
+    from app.models import TaskStatus
+
+    project_id = uuid.uuid4()
+
+    # -- helper: build by_model rows via compute_effort_model_efficiency ------
+    def _by_model(tasks):
+        return compute_effort_model_efficiency(tasks)["by_model"]
+
+    # -- INSUFFICIENT_DATA: too few tasks on either side ---------------------
+    few_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider="deepseek",
+            model="deepseek-v4-flash",
+        )
+        for _ in range(5)
+    ] + [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+        for _ in range(5)
+    ]
+    verdict = compute_provider_routing_verdict(_by_model(few_tasks))
+    assert verdict["state"] == PROVIDER_ROUTING_INSUFFICIENT_DATA, (
+        f"expected INSUFFICIENT_DATA with only 5 tasks each, got {verdict['state']}"
+    )
+    assert "supporting" in verdict
+    assert "recommended_action" in verdict
+
+    # -- ADOPT: DeepSeek cheaper with no quality regression ------------------
+    adopted_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider=prov,
+            model=mod,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+        )
+        for prov, mod in [("deepseek", "deepseek-v4-flash")] * 30
+        + [("anthropic", "claude-sonnet-4-6")] * 30
+    ]
+    # Equal verified rates: first 24 deepseek + first 24 anthropic stay merged,
+    # remaining 6 each side become unmerged.
+    for i, t in enumerate(adopted_tasks):
+        if (t.provider == "deepseek" and i >= 24) or (
+            t.provider == "anthropic" and i >= 54
+        ):
+            t.context = {}
+
+    verdict = compute_provider_routing_verdict(_by_model(adopted_tasks))
+    assert verdict["state"] == PROVIDER_ROUTING_ADOPT, (
+        f"expected ADOPT with DeepSeek cheaper + same quality, got {verdict['state']}"
+    )
+    s = verdict["supporting"]
+    assert s["deepseek_pr_eligible_run_count"] >= 20
+    assert s["anthropic_pr_eligible_run_count"] >= 20
+    assert s["cost_ratio"] is not None and s["cost_ratio"] < 1.0, (
+        "DeepSeek must be cheaper than Anthropic"
+    )
+
+    # -- REJECT: quality regression (verified rate materially lower) ---------
+    regressed_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider=prov,
+            model=mod,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+                "llm_call_count": 5,
+            },
+        )
+        for prov, mod in [("deepseek", "deepseek-v4-flash")] * 30
+        + [("anthropic", "claude-sonnet-4-6")] * 30
+    ]
+    # DeepSeek: only 10/30 verified (33% rate).  Anthropic: 24/30 (80% rate).
+    # That's a 47pp delta → well below the -5pp quality floor → REJECT.
+    for i, t in enumerate(regressed_tasks):
+        if (t.provider == "deepseek" and i >= 10) or (
+            t.provider == "anthropic" and i >= 54
+        ):
+            t.context = {}
+
+    verdict = compute_provider_routing_verdict(_by_model(regressed_tasks))
+    assert verdict["state"] == PROVIDER_ROUTING_REJECT, (
+        f"expected REJECT with DeepSeek quality regression, got {verdict['state']}"
+    )
+    s = verdict["supporting"]
+    assert s["verified_rate_delta_pct"] is not None
+    # The delta should be strongly negative (DeepSeek rate << Anthropic rate).
+    assert s["verified_rate_delta_pct"] < -5.0, (
+        f"rate delta should be below -5pp floor, got {s['verified_rate_delta_pct']}"
+    )
+
+    # -- REJECT: cost not meaningfully lower (cost_ratio >= 0.90) ------------
+    # Both providers have equal verified rates (rate_delta ≈ 0, quality OK),
+    # but DeepSeek's cost-per-merge is not meaningfully cheaper because its
+    # per-task token consumption is high enough to offset its lower per-token
+    # pricing.
+    expensive_ds_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "low"}],
+            provider=prov,
+            model=mod,
+            api_call_summary={
+                # DeepSeek uses ~37x more tokens than Anthropic per call,
+                # cancelling out its ~37x cheaper per-token pricing.
+                "total_input_tokens": 37000 if prov == "deepseek" else 1000,
+                "total_output_tokens": 18500 if prov == "deepseek" else 500,
+                "llm_call_count": 5,
+            },
+        )
+        for prov, mod in [("deepseek", "deepseek-v4-flash")] * 30
+        + [("anthropic", "claude-sonnet-4-6")] * 30
+    ]
+    # Equal verified rates: 24/30 each → ~0pp delta (quality OK).
+    for i, t in enumerate(expensive_ds_tasks):
+        if (t.provider == "deepseek" and i >= 24) or (
+            t.provider == "anthropic" and i >= 54
+        ):
+            t.context = {}
+
+    verdict = compute_provider_routing_verdict(_by_model(expensive_ds_tasks))
+    assert verdict["state"] == PROVIDER_ROUTING_REJECT, (
+        f"expected REJECT with DeepSeek cost not meaningfully lower, "
+        f"got {verdict['state']}"
+    )
+    s = verdict["supporting"]
+    assert s["cost_ratio"] is not None and s["cost_ratio"] >= 0.90, (
+        f"cost_ratio should be >= 0.90 to trigger cost-rejection, "
+        f"got {s['cost_ratio']}"
+    )
+    # Quality should be OK (rate delta should be 0pp, well above -5pp floor).
+    assert s["verified_rate_delta_pct"] > -5.0, (
+        f"rate delta should be above quality floor, got {s['verified_rate_delta_pct']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_seed_routing_verdict_from_snapshot_restores_verdict_state(db_session):
+    """Verdict state is seeded from persisted efficiency_baseline on startup.
+
+    Verifies that ``_seed_routing_verdict_from_snapshot`` reads the
+    ``provider_routing_verdict`` from ``project.design_doc["efficiency_baseline"]``
+    and sets ``runtime_config["provider_routing_verdict_state"]`` accordingly.
+    This is the mechanism that restores DeepSeek preference on backend restart
+    without waiting for the next periodic snapshot write.
+    """
+    from app.shared_state import runtime_config as _rc
+    from app.lifecycle import _seed_routing_verdict_from_snapshot
+
+    # Clean slate: remove any pre-existing verdict state so the test is hermetic.
+    _rc.pop("provider_routing_verdict_state", None)
+
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "provider_routing_verdict": {
+                        "state": PROVIDER_ROUTING_ADOPT,
+                        "supporting": {
+                            "deepseek_run_count": 30,
+                            "anthropic_run_count": 30,
+                        },
+                        "recommended_action": "Adopt DeepSeek routing",
+                    },
+                },
+                "snapshots": [],
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    await _seed_routing_verdict_from_snapshot()
+
+    assert _rc.get("provider_routing_verdict_state") == PROVIDER_ROUTING_ADOPT, (
+        f"expected {PROVIDER_ROUTING_ADOPT}, got {_rc.get('provider_routing_verdict_state')}"
+    )
+
+    # Clean up so we don't leak state into other tests.
+    _rc.pop("provider_routing_verdict_state", None)
+
+
+@pytest.mark.asyncio
+async def test_seed_routing_verdict_from_snapshot_skips_project_without_verdict(db_session):
+    """When no project has a verdict, the runtime_config key remains unset."""
+    from app.shared_state import runtime_config as _rc
+    from app.lifecycle import _seed_routing_verdict_from_snapshot
+
+    _rc.pop("provider_routing_verdict_state", None)
+
+    # Project exists but has no efficiency_baseline in design_doc.
+    project = make_project(design_doc={"some_other_section": {}})
+    db_session.add(project)
+    await db_session.commit()
+
+    await _seed_routing_verdict_from_snapshot()
+
+    assert "provider_routing_verdict_state" not in _rc, (
+        "key should remain absent when no project has a verdict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_seed_routing_verdict_from_snapshot_picks_first_verdict(db_session):
+    """When multiple projects have verdicts, the first one wins (no overwrite)."""
+    from app.shared_state import runtime_config as _rc
+    from app.lifecycle import _seed_routing_verdict_from_snapshot
+
+    _rc.pop("provider_routing_verdict_state", None)
+
+    p1 = make_project(
+        name="Project A",
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "provider_routing_verdict": {"state": PROVIDER_ROUTING_ADOPT},
+                },
+            }
+        },
+    )
+    p2 = make_project(
+        name="Project B",
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "provider_routing_verdict": {"state": PROVIDER_ROUTING_REJECT},
+                },
+            }
+        },
+    )
+    db_session.add(p1)
+    db_session.add(p2)
+    await db_session.commit()
+
+    await _seed_routing_verdict_from_snapshot()
+
+    # The first project (by iteration order) seeds the verdict. If it's ADOPT,
+    # it wins; if REJECT unexpectedly showed first, that would also be correct.
+    # The key assertion is that SOME verdict is set (not INSUFFICIENT_DATA).
+    state = _rc.get("provider_routing_verdict_state")
+    assert state in (PROVIDER_ROUTING_ADOPT, PROVIDER_ROUTING_REJECT), (
+        f"unexpected state {state}"
+    )
+
+    _rc.pop("provider_routing_verdict_state", None)

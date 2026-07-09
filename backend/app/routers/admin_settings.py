@@ -130,6 +130,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "compute_experiment_spend_threshold_usd",
         "cross_provider_fallback_enabled",
         "daily_cost_ceiling_usd",
+        "monthly_budget_target_usd",
         "deploy_repo_identity",
         "drift_over_claim_consistency_threshold",
         "drift_over_claim_min_claims",
@@ -332,6 +333,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "SPEND_HOLD_EXPIRING",
                 "RUNNER_DEACTIVATED",
                 "RUNNER_DEGRADED",
+                "RUNNER_DEGRADED_ESCALATED",
                 "RUNNER_FLEET_OFFLINE",
                 "RUNNER_LOW_DISK",
                 "RUNNER_OUTAGE_ESCALATED",
@@ -705,6 +707,9 @@ async def get_settings(
         "github_account": github_account,
         "require_approval_gates": _runtime_config.get("require_approval_gates", True),
         "daily_cost_ceiling_usd": _runtime_config.get("daily_cost_ceiling_usd", 0),
+        "monthly_budget_target_usd": float(
+            _runtime_config.get("monthly_budget_target_usd", 0)
+        ),
         "compute_experiment_spend_threshold_usd": _runtime_config.get(
             "compute_experiment_spend_threshold_usd", 10.0
         ),
@@ -747,6 +752,7 @@ async def get_settings(
                         "SPEND_HOLD_EXPIRING",
                         "RUNNER_DEACTIVATED",
                         "RUNNER_DEGRADED",
+                        "RUNNER_DEGRADED_ESCALATED",
                         "RUNNER_FLEET_OFFLINE",
                         "RUNNER_LOW_DISK",
                         "RUNNER_OUTAGE_ESCALATED",
@@ -2690,6 +2696,19 @@ async def _apply_settings(
                 detail="daily_cost_ceiling_usd must be between 0 and 100000 (0 = disabled)",
             )
         _runtime_config["daily_cost_ceiling_usd"] = val
+    if "monthly_budget_target_usd" in payload:
+        try:
+            val = float(payload["monthly_budget_target_usd"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="monthly_budget_target_usd must be a number"
+            )
+        if not (0 <= val <= 100000):
+            raise HTTPException(
+                status_code=400,
+                detail="monthly_budget_target_usd must be between 0 and 100000 (0 = disabled)",
+            )
+        _runtime_config["monthly_budget_target_usd"] = val
     if "compute_experiment_spend_threshold_usd" in payload:
         try:
             val = float(payload["compute_experiment_spend_threshold_usd"])
@@ -2965,6 +2984,7 @@ async def _apply_settings(
                 # re-page threshold), so they join the default-on list below.
                 "RUNNER_DEACTIVATED",
                 "RUNNER_DEGRADED",
+                "RUNNER_DEGRADED_ESCALATED",
                 "RUNNER_FLEET_OFFLINE",
                 "RUNNER_LOW_DISK",
                 "RUNNER_OUTAGE_ESCALATED",
@@ -2986,6 +3006,7 @@ async def _apply_settings(
                 "SPEND_HOLD_EXPIRING",
                 "RUNNER_DEACTIVATED",
                 "RUNNER_DEGRADED",
+                "RUNNER_DEGRADED_ESCALATED",
                 "RUNNER_FLEET_OFFLINE",
                 "RUNNER_LOW_DISK",
                 "RUNNER_OUTAGE_ESCALATED",
@@ -3204,6 +3225,9 @@ async def _apply_settings(
                     ),
                     "daily_cost_ceiling_usd": _runtime_config.get(
                         "daily_cost_ceiling_usd", 0
+                    ),
+                    "monthly_budget_target_usd": float(
+                        _runtime_config.get("monthly_budget_target_usd", 0)
                     ),
                     "compute_experiment_spend_threshold_usd": _runtime_config.get(
                         "compute_experiment_spend_threshold_usd", 10.0
@@ -3429,6 +3453,7 @@ async def _apply_settings(
                                 "SPEND_HOLD_EXPIRING",
                                 "RUNNER_DEACTIVATED",
                                 "RUNNER_DEGRADED",
+                                "RUNNER_DEGRADED_ESCALATED",
                                 "RUNNER_FLEET_OFFLINE",
                                 "RUNNER_LOW_DISK",
                                 "RUNNER_OUTAGE_ESCALATED",

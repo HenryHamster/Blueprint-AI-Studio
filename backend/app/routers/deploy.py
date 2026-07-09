@@ -451,4 +451,4 @@ async def get_zone_health_endpoint(
     """Get GCP zone health status for VM provisioning."""
     from app.compute import get_zone_health
 
-    return get_zone_health()
+    return await asyncio.to_thread(get_zone_health)

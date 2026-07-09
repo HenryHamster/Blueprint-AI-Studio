@@ -758,6 +758,142 @@ def do_uninstall(*, system: bool = False, dry_run: bool = False, _run=subprocess
     return 0
 
 
+# ── update (efficient self-update via git) ─────────────────────────────────────
+#
+# `blueprint-runner update` fetches the latest commits from origin, fast-forwards
+# the local branch if it is behind, and conditionally reinstalls npm dependencies
+# only when a lockfile changed — no full reinstall on every update.
+
+
+def _git(args: list[str], *, cwd: str, _run=subprocess.run) -> subprocess.CompletedProcess | None:
+    """Run a git subcommand and return the result, or None on any failure.
+
+    Returns None (never raises) when git is absent, the cwd is not a repo, or a
+    timeout / OSError occurs — a failure here must never crash the launcher.
+    """
+    try:
+        return _run(
+            ["git"] + args,
+            capture_output=True, text=True, timeout=30,
+            cwd=cwd,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def do_update(
+    *,
+    repo_root: str = _REPO_ROOT,
+    _run=subprocess.run,
+) -> int:
+    """Update the local checkout: fetch, fast-forward, reinstall deps if needed.
+
+    Steps:
+      1. ``git fetch origin`` — get latest refs (non-fatal: None if not a repo).
+      2. Read the local HEAD (``git rev-parse HEAD``).
+      3. Read the upstream tracking ref (``git rev-parse @{u}``).
+      4. If local == tracked  → nothing to do (exit 0).
+      5. If local is ahead/diverged → warn and abort (can't fast-forward safely).
+      6. ``git merge --ff-only @{u}`` — fast-forward to upstream.
+      7. ``git diff --name-only <old-head>..HEAD`` — list changed files.
+      8. If any ``package-lock.json`` is among the changed files, run ``npm ci``
+         in the containing directory (only that lockfile's project).
+      9. Report what was updated.
+
+    Returns 0 on success or nothing-to-do, 1 on any failure.
+    """
+    print("[blueprint-runner] checking for updates...", flush=True)
+
+    # Step 1: fetch origin
+    fetch = _git(["fetch", "origin"], cwd=repo_root, _run=_run)
+    if fetch is None or fetch.returncode != 0:
+        print("ERROR: could not run git — is this a git repository?", file=sys.stderr, flush=True)
+        return 1
+
+    # Step 2: current HEAD
+    head_result = _git(["rev-parse", "HEAD"], cwd=repo_root, _run=_run)
+    if head_result is None or head_result.returncode != 0:
+        print("ERROR: could not resolve HEAD — not a git repository?", file=sys.stderr, flush=True)
+        return 1
+    old_head = head_result.stdout.strip()
+
+    # Step 3: upstream tracking ref
+    upstream_result = _git(["rev-parse", "@{u}"], cwd=repo_root, _run=_run)
+    if upstream_result is None or upstream_result.returncode != 0:
+        print("ERROR: no upstream tracking branch configured. Push first, then update.", file=sys.stderr, flush=True)
+        return 1
+    upstream_sha = upstream_result.stdout.strip()
+
+    if old_head == upstream_sha:
+        print("[blueprint-runner] already up to date — nothing to pull.", flush=True)
+        return 0
+
+    # Step 4: check if we are ahead or diverged
+    merge_base = _git(["merge-base", old_head, upstream_sha], cwd=repo_root, _run=_run)
+    if merge_base and merge_base.returncode == 0:
+        base_sha = merge_base.stdout.strip()
+        if base_sha == upstream_sha:
+            # local HEAD is a descendant of upstream → local is ahead
+            print(
+                "[blueprint-runner] local branch is AHEAD of origin — push first, or defer update.",
+                flush=True,
+            )
+            return 1
+        if base_sha != old_head:
+            # merge-base is neither HEAD nor upstream → diverged
+            print(
+                "[blueprint-runner] local and origin have DIVERGED — "
+                "cannot fast-forward. Rebase or reset, then re-run update.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+
+    # Step 5: fast-forward
+    branch_result = _git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd=repo_root, _run=_run)
+    branch = branch_result.stdout.strip() if branch_result else "current branch"
+    print(f"[blueprint-runner] pulling {branch}: "
+          f"{old_head[:10]}..{upstream_sha[:10]}", flush=True)
+    merge = _git(["merge", "--ff-only", "@{u}"], cwd=repo_root, _run=_run)
+    if merge is None or merge.returncode != 0:
+        stderr = (merge.stderr if merge else "") or ""
+        print(f"ERROR: fast-forward merge failed:\n{stderr}", file=sys.stderr, flush=True)
+        return 1
+
+    print("[blueprint-runner] updated to", upstream_sha[:10], flush=True)
+
+    # Step 6: changed files between old and new HEAD
+    changed = _git(["diff", "--name-only", f"{old_head}..HEAD"], cwd=repo_root, _run=_run)
+    if changed and changed.returncode == 0 and changed.stdout.strip():
+        changed_files = changed.stdout.strip().splitlines()
+        # Find which directories have a modified package-lock.json
+        for cf in changed_files:
+            if cf.endswith("/package-lock.json") or cf == "package-lock.json":
+                lock_dir = os.path.dirname(os.path.join(repo_root, cf))
+                print(
+                    f"[blueprint-runner] {cf} changed — reinstalling npm dependencies in {lock_dir}...",
+                    flush=True,
+                )
+                try:
+                    result = _run(
+                        ["npm", "ci"], cwd=lock_dir, timeout=120,
+                    )
+                    if result.returncode != 0:
+                        print(
+                            f"WARNING: npm ci in {lock_dir} exited {result.returncode}. "
+                            "Agent may not work until dependencies are installed manually.",
+                            file=sys.stderr, flush=True,
+                        )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    print(
+                        f"WARNING: could not run npm ci in {lock_dir}: {exc}",
+                        file=sys.stderr, flush=True,
+                    )
+
+    print("[blueprint-runner] update complete.", flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="blueprint-runner",
@@ -767,7 +903,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(
-        dest="command", metavar="{start,check,install,uninstall}"
+        dest="command", metavar="{start,check,install,uninstall,update}"
     )
     for name, help_text in (
         ("start", "Run the runner (blocks; Ctrl-C for graceful shutdown)."),
@@ -873,6 +1009,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Print the commands that would run, without touching the host.",
     )
+
+    sub.add_parser(
+        "update",
+        help="Update the local checkout and reinstall dependencies only when needed.",
+    )
     return parser
 
 
@@ -883,6 +1024,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.command:
         parser.print_help()
         return 2
+
+    if args.command == "update":
+        return do_update()
 
     if args.command == "uninstall":
         return do_uninstall(

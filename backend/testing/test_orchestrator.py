@@ -364,6 +364,110 @@ def test_degraded_runner_deprioritized_in_dispatch():
     )
 
 
+# ── DeepSeek routing preference invariant ───────────────────────────────────
+
+
+def test_deepseek_preferred_routing_for_low_medium_effort():
+    """DeepSeek must be the first-position provider for low/medium-effort
+    categories (_default, initiative, build, ops) in the routing defaults.
+
+    The preference matters because ``provider_selection_mode`` is
+    ``"preferred"`` by default, which means the first listed provider is
+    always tried first.  Regressing this ordering would silently shift
+    low/medium-effort task traffic to a more expensive provider without any
+    config change.
+    """
+    from app.runtime_config_state import (
+        _validate_deepseek_routing_invariant,
+        _backfill_provider_runtime_defaults,
+        runtime_config,
+    )
+
+    # ---- 1. Default runtime_config passes validation ----
+    warnings = _validate_deepseek_routing_invariant(runtime_config)
+    assert warnings == [], (
+        f"default runtime_config must have DeepSeek first for all "
+        f"low/medium-effort categories; got warnings: {warnings}"
+    )
+
+    # ---- 2. Per-category default providers confirm DeepSeek is first ----
+    cat_routing = runtime_config.get("category_routing", {})
+    deepseek_first = {"_default", "initiative", "build", "ops"}
+    for category in deepseek_first:
+        providers = cat_routing[category]["providers"]
+        assert providers[0] == "deepseek", (
+            f"category_routing.{category}: expected DeepSeek first, "
+            f"got {providers}"
+        )
+
+    # ---- 3. Review/explicitly-not-low-medium categories do NOT
+    #        require DeepSeek first ----
+    review_providers = cat_routing["review"]["providers"]
+    assert review_providers[0] == "anthropic", (
+        "review category must prefer anthropic (high-effort, not DeepSeek)"
+    )
+    strategic_providers = cat_routing["strategic"]["providers"]
+    assert strategic_providers[0] == "zai", (
+        "strategic category must prefer zai (max-effort, not DeepSeek)"
+    )
+
+    # ---- 4. Validation catches a violated invariant ----
+    bad_config = {
+        "category_routing": {
+            "build": {"providers": ["openai", "deepseek"], "effort": "medium"},
+            "ops": {"providers": ["deepseek"], "effort": "low"},
+            "_default": {"providers": ["gemini"], "effort": "medium"},
+            "initiative": {"providers": [], "effort": "medium"},
+        }
+    }
+    bad_warnings = _validate_deepseek_routing_invariant(bad_config)
+    assert len(bad_warnings) >= 2, (
+        f"expected at least 2 warnings for violated invariants, got {bad_warnings}"
+    )
+    assert any("_default" in w for w in bad_warnings)
+    assert any("build" in w for w in bad_warnings)
+    # ops is fine (deepseek first), initiative has empty list → skipped
+
+    # ---- 5. _backfill_provider_runtime_defaults repairs ordering ----
+    repair_config: dict = {
+        "category_routing": {
+            "build": {"providers": ["openai", "deepseek", "anthropic"], "effort": "medium"},
+            "initiative": {"providers": ["gemini", "deepseek"], "effort": "medium"},
+            "ops": {"providers": ["gemini", "deepseek"], "effort": "low"},
+            "_default": {"providers": ["openai", "gemini"], "effort": "medium"},
+            "strategic": {"providers": ["zai", "anthropic"], "effort": "max"},
+            "review": {"providers": ["anthropic", "openai"], "effort": "high"},
+        },
+        "provider_settings_by_effort": {
+            "deepseek": {
+                "low": {"model": "deepseek-v4-flash"},
+                "medium": {"model": "deepseek-v4-pro"},
+            },
+            "openai": {"medium": {"model": "gpt-5.4-mini"}},
+            "gemini": {"medium": {"model": "gemini-2.5-flash"}},
+            "anthropic": {"medium": {"model": "claude-sonnet-4-6"}},
+            "zai": {"max": {"model": "glm-5.2"}},
+        },
+    }
+    _backfill_provider_runtime_defaults(repair_config)
+    repaired = repair_config["category_routing"]
+    for category in deepseek_first:
+        providers = repaired[category]["providers"]
+        assert providers[0] == "deepseek", (
+            f"after backfill, category_routing.{category} must have DeepSeek "
+            f"first; got {providers}"
+        )
+    # strategic and review must retain their leading providers.
+    assert repaired["strategic"]["providers"][0] == "zai"
+    assert repaired["review"]["providers"][0] == "anthropic"
+
+    # After repair, validation must produce no warnings.
+    post_warnings = _validate_deepseek_routing_invariant(repair_config)
+    assert post_warnings == [], (
+        f"post-repair config must pass validation; got {post_warnings}"
+    )
+
+
 # ── Fixture: reset circuit breaker state for a project ───────────────────────
 
 

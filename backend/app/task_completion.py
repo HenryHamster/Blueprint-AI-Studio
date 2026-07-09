@@ -2683,6 +2683,9 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
         from app.cost_ceiling import check_daily_cost_ceiling
 
         await check_daily_cost_ceiling(task, session)
+        from app.monthly_budget_alerts import check_monthly_budget
+
+        await check_monthly_budget(session)
         job = None
         if registration.wake_source_ref:
             with contextlib.suppress(ValueError, TypeError):
@@ -3410,6 +3413,53 @@ async def _handle_compute_experiment_completion(
     verdict = evaluate_terminal_output(task, logs)
     sweep_id = (task.first_payload or {}).get("sweep_id") or None
 
+    # === Re-entry from compute verification grader ===
+    # When the independent verification grader completes and the verdict is
+    # returned via QUALITY_GRADER_VERDICT_KEY, we process it here and
+    # short-circuit without re-running the full gate logic (since the
+    # resume-logs from _resolve_quality_grader_completion do not contain
+    # the original terminal output).
+    _cv_verdict_key: str | None = None
+    _cv_verdict_val = (task.context or {}).get("compute_verification")
+    _grader_verdict_val = (task.context or {}).get("quality_grader")  # QUALITY_GRADER_VERDICT_KEY
+    _cv_spawned = (task.context or {}).get("compute_verification_spawned")
+
+    if _grader_verdict_val is not None and _cv_verdict_val is None and _cv_spawned:
+        # Re-entry: the independent verification grader returned its verdict.
+        # The task is already COMPLETED (set by _resolve_quality_grader_completion).
+        # Stamp the verdict on context and commit — no need to re-run the gate
+        # or persist knowledge (already done on the first pass).
+        _passed = bool(_grader_verdict_val.get("passed", True))
+        _reason = str(_grader_verdict_val.get("reason", ""))
+        _mode = "advisory"
+        ctx = dict(task.context or {})
+        ctx["compute_verification"] = {
+            "verdict": "confirmed" if _passed else "rejected",
+            "reasoning": _reason,
+            "mode": _mode,
+        }
+        task.context = ctx
+        flag_modified(task, "context")
+        _cv_final_status = TaskStatus.COMPLETED
+        if not _passed and _mode == "hard_gate":
+            _cv_final_status = TaskStatus.FAILED
+            task.status = _cv_final_status
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[COMPUTE] Verification re-entry for task %s: "
+            "verdict=%s, reason=%.200s, mode=%s",
+            task.id,
+            "passed" if _passed else "failed",
+            _reason,
+            _mode,
+        )
+        return
+
+    if _cv_verdict_val is not None:
+        # Already processed — defensive guard; should not reach here.
+        return
+
     # Record the declared success-criterion verdict DURABLY on the task so the
     # operator and strategic consumers can read whether the experiment's goal
     # was actually met — metric/operator/threshold, observed value, met/unmet,
@@ -3739,6 +3789,19 @@ async def _handle_compute_experiment_completion(
                 f"Compute experiment terminal; spawned reason-and-ship "
                 f"follow-on {child.id}"
             )[:500]
+
+    # === Compute experiment independent verification (Checkpoint 1) ===
+    # When enabled and no grader has been spawned yet, spawn an independent
+    # adversarial grader to verify the self-reported result BEFORE the task
+    # completes.  Advisory mode records the verdict without blocking.
+    if final_status is not TaskStatus.EVALUATING:
+        await _maybe_spawn_compute_verification(
+            task, criterion, logs, session,
+        )
+        # _maybe_spawn_compute_verification may set task.context markers
+        # and update final_status via the task object if a grader was spawned.
+        if (task.context or {}).get("compute_verification_spawned"):
+            final_status = TaskStatus.EVALUATING
     task.status = final_status
     logger.info(
         "[COMPUTE] Task %s delivered a compute artifact (status=%s)",
@@ -3972,7 +4035,7 @@ def reconcile_review_second_opinion(
         primary_sigs = {_review_issue_signature(i) for i in (primary_issues or [])}
         challenge_sigs = {_review_issue_signature(i) for i in challenge_issues}
         reconciled_verdict = "REQUEST_CHANGES"
-        if primary_sigs and primary_sigs == challenge_sigs:
+        if primary_sigs == challenge_sigs:
             state = "challenged_confirmed"
             surviving = list(primary_issues or [])
         else:
@@ -3995,6 +4058,56 @@ def reconcile_review_second_opinion(
         "surviving_issues": surviving,
         "challenge_summary": str(panel.get("summary") or "")[:2000],
     }
+
+
+async def _maybe_spawn_compute_verification(
+    task: Task,
+    criterion: Optional[dict],
+    logs: str,
+    session: AsyncSession,
+) -> None:
+    """Spawn an independent verification grader for a compute experiment result.
+
+    Checks the runtime config and single-shot guard before spawning.  If a
+    grader is spawned, this function sets ``task.context["compute_verification_spawned"]``
+    so the caller can detect the EVALUATING transition.  The caller is
+    responsible for setting ``final_status = EVALUATING``.
+
+    Operates in advisory mode only (current implementation): the verdict is
+    recorded but never blocks the task outcome.
+    """
+    from app.compute_verification import (
+        _build_compute_verification_rubric,
+        _compute_verification_enabled,
+        _has_compute_verification,
+    )
+    from app.task_evaluators import spawn_forward_quality_grader
+
+    if not _compute_verification_enabled():
+        return
+    if criterion is None:
+        return
+    if _has_compute_verification(task):
+        return
+
+    rubric = _build_compute_verification_rubric(task, criterion, logs)
+    ctx = dict(task.context or {})
+    ctx["compute_verification_spawned"] = True
+    task.context = ctx
+
+    grader = await spawn_forward_quality_grader(
+        task,
+        logs,
+        session,
+        rubric=rubric,
+    )
+    if grader is not None:
+        logger.info(
+            "[COMPUTE] Spawned verification grader %s for task %s "
+            "(advisory mode)",
+            grader.id,
+            task.id,
+        )
 
 
 async def _handle_panel_review_completion(task: Task, logs: str, session: AsyncSession):

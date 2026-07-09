@@ -373,6 +373,140 @@ class TestLowActionabilityDecay:
         assert stamped["title"] == "new-low-finding"
 
 
+class TestSalvageBundleTask:
+    """Salvage-bundle task consolidates decay-discarded findings into one actionable task."""
+
+    def _simulate_salvage_payload(self, candidates: list[dict], source_task_id: str) -> dict:
+        """Simulate the salvage bundle payload construction from research_completion.py."""
+        return {
+            "type": "salvage_bundle",
+            "source_task_id": source_task_id,
+            "salvaged_findings": [
+                {
+                    "title": f.get("title") or (f.get("description") or "")[:80],
+                    "discard_reason": f.get("deferred_reason") or "unknown",
+                    "direction_id": f.get("direction_id"),
+                }
+                for f in candidates
+            ],
+            "total_discarded": len(candidates),
+        }
+
+    def test_includes_all_decayed_findings(self):
+        """All decay-category findings appear in the salvage payload."""
+        candidates = [
+            {"title": "ultra-low-conf", "deferred_reason": "ultra_low_confidence",
+             "direction_id": "d-abc"},
+            {"title": "low-actionability", "deferred_reason": "low_actionability",
+             "direction_id": "d-def"},
+            {"title": "degradation-gate", "deferred_reason": "degradation_gate",
+             "direction_id": "d-abc"},
+            {"title": "adversarial-gate", "deferred_reason": "adversarial_gate",
+             "direction_id": "d-ghi"},
+            {"title": "prereq-deferred", "deferred_reason": "prereq_deferred_same_cycle",
+             "direction_id": None},
+        ]
+        payload = self._simulate_salvage_payload(candidates, "task-001")
+        assert payload["type"] == "salvage_bundle"
+        assert payload["total_discarded"] == 5
+        assert len(payload["salvaged_findings"]) == 5
+        titles = {f["title"] for f in payload["salvaged_findings"]}
+        assert "ultra-low-conf" in titles
+        assert "low-actionability" in titles
+        assert "degradation-gate" in titles
+        assert "adversarial-gate" in titles
+        assert "prereq-deferred" in titles
+
+    def test_each_finding_has_reason_and_title(self):
+        """Every salvaged finding entry has a title and discard_reason."""
+        candidates = [
+            {"title": "only-title", "deferred_reason": "low_actionability",
+             "direction_id": "d-1"},
+            {"title": "", "description": "desc-based title",
+             "deferred_reason": "ultra_low_confidence",
+             "direction_id": "d-2"},
+        ]
+        payload = self._simulate_salvage_payload(candidates, "task-002")
+        for entry in payload["salvaged_findings"]:
+            assert entry["discard_reason"] in ("low_actionability", "ultra_low_confidence")
+            assert entry["title"]
+
+    def test_empty_candidates_produce_no_task(self):
+        """Empty salvage candidates means no bundle entries."""
+        payload = self._simulate_salvage_payload([], "task-003")
+        assert payload["total_discarded"] == 0
+        assert payload["salvaged_findings"] == []
+
+    def test_fallback_for_missing_title(self):
+        """Finding missing title falls back to description snippet."""
+        candidates = [
+            {
+                "description": "A very long description that serves as the fallback title",
+                "deferred_reason": "low_actionability",
+                "direction_id": "d-x",
+            }
+        ]
+        payload = self._simulate_salvage_payload(candidates, "task-004")
+        entry = payload["salvaged_findings"][0]
+        assert entry["title"].startswith("A very long description")
+        assert entry["discard_reason"] == "low_actionability"
+
+
+@_pytest.mark.asyncio
+async def test_salvage_bundle_task_created_on_decay(db_session, mocker):
+    """DB-backed integration test: decay-eligible findings in prior_deferred_findings
+    cause _handle_research_completion to create a salvage_bundle Task row and record
+    salvage_activity on the parent task context."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-salvage-decay"
+    )
+    # A finding with ultra_low_confidence and deferred_count >= 4 goes directly
+    # to _decayed → _salvage_candidates without the challenge path.
+    decayed = _make_finding("Slow query in dashboard", direction_id=direction["id"])
+    decayed["deferred_reason"] = "ultra_low_confidence"
+    decayed["deferred_count"] = 4
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fresh sentinel", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+    task.context = {"research_depth": 0, "prior_deferred_findings": [decayed]}
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        ))
+        .scalars()
+        .all()
+    )
+    salvage_bundles = [
+        c for c in children
+        if (c.first_payload or {}).get("type") == "salvage_bundle"
+    ]
+    assert len(salvage_bundles) == 1, (
+        f"expected 1 salvage_bundle task, got {len(salvage_bundles)}"
+    )
+    bundle = salvage_bundles[0]
+    assert bundle.first_payload["total_discarded"] == 1
+    assert bundle.first_payload["salvaged_findings"][0]["title"] == "Slow query in dashboard"
+
+    # Verify salvage_activity was recorded on the parent task context
+    salvage_activity = (task.context or {}).get("salvage_activity")
+    assert salvage_activity is not None, "parent task context must have salvage_activity"
+    assert salvage_activity["salvaged_count"] == 1
+    assert salvage_activity["salvage_task_id"] == str(bundle.id)
+    assert "salvaged_at" in salvage_activity
+
+
 class TestDeferredFindingStaleDiscard:
     """Stale-discard path: deferred findings older than the configured TTL are dropped."""
 
@@ -3080,6 +3214,281 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
 
 
 @_pytest.mark.asyncio
+async def test_dedup_deadlock_exhaustion_deferred_when_owns_uncovered_criterion(
+    db_session,
+):
+    """The dedup-deadlock exhaustion path (line 750 call site of
+    _maybe_autocomplete_exhausted_direction) must defer auto-complete when the
+    direction owns an uncovered acceptance criterion.
+
+    Mirrors the _stamp_no_findings_refractory exhaustion-gate test
+    (test_exhaustion_autocomplete_deferred_when_direction_owns_uncovered_criterion).
+    Without this gate, a dedup-deadlocked direction that owns uncovered criteria
+    would retire without satisfying those criteria.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import (
+        _active_direction,
+        _make_research_task,
+        _map_direction_to_criterion,
+    )
+
+    direction_id = "d-dl-uncovered-criterion"
+    old_history = [
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)
+            ).isoformat(),
+            "task_id": "t-dl-crit1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 2,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)
+            ).isoformat(),
+            "task_id": "t-dl-crit2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1,
+                "word_overlap_dedup": 1,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+    ]
+    direction = {
+        **_active_direction(direction_id, "Dedup deadlock + uncovered criterion"),
+        "research_history": old_history,
+    }
+    project = _Project(
+        name="Deadlock Criterion Gate Test",
+        user_id="test-user-dlcrit",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Map the direction to an UNCOVERED criterion so the gate fires.
+    await _map_direction_to_criterion(
+        db_session, project, direction_id, covered=False
+    )
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Trigger dedup deadlock via a 3rd consecutive dedup-zero cycle.
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        1,  # hash_dedup_count — dedup activity
+        0,  # word_overlap_count
+        0,  # file_overlap_count
+        0,  # evidence_overlap_count
+        0,  # type_filtered_count
+        0,  # empty_prompt_count
+        "research-branch",
+        "main",
+        0,  # research_depth
+        None,  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    # The criterion gate defers exhaustion auto-complete; the direction falls
+    # through to the existing auto-pause path (status='paused').  The critical
+    # invariant is that it is NOT terminal-completed.
+    assert d["status"] != "completed", (
+        "dedup-deadlocked direction with uncovered criterion must NOT be "
+        f"terminal-completed (gate must defer exhaustion auto-complete), "
+        f"got status={d['status']!r}"
+    )
+    assert d.get("auto_completed") is not True, (
+        "auto_completed must NOT be set when exhaustion is gated on uncovered criteria"
+    )
+    assert d.get("_exhaustion_gated_by_criterion") is True, (
+        "_exhaustion_gated_by_criterion must be set when the criterion gate "
+        "blocks dedup-deadlock auto-completion"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_already_fixed_deadlock_with_uncovered_criterion_defers_completion(
+    db_session,
+):
+    """The already-fixed-deadlock exhaustion path (line 890 call site of
+    _maybe_autocomplete_exhausted_direction) must defer auto-complete when the
+    direction owns an uncovered acceptance criterion.
+
+    Mirrors the dedup-deadlock exhaustion-gate test
+    (test_dedup_deadlock_exhaustion_deferred_when_owns_uncovered_criterion).
+    The already-fixed-deadlock variant (where spawned tasks all terminated as
+    SCOPE_EMPTY because the work was already on HEAD) is a separate code path
+    from dedup-deadlock (where cycles produce findings rejected by hash/word-overlap).
+    Both route through _maybe_autocomplete_exhausted_direction and must be gated.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import (
+        _active_direction,
+        _make_research_task,
+        _map_direction_to_criterion,
+    )
+
+    direction_id = "d-af-uncovered-criterion"
+    # Already-fixed-deadlock history: 3 consecutive research cycles whose spawned
+    # tasks all terminated as SCOPE_EMPTY (work already done on HEAD).
+    old_history = [
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=15)
+            ).isoformat(),
+            "task_id": "t-af-crit1",
+            "tasks_created": 1,
+            "scope_empty_noop_count": 1,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "all tasks SCOPE_EMPTY",
+        },
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)
+            ).isoformat(),
+            "task_id": "t-af-crit2",
+            "tasks_created": 2,
+            "scope_empty_noop_count": 2,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "all tasks SCOPE_EMPTY",
+        },
+        {
+            "timestamp": (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)
+            ).isoformat(),
+            "task_id": "t-af-crit3",
+            "tasks_created": 1,
+            "scope_empty_noop_count": 1,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "all tasks SCOPE_EMPTY",
+        },
+    ]
+    direction = {
+        **_active_direction(
+            direction_id, "Already-fixed deadlock + uncovered criterion"
+        ),
+        "research_history": old_history,
+    }
+    project = _Project(
+        name="Already-Fixed Deadlock Criterion Gate Test",
+        user_id="test-user-afcrit",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Map the direction to an UNCOVERED criterion so the gate fires.
+    await _map_direction_to_criterion(
+        db_session, project, direction_id, covered=False
+    )
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Trigger already-fixed deadlock via a 3rd consecutive scope-empty cycle.
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        0,  # hash_dedup_count — no dedup activity (this is already-fixed, not dedup)
+        0,  # word_overlap_count
+        0,  # file_overlap_count
+        0,  # evidence_overlap_count
+        0,  # type_filtered_count
+        0,  # empty_prompt_count
+        "research-branch",
+        "main",
+        0,  # research_depth
+        None,  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    # The criterion gate defers exhaustion auto-complete; the direction must NOT
+    # be terminal-completed.
+    assert d["status"] != "completed", (
+        "already-fixed-deadlocked direction with uncovered criterion must NOT be "
+        f"terminal-completed (gate must defer exhaustion auto-complete), "
+        f"got status={d['status']!r}"
+    )
+    assert d.get("auto_completed") is not True, (
+        "auto_completed must NOT be set when exhaustion is gated on uncovered criteria"
+    )
+    assert d.get("_exhaustion_gated_by_criterion") is True, (
+        "_exhaustion_gated_by_criterion must be set when the criterion gate "
+        "blocks already-fixed-deadlock auto-completion"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
     """When a dedup deadlock fires but exhaustion-completion is DECLINED (the
     direction is externally frozen), the existing auto-pause path still runs and
@@ -4402,6 +4811,182 @@ class TestSummarizeDispatchOutcome:
         )
         assert len(msg) <= 500
 
+    # --- degraded_reason qualifier ---
+
+    def test_degraded_reason_appended_when_set(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=2,
+            total_findings=5,
+            dedup_outcome=self._outcome(),
+            degraded_reason="provider capacity/rate-limit error",
+        )
+        assert "spawned 2/5 findings" in msg
+        assert "degraded: provider capacity/rate-limit error" in msg
+        assert "results may be incomplete" in msg
+
+    def test_degraded_reason_composes_with_deferred(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=0,
+            total_findings=3,
+            dedup_outcome=self._outcome(),
+            deferred_reason_parts=["batch cap (3)"],
+            degraded_reason="provider capacity/rate-limit error",
+        )
+        assert "degraded:" in msg
+        assert "deferred:" in msg
+        # Degradation qualifier should appear last.
+        assert msg.index("degraded:") > msg.index("deferred:")
+
+    def test_degraded_reason_omitted_when_none(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=3, total_findings=3, dedup_outcome=self._outcome()
+        )
+        assert "degraded" not in msg
+        assert msg == "spawned 3/3 findings"
+
+    def test_degraded_reason_respects_500_char_truncation(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        # Long deferred reasons + a degradation qualifier must still fit in 500.
+        long_reasons = [f"reason_{i}_with_padding_text" * 5 for i in range(20)]
+        msg = _summarize_dispatch_outcome(
+            spawned=0,
+            total_findings=99,
+            dedup_outcome=self._outcome(hash_=9),
+            deferred_reason_parts=long_reasons,
+            degraded_reason="provider capacity/rate-limit error — results may be incomplete",
+        )
+        assert len(msg) <= 500
+
+
+class TestCheckCapacityDegradation:
+    """_check_capacity_degradation detects provider quota / rate-limit signals."""
+
+    def _make_task_stub(self, *, status_msg="", context=None):
+        """Build a lightweight task-like object with the attrs the helper reads."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            latest_status_message=status_msg,
+            context=context or {},
+        )
+
+    def test_none_when_clean(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(status_msg="All findings processed normally")
+        assert _check_capacity_degradation(task, "") is None
+
+    def test_none_when_empty_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(status_msg="")
+        assert _check_capacity_degradation(task, "") is None
+
+    def test_none_when_no_task(self):
+        from app.research_completion import _check_capacity_degradation
+
+        assert _check_capacity_degradation(None, "") is None
+
+    def test_detects_quota_in_status_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        # "api usage exhausted" is a key phrase matching _external_api_subtype_from_message
+        task = self._make_task_stub(
+            status_msg="Fatal error: Claude Code API usage exhausted — you have no more turns"
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+        assert "provider capacity" in result or "rate-limit" in result
+
+    def test_detects_rate_limit_in_status_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            status_msg="upstream API returned 429 Too Many Requests — rate limit exceeded"
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+        assert "provider capacity" in result or "rate-limit" in result
+
+    def test_detects_quota_in_logs(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(status_msg="")
+        logs = "insufficient_quota — provider rejected the request with 429"
+        result = _check_capacity_degradation(task, logs)
+        assert result is not None
+
+    def test_detects_quota_in_context_failure_category(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            context={
+                "failure_category": "EXTERNAL_API",
+                "external_api_subtype": "provider_quota",
+            }
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+
+    def test_context_mismatch_returns_none(self):
+        from app.research_completion import _check_capacity_degradation
+
+        # EXTERNAL_API but wrong subtype
+        task = self._make_task_stub(
+            context={
+                "failure_category": "EXTERNAL_API",
+                "external_api_subtype": "network_transient",
+            }
+        )
+        assert _check_capacity_degradation(task, "") is None
+
+        # Right subtype but wrong failure_category
+        task2 = self._make_task_stub(
+            context={
+                "failure_category": "CODE_ERROR",
+                "external_api_subtype": "provider_quota",
+            }
+        )
+        assert _check_capacity_degradation(task2, "") is None
+
+    def test_agent_raw_rate_limited_with_matching_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            status_msg="upstream rate limit exceeded — retrying",
+            context={"agent_failure_category_raw": "rate_limited"},
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+
+    def test_agent_raw_claude_code_failed_with_quota_message(self):
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            status_msg="API usage exhausted — no more credits",
+            context={"agent_failure_category_raw": "claude_code_failed"},
+        )
+        result = _check_capacity_degradation(task, "")
+        assert result is not None
+
+    def test_agent_raw_claude_code_failed_without_quota_message_returns_none(self):
+        """A raw claude_code_failed without matching message text must not
+        falsely trigger capacity degradation."""
+        from app.research_completion import _check_capacity_degradation
+
+        task = self._make_task_stub(
+            status_msg="process crashed with SIGSEGV (unrelated infrastructure failure)",
+            context={"agent_failure_category_raw": "claude_code_failed"},
+        )
+        assert _check_capacity_degradation(task, "") is None
+
 
 class TestBuildPreventiveContext:
     """Regression: project_anomalies entries are sometimes stored as raw strings
@@ -4945,6 +5530,156 @@ async def test_passing_grade_resumes_and_spawns_children(db_session, mocker):
     # EVALUATING state (awaiting child rollup) — NOT FAILED, and no longer
     # parked awaiting a grade.
     assert task.status == TaskStatus.EVALUATING
+
+
+@_pytest.mark.asyncio
+async def test_capacity_degradation_surfaced_in_completion_message(
+    db_session, mocker
+):
+    """A research task whose latest_status_message indicates a provider quota
+    error must surface the degradation in its completion message and context,
+    even when no findings were parsed."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, _direction, task = await _grader_project_and_task(
+        db_session, "d-deg01"
+    )
+    _patch_research_externals(mocker)
+
+    # Patch findings parser to return nothing, and health check to healthy.
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[]
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    # Simulate a task whose last agent heartbeat was a capacity error.
+    task.latest_status_message = (
+        "Fatal error: Claude Code API usage exhausted — insufficient balance"
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # The completion message must include the degradation qualifier.
+    assert "no actionable findings" in task.latest_status_message
+    assert "degraded:" in task.latest_status_message
+    assert "provider capacity" in task.latest_status_message or "rate-limit" in task.latest_status_message
+
+    # Structured context field must be set.
+    assert (task.context or {}).get("degraded_by_capacity") is True
+    assert (task.context or {}).get("degraded_by_capacity_reason") is not None
+
+
+@_pytest.mark.asyncio
+async def test_capacity_degradation_no_false_positive_on_clean_task(
+    db_session, mocker
+):
+    """A task that completed normally must NOT carry the degradation signal."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-deg02"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    # Clean task — no capacity error in status message.
+    task.latest_status_message = "All research findings processed normally"
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Completion message must NOT mention degradation.
+    assert "degraded" not in (task.latest_status_message or "")
+    assert (task.context or {}).get("degraded_by_capacity") is not True
+
+
+@_pytest.mark.asyncio
+async def test_capacity_degradation_surfaced_in_dispatch_summary(
+    db_session, mocker
+):
+    """A research task that spawns findings but had a capacity error mid-run
+    must surface degradation in the dispatch outcome message."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-deg03"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    # Capacity error in logs (even though status message is clean).
+    deg_logs = "insufficient_quota — provider rejected the request with 429"
+    task.latest_status_message = "Completed processing findings"
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, deg_logs, db_session)
+    await db_session.refresh(task)
+
+    # Dispatch summary must include the degradation qualifier.
+    assert "degraded:" in (task.latest_status_message or "")
+    assert "provider capacity" in task.latest_status_message or "rate-limit" in task.latest_status_message
+    assert (task.context or {}).get("degraded_by_capacity") is True
+
+
+@_pytest.mark.asyncio
+async def test_capacity_degradation_from_context_failure_category(
+    db_session, mocker
+):
+    """When task.context already has EXTERNAL_API / provider_quota from
+    persist_failure_category, the completion message must surface degradation."""
+    from test_autonomous_research import _patch_research_externals
+    from app.failure_classification import EXTERNAL_API, EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA
+
+    _project, _direction, task = await _grader_project_and_task(
+        db_session, "d-deg04"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[]
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    # Persisted failure classification on context — no error in status message.
+    task.context = {
+        **(task.context or {}),
+        "failure_category": EXTERNAL_API,
+        "external_api_subtype": EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
+    }
+    task.latest_status_message = "All clean"
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    assert "degraded:" in (task.latest_status_message or "")
+    assert (task.context or {}).get("degraded_by_capacity") is True
 
 
 @_pytest.mark.asyncio
@@ -9091,6 +9826,364 @@ class TestAcceptanceEvidencePropagation:
             "kind": "observable_behavior",
             "description": "endpoint scopes audit to the open candidate",
         }
+
+    @_pytest.mark.asyncio
+    async def test_criterion_carrying_finding_without_named_test_is_rejected(
+        self, db_session, mocker
+    ):
+        """When a direction carries criterion_keys and a finding lacks
+        acceptance_evidence:{kind:named_test}, the spawn loop must REJECT
+        the finding (hard rejection — no child task spawned). The previous
+        non-blocking provenance warning is replaced by a hard gate that
+        blocks the spawn so uncovered criterion-carrying findings never
+        become work that cannot close the criterion coverage loop."""
+        from app.models import Direction as _Direction, ReleaseVersion
+        from app import acceptance_criteria as _ac
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _patch_research_externals,
+        )
+
+        direction_id = "d-crit-reject-01"
+        direction_data = _active_direction(
+            direction_id, "Criterion rejection direction"
+        )
+        project = _Project(
+            name="CritReject Project",
+            user_id="test-user-crit-reject",
+            autonomous_enabled=True,
+            directions=[direction_data],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        version = ReleaseVersion(
+            project_id=project.id, version_number=1, status="open"
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        criterion = await _ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text="All endpoints documented",
+            created_by="strategist",
+        )
+
+        dir_row = _Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            data=direction_data,
+            status="active",
+            criterion_keys=[criterion.criterion_key],
+        )
+        db_session.add(dir_row)
+        await db_session.commit()
+
+        task = _Task(
+            project_id=project.id,
+            title="Research: Criterion rejection direction",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [direction_data],
+                    "base_branch": "main",
+                }
+            ],
+            context={"research_depth": 0, "direction_id": direction_id},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        finding = _make_finding(
+            title="Missing named_test evidence",
+            direction_id=direction_id,
+        )
+        # Explicitly ensure no acceptance_evidence key is present.
+        finding.pop("acceptance_evidence", None)
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # The finding lacks named_test evidence on a criterion-carrying direction
+        # → hard rejection: zero implementation child tasks spawned. A memo task
+        # records the rejection reason but is not an implementation task.
+        impl_children = [
+            c for c in children
+            if (c.first_payload or {}).get("type") != "memo"
+        ]
+        assert len(impl_children) == 0, (
+            "expected zero implementation children for criterion-carrying finding "
+            f"without named_test evidence; got {len(impl_children)}"
+        )
+        # The rejection count is recorded in the research task context.
+        rejected = (task.context or {}).get("research_criterion_evidence_rejected")
+        assert rejected == 1, (
+            "expected research_criterion_evidence_rejected=1 in task context; "
+            f"got {rejected!r}"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_criterion_carrying_finding_with_named_test_evidence_spawns(
+        self, db_session, mocker
+    ):
+        """When a direction carries criterion_keys and a finding declares
+        acceptance_evidence:{kind:named_test}, the spawn loop must let the
+        finding through — the named_test declaration is sufficient proof."""
+        from app.models import Direction as _Direction, ReleaseVersion
+        from app import acceptance_criteria as _ac
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _patch_research_externals,
+        )
+
+        direction_id = "d-crit-spawn-01"
+        direction_data = _active_direction(
+            direction_id, "Criterion spawn direction"
+        )
+        project = _Project(
+            name="CritSpawn Project",
+            user_id="test-user-crit-spawn",
+            autonomous_enabled=True,
+            directions=[direction_data],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        version = ReleaseVersion(
+            project_id=project.id, version_number=1, status="open"
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        criterion = await _ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text="All endpoints documented",
+            created_by="strategist",
+        )
+
+        dir_row = _Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            data=direction_data,
+            status="active",
+            criterion_keys=[criterion.criterion_key],
+        )
+        db_session.add(dir_row)
+        await db_session.commit()
+
+        task = _Task(
+            project_id=project.id,
+            title="Research: Criterion spawn direction",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [direction_data],
+                    "base_branch": "main",
+                }
+            ],
+            context={"research_depth": 0, "direction_id": direction_id},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        finding = _make_finding(
+            title="Has named_test evidence",
+            direction_id=direction_id,
+        )
+        finding["acceptance_evidence"] = {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        }
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1, (
+            "expected exactly one spawned child task for finding with "
+            f"named_test evidence; got {len(children)}"
+        )
+        # Verify the acceptance evidence was forwarded to the child.
+        child = children[0]
+        assert child.first_payload.get("acceptance_evidence") == {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        }, (
+            "child payload must carry the named_test acceptance_evidence; "
+            f"got {child.first_payload.get('acceptance_evidence')!r}"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_criterion_keys_warning_injected_into_research_context(
+        self, db_session, mocker
+    ):
+        """When a direction carries active criterion_keys and a finding is
+        spawned, the child task's prompt_suffix must include a criterion_keys
+        warning so the implementing agent knows to declare named_test
+        acceptance evidence in its output. Without this upfront signal the
+        agent wastes a full research cycle before the rejection gate fires."""
+        from app.models import Direction as _Direction, ReleaseVersion
+        from app import acceptance_criteria as _ac
+        from test_autonomous_research import (
+            _active_direction,
+            _make_finding,
+            _patch_research_externals,
+        )
+
+        direction_id = "d-crit-warn-01"
+        direction_data = _active_direction(
+            direction_id, "Criterion warning direction"
+        )
+        project = _Project(
+            name="CritWarn Project",
+            user_id="test-user-crit-warn",
+            autonomous_enabled=True,
+            directions=[direction_data],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        version = ReleaseVersion(
+            project_id=project.id, version_number=1, status="open"
+        )
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        criterion = await _ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text="All endpoints documented",
+            created_by="strategist",
+        )
+
+        dir_row = _Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            data=direction_data,
+            status="active",
+            criterion_keys=[criterion.criterion_key],
+        )
+        db_session.add(dir_row)
+        await db_session.commit()
+
+        task = _Task(
+            project_id=project.id,
+            title="Research: Criterion warning direction",
+            payloads=[
+                {
+                    "type": "research",
+                    "directions": [direction_data],
+                    "base_branch": "main",
+                }
+            ],
+            context={"research_depth": 0, "direction_id": direction_id},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        finding = _make_finding(
+            title="Finding with named_test for warning injection",
+            direction_id=direction_id,
+        )
+        finding["acceptance_evidence"] = {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        }
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[finding],
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1, (
+            "expected exactly one spawned child task; "
+            f"got {len(children)}"
+        )
+        child = children[0]
+        prompt_suffix = child.first_payload.get("prompt_suffix") or ""
+        assert "acceptance_evidence" in prompt_suffix, (
+            "child prompt_suffix must contain criterion_keys warning "
+            "about acceptance_evidence requirement; "
+            f"got {prompt_suffix!r}"
+        )
+        assert "named_test" in prompt_suffix, (
+            "child prompt_suffix must mention named_test evidence kind; "
+            f"got {prompt_suffix!r}"
+        )
+
 
 
 # ── Shared capability vocabulary: off-registry advisory marking ───────────────
@@ -14416,6 +15509,47 @@ class TestStampNoFindingsRefractory:
             "A budget-paused (cost_pause_evidence) direction must NOT be auto-completed"
         )
 
+    def test_exhaustion_autocomplete_deferred_when_direction_owns_uncovered_criterion(self):
+        """A genuinely-exhausted direction with an uncovered acceptance criterion
+        must NOT auto-complete via the exhaustion route — the criterion must be
+        satisfied first.
+
+        The proven-merge path (>=3 verified merges) already gates on criterion
+        coverage via direction_owns_uncovered_criterion; this guards the additive
+        exhaustion path (<3 merges, saturated/deadlocked) against the same blind
+        spot. Without this gate, a direction that owns uncovered criteria can
+        retire via dedup-deadlock, already-fixed-deadlock, or saturation-with-
+        <3-merges without satisfying those criteria.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+        from unittest.mock import patch, AsyncMock
+
+        # Saturated, genuinely exhausted history (< 3 merges)
+        already_fixed_history = [
+            {"tasks_created": 2, "scope_empty_noop_count": 2, "prs_merged": 0}
+            for _ in range(3)
+        ]
+        task = self._make_task()
+        project = self._make_exhausted_project(research_history=already_fixed_history)
+
+        with patch(
+            "app.acceptance_criteria.direction_owns_uncovered_criterion",
+            AsyncMock(return_value=True),
+        ):
+            self._run(
+                project, _stamp_no_findings_refractory(task, self._make_session())
+            )
+
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "A direction with uncovered criteria must NOT auto-complete via "
+            f"exhaustion, got status={direction.get('status')!r}"
+        )
+        assert direction.get("status") == "active", (
+            f"Direction must remain active when exhaustion is gated on uncovered "
+            f"criteria, got status={direction.get('status')!r}"
+        )
+
     def test_no_findings_auto_completion_reconciles_gap_staffing(self):
         """Auto-completing a direction via the no-findings path must reconcile
         problem-model gap staffing — pruning the direction from active_moves
@@ -14729,14 +15863,15 @@ async def test_no_findings_proven_direction_owning_no_criteria_completes(db_sess
 
 
 @_pytest.mark.asyncio
-async def test_no_findings_proven_direction_fails_open_on_coverage_error(
+async def test_criterion_gate_query_error_defers_autocomplete(
     db_session, mocker
 ):
-    """Site 2: if the coverage query raises, the gate fails open — the saturated
-    proven direction completes rather than being permanently stranded."""
+    """Site 2 (_stamp_no_findings_refractory): when the coverage query raises,
+    the gate must fail closed — deferring retirement rather than allowing
+    auto-complete on a transient error."""
     from app.research_completion import _stamp_no_findings_refractory
 
-    direction_id = "d-cov-failopen"
+    direction_id = "d-cov-failclosed"
     project, task, _ = await _setup_saturated_proven_direction(
         db_session, direction_id=direction_id, criterion_keys=["placeholder"]
     )
@@ -14758,7 +15893,8 @@ async def test_no_findings_proven_direction_fails_open_on_coverage_error(
     db_session.add(row)
     await db_session.commit()
 
-    # Force the coverage resolution to raise; the helper must swallow it (fail-open).
+    # Force the coverage resolution to raise; the helper must swallow it and
+    # return True (fail-closed), deferring retirement.
     mocker.patch(
         "app.release_version.current_open_version",
         new=AsyncMock(side_effect=RuntimeError("transient DB error")),
@@ -14768,11 +15904,496 @@ async def test_no_findings_proven_direction_fails_open_on_coverage_error(
 
     await db_session.refresh(project)
     target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "A coverage-query error must fail closed (defer), never auto-complete "
+        "a saturated direction on a transient failure"
+    )
+    assert target.get("auto_completed") is not True
+    # Refractory stamp still applied even though completion was withheld.
+    assert target.get("possibly_saturated") is True
+
+
+@_pytest.mark.asyncio
+async def test_criterion_gate_failure_logs_warning(db_session, mocker, caplog):
+    """When direction_owns_uncovered_criterion encounters a DB error, the
+    fail-closed block must emit a WARNING log so operators can distinguish
+    transient-query-failure blocks from legitimate uncovered-criterion defers."""
+    from app.models import Direction
+    from app.research_direction_state import apply_post_spawn_state
+
+    direction_id = "d-cov-fail-warn"
+    project, task, _direction = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row's criterion_keys at the real (uncovered) criterion.
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    # Ensure task context carries direction_id so apply_post_spawn_state can
+    # find the current direction for the no-findings cycle entry.
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Force the coverage resolution to raise; the helper must swallow it and
+    # return True (fail-closed), deferring retirement.
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(side_effect=RuntimeError("transient DB error")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.research_direction_state"):
+        await apply_post_spawn_state(
+            db_session,
+            task,
+            [],   # findings
+            [],   # child_tasks
+            [],   # deduplicated
+            [],   # insights
+            [],   # direction_notes
+            [],   # direction_proposals
+            0,    # hash_dedup_count
+            0,    # word_overlap_count
+            0,    # file_overlap_count
+            0,    # evidence_overlap_count
+            0,    # type_filtered_count
+            0,    # empty_prompt_count
+            "research-branch",
+            "main",
+            0,    # research_depth
+            None, # parent_research_task_id
+        )
+
+    assert "Criterion-coverage gate" in caplog.text, (
+        "A criterion-gate block on DB error must emit a WARNING log "
+        "so operators can distinguish transient failures from legitimate defers"
+    )
+    # Verify the direction was NOT auto-completed (fail-closed).
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "A coverage-query error must fail closed (defer), never auto-complete "
+        "a saturated direction on a transient failure"
+    )
+    assert target.get("auto_completed") is not True
+
+
+@_pytest.mark.asyncio
+async def test_no_findings_exhausted_direction_with_uncovered_criterion_stays_active(
+    db_session,
+):
+    """Site 2 (_stamp_no_findings_refractory): a saturated direction with <3
+    verified merges that owns an uncovered active criterion must NOT auto-complete
+    via the exhaustion route — it stays active to keep working toward the unmet
+    outcome."""
+    from app.models import Direction
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-cov-exhausted"
+
+    # Custom setup: direction has <3 verified merges (total_merged=2), is about
+    # to become saturated (2 consecutive unproductive → +1 = 3), and has no
+    # recent prs_merged entries so _direction_has_recent_merges is False —
+    # meaning the direction WOULD be flagged as "exhausted" by the deadlock
+    # predicate if the criterion gate did not block it.
+    direction_dict = {
+        "id": direction_id,
+        "text": "Exhausted direction with uncovered criterion",
+        "status": "active",
+        "history_aggregate": {},
+        "consecutive_unproductive_cycles": 2,  # +1 → saturated
+        "research_history": [
+            {"verified_prs_merged": 1},  # total_merged = 2 (< 3)
+            {"verified_prs_merged": 1},
+        ],
+    }
+    project = _Project(
+        name="Exhaustion Gate Test",
+        user_id="test-user-exhaust-gate",
+        autonomous_enabled=True,
+        directions=[direction_dict],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First-class Direction ORM row with placeholder criterion keys.
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key=direction_id,
+            status="active",
+            data=dict(direction_dict),
+            criterion_keys=["placeholder"],
+        )
+    )
+    await db_session.commit()
+
+    # Open release version with one uncovered criterion.
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row at the real (uncovered) criterion.
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    task = _Task(
+        project_id=project.id,
+        title="Research: exhausted uncovered",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [direction_dict],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "Direction with <3 merges owning an uncovered criterion must NOT "
+        "auto-complete via the exhaustion route; expected it to stay active"
+    )
+    assert target.get("auto_completed") is not True
+    # Refractory stamp is still applied even though completion was withheld.
+    assert target.get("possibly_saturated") is True
+
+
+@_pytest.mark.asyncio
+async def test_direction_autocomplete_gate_blocks_then_records_coverage_for_owned_criterion(
+    db_session,
+):
+    """End-to-end: gate blocks auto-complete when criterion is uncovered, then
+    a proven-verdict merge records coverage, and the gate lifts.
+
+    This test proves the full lifecycle against a REAL uncovered criterion (no
+    mocks on the coverage helper):
+
+    1. A saturated, >=3-merge direction owns an uncovered acceptance criterion.
+       Auto-complete via _stamp_no_findings_refractory is DEFERRED — the
+       direction stays active.
+
+    2. A proven-verdict task merge (naming that same criterion) calls
+       record_task_merge_evidence, which records task_merge + reachability
+       evidence rows.  compute_criterion_coverage now returns 'covered'.
+
+    3. Re-driving auto-complete after the criterion is covered now SUCCEEDS —
+       the direction reaches status='completed'.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.models import Direction
+    from app.research_completion import _stamp_no_findings_refractory
+
+    direction_id = "d-e2e-gate-cover"
+    project, task, _ = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row's criterion_keys at the real (uncovered) criterion.
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    # ── Phase (a): uncovered criterion → gate blocks auto-complete ──────────
+    await _stamp_no_findings_refractory(task, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "Phase (a): direction owning an uncovered criterion must NOT auto-complete; "
+        f"expected status='active', got {target.get('status')!r}"
+    )
+    assert target.get("auto_completed") is not True, (
+        "Phase (a): auto_completed must NOT be set when gated on uncovered criterion"
+    )
+
+    # ── Phase (b): proven-verdict merge → record coverage ───────────────────
+    from app.acceptance_criteria import (
+        record_task_merge_evidence,
+        compute_criterion_coverage,
+        get_evidence_for_criterion,
+    )
+
+    # Build a proven-verdict task that carries the criterion.
+    merge_task = _Task(
+        project_id=project.id,
+        title="Proven-merge task for coverage",
+        payloads=[{"type": "create", "prompt": "record coverage"}],
+        context={
+            "direction_id": direction_id,
+            "review_loop": {"pr_number": 42},
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test ran green under verified merge verdict",
+                "proof_ref": (
+                    "testing/test_research_completion.py::"
+                    "test_direction_autocomplete_gate_blocks_then_records_coverage_for_owned_criterion"
+                ),
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(merge_task)
+    await db_session.commit()
+    await db_session.refresh(merge_task)
+
+    recorded = await record_task_merge_evidence(db_session, merge_task, project.id)
+    assert recorded == 2, (
+        f"Phase (b): expected 2 evidence rows (task_merge + reachability), got {recorded}"
+    )
+
+    # Verify the evidence rows exist and coverage is now 'covered'.
+    evidence = await get_evidence_for_criterion(db_session, criterion.id)
+    coverage = compute_criterion_coverage(evidence)
+    assert coverage == "covered", (
+        f"Phase (b): expected coverage='covered' after proven-verdict merge, "
+        f"got {coverage!r}. Evidence rows: {len(evidence)}"
+    )
+
+    # Confirm a proven task_merge row exists.
+    proven_merges = [
+        e for e in evidence
+        if e.source_kind == "task_merge" and (e.detail or {}).get("proven") is True
+    ]
+    assert len(proven_merges) >= 1, (
+        "Phase (b): expected at least one proven task_merge evidence row"
+    )
+
+    # ── Phase (c): criterion now covered → auto-complete succeeds ───────────
+    # Re-drive auto-complete: the gate must now allow retirement.
+    task2 = _Task(
+        project_id=project.id,
+        title="Research: retry after coverage recorded",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [project.directions[0]],
+                "base_branch": "main",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={"direction_id": direction_id, "research_depth": 0},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    await _stamp_no_findings_refractory(task2, db_session)
+
+    await db_session.refresh(project)
+    target2 = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target2.get("status") == "completed", (
+        "Phase (c): direction whose criterion is now covered must auto-complete; "
+        f"expected status='completed', got {target2.get('status')!r}"
+    )
+    assert target2.get("auto_completed") is True, (
+        "Phase (c): auto_completed must be True when criterion coverage is satisfied"
+    )
+    assert "verified" in (target2.get("auto_completed_reason") or ""), (
+        "Phase (c): auto-complete reason must mention 'verified' (proven-merge route)"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Site 1 (apply_post_spawn_state): proven-route criterion-coverage gate.
+#
+# The proven-merge success completion path inside apply_post_spawn_state must
+# also gate on owned-criterion coverage — identical policy to Site 2
+# (_stamp_no_findings_refractory) but exercised through the full post-spawn
+# state pipeline. A saturated direction with >= 3 verified merges must NOT
+# auto-complete when it owns an uncovered acceptance criterion.
+# --------------------------------------------------------------------------- #
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_proven_direction_with_uncovered_criterion_stays_active(
+    db_session,
+):
+    """Site 1 (apply_post_spawn_state): a saturated, >=3-merge direction that
+    OWNS an uncovered active criterion must NOT auto-complete via the proven
+    route — it stays active to keep working toward the unmet outcome."""
+    from app.research_direction_state import apply_post_spawn_state
+
+    direction_id = "d-apply-cov-uncovered"
+    project, task, _direction = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=False
+    )
+
+    # Point the direction row's criterion_keys at the real (uncovered) criterion.
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    # Ensure task context carries direction_id so apply_post_spawn_state can
+    # find the current direction for the no-findings cycle entry.
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
+    assert target.get("status") == "active", (
+        "Direction owning an uncovered criterion must NOT auto-complete via "
+        "apply_post_spawn_state's proven route; expected it to stay active"
+    )
+    assert target.get("auto_completed") is not True
+    # The direction must have entered the auto-complete check (saturated).
+    assert target.get("possibly_saturated") is True, (
+        "Direction must be saturated (proving the auto-complete check ran) "
+        "but gate must have blocked completion"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_proven_direction_with_covered_criterion_completes(
+    db_session,
+):
+    """Site 1: when the owned criterion IS covered, the saturated proven
+    direction still auto-completes via apply_post_spawn_state (control)."""
+    from app.research_direction_state import apply_post_spawn_state
+
+    direction_id = "d-apply-cov-covered"
+    project, task, _direction = await _setup_saturated_proven_direction(
+        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
+    )
+    _version, criterion = await _open_version_with_criterion(
+        db_session, project, covered=True
+    )
+
+    from app.models import Direction
+
+    row = (
+        await db_session.execute(
+            _select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == direction_id,
+            )
+        )
+    ).scalar_one()
+    row.criterion_keys = [criterion.criterion_key]
+    db_session.add(row)
+    await db_session.commit()
+
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+
+    await db_session.refresh(project)
+    target = next(d for d in project.directions if d.get("id") == direction_id)
     assert target.get("status") == "completed", (
-        "A coverage-query error must fail open (complete), never deadlock the "
-        "saturated direction forever"
+        "Direction whose owned criterion IS covered must still auto-complete "
+        "via apply_post_spawn_state"
     )
     assert target.get("auto_completed") is True
+    assert "verified" in (target.get("auto_completed_reason") or "")
 
 
 # --------------------------------------------------------------------------- #
@@ -15767,6 +17388,10 @@ async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker
         "risk": "low",
         "type": "improvement",
         "direction_id": direction_id,
+        "acceptance_evidence": {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        },
     }
     _patch_research_externals(mocker)
     mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
@@ -15910,6 +17535,10 @@ async def test_criterion_ids_propagated_from_finding_direction(db_session, mocke
         "risk": "low",
         "type": "improvement",
         "direction_id": child_dir_id,
+        "acceptance_evidence": {
+            "kind": "named_test",
+            "test_path": "backend/testing/test_research_completion.py",
+        },
     }
     _patch_research_externals(mocker)
     mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])

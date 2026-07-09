@@ -39,7 +39,9 @@ from app.notification_dispatch import (
 )
 from app.models import (
     MessageType,
+    NotificationDeadLetter,
     Project,
+    ProjectMember,
     ProjectMessage,
     ResidualCaseStatus,
     ResidualRemediationCase,
@@ -108,8 +110,9 @@ async def test_dispatched_runner_events_are_deliverable():
     POSTed through the operator-configured webhook.
 
     Regression guard for the silent-drop bug: the runner-health event types
-    (RUNNER_DEACTIVATED/RUNNER_DEGRADED/RUNNER_FLEET_OFFLINE/RUNNER_LOW_DISK and
-    the RUNNER_OUTAGE_ESCALATED re-page) were not in the allowlist / any default
+    (RUNNER_DEACTIVATED/RUNNER_DEGRADED/RUNNER_DEGRADED_ESCALATED/RUNNER_FLEET_OFFLINE/
+    RUNNER_LOW_DISK and the RUNNER_OUTAGE_ESCALATED re-page) were not in the
+    allowlist / any default
     enabled_events list, so dispatch_external_notification returned early and the
     external page never reached a destination. Now that they are allowlisted and
     default-on, an enabled runner event must deliver with its event_type and
@@ -118,6 +121,7 @@ async def test_dispatched_runner_events_are_deliverable():
     runner_events = [
         "RUNNER_DEACTIVATED",
         "RUNNER_DEGRADED",
+        "RUNNER_DEGRADED_ESCALATED",
         "RUNNER_FLEET_OFFLINE",
         "RUNNER_LOW_DISK",
         "RUNNER_OUTAGE_ESCALATED",
@@ -615,8 +619,6 @@ async def test_exhausted_or_evicted_notification_writes_dead_letter(db_session):
     """A notification that exhausts its retries OR is evicted from the full
     in-memory queue must leave a durable, re-drivable NotificationDeadLetter
     row instead of silently vanishing."""
-    from app.models import NotificationDeadLetter
-    from sqlmodel import select as _select
 
     _reset_stats()
     pid = uuid.uuid4()
@@ -2554,3 +2556,430 @@ async def test_post_version_promotion_readiness_message_includes_self_approval_c
     assert "self-approval" in msg.content.lower()
     assert "post-promotion outcome" in msg.content.lower()
     assert msg in db_session
+
+
+# ---------------------------------------------------------------------------
+# list_dead_letters
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_dead_letters_returns_rows(db_session):
+    """A dead-letter row written via _write_dead_letter is listable with full field detail."""
+    from app.notification_dispatch import list_dead_letters
+
+    pid = uuid.uuid4()
+    entry = _RetryEntry(
+        project_id=pid,
+        event_type="test_dead_event",
+        payload={"key": "value"},
+        body={"event_type": "test_dead_event", "payload": {"key": "value"}},
+        attempts=3,
+        next_retry_at=0,
+        webhook_url="https://hooks.example.com/test",
+    )
+    await nd._write_dead_letter(entry, reason="exhausted", last_status=503)
+
+    rows = await list_dead_letters(db_session, project_id=pid)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["project_id"] == str(pid)
+    assert row["event_type"] == "test_dead_event"
+    assert row["reason"] == "exhausted"
+    assert row["attempts"] == 4  # entry.attempts + 1 from _write_dead_letter
+    assert row["last_status"] == 503
+    assert row["webhook_url"] == "https://hooks.example.com/test"
+    assert row["payload"] == {"key": "value"}
+    assert "created_at" in row
+
+
+@pytest.mark.asyncio
+async def test_list_dead_letters_returns_empty_for_project_with_no_dead_letters(db_session):
+    """Listing dead letters for a project with no dead-letter rows returns an empty list."""
+    from app.notification_dispatch import list_dead_letters
+
+    pid = uuid.uuid4()
+    rows = await list_dead_letters(db_session, project_id=pid)
+    assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# redrive_dead_letter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_redrive_reenqueues_and_deletes(db_session):
+    """Re-driving a dead-letter row re-enqueues it into the retry queue and removes the row."""
+    from app.models import NotificationDeadLetter
+    from app.notification_dispatch import redrive_dead_letter
+    from sqlmodel import select as _select
+
+    _reset_stats()
+    pid = uuid.uuid4()
+    entry = _RetryEntry(
+        project_id=pid,
+        event_type="redrive_test_event",
+        payload={"p": 1},
+        body={"event_type": "redrive_test_event", "payload": {"p": 1}},
+        attempts=2,
+        next_retry_at=time.monotonic(),
+        webhook_url="https://hooks.example.com/redrive",
+    )
+    await nd._write_dead_letter(entry, reason="exhausted", last_status=500)
+
+    # Find the persisted row
+    rows = (
+        await db_session.execute(
+            _select(NotificationDeadLetter).where(
+                NotificationDeadLetter.project_id == str(pid),
+                NotificationDeadLetter.event_type == "redrive_test_event",
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    dl_id = str(rows[0].id)
+
+    # The retry queue should be empty before the redrive
+    assert len(nd._retry_queue) == 0
+
+    result = await redrive_dead_letter(db_session, dead_letter_id=dl_id, project_id=str(pid))
+    assert result["status"] == "redriven"
+    assert result["id"] == dl_id
+
+    # The entry should now be in the retry queue
+    assert len(nd._retry_queue) == 1
+    queued = nd._retry_queue[0]
+    assert queued.event_type == "redrive_test_event"
+    assert queued.payload == {"p": 1}
+    assert queued.webhook_url == "https://hooks.example.com/redrive"
+    assert queued.attempts == 0  # fresh attempt count
+
+    # The dead-letter row should be deleted
+    remaining = (
+        await db_session.execute(
+            _select(NotificationDeadLetter).where(
+                NotificationDeadLetter.id == rows[0].id,
+            )
+        )
+    ).scalars().all()
+    assert len(remaining) == 0
+
+
+@pytest.mark.asyncio
+async def test_redrive_unknown_id_raises_value_error(db_session):
+    """Re-driving a nonexistent dead-letter id raises ValueError."""
+    from app.notification_dispatch import redrive_dead_letter
+
+    with pytest.raises(ValueError, match="dead letter not found"):
+        await redrive_dead_letter(db_session, dead_letter_id=str(uuid.uuid4()), project_id=str(uuid.uuid4()))
+
+
+@pytest.mark.asyncio
+async def test_redrive_restores_original_body_and_event_type(db_session):
+    """A re-driven entry carries the original JSON body and event_type, so the
+    retry delivers the same notification that was originally attempted."""
+    from app.models import NotificationDeadLetter
+    from app.notification_dispatch import redrive_dead_letter
+    from sqlmodel import select as _select
+
+    _reset_stats()
+    pid = uuid.uuid4()
+    original_body = {
+        "event_type": "custom_event_type",
+        "project_id": str(pid),
+        "timestamp": "2024-01-01T00:00:00",
+        "payload": {"nested": True, "count": 42},
+    }
+    entry = _RetryEntry(
+        project_id=pid,
+        event_type="custom_event_type",
+        payload={"nested": True, "count": 42},
+        body=original_body,
+        attempts=1,
+        next_retry_at=time.monotonic(),
+        webhook_url="https://hooks.example.com/original",
+    )
+    await nd._write_dead_letter(entry, reason="exhausted", last_status=502)
+    rows = (
+        await db_session.execute(
+            _select(NotificationDeadLetter).where(
+                NotificationDeadLetter.project_id == str(pid),
+                NotificationDeadLetter.event_type == "custom_event_type",
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+
+    await redrive_dead_letter(db_session, dead_letter_id=str(rows[0].id), project_id=str(pid))
+    assert len(nd._retry_queue) == 1
+    queued = nd._retry_queue[0]
+    assert queued.event_type == "custom_event_type"
+    assert queued.body == original_body
+    assert queued.payload == {"nested": True, "count": 42}
+    assert queued.webhook_url == "https://hooks.example.com/original"
+
+
+@pytest.mark.asyncio
+async def test_redrive_wrong_project_raises_value_error(db_session):
+    """Re-driving with a mismatched project_id raises ValueError (cross-project guard)."""
+    from app.models import NotificationDeadLetter
+    from app.notification_dispatch import redrive_dead_letter
+    from sqlmodel import select as _select
+
+    _reset_stats()
+    pid = uuid.uuid4()
+    entry = _RetryEntry(
+        project_id=pid,
+        event_type="cross_project_test",
+        payload={"p": 1},
+        body={"event_type": "cross_project_test", "payload": {"p": 1}},
+        attempts=1,
+        next_retry_at=time.monotonic(),
+        webhook_url="https://hooks.example.com/cross",
+    )
+    await nd._write_dead_letter(entry, reason="exhausted", last_status=500)
+    rows = (
+        await db_session.execute(
+            _select(NotificationDeadLetter).where(
+                NotificationDeadLetter.project_id == str(pid),
+                NotificationDeadLetter.event_type == "cross_project_test",
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    dl_id = str(rows[0].id)
+
+    # Redrive with a DIFFERENT project_id → should raise ValueError
+    other_pid = uuid.uuid4()
+    with pytest.raises(ValueError, match="dead letter not found"):
+        await redrive_dead_letter(db_session, dead_letter_id=dl_id, project_id=str(other_pid))
+
+
+# ---------------------------------------------------------------------------
+# Router-level tests (test client)
+# ---------------------------------------------------------------------------
+
+
+TEST_USER_ID = "test-user-123"  # matches conftest override_get_current_user
+
+
+async def _setup_project_with_owner(session) -> Project:
+    """Create a test project with the conftest test user as owner."""
+    project = Project(name="DL Test Project", user_id=TEST_USER_ID)
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+    await session.commit()
+    return project
+
+
+class TestDeadLetterRouter:
+    """Router-level tests for GET/POST dead-letter endpoints via the test client."""
+
+    @pytest.mark.asyncio
+    async def test_list_dead_letters_empty(self, client, db_session):
+        """GET with a valid project returns empty list when no dead letters exist."""
+        project = await _setup_project_with_owner(db_session)
+        resp = await client.get(
+            f"/api/admin/notification-dispatch/dead-letters?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data == []
+
+    @pytest.mark.asyncio
+    async def test_list_dead_letters_with_rows(self, client, db_session):
+        """GET returns dead-letter rows for the project, newest first."""
+        project = await _setup_project_with_owner(db_session)
+        pid = project.id
+
+        # Write two dead-letter rows
+        for i, reason in enumerate(["exhausted", "evicted"]):
+            entry = _RetryEntry(
+                project_id=pid,
+                event_type=f"dl_event_{i}",
+                payload={"n": i},
+                body={"event_type": f"dl_event_{i}", "payload": {"n": i}},
+                attempts=i,
+                next_retry_at=0,
+                webhook_url=f"https://hooks.example.com/dl{i}",
+            )
+            await nd._write_dead_letter(entry, reason=reason, last_status=500 + i)
+
+        resp = await client.get(
+            f"/api/admin/notification-dispatch/dead-letters?project_id={pid}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        # Newest first (evicted written second)
+        assert data[0]["reason"] == "evicted"
+        assert data[1]["reason"] == "exhausted"
+        # Admin user sees full webhook_url
+        assert data[0]["webhook_url"] == "https://hooks.example.com/dl1"
+
+    @pytest.mark.asyncio
+    async def test_list_dead_letters_invalid_uuid_returns_400(self, client, db_session):
+        """GET with a non-UUID project_id returns 400."""
+        resp = await client.get(
+            "/api/admin/notification-dispatch/dead-letters?project_id=not-a-uuid"
+        )
+        assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
+        # HTTPException detail may appear under 'detail' or another key depending
+        # on middleware; accept the string anywhere in the JSON body.
+        body = resp.json()
+        if isinstance(body, dict):
+            assert "Invalid project_id format" in str(body), f"body: {body}"
+        else:
+            assert "Invalid project_id format" in resp.text, f"text: {resp.text}"
+
+    @pytest.mark.asyncio
+    async def test_list_dead_letters_nonexistent_project_returns_404(self, client, db_session):
+        """GET with a valid UUID that the user is not a member of returns 404."""
+        resp = await client.get(
+            f"/api/admin/notification-dispatch/dead-letters?project_id={uuid.uuid4()}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_redrive_succeeds_and_removes_row(self, client, db_session):
+        """POST /redrive re-enqueues the dead letter and returns redriven count."""
+        project = await _setup_project_with_owner(db_session)
+        pid = project.id
+
+        entry = _RetryEntry(
+            project_id=pid,
+            event_type="redrive_router_test",
+            payload={"x": 1},
+            body={"event_type": "redrive_router_test", "payload": {"x": 1}},
+            attempts=2,
+            next_retry_at=time.monotonic(),
+            webhook_url="https://hooks.example.com/redrive-router",
+        )
+        await nd._write_dead_letter(entry, reason="exhausted", last_status=503)
+
+        # Find the row ID
+        from app.models import NotificationDeadLetter
+        from sqlmodel import select as _select
+        rows = (
+            await db_session.execute(
+                _select(NotificationDeadLetter).where(
+                    NotificationDeadLetter.project_id == str(pid),
+                    NotificationDeadLetter.event_type == "redrive_router_test",
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        dl_id = str(rows[0].id)
+
+        _reset_stats()
+        resp = await client.post(
+            "/api/admin/notification-dispatch/dead-letters/redrive",
+            json={"project_id": str(pid), "ids": [dl_id]},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["redriven"] == 1
+        assert data["errors"] == []
+
+    @pytest.mark.asyncio
+    async def test_redrive_invalid_id_format_returns_error_entry(self, client, db_session):
+        """POST /redrive with a non-UUID id collects an error entry, does not 400."""
+        project = await _setup_project_with_owner(db_session)
+        _reset_stats()
+        resp = await client.post(
+            "/api/admin/notification-dispatch/dead-letters/redrive",
+            json={"project_id": str(project.id), "ids": ["not-a-uuid", "also-bad"]},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["redriven"] == 0
+        assert len(data["errors"]) == 2
+        assert all(e["error"] == "invalid id format" for e in data["errors"])
+
+    @pytest.mark.asyncio
+    async def test_redrive_nonexistent_id_returns_not_found_error(self, client, db_session):
+        """POST /redrive with a valid UUID that doesn't exist → not-found error."""
+        project = await _setup_project_with_owner(db_session)
+        _reset_stats()
+        resp = await client.post(
+            "/api/admin/notification-dispatch/dead-letters/redrive",
+            json={"project_id": str(project.id), "ids": [str(uuid.uuid4())]},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["redriven"] == 0
+        assert len(data["errors"]) == 1
+        assert data["errors"][0]["error"] == "not found"
+
+    @pytest.mark.asyncio
+    async def test_redrive_invalid_project_id_returns_400(self, client, db_session):
+        """POST /redrive with a non-UUID project_id returns 400."""
+        resp = await client.post(
+            "/api/admin/notification-dispatch/dead-letters/redrive",
+            json={"project_id": "garbage", "ids": [str(uuid.uuid4())]},
+        )
+        assert resp.status_code == 400, f"expected 400, got {resp.status_code}: {resp.text}"
+        body = resp.json()
+        if isinstance(body, dict):
+            assert "Invalid project_id format" in str(body), f"body: {body}"
+        else:
+            assert "Invalid project_id format" in resp.text, f"text: {resp.text}"
+
+    @pytest.mark.asyncio
+    async def test_redrive_mixed_valid_and_invalid_ids(self, client, db_session):
+        """POST /redrive with mix of valid, invalid-format, and nonexistent IDs."""
+        project = await _setup_project_with_owner(db_session)
+        pid = project.id
+
+        # Create one valid dead-letter row
+        entry = _RetryEntry(
+            project_id=pid,
+            event_type="mixed_test",
+            payload={"z": 1},
+            body={"event_type": "mixed_test", "payload": {"z": 1}},
+            attempts=1,
+            next_retry_at=time.monotonic(),
+            webhook_url="https://hooks.example.com/mixed",
+        )
+        await nd._write_dead_letter(entry, reason="exhausted", last_status=500)
+
+        from app.models import NotificationDeadLetter
+        from sqlmodel import select as _select
+        rows = (
+            await db_session.execute(
+                _select(NotificationDeadLetter).where(
+                    NotificationDeadLetter.project_id == str(pid),
+                    NotificationDeadLetter.event_type == "mixed_test",
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        good_id = str(rows[0].id)
+
+        _reset_stats()
+        resp = await client.post(
+            "/api/admin/notification-dispatch/dead-letters/redrive",
+            json={
+                "project_id": str(pid),
+                "ids": [good_id, "bad-format", str(uuid.uuid4())],
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["redriven"] == 1
+        assert len(data["errors"]) == 2
+        error_ids = {e["id"] for e in data["errors"]}
+        assert "bad-format" in error_ids
+
+    @pytest.mark.asyncio
+    async def test_redrive_ids_max_200_validated(self, client, db_session):
+        """POST /redrive rejects payloads with more than 200 ids via Pydantic validation."""
+        project = await _setup_project_with_owner(db_session)
+        resp = await client.post(
+            "/api/admin/notification-dispatch/dead-letters/redrive",
+            json={"project_id": str(project.id), "ids": [str(uuid.uuid4())] * 201},
+        )
+        assert resp.status_code == 422  # Pydantic validation error

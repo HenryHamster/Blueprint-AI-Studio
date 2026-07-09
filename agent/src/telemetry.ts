@@ -118,6 +118,29 @@ export function setPromptSizeTelemetry(
   _promptSectionSizes = sectionSizes;
 }
 
+/** Build prompt-size telemetry from the assembled prompt and its named sections.
+ *  Sorts sections descending by byte size and caps at the top 10 for heartbeat
+ *  payload size. Returns an object suitable for destructuring into
+ *  setPromptSizeTelemetry. */
+export function buildPromptSizeTelemetry(
+  fullPrompt: string,
+  sections: Array<[string, string]>,
+): {
+  prompt_size_bytes: number;
+  prompt_section_count: number;
+  prompt_section_sizes: Array<{ name: string; bytes: number }>;
+} {
+  const sized = sections
+    .map(([name, text]) => ({ name, bytes: Buffer.byteLength(text, 'utf8') }))
+    .filter(s => s.bytes > 0)
+    .sort((a, b) => b.bytes - a.bytes);
+  return {
+    prompt_size_bytes: Buffer.byteLength(fullPrompt, 'utf8'),
+    prompt_section_count: sized.length,
+    prompt_section_sizes: sized.slice(0, 10),
+  };
+}
+
 /** Snapshot the current cumulative LLM telemetry for heartbeat / status posts. */
 export function getLlmTelemetry(): {
   llm_call_count: number;

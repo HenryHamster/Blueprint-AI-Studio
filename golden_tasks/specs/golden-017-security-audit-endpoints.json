@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-017",
+  "name": "Audit endpoint access controls",
+  "description": "A 'security_audit' task: audit all API endpoints for missing or incorrect access control decorators.",
+  "task_type": "security_audit",
+  "prompt": "Audit all public API endpoints in backend/app/routers/ for access control. Flag any handler that: (1) is missing @require_project_access or @require_role, (2) uses weak auth only (get_current_user_optional where get_current_user is appropriate), (3) leaks internal IDs or stack traces in error responses. List severity, file:line, and remediation for each finding. Do NOT implement fixes.",
+  "effort": "high",
+  "source_info": "Pattern from security_audit tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "audit_findings"
+  },
+  "tags": ["security", "expensive", "cost-baseline"]
+}

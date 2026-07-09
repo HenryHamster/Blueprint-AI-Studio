@@ -737,6 +737,108 @@ def test_resolve_task_routing_partial_override_inherits_other_field():
     assert result["effort"] == "medium"
 
 
+def test_resolve_task_routing_applies_adopt_verdict():
+    """When provider_routing_verdict_state=ADOPT, DeepSeek is moved to first
+    position for initiative/build/ops categories."""
+    from app.max_plan_pool import resolve_task_routing
+
+    runtime_config = {
+        "task_type_categories": {"initiative": ["plan"], "build": ["create"]},
+        "category_routing": {
+            "initiative": {"providers": ["anthropic", "deepseek", "openai"]},
+            "build": {"providers": ["openai", "deepseek"]},
+        },
+        "provider_routing_verdict_state": "ADOPT",
+    }
+    # initiative: deepseek moves from pos 1 to pos 0
+    assert resolve_task_routing(_make_task("plan"), runtime_config)["providers"] == [
+        "deepseek", "anthropic", "openai",
+    ]
+    # build: deepseek moves from pos 1 to pos 0
+    assert resolve_task_routing(_make_task("create"), runtime_config)["providers"] == [
+        "deepseek", "openai",
+    ]
+
+
+def test_resolve_task_routing_applies_reject_verdict():
+    """When provider_routing_verdict_state=REJECT, Anthropic is moved to first
+    position for initiative/build/ops categories."""
+    from app.max_plan_pool import resolve_task_routing
+
+    runtime_config = {
+        "task_type_categories": {"build": ["create"], "ops": ["docs"]},
+        "category_routing": {
+            "build": {"providers": ["deepseek", "openai", "anthropic"]},
+            "ops": {"providers": ["deepseek", "gemini"]},
+        },
+        "provider_routing_verdict_state": "REJECT",
+    }
+    # build: anthropic moves from pos 2 to pos 0
+    assert resolve_task_routing(_make_task("create"), runtime_config)["providers"] == [
+        "anthropic", "deepseek", "openai",
+    ]
+    # ops: anthropic (not in list) gets prepended
+    assert resolve_task_routing(_make_task("docs"), runtime_config)["providers"] == [
+        "anthropic", "deepseek", "gemini",
+    ]
+
+
+def test_resolve_task_routing_verdict_insufficient_data_unchanged():
+    """INSUFFICIENT_DATA leaves static config order unchanged."""
+    from app.max_plan_pool import resolve_task_routing
+
+    runtime_config = {
+        "task_type_categories": {"build": ["create"]},
+        "category_routing": {
+            "build": {"providers": ["anthropic", "deepseek", "openai"]},
+        },
+        "provider_routing_verdict_state": "INSUFFICIENT_DATA",
+    }
+    assert resolve_task_routing(_make_task("create"), runtime_config)["providers"] == [
+        "anthropic", "deepseek", "openai",
+    ]
+
+
+def test_resolve_task_routing_verdict_skips_unaffected_categories():
+    """Strategic and review categories are NOT affected by the verdict."""
+    from app.max_plan_pool import resolve_task_routing
+
+    runtime_config = {
+        "task_type_categories": {
+            "strategic": ["strategic_review"],
+            "review": ["review"],
+        },
+        "category_routing": {
+            "strategic": {"providers": ["zai", "anthropic", "deepseek"]},
+            "review": {"providers": ["anthropic", "deepseek"]},
+        },
+        "provider_routing_verdict_state": "ADOPT",
+    }
+    # strategic: max effort, verdict doesn't apply — zai stays first
+    assert resolve_task_routing(
+        _make_task("strategic_review"), runtime_config
+    )["providers"] == ["zai", "anthropic", "deepseek"]
+    # review: high effort, verdict doesn't apply — anthropic stays first
+    assert resolve_task_routing(
+        _make_task("review"), runtime_config
+    )["providers"] == ["anthropic", "deepseek"]
+
+
+def test_resolve_task_routing_no_verdict_key_unchanged():
+    """Absent provider_routing_verdict_state key = no reordering."""
+    from app.max_plan_pool import resolve_task_routing
+
+    runtime_config = {
+        "task_type_categories": {"build": ["create"]},
+        "category_routing": {
+            "build": {"providers": ["anthropic", "deepseek"]},
+        },
+    }
+    assert resolve_task_routing(_make_task("create"), runtime_config)["providers"] == [
+        "anthropic", "deepseek",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # build_agent_secret_manifest integration
 # ---------------------------------------------------------------------------

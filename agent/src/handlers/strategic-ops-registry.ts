@@ -81,6 +81,8 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Spawn an implementation/research/plan task for a direction.' },
   { op: 'spawn_fix', alias: 'spawn-fix', cli: true, prompt: true, internalReason: null,
     description: 'Spawn a one-time fix task.' },
+  { op: 'cancel_task', alias: 'cancel-task', cli: true, prompt: true, internalReason: null,
+    description: 'Cancel a previously spawned QUEUED/PROVISIONING task with a required reason.' },
   { op: 'dispose_completion_debt', alias: 'dispose-completion-debt', cli: true, prompt: true, internalReason: null,
     description: 'Dispose of an open completion-debt ledger entry.' },
   { op: 'set_retirement_critiques', alias: 'set-retirement-critiques', cli: true, prompt: true, internalReason: null,

@@ -10,6 +10,7 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 
+from sqlalchemy import and_, or_
 from sqlmodel import select
 
 from app.models import Task, TaskStatus, TaskWakeRegistration, WakeDeliveryState
@@ -140,6 +141,61 @@ async def sweep_converge_linked_bug_messages(
     acted = 0
     pending_broadcasts: list[tuple[str, dict]] = []
 
+    # ── Batch-load linked directions and tasks ───────────────────────
+    direction_keys: list[tuple[str, str]] = []
+    task_ids: list[uuid.UUID] = []
+    for _msg in msgs:
+        _link = get_message_link(_msg)
+        if not _link:
+            continue
+        _kind = _link.get("kind")
+        _oid = _link.get("id")
+        if not _kind or not _oid:
+            continue
+        if _kind == "direction":
+            direction_keys.append((str(_msg.project_id), str(_oid)))
+        elif _kind == "task":
+            try:
+                task_ids.append(uuid.UUID(str(_oid)))
+            except (ValueError, AttributeError):
+                pass  # handled inside the main loop
+
+    directions_by_key: dict[tuple[str, str], Direction] = {}
+    if direction_keys:
+        _dir_conditions = [
+            and_(
+                Direction.project_id == pid,
+                Direction.direction_key == dk,
+            )
+            for pid, dk in direction_keys
+        ]
+        _dir_rows = (
+            (
+                await session.execute(
+                    select(Direction).where(or_(*_dir_conditions))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        directions_by_key = {
+            (str(r.project_id), r.direction_key): r
+            for r in _dir_rows
+        }
+
+    tasks_by_id: dict[uuid.UUID, Task] = {}
+    if task_ids:
+        _task_rows = (
+            (
+                await session.execute(
+                    select(Task).where(Task.id.in_(task_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        tasks_by_id = {r.id: r for r in _task_rows}
+
     for msg in msgs:
         link = get_message_link(msg)
         if not link:
@@ -162,17 +218,8 @@ async def sweep_converge_linked_bug_messages(
                 linked_at = None
 
         if kind == "direction":
-            dir_row = (
-                (
-                    await session.execute(
-                        select(Direction).where(
-                            Direction.project_id == msg.project_id,
-                            Direction.direction_key == outcome_id,
-                        )
-                    )
-                )
-                .scalars()
-                .first()
+            dir_row = directions_by_key.get(
+                (str(msg.project_id), str(outcome_id))
             )
 
             if dir_row is None:
@@ -262,7 +309,7 @@ async def sweep_converge_linked_bug_messages(
                 )
                 continue
 
-            task_row = await session.get(Task, task_uuid)
+            task_row = tasks_by_id.get(task_uuid)
 
             if task_row is None:
                 reason = f"Owning task '{outcome_id}' no longer exists"

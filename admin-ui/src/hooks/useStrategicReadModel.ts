@@ -3,7 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchStrategicState, type StrategicSessionResponse, type StrategicStateResponse } from '../strategicStateApi';
 import { DEFAULT_POLL_MS, usePoller } from './usePoller';
 
-export function useStrategicReadModel(projectId: string | null) {
+export function useStrategicReadModel(projectId: string | null, opts?: { pollerEnabled?: boolean }) {
+  const pollerEnabled = opts?.pollerEnabled ?? true;
   const [data, setData] = useState<StrategicStateResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -85,7 +86,7 @@ export function useStrategicReadModel(projectId: string | null) {
 
   usePoller(refresh, {
     intervalMs: DEFAULT_POLL_MS,
-    enabled: Boolean(projectId),
+    enabled: Boolean(projectId) && pollerEnabled,
     deps: [projectId],
   });
 

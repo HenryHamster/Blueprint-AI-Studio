@@ -564,6 +564,13 @@ class RenderUnitTests(unittest.TestCase):
                           "StartLimitBurst=3", "KillSignal=SIGTERM",
                           "TimeoutStopSec=30", "WantedBy=default.target"):
             self.assertIn(directive, text)
+        # StartLimitIntervalSec and StartLimitBurst belong in [Unit], not [Service].
+        self.assertLess(
+            text.index("StartLimitIntervalSec=60"), text.index("[Service]"),
+            "StartLimitIntervalSec must appear in the [Unit] block")
+        self.assertLess(
+            text.index("StartLimitBurst=3"), text.index("[Service]"),
+            "StartLimitBurst must appear in the [Unit] block")
 
     def test_system_template_substitutes_user_and_wantedby(self):
         text = br.render_unit(
@@ -582,6 +589,13 @@ class RenderUnitTests(unittest.TestCase):
         self.assertIn("KillSignal=SIGTERM", text)
         self.assertIn("StartLimitIntervalSec=60", text)
         self.assertIn("StartLimitBurst=3", text)
+        # StartLimitIntervalSec and StartLimitBurst belong in [Unit], not [Service].
+        self.assertLess(
+            text.index("StartLimitIntervalSec=60"), text.index("[Service]"),
+            "StartLimitIntervalSec must appear in the [Unit] block")
+        self.assertLess(
+            text.index("StartLimitBurst=3"), text.index("[Service]"),
+            "StartLimitBurst must appear in the [Unit] block")
         # Comment block documents crash-loop guard recovery.
         self.assertIn("systemctl reset-failed", text)
 
@@ -1043,6 +1057,186 @@ class CredentialDirTests(unittest.TestCase):
             Path(token_path).write_text("my-persisted-token\n")
             with patch.object(br, "_credential_dir", return_value=tmpdir):
                 self.assertEqual(br._load_persisted_token(), "my-persisted-token")
+
+
+def _git_recorder(*, upstream="upstream-sha", behind=True, fetch_rc=0, merge_rc=0, record=None):
+    """Fake ``_run`` for git commands dispatched on argv.
+
+    Simulates a repo that is behind origin: ``git rev-parse HEAD`` returns
+    ``"local-sha"``, ``git rev-parse @{u}`` returns *upstream*, and
+    ``git merge --ff-only @{u}`` succeeds when *behind* is True (or fails when
+    behind is False, simulating nothing-to-pull or conflict).
+    ``git diff --name-only`` returns changed files from *diff_files* (default
+    ``"agent/package-lock.json\nadmin-ui/package-lock.json"``). ``git fetch``
+    returns *fetch_rc*. ``record`` captures every argv.
+    """
+
+    LOCAL_SHA = "a" * 40
+
+    def run(argv, **kwargs):
+        if record is not None:
+            record.append(list(argv))
+        joined = " ".join(argv) if isinstance(argv, (list, tuple)) else ""
+
+        # git fetch origin
+        if "fetch" in joined and "origin" in joined:
+            return MagicMock(returncode=fetch_rc, stdout="", stderr="")
+        # git rev-parse HEAD
+        if "rev-parse" in joined and "HEAD" in joined and "@{u}" not in joined and "--abbrev-ref" not in joined:
+            return MagicMock(returncode=0, stdout=LOCAL_SHA, stderr="")
+        # git rev-parse @{u}
+        if "rev-parse" in joined and "@{u}" in joined:
+            return MagicMock(
+                returncode=0,
+                stdout=upstream,
+                stderr="",
+            )
+        # git rev-parse --abbrev-ref HEAD
+        if "rev-parse" in joined and "--abbrev-ref" in joined and "HEAD" in joined:
+            return MagicMock(returncode=0, stdout="main\n", stderr="")
+        # git merge-base
+        if "merge-base" in joined:
+            # When local is behind, merge-base = local-sha (not upstream)
+            if behind:
+                return MagicMock(returncode=0, stdout=LOCAL_SHA, stderr="")
+            return MagicMock(returncode=0, stdout=upstream, stderr="")
+        # git merge --ff-only
+        if "merge" in joined and "--ff-only" in joined:
+            return MagicMock(returncode=merge_rc, stdout="Fast-forward\n", stderr="")
+        # git diff --name-only
+        if "diff" in joined and "--name-only" in joined:
+            if behind and merge_rc == 0:
+                return MagicMock(
+                    returncode=0,
+                    stdout="agent/package-lock.json\nadmin-ui/package-lock.json\n",
+                    stderr="",
+                )
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    return run
+
+
+class UpdateCommandTests(unittest.TestCase):
+    """Tests for the ``blueprint-runner update`` command."""
+
+    def test_update_routed_from_main(self):
+        """``main(["update"])`` routes to ``do_update``."""
+        with patch.object(br, "do_update", return_value=0) as upd:
+            rc = br.main(["update"])
+        self.assertEqual(rc, 0)
+        upd.assert_called_once()
+
+    def test_update_returns_1_when_git_unavailable(self):
+        """When _git returns None (git absent), do_update prints an error and returns 1."""
+        rc = br.do_update(_run=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError))
+        self.assertEqual(rc, 1)
+
+    def test_update_already_up_to_date(self):
+        """When local HEAD matches upstream, do_update reports up-to-date and returns 0."""
+        # Both rev-parse HEAD and @{u} return the same sha → already up to date.
+        SAME_SHA = "a" * 40
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            joined = " ".join(argv) if isinstance(argv, (list, tuple)) else ""
+            if "fetch" in joined and "origin" in joined:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if "rev-parse" in joined and "HEAD" in joined and "@{u}" not in joined and "--abbrev-ref" not in joined:
+                return MagicMock(returncode=0, stdout=SAME_SHA, stderr="")
+            if "rev-parse" in joined and "@{u}" in joined:
+                return MagicMock(returncode=0, stdout=SAME_SHA, stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        rc = br.do_update(_run=fake_run)
+        self.assertEqual(rc, 0)
+        # No merge attempted when already up to date.
+        self.assertFalse(any("merge" in " ".join(c) for c in calls))
+
+    def test_update_behind_fetches_and_fastforwards(self):
+        """When behind origin, do_update fetches, merges --ff-only, and reinstalls deps."""
+        calls = []
+        run = _git_recorder(record=calls)
+        rc = br.do_update(_run=run)
+        self.assertEqual(rc, 0)
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(any("fetch origin" in j for j in joined))
+        self.assertTrue(any("merge --ff-only" in j for j in joined))
+        self.assertTrue(any("diff --name-only" in j for j in joined))
+
+    def test_update_ahead_returns_1(self):
+        """When local HEAD is ahead of upstream, do_update returns 1."""
+        # Simulate local ahead: merge-base matches upstream, not local
+        LOCAL = "a" * 40
+        UPSTREAM = "b" * 40  # older than local
+
+        def fake_run(argv, **kwargs):
+            joined = " ".join(argv) if isinstance(argv, (list, tuple)) else ""
+            if "fetch" in joined and "origin" in joined:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if "rev-parse" in joined and "HEAD" in joined and "@{u}" not in joined and "--abbrev-ref" not in joined:
+                return MagicMock(returncode=0, stdout=LOCAL, stderr="")
+            if "rev-parse" in joined and "@{u}" in joined:
+                return MagicMock(returncode=0, stdout=UPSTREAM, stderr="")
+            if "merge-base" in joined:
+                # merge-base equals upstream → local is ahead
+                return MagicMock(returncode=0, stdout=UPSTREAM, stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        rc = br.do_update(_run=fake_run)
+        self.assertEqual(rc, 1)
+
+    def test_update_diverged_returns_1(self):
+        """When local and upstream have diverged, do_update returns 1."""
+        LOCAL = "a" * 40
+        UPSTREAM = "b" * 40
+        MERGE_BASE = "c" * 40  # neither HEAD nor upstream → diverged
+
+        def fake_run(argv, **kwargs):
+            joined = " ".join(argv) if isinstance(argv, (list, tuple)) else ""
+            if "fetch" in joined and "origin" in joined:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if "rev-parse" in joined and "HEAD" in joined and "@{u}" not in joined and "--abbrev-ref" not in joined:
+                return MagicMock(returncode=0, stdout=LOCAL, stderr="")
+            if "rev-parse" in joined and "@{u}" in joined:
+                return MagicMock(returncode=0, stdout=UPSTREAM, stderr="")
+            if "merge-base" in joined:
+                return MagicMock(returncode=0, stdout=MERGE_BASE, stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        rc = br.do_update(_run=fake_run)
+        self.assertEqual(rc, 1)
+
+    def test_update_no_upstream_returns_1(self):
+        """When there is no upstream tracking branch, do_update returns 1."""
+        def fake_run(argv, **kwargs):
+            joined = " ".join(argv) if isinstance(argv, (list, tuple)) else ""
+            if "fetch" in joined and "origin" in joined:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if "rev-parse" in joined and "HEAD" in joined and "@{u}" not in joined:
+                return MagicMock(returncode=0, stdout="a" * 40, stderr="")
+            if "rev-parse" in joined and "@{u}" in joined:
+                return MagicMock(returncode=1, stdout="", stderr="fatal: no upstream configured")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        rc = br.do_update(_run=fake_run)
+        self.assertEqual(rc, 1)
+
+    def test_update_merge_failure_returns_1(self):
+        """When git merge --ff-only fails, do_update returns 1."""
+        calls = []
+        run = _git_recorder(merge_rc=1, record=calls)
+        rc = br.do_update(_run=run)
+        self.assertEqual(rc, 1)
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(any("merge --ff-only" in j for j in joined))
+
+    def test_update_fetch_failure_returns_1(self):
+        """When git fetch fails, do_update returns 1."""
+        run = _git_recorder(fetch_rc=1)
+        rc = br.do_update(_run=run)
+        self.assertEqual(rc, 1)
 
 
 class PrintNoSystemdGuidanceTests(unittest.TestCase):

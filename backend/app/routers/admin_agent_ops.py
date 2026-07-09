@@ -5,6 +5,7 @@ size cap. All HTTP routes, request/response schemas, and authentication rules
 are unchanged.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -156,6 +157,7 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "resolve_message",
     "spawn_task",
     "spawn_fix",
+    "cancel_task",
     "dispose_completion_debt",
     "set_retirement_critiques",
     "set_evidence_progress",
@@ -718,7 +720,8 @@ async def agent_annotate(
         assert file_path is not None
         assert change_summary is not None
 
-        verdict = _classify_breach_policy(
+        verdict = await asyncio.to_thread(
+            _classify_breach_policy,
             file_path.strip(),
             current_size,
             payload.section,
@@ -3027,6 +3030,24 @@ async def strategic_operation(
                     "acceptance_evidence must be a dict; ignored"
                 )
 
+        # Cross-field guard: explicit criterion_ids require named_test acceptance
+        # evidence so the acceptance pipeline can record a proven-verdict at merge
+        # time. Without this, a strategist can spawn a criterion-carrying task that
+        # will never close the coverage loop — silently defeating the
+        # criterion-coverage gate that direction d-7cd4170b put in place.
+        if explicit_criterion_ids and (
+            not isinstance(spawn_payload.get("acceptance_evidence"), dict)
+            or spawn_payload["acceptance_evidence"].get("kind") != "named_test"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "criterion_ids requires acceptance_evidence with "
+                    'kind "named_test" so the merge of this task can record '
+                    "a proven-verdict for the criterion(s)"
+                ),
+            )
+
         # compute_experiment requires a validated launch contract with spend-gate.
         spawn_requires_approval: bool | None = None
         if spawn_type == "compute_experiment":
@@ -3591,6 +3612,7 @@ async def strategic_operation(
             normalize_active_moves_writeback as _normalize_active_moves_writeback,
             operator_owned_subset,
         )
+        from app.research_direction_state import RETIRED_DIRECTION_STATUSES
         from app.strategic_completion import (
             NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
             NEW_VERSION_GOAL_CONTEXT_KEY,
@@ -3664,6 +3686,11 @@ async def strategic_operation(
                     if snap:
                         baseline_pm = snap
         _protected_gap_ids = _active_direction_gap_ids(project.directions)
+        _live_dir_ids = frozenset(
+            str(d.get("id"))
+            for d in (project.directions or [])
+            if d.get("status") not in RETIRED_DIRECTION_STATUSES
+        )
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
@@ -3671,6 +3698,7 @@ async def strategic_operation(
                 now_iso=_utcnow().isoformat(),
                 baseline_raw=baseline_pm,
                 protected_gap_ids=_protected_gap_ids,
+                live_direction_ids=_live_dir_ids,
             )
         except _PmValidationError as ve:
             raise HTTPException(
@@ -4812,6 +4840,103 @@ async def strategic_operation(
                 "finding_key": finding_key,
                 "state": state,
                 "release_version_id": str(resolution_version_id),
+            }
+        )
+
+    elif payload.op == "cancel_task":
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="cancel_task data must be an object",
+            )
+        target_task_id = data.get("target_task_id")
+        reason = str(data.get("reason", "")).strip()
+        if not target_task_id:
+            raise HTTPException(
+                status_code=400,
+                detail="cancel_task requires 'target_task_id'",
+            )
+        if not reason:
+            raise HTTPException(
+                status_code=400,
+                detail="cancel_task requires a non-empty 'reason' string",
+            )
+        reason = _cap_str(reason, 500, "reason", warnings)
+
+        target_task = await session.get(Task, target_task_id)
+        if not target_task:
+            raise HTTPException(
+                status_code=404,
+                detail=f"cancel_task: target task {target_task_id} not found",
+            )
+        if target_task.project_id != project.id:
+            raise HTTPException(
+                status_code=403,
+                detail="cancel_task: target task belongs to a different project",
+            )
+
+        # Only allow cancelling tasks that THIS strategic session spawned.
+        target_ctx = target_task.context or {}
+        if target_ctx.get("parent_strategic_task_id") != str(task.id):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"cancel_task: target task {target_task_id} was not spawned "
+                    f"by this strategic session ({task.id})"
+                ),
+            )
+
+        # Only allow cancelling early-lifecycle states (no active VM/agent).
+        _CANCELLABLE_STATUSES = frozenset(
+            {"QUEUED", "PROVISIONING"}
+        )
+        _target_status = target_task.status.value if hasattr(target_task.status, 'value') else str(target_task.status)
+        if _target_status not in _CANCELLABLE_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"cancel_task: target task {target_task_id} is in "
+                    f"status '{_target_status}', which is not cancellable "
+                    f"(allowed: {sorted(_CANCELLABLE_STATUSES)})"
+                ),
+            )
+
+        # Transition to CANCELLED with reason recorded durably.
+        previous_status = _target_status
+        target_ctx = dict(target_task.context or {})
+        target_ctx["cancelled_by"] = "STRATEGIC_AGENT"
+        target_ctx["cancelled_by_task_id"] = str(task.id)
+        target_ctx["cancel_reason"] = reason
+        target_ctx["cancelled_at"] = _utcnow().isoformat()
+        target_task.context = target_ctx
+        target_task.status = TaskStatus.CANCELLED
+        target_task.latest_status_message = (
+            f"Cancelled by strategic session {task.id}: {reason}"
+        )
+        flag_modified(target_task, "context")
+        session.add(target_task)
+
+        # Stamp the parent review so the cycle knows it cancelled work.
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+
+        logger.info(
+            "[STRATEGIC API] cancel_task: task %s cancelled %s "
+            "(reason=%s) for project %s",
+            task.id,
+            target_task_id,
+            reason,
+            project.id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "cancel_task",
+                "target_task_id": str(target_task.id),
+                "previous_status": previous_status,
             }
         )
 

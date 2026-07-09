@@ -71,6 +71,7 @@ vi.mock('../processTracking.js', () => ({
 vi.mock('../prompt.js', () => ({
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
+  SHARED_LIFECYCLE_REMAINDER: '',
 }));
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────

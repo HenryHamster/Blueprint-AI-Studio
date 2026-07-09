@@ -1559,6 +1559,44 @@ async def update_agent_status(
                         f"got: {payload.pr_url!r}"
                     ),
                 )
+            # Validate PR's actual base branch matches the task's expected base branch.
+            expected_base_branch = (task.first_payload or {}).get("base_branch")
+            if (
+                payload.pr_url
+                and payload.status == TaskStatus.COMPLETED
+                and expected_base_branch
+            ):
+                try:
+                    from app.routers.agent import get_github_token_for_task
+                    from app.github import get_pull_request
+
+                    _parts = payload.pr_url.rstrip("/").split("/")
+                    _gh_token, _gh_owner, _gh_repo = (
+                        await get_github_token_for_task(task.id, session)
+                    )
+                    _pr_num = int(_parts[-1])
+                    _pr_data = await get_pull_request(
+                        _gh_token, _gh_owner, _gh_repo, _pr_num
+                    )
+                    _actual_base = (_pr_data.get("base") or {}).get("ref")
+                    if _actual_base and _actual_base != expected_base_branch:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"PR #{_pr_num} targets branch '{_actual_base}', "
+                                f"but task expects base branch '{expected_base_branch}'. "
+                                f"Retarget the PR to '{expected_base_branch}' "
+                                f"or resubmit through ./pr open."
+                            ),
+                        )
+                except HTTPException:
+                    raise
+                except Exception as _gh_exc:
+                    logger.warning(
+                        f"[STATUS] Could not verify PR base branch for task {task.id} "
+                        f"PR #{_parts[-1]}: {type(_gh_exc).__name__}: {_gh_exc} — "
+                        f"accepting submission without validation"
+                    )
             existing = (
                 (
                     await session.execute(

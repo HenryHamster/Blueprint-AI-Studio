@@ -1,5 +1,5 @@
 /* eslint-disable react-hooks/immutability, react-hooks/set-state-in-effect */
-import { useState, useRef, useEffect } from 'react';
+import { memo, useCallback, useState, useRef, useEffect } from 'react';
 import { Terminal, X, Copy, Check, CheckCircle, CheckSquare, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download, Diff, ChevronDown, ChevronRight, Plus, Minus, CopyPlus } from 'lucide-react';
 import { LogsTab } from './TaskDetailDrawerLogs';
 import type { LogLevel } from './TaskDetailDrawerLogs';
@@ -279,7 +279,7 @@ function ChangesTabContent({
   );
 }
 
-export function TaskDetailDrawer({
+export const TaskDetailDrawer = memo(function TaskDetailDrawer({
   task,
   tasks,
   logLines,
@@ -327,6 +327,16 @@ export function TaskDetailDrawer({
   const [cancelImpact, setCancelImpact] = useState<CancelImpactResponse | null>(null);
   const [cancelImpactStatus, setCancelImpactStatus] = useState<CancelImpactStatus>('idle');
   const [detailTask, setDetailTask] = useState<Task | null>(null);
+
+  // Stable callbacks replacing inline arrow functions to minimize child re-renders.
+  const handleApprove = useCallback(() => onApprove(task.id), [onApprove, task.id]);
+  const handleCancel = useCallback(() => onCancel(task.id), [onCancel, task.id]);
+  const handleRetry = useCallback(() => onRetry(task.id), [onRetry, task.id]);
+  const handleDismiss = useCallback(() => onDismiss(task.id), [onDismiss, task.id]);
+  const handleDuplicate = useCallback(() => onDuplicate?.(task), [onDuplicate, task]);
+  const handlePanelReview = useCallback(() => onPanelReview?.(task), [onPanelReview, task]);
+  const handleResetIterationCap = useCallback(() => onResetIterationCap?.(task.id), [onResetIterationCap, task.id]);
+  const handleTriggerRollup = useCallback(() => onTriggerRollup?.(task.id), [onTriggerRollup, task.id]);
 
   // Fetch full task detail (status_log, plan_output) which are omitted from the list endpoint.
   useEffect(() => {
@@ -543,7 +553,7 @@ export function TaskDetailDrawer({
             <div className="flex items-center gap-1 shrink-0">
               {onPanelReview && panelReviewablePr(task) && (
                 <button
-                  onClick={() => onPanelReview(task)}
+                  onClick={handlePanelReview}
                   title="Panel review this PR"
                   className="p-2.5 md:p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                 >
@@ -552,7 +562,7 @@ export function TaskDetailDrawer({
               )}
               {onDuplicate && (
                 <button
-                  onClick={() => onDuplicate(task)}
+                  onClick={handleDuplicate}
                   title="Duplicate task"
                   className="p-2.5 md:p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
                 >
@@ -694,7 +704,7 @@ export function TaskDetailDrawer({
               <div className="flex flex-col gap-2 w-full">
                 <div className="flex flex-wrap gap-2">
                   <button
-                    onClick={() => onApprove(task.id)}
+                    onClick={handleApprove}
                     disabled={!!actionLoading}
                     className="flex-1 px-6 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
                   >
@@ -707,7 +717,7 @@ export function TaskDetailDrawer({
                     Request Changes
                   </button>
                   <button
-                    onClick={() => onCancel(task.id)}
+                    onClick={handleCancel}
                     disabled={!!actionLoading}
                     className="px-3 py-3 rounded-lg bg-neutral-800 hover:bg-red-900/50 text-neutral-500 hover:text-red-400 text-sm transition-colors disabled:opacity-50 border border-neutral-700"
                   >
@@ -837,7 +847,7 @@ export function TaskDetailDrawer({
             {showFailedActions && (
               <>
                 <button
-                  onClick={() => onRetry(task.id)}
+                  onClick={handleRetry}
                   disabled={!!actionLoading}
                   className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                 >
@@ -874,7 +884,7 @@ export function TaskDetailDrawer({
                   </div>
                 )}
                 <button
-                  onClick={() => onDismiss(task.id)}
+                  onClick={handleDismiss}
                   disabled={!!actionLoading}
                   className="px-4 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-400 text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                 >
@@ -885,7 +895,7 @@ export function TaskDetailDrawer({
 
             {showResetCap && (
               <button
-                onClick={() => onResetIterationCap?.(task.id)}
+                onClick={handleResetIterationCap}
                 disabled={!!actionLoading}
                 title="Archive failed review/fix tasks on this PR and reset the iteration counter"
                 className="px-4 py-2 rounded-lg bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 text-sm font-medium transition-colors disabled:opacity-50 border border-amber-600/30 flex items-center gap-1.5"
@@ -896,7 +906,7 @@ export function TaskDetailDrawer({
 
             {showTriggerRollup && (
               <button
-                onClick={() => onTriggerRollup?.(task.id)}
+                onClick={handleTriggerRollup}
                 disabled={!!actionLoading}
                 title="Force-create the rollup PR for this EVALUATING parent task"
                 className="px-4 py-2 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 text-sm font-medium transition-colors disabled:opacity-50 border border-blue-600/30 flex items-center gap-1.5"
@@ -909,4 +919,4 @@ export function TaskDetailDrawer({
       </div>
     </div>
   );
-}
+});

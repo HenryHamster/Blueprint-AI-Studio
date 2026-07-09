@@ -36,7 +36,7 @@ export function useSettings(addToast: AddToast) {
   const [autoArchiveIntervalMinutes, setAutoArchiveIntervalMinutes] = useState(60);
   const [notificationConfig, setNotificationConfig] = useState<NotificationConfig>({
     webhook_url: '',
-    enabled_events: ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT', 'REMEDIATION_ESCALATED', 'MERGE_UNVERIFIED', 'RUNNER_DEACTIVATED', 'RUNNER_DEGRADED', 'RUNNER_FLEET_OFFLINE', 'RUNNER_LOW_DISK', 'RUNNER_OUTAGE_ESCALATED'],
+    enabled_events: ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT', 'REMEDIATION_ESCALATED', 'MERGE_UNVERIFIED', 'RUNNER_DEACTIVATED', 'RUNNER_DEGRADED', 'RUNNER_DEGRADED_ESCALATED', 'RUNNER_FLEET_OFFLINE', 'RUNNER_LOW_DISK', 'RUNNER_OUTAGE_ESCALATED'],
     throttle_seconds: 30,
   });
   const [providerTierModelMap, setProviderTierModelMap] = useState<Record<string, Record<string, string>>>({});
@@ -137,7 +137,7 @@ export function useSettings(addToast: AddToast) {
         if (data.notification_config) {
           setNotificationConfig({
             webhook_url: data.notification_config.webhook_url ?? '',
-            enabled_events: data.notification_config.enabled_events ?? ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT', 'REMEDIATION_ESCALATED', 'MERGE_UNVERIFIED', 'RUNNER_DEACTIVATED', 'RUNNER_DEGRADED', 'RUNNER_FLEET_OFFLINE', 'RUNNER_LOW_DISK', 'RUNNER_OUTAGE_ESCALATED'],
+            enabled_events: data.notification_config.enabled_events ?? ['TASK_FAILED', 'APPROVAL_NEEDED', 'DEPLOY_HEALTH_ALERT', 'REMEDIATION_ESCALATED', 'MERGE_UNVERIFIED', 'RUNNER_DEACTIVATED', 'RUNNER_DEGRADED', 'RUNNER_DEGRADED_ESCALATED', 'RUNNER_FLEET_OFFLINE', 'RUNNER_LOW_DISK', 'RUNNER_OUTAGE_ESCALATED'],
             throttle_seconds: data.notification_config.throttle_seconds ?? 30,
           });
         }

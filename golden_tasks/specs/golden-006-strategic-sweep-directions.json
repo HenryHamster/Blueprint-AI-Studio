@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-006",
+  "name": "Strategic direction sweep",
+  "description": "A 'strategic_review' task: perform a strategic sweep across active directions, assess health, and propose retirements.",
+  "task_type": "strategic_review",
+  "prompt": "Sweep active directions. For each: assess progress, check if acceptance criteria are met, confirm evidence, and recommend retire/continue/stage. Identify any gap where a new direction is needed. Cost-reduction is the urgent front — evaluate each direction's cost efficiency.",
+  "effort": "high",
+  "source_info": "Pattern from strategic review cycles",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "read_only_unclassified"
+  },
+  "tags": ["strategic", "expensive", "cost-baseline"]
+}

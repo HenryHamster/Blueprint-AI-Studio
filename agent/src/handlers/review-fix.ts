@@ -69,6 +69,7 @@ export {
   buildTypeCheckInstructions,
 } from '../prompts/review-prompt.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 
 // ── Extracted helper modules ──────────────────────────────────────────────────
 import { annotateResolvedIssues, fmtAnnotatedIssue } from './review-fix-issue-dedup.js';
@@ -80,7 +81,7 @@ export { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajector
 import { detectMigrationConflict, buildMigrationConflictGuidance, extractReservedMigrationRevision } from './review-fix-migration.js';
 import { resolveMigrationLayout } from './specialized.js';
 import { downloadViewportShots } from '../utils/viewport-shot-download.js';
-import { recordViewportScreenshotDownload } from '../telemetry.js';
+import { recordViewportScreenshotDownload, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 export { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
 export type { MigrationConflict } from './review-fix-migration.js';
 
@@ -576,7 +577,7 @@ export async function handleReview(
 
   // Read CLAUDE.md for codebase instructions
   const reviewClaudeMd = readClaudeMd();
-  const reviewClaudeMdPrefix = reviewClaudeMd
+  const reviewClaudeMdPrefix = (reviewClaudeMd && !providerAutoInjectsClaudeMd())
     ? `${REVIEW_CLAUDEMD_PROMPT_HEADER}${reviewClaudeMd}${REVIEW_CLAUDEMD_PROMPT_FOOTER}`
     : '';
 
@@ -746,6 +747,21 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
   if (reviewProjectId) writeFetchHelper(taskId, reviewProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
   const reviewFetchGuidance = reviewProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
   const launchedReviewPrompt = reviewPrompt + parallelReviewBlock + `\n\n${reviewFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const reviewTelemetry = buildPromptSizeTelemetry(launchedReviewPrompt, [
+    ['strategic_framing', reviewStrategicFraming],
+    ['claude_md', reviewClaudeMdPrefix],
+    ['playbook', reviewPlaybookSection],
+    ['project_context', reviewProjectCtxSection],
+    ['review_history', reviewHistorySection],
+    ['fix_responses', fixResponsesSection],
+    ['review_preamble', buildReviewMasterPreamble(prNumber, branch, baseBranch)],
+    ['pr_context', `${iterationPreamble}${rollupGuidance}${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}Files changed in this PR:\n${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}`],
+    ['review_meta', `${selfReviewBlindSpotsSection}${plannedFilesSection}${viewportScreenshotSection}${buildReviewDiffAccessHint(baseBranch)}`],
+    ['review_guidance', `${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId, baseBranch)}`],
+    ['parallel_review', parallelReviewBlock],
+    ['fetch_and_tools', `\n\n${reviewFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`],
+  ]);
+  setPromptSizeTelemetry(reviewTelemetry.prompt_size_bytes, reviewTelemetry.prompt_section_count, reviewTelemetry.prompt_section_sizes);
   const promptFingerprint = computeReviewPromptFingerprint(reviewBuildConfig, {
     branch,
     baseBranch,
@@ -1347,7 +1363,7 @@ export async function handleFix(
   const fixPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const fixRetryContext = buildRetryContext(task);
   const fixFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
-  if (fixClaudeMd) {
+  if (fixClaudeMd && !providerAutoInjectsClaudeMd()) {
     enrichedPrompt = `## Codebase Instructions\n${fixClaudeMd}\n\n${fixPlaybookSection}${fixRetryContext}${enrichedPrompt}`;
   } else if (fixPlaybookSection || fixRetryContext) {
     enrichedPrompt = `${fixPlaybookSection}${fixRetryContext}${enrichedPrompt}`;
@@ -1483,6 +1499,20 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   }
 
   // Run Claude with the review feedback as the prompt
+  const fixTelemetry = buildPromptSizeTelemetry(enrichedPrompt, [
+    ['claude_md', fixClaudeMd],
+    ['playbook', fixPlaybookSection],
+    ['retry_context', fixRetryContext],
+    ['domain_overview', fixDomainOverview],
+    ['repo_overview', fixRepoOverview],
+    ['strategic_intent', fixStrategicIntent],
+    ['project_vision', fixProjectVision],
+    ['rejection_patterns', fixRejectionPatterns],
+    ['core_prompt', basePrompt],
+    ['guidance', `${fixFirstTaskSection}${buildCodeChangeHelperGuidance({ buildConfig: fixBuildConfig, owner, repo })}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}${parallelFixBlock}`],
+    ['fetch_and_tools', `\n\n${fixFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`],
+  ]);
+  setPromptSizeTelemetry(fixTelemetry.prompt_size_bytes, fixTelemetry.prompt_section_count, fixTelemetry.prompt_section_sizes);
   const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected, promotionTarget, codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: fixBuildConfig, owner, repo }) });
   statusRef.value = 'Addressing review feedback...';
   setCurrentPromptFingerprint(promptFingerprint);

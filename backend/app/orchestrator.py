@@ -374,6 +374,7 @@ _last_runner_escalation_sweep: datetime = _utcnow()
 _last_local_runner_hold_sweep: datetime = _utcnow()
 _last_deadlock_check: datetime | None = None
 _last_zone_exhaustion_log: datetime | None = None
+_last_budget_gate_log: datetime | None = None
 _last_concurrency_broadcast: datetime | None = None
 _last_type_throttle_broadcast: dict[str, datetime | None] = {}
 _last_type_unthrottle_broadcast: dict[str, datetime | None] = {}
@@ -913,6 +914,7 @@ async def orchestrator_worker():
     from app.evergreen_backlog import check_evergreen_fill as _check_evergreen_fill
     from app.rollup_management import _verify_pr_merged
     from app.broadcast import broadcast_to_project, manager as ws_manager
+    from app.monthly_budget_alerts import check_monthly_budget
     from app.services import (
         _recover_orphaned_tasks,
         _sweep_post_commit_pending,
@@ -934,7 +936,8 @@ async def orchestrator_worker():
         _last_runner_deactivation_sweep, \
         _last_runner_degraded_sweep, \
         _last_runner_escalation_sweep, \
-        _last_local_runner_hold_sweep
+        _last_local_runner_hold_sweep, \
+        _last_budget_gate_log
     while True:
         queued_tasks = []
         # Reset at the very top of the loop body (before the try) — REQUIRED for
@@ -1694,6 +1697,24 @@ async def orchestrator_worker():
                 # 50 NULL-launcher candidates = 50 redundant Project SELECTs
                 # every cycle.
                 _project_user_cache: Dict[uuid.UUID, str] = {}
+                # Pre-warm the project cache for tasks without a launcher so the
+                # eligibility loop and dispatch section never issue per-task
+                # Project SELECTs.
+                _null_launcher_pids = {
+                    t.project_id
+                    for t in candidate_tasks
+                    if not t.launched_by_user_id
+                }
+                if _null_launcher_pids:
+                    _proj_rows = (
+                        await session.execute(
+                            select(Project.id, Project.user_id).where(
+                                Project.id.in_(_null_launcher_pids)
+                            )
+                        )
+                    ).all()
+                    for _pid, _uid in _proj_rows:
+                        _project_user_cache[_pid] = _uid
 
                 async def _user_has_available_account(task: Task) -> bool:
                     user_id = task.launched_by_user_id
@@ -1793,6 +1814,10 @@ async def orchestrator_worker():
                 # distinct failed prerequisite (flushed after the loop), rather
                 # than one alert per cancelled dependent.
                 _cascade_cancel_by_prereq: dict[uuid.UUID, dict] = {}
+                # Batch collect status-message updates for pending-dep tasks so
+                # they can be flushed in one query after the loop instead of N
+                # individual _dep_session.get() calls (one per pending-dep task).
+                _pending_dep_msg_updates: list[tuple[uuid.UUID, str]] = []
                 from app.failure_classification import (
                     is_non_death_cancellation as _is_non_death_cancellation,
                 )
@@ -1982,20 +2007,42 @@ async def orchestrator_worker():
                         ]
                         dep_msg = f"Waiting on {len(pending)} dep{'s' if len(pending) != 1 else ''}: {', '.join(pending[:3])}"
                         if pending and task.latest_status_message != dep_msg:
-                            try:
-                                async with AsyncSessionLocal() as _dep_session:
-                                    _dep_task = await _dep_session.get(Task, task.id)
-                                    if (
-                                        _dep_task
-                                        and _dep_task.latest_status_message != dep_msg
-                                    ):
-                                        _dep_task.latest_status_message = dep_msg
-                                        _dep_session.add(_dep_task)
-                                        await _dep_session.commit()
-                            except Exception:
-                                logger.exception(
-                                    f"[ORCHESTRATOR] Failed to update dep wait message for task {task.id}"
+                            # Defer the DB write — batch-flush below in one
+                            # session/query instead of N individual queries.
+                            _pending_dep_msg_updates.append((task.id, dep_msg))
+
+                # Batch flush pending-dep status-message updates: one query for
+                # all tasks instead of N individual _dep_session.get() calls.
+                if _pending_dep_msg_updates:
+                    try:
+                        async with AsyncSessionLocal() as _dep_batch_session:
+                            dep_ids = [tid for tid, _ in _pending_dep_msg_updates]
+                            _dep_rows = (
+                                (
+                                    await _dep_batch_session.execute(
+                                        select(Task).where(Task.id.in_(dep_ids))
+                                    )
                                 )
+                                .scalars()
+                                .all()
+                            )
+                            _dep_task_by_id = {t.id: t for t in _dep_rows}
+                            _to_add = []
+                            for tid, msg in _pending_dep_msg_updates:
+                                _t = _dep_task_by_id.get(tid)
+                                if _t is not None and _t.latest_status_message != msg:
+                                    _t.latest_status_message = msg
+                                    _to_add.append(_t)
+                            if _to_add:
+                                for _t in _to_add:
+                                    _dep_batch_session.add(_t)
+                                await _dep_batch_session.commit()
+                    except Exception:
+                        logger.exception(
+                            "[ORCHESTRATOR] Failed to batch flush dep wait messages "
+                            "for %d tasks",
+                            len(_pending_dep_msg_updates),
+                        )
 
                 # Flush accumulated cascade-cancels: raise ONE deduplicated
                 # operator alert per distinct failed prerequisite that cancelled
@@ -2303,6 +2350,47 @@ async def orchestrator_worker():
                     project_active_counts,
                     broadcast_to_project,
                 )
+
+                # Monthly budget gate: if month-to-date spend has reached 100% of
+                # monthly_budget_target_usd, defer all remaining eligible tasks with a
+                # message indicating the budget gate is active. This check is fail-open
+                # (any exception silently passes through).
+                try:
+                    budget_exhausted, usage_ratio = await check_monthly_budget(session)
+                except Exception:
+                    budget_exhausted = False
+                    logger.exception(
+                        "[ORCHESTRATOR] Monthly budget check failed — treating as not exhausted"
+                    )
+
+                if budget_exhausted and eligible_ids:
+                    _shared_state.monthly_budget_gate_engaged = True
+                    _deferred_count = len(eligible_ids)
+                    eligible_ids = []
+                    # Use a broad WS broadcast so the admin UI / agent surfaces
+                    # see the throttle signal regardless of which project triggered
+                    # the exhaustion (follows the zone-exhaustion pattern).
+                    if _is_cadence_due(_last_budget_gate_log, 60, _utcnow()):
+                        _last_budget_gate_log = _utcnow()
+                        logger.info(
+                            "[ORCHESTRATOR] Monthly budget exhausted (%.1f%% of target) — deferring %d queued tasks",
+                            usage_ratio * 100 if usage_ratio else 100.0,
+                            _deferred_count,
+                        )
+                        try:
+                            await ws_manager.broadcast_to_all(
+                                "pipeline_throttle",
+                                {
+                                    "reason": "monthly_budget",
+                                    "detail": "Monthly budget target exhausted",
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[ORCHESTRATOR] Failed to broadcast monthly_budget throttle"
+                            )
+                elif not budget_exhausted:
+                    _shared_state.monthly_budget_gate_engaged = False
 
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]

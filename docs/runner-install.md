@@ -123,7 +123,51 @@ needed.
 
 ---
 
-## 5. View logs
+## 5. Self-update
+
+When a new agent version is released, update the local checkout efficiently:
+
+```bash
+blueprint-runner update
+```
+
+This does all of the following:
+
+- Fetches the latest refs from `origin` without merging yet;
+- Checks whether the local branch is behind its upstream tracking branch;
+- If already up to date, reports so and exits 0;
+- If the local branch is **ahead** of upstream (unpushed local commits), **aborts**
+  with a warning — push first to avoid losing work;
+- If the local branch has **diverged** from upstream, **aborts** with a warning
+  — rebase or reset first;
+- If the local branch is cleanly **behind**, runs `git merge --ff-only` to
+  fast-forward to the latest upstream commits;
+- After the merge, checks every changed file: if a `package-lock.json` was
+  modified, runs `npm ci` in **only** that project directory (e.g. `agent/` or
+  `admin-ui/`), skipping the full `npm ci` for projects whose lockfile did not
+  change — this makes repeated updates far faster than a naive `npm ci` on
+  every update.
+
+### No-token, no-teardown
+
+Unlike `install`, `update` requires **no** orchestrator token — it's purely a
+local git operation. The runner service **does not** need to be stopped first;
+you can open a second terminal and run `update` while the runner keeps working.
+
+### Failure modes
+
+- :no_entry: **Not a git repository** — the working tree is a plain checkout
+  with no `.git` or was installed from an archive (use a git clone instead).
+- :no_entry: **No upstream tracking branch** — the current branch was never
+  pushed (push once, then `update` works from then on).
+- :no_entry: **Merge conflict** — a fast-forward was not possible (the merge
+  was rejected without applying changes; none of your local files were touched).
+- :warning: **`npm ci` failure** — logged as a warning (not fatal). The repo is
+  updated; you may need to install deps manually.
+
+---
+
+## 6. View logs
 
 ```bash
 # Live tail
@@ -138,7 +182,7 @@ journalctl --user -u blueprint-runner.service -b
 
 ---
 
-## 6. Verify the runner is healthy
+## 7. Verify the runner is healthy
 
 ```bash
 # Run the built-in preflight check (no work claimed)
@@ -151,7 +195,7 @@ read the preflight output for details.
 
 ---
 
-## 7. Re-enrollment
+## 8. Re-enrollment
 
 If the runner token is revoked or lost and you cannot recover it from
 `~/.blueprint/runner_token`, re-enroll via the admin UI (Settings → Runners →

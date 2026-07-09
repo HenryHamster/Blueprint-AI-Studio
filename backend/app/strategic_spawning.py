@@ -4515,7 +4515,8 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
             routine_violations.append(v)
             continue
         try:
-            verdict = classify_breach(
+            verdict = await asyncio.to_thread(
+                classify_breach,
                 module_key=v["rel"],
                 current_size=v["count"],
                 section=v.get("section", "backend"),
@@ -6598,10 +6599,12 @@ async def _spawn_strategic_review(
                 f"`version_phase.last_qualification` on v{_cur_n} means this "
                 f"fresh version has not yet begun its OWN qualification (expected "
                 f"for a just-opened version) — it does NOT mean v{_prior_n}'s "
-                f"promotion is pending or failed. As your FIRST action this "
-                f"cycle, complete next-version setup: {_setup_instruction}; "
-                f"retire directions v{_prior_n} already satisfied, and propose "
-                f"the directions the next milestone needs."
+                f"promotion is pending or failed. Open two concurrent "
+                f"workstreams this cycle: (a) complete next-version setup: "
+                f"{_setup_instruction}; (b) retire directions v{_prior_n} "
+                f"already satisfied — these are independent and can run in "
+                f"parallel. Once setup is complete, propose the directions "
+                f"the next milestone needs."
             )
         prompt_suffix = (
             f"{prompt_suffix}\n{_post_promote_hint}"

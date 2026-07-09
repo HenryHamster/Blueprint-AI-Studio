@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-001",
+  "name": "Add health check endpoint",
+  "description": "A minimal 'create' task: add a GET /api/health endpoint that returns status and timestamp.",
+  "task_type": "create",
+  "prompt": "Add a GET /api/health endpoint to the backend at backend/app/routers/health.py that returns {\"status\": \"ok\", \"timestamp\": \"<iso-utc>\"}. Wire it into the app.",
+  "effort": "low",
+  "source_info": "Pattern from common quick-create tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "code_merge"
+  },
+  "tags": ["create", "simple", "cost-baseline"]
+}

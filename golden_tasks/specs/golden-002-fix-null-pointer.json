@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-002",
+  "name": "Fix null reference in user resolver",
+  "description": "A 'fix' task: resolve a NullReferenceError when profile.profile_picture is None.",
+  "task_type": "fix",
+  "prompt": "Fix NullReferenceError: user/profile.py line 47 assumes profile.profile_picture is always a string, but can be None for users who never uploaded an avatar. Add a null guard.",
+  "effort": "low",
+  "source_info": "Pattern from common quick-fix tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "code_merge"
+  },
+  "tags": ["fix", "simple", "cost-baseline"]
+}

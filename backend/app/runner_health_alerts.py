@@ -602,9 +602,11 @@ async def _maybe_escalate_runner_degraded_alerts(session: AsyncSession) -> int:
     :func:`~app.orchestrator_runner_dispatch._check_degraded_runners`), for each
     open, unacknowledged ``runner.degraded:*`` alert it
 
-    * **re-notifies** via a follow-up ``RUNNER_DEGRADED`` external notification
-      (marked ``escalation=True`` with the alert age) once the alert has been
-      open past :data:`_RUNNER_ESCALATION_FIRST_SECONDS` (1h), then repeats every
+    * **re-notifies** via a follow-up ``RUNNER_DEGRADED_ESCALATED`` external
+      notification (distinct from the initial ``RUNNER_DEGRADED`` page, mirroring
+      the ``RUNNER_OUTAGE_ESCALATED`` / ``RUNNER_DEACTIVATED`` pair for outages)
+      once the alert has been open past
+      :data:`_RUNNER_ESCALATION_FIRST_SECONDS` (1h), then repeats every
       :data:`_RUNNER_ESCALATION_REPEAT_SECONDS` (4h); and
     * **escalates severity** WARNING → ERROR (bumping the occurrence count and
       updating the title) once the alert has aged past the configurable
@@ -688,7 +690,7 @@ async def _maybe_escalate_runner_degraded_alerts(session: AsyncSession) -> int:
                 _asyncio.ensure_future(  # noqa: RUF006
                     dispatch_external_notification(
                         alert.project_id,
-                        "RUNNER_DEGRADED",
+                        "RUNNER_DEGRADED_ESCALATED",
                         {
                             "runner_id": runner_id_str,
                             "title": alert.title,

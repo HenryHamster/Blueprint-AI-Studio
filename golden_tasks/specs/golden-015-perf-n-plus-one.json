@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-015",
+  "name": "Profile N+1 query pattern",
+  "description": "A 'perf' task: identify N+1 query patterns in the task listing endpoint.",
+  "task_type": "perf",
+  "prompt": "Profile the GET /api/projects/{id}/tasks endpoint for N+1 query patterns. Check: (1) Are task payloads loaded in a separate query per task? (2) Are context fields lazily loaded? (3) Is there an unbounded pagination issue? List each finding with file:line and estimated impact.",
+  "effort": "medium",
+  "source_info": "Pattern from perf tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "audit_findings"
+  },
+  "tags": ["perf", "medium", "cost-baseline"]
+}

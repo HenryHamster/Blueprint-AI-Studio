@@ -7255,25 +7255,18 @@ async def test_post_commit_failed_non_safeguard_does_not_touch_gate(tl_db, mocke
 
 
 @pytest.mark.asyncio
-async def test_main_branch_auto_approve_rejects_ineligible_type_via_strict_helper(
+async def test_main_branch_non_rollup_skips_review_auto_merges(
     tl_db, mocker
 ):
+    """A non-rollup single task landing directly into automain (base_branch=main,
+    not intermediate) skips the model review and routes through the auto-merge
+    path. CI + the promotion gate serve as the backstop, per the v24 cost plan.
+    """
     session, factory = tl_db
     project = await _make_project(session)
-    # Favorable direction history so the acceptance gate would PASS (isolating
-    # the source-type gap as the thing that rejects).
-    project.directions = [
-        {
-            "id": "d-docs-1",
-            "research_history": [{"prs_merged": 8, "prs_rejected": 0}],
-        }
-    ]
-    session.add(project)
-    await session.commit()
 
-    # docs task: allowed past the outer routing guard AND auto-approved by the
-    # weak inline copy, but rejected by should_auto_approve_diff (source type not
-    # in create/refactor/fix/migrate).
+    # docs task with any scope on main branch — all non-intermediate tasks now
+    # skip review regardless of auto-approve eligibility.
     task = await _make_task(
         session,
         project.id,
@@ -7281,13 +7274,9 @@ async def test_main_branch_auto_approve_rejects_ineligible_type_via_strict_helpe
         status=TaskStatus.IN_PROGRESS,
         context={
             "scope": "small",
-            "direction_id": "d-docs-1",
-            "_pr_changed_files": ["docs/readme.md"],
-            "_pr_diff_summary": [{"file": "docs/readme.md", "added": 5, "removed": 1}],
         },
     )
-    # base_branch=main → not a staging branch → is_intermediate is False, so the
-    # main-branch auto-approve gate (the QP6 path) is the one under test.
+    # base_branch=main → not a staging branch → is_intermediate is False
     task.payloads = [{"type": "docs", "prompt": "update docs", "base_branch": "main"}]
     session.add(task)
     await session.commit()
@@ -7299,10 +7288,6 @@ async def test_main_branch_auto_approve_rejects_ineligible_type_via_strict_helpe
         new_callable=AsyncMock,
         return_value=("gh-token", "owner", "repo"),
     )
-    # PR-state guard fetch + (pre-fix) weak-copy diff source. The additions/
-    # deletions/changed_files make the PR small enough that the PRE-FIX weak
-    # inline copy WOULD auto-approve this docs PR (proving the test fails against
-    # pre-fix code); the post-fix strict helper rejects it on source type.
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
@@ -7314,8 +7299,6 @@ async def test_main_branch_auto_approve_rejects_ineligible_type_via_strict_helpe
             "changed_files": 1,
         },
     )
-    # _merge_with_retry is the discriminator: only the auto-approve path merges.
-    # The review path runs a security scan too, so the scan is NOT a discriminator.
     merge_spy = mocker.patch(
         "app.task_lifecycle._merge_with_retry",
         new_callable=AsyncMock,
@@ -7331,12 +7314,13 @@ async def test_main_branch_auto_approve_rejects_ineligible_type_via_strict_helpe
             "report": "",
         },
     )
-    # Review-spawn path dependencies.
     mocker.patch(
         "app.github.get_pr_files",
         new_callable=AsyncMock,
         return_value=[{"filename": "docs/readme.md", "status": "modified"}],
     )
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     review_calls = []
 
     async def _capture_spawn(src_task, ptype, *a, **kw):
@@ -7355,11 +7339,83 @@ async def test_main_branch_auto_approve_rejects_ineligible_type_via_strict_helpe
 
     await _process_post_commit(task.id, payload, _session_factory=factory)
 
-    # Post-fix: the strict helper rejects docs → no auto-merge, review spawned.
-    merge_spy.assert_not_awaited()
-    assert "review" in review_calls, (
-        "ineligible-type small PR must be routed to review, not auto-merged "
-        "(weak-copy gap closed)"
+    # Non-intermediate task must take the auto-merge path, not spawn a review.
+    merge_spy.assert_awaited()
+    assert "review" not in review_calls, (
+        "non-rollup main-branch task must skip review and auto-merge "
+        "(v24 cost plan: CI + promotion gate backstop)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_large_scope_intermediate_still_spawns_review(tl_db, mocker):
+    """A large-scope intermediate (staging-branch) task that feeds into a
+    rollup PR still gets the full model review dispatch. Only non-rollup single
+    tasks landing directly into automain skip review per the v24 cost plan.
+    """
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "large"},
+    )
+    # base_branch matching staging prefix → is_intermediate=True
+    task.payloads = [
+        {"type": "create", "prompt": "do create", "base_branch": "research/cycle-1"}
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "README.md", "status": "modified"}],
+    )
+    review_spawns = []
+
+    async def _capture_spawn(src_task, ptype, *a, **kw):
+        review_spawns.append(ptype)
+        mock_task = mocker.MagicMock()
+        mock_task.id = uuid.uuid4()
+        mock_task.first_payload = {"type": "review"}
+        mock_task.status = TaskStatus.QUEUED
+        return (mock_task, True)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/88",
+        branch="blueprint/task-abc",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert "review" in review_spawns, (
+        "large-scope intermediate (rollup-chain) task must still spawn a review"
     )
 
 

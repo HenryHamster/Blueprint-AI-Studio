@@ -87,11 +87,13 @@ import {
   BEYOND_SCOPE_REPORTING,
   READ_ONLY_BASH_WRITE_NOTE,
   SELF_REVIEW_PROMPT_VERSION,
+  SHARED_LIFECYCLE_REMAINDER,
   assembleFailureGuidanceBlocks,
   type FixAttempt,
 } from './prompt.js';
 import { getReadOnlyTaskTypes, getWriteTaskTypes } from './taskCapabilities.js';
 import { handlers } from './handlers/index.js';
+import { buildThinkerPrompt, type ThinkerPromptParams } from './prompts/thinker.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
 describe('formatPlaybook', () => {
@@ -2310,6 +2312,24 @@ describe('getTaskTypeHints', () => {
     expect(hint).toContain('./done --indeterminate');
   });
 
+  it('fix hint separates code-review fix and defect reproduction into two labeled branches', () => {
+    const hint = TASK_TYPE_HINTS['fix'];
+    // Two distinct labeled branches
+    expect(hint).toContain('Code-review fix');
+    expect(hint).toContain('Defect reproduction');
+    // Code-review branch (common case) is front-loaded before defect reproduction
+    const codeReviewIdx = hint.indexOf('Code-review fix');
+    const defectIdx = hint.indexOf('Defect reproduction');
+    expect(codeReviewIdx).toBeGreaterThan(-1);
+    expect(defectIdx).toBeGreaterThan(-1);
+    expect(codeReviewIdx).toBeLessThan(defectIdx);
+    // Code-review branch has the end-to-end flow inline (no reproduce-first noise)
+    const codeReviewSection = hint.substring(codeReviewIdx, defectIdx);
+    expect(codeReviewSection).toContain('./check');
+    expect(codeReviewSection).toContain('./pr open');
+    expect(codeReviewSection).toContain('./done');
+  });
+
   it('investigate hint asks for the canonical reproduce verdict, not free-text only', () => {
     const hint = TASK_TYPE_HINTS['investigate'];
     expect(hint).toContain('reproduce-on-HEAD verdict');
@@ -4259,7 +4279,8 @@ describe('TASK_TYPE_HINTS dispatch parity', () => {
 // fingerprint strings to the source constants so a rename here fails immediately
 // rather than silently invalidating the downstream assertions.
 describe('cross-cutting guidance-block fingerprints — structural invariants for prompt.ts', () => {
-  it('PLAYBOOK_GUIDANCE contains fingerprint used by handler structural tests', () => {
+  it('PLAYBOOK_GUIDANCE is under 800 bytes and contains ./playbook set', () => {
+    expect(Buffer.byteLength(PLAYBOOK_GUIDANCE)).toBeLessThan(800);
     expect(PLAYBOOK_GUIDANCE).toContain('./playbook set');
   });
 
@@ -5449,5 +5470,71 @@ describe('writePlaybookHelper live token resolution', () => {
     // Conditional keys omitted exactly as the old jq `if $br == "" then {}` did.
     expect('branch' in parsed).toBe(false);
     expect('head_sha' in parsed).toBe(false);
+  });
+});
+
+// ── SHARED_LIFECYCLE_REMAINDER — byte size and category coverage ──────────────
+describe('SHARED_LIFECYCLE_REMAINDER — byte size and category coverage', () => {
+  const CATEGORIES = [
+    'correctness', 'error-handling', 'security', 'style-conventions',
+    'type-safety', 'documentation', 'performance', 'architecture',
+    'test-coverage', 'scope-drift', 'regression_risk', 'cross-system-contract',
+  ];
+
+  it('contains all 12 review category IDs', () => {
+    for (const cat of CATEGORIES) {
+      expect(SHARED_LIFECYCLE_REMAINDER).toContain(cat);
+    }
+  });
+
+  it('is under 4500 bytes', () => {
+    const byteLen = Buffer.byteLength(SHARED_LIFECYCLE_REMAINDER, 'utf-8');
+    expect(byteLen).toBeLessThan(4500);
+  });
+});
+describe('thinker prompt contains criterion-coverage retirement warning', () => {
+  it('includes criterion-coverage check before retirement guidance in Section 3 (Moves)', () => {
+    const params: ThinkerPromptParams = {
+      contextPrefix: '',
+      projectName: 'Test Project',
+      clockHeader: 'Clock: 2026-05-04',
+      isSelfRepo: false,
+      userStateLine: 'User last active: today',
+      packerMetaSection: '',
+      strategicContext: '',
+      problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
+      problemModelRecovery: 'empty',
+      reflectionSection: '## What you previously said was hard\n_(no prior)_',
+      selfImprovementBlock: '',
+      runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
+      designDocJson: '',
+      visionJson: '',
+      outcomeSection: '',
+      previousDecisionOutcomes: '',
+      pastRetirementCritiquesSection: '',
+      retiredDirectionsSummarySection: '',
+      dirSummaryText: 'No active directions.',
+      dirHealthSummary: 'Active: 0/10 slots.',
+      userPausedSection: '',
+      rejectedProposalsSection: '',
+      operatorOverridesSection: '',
+      portfolioCompositionText: 'No active directions — portfolio is empty.',
+      modelHealthSection: '',
+      systemMaturitySection: '',
+      driftSection: '',
+      recentWorkSection: '',
+      feedbackSection: '',
+      questionSection: '',
+      threadSection: '',
+      taskId: 'test-task-999',
+      versionPhaseSection: '',
+      memoCitationsSection: '',
+      efficiencySnapshotSection: '',
+    };
+    const prompt = buildThinkerPrompt(params);
+    expect(prompt).toContain('Criterion-coverage check before retirement');
+    expect(prompt).toContain('direction_owns_uncovered_criterion');
+    expect(prompt).toContain('retract the orphaned criterion via Section 8');
+    expect(prompt).toContain('Do NOT retire a criterion-carrying direction without first addressing its criterion');
   });
 });

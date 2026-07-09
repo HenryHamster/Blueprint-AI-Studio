@@ -334,7 +334,7 @@ async def get_direction_auto_pause_stats(
                     )
                 )
                 .order_by(ProjectMessage.created_at.desc())
-                .limit(10_000)
+                .limit(2_000)
             )
         )
         .scalars()
@@ -522,7 +522,7 @@ async def get_task_cost_breakdown(
     project_id: uuid.UUID | None = Query(None),
     window: str = Query("1h"),
     top_n: int = Query(5, ge=1, le=20),
-    max_tasks: int = Query(5000, ge=1, le=20000),
+    max_tasks: int = Query(1000, ge=1, le=5000),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
@@ -722,7 +722,7 @@ async def get_spend_burn_rate(
                 )
                 .where(*filters)
                 .order_by(terminal_at_sql.desc(), Task.created_at.desc())
-                .limit(20000)
+                .limit(5000)
             )
         )
         .scalars()
@@ -761,7 +761,7 @@ async def get_spend_burn_rate(
 @router.get("/lane-diag")
 async def get_lane_diag(
     project_id: uuid.UUID | None = Query(None),
-    max_tasks: int = Query(5000, ge=1, le=20000),
+    max_tasks: int = Query(5000, ge=1, le=5000),
     pr_breakdown_limit: int = Query(100, ge=1, le=250),
     version_number: int | None = Query(None, ge=1),
     session: AsyncSession = Depends(get_session),

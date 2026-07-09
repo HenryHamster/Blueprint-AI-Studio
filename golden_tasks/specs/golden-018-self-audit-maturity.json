@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-018",
+  "name": "Self-audit system maturity",
+  "description": "A 'self_audit' task: score the orchestrator module on 4 maturity signals.",
+  "task_type": "self_audit",
+  "prompt": "Score the orchestrator.py module on 4 maturity signals (0-100 each): (1) test coverage — does every public function have a test? (2) error handling — are all error paths logged and surfaced? (3) documentation — do public functions have docstrings? (4) observability — are key decisions logged at INFO? For each, provide specific evidence from the code.",
+  "effort": "medium",
+  "source_info": "Pattern from self_audit tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "audit_findings"
+  },
+  "tags": ["audit", "medium", "cost-baseline"]
+}

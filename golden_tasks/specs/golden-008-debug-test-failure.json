@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-008",
+  "name": "Debug flaky test failure",
+  "description": "A 'debug' task: root-cause a flaky test that fails non-deterministically in CI.",
+  "task_type": "debug",
+  "prompt": "Debug the flaky test test_task_dispatch_timeout in backend/testing/test_orchestrator.py. It fails ~30% of CI runs with 'Task not in terminal state after timeout'. Trace the root cause, identify affected system state, and propose a deterministic fix.",
+  "effort": "medium",
+  "source_info": "Pattern from debug tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "read_only_unclassified"
+  },
+  "tags": ["debug", "medium", "cost-baseline"]
+}

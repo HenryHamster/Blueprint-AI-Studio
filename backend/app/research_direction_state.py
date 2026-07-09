@@ -75,6 +75,31 @@ _CHALLENGE_AGREEMENT_BUCKETS = (
     CHALLENGE_INDETERMINATE,
 )
 
+# ── Criterion-coverage gate: auto-complete paths ──────────────────────────
+# Every direction retirement path — auto-complete (exhaustion, proven-merge,
+# no-findings refractory) and strategist-authored retire_direction — must
+# call direction_owns_uncovered_criterion before retiring a direction. A
+# criterion-carrying direction with an uncovered criterion must not reach
+# success_evidence_met, saturated, or deadlock completion, nor be manually
+# retired. This frozenset declares all gated paths; the invariant test
+# test_all_autocomplete_paths_gate_on_criterion_coverage in test_invariants.py
+# verifies structurally that every declared path contains the gate call.
+_AUTOCOMPLETE_PATHS_GATED_ON_CRITERION_COVERAGE: frozenset[str] = frozenset(
+    {
+        "exhaustion",  # _maybe_autocomplete_exhausted_direction (this module)
+        "proven_merge",  # apply_post_spawn_state >=3-merge completion (this module)
+        "no_findings",  # _stamp_no_findings_refractory (research_completion.py)
+        "strategist_retire",  # _handle_strategic_completion retire_direction op (strategic_completion.py)
+    }
+)
+
+#: The criterion key that gates all autocomplete paths. Any direction carrying
+#: this key in its ``criterion_keys`` is blocked from reaching any auto-complete
+#: terminal state (exhaustion, proven-merge, no-findings, strategist retire)
+#: until the criterion is satisfied. Carried by direction d-12f7d408, which
+#: owns the acceptance-outcome tracking for the AST-invariant gate tests.
+_CRITERION_COVERAGE_GATE_KEY: str = "c-560ec27e"
+
 
 def _empty_finding_challenge_summary() -> dict:
     return {
@@ -312,6 +337,22 @@ async def _maybe_autocomplete_exhausted_direction(
     )
 
     if not _should_autocomplete_exhausted(d, exhausted=exhausted):
+        return False
+
+    # Gate exhaustion auto-complete on criterion coverage: a direction that owns
+    # uncovered acceptance criteria must not retire via exhaustion — the criteria
+    # must be satisfied first. Fail-closed (helper returns True on error)
+    # defers auto-completion until the query succeeds.
+    from app.acceptance_criteria import (  # noqa: PLC0415
+        direction_owns_uncovered_criterion,
+    )
+
+    if await direction_owns_uncovered_criterion(session, task.project_id, did):
+        logger.warning(
+            f"[RESEARCH] Exhaustion auto-complete deferred for direction {did}: "
+            f"owns uncovered acceptance criteria (task {task.id})"
+        )
+        d["_exhaustion_gated_by_criterion"] = True
         return False
 
     reason = _exhaustion_complete_reason(d)
@@ -971,9 +1012,9 @@ async def apply_post_spawn_state(
                         # Gate the PROVEN-merge SUCCESS route on outcome
                         # coverage: a saturated direction must not retire
                         # declaring success while an acceptance criterion it
-                        # owns is still uncovered. Fail-open (helper returns
-                        # False) preserves current behavior for directions that
-                        # own no criteria or on any query error. When gated, the
+                        # owns is still uncovered. Fail-closed (helper returns
+                        # True) blocks completion for directions that own
+                        # uncovered criteria or on any query error. When gated, the
                         # direction simply stays active — do NOT fall through to
                         # the exhaustion route, which declares deadlock (not
                         # success), not an unmet-but-productive outcome.
@@ -1033,6 +1074,12 @@ async def apply_post_spawn_state(
                                 logger.warning(
                                     f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
                                 )
+                        elif total_merged >= 3 and _owns_uncovered:
+                            logger.warning(
+                                f"[RESEARCH] Criterion-coverage gate: direction {did} "
+                                f"saturated ({total_merged} verified merges) but owns "
+                                f"an uncovered acceptance criterion — staying active"
+                            )
 
             # Also apply sub-research annotation directly on the in-memory
             # `directions` list before the locked write so both updates land
@@ -1320,6 +1367,14 @@ async def apply_post_spawn_state(
             else ""
         )
     )
+    # Preserve capacity-degradation qualifier set by
+    # _handle_research_completion's _summarize_dispatch_outcome. That call
+    # runs before apply_post_spawn_state, but its result is overwritten when
+    # this function sets latest_status_message below — re-read the marker from
+    # context so users see "degraded: …" in the admin UI and task failures CLI.
+    _degraded_reason = (task.context or {}).get("degraded_by_capacity_reason")
+    if _degraded_reason:
+        status_msg += f" (degraded: {_degraded_reason} — results may be incomplete)"
 
     # Snapshot plain values for the final log/broadcast below: the
     # duplicate-spawn catch around the terminal transition rolls the session
@@ -1349,6 +1404,7 @@ async def apply_post_spawn_state(
             file_overlap_count=file_overlap_count,
             type_filtered_count=type_filtered_count,
             empty_prompt_count=empty_prompt_count,
+            filtered_findings=filtered_findings,
         )
     except IntegrityError as _dup_exc:
         if "ux_task_active_idempotency_key" not in str(_dup_exc):
@@ -1415,6 +1471,7 @@ async def _apply_terminal_transition(
     file_overlap_count: int,
     type_filtered_count: int,
     empty_prompt_count: int,
+    filtered_findings: List[Dict[str, Any]] | None = None,
 ) -> None:
     """Flip the research task to its post-spawn status and commit.
 
@@ -1490,9 +1547,26 @@ async def _apply_terminal_transition(
         _note_filter = (
             ("; ".join(_note_parts) + ".") if _note_parts else "not actionable."
         )
+        # Surface individual filtered finding titles + reasons (up to 10) so
+        # the strategist can distinguish correctly-filtered noise from findings
+        # wrongly dropped — aggregate counts alone are not enough.
+        _filtered_detail_parts = []
+        if filtered_findings:
+            _ff_list = list(filtered_findings)
+            _cap = 10
+            for i, ff in enumerate(_ff_list[:_cap]):
+                _title = (ff.get("title") or "?")[:120]
+                _reason = (ff.get("reason") or "")[:80]
+                _filtered_detail_parts.append(f"'{_title}' ({_reason})")
+            if len(_ff_list) > _cap:
+                _filtered_detail_parts.append(f"and {len(_ff_list) - _cap} more")
+            _detail_line = " Filtered: " + "; ".join(_filtered_detail_parts) + "."
+        else:
+            _detail_line = ""
         note = (
             f"Research cycle {task.id} found {len(findings)} findings but created 0 tasks: "
             + _note_filter
+            + _detail_line
         )
         project = await session.get(Project, task.project_id)
         if project and str(direction_id) != "?" and direction_id != "crosscutting":

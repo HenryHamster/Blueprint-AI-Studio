@@ -25,6 +25,7 @@ consumer over-claims on a thin sample.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import uuid
 from datetime import timedelta
@@ -81,6 +82,14 @@ _V22_BACKFILL_SEVERITY = "low"
 # count against this constant and warns on mismatch — a self-reported-vs-expected
 # data-integrity check in the same spirit as the metrics-integrity sweep.
 _V22_EXPECTED_LOW_SEVERITY_COUNT = 13
+
+# Evergreen-backlog provenance and finding key for count-divergence enrollment.
+# When the backfill's self-check detects a mismatch between the resolved count
+# and the expected constant, an actionable EvergreenBacklogItem is enrolled
+# (deduped, best-effort) so the signal reaches the triage surface instead of
+# living only in an unmonitored log line.
+_V22_BACKFILL_PROVENANCE = "v22_backfill"
+_V22_BACKFILL_COUNT_DIVERGENCE_KEY = "v22_backfill_count_divergence"
 
 # Module-level guard state observable by tests.  Updated at the end of each
 # backfill_v22_carried_findings_resolved call against a v22 version; reset
@@ -1583,6 +1592,53 @@ async def compute_goal_coverage_drift_signal(
 # --------------------------------------------------------------------------- #
 
 
+async def _attach_v22_data_integrity_criterion_evidence(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+    finding_count: int,
+) -> bool:
+    """Attach CriterionEvidence to c-1a3ec09d for the v22 backfill (dedup-guarded).
+
+    Returns True when a new evidence row was written; False when the criterion
+    is absent or the evidence was already recorded.
+    """
+    from app.acceptance_criteria import (  # noqa: PLC0415 — avoid load-time cycle
+        get_criterion_by_key,
+        get_evidence_for_criterion,
+        record_evidence,
+    )
+
+    criterion = await get_criterion_by_key(
+        session, version.id, _V22_DATA_INTEGRITY_CRITERION_KEY
+    )
+    if criterion is None:
+        return False
+
+    existing = await get_evidence_for_criterion(session, criterion.id)
+    already_recorded = any(
+        e.source_kind == "audit_finding_backfill"
+        and e.source_id == _V22_BACKFILL_RESOLVING_REF
+        for e in existing
+    )
+    if already_recorded:
+        return False
+
+    await record_evidence(
+        session,
+        criterion_id=criterion.id,
+        project_id=project_id,
+        source_kind="audit_finding_backfill",
+        source_id=_V22_BACKFILL_RESOLVING_REF,
+        detail={
+            "resolving_ref": _V22_BACKFILL_RESOLVING_REF,
+            "finding_count": finding_count,
+            "note": _V22_BACKFILL_NOTE,
+        },
+    )
+    return True
+
+
 async def backfill_v22_carried_findings_resolved(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1614,12 +1670,6 @@ async def backfill_v22_carried_findings_resolved(
     Returns the number of low-severity resolution rows written (0 when the
     version is not v22 or it carries no low-severity findings).
     """
-    from app.acceptance_criteria import (  # noqa: PLC0415 — avoid load-time cycle
-        get_criterion_by_key,
-        get_evidence_for_criterion,
-        record_evidence,
-    )
-
     # Guard 1: only ever operate on release version 22.
     if version.version_number != _V22_BACKFILL_VERSION_NUMBER:
         return 0
@@ -1658,29 +1708,9 @@ async def backfill_v22_carried_findings_resolved(
 
     # Attach summary evidence to the data-integrity criterion if present on this
     # version.  Dedup-guarded so repeated ticks do not append duplicate rows.
-    criterion = await get_criterion_by_key(
-        session, version.id, _V22_DATA_INTEGRITY_CRITERION_KEY
+    await _attach_v22_data_integrity_criterion_evidence(
+        session, project_id, version, count
     )
-    if criterion is not None:
-        existing = await get_evidence_for_criterion(session, criterion.id)
-        already_recorded = any(
-            e.source_kind == "audit_finding_backfill"
-            and e.source_id == _V22_BACKFILL_RESOLVING_REF
-            for e in existing
-        )
-        if not already_recorded:
-            await record_evidence(
-                session,
-                criterion_id=criterion.id,
-                project_id=project_id,
-                source_kind="audit_finding_backfill",
-                source_id=_V22_BACKFILL_RESOLVING_REF,
-                detail={
-                    "resolving_ref": _V22_BACKFILL_RESOLVING_REF,
-                    "finding_count": count,
-                    "note": _V22_BACKFILL_NOTE,
-                },
-            )
 
     # Count guard: detect divergence between the number of low-severity
     # findings actually resolved and the expected constant (13), then log a
@@ -1702,6 +1732,33 @@ async def backfill_v22_carried_findings_resolved(
             count,
             expected,
         )
+        # Best-effort enrollment so the divergence signal reaches the triage
+        # surface via the evergreen backlog instead of living only in a log
+        # line.  Failure to enroll must never abort the backfill or the
+        # return — this is a flag-only observation, not a mutating action.
+        try:
+            from app.evergreen_backlog import enroll_backlog_item  # noqa: PLC0415
+            await enroll_backlog_item(
+                session,
+                project_id=project_id,
+                finding_key=_V22_BACKFILL_COUNT_DIVERGENCE_KEY,
+                title="v22 backfill count divergence",
+                detail=(
+                    f"v22 backfill resolved {count} low-severity findings, "
+                    f"but expected {expected}. The v22 audit-finding inventory "
+                    f"may have changed or the seed data may be inconsistent."
+                ),
+                provenance=_V22_BACKFILL_PROVENANCE,
+            )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "Failed to enroll evergreen backlog item for v22 backfill "
+                "count divergence (project %s)",
+                project_id,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
 
     return count
 

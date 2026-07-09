@@ -11,7 +11,9 @@ import {
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext,
   computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { repairStructuredOutput, type ParsedValueValidationResult } from './structured-output-repair.js';
 import {
   resolveCandidateSha, provisionAuditFetchHelpers, designDocAdvertisement,
@@ -314,7 +316,7 @@ export async function handleReleaseMergeGrade(
 
   const contextPrefix = buildContextPrefix(task);
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const fileTreeSection = buildFileTree(ws);
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const retryContext = buildRetryContext(task);
@@ -325,7 +327,7 @@ export async function handleReleaseMergeGrade(
     : '## Version goal\n(No goal text was supplied in your payload. If the goal is genuinely empty, set covers_goal=false, coverage_score=0, and name the missing goal as the biggest_gap.)\n\n';
   const mergedPrsSection = formatMergedPrsSection(payload);
 
-  const mergeGradePrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}You are an UNINVESTED, independent release MERGE-GRADER. You did not write any of this code and have no stake in it. \`${candidateSha}\` is the PINNED release candidate commit; it has already been fetched into this clone on \`${baseBranch}\`, so the diff range \`${diffRange}\` resolves. Your single job: judge whether the MERGED diff actually satisfies the version goal below.
+  const mgCorePrompt = `You are an UNINVESTED, independent release MERGE-GRADER. You did not write any of this code and have no stake in it. \`${candidateSha}\` is the PINNED release candidate commit; it has already been fetched into this clone on \`${baseBranch}\`, so the diff range \`${diffRange}\` resolves. Your single job: judge whether the MERGED diff actually satisfies the version goal below.
 
 BLINDNESS RULE (critical): grade STRICTLY the merged code changes against the stated goal. You have NO access to any strategist progress narrative, status report, or self-description of what was "supposed" to have shipped — and you must NOT request, infer, reconstruct, or rely on one. The only evidence that counts is the actual merged diff versus the goal text. Do not let any narrative claim of progress substitute for code that is actually present in the diff.
 
@@ -364,12 +366,24 @@ Rules:
 
   const buildConfig = resolveBuildConfig(task);
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const mgSuffixBlock = firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${mergeGradeFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const mergeGradePrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}${mgCorePrompt}${mgSuffixBlock}`;
+  const mgTelemetry = buildPromptSizeTelemetry(mergeGradePrompt, [
+    ['claude_md', codebaseSummary],
+    ['playbook', playbookSection],
+    ['retry_context', retryContext],
+    ['context_prefix', contextPrefix],
+    ['file_tree', fileTreeSection],
+    ['core_prompt', mgCorePrompt],
+    ['suffix', mgSuffixBlock],
+  ]);
+  setPromptSizeTelemetry(mgTelemetry.prompt_size_bytes, mgTelemetry.prompt_section_count, mgTelemetry.prompt_section_sizes);
   statusRef.value = 'Running release merge grade...';
   const mergeGradeFingerprint = computePromptFingerprint('release_merge_grade', buildConfig);
   setCurrentPromptFingerprint(mergeGradeFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: mergeGradeFingerprint });
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-    mergeGradePrompt + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${mergeGradeFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
+    mergeGradePrompt,
     ws, statusRef, model, effort, disallowedTools,
   );
 

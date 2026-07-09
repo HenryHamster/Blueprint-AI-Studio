@@ -328,6 +328,73 @@ async def _seed_completion_debt_design_doc():
         )
 
 
+async def _seed_routing_verdict_from_snapshot():
+    """Seed in-memory ``provider_routing_verdict_state`` from the persisted snapshot.
+
+    ``provider_routing_verdict_state`` in ``runtime_config`` is only set by
+    ``compute_current_axes`` during the periodic snapshot write. On restart the
+    key is absent, so ``_apply_routing_verdict()`` treats it as
+    INSUFFICIENT_DATA — disabling DeepSeek preference for up to 24 hours.
+    This function restores the latest persisted verdict from
+    ``project.design_doc["efficiency_baseline"]`` (baseline, snapshot, or
+    container level — in that preference order) immediately on startup.
+
+    Best-effort and non-fatal: a seed failure must never abort startup.
+    """
+    try:
+        from app.shared_state import runtime_config as _rc
+        from app.efficiency_snapshot import DESIGN_DOC_KEY
+
+        async with AsyncSessionLocal() as seed_session:
+            project_ids = (
+                (await seed_session.execute(select(Project.id))).scalars().all()
+            )
+            for project_id in project_ids:
+                project = await seed_session.get(Project, project_id)
+                if not project or not project.design_doc:
+                    continue
+                container = project.design_doc.get(DESIGN_DOC_KEY)
+                if not container:
+                    continue
+                # Read the verdict from where write_snapshot actually stores it.
+                # Priority (newest-first):
+                #   1. snapshots[-1]["provider_routing_verdict"] — latest snapshot,
+                #   2. baseline["provider_routing_verdict"] — first-ever snapshot
+                #      (fallback when no snapshots exist yet),
+                #   3. container-level key (backward compat with data seeded at
+                #      the wrong level before the fix).
+                provider_routing_verdict = None
+                snapshots = container.get("snapshots") or []
+                if snapshots:
+                    provider_routing_verdict = snapshots[-1].get(
+                        "provider_routing_verdict"
+                    )
+                if not provider_routing_verdict:
+                    provider_routing_verdict = (container.get("baseline") or {}).get(
+                        "provider_routing_verdict"
+                    )
+                if not provider_routing_verdict:
+                    provider_routing_verdict = container.get(
+                        "provider_routing_verdict"
+                    )
+                if not provider_routing_verdict:
+                    continue
+                state = provider_routing_verdict.get("state")
+                if state:
+                    _rc["provider_routing_verdict_state"] = state
+                    logger.info(
+                        "[STARTUP] Seeded provider_routing_verdict_state=%s from project %s",
+                        state,
+                        project_id,
+                    )
+                    return  # First project with a verdict is sufficient
+    except Exception:
+        logger.warning(
+            "[STARTUP] provider_routing_verdict_state seed failed (non-fatal)",
+            exc_info=True,
+        )
+
+
 async def _leader_lock_keepalive_tick(leader_conn) -> str:
     """Run one leader-lock keepalive iteration and report the outcome.
 
@@ -556,6 +623,11 @@ async def lifespan(app):
 
     # Load persisted Max plan accounts into in-memory pool
     await load_max_plan_pool()
+
+    # Seed provider_routing_verdict_state from the latest persisted snapshot
+    # so DeepSeek preference is restored immediately on restart, not gated on
+    # the next periodic snapshot write (up to ~1h delay).
+    await _seed_routing_verdict_from_snapshot()
 
     # Check deployment state (detect new deploy, rollback, or normal restart)
     await _init_deployment_state()

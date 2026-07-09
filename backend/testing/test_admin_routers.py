@@ -7248,7 +7248,7 @@ class TestMessagesWorkbenchState:
         assert "preferred_runner_id" not in marker
 
     @pytest.mark.asyncio
-    async def test_list_runners_returns_all_by_default(
+    async def test_list_runners_returns_all_with_explicit_limit(
         self, client: AsyncClient, db_session
     ):
         project = await _make_project(db_session)
@@ -7265,12 +7265,45 @@ class TestMessagesWorkbenchState:
         db_session.add_all(runners)
         await db_session.commit()
 
-        resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners?limit=1000"
+        )
         assert resp.status_code == 200
         listed = resp.json()
         assert len(listed) == 205
         assert listed[0]["hostname"] == "runner-000"
         assert listed[-1]["hostname"] == "runner-204"
+
+    @pytest.mark.asyncio
+    async def test_list_runners_default_limit(
+        self, client: AsyncClient, db_session
+    ):
+        """Call without limit param; should return at most 50 runners by default."""
+        project = await _make_project(db_session)
+        runners = [
+            LocalRunner(
+                project_id=project.id,
+                token_hash=f"{i:064x}",
+                hostname=f"runner-{i:03d}",
+                status="active",
+                created_at=_utcnow() - timedelta(seconds=i),
+            )
+            for i in range(205)
+        ]
+        db_session.add_all(runners)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners"
+        )
+        assert resp.status_code == 200
+        listed = resp.json()
+        # Default limit is 50; with 205 seeded runners we expect exactly 50
+        assert len(listed) == 50, f"expected 50 (default limit), got {len(listed)}"
+        # Runners are ordered by created_at DESC; the most-recently-created
+        # (lowest i) should appear first
+        assert listed[0]["hostname"] == "runner-000"
+        assert listed[-1]["hostname"] == "runner-049"
 
     @pytest.mark.asyncio
     async def test_leaving_continuous_mode_clears_local_continuation_marker(
@@ -9308,12 +9341,13 @@ class TestNotificationConfigSettings:
     async def test_patch_notification_config_runner_events_are_valid(
         self, client: AsyncClient
     ):
-        """The five runner-health event types are accepted by PATCH validation
+        """The runner-health event types are accepted by PATCH validation
         so an operator can opt in (previously the allowlist rejected them as
         unknown events, silently blocking every runner-health external page)."""
         runner_events = [
             "RUNNER_DEACTIVATED",
             "RUNNER_DEGRADED",
+            "RUNNER_DEGRADED_ESCALATED",
             "RUNNER_FLEET_OFFLINE",
             "RUNNER_LOW_DISK",
             "RUNNER_OUTAGE_ESCALATED",
@@ -11777,6 +11811,89 @@ class TestSrCatchRateTrendsDirectionExamples:
         dir_cats = by_dir["dir-empty"].get("categories", {})
         assert "scope-drift" in dir_cats
         assert "examples" not in dir_cats["scope-drift"]
+
+
+# ---------------------------------------------------------------------------
+# Provider routing verdict in digest payload
+# ---------------------------------------------------------------------------
+
+
+class TestDigestProviderRoutingVerdict:
+    """provider_routing_verdict appears in the digest effort_model_efficiency payload."""
+
+    @pytest.mark.asyncio
+    async def test_digest_provider_routing_verdict_present(
+        self, client: AsyncClient, db_session
+    ):
+        """(a/b) The digest payload includes provider_routing_verdict inside
+        effort_model_efficiency with the expected shape."""
+        from testing.factories import make_task, make_project
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Create a minimal set of completed tasks with provider data so that
+        # compute_effort_model_efficiency produces by_model rows and
+        # compute_provider_routing_verdict derives a verdict from them.
+        # With fewer than 20 PR-eligible tasks per provider the verdict will
+        # be INSUFFICIENT_DATA — sufficient to assert the field is present and
+        # structurally sound.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                provider="anthropic",
+                model="claude-opus-4-8",
+                payloads=[{"type": "create", "effort": "high"}],
+                context={"pr_merged": True},
+                api_call_summary={
+                    "total_input_tokens": 100,
+                    "total_output_tokens": 100,
+                    "llm_call_count": 1,
+                },
+            )
+        )
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                provider="deepseek",
+                model="deepseek-chat",
+                payloads=[{"type": "create", "effort": "low"}],
+                context={"pr_merged": True},
+                api_call_summary={
+                    "total_input_tokens": 100,
+                    "total_output_tokens": 100,
+                    "llm_call_count": 1,
+                },
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        efficiency = data.get("effort_model_efficiency")
+        assert efficiency is not None, "effort_model_efficiency missing from digest"
+
+        verdict = efficiency.get("provider_routing_verdict")
+        assert verdict is not None, (
+            "provider_routing_verdict missing from effort_model_efficiency"
+        )
+
+        # Verify structural shape.
+        assert verdict["state"] in ("ADOPT", "REJECT", "INSUFFICIENT_DATA")
+        assert isinstance(verdict.get("recommended_action"), str)
+        supporting = verdict.get("supporting")
+        assert supporting is not None
+        # Check a few known supporting keys exist.
+        assert "deepseek_run_count" in supporting
+        assert "anthropic_run_count" in supporting
+        assert "cost_ratio" in supporting
+        assert "verified_rate_delta_pct" in supporting
 
 
 # ---------------------------------------------------------------------------
@@ -22641,6 +22758,10 @@ class TestStrategistSpawnCriterionIds:
                     "prompt": "Research the coverage gap for the active criterion",
                     # Active key should survive; inactive should be dropped.
                     "criterion_ids": [active_key, inactive_key],
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_admin_routers.py",
+                    },
                 },
             },
         )
@@ -22738,6 +22859,10 @@ class TestStrategistSpawnCriterionIds:
                     "prompt": "Investigate both criterion areas",
                     "direction_id": direction_id_str,
                     "criterion_ids": [explicit_key],
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_admin_routers.py",
+                    },
                 },
             },
         )
@@ -22915,6 +23040,139 @@ class TestStrategistSpawnCriterionIds:
         )
         assert resp.status_code == 400
         assert "criterion_ids" in resp.json().get("error", {}).get("message", "")
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_criterion_ids_requires_acceptance_evidence(
+        self, client: AsyncClient, db_session
+    ):
+        """criterion_ids without named_test acceptance_evidence is rejected (400).
+
+        A strategist who passes criterion_ids but omits acceptance_evidence (or
+        passes a non-named_test kind) creates a task that can never record a
+        proven-verdict for those criteria — silently defeating the
+        criterion-coverage gate. The endpoint must reject this at spawn time
+        rather than let the task proceed to a merge that records nothing.
+        """
+        import uuid as _uuid
+        from app.auth import create_agent_token
+        from app.models import VersionAcceptanceCriterion
+
+        project = Project(name="CritIdsReqAESpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        rv = await _make_open_version(db_session, project.id)
+        active_key = f"c-active-{_uuid.uuid4().hex[:8]}"
+        db_session.add(
+            VersionAcceptanceCriterion(
+                project_id=project.id,
+                release_version_id=rv.id,
+                criterion_key=active_key,
+                status="active",
+                text="Active criterion requiring evidence",
+            )
+        )
+        await db_session.commit()
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for criterion-ids-no-evidence",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-crit-no-ae-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-crit-no-ae-test",
+            task_type="strategic_review",
+        )
+
+        # Case 1: criterion_ids without acceptance_evidence → 400
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with criteria but no evidence",
+                    "prompt": "Investigate the criterion coverage gap",
+                    "criterion_ids": [active_key],
+                },
+            },
+        )
+        assert resp.status_code == 400, (
+            f"expected 400 when criterion_ids lacks acceptance_evidence, "
+            f"got {resp.status_code}: {resp.text}"
+        )
+        msg = resp.json().get("detail") or resp.json().get("error", {}).get("message", "")
+        assert "acceptance_evidence" in msg, (
+            f"error must mention acceptance_evidence, got: {msg!r}"
+        )
+        assert "named_test" in msg, (
+            f"error must mention named_test, got: {msg!r}"
+        )
+        assert "criterion_ids" in msg, (
+            f"error must mention criterion_ids, got: {msg!r}"
+        )
+
+        # Case 2: criterion_ids with non-named_test acceptance_evidence → 400
+        resp2 = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with criteria and wrong evidence kind",
+                    "prompt": "Investigate the criterion coverage gap",
+                    "criterion_ids": [active_key],
+                    "acceptance_evidence": {
+                        "kind": "observable_behavior",
+                        "description": "the task produces a test that passes",
+                    },
+                },
+            },
+        )
+        assert resp2.status_code == 400, (
+            f"expected 400 when criterion_ids has non-named_test acceptance_evidence, "
+            f"got {resp2.status_code}: {resp2.text}"
+        )
+        msg2 = resp2.json().get("detail") or resp2.json().get("error", {}).get("message", "")
+        assert "named_test" in msg2, (
+            f"error must mention named_test, got: {msg2!r}"
+        )
+
+        # Case 3: criterion_ids with named_test acceptance_evidence → 200
+        resp3 = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with criteria and named_test evidence",
+                    "prompt": "Investigate the criterion coverage gap",
+                    "criterion_ids": [active_key],
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_admin_routers.py",
+                    },
+                },
+            },
+        )
+        assert resp3.status_code == 200, (
+            f"expected 200 when criterion_ids has named_test acceptance_evidence, "
+            f"got {resp3.status_code}: {resp3.text}"
+        )
 
 
 @pytest.mark.asyncio
@@ -27510,3 +27768,270 @@ class TestTaskListPlanSubtasksContract:
         assert resp.status_code == 200, resp.text
         t = resp.json()["tasks"][0]
         assert t["fix_loop_summary"] is None
+
+
+class TestStrategistCancelTask:
+    """Strategic cancel_task op: the strategist can retract its own dispatched work."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_spawned_task(self, client: AsyncClient, db_session):
+        """Spawn a task via spawn_task, then cancel it. Assert status transitions
+        to CANCELLED and the reason is recorded in the task context."""
+        from app.auth import create_agent_token
+
+        project = Project(name="CancelSpawnedTaskTest", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for cancel test",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-spawn-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-cancel-spawn-test",
+            task_type="strategic_review",
+        )
+
+        # Spawn a QUEUED child task
+        spawn_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Cancel test research",
+                    "prompt": "Investigate cancellability",
+                },
+            },
+        )
+        assert spawn_resp.status_code == 200, spawn_resp.text
+        spawn_body = spawn_resp.json()
+        child_id = spawn_body["task_id"]
+
+        child = await db_session.get(Task, uuid.UUID(child_id))
+        assert child is not None
+        assert child.status == TaskStatus.QUEUED
+
+        # Cancel the spawned task
+        cancel_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "cancel_task",
+                "data": {
+                    "target_task_id": child_id,
+                    "reason": "Wrong diagnosis — the identified issue does not exist",
+                },
+            },
+        )
+        assert cancel_resp.status_code == 200, cancel_resp.text
+        cancel_body = cancel_resp.json()
+        assert cancel_body["status"] == "ok"
+        assert cancel_body["op"] == "cancel_task"
+        assert cancel_body["target_task_id"] == child_id
+        assert cancel_body["previous_status"] == "QUEUED"
+
+        await db_session.refresh(child)
+        assert child.status == TaskStatus.CANCELLED
+        assert child.context.get("cancel_reason") == (
+            "Wrong diagnosis — the identified issue does not exist"
+        )
+        assert child.context.get("cancelled_by") == "STRATEGIC_AGENT"
+        assert child.context.get("cancelled_by_task_id") == str(strategic_task.id)
+        assert child.context.get("cancelled_at") is not None
+
+    @pytest.mark.asyncio
+    async def test_cancel_rejects_wrong_session(self, client: AsyncClient, db_session):
+        """Cancelling a task that the calling strategic session did NOT spawn
+        must be rejected with 403."""
+        from app.auth import create_agent_token
+
+        project = Project(name="CancelWrongSessionTest", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Session A spawns a task
+        session_a = Task(
+            project_id=project.id,
+            title="Session A strategic review",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-sess-a",
+        )
+        db_session.add(session_a)
+        await db_session.commit()
+        await db_session.refresh(session_a)
+
+        token_a = create_agent_token(
+            str(session_a.id),
+            "agent-vm-cancel-sess-a",
+            task_type="strategic_review",
+        )
+
+        spawn_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token_a},
+            json={
+                "task_id": str(session_a.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Session A research",
+                    "prompt": "Research A",
+                },
+            },
+        )
+        assert spawn_resp.status_code == 200, spawn_resp.text
+        child_id = spawn_resp.json()["task_id"]
+
+        # Session B tries to cancel it
+        session_b = Task(
+            project_id=project.id,
+            title="Session B strategic review",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-sess-b",
+        )
+        db_session.add(session_b)
+        await db_session.commit()
+        await db_session.refresh(session_b)
+
+        token_b = create_agent_token(
+            str(session_b.id),
+            "agent-vm-cancel-sess-b",
+            task_type="strategic_review",
+        )
+
+        cancel_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token_b},
+            json={
+                "task_id": str(session_b.id),
+                "op": "cancel_task",
+                "data": {
+                    "target_task_id": child_id,
+                    "reason": "Session B thinks this was a mistake",
+                },
+            },
+        )
+        assert cancel_resp.status_code == 403, cancel_resp.text
+
+        # The child must remain QUEUED
+        child = await db_session.get(Task, uuid.UUID(child_id))
+        assert child is not None
+        assert child.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_cancel_rejects_in_progress(self, client: AsyncClient, db_session):
+        """Cancelling an IN_PROGRESS task must be rejected with 409."""
+        from app.auth import create_agent_token
+
+        project = Project(name="CancelInProgressTest", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for IN_PROGRESS cancel",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-ip-test",
+            context={
+                "parent_strategic_task_id": "placeholder",
+                "spawned_by": "strategic_direct",
+            },
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        # Set parent_strategic_task_id after we know the strategic task's id
+        from sqlalchemy.orm.attributes import flag_modified
+        strategic_task.context["parent_strategic_task_id"] = str(strategic_task.id)
+        flag_modified(strategic_task, "context")
+        db_session.add(strategic_task)
+        await db_session.commit()
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-cancel-ip-test",
+            task_type="strategic_review",
+        )
+
+        cancel_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "cancel_task",
+                "data": {
+                    "target_task_id": str(strategic_task.id),
+                    "reason": "Test: cancelling IN_PROGRESS should fail",
+                },
+            },
+        )
+        assert cancel_resp.status_code == 409, cancel_resp.text
+
+        # The strategic task must still be IN_PROGRESS
+        await db_session.refresh(strategic_task)
+        assert strategic_task.status == TaskStatus.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_cancel_requires_reason(self, client: AsyncClient, db_session):
+        """cancel_task without a 'reason' must be rejected."""
+        from app.auth import create_agent_token
+
+        project = Project(name="CancelNoReasonTest", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for cancel no-reason",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-nr-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        from sqlalchemy.orm.attributes import flag_modified
+        strategic_task.context["parent_strategic_task_id"] = str(strategic_task.id)
+        flag_modified(strategic_task, "context")
+        db_session.add(strategic_task)
+        await db_session.commit()
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-cancel-nr-test",
+            task_type="strategic_review",
+        )
+
+        cancel_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "cancel_task",
+                "data": {
+                    "target_task_id": str(strategic_task.id),
+                },
+            },
+        )
+        assert cancel_resp.status_code == 400, cancel_resp.text

@@ -694,22 +694,38 @@ async def remove_direction(
             headers={"Retry-After": "2"},
         )
 
-    # Cancel QUEUED tasks spawned for this direction (same transaction, lock held)
-    cancelled_result = await session.execute(
-        select(Task).where(
-            Task.project_id == project_id,
-            Task.status == TaskStatus.QUEUED,
-            Task.context["direction_id"].as_string() == direction_id,
+    # Cancel QUEUED tasks spawned for this direction (same transaction, lock held).
+    # Paginated to avoid unbounded in-memory fetch for directions with many tasks.
+    _CANCEL_BATCH_SIZE = 5000
+    cancelled_tasks: List[Task] = []
+    vm_ids_to_delete: List[str] = []
+    _last_seen_id: int | None = None
+    while True:
+        stmt = (
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.status == TaskStatus.QUEUED,
+                Task.context["direction_id"].as_string() == direction_id,
+            )
         )
-    )
-    cancelled_tasks = cancelled_result.scalars().all()
-    vm_ids_to_delete = []
-    for t in cancelled_tasks:
-        t.status = TaskStatus.CANCELLED
-        t.latest_status_message = f"Cancelled: direction {direction_id} was removed"
-        session.add(t)
-        if t.vm_instance_id:
-            vm_ids_to_delete.append(t.vm_instance_id)
+        if _last_seen_id is not None:
+            stmt = stmt.where(Task.id > _last_seen_id)
+        stmt = stmt.order_by(Task.id).limit(_CANCEL_BATCH_SIZE)
+        _batch = (
+            (await session.execute(stmt))
+            .scalars()
+            .all()
+        )
+        if not _batch:
+            break
+        for t in _batch:
+            t.status = TaskStatus.CANCELLED
+            t.latest_status_message = f"Cancelled: direction {direction_id} was removed"
+            session.add(t)
+            if t.vm_instance_id:
+                vm_ids_to_delete.append(t.vm_instance_id)
+        _last_seen_id = _batch[-1].id
+        cancelled_tasks.extend(_batch)
 
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)

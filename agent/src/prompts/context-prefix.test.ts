@@ -242,6 +242,10 @@ describe('buildContextPrefix', () => {
     expect(prefix).toContain('testing/test_propagation.py::test_seam');
     // It frames the proof as something to aim for, not a blocking gate.
     expect(prefix).toContain('Aim to produce it');
+    // The evidence declaration can originate at plan time or research time;
+    // the spawned task sees it as declared "at spawn time".
+    expect(prefix).toContain('at spawn time');
+    expect(prefix).not.toContain('at plan time');
   });
 
   it('omits the selector line when no selector is supplied', () => {

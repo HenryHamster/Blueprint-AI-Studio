@@ -19,6 +19,7 @@ import type WebSocket from 'ws';
 import {
   strVal, sanitize, sendLog, persistAndPostStatus, apiPost,
 } from '../index.js';
+import { setPromptSizeTelemetry } from '../telemetry.js';
 
 // ── Handler: Compute Experiment ──────────────────────────────────────────────
 //
@@ -177,6 +178,10 @@ export async function handleComputeExperiment(
   _ghToken: string, _owner: string, _repo: string, ws: WebSocket | null, statusRef: { value: string },
   _model?: string, _effort?: string,
 ) {
+  // No Claude invocation in this handler — record a zero-byte prompt so
+  // the task type reports a non-null prompt_size_bytes in its api_call_summary.
+  setPromptSizeTelemetry(0, 0, []);
+
   const command = strVal(payload.command);
   const spendCap = numOrNull(payload.spend_cap_usd);
   const deadlineSeconds = numOrNull(payload.deadline_seconds);

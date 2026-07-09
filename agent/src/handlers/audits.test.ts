@@ -110,7 +110,7 @@ import {
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode, git,
 } from '../index.js';
-import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
+import { recordFormatRepairAttempt, recordFormatRepairSuccess, getLlmTelemetry, resetLlmTelemetry } from '../telemetry.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
@@ -1314,5 +1314,73 @@ describe('fetchCandidateCommitWithRetry — bounded candidate-fetch retry', () =
     expect(res.fetchOk).toBe(true);
     expect(res.diffRangeResolves).toBe(false);  // genuine unresolvable → fail loud
     expect(res.diffRangeFailDetail).toContain('bad revision');
+  });
+});
+
+// ── Prompt size telemetry — audit handlers record prompt size before runClaudeCode ─
+describe('audit handlers — prompt size telemetry', () => {
+  const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    resetLlmTelemetry();
+  });
+
+  it('test_security_audit_sets_prompt_size_telemetry', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue([{ title: 'SQL Injection', severity: 'critical' }]);
+
+    await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_sizes).not.toBeNull();
+    expect((telemetry.prompt_section_sizes ?? []).length).toBeGreaterThan(0);
+    for (const s of (telemetry.prompt_section_sizes ?? [])) {
+      expect(s.bytes).toBeGreaterThan(0);
+      expect(typeof s.name).toBe('string');
+    }
+  });
+
+  it('test_self_audit_sets_prompt_size_telemetry', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({ findings: [] });
+
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_sizes).not.toBeNull();
+    expect((telemetry.prompt_section_sizes ?? []).length).toBeGreaterThan(0);
+    for (const s of (telemetry.prompt_section_sizes ?? [])) {
+      expect(s.bytes).toBeGreaterThan(0);
+      expect(typeof s.name).toBe('string');
+    }
+  });
+
+  it('test_release_audit_sets_prompt_size_telemetry', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 1,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    });
+
+    await handleReleaseAudit(
+      TASK_ID, { base_branch: 'main', candidate_sha: CANDIDATE_SHA },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_sizes).not.toBeNull();
+    expect((telemetry.prompt_section_sizes ?? []).length).toBeGreaterThan(0);
+    for (const s of (telemetry.prompt_section_sizes ?? [])) {
+      expect(s.bytes).toBeGreaterThan(0);
+      expect(typeof s.name).toBe('string');
+    }
   });
 });

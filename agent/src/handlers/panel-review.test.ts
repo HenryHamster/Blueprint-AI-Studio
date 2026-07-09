@@ -88,10 +88,6 @@ vi.mock('../telemetry.js', async (importOriginal) => {
     recordFormatRepairTokens: vi.fn(),
     recordFormatRepairMiss: vi.fn(),
     recordFormatRepairInfraFailure: vi.fn(),
-    getLlmTelemetry: vi.fn().mockReturnValue({
-      llm_call_count: 0, num_turns: 0, total_input_tokens: 0, total_output_tokens: 0,
-      viewport_screenshot_forwarded_count: 0,
-    }),
   };
 });
 
@@ -131,7 +127,7 @@ import {
   readHandlerOutput,
   runClaudeCode,
 } from '../index.js';
-import { recordFormatMiss } from '../telemetry.js';
+import { recordFormatMiss, getLlmTelemetry, resetLlmTelemetry } from '../telemetry.js';
 import { handlePanelReview, PANEL_REVIEW_LENSES } from './panel-review.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -587,5 +583,69 @@ describe('handlePanelReview', () => {
         ['code_quality', 'correctness', 'security', 'test_coverage'],
       );
     });
+  });
+});
+
+// ── Prompt size telemetry — panel review records prompt size before runClaudeCode ─
+describe('handlePanelReview — prompt size telemetry', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(execFileSync).mockReturnValue('abc123\trefs/heads/feature/panel-review\n');
+    vi.mocked(providerSupportsNativeSubagents).mockReturnValue(true);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(matchesAuthFailure).mockReturnValue(false);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ title: 'Panel review PR', body: 'Review this carefully.' }),
+    });
+    resetLlmTelemetry();
+  });
+
+  it('parallel path records prompt size telemetry before calling runClaudeCode', async () => {
+    await handlePanelReview(
+      'task-panel-1',
+      { ...PAYLOAD },
+      { project_metadata: {}, playbook: {}, context: {} },
+      'gh-token', 'owner', 'repo', null, { value: '' }, 'gpt-5', 'medium',
+    );
+
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_sizes).not.toBeNull();
+    expect((telemetry.prompt_section_sizes ?? []).length).toBeGreaterThan(0);
+    for (const s of (telemetry.prompt_section_sizes ?? [])) {
+      expect(s.bytes).toBeGreaterThanOrEqual(0);
+      expect(typeof s.name).toBe('string');
+    }
+    // At least the core_prompt section must be non-empty.
+    const nonEmpty = (telemetry.prompt_section_sizes ?? []).filter(s => s.bytes > 0);
+    expect(nonEmpty.length).toBeGreaterThan(0);
+  });
+
+  it('serial fallback path records prompt size telemetry before calling runClaudeCode', async () => {
+    vi.mocked(providerSupportsNativeSubagents).mockReturnValue(false);
+
+    await handlePanelReview(
+      'task-panel-1',
+      { ...PAYLOAD },
+      { project_metadata: {}, playbook: {}, context: {} },
+      'gh-token', 'owner', 'repo', null, { value: '' }, 'gpt-5', 'medium',
+    );
+
+    const telemetry = getLlmTelemetry();
+    // The serial path calls runClaudeCode per lens; the last lens call's
+    // telemetry should be stored.
+    expect(telemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_sizes).not.toBeNull();
+    expect((telemetry.prompt_section_sizes ?? []).length).toBeGreaterThan(0);
+    for (const s of (telemetry.prompt_section_sizes ?? [])) {
+      expect(s.bytes).toBeGreaterThanOrEqual(0);
+      expect(typeof s.name).toBe('string');
+    }
+    // At least the core_prompt section must be non-empty.
+    const nonEmpty = (telemetry.prompt_section_sizes ?? []).filter(s => s.bytes > 0);
+    expect(nonEmpty.length).toBeGreaterThan(0);
   });
 });

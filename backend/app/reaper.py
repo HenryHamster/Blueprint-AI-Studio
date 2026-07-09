@@ -29,6 +29,7 @@ import random
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 from typing import Dict
 
 from sqlalchemy.exc import IntegrityError
@@ -783,6 +784,25 @@ async def reaper_service():
                 _orphan_loop_started_monotonic = time.monotonic()
                 _orphan_loop_processed = 0
                 _orphan_loop_time_deferred = 0
+
+                # Batch-fetch all children for all orphaned task IDs (N+1 guard).
+                # Build a parent_task_id → [Task] mapping so the per-iteration loop
+                # below never issues an individual SELECT per research/plan parent.
+                _children_by_parent: dict[int, list[Task]] = defaultdict(list)
+                if _orphaned_task_ids:
+                    _all_children = (
+                        (
+                            await session.execute(
+                                select(Task).where(
+                                    Task.parent_task_id.in_(_orphaned_task_ids)
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    for _child in _all_children:
+                        _children_by_parent[_child.parent_task_id].append(_child)
 
                 for _orphan_loop_idx, task_id in enumerate(_orphaned_task_ids):
                     # Stop taking NEW orphans once the wall-time budget is spent.
@@ -1743,19 +1763,11 @@ async def reaper_service():
                             # re-evaluate instead of re-run.
                             task_type = (task.first_payload).get("type", "")
                             is_parent_type = task_type in ("research", "plan")
-                            children = []
-                            if is_parent_type:
-                                children = (
-                                    (
-                                        await session.execute(
-                                            select(Task).where(
-                                                Task.parent_task_id == task.id
-                                            )
-                                        )
-                                    )
-                                    .scalars()
-                                    .all()
-                                )
+                            # Use pre-batched children mapping (N+1 guard above the loop).
+                            children = _children_by_parent.get(task.id, [])
+                            if not is_parent_type:
+                                # Non-parent types have no children; ensure empty list.
+                                children = []
                             if children:
                                 # Audit A8: queue for post-commit processing; don't
                                 # block heartbeats on this task while we clone children.

@@ -3324,8 +3324,11 @@ async def test_fetch_efficiency_snapshot(client: AsyncClient, db_session):
     assert body["status"] == "success"
     data = body["data"]
     assert "cost_per_merged_pr" in data
+    assert "cost_per_verified_task" in data
     assert "vm_reuse_rate" in data
     assert "llm_cost_per_merged_pr" in data
+    assert "llm_cost_per_verified_task" in data
+    assert "llm_cache_hit_rate" in data
     assert "format_compliance" in data
     assert data["window_days"] == 7
 
@@ -3383,7 +3386,10 @@ async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
 
     # Existing scalar fields still present
     assert "cost_per_merged_pr" in data
+    assert "cost_per_verified_task" in data
     assert "llm_cost_per_merged_pr" in data
+    assert "llm_cost_per_verified_task" in data
+    assert "llm_cache_hit_rate" in data
     assert "format_compliance" in data
     assert data["window_days"] == 7
 
@@ -3418,6 +3424,83 @@ async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
     assert data["panel_review_effectiveness_post_deploy"] is None
     assert "gate_health_post_deploy" in data
     assert data["gate_health_post_deploy"] is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_efficiency_snapshot_includes_llm_cache_hit_rate(
+    client: AsyncClient, db_session
+):
+    """Agent efficiency-snapshot returns llm_cache_hit_rate with a numerically
+    correct value computed from per-task cache-read / total-input tokens."""
+    from datetime import datetime, timezone
+
+    from app.models import TaskStatus
+
+    project = Project(name="Cache Hit Test", user_id="test-user-cachehit")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-cachehit",
+    )
+    db_session.add(token_task)
+
+    # Task 1: 1000 input tokens, 300 cache-read → 0.30 cache hit rate contribution
+    db_session.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            updated_at=datetime.now(timezone.utc),
+            vm_provisioned_at=datetime.now(timezone.utc),
+            vm_stopped_at=datetime.now(timezone.utc),
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 200,
+                "total_cache_read_input_tokens": 300,
+                "llm_call_count": 2,
+            },
+        )
+    )
+
+    # Task 2: 1000 input tokens, 100 cache-read → 0.10 cache hit rate contribution
+    db_session.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "fix"}],
+            status=TaskStatus.COMPLETED,
+            updated_at=datetime.now(timezone.utc),
+            vm_provisioned_at=datetime.now(timezone.utc),
+            vm_stopped_at=datetime.now(timezone.utc),
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 100,
+                "total_cache_read_input_tokens": 100,
+                "llm_call_count": 1,
+            },
+        )
+    )
+
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-cachehit")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert "llm_cache_hit_rate" in data
+    # (300 + 100) cache-read / (1000 + 1000) total input = 400/2000 = 0.20
+    assert data["llm_cache_hit_rate"] == 0.20
 
 
 @pytest.mark.asyncio

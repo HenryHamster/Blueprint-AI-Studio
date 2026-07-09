@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-003",
+  "name": "Rename UserService to UserManager for clarity",
+  "description": "A 'refactor' task: rename UserService class to UserManager across the backend, updating all references.",
+  "task_type": "refactor",
+  "prompt": "Rename the UserService class in backend/app/user_service.py to UserManager. Update all imports and references across the codebase. Keep all existing behavior and signatures identical.",
+  "effort": "medium",
+  "source_info": "Pattern from refactor-naming historical tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "code_merge"
+  },
+  "tags": ["refactor", "medium", "cost-baseline"]
+}

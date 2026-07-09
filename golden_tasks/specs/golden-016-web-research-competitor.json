@@ -1,0 +1,15 @@
+{
+  "spec_id": "golden-016",
+  "name": "Research competitor pricing models",
+  "description": "A 'web_research' task: research how competitor AI coding assistants price their services.",
+  "task_type": "web_research",
+  "prompt": "Research how AI coding assistants (GitHub Copilot, Cursor, Windsurf, Cody) price their services. For each: (1) pricing tiers and per-seat cost, (2) any usage-based components, (3) how they differentiate free vs paid tiers. Summarize into a knowledge document with sources.",
+  "effort": "medium",
+  "source_info": "Pattern from web_research tasks",
+  "expected": {
+    "terminal_status": "COMPLETED",
+    "outcome_status": "success",
+    "outcome_kind": "knowledge_document"
+  },
+  "tags": ["web-research", "medium", "cost-baseline"]
+}

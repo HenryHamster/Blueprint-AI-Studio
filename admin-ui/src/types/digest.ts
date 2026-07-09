@@ -335,6 +335,30 @@ interface EfficiencyFallbackCombo {
   count: number;
 }
 
+// Provider routing A/B verdict (ADOPT/REJECT/INSUFFICIENT_DATA). Mirrors the
+// backend compute_provider_routing_verdict return shape so the UI can render
+// routing-payoff state alongside the per-model efficiency rows that informed it.
+export interface ProviderRoutingVerdict {
+  state: 'ADOPT' | 'REJECT' | 'INSUFFICIENT_DATA';
+  supporting: {
+    deepseek_run_count: number;
+    deepseek_pr_eligible_run_count: number;
+    deepseek_verified_landed_count: number;
+    deepseek_verified_landed_rate: number | null;
+    deepseek_cost_per_merge: number | null;
+    deepseek_total_cost_usd: number;
+    anthropic_run_count: number;
+    anthropic_pr_eligible_run_count: number;
+    anthropic_verified_landed_count: number;
+    anthropic_verified_landed_rate: number | null;
+    anthropic_cost_per_merge: number | null;
+    anthropic_total_cost_usd: number;
+    cost_ratio: number | null;
+    verified_rate_delta_pct: number | null;
+  };
+  recommended_action: string;
+}
+
 export interface EffortModelEfficiency {
   by_effort: EffortEfficiencyRow[];
   by_model: ModelEfficiencyRow[];
@@ -344,6 +368,7 @@ export interface EffortModelEfficiency {
     total: number;
     combos: EfficiencyFallbackCombo[];
   };
+  provider_routing_verdict?: ProviderRoutingVerdict;
 }
 
 // Dependency/foundation-resolution observability (read-only). Mirrors the

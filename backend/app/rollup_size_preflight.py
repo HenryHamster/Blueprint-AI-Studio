@@ -20,6 +20,7 @@ Verdicts (mirroring the Alembic chain guard vocabulary):
              non-fast-forward 422, or a network blip); caller retries next cycle
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -219,7 +220,8 @@ async def preflight_rollup_size_caps(
                 return ("defer", f"no content returned for {full_path} at {staging_branch}")
             line_count = len(content.splitlines())
             if line_count > cap:
-                verdict = classify_breach(
+                verdict = await asyncio.to_thread(
+                    classify_breach,
                     module_key=key, current_size=line_count, section=section
                 )
                 if verdict["is_chronic"] and verdict["suggested_new_limit"] is None:

@@ -753,11 +753,14 @@ async def _resolve_quality_grader_completion(
     # Registry-driven (keyed by TaskCapability.completion_handler) so any
     # blast-radius knowledge type can opt into the same escalation/resume path
     # without another hardcoded entry.
+    from app.task_completion import _handle_compute_experiment_completion
+
     _resume_handlers = {
         "research": _handle_research_completion,
         "security_audit": _handle_security_audit_completion,
         "web_research": _handle_web_research_completion,
         "design": _handle_design_completion,
+        "compute_experiment": _handle_compute_experiment_completion,
     }
     source_type = (source.first_payload or {}).get("type")
     cap = get_task_capability(source_type)
@@ -2030,9 +2033,19 @@ async def _process_post_commit(
 
                 if (
                     is_intermediate and scope in ("small", "medium")
-                ) or auto_approve_small:
-                    # Small/medium scope on intermediate branch → security scan then auto-merge, skip review
-                    # The rollup PR to main gets the full review — intermediate merges don't need it
+                ) or auto_approve_small or not is_intermediate:
+                    # Security scan then auto-merge, skip model review.
+                    #
+                    # Two cases route here:
+                    #   1) Small/medium scope on an intermediate staging branch
+                    #      (rollup child). The rollup PR to main gets the full
+                    #      review — staging-branch merges don't need it.
+                    #   2) Non-rollup single task landing directly into automain
+                    #      (any scope, not intermediate). CI + the promotion gate
+                    #      already backstop these, so the expensive model review
+                    #      is redundant and the cut matches the v24 cost plan
+                    #      (P2: Reduce duplicate agent work). Rollup PRs where
+                    #      changes aggregate keep full review.
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(
                             task.id, session
@@ -2044,7 +2057,7 @@ async def _process_post_commit(
                                 gh_token, owner, repo, pr_number
                             )
                             logger.info(
-                                f"[SECURITY] Small-scope scan: {scan_result['summary']}"
+                                f"[SECURITY] Pipeline scan: {scan_result['summary']}"
                             )
                             if scan_result["blocked"]:
                                 task.requires_approval = True
@@ -2403,7 +2416,8 @@ async def _process_post_commit(
                                         task.id,
                                     )
                             logger.info(
-                                f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)"
+                                f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} "
+                                f"(scope={scope}, intermediate={is_intermediate})"
                             )
                         else:
                             logger.error(
@@ -2765,10 +2779,14 @@ async def _process_post_commit(
                                 f"[PIPELINE] Could not check PR files for infra flagging: {e}"
                             )
 
-                    # Always spawn the review — requires_approval gates MERGING
-                    # (checked at merge time in the review-complete path), not
-                    # reviewing. A security scan failure or blocking finding
-                    # should not orphan the PR by preventing review entirely.
+                    # Full model review — only reached for large-scope intermediate
+                    # (staging branch) tasks that feed into rollup PRs (the v24 cost
+                    # plan skips review for non-rollup single tasks landing directly
+                    # into automain; CI + the promotion gate backstop those).
+                    # requires_approval gates MERGING (checked at merge time in the
+                    # review-complete path), not reviewing. A security scan failure
+                    # or blocking finding should not orphan the PR by preventing
+                    # review entirely.
                     review_task, _ = await _spawn_pipeline_task(
                         task,
                         "review",
