@@ -2683,6 +2683,9 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
         from app.cost_ceiling import check_daily_cost_ceiling
 
         await check_daily_cost_ceiling(task, session)
+        from app.monthly_budget_alerts import check_monthly_budget
+
+        await check_monthly_budget(session)
         job = None
         if registration.wake_source_ref:
             with contextlib.suppress(ValueError, TypeError):

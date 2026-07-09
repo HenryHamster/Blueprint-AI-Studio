@@ -718,6 +718,12 @@ runtime_config: Dict = {
     "max_retained_images": 5,  # Agent VM image family pruning (keep N most recent; GCP per-project image quota is tight)
     "require_approval_gates": True,
     "daily_cost_ceiling_usd": 0,  # 0 = disabled; positive float enables budget alerts
+    # Monthly budget target (USD). 0 = disabled. When >0, Blueprint's own cost
+    # telemetry compares month-to-date total spend (VM + compute + pool idle)
+    # against this target and fires Alerts at 50/90/100% thresholds — live from
+    # the admin UI, no deploy needed. The GCP-native billing budget in
+    # infra/terraform/budget.tf stays as a high backstop ($5000 default).
+    "monthly_budget_target_usd": 0,  # 0 = disabled; positive float enables monthly budget alerts
     # Proposed compute_experiment spend cap (USD) above which an autonomously
     # authored launch is HELD for operator approval (requires_approval=True at
     # spawn) rather than dispatched. A per-direction override is honored when a
@@ -1919,6 +1925,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "daily_cost_ceiling_usd",
                         float(config_json["daily_cost_ceiling_usd"]),
+                    )
+                if "monthly_budget_target_usd" in config_json:
+                    _set(
+                        "monthly_budget_target_usd",
+                        float(config_json["monthly_budget_target_usd"]),
                     )
                 if "compute_experiment_spend_threshold_usd" in config_json:
                     _set(
