@@ -27735,3 +27735,270 @@ class TestTaskListPlanSubtasksContract:
         assert resp.status_code == 200, resp.text
         t = resp.json()["tasks"][0]
         assert t["fix_loop_summary"] is None
+
+
+class TestStrategistCancelTask:
+    """Strategic cancel_task op: the strategist can retract its own dispatched work."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_spawned_task(self, client: AsyncClient, db_session):
+        """Spawn a task via spawn_task, then cancel it. Assert status transitions
+        to CANCELLED and the reason is recorded in the task context."""
+        from app.auth import create_agent_token
+
+        project = Project(name="CancelSpawnedTaskTest", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for cancel test",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-spawn-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-cancel-spawn-test",
+            task_type="strategic_review",
+        )
+
+        # Spawn a QUEUED child task
+        spawn_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Cancel test research",
+                    "prompt": "Investigate cancellability",
+                },
+            },
+        )
+        assert spawn_resp.status_code == 200, spawn_resp.text
+        spawn_body = spawn_resp.json()
+        child_id = spawn_body["task_id"]
+
+        child = await db_session.get(Task, uuid.UUID(child_id))
+        assert child is not None
+        assert child.status == TaskStatus.QUEUED
+
+        # Cancel the spawned task
+        cancel_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "cancel_task",
+                "data": {
+                    "target_task_id": child_id,
+                    "reason": "Wrong diagnosis — the identified issue does not exist",
+                },
+            },
+        )
+        assert cancel_resp.status_code == 200, cancel_resp.text
+        cancel_body = cancel_resp.json()
+        assert cancel_body["status"] == "ok"
+        assert cancel_body["op"] == "cancel_task"
+        assert cancel_body["target_task_id"] == child_id
+        assert cancel_body["previous_status"] == "QUEUED"
+
+        await db_session.refresh(child)
+        assert child.status == TaskStatus.CANCELLED
+        assert child.context.get("cancel_reason") == (
+            "Wrong diagnosis — the identified issue does not exist"
+        )
+        assert child.context.get("cancelled_by") == "STRATEGIC_AGENT"
+        assert child.context.get("cancelled_by_task_id") == str(strategic_task.id)
+        assert child.context.get("cancelled_at") is not None
+
+    @pytest.mark.asyncio
+    async def test_cancel_rejects_wrong_session(self, client: AsyncClient, db_session):
+        """Cancelling a task that the calling strategic session did NOT spawn
+        must be rejected with 403."""
+        from app.auth import create_agent_token
+
+        project = Project(name="CancelWrongSessionTest", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Session A spawns a task
+        session_a = Task(
+            project_id=project.id,
+            title="Session A strategic review",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-sess-a",
+        )
+        db_session.add(session_a)
+        await db_session.commit()
+        await db_session.refresh(session_a)
+
+        token_a = create_agent_token(
+            str(session_a.id),
+            "agent-vm-cancel-sess-a",
+            task_type="strategic_review",
+        )
+
+        spawn_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token_a},
+            json={
+                "task_id": str(session_a.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Session A research",
+                    "prompt": "Research A",
+                },
+            },
+        )
+        assert spawn_resp.status_code == 200, spawn_resp.text
+        child_id = spawn_resp.json()["task_id"]
+
+        # Session B tries to cancel it
+        session_b = Task(
+            project_id=project.id,
+            title="Session B strategic review",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-sess-b",
+        )
+        db_session.add(session_b)
+        await db_session.commit()
+        await db_session.refresh(session_b)
+
+        token_b = create_agent_token(
+            str(session_b.id),
+            "agent-vm-cancel-sess-b",
+            task_type="strategic_review",
+        )
+
+        cancel_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token_b},
+            json={
+                "task_id": str(session_b.id),
+                "op": "cancel_task",
+                "data": {
+                    "target_task_id": child_id,
+                    "reason": "Session B thinks this was a mistake",
+                },
+            },
+        )
+        assert cancel_resp.status_code == 403, cancel_resp.text
+
+        # The child must remain QUEUED
+        child = await db_session.get(Task, uuid.UUID(child_id))
+        assert child is not None
+        assert child.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_cancel_rejects_in_progress(self, client: AsyncClient, db_session):
+        """Cancelling an IN_PROGRESS task must be rejected with 409."""
+        from app.auth import create_agent_token
+
+        project = Project(name="CancelInProgressTest", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for IN_PROGRESS cancel",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-ip-test",
+            context={
+                "parent_strategic_task_id": "placeholder",
+                "spawned_by": "strategic_direct",
+            },
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        # Set parent_strategic_task_id after we know the strategic task's id
+        from sqlalchemy.orm.attributes import flag_modified
+        strategic_task.context["parent_strategic_task_id"] = str(strategic_task.id)
+        flag_modified(strategic_task, "context")
+        db_session.add(strategic_task)
+        await db_session.commit()
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-cancel-ip-test",
+            task_type="strategic_review",
+        )
+
+        cancel_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "cancel_task",
+                "data": {
+                    "target_task_id": str(strategic_task.id),
+                    "reason": "Test: cancelling IN_PROGRESS should fail",
+                },
+            },
+        )
+        assert cancel_resp.status_code == 409, cancel_resp.text
+
+        # The strategic task must still be IN_PROGRESS
+        await db_session.refresh(strategic_task)
+        assert strategic_task.status == TaskStatus.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_cancel_requires_reason(self, client: AsyncClient, db_session):
+        """cancel_task without a 'reason' must be rejected."""
+        from app.auth import create_agent_token
+
+        project = Project(name="CancelNoReasonTest", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for cancel no-reason",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-cancel-nr-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        from sqlalchemy.orm.attributes import flag_modified
+        strategic_task.context["parent_strategic_task_id"] = str(strategic_task.id)
+        flag_modified(strategic_task, "context")
+        db_session.add(strategic_task)
+        await db_session.commit()
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-cancel-nr-test",
+            task_type="strategic_review",
+        )
+
+        cancel_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "cancel_task",
+                "data": {
+                    "target_task_id": str(strategic_task.id),
+                },
+            },
+        )
+        assert cancel_resp.status_code == 400, cancel_resp.text

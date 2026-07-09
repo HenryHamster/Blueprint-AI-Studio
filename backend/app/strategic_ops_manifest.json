@@ -128,6 +128,14 @@
     "internal_reason": null
   },
   {
+    "op": "cancel_task",
+    "alias": "cancel-task",
+    "description": "Cancel a previously spawned QUEUED/PROVISIONING task with a required reason.",
+    "cli": true,
+    "prompt": true,
+    "internal_reason": null
+  },
+  {
     "op": "dispose_completion_debt",
     "alias": "dispose-completion-debt",
     "description": "Dispose of an open completion-debt ledger entry.",

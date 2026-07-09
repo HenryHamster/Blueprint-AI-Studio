@@ -13,6 +13,7 @@ vi.mock('../telemetry.js', () => ({
 
 vi.mock('../prompt.js', () => ({
   DEFAULT_TOOL_GUIDANCE: '',
+  SHARED_LIFECYCLE_REMAINDER: '',
 }));
 
 import { attemptStructuredRepair } from './structured-repair.js';

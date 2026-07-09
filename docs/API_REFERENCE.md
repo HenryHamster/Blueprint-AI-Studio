@@ -600,7 +600,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | dispose_completion_debt | set_problem_model | set_running_update | reflect | pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | cancel_task | dispose_completion_debt | set_problem_model | set_running_update | reflect | pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution",
   "data": { }
 }
 ```
