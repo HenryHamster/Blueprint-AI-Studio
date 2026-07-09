@@ -689,6 +689,7 @@ async def _project_resource_dispatch_defer_message(
     # per-project spend ceiling above so projects without a spend_ceiling_usd
     # (the default) are still gated when the fleet-wide budget is exhausted.
     if budget_exhausted:
+
         return (
             "Waiting for monthly budget — "
             "fleet-wide spend has exceeded the monthly budget target"

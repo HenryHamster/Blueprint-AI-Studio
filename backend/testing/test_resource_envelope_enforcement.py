@@ -1025,3 +1025,123 @@ async def test_patch_resource_envelope_rejects_out_of_range_spend_warning_fracti
         json={"spend_warning_fraction": 1.5},
     )
     assert resp.status_code == 422, resp.text
+
+
+# ---------------------------------------------------------------------------
+# pause_on_ceiling_exceeded auto-pause enforcement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_defers_at_ceiling_via_defer_message(
+    db_session, mocker
+):
+    """When spend exceeds ceiling, _filter_project_resource_dispatch_eligible
+    filters out the task via a deferral message AND hard-pauses the project
+    when pause_on_ceiling_exceeded is set (both mechanisms are active:
+    the task gets a defer message, and the project is paused)."""
+    project = make_project(
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 7,
+                "pause_on_ceiling_exceeded": True,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(
+            return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}
+        ),
+    )
+    broadcast = AsyncMock()
+
+    result = await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task.id],
+        [task],
+        {},
+        broadcast,
+    )
+
+    # Task is deferred because spend ceiling is exceeded
+    assert result == []
+
+    # The defer message is set on the task (the "via defer message" behavior)
+    assert task.latest_status_message is not None
+    assert "spend budget" in task.latest_status_message
+    assert "$10.00/$10.00" in task.latest_status_message
+
+    # Project IS hard-paused because pause_on_ceiling_exceeded is True
+    await db_session.refresh(project)
+    assert project.paused is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_defer_message_contains_spend_details(
+    db_session, mocker
+):
+    """The defer message should include the current spend and ceiling values
+    for operator visibility."""
+    project = make_project(
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 50.0,
+                "spend_window_days": 7,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(
+            return_value={"total": 50.0, "compute": 50.0, "agent_vm": 0.0, "idle": 0.0}
+        ),
+    )
+    broadcast = AsyncMock()
+
+    # Patch _project_resource_dispatch_defer_message to capture the reason
+    import app.orchestrator as _orch
+
+    orig_fn = _orch._project_resource_dispatch_defer_message
+    captured_reason = None
+
+    async def capturing_fn(*args, **kwargs):
+        nonlocal captured_reason
+        captured_reason = await orig_fn(*args, **kwargs)
+        return captured_reason
+
+    mocker.patch.object(
+        _orch,
+        "_project_resource_dispatch_defer_message",
+        capturing_fn,
+    )
+
+    result = await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task.id],
+        [task],
+        {},
+        broadcast,
+    )
+
+    assert result == []
+    assert captured_reason is not None
+    assert "50.00" in captured_reason
+    assert "spend budget" in captured_reason
