@@ -3080,6 +3080,17 @@ def main() -> None:
                 time.sleep(poll_interval)
                 continue
 
+            if status == 503 and isinstance(body, dict) and body.get("pool_exhausted"):
+                _release_capacity(agent_capacity)
+                print(
+                    "[runner] POOL EXHAUSTED — no LLM account available; "
+                    "task stays claimable for a future poll cycle",
+                    flush=True,
+                )
+                poll_interval = min(poll_interval * 2, 30.0)
+                time.sleep(poll_interval)
+                continue
+
             if status == 204 or body is None:
                 _release_capacity(agent_capacity)
                 poll_interval = min(poll_interval * 2, 30.0)

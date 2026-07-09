@@ -1152,10 +1152,11 @@ class TestRunnerEndpoints:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        # When no LLM account is resolved, the handler returns 204
-        # with no body, rolling back the dispatch marker so the task
-        # stays claimable by a future poll cycle.
-        assert resp.status_code == 204
+        # When no LLM account is resolved, the handler returns 503
+        # with pool_exhausted=True, rolling back the dispatch marker
+        # so the task stays claimable by a future poll cycle.
+        assert resp.status_code == 503
+        assert resp.json() == {"pool_exhausted": True}
 
         # Task context was NOT stamped since select_llm_runtime_for_task returned None.
         await db_session.refresh(task_instance)
@@ -1332,13 +1333,13 @@ class TestRunnerEndpoints:
             _clear_pool()
 
     @pytest.mark.asyncio
-    async def test_next_task_returns_204_when_pool_exhausted(
+    async def test_next_task_returns_503_when_pool_exhausted(
         self, client: AsyncClient, db_session
     ):
         """When no eligible account exists in the pool, /next-task must return
-        204 and leave started_at unset so the task remains claimable once an
-        account frees up.  A 204 is the correct "nothing available" signal,
-        not a 5xx or a task dispatched without credentials."""
+        503 with pool_exhausted=True and leave started_at unset so the task
+        remains claimable once an account frees up.  A 503 signals resource
+        exhaustion distinct from "no tasks available" (204)."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
         # Do NOT seed any account — the pool is empty.
@@ -1358,7 +1359,8 @@ class TestRunnerEndpoints:
                 "/api/runner/next-task",
                 headers={"Authorization": f"Bearer {token}"},
             )
-            assert resp.status_code == 204
+            assert resp.status_code == 503
+            assert resp.json() == {"pool_exhausted": True}
 
             # started_at must NOT be set — the task was not dispatched.
             await db_session.refresh(task)

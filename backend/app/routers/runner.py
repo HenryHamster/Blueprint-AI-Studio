@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool, StrictStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -346,8 +347,10 @@ async def next_task(
                     task.started_at = None
                     session.add(task)
                     await session.commit()
-                    response.status_code = status.HTTP_204_NO_CONTENT
-                    return response
+                    return JSONResponse(
+                        {"pool_exhausted": True},
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    )
     except Exception:
         logger.exception(
             "[RUNNERS] Failed to resolve LLM credentials for task %s; "
