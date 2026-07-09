@@ -4431,7 +4431,7 @@ async def strategic_operation(
         # (project_id, release_version_id) scope so repeated calls are safe.
         from app.acceptance_criteria import (
             count_active_criteria_for_version as _count_active_criteria,
-            get_criterion_by_key as _get_criterion_by_key,
+            get_criteria_by_keys as _get_criteria_by_keys,
             get_criterion_by_text as _get_criterion_by_text,
             generate_criterion_key as _gen_criterion_key,
             is_operator_authored_criterion as _is_operator_authored_criterion,
@@ -4520,12 +4520,27 @@ async def strategic_operation(
         # retraction commits so a partial batch cannot leave some retracted.
         # Also snapshot each target's pre-retraction status so the notification
         # step only fires when a previously-active criterion actually changes.
+        # Batch-fetch ALL retraction targets (and supersession target keys) in
+        # a single query instead of N individual _get_criterion_by_key() calls
+        # across three separate loops (finding 1: 3N → 1 + N).
+        _retract_keys: list[str] = [item["criterion_key"].strip() for item in retract_input]
+        _supersession_keys: list[str] = [
+            item["superseded_by_key"].strip()
+            for item in retract_input
+            if isinstance(item.get("superseded_by_key"), str) and item["superseded_by_key"].strip()
+        ]
+        _all_crit_keys = list(set(_retract_keys + _supersession_keys))
+        _criteria_by_key: dict[str, _VAC] = {}
+        if _all_crit_keys:
+            _rows = await _get_criteria_by_keys(
+                session, project.id, _all_crit_keys, release_version_id=open_version.id
+            )
+            _criteria_by_key = {r.criterion_key: r for r in _rows}
+
         pre_status_by_key: dict[str, str | None] = {}
         for item in retract_input:
             criterion_key = item["criterion_key"].strip()
-            existing = await _get_criterion_by_key(
-                session, open_version.id, criterion_key
-            )
+            existing = _criteria_by_key.get(criterion_key)
             pre_status_by_key[criterion_key] = (
                 existing.status if existing is not None else None
             )
@@ -4557,7 +4572,7 @@ async def strategic_operation(
                     status_code=400,
                     detail=f"set_acceptance_criteria: criterion '{criterion_key}' cannot supersede itself",
                 )
-            target = await _get_criterion_by_key(session, open_version.id, superseded_by_key)
+            target = _criteria_by_key.get(superseded_by_key)
             if target is None or target.status != "active":
                 raise HTTPException(
                     status_code=400,
@@ -4662,6 +4677,25 @@ async def strategic_operation(
         new_added_count = 0
         skipped_over_cap = 0
         processed: list[dict] = []
+
+        # Batch-fetch ALL direction rows referenced across criteria_input in a
+        # single query instead of per-item N+1 _get_direction_row() calls
+        # (finding 2: M*D → 1 query).
+        _all_direction_keys: list[str] = []
+        for item in criteria_input:
+            _all_direction_keys.extend(item.get("direction_keys") or [])
+        _direction_rows: dict[str, Any] = {}
+        if _all_direction_keys:
+            _unique_dir_keys = list(set(_all_direction_keys))
+            from app.models import Direction as _DirectionModel
+            _dir_result = await session.execute(
+                select(_DirectionModel).where(
+                    _DirectionModel.project_id == project.id,
+                    _DirectionModel.direction_key.in_(_unique_dir_keys),
+                )
+            )
+            _direction_rows = {r.direction_key: r for r in _dir_result.scalars().all()}
+
         for item in criteria_input:
             text = item["text"].strip()
             direction_keys_input: list[str] = list(item.get("direction_keys") or [])
@@ -4694,7 +4728,7 @@ async def strategic_operation(
 
             mapped_keys: list[str] = []
             for dk in direction_keys_input:
-                dir_row = await _get_direction_row(session, project.id, dk)
+                dir_row = _direction_rows.get(dk)
                 if dir_row is None:
                     warnings.append(f"Unknown direction_key: {dk}")
                     continue

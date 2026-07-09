@@ -1537,6 +1537,11 @@ class Task(SQLModel, table=True):
         # test_model_indexes_covered_by_migrations.
         Index("ix_task_created_at", "created_at"),
         Index("ix_task_started_at", "started_at"),
+        # Standalone index on updated_at for reaper staleness sweeps,
+        # strategic spawning (ORDER BY updated_at DESC), operator attention,
+        # and work session recheck queries (~15 query sites total). Without
+        # this index every staleness sweep does a full sort of the tasks table.
+        Index("ix_task_updated_at", "updated_at"),
         # Partial index on vm_stopped_at for anomaly_detection cost-window queries
         # that filter vm_stopped_at IS NOT NULL and order by vm_stopped_at.
         # Without this, the query full-scans all task history linearly.

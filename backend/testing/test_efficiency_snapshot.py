@@ -11640,3 +11640,95 @@ async def test_write_snapshot_persists_effort_model_efficiency_by_model(db_sessi
     assert len(read_by_model) == len(by_model), (
         "by_model row count must match between write and read"
     )
+
+
+async def test_model_routing_efficiency_persisted_in_snapshot(db_session):
+    """provider_routing_share (per-provider aggregation of by_model) is persisted
+    in write_snapshot and surfaced by read_baseline_with_drift.
+
+    Creates tasks on two providers, writes a snapshot, and verifies the
+    by_provider block aggregates correctly.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Sonnet task: merged create, 1 pr-eligible, 1 verified.
+    sonnet_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "effort": "medium", "pr_number": 1}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 500,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # DeepSeek task: merged create, 1 pr-eligible, 1 verified.
+    deepseek_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "effort": "low", "pr_number": 2}],
+        api_call_summary={
+            "total_input_tokens": 1500,
+            "total_output_tokens": 400,
+            "llm_call_count": 6,
+        },
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+    db_session.add(sonnet_task)
+    db_session.add(deepseek_task)
+    await db_session.commit()
+
+    # --- write_snapshot returns provider_routing_share -------------------------
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    prs = snap.get("provider_routing_share")
+    assert prs is not None, (
+        "provider_routing_share must be present in write_snapshot return value"
+    )
+
+    by_provider = prs.get("by_provider")
+    assert isinstance(by_provider, list), "by_provider must be a list"
+    assert len(by_provider) >= 2, "at least 2 provider rows for anthropic + deepseek"
+
+    by_provider_map = {r["provider"]: r for r in by_provider}
+    assert "anthropic" in by_provider_map
+    assert "deepseek" in by_provider_map
+
+    # -- Anthropic row: 1 run, 1 pr-eligible, 1 verified -----------------------
+    anth = by_provider_map["anthropic"]
+    assert anth["run_count"] == 1
+    assert anth["pr_eligible_run_count"] == 1
+    assert anth["verified_landed_count"] == 1
+    assert anth["verified_landed_rate"] == 1.0
+    assert anth["cost_per_merge"] is not None
+
+    # -- DeepSeek row: 1 run, 1 pr-eligible, 1 verified ------------------------
+    ds = by_provider_map["deepseek"]
+    assert ds["run_count"] == 1
+    assert ds["pr_eligible_run_count"] == 1
+    assert ds["verified_landed_count"] == 1
+    assert ds["verified_landed_rate"] == 1.0
+    assert ds["cost_per_merge"] is not None
+
+    # -- Totals -----------------------------------------------------------------
+    assert prs["total_run_count"] == 2
+    assert prs["total_pr_eligible_run_count"] == 2
+
+    # -- read_baseline_with_drift surfaces the same block -----------------------
+    drift = await read_baseline_with_drift(db_session, project.id)
+    read_prs = drift.get("provider_routing_share")
+    assert read_prs is not None, (
+        "read_baseline_with_drift must surface provider_routing_share"
+    )
+    assert len(read_prs["by_provider"]) == len(by_provider), (
+        "by_provider row count must match between write and read"
+    )

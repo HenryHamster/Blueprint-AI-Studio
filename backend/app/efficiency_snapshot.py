@@ -2855,6 +2855,11 @@ async def compute_current_axes(
             "by_model": _effort_model["by_model"],
             "totals": _effort_model["totals"],
         },
+        # Per-provider routing share (direction d-cf39cb40): aggregates by_model into
+        # a compact by_provider block so operators can confirm at a glance which
+        # provider handled what fraction of tasks, at what cost and verified-landing
+        # rate. Persisted alongside the verdict for retroactive decomposition.
+        "provider_routing_share": compute_provider_routing_share(_effort_model["by_model"]),
         # Self-check: reconcile LLM cost telemetry against an independent
         # recomputation path so operators are alerted if the two diverge beyond
         # the declared tolerance. Non-zero tasks with at least one priced attempt
@@ -3814,6 +3819,11 @@ async def read_baseline_with_drift(
         # cost ratio + verified-merge-rate delta, persisted in the daily snapshot and
         # surfaced here from the latest snapshot so the A/B is machine-checkable.
         "provider_routing_verdict": latest.get("provider_routing_verdict"),
+        # Per-provider routing share from the latest snapshot: by_provider block
+        # with run counts, cost, and verified landing rate per provider, plus
+        # aggregate totals. Persisted alongside the verdict in the daily snapshot
+        # for retroactive decomposition of model routing efficiency.
+        "provider_routing_share": latest.get("provider_routing_share"),
         # Per-(provider,model) efficiency breakdown from the latest snapshot:
         # by_model rows with verified_landed_rate, cost_per_merge, run counts, and
         # aggregate totals. Persisted in the daily snapshot for retroactive A/B
