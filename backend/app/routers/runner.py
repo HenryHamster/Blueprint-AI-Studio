@@ -407,20 +407,48 @@ async def decline_task(
         # (idempotent; the stale-runner sweep is the safety net).
         return {"ok": True}
 
+    # Release the LLM pool account that was claimed when the task was
+    # dispatched via /next-task, so the slot isn't leaked indefinitely.
+    # Use the same idempotent ``_slot_released`` marker as the park path
+    # in task_lifecycle.py to guard against double-release.
+    acct_id = None
+    try:
+        from app.max_plan_pool import (
+            get_task_llm_account_id,
+            release_max_plan_account,
+        )
+
+        acct_id = get_task_llm_account_id(task)
+        if acct_id and not (task.context or {}).get("_slot_released"):
+            await release_max_plan_account(acct_id)
+    except Exception:
+        logger.exception(
+            "[RUNNERS] pool account release failed for declined task %s",
+            payload.task_id,
+        )
+
+    task.llm_account_id = None
     task.status = TaskStatus.QUEUED
     task.vm_instance_id = None
     task.vm_provisioned_at = None
     task.started_at = None
     new_ctx = dict(task.context or {})
-    new_ctx.pop("runner_target_id", None)
+    for key in (
+        "llm_account_id", "llm_provider", "llm_auth_mode", "llm_model",
+        "llm_execution_mode", "max_plan_account_id", "runner_target_id",
+        "_slot_released",
+    ):
+        new_ctx.pop(key, None)
     task.context = new_ctx
     session.add(task)
     await session.commit()
 
     logger.info(
-        "[RUNNERS] Runner %s declined task %s — released back to QUEUED",
+        "[RUNNERS] Runner %s declined task %s — released back to QUEUED "
+        "(pool account %s released)",
         runner.id,
         payload.task_id,
+        acct_id,
     )
     return {"ok": True}
 

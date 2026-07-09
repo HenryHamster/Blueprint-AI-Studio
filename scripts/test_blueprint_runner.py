@@ -1239,6 +1239,87 @@ class UpdateCommandTests(unittest.TestCase):
         rc = br.do_update(_run=run)
         self.assertEqual(rc, 1)
 
+    def test_update_restarts_service(self):
+        """After successful fast-forward, _restart_runner_service is called."""
+        run = _git_recorder()
+        with patch.object(br, "_restart_runner_service", return_value=True) as restart_mock:
+            rc = br.do_update(_run=run)
+        self.assertEqual(rc, 0)
+        restart_mock.assert_called_once()
+
+
+class RestartServiceTests(unittest.TestCase):
+    """Tests for :func:`_restart_runner_service`."""
+
+    def test_restarts_user_service(self):
+        """When user unit exists and is active, restarts via systemctl --user."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", return_value=True):
+            result = br._restart_runner_service(_run=run)
+        self.assertTrue(result)
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(
+            any("systemctl --user restart blueprint-runner.service" in j for j in joined)
+        )
+
+    def test_restarts_system_service_when_no_user_unit(self):
+        """When only system unit exists, restarts via systemctl (no --user)."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", side_effect=lambda p: "etc/systemd" in str(p)):
+            result = br._restart_runner_service(_run=run)
+        self.assertTrue(result)
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(
+            any("systemctl restart blueprint-runner.service" in j for j in joined)
+        )
+        self.assertFalse(
+            any("--user" in j and "restart" in j for j in joined)
+        )
+
+    def test_noop_when_not_installed(self):
+        """Returns False when no unit file exists."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", return_value=False):
+            result = br._restart_runner_service(_run=run)
+        self.assertFalse(result)
+        self.assertFalse(any("restart" in " ".join(c) for c in calls))
+
+    def test_noop_when_unit_inactive(self):
+        """Returns False when unit exists but is-active fails."""
+        calls = []
+        run = _systemctl_recorder(fail_on={"is-active": 3}, record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", return_value=True):
+            result = br._restart_runner_service(_run=run)
+        self.assertFalse(result)
+        self.assertFalse(any("restart" in " ".join(c) for c in calls))
+
+    def test_noop_when_systemctl_absent(self):
+        """Returns False when systemctl is not on PATH."""
+        with patch.object(br.shutil, "which", return_value=None):
+            result = br._restart_runner_service()
+        self.assertFalse(result)
+
+    def test_user_scope_preferred_over_system(self):
+        """When both user and system units exist, restarts user scope first."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", return_value=True):
+            result = br._restart_runner_service(_run=run)
+        self.assertTrue(result)
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(
+            any("systemctl --user restart" in j for j in joined),
+            "user scope must be checked (and restarted) first when both exist",
+        )
+
 
 class PrintNoSystemdGuidanceTests(unittest.TestCase):
     def test_output_includes_actionable_guidance(self):

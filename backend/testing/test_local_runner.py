@@ -1274,6 +1274,50 @@ class TestRunnerEndpoints:
         assert task3.status == TaskStatus.IN_PROGRESS
 
     @pytest.mark.asyncio
+    async def test_decline_task_releases_pool_account(
+        self, client: AsyncClient, db_session
+    ):
+        """Declining a task releases the LLM pool account slot."""
+        _clear_pool()
+        acct = _seed_pool_account(active_tasks=1)
+        acct_id = acct["id"]
+        assert acct["active_tasks"] == 1  # pre-condition: slot is claimed
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = Task(
+            project_id=project.id, payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={
+                "runner_target_id": str(runner.id),
+                "llm_account_id": acct_id,
+            },
+            llm_account_id=acct_id,
+            started_at=_utcnow(),
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/decline-task",
+            json={"task_id": str(task.id)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+
+        # Pool slot was released back.
+        assert acct["active_tasks"] == 0
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.llm_account_id is None
+        ctx = task.context or {}
+        assert "llm_account_id" not in ctx
+        assert "llm_provider" not in ctx
+
+    @pytest.mark.asyncio
     async def test_heartbeat_updates_last_seen(
         self, client: AsyncClient, db_session
     ):

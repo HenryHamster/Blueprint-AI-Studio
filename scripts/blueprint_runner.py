@@ -758,6 +758,35 @@ def do_uninstall(*, system: bool = False, dry_run: bool = False, _run=subprocess
     return 0
 
 
+def _restart_runner_service(*, _run=subprocess.run) -> bool:
+    """Restart the runner systemd service if it is installed and active.
+
+    Checks both user and system scopes, restarting the first active unit
+    found. User scope is checked first (the common case for a local runner
+    installed by a non-root operator).
+
+    Returns True if a restart was performed, False otherwise.
+    """
+    if shutil.which("systemctl") is None:
+        return False
+
+    for system in (False, True):
+        unit_path = _system_unit_path() if system else _user_unit_path()
+        if not os.path.isfile(unit_path):
+            continue
+        result = _systemctl(["is-active", SERVICE_UNIT_NAME], system=system, _run=_run)
+        if getattr(result, "returncode", 1) == 0:
+            scope_label = "system" if system else "user"
+            print(
+                f"[blueprint-runner] restarting {SERVICE_UNIT_NAME} "
+                f"({scope_label} scope)...",
+                flush=True,
+            )
+            _systemctl(["restart", SERVICE_UNIT_NAME], system=system, _run=_run)
+            return True
+    return False
+
+
 # ── update (efficient self-update via git) ─────────────────────────────────────
 #
 # `blueprint-runner update` fetches the latest commits from origin, fast-forwards
@@ -889,6 +918,8 @@ def do_update(
                         f"WARNING: could not run npm ci in {lock_dir}: {exc}",
                         file=sys.stderr, flush=True,
                     )
+
+    _restart_runner_service(_run=_run)
 
     print("[blueprint-runner] update complete.", flush=True)
     return 0
