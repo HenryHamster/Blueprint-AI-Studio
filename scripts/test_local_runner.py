@@ -4229,7 +4229,7 @@ class TestProviderCredentialCheck(unittest.TestCase):
              patch("builtins.print", side_effect=capture_print), \
              patch.object(br, "_node_major", return_value=22), \
              patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
-             patch.object(br, "run_local_runner", return_value=0):
+             patch.object(br, "run_local_runner", return_value=1):
             rc = br.main(["check"])
 
         warning_lines = [line for line in output_lines if "WARNING" in line and "credential" in line.lower()]
@@ -4238,7 +4238,10 @@ class TestProviderCredentialCheck(unittest.TestCase):
             f"Expected WARNING about missing credentials in output. Got: {output_lines}",
         )
         self.assertIn("ANTHROPIC_API_KEY", warning_lines[0])
-        self.assertEqual(rc, 0, "WARNING must not change the exit code")
+        # Missing provider creds must make --check exit non-zero so the operator
+        # catches the misconfiguration at enrollment time instead of discovering
+        # every agent task fails at runtime.
+        self.assertEqual(rc, 1, "Missing provider creds must make blueprint-runner check exit non-zero")
 
 
 class TestStatusJson(unittest.TestCase):
@@ -4547,10 +4550,10 @@ class TestProviderCredentials(unittest.TestCase):
             )
 
         output = buf.getvalue()
-        self.assertIn("NONE", output)
+        self.assertIn("FAIL", output)
         self.assertIn("provider creds", output)
-        # setup_ok should remain True (provider creds are a warning, NOT a blocker).
-        self.assertTrue(result["setup_ok"])
+        # Failure is when agent tasks are claimable but no provider creds are set.
+        self.assertFalse(result["setup_ok"])
 
     def test_preflight_with_provider_credentials_does_not_warn(self):
         """Preflight does NOT warn when provider credentials are set."""

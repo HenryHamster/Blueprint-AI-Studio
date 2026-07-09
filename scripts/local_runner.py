@@ -2517,16 +2517,25 @@ def _preflight(
     for note in caps.notes:
         print(f"    note         : {note}", flush=True)
 
-    # Provider credential check (non-blocking warning).
+    # Provider credential check. When agent work is claimable this is a HARD
+    # requirement: --check exits non-zero (setup_ok=False) so the operator
+    # catches the misconfiguration at enrollment time instead of discovering
+    # every agent task fails at PRE_CLAIM_FAILED at runtime.
     provider_creds = _check_provider_credentials()
+    agent_claimable = claimable[iso.CLASS_AGENT]
     if provider_creds:
         _fmt("provider creds", f"present ({len(provider_creds)} key(s))")
+    elif agent_claimable:
+        print(
+            "  provider creds  : FAIL — no LLM provider credential found.\n"
+            "                    Set ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,\n"
+            "                    OPENAI_API_KEY, GEMINI_API_KEY, or similar in\n"
+            "                    the environment before claiming agent work.",
+            flush=True,
+        )
     else:
         print(
-            "  provider creds  : NONE — agent tasks WILL fail at claim unless a\n"
-            "                    provider credential (ANTHROPIC_API_KEY,\n"
-            "                    OPENAI_API_KEY, GEMINI_API_KEY, etc.) is set\n"
-            "                    in the environment.",
+            "  provider creds  : NONE (compute-only runner — not required)",
             flush=True,
         )
 
@@ -2558,6 +2567,7 @@ def _preflight(
         (token_valid or token_401)
         and ws_writable
         and (claimable[iso.CLASS_AGENT] or claimable[iso.CLASS_COMPUTE])
+        and (bool(provider_creds) or not agent_claimable)
     )
     return {
         "orchestrator_ok": orchestrator_ok,
