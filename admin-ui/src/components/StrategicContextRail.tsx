@@ -22,9 +22,13 @@ import {
   removeStrategicSelectedRef,
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
+import type { StrategicLiveActivity } from '../utils/strategicSessionLive';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
+import { StrategicActivityStrip } from './StrategicLiveTurn';
 import type { StrategicAccountSpendStatus } from './StrategicSessionControl';
 import { WorkbenchPanel } from './WorkbenchLayout';
+import { computeLayout, VIEWBOX_WIDTH } from './StrategicContextMap';
+import type { StrategicContextCanvasNode, StrategicContextCanvasEdge } from '../strategicStateApi';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
 type TaskFocusBucketKey = 'needs_judgment' | 'active' | 'friction' | 'queued' | 'recent_completed';
@@ -40,6 +44,7 @@ interface StrategicContextRailProps {
   strategistActive?: boolean;
   cycleProgress?: StrategicCycleProgress | null;
   lastCycleCompletion?: StrategicCycleCompletion | null;
+  liveActivity?: StrategicLiveActivity;
   onOpenProjectSection: (section: ProjectTarget) => void;
   onOpenPipeline: () => void;
   onOpenRuntimeHealth: () => void;
@@ -627,12 +632,21 @@ function TaskFocusRow({
   onOpenTask?: (taskId: string) => void;
 }) {
   const detail = taskFocusDetail(item);
+  const stepLabel =
+    item.bucket === 'active' && item.task_type
+      ? item.task_type.replace(/_/g, ' ')
+      : null;
   const content = (
     <>
       <div className="flex min-w-0 items-center justify-between gap-2">
         <span className="truncate text-xs font-semibold text-neutral-200">{item.title || item.id}</span>
         <span className="shrink-0 font-mono text-ui-sm text-neutral-600">{shortId(item.id)}</span>
       </div>
+      {stepLabel && (
+        <p className="mt-0.5 text-xs font-medium text-cyan-400/70 uppercase tracking-wider">
+          {stepLabel}
+        </p>
+      )}
       <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-neutral-500">{detail}</p>
     </>
   );
@@ -690,6 +704,32 @@ function TaskFocusBlock({
   );
 }
 
+function RailMiniCanvas({ canvas }: { canvas: { nodes?: StrategicContextCanvasNode[]; edges?: StrategicContextCanvasEdge[] } }) {
+  const layout = useMemo(() => computeLayout(canvas.nodes ?? [], canvas.edges ?? []), [canvas.nodes, canvas.edges]);
+  if (layout.positionedNodes.length === 0) return null;
+
+  function miniFill(s?: string | null): string {
+    const c = s?.toLowerCase() ?? '';
+    if (/active|running|building|pending/.test(c)) return '#22d3ee';
+    if (/blocked|failed|error|critical/.test(c)) return '#fb7185';
+    if (/done|ready|complete|resolved/.test(c)) return '#34d399';
+    return '#525252';
+  }
+
+  return (
+    <div className="mb-2 overflow-hidden rounded border border-neutral-800 bg-[#080d13]" style={{ maxHeight: 120 }} data-testid="rail-mini-canvas">
+      <svg className="w-full" viewBox={`0 0 ${VIEWBOX_WIDTH} ${layout.height}`} preserveAspectRatio="xMidYMin meet" style={{ pointerEvents: 'none' }} aria-hidden="true">
+        {layout.positionedEdges.map((e, i) => (
+          <path key={i} d={e.path} fill="none" stroke="#3f3f46" strokeWidth="1" />
+        ))}
+        {layout.positionedNodes.map(pn => (
+          <circle key={pn.node.id} cx={pn.x} cy={pn.y} r={5} fill={miniFill(pn.node.status)} />
+        ))}
+      </svg>
+    </div>
+  );
+}
+
 function ContextPackageBlock({
   contextPackage,
   sessionRefs,
@@ -734,6 +774,9 @@ function ContextPackageBlock({
           <p className="mt-1 line-clamp-1 text-xs leading-relaxed text-neutral-400">
             {contextPackage.title}
           </p>
+          {contextPackage.canvas?.nodes?.length ? (
+            <RailMiniCanvas canvas={contextPackage.canvas} />
+          ) : null}
           {summaryItems.length > 0 && (
             <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
               {summaryItems.map(item => <span key={item}>{item}</span>)}
@@ -751,6 +794,19 @@ function ContextPackageBlock({
   );
 }
 
+/** Ephemeral live-activity section at the top of the rail. Self-hides when
+ *  the activity strip has nothing to show (idle or turn finished). */
+function RailLiveActivitySection({ liveActivity }: { liveActivity?: StrategicLiveActivity }) {
+  if (!liveActivity) return null;
+  const { items, latestLifecycle } = liveActivity;
+  if (!items.length || latestLifecycle === 'done') return null;
+  return (
+    <div className="border-b border-neutral-800 pb-3" data-testid="rail-live-activity">
+      <StrategicActivityStrip items={items.slice(-3)} latestLifecycle={latestLifecycle} />
+    </div>
+  );
+}
+
 export const StrategicContextRail = memo(function StrategicContextRail({
   state,
   loading = false,
@@ -758,6 +814,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   strategistActive = false,
   cycleProgress = null,
   lastCycleCompletion = null,
+  liveActivity,
   onOpenProjectSection,
   onOpenPipeline,
   onOpenRuntimeHealth,
@@ -977,6 +1034,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
 
   return (
     <div className="space-y-3" data-testid="strategic-context-rail">
+      <RailLiveActivitySection liveActivity={liveActivity} />
       <WorkbenchPanel title="Strategic" meta={loading ? 'loading' : error ? 'stale' : 'live'}>
         <div className="flex min-w-0 items-start gap-3">
           <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${statusTone}`} aria-hidden="true" />

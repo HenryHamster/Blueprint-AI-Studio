@@ -63,6 +63,7 @@ import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
+import { computeStrategicSessionActivity } from './utils/strategicSessionLive';
 import { buildStrategicContextDescriptor } from './utils/strategicContextDescriptor';
 import { STATUS_OPTIONS } from './constants';
 
@@ -1363,6 +1364,10 @@ export default function App() {
       dailyCostCeilingUsd: s.dailyCostCeilingUsd,
     };
   }, [s.cumulativeCost, s.dailyCostCeilingUsd, s.maxPlanAccounts]);
+  const railLiveActivity = useMemo(
+    () => computeStrategicSessionActivity(s.strategicSessionTranscript, []),
+    [s.strategicSessionTranscript],
+  );
   const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
     void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
   }, [persistStrategicWorkbench]);
@@ -1815,6 +1820,7 @@ export default function App() {
                 strategistActive={s.strategistActive}
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
+                liveActivity={railLiveActivity}
                 onOpenProjectSection={(section) => openStrategicContextTarget({ surface: 'project', section })}
                 onOpenPipeline={() => openStrategicContextTarget({ surface: 'pipeline', section: 'flow' })}
                 onOpenRuntimeHealth={() => openStrategicContextTarget({ surface: 'runtime', section: 'health' })}
