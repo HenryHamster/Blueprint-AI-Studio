@@ -20,6 +20,7 @@ from app.efficiency_snapshot import (
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
     AXIS_PROMPT_STATIC_BYTES,
+    AXIS_REWORK_COST_SHARE,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
     CACHE_CREATION_INPUT_RATE_MULTIPLIER,
@@ -200,6 +201,56 @@ async def test_compute_current_axes_includes_llm_cache_hit_rate(db_session):
     assert AXIS_LLM_CACHE_HIT_RATE in axes
     # 300 cache-read from second task / (1000 + 1000) total input = 0.15
     assert axes[AXIS_LLM_CACHE_HIT_RATE] == 0.15
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_includes_rework_cost_share(db_session):
+    """AXIS_REWORK_COST_SHARE is in ALL_AXES and compute_current_axes returns a float."""
+    # Sanity: the constant must be in ALL_AXES.
+    assert AXIS_REWORK_COST_SHARE in ALL_AXES, (
+        "AXIS_REWORK_COST_SHARE must be registered in ALL_AXES"
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # PR 42 chain: create (first-pass) + fix (rework) with priced LLM tokens.
+    create = _pr_chain_task(
+        project.id,
+        pr_number=42,
+        task_type="create",
+        input_tokens=2000,
+        output_tokens=1000,
+    )
+    fix = _pr_chain_task(
+        project.id,
+        pr_number=42,
+        task_type="fix",
+        input_tokens=1500,
+        output_tokens=800,
+    )
+    db_session.add_all([create, fix])
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert AXIS_REWORK_COST_SHARE in axes, (
+        "compute_current_axes must include AXIS_REWORK_COST_SHARE"
+    )
+
+    value = axes[AXIS_REWORK_COST_SHARE]
+    assert isinstance(value, float), (
+        f"AXIS_REWORK_COST_SHARE must be a float, got {type(value).__name__}: {value!r}"
+    )
+    # Rework share = fix cost / total cost.
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_rw_usd = round(1500 * input_rate + 800 * output_rate, 6)
+    expected_total_usd = round(
+        2000 * input_rate + 1000 * output_rate + expected_rw_usd, 6
+    )
+    expected_share = round(expected_rw_usd / expected_total_usd, 4)
+    assert value == pytest.approx(expected_share, abs=1e-9)
 
 
 @pytest.mark.asyncio

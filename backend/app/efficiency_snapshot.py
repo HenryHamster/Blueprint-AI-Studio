@@ -119,6 +119,7 @@ AXIS_LANE_WARM_RESUME_RATE = "lane_warm_resume_rate"
 AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
 AXIS_PROMPT_STATIC_BYTES = "prompt_static_bytes"
 AXIS_LLM_CACHE_HIT_RATE = "llm_cache_hit_rate"
+AXIS_REWORK_COST_SHARE = "rework_cost_share"
 
 # Guard threshold for prompt_static_bytes: alert when static prompt size exceeds
 # this many source characters. Set well above the current measured value (~31k chars)
@@ -150,6 +151,7 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_CHECKPOINT_LOSS_RATE,
     AXIS_PROMPT_STATIC_BYTES,
     AXIS_LLM_CACHE_HIT_RATE,
+    AXIS_REWORK_COST_SHARE,
 )
 
 # ---------------------------------------------------------------------------
@@ -198,6 +200,9 @@ AXIS_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_LLM_CACHE_HIT_RATE: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_REWORK_COST_SHARE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
 }
@@ -278,7 +283,9 @@ _SNAPSHOT_HISTORY_MAX = 365
 #      constants in agent/src/prompt.ts) as a leading indicator for token budget growth.
 # v11: LLM spend axes became provider-cache-aware and pricing rows were refreshed
 #      for current Opus/Haiku/OpenAI Codex proxy rates.
-METRIC_DEF_VERSION = "v11"
+# v12: rework_cost_share axis added — fraction of total LLM spend consumed by fix/
+#      re-attempt tasks, computed from the existing per-PR chain breakdown.
+METRIC_DEF_VERSION = "v12"
 
 
 async def _load_recent_tasks(
@@ -2524,6 +2531,23 @@ def _compute_llm_cache_hit_rate(tasks: list[Task]) -> float | None:
     return round(total_cache_read / total_input, 4)
 
 
+def _compute_rework_cost_share(tasks: list[Task]) -> float | None:
+    """Fraction of total LLM spend consumed by fix/re-attempt (rework) tasks.
+
+    Delegates to :func:`compute_pr_rework_chain_breakdown` for the per-PR
+    first-pass-vs-rework split and returns the aggregate
+    ``rework_share_of_total_llm_cost``. Returns ``None`` when there are no
+    priced tasks in the window (total LLM cost is zero).
+
+    Rework is a direct cost multiplier — high rework means the same PR
+    consumed 2-3x the tokens it should have. Making it driftable lets the
+    direction drift detector catch cost regressions caused by review-loop
+    inflation, which is orthogonal to routing savings.
+    """
+    breakdown = compute_pr_rework_chain_breakdown(tasks)
+    return breakdown.get("rework_share_of_total_llm_cost")
+
+
 def _compute_prompt_static_bytes() -> int | None:
     """Sum the source character lengths of all static code-change prompt sections.
 
@@ -2666,6 +2690,7 @@ async def compute_current_axes(
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),
         AXIS_PROMPT_STATIC_BYTES: _compute_prompt_static_bytes(),
         AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
+        AXIS_REWORK_COST_SHARE: _compute_rework_cost_share(tasks),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
