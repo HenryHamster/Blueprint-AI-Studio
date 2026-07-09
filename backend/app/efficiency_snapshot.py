@@ -248,6 +248,10 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
         "ground_truth": "Task.context.review_second_opinion.state (challenged_confirmed / challenged_revised / challenged_rejected)",
         "consumer": "efficiency_snapshot.write_snapshot (durable gate ROI signal in daily snapshot)",
     },
+    "effort_model_efficiency": {
+        "ground_truth": "Task.first_payload[effort] + Task.provider + Task.model + Task.context.pr_merged + api_call_summary tokens priced via LLM_TOKEN_PRICING",
+        "consumer": "efficiency_snapshot.write_snapshot → read_baseline_with_drift (persisted by_model efficiency breakdown for DeepSeek vs Anthropic A/B)",
+    },
 }
 
 DESIGN_DOC_KEY = "efficiency_baseline"
@@ -319,7 +323,11 @@ _SNAPSHOT_HISTORY_MAX = 365
 #      drift floor of ≥20 verified merges.
 # v12: rework_cost_share axis added — fraction of total LLM spend consumed by fix/
 #      re-attempt tasks, computed from the existing per-PR chain breakdown.
-METRIC_DEF_VERSION = "v12"
+# v13: effort_model_efficiency block added — per-(provider,model) by_model efficiency
+#      breakdown (verified_landed_rate, cost_per_merge, run counts) persisted from
+#      compute_effort_model_efficiency for retroactive A/B verification of DeepSeek
+#      vs Anthropic routing across daily snapshots.
+METRIC_DEF_VERSION = "v13"
 
 
 async def _load_recent_tasks(
@@ -2763,6 +2771,15 @@ async def compute_current_axes(
         # Anthropic cost ratio + verified-merge-rate delta, persisted in the
         # daily snapshot so the A/B is machine-checkable on the deployed instance.
         "provider_routing_verdict": provider_routing_verdict,
+        # Per-(provider,model) efficiency breakdown from compute_effort_model_efficiency:
+        # by_model rows with verified_landed_rate, cost_per_merge, run counts, and token
+        # volumes, plus aggregate totals. Persisted in the daily snapshot so the DeepSeek
+        # vs Anthropic A/B (direction d-cf39cb40) can be verified retroactively from
+        # persisted history rather than only from the live digest endpoint.
+        "effort_model_efficiency": {
+            "by_model": _effort_model["by_model"],
+            "totals": _effort_model["totals"],
+        },
         # Self-check: reconcile LLM cost telemetry against an independent
         # recomputation path so operators are alerted if the two diverge beyond
         # the declared tolerance. Non-zero tasks with at least one priced attempt
@@ -2823,6 +2840,7 @@ async def write_snapshot(
                 FORMAT_COMPLIANCE_KEY,
                 "llm_cost_attribution",
                 "panel_review_effectiveness",
+                "effort_model_efficiency",
             ):
                 if snapshot.get(_key) is not None:
                     _prov[_key] = {
@@ -2851,6 +2869,7 @@ async def write_snapshot(
                     FORMAT_COMPLIANCE_KEY,
                     "llm_cost_attribution",
                     "panel_review_effectiveness",
+                    "effort_model_efficiency",
                 ]:
                     _bval = baseline.get(_member)
                     if _bval is None:
@@ -2956,6 +2975,15 @@ async def write_snapshot(
                     "panel_review_effectiveness"
                 ]
                 provenance["panel_review_effectiveness"] = {
+                    "seeded_at": captured_at,
+                    "snapshot_captured_at": captured_at,
+                }
+            if (
+                baseline.get("effort_model_efficiency") is None
+                and snapshot.get("effort_model_efficiency") is not None
+            ):
+                baseline["effort_model_efficiency"] = snapshot["effort_model_efficiency"]
+                provenance["effort_model_efficiency"] = {
                     "seeded_at": captured_at,
                     "snapshot_captured_at": captured_at,
                 }
@@ -3368,6 +3396,7 @@ async def read_baseline_with_drift(
             FORMAT_COMPLIANCE_KEY,
             "llm_cost_attribution",
             "panel_review_effectiveness",
+            "effort_model_efficiency",
         ]:
             _bval = baseline.get(_member)
             if _bval is None:
@@ -3690,6 +3719,11 @@ async def read_baseline_with_drift(
         # cost ratio + verified-merge-rate delta, persisted in the daily snapshot and
         # surfaced here from the latest snapshot so the A/B is machine-checkable.
         "provider_routing_verdict": latest.get("provider_routing_verdict"),
+        # Per-(provider,model) efficiency breakdown from the latest snapshot:
+        # by_model rows with verified_landed_rate, cost_per_merge, run counts, and
+        # aggregate totals. Persisted in the daily snapshot for retroactive A/B
+        # verification of DeepSeek vs Anthropic routing across daily snapshots.
+        "effort_model_efficiency": latest.get("effort_model_efficiency"),
         # Recommended sample_rate for the challenger gate, computed on-the-fly from
         # the latest snapshot's panel_review_effectiveness so operators always see a
         # fresh recommendation without waiting for the next daily snapshot write.

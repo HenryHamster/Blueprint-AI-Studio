@@ -11334,4 +11334,114 @@ async def test_seed_routing_verdict_from_snapshot_picks_first_verdict(db_session
         f"unexpected state {state}"
     )
 
-    _rc.pop("provider_routing_verdict_state", None)
+
+@pytest.mark.asyncio
+async def test_write_snapshot_persists_effort_model_efficiency_by_model(db_session):
+    """write_snapshot persists the effort_model_efficiency block (by_model + totals)
+    from compute_effort_model_efficiency, and read_baseline_with_drift surfaces it.
+
+    Creates tasks on two providers (Anthropic Sonnet and DeepSeek V4 Flash),
+    writes a snapshot, and verifies the by_model rows contain the correct
+    per-model fields (run_count, pr_eligible_run_count, verified_landed_count,
+    verified_landed_rate, cost_per_merge, total_cost_usd) and the totals are
+    consistent with the fixture.
+    """
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Sonnet task: merged create, 1 landed out of 1 pr-eligible.
+    sonnet_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "effort": "medium", "pr_number": 1}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 500,
+            "llm_call_count": 8,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # DeepSeek task: also merged create, 1 landed out of 1 pr-eligible.
+    deepseek_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create", "effort": "low", "pr_number": 2}],
+        api_call_summary={
+            "total_input_tokens": 1500,
+            "total_output_tokens": 400,
+            "llm_call_count": 6,
+        },
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+    db_session.add(sonnet_task)
+    db_session.add(deepseek_task)
+    await db_session.commit()
+
+    # --- write_snapshot returns the block ------------------------------------
+    snap = await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    em = snap.get("effort_model_efficiency")
+    assert em is not None, (
+        "effort_model_efficiency must be present in write_snapshot return value"
+    )
+
+    # Top-level keys: by_model + totals
+    by_model = em.get("by_model")
+    totals = em.get("totals")
+    assert isinstance(by_model, list), "by_model must be a list"
+    assert isinstance(totals, dict), "totals must be a dict"
+    assert len(by_model) >= 2, "at least 2 model rows for sonnet + deepseek"
+
+    # Build lookup by (provider, model)
+    by_model_map = {(r["provider"], r["model"]): r for r in by_model}
+
+    # -- Sonnet row assertions ------------------------------------------------
+    sonnet_row = by_model_map.get(("anthropic", "claude-sonnet-4-6"))
+    assert sonnet_row is not None, "claude-sonnet-4-6 must appear in by_model"
+    assert sonnet_row["run_count"] == 1
+    assert sonnet_row["pr_eligible_run_count"] == 1
+    assert sonnet_row["landed_count"] == 1
+    assert sonnet_row["verified_landed_count"] == 1
+    assert sonnet_row["verified_landed_rate"] == 1.0, (
+        "1 verified / 1 pr-eligible = 1.0"
+    )
+    assert sonnet_row["cost_per_merge"] is not None, (
+        "cost_per_merge is not None when verified_landed_count > 0"
+    )
+
+    # -- DeepSeek row assertions ----------------------------------------------
+    ds_row = by_model_map.get(("deepseek", "deepseek-v4-flash"))
+    assert ds_row is not None, "deepseek-v4-flash must appear in by_model"
+    assert ds_row["run_count"] == 1
+    assert ds_row["pr_eligible_run_count"] == 1
+    assert ds_row["landed_count"] == 1
+    assert ds_row["verified_landed_count"] == 1
+    assert ds_row["verified_landed_rate"] == 1.0
+    assert ds_row["cost_per_merge"] is not None
+
+    # -- Totals assertions ----------------------------------------------------
+    assert totals["run_count"] == 2, "total must include both tasks"
+    assert totals["pr_eligible_run_count"] == 2, (
+        "both tasks are PR-eligible create"
+    )
+    assert totals["landed_count"] == 2
+    assert totals["verified_landed_count"] == 2
+    assert totals["landed_rate"] == 1.0  # 2/2
+
+    # -- read_baseline_with_drift surfaces the same block ---------------------
+    drift = await read_baseline_with_drift(db_session, project.id)
+    read_em = drift.get("effort_model_efficiency")
+    assert read_em is not None, (
+        "read_baseline_with_drift must surface effort_model_efficiency"
+    )
+    read_by_model = read_em.get("by_model")
+    assert len(read_by_model) == len(by_model), (
+        "by_model row count must match between write and read"
+    )

@@ -1790,9 +1790,6 @@ async def list_knowledge_documents(
     sweep_id: str | None = Query(
         default=None, description="Exact sweep-id filter (compute_experiment sweeps)"
     ),
-    lifecycle_status: str | None = Query(
-        default=None, description="Filter by lifecycle status: pending, consumed, dismissed"
-    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -1823,7 +1820,6 @@ async def list_knowledge_documents(
         lifecycle_status=lifecycle_status,
         finding_hash=finding_hash,
         sweep_id=sweep_id,
-        lifecycle_status=lifecycle_status,
         limit=limit,
         offset=offset,
     )
