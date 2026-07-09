@@ -464,7 +464,7 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
       try {
         const stemPattern = tsImportStems.length === 1
           ? tsImportStems[0]
-          : `(?:${tsImportStems.join('|')})`;
+          : `(${tsImportStems.join('|')})`;
         const tsImportPattern = `from ['"][^'"]*/${stemPattern}(\\.js|\\.ts|\\.tsx)?['"]`;
         const tsGrepResult = execFileSync('git', ['grep', '-lE', tsImportPattern, '--', '*test*'],
           { cwd: WORKSPACE, encoding: 'utf-8' });
