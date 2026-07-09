@@ -256,7 +256,10 @@ export interface StrategicContextPackageDescriptor {
   } | null;
   resources?: StrategicContextResourceRef[];
   evidence?: {
-    knowledge?: StrategicContextEvidenceCollection<StrategicContextKnowledgeEvidence>;
+    knowledge?: StrategicContextEvidenceCollection<StrategicContextKnowledgeEvidence> & {
+      pending_count?: number;
+      oldest_pending_age_hours?: number | null;
+    };
     artifacts?: StrategicContextEvidenceCollection<StrategicContextArtifactEvidence>;
   } | null;
   descriptors?: StrategicContextRenderableDescriptor[];

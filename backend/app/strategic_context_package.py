@@ -10,6 +10,8 @@ from __future__ import annotations
 import uuid
 from typing import Any, Dict, List
 
+from app.time_utils import _utcnow
+
 from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -639,6 +641,36 @@ async def load_strategic_context_evidence(
             select(func.count()).where(KnowledgeDocument.project_id == project_id)
         )
     ).scalar()
+
+    # Real aggregate count of pending (unaddressed) knowledge documents — not a
+    # slice of the top-N sample, so the dashboard reflects the full backlog.
+    pending_count = (
+        await session.execute(
+            select(func.count()).where(
+                KnowledgeDocument.project_id == project_id,
+                KnowledgeDocument.lifecycle_status == "pending",
+            )
+        )
+    ).scalar()
+
+    # Age of the oldest unaddressed pending document so backlog health is
+    # observable over time (no signal was tracked before).
+    oldest_pending_created_at = (
+        await session.execute(
+            select(KnowledgeDocument.created_at)
+            .where(
+                KnowledgeDocument.project_id == project_id,
+                KnowledgeDocument.lifecycle_status == "pending",
+            )
+            .order_by(KnowledgeDocument.created_at.asc())
+            .limit(1)
+        )
+    ).scalar()
+    oldest_pending_age_hours: float | None = None
+    if oldest_pending_created_at is not None:
+        delta = _utcnow() - oldest_pending_created_at
+        oldest_pending_age_hours = round(delta.total_seconds() / 3600, 1)
+
     knowledge_rows = (
         await session.execute(
             select(KnowledgeDocument)
@@ -718,11 +750,8 @@ async def load_strategic_context_evidence(
     ).all()
 
     knowledge_items = []
-    pending_count = 0
     for doc in knowledge_rows:
         lc_status = doc.lifecycle_status or "pending"
-        if lc_status == "pending":
-            pending_count += 1
         # Only surface pending (unconsumed, undismissed) docs in the evidence
         # section so the strategist sees actionable follow-ups, not already-
         # processed documents.
@@ -795,7 +824,8 @@ async def load_strategic_context_evidence(
     return {
         "knowledge": {
             "total": int(knowledge_total or 0),
-            "pending_count": pending_count,
+            "pending_count": int(pending_count or 0),
+            "oldest_pending_age_hours": oldest_pending_age_hours,
             "items": knowledge_items,
         },
         "artifacts": {
