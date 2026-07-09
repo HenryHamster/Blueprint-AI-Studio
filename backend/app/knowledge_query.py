@@ -13,6 +13,7 @@ the JSON tag list. ``topic`` / ``tag`` apply exact filters. The list shape
 omits the (potentially large) markdown body; only get-by-id returns it.
 """
 
+import logging
 import uuid
 from typing import Any, NamedTuple
 
@@ -21,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import KnowledgeDocument, SourceKind, Task, TaskStatus
+
+logger = logging.getLogger(__name__)
 
 
 COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE = "acceptance"
@@ -253,19 +256,26 @@ async def fetch_knowledge_substance_index(
     whose originating task is CANCELLED but whose substance persists as a durable
     KnowledgeDocument, preventing escalation-parking forever.
     """
-    rows = (
-        await session.execute(
-            select(
-                KnowledgeDocument.topic,
-                Task.context,
-                KnowledgeDocument.source_kind,
-                KnowledgeDocument.source_citations,
-                KnowledgeDocument.forward_quality_verdict,
-            )
-            .join(Task, Task.id == KnowledgeDocument.source_task_id, isouter=True)
-            .where(KnowledgeDocument.project_id == project_id)
+    rows_result = await session.execute(
+        select(
+            KnowledgeDocument.topic,
+            Task.context,
+            KnowledgeDocument.source_kind,
+            KnowledgeDocument.source_citations,
+            KnowledgeDocument.forward_quality_verdict,
         )
-    ).all()
+        .join(Task, Task.id == KnowledgeDocument.source_task_id, isouter=True)
+        .where(KnowledgeDocument.project_id == project_id)
+        .order_by(KnowledgeDocument.created_at.desc())
+        .limit(10000)
+    )
+    rows = rows_result.all()
+    if len(rows) >= 10000:
+        logger.warning(
+            "[KNOWLEDGE] fetch_knowledge_substance_index truncated to 10000 rows "
+            "for project_id=%s — substance index may be incomplete",
+            project_id,
+        )
     result: list[KnowledgeSubstance] = []
     for topic, context, source_kind, source_citations, verdict in rows:
         fh = (context or {}).get("finding_hash") if context is not None else None
@@ -661,8 +671,16 @@ async def fetch_direction_knowledge_index(
             KnowledgeDocument.direction_id.in_(direction_ids),
         )
         .order_by(KnowledgeDocument.direction_id, KnowledgeDocument.created_at.desc())
+        .limit(5000)
     )
     rows = (await session.execute(stmt)).scalars().all()
+    if len(rows) >= 5000:
+        logger.warning(
+            "[KNOWLEDGE] fetch_direction_knowledge_index query truncated "
+            "to 5000 rows for project_id=%s — some directions may have "
+            "incomplete index entries",
+            project_id,
+        )
     by_dir: dict[str, list[dict]] = {}
     counts: dict[str, int] = {}
     for doc in rows:
@@ -818,8 +836,16 @@ async def build_compute_sweep_groups(
         )
         .where(KnowledgeDocument.sweep_id.is_not(None))
         .order_by(KnowledgeDocument.sweep_id, KnowledgeDocument.created_at.desc())
+        .limit(5000)
     )
     all_doc_rows = (await session.execute(docs_stmt)).scalars().all()
+    if len(all_doc_rows) >= 5000:
+        logger.warning(
+            "[KNOWLEDGE] build_compute_sweep_groups doc query truncated "
+            "to 5000 rows for project_id=%s — sweep completeness gate may "
+            "exclude some sweeps",
+            project_id,
+        )
 
     all_sweep_ids: set[str] = set()
     for doc in all_doc_rows:
@@ -840,7 +866,15 @@ async def build_compute_sweep_groups(
         task_stmt = task_stmt.where(
             Task.context["direction_id"].as_string() == direction_id
         )
+    task_stmt = task_stmt.order_by(Task.created_at.desc()).limit(5000)
     tasks = (await session.execute(task_stmt)).scalars().all()
+    if len(tasks) >= 5000:
+        logger.warning(
+            "[KNOWLEDGE] build_compute_sweep_groups task query truncated "
+            "to 5000 rows for project_id=%s — sweep completeness gate may "
+            "exclude tasks from some sweeps",
+            project_id,
+        )
 
     planned: dict[str, dict[str | None, list[Task]]] = {}
     task_to_arm: dict[uuid.UUID, str | None] = {}
@@ -982,14 +1016,22 @@ async def build_compute_sweep_groups(
     # sweep follow-on) when one exists, so the strategist can skip re-synthesizing sweeps
     # that already have a follow-on in progress or completed.
     _sweep_ids = list(complete.keys())
-    _disp_rows = (
-        await session.execute(
-            select(Task).where(
-                Task.project_id == project_id,
-                Task.context["act_on_verdict_sweep_id"].as_string().in_(_sweep_ids),
-            )
+    _disp_stmt = (
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.context["act_on_verdict_sweep_id"].as_string().in_(_sweep_ids),
         )
-    ).scalars().all()
+        .order_by(Task.created_at.desc())
+        .limit(10000)
+    )
+    _disp_rows = (await session.execute(_disp_stmt)).scalars().all()
+    if len(_disp_rows) >= 10000:
+        logger.warning(
+            "[KNOWLEDGE] build_compute_sweep_groups disposition query truncated "
+            "to 10000 rows for project_id=%s — some sweeps may lack "
+            "disposition annotations",
+            project_id,
+        )
     _disposition: dict[str, dict] = {}
     for _t in _disp_rows:
         _sid = (_t.context or {}).get("act_on_verdict_sweep_id")

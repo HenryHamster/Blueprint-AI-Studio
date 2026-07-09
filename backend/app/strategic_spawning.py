@@ -2731,8 +2731,16 @@ async def _build_recent_interventions(
         .options(
             load_only(Task.id, Task.status, Task.context, Task.payloads, raiseload=True)
         )
+        .order_by(Task.created_at.desc())
+        .limit(500)
     )
     active_tasks = list(active_tasks_result.scalars().all())
+    if len(active_tasks) >= 500:
+        logger.warning(
+            "[STRATEGIC] active_tasks truncated to 500 rows for project=%s "
+            "— active_by_direction/active_by_scope metrics may be incomplete",
+            project.id,
+        )
     held_tasks_result = await session.execute(
         select(Task)
         .where(
@@ -2740,8 +2748,16 @@ async def _build_recent_interventions(
             Task.status.in_((TaskStatus.BLOCKED, TaskStatus.PARKED)),
         )
         .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
+        .order_by(Task.created_at.desc())
+        .limit(500)
     )
     held_tasks = list(held_tasks_result.scalars().all())
+    if len(held_tasks) >= 500:
+        logger.warning(
+            "[STRATEGIC] held_tasks truncated to 500 rows for project=%s "
+            "— held_by_direction metrics may be incomplete",
+            project.id,
+        )
 
     # Build direction lookup for text enrichment
     directions_by_id: dict[str, str] = {
@@ -4481,14 +4497,22 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
         TaskStatus.BLOCKED,
         TaskStatus.PARKED,
     }
-    rows = (
-        await session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.status.in_(active_statuses),
-            )
+    rows_result = await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status.in_(active_statuses),
         )
-    ).scalars().all()
+        .order_by(Task.created_at.desc())
+        .limit(100)
+    )
+    rows = list(rows_result.scalars().all())
+    if len(rows) >= 100:
+        logger.warning(
+            "[COMPLIANCE_CAP_BUMP] dedup query truncated to 100 rows "
+            "for project=%s, head_sha=%s — dedup may miss existing tasks",
+            project.id,
+            head_sha,
+        )
     for task in rows:
         context = task.context or {}
         if (
