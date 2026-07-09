@@ -1887,6 +1887,78 @@ export function extractLineCoverage(output: string): number | null {
 }
 
 /**
+ * Extract a diff-aware changed-line coverage percentage from pytest-cov terminal output.
+ *
+ * Parses the per-file coverage table from ``--cov-report=term-missing`` and computes a
+ * weighted average: for each file touched by the PR diff, its coverage percentage is
+ * weighted by the number of changed lines in that file.
+ *
+ * This is an approximation that prefers simplicity over line-level precision — it
+ * assumes coverage within a file is uniformly distributed.  A line-level intersection
+ * with the diff (via ``--cov-report=json``) is a further refinement.
+ *
+ * @param output Raw pytest-cov terminal output containing the per-file table.
+ * @param changedLineCounts Map of repo-relative file path → count of changed/added lines.
+ *   Paths are first tried as-is, then with the first directory component stripped (to
+ *   handle the common case where tests run from a subdirectory like ``backend/``).
+ * @returns The weighted changed-line coverage percentage, or null when no per-file
+ *   coverage data is found or ``changedLineCounts`` is empty.
+ */
+export function extractChangedLineCoverage(
+  output: string,
+  changedLineCounts: Record<string, number>,
+): number | null {
+  if (!output) return null;
+  const changedFiles = Object.keys(changedLineCounts).filter(f => changedLineCounts[f] > 0);
+  if (changedFiles.length === 0) return null;
+
+  // Parse per-file coverage from pytest-cov terminal output.  Format per data line:
+  //   backend/app/foo.py   100    10    90%
+  // Skip the header row (Name), the dashed separator, and the TOTAL summary.
+  const fileCoverage: Record<string, number> = {};
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed === 'Name' || /^(?:-+|TOTAL)/.test(trimmed)) continue;
+    const m = trimmed.match(/^(\S+(?:\/\S+)*)\s+(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)%/);
+    if (m) {
+      const pct = parseFloat(m[4]);
+      if (isFinite(pct)) fileCoverage[m[1]] = pct;
+    }
+  }
+
+  const fileCoverageKeys = Object.keys(fileCoverage);
+  if (fileCoverageKeys.length === 0) return null;
+
+  // Compute weighted average: weight each changed file's coverage by its
+  // changed-line count.  Try the diff path as-is first, then strip the first
+  // directory component (handles tests run from a project subdirectory).
+  let weightedSum = 0;
+  let totalChangedLines = 0;
+  for (const filePath of changedFiles) {
+    const changedCount = changedLineCounts[filePath];
+    // Try the full repo-relative path (e.g. ``backend/app/foo.py``).
+    let covPct: number | null = null;
+    if (filePath in fileCoverage) {
+      covPct = fileCoverage[filePath];
+    } else {
+      // Fallback: strip the first directory (``backend/app/foo.py`` → ``app/foo.py``).
+      const slashIdx = filePath.indexOf('/');
+      const stripped = slashIdx !== -1 ? filePath.slice(slashIdx + 1) : null;
+      if (stripped !== null && stripped in fileCoverage) {
+        covPct = fileCoverage[stripped];
+      }
+    }
+    if (covPct !== null) {
+      weightedSum += covPct * changedCount;
+      totalChangedLines += changedCount;
+    }
+  }
+
+  if (totalChangedLines === 0) return null;
+  return Math.round((weightedSum / totalChangedLines) * 100) / 100;
+}
+
+/**
  * Parse failing test identifiers from test runner output.
  * Returns a Set of stable test IDs (e.g. "path/test_foo.py::test_bar" for pytest,
  * "test description" for vitest) for baseline comparison.

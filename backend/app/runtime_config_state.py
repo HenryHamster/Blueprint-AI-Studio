@@ -75,13 +75,13 @@ runtime_config: Dict = {
     # the panel_review task type (it stays available as a user-launchable
     # advisory workflow); reconciliation records then read ``unchallenged``.
     "review_second_opinion_gate_enabled": True,
-    # Default-off blind multi-reviewer gate for judgment-shaped acceptance
-    # decisions (pillar 2 of independent acceptance verification). When True,
-    # eligible high-stakes decisions spawn N independent blind reviewers
-    # (panel_review with is_blind=True and majority voting) instead of a
-    # single second-opinion review. Ships dark (default False) — no behavioral
-    # change until an operator enables it via PATCH /api/admin/settings.
-    "blind_multi_reviewer_gate_enabled": False,
+    # Default-on blind multi-reviewer gate for judgment-shaped acceptance
+    # decisions (pillar 2 of independent acceptance verification). When True
+    # (default), eligible high-stakes decisions spawn N independent blind
+    # reviewers (panel_review with is_blind=True and majority voting) instead
+    # of a single second-opinion review. Operator can disable via
+    # PATCH /api/admin/settings.
+    "blind_multi_reviewer_gate_enabled": True,
     # Fraction of high-stakes trunk-targeting APPROVEs that spawn a panel_review
     # challenger (0.0 = none, 1.0 = all). Default 1.0 preserves existing behavior.
     # Uses deterministic task-ID-based sampling so operators can safely dial down

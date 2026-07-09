@@ -2185,7 +2185,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                                 ci_loop["test_coverage_result"] = {
                                     "coverage_pct": round(
                                         float(_line_cov), 2
-                                    )
+                                    ),
                                 }
                             else:
                                 _total = _cov.get("total", 0) or 0
@@ -2194,8 +2194,23 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                                     ci_loop["test_coverage_result"] = {
                                         "coverage_pct": round(
                                             (_passed / _total) * 100.0, 2
-                                        )
+                                        ),
+                                        "source": "test_pass_rate",
                                     }
+                            # Diff-aware changed-line coverage: when the
+                            # verify-tests handler has PR diff data available,
+                            # it computes changed_lines_coverage_pct weighted
+                            # per-file over the changed lines.  Store alongside
+                            # coverage_pct so the acceptance gate can prefer it.
+                            _changed = _cov.get("changed_lines_coverage_pct")
+                            if (
+                                isinstance(_changed, (int, float))
+                                and not isinstance(_changed, bool)
+                                and "test_coverage_result" in ci_loop
+                            ):
+                                ci_loop["test_coverage_result"][
+                                    "changed_lines_coverage_pct"
+                                ] = round(float(_changed), 2)
                     # Auto-heal a stale stored test command: when the
                     # verify run discovered the stored command was
                     # stale and ran a real replacement suite, persist

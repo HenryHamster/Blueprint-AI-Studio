@@ -1166,6 +1166,52 @@ def test_coverage_delta_non_numeric_coverage_fails_closed():
     assert verdict.proven is False
 
 
+def test_coverage_delta_proxy_metric_not_proven():
+    """coverage_delta is satisfied but NOT proven when the measurement is a
+    test-pass-rate proxy rather than real line-coverage instrumentation.
+
+    The orchestrator stores ``source: "test_pass_rate"`` in the coverage result
+    when it falls back to (passed/total)*100.  The acceptance gate must recognize
+    this marker and return proven=False even when the threshold is met, because
+    test pass rate is not independently verified line coverage.  A task can still
+    merge (satisfied=True), but never earns a proven-score credit from a proxy
+    measurement on its own.
+    """
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    # Simulate the orchestrator's test-pass-rate proxy: coverage_pct=84.0
+    # (42 passed / 50 total) with the source marker set.
+    task.context[TEST_COVERAGE_RESULT_KEY] = {
+        "coverage_pct": 84.0,
+        "source": "test_pass_rate",
+    }
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True, (
+        "proxy measurement meeting threshold must still be satisfied "
+        "(the task shipped and tests passed)"
+    )
+    assert verdict.proven is False, (
+        "test-pass-rate proxy must NOT be machine-checked proven — "
+        "the measurement is not independently verified line coverage"
+    )
+    assert "proxy" in verdict.reason.lower()
+    assert "not proven" in verdict.reason.lower()
+
+    # Record and verify the recorded verdict also reflects proven=False.
+    record_code_acceptance_verdict(task)
+    stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stamped["satisfied"] is True
+    assert stamped["proven"] is False
+    assert "proxy" in stamped["reason"].lower()
+
+
 def test_coverage_delta_populated_from_verify_tests_artifact():
     """coverage_delta acceptance evidence consumes coverage data that was
     extracted from a MERGE_TEST_RESULT verdict and bridged into task context,
@@ -1446,9 +1492,11 @@ def test_verdict_axis_implication_invariant_over_mix():
             # NEVER proven.
             assert not verdict.proven, label
 
-        # Only a satisfied named_test or visual is ever proven at evaluation time.
+        # Only a satisfied named_test, visual, or coverage_delta (with real line
+        # coverage instrumentation, not the test-pass-rate proxy) is ever proven
+        # at evaluation time.
         if verdict.proven:
-            assert verdict.kind in {"named_test", "visual"}, label
+            assert verdict.kind in {"named_test", "visual", "coverage_delta"}, label
 
         # Now exercise the recorded-verdict predicates the aggregates consume.
         recorded = record_code_acceptance_verdict(task)

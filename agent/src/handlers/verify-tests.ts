@@ -87,7 +87,7 @@ interface VerifyTestsResult {
   // entirely when the counts could not be reliably parsed (extractTestCoverage
   // returned null) and on every detected=false / setup-failure path, so older
   // consumers that ignore it are byte-for-byte unaffected.
-  coverage?: { passed: number; skipped: number; total: number; line_coverage_pct?: number };
+  coverage?: { passed: number; skipped: number; total: number; line_coverage_pct?: number; changed_lines_coverage_pct?: number };
   // Cheap goal-level acceptance probe. Attached on TWO paths:
   //   - the detected=false fall-open paths (no suite / thin / all-skipped) and
   //     the setup-failure path, where it may carry EITHER the operator's declared
@@ -226,11 +226,12 @@ async function runVerifyLoop(
   buildConfig: BuildConfig | undefined,
   runnersOverride?: TestRunner[],
   retryStatusLabel = 'detected suite',
+  changedLineCounts?: Record<string, number>,
 ): Promise<TestFixLoopResult> {
   let loop = await testFixLoop(
     ws, statusRef, model, effort, buildConfig,
     undefined, undefined, undefined,
-    { maxFixAttempts: 0, runnersOverride },
+    { maxFixAttempts: 0, runnersOverride, changedLineCounts },
   );
 
   let setupRetries = 0;
@@ -245,7 +246,7 @@ async function runVerifyLoop(
     loop = await testFixLoop(
       ws, statusRef, model, effort, buildConfig,
       undefined, undefined, undefined,
-      { maxFixAttempts: 0, runnersOverride },
+      { maxFixAttempts: 0, runnersOverride, changedLineCounts },
     );
   }
 
@@ -850,10 +851,11 @@ async function recoverFromStaleCommand(
         status: passed ? 'pass' : 'fail',
         message: passed ? '' : message,
       })),
-      ...(loop.coverage || loop.line_coverage_pct !== undefined ? {
+      ...(loop.coverage || loop.line_coverage_pct !== undefined || loop.changed_lines_coverage_pct !== undefined ? {
         coverage: {
           ...(loop.coverage ? loop.coverage : { passed: 0, skipped: 0, total: 0 }),
           ...(loop.line_coverage_pct !== undefined ? { line_coverage_pct: loop.line_coverage_pct } : {}),
+          ...(loop.changed_lines_coverage_pct !== undefined ? { changed_lines_coverage_pct: loop.changed_lines_coverage_pct } : {}),
         },
       } : {}),
       output: passed ? '' : (loop.failureSummary ?? '').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
@@ -1018,12 +1020,22 @@ export async function handleVerifyTests(
     const activeRunners = filterRunnersByDiff(runners, earlyPrDiff, ws);
     sendLog(ws, `Detected test runner(s): ${activeRunners.map(r => r.label).join(', ')}\n`);
     statusRef.value = 'Running detected test suite...';
+    // Compute changed-line counts from the PR diff for diff-aware coverage
+    // measurement.  Null-safe: without the diff, total-coverage is used.
+    const changedLineCounts = earlyPrDiff
+      ? Object.fromEntries(
+          Object.entries(earlyPrDiff.addedLinesByFile).map(
+            ([f, lines]) => [f, lines.length],
+          ),
+        )
+      : undefined;
     // Single no-fix run: maxFixAttempts 0 means testFixLoop runs each runner
     // once and returns a verdict without ever invoking Claude to repair code.
     const loop = await runVerifyLoop(
       ws, statusRef, model, effort, buildConfig,
       activeRunners,
       'detected suite',
+      changedLineCounts,
     );
 
     if (loop.setupFailed || loop.partialSetupFailed) {
@@ -1101,10 +1113,11 @@ export async function handleVerifyTests(
         // On the passed branch output is intentionally discarded; coverage was
         // parsed from the raw runner output inside the loop BEFORE it was
         // dropped, so the partial-skip signal survives. Omitted when null.
-        ...(loop.coverage || loop.line_coverage_pct !== undefined ? {
+        ...(loop.coverage || loop.line_coverage_pct !== undefined || loop.changed_lines_coverage_pct !== undefined ? {
           coverage: {
             ...(loop.coverage ? loop.coverage : { passed: 0, skipped: 0, total: 0 }),
             ...(loop.line_coverage_pct !== undefined ? { line_coverage_pct: loop.line_coverage_pct } : {}),
+            ...(loop.changed_lines_coverage_pct !== undefined ? { changed_lines_coverage_pct: loop.changed_lines_coverage_pct } : {}),
           },
         } : {}),
         output: passed ? '' : (loop.failureSummary ?? '').slice(-VERIFY_TESTS_OUTPUT_LIMIT),

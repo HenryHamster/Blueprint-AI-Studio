@@ -604,7 +604,7 @@ async def get_settings(
             _runtime_config.get("review_second_opinion_gate_enabled", True)
         ),
         "blind_multi_reviewer_gate_enabled": bool(
-            _runtime_config.get("blind_multi_reviewer_gate_enabled", False)
+            _runtime_config.get("blind_multi_reviewer_gate_enabled", True)
         ),
         "review_second_opinion_sample_rate": float(
             _runtime_config.get("review_second_opinion_sample_rate", 1.0)

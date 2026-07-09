@@ -8697,6 +8697,17 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_blind_multi_reviewer_enabled_by_default(self, client: AsyncClient):
+        """blind_multi_reviewer_gate_enabled defaults to True for trunk
+        merges, independent of any PATCH mutation — the blind multi-reviewer
+        system (N=3 independent reviewers, 2/3 majority, zero visibility into
+        each other's findings or the primary verdict) is the default gate mode
+        for judgment-shaped acceptance decisions (direction
+        independent-acceptance-verification pillar 2)."""
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["blind_multi_reviewer_gate_enabled"] is True
+
+    @pytest.mark.asyncio
     async def test_patch_blind_multi_reviewer_gate_enabled(self, client: AsyncClient):
         """blind_multi_reviewer_gate_enabled accepts booleans, rejects
         non-booleans, and round-trips on GET (operator enablement for the
