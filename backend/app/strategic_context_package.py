@@ -651,6 +651,7 @@ async def load_strategic_context_evidence(
                     KnowledgeDocument.topic,
                     KnowledgeDocument.direction_id,
                     KnowledgeDocument.source_task_id,
+                    KnowledgeDocument.lifecycle_status,
                     KnowledgeDocument.created_at,
                     KnowledgeDocument.updated_at,
                     raiseload=True,

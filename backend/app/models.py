@@ -3631,6 +3631,29 @@ class KnowledgeDocument(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
+    # Lifecycle tracking for the strategist follow-up workflow.
+    # New documents start as "pending"; the strategist can mark them
+    # "consumed" (read + acted on) or "dismissed" (not actionable).
+    lifecycle_status: str = Field(
+        default="pending",
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=text("'pending'"),
+        ),
+    )
+    consumed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    dismissed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    dismissed_reason: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -3670,6 +3693,7 @@ class KnowledgeDocument(SQLModel, table=True):
         Index("ix_knowledge_document_origin_finding_hash", "origin_finding_hash"),
         Index("ix_knowledge_document_sweep_id", "sweep_id"),
         Index("ix_knowledge_document_project_direction", "project_id", "direction_id"),
+        Index("ix_knowledge_document_lifecycle_status", "lifecycle_status"),
     )
 
 

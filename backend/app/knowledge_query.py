@@ -337,6 +337,10 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "sweep_id": doc.sweep_id,
         "arm_label": doc.arm_label,
         "origin_provenance": serialize_origin_provenance(doc),
+        "lifecycle_status": doc.lifecycle_status,
+        "consumed_at": doc.consumed_at.isoformat() if doc.consumed_at else None,
+        "dismissed_at": doc.dismissed_at.isoformat() if doc.dismissed_at else None,
+        "dismissed_reason": doc.dismissed_reason,
     }
     if include_body:
         out["body"] = doc.body
@@ -552,6 +556,7 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         "criterion": verdict.get("criterion") if is_compute else None,
         "per_arm_verdicts": verdict.get("per_arm_verdicts") if is_compute else None,
         "origin_provenance": serialize_origin_provenance(doc),
+        "lifecycle_status": doc.lifecycle_status,
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
     }
 
