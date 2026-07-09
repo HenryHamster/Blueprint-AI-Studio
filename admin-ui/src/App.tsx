@@ -11,6 +11,8 @@ import { matchesTaskTypeFilter, resolveTaskCapabilities, TaskCapabilitiesProvide
 import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
 const ResearchBrowser = lazy(() => import('./components/ResearchBrowser').then(m => ({ default: m.ResearchBrowser })));
 const KnowledgeBrowser = lazy(() => import('./components/KnowledgeBrowser').then(m => ({ default: m.KnowledgeBrowser })));
+const NewTaskModal = lazy(() => import('./components/NewTaskModal').then(m => ({ default: m.NewTaskModal })));
+const NewProjectModal = lazy(() => import('./components/NewProjectModal').then(m => ({ default: m.NewProjectModal })));
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask } from './api/tasks';
 import { apiFetch, API_BASE_URL } from './api/core';
@@ -20,8 +22,6 @@ import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { AlertsPopover } from './components/AlertsPopover';
 import { FleetDetailDrawer } from './components/FleetDetailDrawer';
-import { NewTaskModal } from './components/NewTaskModal';
-import { NewProjectModal } from './components/NewProjectModal';
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
@@ -35,10 +35,10 @@ import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERM
 import { Pagination } from './components/Pagination';
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
-import ActivityFeed from './components/ActivityFeed';
 const MessagesPanel = lazy(() => import('./components/MessagesPanel').then(m => ({ default: m.MessagesPanel })));
+const ActivityFeed = lazy(() => import('./components/ActivityFeed'));
+const StrategicContextWorkspace = lazy(() => import('./components/StrategicContextWorkspace').then(m => ({ default: m.StrategicContextWorkspace })));
 import { StrategicContextRail } from './components/StrategicContextRail';
-import { StrategicContextWorkspace } from './components/StrategicContextWorkspace';
 import { StrategicSessionControl, type StrategicAccountSpendStatus, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
 import { KeyboardShortcutsOverlay } from './components/KeyboardShortcutsOverlay';
@@ -1670,6 +1670,7 @@ export default function App() {
       />
       <CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} />
       <KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} />
+      <Suspense fallback={null}>
       <StrategicContextWorkspace
         open={strategicContextWorkspaceOpen}
         state={strategicReadModel.data ?? null}
@@ -1695,6 +1696,7 @@ export default function App() {
         onOpenSpend={openRuntimeAnalytics}
         onUpdateSessionRefs={updateStrategicSessionRefs}
       />
+      </Suspense>
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
         return (
@@ -2094,6 +2096,7 @@ export default function App() {
       />
 
       {s.showNewTaskModal && (
+        <Suspense fallback={null}>
         <NewTaskModal
           newTaskRepo={s.newTaskRepo}
           newTaskBranch={s.newTaskBranch}
@@ -2145,9 +2148,11 @@ export default function App() {
           onSubmit={s.handleCreateTask}
           onClose={() => s.setShowNewTaskModal(false)}
         />
+        </Suspense>
       )}
 
       {(showNewProjectModal || setupProjectId) && (
+        <Suspense fallback={null}>
         <NewProjectModal
           onClose={() => { setShowNewProjectModal(false); setSetupProjectId(null); }}
           onSuccess={() => {
@@ -2156,6 +2161,7 @@ export default function App() {
           }}
           setupProject={setupProject}
         />
+        </Suspense>
       )}
 
       {showProjectManagement && (
@@ -2258,6 +2264,7 @@ export default function App() {
       )}
 
       {showActivityFeed && (
+        <Suspense fallback={null}>
         <ActivityFeed
           selectedProjectId={s.selectedProjectId}
           refreshInterval={s.refreshInterval}
@@ -2268,6 +2275,7 @@ export default function App() {
           onClose={() => setShowActivityFeed(false)}
           lastVisitTimestamp={s.lastVisitTimestamp}
         />
+        </Suspense>
       )}
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
