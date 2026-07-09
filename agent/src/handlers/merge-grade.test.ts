@@ -101,7 +101,7 @@ import {
 } from '../index.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
-import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
+import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess, getLlmTelemetry, resetLlmTelemetry } from '../telemetry.js';
 
 // ── Shared test helpers ──────────────────────────────────────────────────────
 const TASK_ID = 'task-grade-1';
@@ -459,5 +459,21 @@ describe('handleReleaseMergeGrade — pinned candidate + diff-range pre-flight',
   it('reads the live release_merge_grade artifact basename', async () => {
     await handleReleaseMergeGrade(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expectCalledWith(readHandlerOutput, TASK_ID, 'release_merge_grade', WS);
+  });
+
+  it('records prompt size telemetry before calling runClaudeCode', async () => {
+    resetLlmTelemetry();
+
+    await handleReleaseMergeGrade(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(telemetry.prompt_section_sizes).not.toBeNull();
+    expect((telemetry.prompt_section_sizes ?? []).length).toBeGreaterThan(0);
+    for (const s of (telemetry.prompt_section_sizes ?? [])) {
+      expect(s.bytes).toBeGreaterThan(0);
+      expect(typeof s.name).toBe('string');
+    }
   });
 });

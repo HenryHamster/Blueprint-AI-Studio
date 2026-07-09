@@ -61,7 +61,7 @@ import {
 } from '../prompts/review-prompt.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { downloadViewportShots } from '../utils/viewport-shot-download.js';
-import { recordViewportScreenshotDownload } from '../telemetry.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry, recordViewportScreenshotDownload } from '../telemetry.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
 
 export const PANEL_REVIEW_LENSES = [
@@ -642,6 +642,14 @@ export async function handlePanelReview(
       fetchGuidance: panelFetchGuidance,
     });
 
+    const parentPanelTelemetry = buildPromptSizeTelemetry(parentPrompt, [
+      ['claude_md', claudeMdPrefix],
+      ['playbook', playbookSection],
+      ['project_context', projectContextSection],
+      ['core_prompt', parentPrompt],
+    ]);
+    setPromptSizeTelemetry(parentPanelTelemetry.prompt_size_bytes, parentPanelTelemetry.prompt_section_count, parentPanelTelemetry.prompt_section_sizes);
+
     const { exitCode, allOutput, lastResultText } = await runClaudeCode(
       parentPrompt,
       ws,
@@ -720,6 +728,14 @@ export async function handlePanelReview(
         playbookSection,
         claudeMdPrefix,
       });
+
+      const lensTelemetry = buildPromptSizeTelemetry(lensPrompt, [
+        ['claude_md', claudeMdPrefix],
+        ['playbook', playbookSection],
+        ['project_context', projectContextSection],
+        ['core_prompt', lensPrompt],
+      ]);
+      setPromptSizeTelemetry(lensTelemetry.prompt_size_bytes, lensTelemetry.prompt_section_count, lensTelemetry.prompt_section_sizes);
 
       const { exitCode, allOutput, lastResultText } = await runClaudeCode(
         lensPrompt,

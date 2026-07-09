@@ -40,6 +40,7 @@ import {
 } from './strategic-helpers.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 
 // Read the read-only mid-run helper guidance for an audit handler. project_id is
 // set for all task types by the backend; when it is absent we provision NOTHING
@@ -340,7 +341,24 @@ Rules:
   setCurrentPromptFingerprint(secFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: secFingerprint });
   const secParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + secParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${secFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const secFinalPrompt = securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + secParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${secFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const secPromptTelemetry = buildPromptSizeTelemetry(secFinalPrompt, [
+    ['claude_md', codebaseSummary],
+    ['playbook', secPlaybookSection],
+    ['retry_context', secRetryContext],
+    ['context', contextPrefix],
+    ['file_tree', fileTreeSection],
+    ['audit_scope', auditScopeSection],
+    ['core_prompt', securityPrompt],
+    ['type_hint', secTypeHint],
+    ['first_task', secFirstTaskSection],
+    ['prompt_suffix', securityPromptSuffix],
+    ['parallel_guidance', secParallelGuidance],
+    ['playbook_guidance', PLAYBOOK_GUIDANCE],
+    ['fetch_tool', `${secFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`],
+  ]);
+  setPromptSizeTelemetry(secPromptTelemetry.prompt_size_bytes, secPromptTelemetry.prompt_section_count, secPromptTelemetry.prompt_section_sizes);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(secFinalPrompt, ws, statusRef, model, effort, disallowedTools);
 
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
@@ -497,7 +515,25 @@ Rules:
   setCurrentPromptFingerprint(selfAuditFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: selfAuditFingerprint });
   const selfAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + selfAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${selfAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const selfAuditFinalPrompt = selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + selfAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${selfAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const selfAuditTelemetry = buildPromptSizeTelemetry(selfAuditFinalPrompt, [
+    ['claude_md', codebaseSummary],
+    ['playbook', playbookSection],
+    ['retry_context', retryContext],
+    ['context', contextPrefix],
+    ['file_tree', fileTreeSection],
+    ['drift', driftSection],
+    ['focus', focusSection],
+    ['core_prompt', selfAuditPrompt],
+    ['type_hint', typeHint],
+    ['first_task', firstTaskSection],
+    ['prompt_suffix', promptSuffix],
+    ['parallel_guidance', selfAuditParallelGuidance],
+    ['playbook_guidance', PLAYBOOK_GUIDANCE],
+    ['fetch_tool', `${selfAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`],
+  ]);
+  setPromptSizeTelemetry(selfAuditTelemetry.prompt_size_bytes, selfAuditTelemetry.prompt_section_count, selfAuditTelemetry.prompt_section_sizes);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditFinalPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Parse findings: prefer structured file output, then a {findings:[...]} object
   // anywhere in the output, then a bare array of findings (wrapped on our side).
@@ -897,10 +933,23 @@ Rules:
   setCurrentPromptFingerprint(releaseAuditFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: releaseAuditFingerprint });
   const releaseAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + releaseAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${releaseAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
-    ws, statusRef, model, effort, disallowedTools,
-  );
+  const releaseAuditFinalPrompt = releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + releaseAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${releaseAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const releaseAuditTelemetry = buildPromptSizeTelemetry(releaseAuditFinalPrompt, [
+    ['claude_md', codebaseSummary],
+    ['playbook', playbookSection],
+    ['retry_context', retryContext],
+    ['context', contextPrefix],
+    ['file_tree', fileTreeSection],
+    ['core_prompt', releaseAuditPrompt],
+    ['type_hint', typeHint],
+    ['first_task', firstTaskSection],
+    ['prompt_suffix', promptSuffix],
+    ['parallel_guidance', releaseAuditParallelGuidance],
+    ['playbook_guidance', PLAYBOOK_GUIDANCE],
+    ['fetch_tool', `${releaseAuditFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`],
+  ]);
+  setPromptSizeTelemetry(releaseAuditTelemetry.prompt_size_bytes, releaseAuditTelemetry.prompt_section_count, releaseAuditTelemetry.prompt_section_sizes);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(releaseAuditFinalPrompt, ws, statusRef, model, effort, disallowedTools);
 
   const handlerOutput = readHandlerOutput(taskId, 'release_audit_report', ws) as {
     audit_score?: number;

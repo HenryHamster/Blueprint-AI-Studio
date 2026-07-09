@@ -12,6 +12,7 @@ import {
   computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { repairStructuredOutput, type ParsedValueValidationResult } from './structured-output-repair.js';
 import {
   resolveCandidateSha, provisionAuditFetchHelpers, designDocAdvertisement,
@@ -368,10 +369,21 @@ Rules:
   const mergeGradeFingerprint = computePromptFingerprint('release_merge_grade', buildConfig);
   setCurrentPromptFingerprint(mergeGradeFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: mergeGradeFingerprint });
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-    mergeGradePrompt + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${mergeGradeFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`,
-    ws, statusRef, model, effort, disallowedTools,
-  );
+  const mergeGradeFinalPrompt = mergeGradePrompt + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${mergeGradeFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const mergeGradeTelemetry = buildPromptSizeTelemetry(mergeGradeFinalPrompt, [
+    ['claude_md', codebaseSummary],
+    ['playbook', playbookSection],
+    ['retry_context', retryContext],
+    ['context', contextPrefix],
+    ['file_tree', fileTreeSection],
+    ['core_prompt', mergeGradePrompt],
+    ['first_task', firstTaskSection],
+    ['prompt_suffix', promptSuffix],
+    ['playbook_guidance', PLAYBOOK_GUIDANCE],
+    ['fetch_tool', `${mergeGradeFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`],
+  ]);
+  setPromptSizeTelemetry(mergeGradeTelemetry.prompt_size_bytes, mergeGradeTelemetry.prompt_section_count, mergeGradeTelemetry.prompt_section_sizes);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(mergeGradeFinalPrompt, ws, statusRef, model, effort, disallowedTools);
 
   const handlerOutput = readHandlerOutput(taskId, 'release_merge_grade', ws);
 
