@@ -20,6 +20,7 @@ from sqlmodel import select
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     CRITERION_OPS,
+    TEST_COVERAGE_RESULT_KEY,
     acceptance_blocks_success,
     acceptance_is_proven,
     acceptance_counts_as_verified_context,
@@ -33,10 +34,12 @@ from app.acceptance_gate import (
     record_artifact_consumptions_for_task,
     record_code_acceptance_verdict,
     summarize_version_acceptance_aggregate,
+    _evaluate_coverage_delta,
 )
 from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
 from app.models import Artifact, ArtifactConsumption, ArtifactType, Task, TaskStatus
+from app.payload_schemas import AcceptanceEvidence
 from testing.factories import make_project
 
 
@@ -1074,6 +1077,94 @@ def test_failed_named_test_is_declared_but_not_proven():
     assert acceptance_blocks_success(stamped) is True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# coverage_delta — test-coverage based acceptance gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_coverage_delta_meets_threshold_passes_and_is_proven():
+    """coverage_delta passes when the coverage result meets or exceeds threshold."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": 85.0}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "achieved" in verdict.reason
+
+
+def test_coverage_delta_below_threshold_fails_closed():
+    """coverage_delta fails when coverage is below the declared threshold."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": 45.0}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "coverage <" in verdict.reason or "below" in verdict.reason
+
+
+def test_coverage_delta_missing_result_fails_closed():
+    """coverage_delta fails when no coverage result is stored in context."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py"],
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "no result" in verdict.reason.lower()
+
+
+def test_coverage_delta_missing_threshold_fails_closed():
+    """coverage_delta fails when no threshold is provided in the declaration.
+
+    The schema-layer validator on AcceptanceEvidence rejects missing threshold
+    before ``evaluate_code_acceptance`` is reached, so this test validates the
+    gate-level ``_evaluate_coverage_delta`` function directly (bypassing the
+    schema validator via ``model_construct``) to confirm the fail-closed guard
+    still fires if a malformed declaration ever reached it.
+    """
+    evidence = AcceptanceEvidence.model_construct(kind="coverage_delta")
+    verdict = _evaluate_coverage_delta(evidence, context={})
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+
+
+def test_coverage_delta_non_numeric_coverage_fails_closed():
+    """coverage_delta fails when coverage_pct is not a number."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py"],
+    )
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": "high"}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+
+
 def test_acceptance_was_declared_and_is_proven_contract():
     # Undeclared / legacy / garbage rows are never declared and never proven.
     for bad in (None, "garbage", 123, []):
@@ -1165,6 +1256,23 @@ _VERDICT_MIX = [
         True,
     ),
     (
+        "coverage_delta_proven",
+        {
+            "acceptance_evidence": {
+                "kind": "coverage_delta",
+                "threshold": 80,
+            },
+            "changed_files": [
+                "backend/app/widget.py",
+                "backend/testing/test_widget.py",
+            ],
+            "unverified_reason": None,
+        },
+        True,
+        True,
+        True,
+    ),
+    (
         "declared_unsatisfied_named_test_missing",
         {
             "acceptance_evidence": {
@@ -1233,6 +1341,8 @@ def test_verdict_axis_implication_invariant_over_mix():
                 "gs://bucket/viewport-failures/"
                 f"{task.project_id}/MetricsDashboard-1280.png"
             )
+        if label == "coverage_delta_proven":
+            task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": 85.0}
         verdict = evaluate_code_acceptance(task)
 
         # The verdict matches the expected per-axis outcome for this kind.
@@ -1479,7 +1589,7 @@ def test_invariant_all_valid_kinds_covered():
     assert vis.kind == "visual"
 
     # Verify the four kinds are the closed set by checking the schema.
-    # (This documents that if AcceptanceEvidence.kind ever adds a fourth kind,
+    # (This documents that if AcceptanceEvidence.kind ever adds a new kind,
     # this test's assertion will need updating, triggering a review of whether
     # the evaluation logic covers the new kind.)
     import typing
@@ -1493,6 +1603,7 @@ def test_invariant_all_valid_kinds_covered():
             "observable_behavior",
             "downstream_artifact",
             "visual",
+            "coverage_delta",
         }
 
 

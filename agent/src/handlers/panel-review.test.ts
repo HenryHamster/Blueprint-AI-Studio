@@ -128,7 +128,7 @@ import {
   runClaudeCode,
 } from '../index.js';
 import { recordFormatMiss, getLlmTelemetry, resetLlmTelemetry } from '../telemetry.js';
-import { handlePanelReview, PANEL_REVIEW_LENSES } from './panel-review.js';
+import { handlePanelReview, PANEL_REVIEW_LENSES, synthesizeBlindReviewVerdict } from './panel-review.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 const PAYLOAD = {
@@ -647,5 +647,85 @@ describe('handlePanelReview — prompt size telemetry', () => {
     // At least the core_prompt section must be non-empty.
     const nonEmpty = (telemetry.prompt_section_sizes ?? []).filter(s => s.bytes > 0);
     expect(nonEmpty.length).toBeGreaterThan(0);
+  });
+});
+
+describe('synthesizeBlindReviewVerdict', () => {
+  it('returns APPROVE when 2/3 reviewers approve (majority threshold)', () => {
+    const result = synthesizeBlindReviewVerdict(
+      {
+        blind_reviewer_1: { verdict: 'APPROVE', summary: 'LGTM', issues: [] },
+        blind_reviewer_2: { verdict: 'APPROVE', summary: 'Looks good', issues: [] },
+        blind_reviewer_3: { verdict: 'REQUEST_CHANGES', summary: 'Minor nit', issues: [{ description: 'Fix the comment', severity: 'minor', file: 'a.ts', line: 5 }] },
+      },
+      ['a.ts', 'b.ts'],
+    );
+    expect(result.overall_verdict).toBe('APPROVE');
+    expect(result.investigated_files).toEqual(['a.ts', 'b.ts']);
+    expect(result.summary).toContain('Reviewer 1 [APPROVE]');
+    expect(result.summary).toContain('Reviewer 2 [APPROVE]');
+    expect(result.summary).toContain('Reviewer 3 [REQUEST_CHANGES]');
+    expect(result.summary).toContain('2/3');
+    expect(result.issues).toHaveLength(1);
+    expect(result.issues[0].description).toBe('Fix the comment');
+  });
+
+  it('returns REQUEST_CHANGES when only 1/3 approve (below majority threshold)', () => {
+
+    const result = synthesizeBlindReviewVerdict(
+      {
+        blind_reviewer_1: { verdict: 'APPROVE', summary: 'Looks OK', issues: [] },
+        blind_reviewer_2: { verdict: 'REQUEST_CHANGES', summary: 'Bug found', issues: [{ description: 'Off-by-one error', severity: 'major', file: 'b.ts', line: 42 }] },
+        blind_reviewer_3: { verdict: 'REQUEST_CHANGES', summary: 'Needs rework', issues: [{ description: 'Missing error handling', severity: 'major', file: 'c.ts', line: 10 }] },
+      },
+      ['b.ts', 'c.ts'],
+    );
+    expect(result.overall_verdict).toBe('REQUEST_CHANGES');
+    expect(result.issues).toHaveLength(2);
+  });
+
+  it('handles empty reviewer set gracefully', () => {
+
+    const result = synthesizeBlindReviewVerdict({}, []);
+    // With 0 reviewers: ceil(0 * 2/3) = 0 threshold, 0 >= 0 → APPROVE (vacuous majority).
+    expect(result.overall_verdict).toBe('APPROVE');
+    expect(result.issues).toEqual([]);
+    expect(result.investigated_files).toEqual([]);
+  });
+
+  it('returns APPROVE when 1/1 reviewer approves', () => {
+
+    const result = synthesizeBlindReviewVerdict(
+      {
+        blind_reviewer_1: { verdict: 'APPROVE', summary: 'Ship it', issues: [] },
+      },
+      ['a.ts'],
+    );
+    expect(result.overall_verdict).toBe('APPROVE');
+    expect(result.summary).toContain('1/1');
+  });
+
+  it('deduplicates issues with same description across reviewers', () => {
+
+    const result = synthesizeBlindReviewVerdict(
+      {
+        blind_reviewer_1: { verdict: 'REQUEST_CHANGES', summary: 'Bug', issues: [{ description: 'Null pointer risk', severity: 'critical', file: 'd.ts', line: 1 }] },
+        blind_reviewer_2: { verdict: 'REQUEST_CHANGES', summary: 'Same bug', issues: [{ description: 'Null pointer risk', severity: 'critical', file: 'd.ts', line: 1 }] },
+      },
+      ['d.ts'],
+    );
+    expect(result.issues).toHaveLength(1);
+    expect(result.issues[0].description).toBe('Null pointer risk');
+  });
+
+  it('caps investigated_files at 50', () => {
+    const manyFiles = Array.from({ length: 100 }, (_, i) => `file-${i}.ts`);
+    const result = synthesizeBlindReviewVerdict(
+      {
+        blind_reviewer_1: { verdict: 'APPROVE', summary: 'ok', issues: [] },
+      },
+      manyFiles,
+    );
+    expect(result.investigated_files).toHaveLength(50);
   });
 });

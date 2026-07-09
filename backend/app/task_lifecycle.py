@@ -958,6 +958,7 @@ async def _resolve_review_second_opinion(
     unparseable, do NOT merge or spawn.
     """
     from app.task_evaluators import (
+        BLIND_REVIEW_SOURCE_KEY,
         REVIEW_SECOND_OPINION_SOURCE_KEY,
         REVIEW_SECOND_OPINION_AWAITING_KEY,
         REVIEW_SECOND_OPINION_PARKED_KEY,
@@ -1177,6 +1178,11 @@ async def _resolve_review_second_opinion(
         record = reconcile_review_second_opinion(primary_verdict, primary_issues, panel)
         record["challenger_task_id"] = str(challenger.id)
         record["review_task_id"] = str(review.id)
+        # Distinguish blind multi-reviewer from single second-opinion challenger
+        # so the reconciliation record is self-describing for telemetry.
+        record["is_blind"] = bool(
+            (challenger.context or {}).get(BLIND_REVIEW_SOURCE_KEY)
+        )
 
         ctx = dict(review.context or {})
         ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = record
@@ -1215,8 +1221,10 @@ async def _resolve_review_second_opinion(
             }
         ),
     )
+    _blind = " blind" if record.get("is_blind") else ""
     logger.info(
-        "[REVIEW SECOND-OPINION] Challenge %s for review %s reconciled as %s (%s → %s); re-dispatching review",
+        "[REVIEW SECOND-OPINION]%s Challenge %s for review %s reconciled as %s (%s → %s); re-dispatching review",
+        _blind,
         challenger.id,
         review.id,
         record["state"],
@@ -3094,6 +3102,7 @@ async def _process_post_commit(
                 )
                 from app.task_evaluators import (
                     review_is_high_stakes,
+                    spawn_blind_multi_reviewer,
                     spawn_review_second_opinion,
                 )
                 from app.review_heuristics import (
@@ -3220,19 +3229,39 @@ async def _process_post_commit(
                             }
                             session.add(task)
                         else:
-                            _challenger = await spawn_review_second_opinion(
-                                task,
-                                session,
-                                verdict=verdict,
-                                issues=issues,
-                                feedback=feedback,
-                                pr_number=pr_number,
-                                branch=branch,
-                                base_branch=base_branch,
-                                original_task_id=original_task_id,
-                                original_prompt=original_prompt,
-                                investigated_files=investigated_files,
+                            _use_blind = bool(
+                                _runtime_config.get(
+                                    "blind_multi_reviewer_gate_enabled", False
+                                )
                             )
+                            if _use_blind:
+                                _challenger = await spawn_blind_multi_reviewer(
+                                    task,
+                                    session,
+                                    verdict=verdict,
+                                    issues=issues,
+                                    feedback=feedback,
+                                    pr_number=pr_number,
+                                    branch=branch,
+                                    base_branch=base_branch,
+                                    original_task_id=original_task_id,
+                                    original_prompt=original_prompt,
+                                    investigated_files=investigated_files,
+                                )
+                            else:
+                                _challenger = await spawn_review_second_opinion(
+                                    task,
+                                    session,
+                                    verdict=verdict,
+                                    issues=issues,
+                                    feedback=feedback,
+                                    pr_number=pr_number,
+                                    branch=branch,
+                                    base_branch=base_branch,
+                                    original_task_id=original_task_id,
+                                    original_prompt=original_prompt,
+                                    investigated_files=investigated_files,
+                                )
                             if _challenger is not None:
                                 logger.info(
                                     "[REVIEW PIPELINE] PR #%s: parked review %s "

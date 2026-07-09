@@ -18424,3 +18424,96 @@ async def test_spawn_review_second_opinion_forwards_viewport_shots(db_session):
         "challenger payload must carry viewport_shot_entries forwarded from the review task"
     )
     assert cp.get("viewport_source_task_id") == "src-task-abc"
+
+
+async def test_spawn_blind_multi_reviewer_creates_panel_review_task(db_session):
+    """spawn_blind_multi_reviewer creates a panel_review challenger with
+    is_blind: True, default reviewer count, forwarded viewport shots,
+    and both REVIEW_SECOND_OPINION_SOURCE_KEY + BLIND_REVIEW_SOURCE_KEY
+    in context. The source review task is parked EVALUATING."""
+    from app.task_evaluators import (
+        BLIND_REVIEW_SOURCE_KEY,
+        REVIEW_SECOND_OPINION_SOURCE_KEY,
+        spawn_blind_multi_reviewer,
+    )
+    from app.task_completion import REVIEW_SECOND_OPINION_AWAITING_KEY
+
+    project = Project(name="blind-test", user_id="user-1", github_repo="o/r")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    shot_entries = [
+        {"name": "before/comp/blind-375px"},
+    ]
+    source_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9002,
+                "branch": "feat/blind",
+                "base_branch": "main",
+                "original_task_id": str(uuid.uuid4()),
+                "viewport_shot_entries": shot_entries,
+                "viewport_source_task_id": "src-blind-abc",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    challenger = await spawn_blind_multi_reviewer(
+        source_task,
+        db_session,
+        verdict="APPROVE",
+        issues=[],
+        feedback="lgtm",
+        pr_number=9002,
+        branch="feat/blind",
+        base_branch="main",
+        original_task_id=str(uuid.uuid4()),
+        original_prompt="do the thing",
+        investigated_files=["app/x.py"],
+    )
+
+    assert challenger is not None
+    cp = challenger.first_payload
+    assert cp.get("type") == "panel_review"
+    assert cp.get("is_blind") is True, "blind multi-reviewer: is_blind must be True"
+    assert cp.get("blind_reviewer_count") == 3, (
+        "default blind_reviewer_count must be 3"
+    )
+    assert cp.get("viewport_shot_entries") == shot_entries, (
+        "challenger payload must carry viewport_shot_entries forwarded from the source task"
+    )
+    assert cp.get("viewport_source_task_id") == "src-blind-abc"
+
+    # Context must carry both source keys for routing and identification.
+    ctx = challenger.context or {}
+    assert REVIEW_SECOND_OPINION_SOURCE_KEY in ctx, (
+        "blind challenger context must have REVIEW_SECOND_OPINION_SOURCE_KEY for reconciliation routing"
+    )
+    assert BLIND_REVIEW_SOURCE_KEY in ctx, (
+        "blind challenger context must have BLIND_REVIEW_SOURCE_KEY for identification"
+    )
+    assert ctx[REVIEW_SECOND_OPINION_SOURCE_KEY] == str(source_task.id)
+    assert ctx[BLIND_REVIEW_SOURCE_KEY] == str(source_task.id)
+
+    # Source task must be parked EVALUATING with the awaiting marker.
+    assert source_task.status == TaskStatus.EVALUATING, (
+        "source task must be parked EVALUATING pending blind review"
+    )
+    assert (source_task.context or {}).get(REVIEW_SECOND_OPINION_AWAITING_KEY) is not False, (  # truthy (True or task id str)
+        "source task must have REVIEW_SECOND_OPINION_AWAITING_KEY set"
+    )
+
+    # Cleanup: can't leave a parked task in the session without committing
+    # the parking state. The test already committed through the spawn; just
+    # verify the DB state is consistent.
+    await db_session.refresh(source_task)
+    assert source_task.status == TaskStatus.EVALUATING

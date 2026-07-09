@@ -120,6 +120,12 @@ def criterion_met(value: Any, op: str, threshold: Any) -> bool:
 # verdict was recorded" and preserves prior bare-merge scoring exactly.
 CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 
+# Context key where the verify-tests handler stores the coverage measurement
+# result for the coverage_delta acceptance gate to consume. The value is a dict
+# with at least ``{"coverage_pct": <float>}`` — the percentage of changed
+# production lines exercised by the declared test.
+TEST_COVERAGE_RESULT_KEY = "test_coverage_result"
+
 ACCEPTANCE_AGGREGATE_BUCKETS: tuple[str, ...] = (
     "proven",
     "satisfied_unproven",
@@ -480,6 +486,65 @@ def _evaluate_visual(task: Task, evidence: AcceptanceEvidence) -> AcceptanceGate
     )
 
 
+def _evaluate_coverage_delta(
+    evidence: AcceptanceEvidence,
+    context: Mapping[str, Any] | None,
+) -> AcceptanceGateVerdict:
+    """Fail-closed gate for a ``coverage_delta`` acceptance declaration.
+
+    Reads the coverage measurement stored in task context (``TEST_COVERAGE_RESULT_KEY``)
+    by the verify-tests handler and compares the achieved ``coverage_pct`` against
+    the declared threshold.  Passes only when the coverage result is present and
+    carries a numeric ``coverage_pct`` at or above the threshold.
+
+    Note: Unlike :func:`_evaluate_named_test`, this function does **not** receive
+    the ``verified`` flag.  The coverage measurement itself is produced only by a
+    real test run, so an absent result implicitly means no test ran — no separate
+    verification gate is needed.
+
+    Absent / non-numeric result, absent or non-numeric threshold, or coverage below
+    threshold all fail closed.
+    """
+    threshold = coerce_number(evidence.threshold)
+    if threshold is None:
+        return AcceptanceGateVerdict(
+            True, False, evidence.kind,
+            "coverage_delta acceptance evidence requires a numeric threshold "
+            "(coverage percentage 0–100)",
+        )
+
+    result = (context or {}).get(TEST_COVERAGE_RESULT_KEY)
+    if not isinstance(result, dict):
+        return AcceptanceGateVerdict(
+            True, False, evidence.kind,
+            "coverage_delta acceptance evidence requires a test coverage result "
+            f"in task context ({TEST_COVERAGE_RESULT_KEY}) — no result found",
+        )
+
+    coverage_pct = coerce_number(result.get("coverage_pct"))
+    if coverage_pct is None:
+        return AcceptanceGateVerdict(
+            True, False, evidence.kind,
+            "coverage_delta acceptance evidence: coverage result is missing "
+            "numeric coverage_pct",
+        )
+
+    if criterion_met(coverage_pct, ">=", threshold):
+        return AcceptanceGateVerdict(
+            True, True, evidence.kind,
+            f"coverage_delta acceptance evidence: achieved {coverage_pct}% "
+            f"coverage >= {threshold}% threshold",
+            proven=True,
+            proof_ref=f"coverage_delta={coverage_pct}%",
+        )
+
+    return AcceptanceGateVerdict(
+        True, False, evidence.kind,
+        f"coverage_delta acceptance evidence: achieved {coverage_pct}% "
+        f"coverage < {threshold}% threshold",
+    )
+
+
 def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     """Evaluate ``task``'s declared acceptance evidence, fail-closed.
 
@@ -507,6 +572,9 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
 
     if evidence.kind == "visual":
         return _evaluate_visual(task, evidence)
+
+    if evidence.kind == "coverage_delta":
+        return _evaluate_coverage_delta(evidence, task.context)
 
     # observable_behavior carries no machine-checkable assertion the backend can
     # independently re-run at completion. To the extent checkable, require that

@@ -92,14 +92,36 @@ export const PANEL_REVIEW_LENSES = [
   },
 ] as const;
 
-type PanelReviewLensId = (typeof PANEL_REVIEW_LENSES)[number]['id'];
+/**
+ * Number of redundant independent reviewers for blind multi-reviewer mode.
+ * N reviewers evaluate the same question independently, blind to each other
+ * and to any self-assessment, with majority vote (2/3 threshold) determining
+ * the gate outcome.
+ */
+export const BLIND_REVIEWER_COUNT = 3;
+
+/**
+ * Maximum number of blind reviewers.  Caps an unbounded payload property so
+ * a misconfigured or malicious payload cannot exhaust concurrent agent slots.
+ */
+export const MAX_BLIND_REVIEWERS = 5;
+
+/**
+ * Lens definition shape shared by the standard four-lens panel and the
+ * dynamic blind-reviewer array.
+ */
+type PanelReviewLens = {
+  id: string;
+  label: string;
+  focus: string;
+};
 
 type PanelReviewIssue = {
   severity?: string;
   description: string;
   file?: string;
   line?: number;
-  lens?: PanelReviewLensId;
+  lens?: string;
 };
 
 type PanelReviewLensVerdict = {
@@ -113,10 +135,10 @@ type PanelReviewVerdict = {
   summary: string;
   issues: PanelReviewIssue[];
   investigated_files: string[];
-  lenses: Record<PanelReviewLensId, PanelReviewLensVerdict>;
+  lenses: Record<string, PanelReviewLensVerdict>;
 };
 
-function normalizeIssue(raw: unknown, lens: PanelReviewLensId): PanelReviewIssue | null {
+function normalizeIssue(raw: unknown, lens: string): PanelReviewIssue | null {
   if (!raw || typeof raw !== 'object') return null;
   const issue = raw as Record<string, unknown>;
   const description = strVal(issue.description).trim();
@@ -132,7 +154,7 @@ function normalizeIssue(raw: unknown, lens: PanelReviewLensId): PanelReviewIssue
   return normalized;
 }
 
-function normalizeLensVerdict(raw: unknown, lens: PanelReviewLensId): PanelReviewLensVerdict | null {
+function normalizeLensVerdict(raw: unknown, lens: string): PanelReviewLensVerdict | null {
   if (!raw || typeof raw !== 'object') return null;
   const payload = raw as Record<string, unknown>;
   const verdict = strVal(payload.verdict).trim();
@@ -170,7 +192,7 @@ function dedupeIssues(issues: PanelReviewIssue[]): PanelReviewIssue[] {
   return deduped;
 }
 
-function panelReviewLensOutputType(lensId: PanelReviewLensId): string {
+function panelReviewLensOutputType(lensId: string): string {
   return `panel_review_lens_${lensId}`;
 }
 
@@ -185,7 +207,7 @@ function panelReviewLensOutputType(lensId: PanelReviewLensId): string {
  * the panel cannot silently approve when one lens found a blocker.
  */
 function synthesizePanelReviewVerdict(
-  lensVerdicts: Record<PanelReviewLensId, PanelReviewLensVerdict>,
+  lensVerdicts: Record<string, PanelReviewLensVerdict>,
   investigatedFiles: string[],
 ): PanelReviewVerdict {
   const lensIds = PANEL_REVIEW_LENSES.map(lens => lens.id);
@@ -211,13 +233,46 @@ function synthesizePanelReviewVerdict(
   };
 }
 
+/**
+ * Majority-vote aggregation for blind multi-reviewer mode.
+ *
+ * N redundant reviewers each produce an independent APPROVE/REQUEST_CHANGES
+ * verdict. The aggregated gate outcome is determined by 2/3 majority
+ * threshold — APPROVE requires at least ceil(N * 2/3) approvals.
+ */
+export function synthesizeBlindReviewVerdict(
+  reviewerVerdicts: Record<string, PanelReviewLensVerdict>,
+  investigatedFiles: string[],
+): PanelReviewVerdict {
+  const ids = Object.keys(reviewerVerdicts);
+  const approveCount = ids.filter(id => reviewerVerdicts[id].verdict === 'APPROVE').length;
+  const majorityThreshold = Math.ceil(ids.length * 2 / 3);
+  const overallVerdict: PanelReviewVerdict['overall_verdict'] =
+    approveCount >= majorityThreshold ? 'APPROVE' : 'REQUEST_CHANGES';
+  const summary =
+    ids
+      .map(
+        id =>
+          `Reviewer ${id.replace('blind_reviewer_', '')} [${reviewerVerdicts[id].verdict}]: ${reviewerVerdicts[id].summary}`,
+      )
+      .join('\n') + `\n\nMajority threshold: ${majorityThreshold}/${ids.length} (2/3)`;
+  const issues = dedupeIssues(ids.flatMap(id => reviewerVerdicts[id].issues));
+  return {
+    overall_verdict: overallVerdict,
+    summary,
+    issues,
+    investigated_files: Array.from(new Set(investigatedFiles)).slice(0, 50),
+    lenses: reviewerVerdicts,
+  };
+}
+
 type ChallengeContext = {
   primaryVerdict: string;
   primaryIssues: unknown[];
 };
 
 type PanelReviewLensBodyArgs = {
-  lens: (typeof PANEL_REVIEW_LENSES)[number];
+  lens: PanelReviewLens;
   taskId: string;
   prNumber: number;
   branch: string;
@@ -548,11 +603,15 @@ export async function handlePanelReview(
   const promptFingerprint = computePromptFingerprint('panel_review', buildConfig);
   setCurrentPromptFingerprint(promptFingerprint);
 
-  // Detect challenge mode: the backend sets is_challenge === true and passes
-  // primary_verdict + primary_issues when this panel_review is acting as a
-  // second-opinion challenger for a primary verdict. Absent → standalone
-  // advisory workflow (backward compatible; no change to existing behavior).
-  const isChallenge = payload.is_challenge === true;
+  // Detect challenge and blind modes.
+  //   is_challenge === true — second-opinion challenger; reviewers see the
+  //     primary verdict for CONFIRM/DISPUTE adjudication.
+  //   is_blind === true — multi-reviewer redundancy; N independent reviewers
+  //     evaluate the same question, blind to all self-assessments and peer
+  //     findings, with majority vote (2/3 threshold) determining the outcome.
+  // is_blind overrides is_challenge (blind reviewers never see self-assessments).
+  const isBlind = payload.is_blind === true;
+  const isChallenge = !isBlind && payload.is_challenge === true;
   const challengeContext: ChallengeContext | undefined = isChallenge
     ? {
         primaryVerdict: strVal(
@@ -566,9 +625,32 @@ export async function handlePanelReview(
       }
     : undefined;
 
-  // Per-lens review brief, shared by both execution paths. Bounded to exactly
-  // the four declared lenses (no unbounded recursion, no per-lens sub-fan-out).
-  const lensArgs: PanelReviewLensBodyArgs[] = PANEL_REVIEW_LENSES.map(lens => ({
+  // Build the set of reviewers: for blind mode create N=3 identical independent
+  // reviewers; for standard panel mode use the 4 specialized lens-specific passes.
+  // Note: PANEL_REVIEW_LENSES is a readonly tuple so it is assignable to
+  // readonly PanelReviewLens[] — the structural shape is the same.
+  const activeLenses: readonly PanelReviewLens[] = isBlind
+    ? Array.from(
+        {
+          length: Math.min(
+            MAX_BLIND_REVIEWERS,
+            Math.max(2, Number(payload.blind_reviewer_count) || BLIND_REVIEWER_COUNT),
+          ),
+        },
+        (_, i) => ({
+          id: `blind_reviewer_${i + 1}`,
+          label: `Independent Reviewer ${i + 1}`,
+          focus:
+            'Overall PR quality and correctness: evaluate the complete diff ' +
+            'holistically on correctness, security, code quality, and test ' +
+            'coverage. You are one of several BLIND reviewers — judge ' +
+            'independently without knowing what other reviewers found.',
+        }),
+      )
+    : PANEL_REVIEW_LENSES;
+
+  // Per-reviewer brief, shared by both execution paths.
+  const lensArgs: PanelReviewLensBodyArgs[] = activeLenses.map(lens => ({
     lens,
     taskId,
     prNumber,
@@ -617,7 +699,7 @@ export async function handlePanelReview(
     }
   };
 
-  const lensVerdicts = {} as Record<PanelReviewLensId, PanelReviewLensVerdict>;
+  const lensVerdicts = {} as Record<string, PanelReviewLensVerdict>;
 
   if (providerSupportsNativeSubagents()) {
     // Parallel path: ONE orchestrating runClaudeCode pass fans the four lenses
@@ -628,8 +710,8 @@ export async function handlePanelReview(
     // live through the parallel window; each sub-agent still writes its own
     // verdict file, and synthesis below fails closed on any missing/unusable
     // verdict or non-zero parent exit.
-    statusRef.value = `Panel review: fanning out ${PANEL_REVIEW_LENSES.length} lenses in parallel...`;
-    sendLog(ws, `Running panel review lenses in parallel via native sub-agent fan-out (${PANEL_REVIEW_LENSES.length} lenses)\n`);
+    statusRef.value = `Panel review: fanning out ${activeLenses.length} lenses in parallel...`;
+    sendLog(ws, `Running panel review lenses in parallel via native sub-agent fan-out (${activeLenses.length} lenses)\n`);
     sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
     const parentPrompt = buildPanelReviewParentPrompt({
@@ -673,7 +755,7 @@ export async function handlePanelReview(
     // Read every lens verdict file; fail closed if ANY lens is missing or
     // unusable. All four launched together, so unlike the serial path there is
     // no short-circuit — we still must require all four to be usable.
-    for (const [index, lens] of PANEL_REVIEW_LENSES.entries()) {
+    for (const [index, lens] of activeLenses.entries()) {
       const rawLensVerdict = readHandlerOutput(taskId, panelReviewLensOutputType(lens.id), ws);
       let normalizedLens = normalizeLensVerdict(rawLensVerdict, lens.id);
 
@@ -692,7 +774,7 @@ export async function handlePanelReview(
           model,
           effort,
           disallowedTools,
-          retryStatus: `Panel review lens ${index + 1}/${PANEL_REVIEW_LENSES.length}: repairing '${lens.id}' verdict...`,
+          retryStatus: `Panel review lens ${index + 1}/${activeLenses.length}: repairing '${lens.id}' verdict...`,
           schemaLabel: 'panel_review_lens',
         });
         // Try normalizing the value extracted from text output, then re-read the file
@@ -719,9 +801,9 @@ export async function handlePanelReview(
     // Serial fallback: providers without a native sub-agent primitive (codex,
     // gemini) can't fan out, so each declared lens runs as its OWN independent
     // runClaudeCode pass in sequence. Same fail-closed guarantees; just slower.
-    for (const [index, lens] of PANEL_REVIEW_LENSES.entries()) {
-      statusRef.value = `Panel review lens ${index + 1}/${PANEL_REVIEW_LENSES.length}: ${lens.label}...`;
-      sendLog(ws, `Running panel review lens '${lens.id}' (${index + 1}/${PANEL_REVIEW_LENSES.length})\n`);
+    for (const [index, lens] of activeLenses.entries()) {
+      statusRef.value = `Panel review lens ${index + 1}/${activeLenses.length}: ${lens.label}...`;
+      sendLog(ws, `Running panel review lens '${lens.id}' (${index + 1}/${activeLenses.length})\n`);
       sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
       const lensPrompt = buildPanelReviewLensPrompt({
@@ -775,7 +857,7 @@ export async function handlePanelReview(
           model,
           effort,
           disallowedTools,
-          retryStatus: `Panel review lens ${index + 1}/${PANEL_REVIEW_LENSES.length}: repairing '${lens.id}' verdict...`,
+          retryStatus: `Panel review lens ${index + 1}/${activeLenses.length}: repairing '${lens.id}' verdict...`,
           schemaLabel: 'panel_review_lens',
         });
         // Try normalizing the value extracted from text output, then re-read the file
@@ -801,7 +883,9 @@ export async function handlePanelReview(
   }
 
   const investigatedFiles = extractInvestigatedFiles(snapshotToolTrace());
-  const synthesized = synthesizePanelReviewVerdict(lensVerdicts, investigatedFiles);
+  const synthesized = isBlind
+    ? synthesizeBlindReviewVerdict(lensVerdicts, investigatedFiles)
+    : synthesizePanelReviewVerdict(lensVerdicts, investigatedFiles);
   const logs = JSON.stringify(synthesized);
   sendLog(ws, `Panel review synthesized verdict: ${synthesized.overall_verdict}\n`);
 
