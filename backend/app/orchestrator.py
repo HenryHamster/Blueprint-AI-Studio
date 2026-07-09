@@ -68,6 +68,7 @@ from app.models import (
 )
 from app.resource_envelope import (
     get_project_recent_spend_usd,
+    resolve_project_pause_on_ceiling_exceeded,
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
     resolve_project_vm_cap,
@@ -761,6 +762,39 @@ async def _filter_project_resource_dispatch_eligible(
         except Exception:
             logger.exception("[ORCHESTRATOR] Failed to broadcast ceiling_restored for %s", _pid)
     _shared_state.project_ceiling_deferred_ids = _current_ceiling_deferred
+
+    # Auto-pause projects whose spend ceiling is exceeded when
+    # pause_on_ceiling_exceeded is enabled. The project stays paused until the
+    # operator manually unpauses — even if spend later drops below the ceiling.
+    # The paused flag blocks dispatch via the candidate-task WHERE clause
+    # (Project.paused.is_(False)) and _lock_dispatchable_task_for_mutation.
+    _auto_paused_ids: list[str] = []
+    for _pid, (_recent, _ceiling, _) in spend_cache.items():
+        if _recent < _ceiling:
+            continue
+        _project = project_cache.get(_pid)
+        if _project is None:
+            continue
+        if resolve_project_pause_on_ceiling_exceeded(_project) and not _project.paused:
+            _project.paused = True
+            session.add(_project)
+            _auto_paused_ids.append(str(_pid))
+            try:
+                await broadcast_to_project(
+                    str(_pid),
+                    "project_paused",
+                    {"project_id": str(_pid), "reason": "spend_ceiling_exceeded"},
+                )
+            except Exception:
+                logger.exception(
+                    "[ORCHESTRATOR] Failed to broadcast project_paused for %s", _pid
+                )
+    if _auto_paused_ids:
+        logger.warning(
+            "[ORCHESTRATOR] Auto-paused %d project(s) due to spend ceiling exceeded: %s",
+            len(_auto_paused_ids),
+            _auto_paused_ids,
+        )
 
     if session.dirty:
         await session.commit()

@@ -939,6 +939,10 @@ class ResourceEnvelope(BaseModel):
     # to compute_experiment tasks for now; a future field could extend the
     # policy to other task types. Absent/None ⇒ False (cloud fallback permitted).
     require_local_runner: bool | None = Field(None)
+    # When True, exceeding the spend ceiling automatically pauses the project
+    # (project.paused = True) until an operator manually unpauses it.
+    # Absent/None ⇒ False (soft-defer tasks but don't pause the project).
+    pause_on_ceiling_exceeded: bool | None = Field(None)
 
     @field_validator("allowed_machine_types", mode="before")
     @classmethod

@@ -98,6 +98,17 @@ def resolve_project_require_local_runner(project: Project) -> bool:
     return raw is True
 
 
+def resolve_project_pause_on_ceiling_exceeded(project: Project) -> bool:
+    """Return True when the project should auto-pause on spend ceiling breach.
+
+    Reads ``project.build_config["resource_envelope"]["pause_on_ceiling_exceeded"]``.
+    Returns False when absent, null, or not a bool — soft-defer (no pause) is the
+    default so legacy projects are unaffected.
+    """
+    raw = _get_envelope(project).get("pause_on_ceiling_exceeded")
+    return raw is True
+
+
 def resolve_project_spend_warning_fraction(project: Project) -> float:
     """Return the warning fraction of the spend ceiling, defaulting to 0.8.
 
