@@ -193,6 +193,46 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> float | None:
     return round(total_cost / merged, 6)
 
 
+def _compute_llm_cost_per_verified_task(tasks: list[Task]) -> float | None:
+    """Total LLM token cost / CI-verified merge count over the window.
+
+    Uses :func:`is_verified_merge` as the denominator so fall-open (CI-bypassed)
+    merges do not dilute the per-verified-task LLM cost. Returns None when no
+    verified merges exist.
+    """
+    total_cost = 0.0
+    verified = 0
+    for t in tasks:
+        for (
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            _call_count,
+            cache_creation,
+            cache_read,
+        ) in _task_llm_attempts(t):
+            if provider and model:
+                pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
+                if pricing:
+                    input_rate, output_rate = pricing
+                    total_cost += _price_llm_attempt(
+                        input_tokens,
+                        output_tokens,
+                        cache_creation,
+                        cache_read,
+                        input_rate,
+                        output_rate,
+                        provider=provider,
+                        model=model,
+                    )
+        if is_verified_merge(t):
+            verified += 1
+    if not verified:
+        return None
+    return round(total_cost / verified, 6)
+
+
 _UNPRICED_COMBOS_CAP = 10
 
 

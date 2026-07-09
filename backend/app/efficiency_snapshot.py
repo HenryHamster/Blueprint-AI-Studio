@@ -64,6 +64,7 @@ from app.llm_cost_attribution import (
     _UNPRICED_COMBOS_CAP,
     _compact_llm_cost_attribution,
     _compute_llm_cost_per_merged_pr,
+    _compute_llm_cost_per_verified_task,
     _compute_llm_cost_pricing_coverage,
     _price_llm_attempt,
     _task_llm_attempts,
@@ -114,6 +115,8 @@ AXIS_VM_REUSE_RATE = "vm_reuse_rate"
 AXIS_MEDIAN_API_CALLS_PER_TASK = "median_api_calls_per_task"
 AXIS_MEDIAN_REVIEW_ITERATIONS = "median_review_iterations"
 AXIS_LLM_COST_PER_MERGED_PR = "llm_cost_per_merged_pr"
+AXIS_COST_PER_VERIFIED_TASK = "cost_per_verified_task"
+AXIS_LLM_COST_PER_VERIFIED_TASK = "llm_cost_per_verified_task"
 AXIS_LANE_COST_PER_MERGED_PR = "lane_cost_per_merged_pr"
 AXIS_LANE_WARM_RESUME_RATE = "lane_warm_resume_rate"
 AXIS_CHECKPOINT_LOSS_RATE = "checkpoint_loss_rate"
@@ -146,6 +149,8 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
     AXIS_LLM_COST_PER_MERGED_PR,
+    AXIS_COST_PER_VERIFIED_TASK,
+    AXIS_LLM_COST_PER_VERIFIED_TASK,
     AXIS_LANE_COST_PER_MERGED_PR,
     AXIS_LANE_WARM_RESUME_RATE,
     AXIS_CHECKPOINT_LOSS_RATE,
@@ -185,6 +190,12 @@ AXIS_CONSUMERS: dict[str, dict] = {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_LLM_COST_PER_MERGED_PR: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_COST_PER_VERIFIED_TASK: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_LLM_COST_PER_VERIFIED_TASK: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
     AXIS_LANE_COST_PER_MERGED_PR: {
@@ -471,6 +482,24 @@ def _compute_cost_per_merged_pr(tasks: list[Task]) -> float | None:
     if not merged:
         return None
     return round(total_cost / merged, 4)
+
+
+def _compute_cost_per_verified_task(tasks: list[Task]) -> float | None:
+    """Total VM cost / CI-verified merge count over the window.
+
+    Uses :func:`is_verified_merge` as the denominator so fall-open (CI-bypassed)
+    merges do not dilute the per-task cost. Returns None when no verified merges.
+    """
+    total_cost = 0.0
+    verified = 0
+    parent_ids = _rollup_parent_ids(tasks)
+    for t in tasks:
+        total_cost += get_task_total_vm_cost_usd(t)
+        if is_verified_merge(t) and t.id not in parent_ids:
+            verified += 1
+    if not verified:
+        return None
+    return round(total_cost / verified, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -2685,6 +2714,8 @@ async def compute_current_axes(
         AXIS_MEDIAN_API_CALLS_PER_TASK: _compute_median_api_calls_per_task(tasks),
         AXIS_MEDIAN_REVIEW_ITERATIONS: _compute_median_review_iterations(tasks),
         AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
+        AXIS_COST_PER_VERIFIED_TASK: _compute_cost_per_verified_task(tasks),
+        AXIS_LLM_COST_PER_VERIFIED_TASK: _compute_llm_cost_per_verified_task(tasks),
         AXIS_LANE_COST_PER_MERGED_PR: _compute_lane_cost_per_merged_pr(lanes),
         AXIS_LANE_WARM_RESUME_RATE: _compute_lane_warm_resume_rate(lanes),
         AXIS_CHECKPOINT_LOSS_RATE: _compute_checkpoint_loss_rate(lanes),

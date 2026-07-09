@@ -17,6 +17,8 @@ from app.efficiency_snapshot import (
     AXIS_LANE_WARM_RESUME_RATE,
     AXIS_LLM_CACHE_HIT_RATE,
     AXIS_LLM_COST_PER_MERGED_PR,
+    AXIS_COST_PER_VERIFIED_TASK,
+    AXIS_LLM_COST_PER_VERIFIED_TASK,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
     AXIS_PROMPT_STATIC_BYTES,
@@ -277,6 +279,88 @@ async def test_cost_per_merged_pr_excludes_non_merge_unblocks(db_session):
 
     expected_cpm = round(2 * 300 * ON_DEMAND_RATE, 4)
     assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm
+
+
+@pytest.mark.asyncio
+async def test_cost_per_verified_task_differs_from_cost_per_merged_pr_with_fall_open_merges(
+    db_session,
+):
+    """AXIS_COST_PER_VERIFIED_TASK uses is_verified_merge denominator and differs
+    from AXIS_COST_PER_MERGED_PR when fall-open (CI-bypassed) merges are present.
+
+    A mix of one verified and one unverified merged task: the verified axis
+    denominator counts only the verified task, while the merged-pr axis counts
+    both — so the two axes produce different values.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Verified merge: no unverified_merge_reason in context.
+    db_session.add(_make_efficient_task(project.id))
+    # Fall-open (unverified) merge: carries a degraded reason.
+    db_session.add(
+        _make_merged_task(
+            project.id,
+            reason="ci_unavailable_runner_offline",
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    # cost_per_merged_pr: denominator = 2 (both tasks merged)
+    assert axes[AXIS_COST_PER_MERGED_PR] is not None
+
+    # cost_per_verified_task: denominator = 1 (only the verified task)
+    assert axes[AXIS_COST_PER_VERIFIED_TASK] is not None
+
+    # With one verified and one unverified task, the verified denominator is
+    # smaller, so the per-verified cost is higher than per-merged cost.
+    assert axes[AXIS_COST_PER_VERIFIED_TASK] > axes[AXIS_COST_PER_MERGED_PR]
+
+    # The verified cost is exactly total VM cost / 1 (only the verified task
+    # has VM cost — the unverified merged task has no vm_provisioned_at).
+    expected_verified = round(300 * ON_DEMAND_RATE, 4)
+    assert axes[AXIS_COST_PER_VERIFIED_TASK] == expected_verified
+
+    # llm_cost_per_verified_task is also present and finite.
+    assert AXIS_LLM_COST_PER_VERIFIED_TASK in axes
+    assert axes[AXIS_LLM_COST_PER_VERIFIED_TASK] is not None
+
+
+@pytest.mark.asyncio
+async def test_cost_per_verified_task_none_when_no_verified_merges(db_session):
+    """When all merged tasks are fall-open (unverified), the verified-task axes
+    return None because the denominator is zero."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two fall-open merges, zero verified.
+    db_session.add(
+        _make_merged_task(
+            project.id,
+            reason="ci_unavailable_runner_offline",
+        )
+    )
+    db_session.add(
+        _make_merged_task(
+            project.id,
+            reason="no_runnable_tests",
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    # cost_per_merged_pr is computed (both tasks merged).
+    assert axes[AXIS_COST_PER_MERGED_PR] is not None
+    # Verified axes are None — no verified merges in the window.
+    assert axes[AXIS_COST_PER_VERIFIED_TASK] is None
+    assert axes[AXIS_LLM_COST_PER_VERIFIED_TASK] is None
 
 
 @pytest.mark.asyncio
