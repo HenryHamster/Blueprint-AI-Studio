@@ -2187,6 +2187,79 @@ async def test_backfill_verdicts_no_starvation(db_session):
 
 
 @pytest.mark.asyncio
+async def test_backfill_verdicts_resilient_to_mid_loop_rollback(db_session):
+    """A rollback inside record_task_merge_evidence (e.g. IntegrityError on
+    CriterionEvidence unique constraint) must not abort the whole backfill
+    cycle.  Specifically, subsequent loop iterations must not raise
+    MissingGreenlet when accessing task attributes after the rollback
+    unconditionally expired all session objects.
+
+    Regression test for the gap where expire_on_commit=False only covered
+    the COMMIT path, leaving the ROLLBACK path unprotected.  The fix
+    collects task IDs upfront and re-fetches each task fresh at the start
+    of every iteration via session.get(), making each iteration independent
+    of prior commits or rollbacks.
+    """
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    FIX_TS = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+
+    # Three tasks eligible for upgrade (false-negative named_test verdicts).
+    for _ in range(3):
+        task = _make_code_task(
+            acceptance_evidence={
+                "kind": "named_test",
+                "test_path": "backend/testing/test_invariants.py",
+            },
+            changed_files=[
+                "backend/app/acceptance_gate.py",
+                "backend/testing/test_invariants.py",
+            ],
+        )
+        task.project_id = project.id
+        task.completed_at = FIX_TS
+        ctx = dict(task.context or {})
+        ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+            "satisfied": True,
+            "proven": False,
+            "kind": "named_test",
+            "reason": "simulated false-negative for rollback resilience test",
+        }
+        task.context = ctx
+        db_session.add(task)
+    await db_session.flush()
+
+    # Patch record_task_merge_evidence to simulate a session rollback on the
+    # first call (as would happen when record_evidence hits an IntegrityError
+    # on a duplicate CriterionEvidence row).  After the rollback all session
+    # objects are expired; the fix must re-fetch each task so the 2nd and 3rd
+    # iterations do not raise MissingGreenlet on task attribute access.
+    call_count = [0]
+
+    async def _mock_rtme_with_rollback(session, task, project_id):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            await session.rollback()
+        return 0
+
+    with patch(
+        "app.acceptance_criteria.record_task_merge_evidence",
+        _mock_rtme_with_rollback,
+    ):
+        upgraded = await backfill_acceptance_verdicts(db_session)
+
+    assert upgraded == 3, (
+        f"Expected all 3 tasks upgraded (verdict set to proven); got {upgraded}. "
+        "A MissingGreenlet or premature abort would have reduced this count."
+    )
+
+
+@pytest.mark.asyncio
 async def test_backfill_verdicts_advances_past_unprovable(db_session):
     """The backfill query advances past tasks that can never be proven (wrong
     verdict kind, not satisfied, or re-evaluation still unprovable), instead of

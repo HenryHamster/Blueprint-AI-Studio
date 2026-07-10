@@ -1161,36 +1161,50 @@ async def backfill_acceptance_verdicts(session) -> int:
         ).is_(None)
     else:
         _backfill_checked = not_(Task.context.has_key("_backfill_checked_at"))
+    # Collect IDs only — not Task objects — so a mid-loop rollback inside
+    # record_task_merge_evidence (which unconditionally expires ALL session
+    # objects regardless of expire_on_commit) cannot leave the remaining
+    # iterations' task objects stale.  Each iteration re-fetches its task
+    # fresh via session.get() at the top of the loop.
     result = await session.execute(
-        select(Task).where(
+        select(Task.id).where(
             Task.status == TaskStatus.COMPLETED,
             Task.completed_at < FIX_TIMESTAMP,
             not_(_proven_exists),
             _backfill_checked,
         ).order_by(Task.completed_at.asc()).limit(200)
     )
-    tasks = list(result.scalars().all())
+    task_ids = list(result.scalars().all())
 
-    # Prevent record_evidence's internal commit from expiring our task ORM
-    # instances (which would cause MissingGreenlet on the next iteration).
+    # expire_on_commit=False prevents a commit inside record_task_merge_evidence
+    # from expiring the freshly-fetched task object before its attributes are
+    # read by that function.  A ROLLBACK still expires all objects, but each
+    # iteration re-fetches its own task so the next iteration is unaffected.
     _prior_expire = session.sync_session.expire_on_commit
     session.sync_session.expire_on_commit = False
     try:
         upgraded = 0
-        marked: list[Task] = []
-        for task in tasks:
+        marked_ids: list = []
+        for task_id in task_ids:
+            # Re-fetch fresh each iteration: a rollback from record_evidence
+            # (IntegrityError on CriterionEvidence unique constraint) expires
+            # all session objects; re-fetching here avoids MissingGreenlet on
+            # the subsequent attribute access.
+            task = await session.get(Task, task_id)
+            if task is None:
+                continue
             verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
             if not isinstance(verdict_data, dict):
-                marked.append(task)
+                marked_ids.append(task_id)
                 continue
             if verdict_data.get("kind") != "named_test":
-                marked.append(task)
+                marked_ids.append(task_id)
                 continue
             if verdict_data.get("satisfied") is not True:
-                marked.append(task)
+                marked_ids.append(task_id)
                 continue
             if verdict_data.get("proven") is True:
-                marked.append(task)
+                marked_ids.append(task_id)
                 continue
 
             re_eval = evaluate_code_acceptance(task)
@@ -1224,7 +1238,7 @@ async def backfill_acceptance_verdicts(session) -> int:
             else:
                 # Re-evaluation could not prove — stamp marker so the
                 # LIMIT-200 window advances past this task in future calls.
-                marked.append(task)
+                marked_ids.append(task_id)
 
         # Stamp backfill-checked marker on every examined task that was NOT
         # upgraded, so the query window advances past tasks that can never be
@@ -1232,13 +1246,18 @@ async def backfill_acceptance_verdicts(session) -> int:
         # returns proven=False). Without this marker, those tasks permanently
         # occupy the LIMIT-200 window and starve newer but later-ordered tasks
         # from ever being examined.
-        if marked:
+        if marked_ids:
             now_ts = datetime.now(timezone.utc).isoformat()
-            for task in marked:
-                ctx = dict(task.context or {})
+            for mid in marked_ids:
+                # Re-fetch so any mid-loop rollback from a prior iteration
+                # does not leave these objects expired at stamping time.
+                t = await session.get(Task, mid)
+                if t is None:
+                    continue
+                ctx = dict(t.context or {})
                 ctx["_backfill_checked_at"] = now_ts
-                task.context = ctx
-                session.add(task)
+                t.context = ctx
+                session.add(t)
             await session.commit()
 
         if upgraded:
