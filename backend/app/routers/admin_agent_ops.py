@@ -109,6 +109,7 @@ from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
     lock_project_or_429 as _lock_project_or_429,
     task_lock,
+    with_design_doc_locked as _with_design_doc_locked,
     with_directions_locked as _with_directions_locked,
     with_vision_locked as _with_vision_locked,
 )
@@ -298,6 +299,74 @@ class DesignDocUpdate(BaseModel):
     value: Any | None = None
 
 
+def _get_file_list_from_system_page(doc_val: dict) -> list[str]:
+    """Extract the file path list from a ``systems/*`` design-doc page.
+
+    Systems pages were authored with different field-name conventions for
+    listing their covered files: ``key_paths`` (majority convention),
+    ``key_files`` (a few pages), or ``modules`` (earliest pages).  This helper
+    checks each in preference order and returns entries from the first one that
+    is a non-empty list of strings, so the caller (the ``_file_to_system``
+    reverse-index builder) never depends on a single unenforced field name.
+    """
+    for field in ("key_paths", "key_files", "modules"):
+        files = doc_val.get(field)
+        if isinstance(files, list):
+            return [f for f in files if isinstance(f, str)]
+    return []
+
+
+async def backfill_file_to_system_index(session: AsyncSession) -> int:
+    """One-time startup backfill: recompute ``_file_to_system`` for every
+    project that has a non-empty ``design_doc``.
+
+    Uses :func:`_with_design_doc_locked` for each project so the canonical
+    locking helper is used for all ``project.design_doc`` writes.
+
+    The reverse-index was originally built only from the ``modules`` field
+    name, but most ``systems/*`` pages use ``key_paths`` (or ``key_files``).
+    This sweep applies the corrected field-reading logic (via
+    :func:`_get_file_list_from_system_page`) to every existing systems page,
+    bringing the index in sync without waiting for each page to be re-set.
+
+    Returns the number of projects whose index was actually updated.
+    """
+    project_ids = (
+        (
+            await session.execute(
+                select(Project.id).where(
+                    Project.design_doc.isnot(None),
+                    Project.design_doc != {},
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    updated_count = 0
+    for project_id in project_ids:
+        _was_updated = False
+
+        def _mutate(doc: dict) -> None:
+            nonlocal _was_updated
+            rebuilt: dict[str, str] = {}
+            for doc_key, doc_val in doc.items():
+                if doc_key.startswith("systems/") and isinstance(doc_val, dict):
+                    sys_id = doc_key[len("systems/") :]
+                    for fpath in _get_file_list_from_system_page(doc_val):
+                        rebuilt[fpath] = sys_id
+            current = doc.get("_file_to_system")
+            if isinstance(current, dict) and current == rebuilt:
+                return  # already correct
+            doc["_file_to_system"] = rebuilt
+            _was_updated = True
+
+        await _with_design_doc_locked(session, project_id, _mutate)
+        if _was_updated:
+            updated_count += 1
+    return updated_count
+
+
 @router.post("/api/agent/design-doc")
 @limiter.limit("60/minute")
 async def update_design_doc(
@@ -406,9 +475,8 @@ async def update_design_doc(
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
                     sys_id = doc_key[len("systems/") :]
-                    for fpath in doc_val.get("modules", []):
-                        if isinstance(fpath, str):
-                            file_to_system_map[fpath] = sys_id
+                    for fpath in _get_file_list_from_system_page(doc_val):
+                        file_to_system_map[fpath] = sys_id
             doc["_file_to_system"] = file_to_system_map
     elif payload.op == "delete":
         doc.pop(key, None)
@@ -418,9 +486,8 @@ async def update_design_doc(
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
                     sys_id = doc_key[len("systems/") :]
-                    for fpath in doc_val.get("modules", []):
-                        if isinstance(fpath, str):
-                            file_to_system_deleted_map[fpath] = sys_id
+                    for fpath in _get_file_list_from_system_page(doc_val):
+                        file_to_system_deleted_map[fpath] = sys_id
             doc["_file_to_system"] = file_to_system_deleted_map
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")

@@ -963,6 +963,28 @@ async def lifespan(app):
             "[STARTUP] Branch backfill failed (non-fatal): %s", _bf_exc, exc_info=True
         )
 
+    # Backfill _file_to_system reverse index for all existing design-doc
+    # systems/* pages. The index was originally built only from the
+    # "modules" field, but most pages use "key_paths" (or "key_files");
+    # this sweep applies the corrected field-reading logic to every
+    # existing systems page without waiting for each to be re-set.
+    try:
+        from app.routers.admin_agent_ops import backfill_file_to_system_index
+
+        async with AsyncSessionLocal() as _fts_session:
+            _fts_count = await backfill_file_to_system_index(_fts_session)
+            await _fts_session.commit()
+            logger.info(
+                "[STARTUP] _file_to_system backfill complete: %d projects updated",
+                _fts_count,
+            )
+    except Exception as _fts_exc:
+        logger.error(
+            "[STARTUP] _file_to_system backfill failed (non-fatal): %s",
+            _fts_exc,
+            exc_info=True,
+        )
+
     # Reclaim lane warm-workspace states whose backing pool VM was deleted while
     # the orchestrator was stopped (crash / deploy / manual removal).  The live
     # path (clear_lanes_for_torn_down_vm) handles in-process teardowns; this

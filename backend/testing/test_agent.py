@@ -5293,6 +5293,265 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_design_doc_file_to_system_index_key_paths(
+    client: AsyncClient, db_session,
+):
+    """Setting a systems/* page with ``key_paths`` field populates _file_to_system."""
+    project = Project(name="KeyPaths Index Test", user_id="test-user-kp")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-kp-test",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-kp-test", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # Set a system page using key_paths convention
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/reaper",
+            "value": {
+                "name": "Reaper",
+                "key_paths": [
+                    "backend/app/reaper.py",
+                    "backend/app/reaper_post_orphan_sweep.py",
+                ],
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+    assert idx["backend/app/reaper.py"] == "reaper"
+    assert idx["backend/app/reaper_post_orphan_sweep.py"] == "reaper"
+
+    # Set a second system page using key_files convention
+    resp2 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/runner",
+            "value": {
+                "name": "Runner",
+                "key_files": [
+                    "backend/app/routers/runner.py",
+                ],
+            },
+        },
+        headers=headers,
+    )
+    assert resp2.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+    assert idx["backend/app/routers/runner.py"] == "runner"
+    # key_paths entries still present
+    assert idx["backend/app/reaper.py"] == "reaper"
+
+    # Delete key_paths-based system; index should no longer contain its files
+    resp3 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "delete",
+            "key": "systems/reaper",
+        },
+        headers=headers,
+    )
+    assert resp3.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+    assert "backend/app/reaper.py" not in idx
+    assert idx["backend/app/routers/runner.py"] == "runner"
+
+
+@pytest.mark.asyncio
+async def test_design_doc_file_to_system_index_mixed_conventions(
+    client: AsyncClient, db_session,
+):
+    """Systems/* pages with different field-name conventions (key_paths, key_files, modules)
+    all contribute to _file_to_system."""
+    project = Project(name="Mixed Conventions Test", user_id="test-user-mixed")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-mixed-test",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-mixed-test", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # Page using key_paths (majority convention)
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/auth",
+            "value": {
+                "name": "Auth",
+                "key_paths": ["backend/app/auth.py"],
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    # Page using modules (earliest convention)
+    resp2 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/database",
+            "value": {
+                "name": "Database",
+                "modules": ["backend/app/database.py", "backend/app/models.py"],
+            },
+        },
+        headers=headers,
+    )
+    assert resp2.status_code == 200
+
+    # Page using key_files (minority convention)
+    resp3 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/agent",
+            "value": {
+                "name": "Agent",
+                "key_files": ["agent/src/index.ts"],
+            },
+        },
+        headers=headers,
+    )
+    assert resp3.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+
+    # Entries from all three conventions must be present
+    assert idx["backend/app/auth.py"] == "auth"
+    assert idx["backend/app/database.py"] == "database"
+    assert idx["backend/app/models.py"] == "database"
+    assert idx["agent/src/index.ts"] == "agent"
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_architecture_context_via_key_paths_convention(
+    client: AsyncClient, db_session,
+):
+    """Architecture context injection works when _file_to_system is populated
+    via the key_paths field-name convention (previously silently dropped)."""
+    project = Project(name="Arch Ctx KeyPaths", user_id="test-user-arch-kp")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    setup_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-arch-kp-setup",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(setup_task)
+    await db_session.commit()
+    await db_session.refresh(setup_task)
+
+    token = create_agent_token(
+        str(setup_task.id), "agent-vm-arch-kp-setup", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # Populate a systems/* page using key_paths convention
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(setup_task.id),
+            "op": "set",
+            "key": "systems/rollup",
+            "value": {
+                "name": "Rollup Manager",
+                "status": "mature",
+                "ready_for_features": True,
+                "description": "Handles research rollup generation and salvage bundling.",
+                "key_paths": ["backend/app/rollup_management.py"],
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, f"Setup set failed: {resp.text}"
+
+    await db_session.refresh(project)
+    idx = project.design_doc.get("_file_to_system", {})
+    assert isinstance(idx, dict), f"_file_to_system not a dict: {idx}"
+    assert idx.get("backend/app/rollup_management.py") == "rollup", (
+        f"Expected rollup in index, got: {idx}"
+    )
+
+    # Now claim a create task whose related_files matches the key_paths entry
+    claim_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Refactor rollup manager"}],
+        vm_instance_id="agent-vm-arch-kp-claim",
+        context={"related_files": ["backend/app/rollup_management.py"]},
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    claim_token = create_agent_token(
+        str(claim_task.id), "agent-vm-arch-kp-claim"
+    )
+    resp2 = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": claim_token}
+    )
+    assert resp2.status_code == 200, f"Claim failed: {resp2.text}"
+
+    data = resp2.json()
+    project_ctx = data.get("project_context", {})
+    assert "architecture_context" in project_ctx, (
+        f"Expected architecture_context via key_paths convention, "
+        f"got project_context keys: {list(project_ctx.keys())}"
+    )
+    arch_ctx = project_ctx["architecture_context"]
+    assert len(arch_ctx) == 1
+    assert arch_ctx[0]["name"] == "Rollup Manager"
+    assert arch_ctx[0]["status"] == "mature"
+    assert arch_ctx[0]["ready_for_features"] is True
+
+
+@pytest.mark.asyncio
 async def test_design_doc_get_reconciles_absent_capability_entry(
     client: AsyncClient, db_session, tmp_path, monkeypatch
 ):
