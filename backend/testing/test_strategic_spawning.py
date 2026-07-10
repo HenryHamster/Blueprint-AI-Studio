@@ -22,6 +22,8 @@ from sqlalchemy import select, update
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
 from app.models import (
+    Artifact,
+    ArtifactType,
     LocalRunner,
     Project,
     Task,
@@ -6308,25 +6310,32 @@ async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(
         )
     await db_session.commit()
 
-    # Create 5 completed claim-tasks with no PR artifacts → stalled_despite_churn
+    # Create 5 completed claim-tasks with unmerged PR artifacts.
     for i in range(5):
+        task = Task(
+            project_id=project.id,
+            title=f"trend claim {i}",
+            description="",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "x",
+                    "current_direction_id": "d-trend01",
+                }
+            ],
+            context={"direction_id": "d-trend01"},
+            plan_output={"summary": "shipped"},
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(task)
+        await db_session.flush()
         db_session.add(
-            Task(
-                project_id=project.id,
-                title=f"trend claim {i}",
-                description="",
-                status=TaskStatus.COMPLETED,
-                created_by="ORCHESTRATOR",
-                payloads=[
-                    {
-                        "type": "create",
-                        "prompt": "x",
-                        "current_direction_id": "d-trend01",
-                    }
-                ],
-                context={"direction_id": "d-trend01"},
-                plan_output={"summary": "shipped"},
-                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.PULL_REQUEST,
+                pr_url=f"https://github.com/test/repo/pull/{task.id.hex[:8]}",
             )
         )
     await db_session.commit()

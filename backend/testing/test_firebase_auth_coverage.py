@@ -35,7 +35,7 @@ from app.auth import (
     get_metrics_reader,
     AGENT_JWT_ALGORITHM,
 )
-from app.models import AllowedUser, LocalRunner, _utcnow
+from app.models import AllowedUser, LocalRunner, Project, _utcnow
 
 
 def _creds(token="fake-firebase-token"):
@@ -485,11 +485,13 @@ class TestRunnerTokenHelpers:
     async def test_verify_runner_token_returns_runner(self, db_session):
         """verify_runner_token returns the LocalRunner for a valid non-deleted runner."""
         import uuid
-        project_id = uuid.uuid4()
+        project = Project(name="Runner Token Project", user_id="runner-token-user")
+        db_session.add(project)
+        await db_session.flush()
         token = create_runner_token(runner_id=uuid.uuid4())
         token_hash = hash_runner_token(token)
         runner = LocalRunner(
-            project_id=project_id,
+            project_id=project.id,
             token_hash=token_hash,
             hostname="test-runner-host",
             status="active",
@@ -511,11 +513,13 @@ class TestRunnerTokenHelpers:
     async def test_verify_runner_token_returns_none_for_deleted_runner(self, db_session):
         """verify_runner_token returns None for a runner with status='deleted'."""
         import uuid
-        project_id = uuid.uuid4()
+        project = Project(name="Deleted Runner Project", user_id="runner-token-user")
+        db_session.add(project)
+        await db_session.flush()
         token = create_runner_token(runner_id=uuid.uuid4())
         token_hash = hash_runner_token(token)
         runner = LocalRunner(
-            project_id=project_id,
+            project_id=project.id,
             token_hash=token_hash,
             status="deleted",
         )
@@ -529,11 +533,13 @@ class TestRunnerTokenHelpers:
     async def test_verify_runner_token_accepts_inactive_runner(self, db_session):
         """An inactive runner (stale heartbeat) can still authenticate."""
         import uuid
-        project_id = uuid.uuid4()
+        project = Project(name="Inactive Runner Project", user_id="runner-token-user")
+        db_session.add(project)
+        await db_session.flush()
         token = create_runner_token(runner_id=uuid.uuid4())
         token_hash = hash_runner_token(token)
         runner = LocalRunner(
-            project_id=project_id,
+            project_id=project.id,
             token_hash=token_hash,
             status="inactive",
         )

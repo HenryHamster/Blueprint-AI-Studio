@@ -11,6 +11,8 @@ from sqlmodel import select
 
 from app.main import app
 from app.models import (
+    Artifact,
+    ArtifactType,
     ImprovementLane,
     ImprovementLaneStatus,
     PoolVm,
@@ -6857,6 +6859,14 @@ async def test_drift_snapshot_over_claim_direction_flagged(
             created_at=_now() - timedelta(hours=2),
         )
         db_session.add(task)
+        await db_session.flush()
+        db_session.add(
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.PULL_REQUEST,
+                pr_url=f"https://github.com/test/repo/pull/{task.id.hex[:8]}",
+            )
+        )
 
     await db_session.commit()
 
@@ -6922,6 +6932,14 @@ async def test_drift_snapshot_history_series_returned(client: AsyncClient, db_se
             created_at=now - timedelta(hours=1),
         )
         db_session.add(task)
+        await db_session.flush()
+        db_session.add(
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.PULL_REQUEST,
+                pr_url=f"https://github.com/test/repo/pull/{task.id.hex[:8]}",
+            )
+        )
     await db_session.commit()
 
     response = await client.get(f"/api/admin/drift-snapshot?project_id={project.id}")
@@ -6985,12 +7003,19 @@ async def test_drift_snapshot_response_shape_pinned(client: AsyncClient, db_sess
     )
     now = _now()
     for _ in range(4):
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"direction_id": dir_id, "shipped": True},
+            created_at=now - timedelta(hours=1),
+        )
+        db_session.add(task)
+        await db_session.flush()
         db_session.add(
-            make_task(
-                project_id=project.id,
-                status=TaskStatus.COMPLETED,
-                context={"direction_id": dir_id, "shipped": True},
-                created_at=now - timedelta(hours=1),
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.PULL_REQUEST,
+                pr_url=f"https://github.com/test/repo/pull/{task.id.hex[:8]}",
             )
         )
     await db_session.commit()
