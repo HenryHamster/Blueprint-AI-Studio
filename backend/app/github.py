@@ -17,6 +17,7 @@ import random
 import re as _re
 from datetime import datetime
 from urllib.parse import quote
+from collections import OrderedDict
 
 import httpx
 import logging
@@ -46,6 +47,16 @@ _github_client: httpx.AsyncClient | None = None
 # ref (e.g. every rollup parent reading automain's tip in the same sweep), a
 # dominant install-token-budget drain.
 _inflight_reads: dict[tuple[str, str], "asyncio.Future[httpx.Response]"] = {}
+
+# File-content cache: memoizes get_file_text_at_ref results by
+# (owner, repo, ref, path) for a short TTL.  At a fixed git ref the content is
+# immutable, so caching across calls avoids redundant GitHub API content reads
+# for the same file — the dominant cost in ci-compliance evaluation (~213 capped
+# files per new integration-branch SHA).  Bounded LRU eviction prevents unbounded
+# memory growth under sustained rollup activity.
+_FILE_CONTENT_CACHE_TTL_SECONDS = 600  # 10 minutes
+_FILE_CONTENT_CACHE_MAX_SIZE = 2000   # ~2000 entries ≈ ~3-5 MB at average file size
+_file_content_cache: "OrderedDict[tuple[str, str, str, str], tuple[str, float]]" = OrderedDict()
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -852,6 +863,7 @@ async def get_file_text_at_ref(
     repo: str,
     ref: str,
     project_id: str | None = None,
+    use_content_cache: bool = True,
 ) -> str | None:
     """Fetch the decoded TEXT of *path* at ``owner/repo@ref``.
 
@@ -861,11 +873,28 @@ async def get_file_text_at_ref(
     Goes through :func:`_github_request`, so it is quota-accounted and
     rate-limit-aware like every other GitHub call.
 
+    When ``use_content_cache`` (default True), results are memoized in an
+    in-memory LRU cache keyed by ``(owner, repo, ref, path)`` with a 10-minute
+    TTL, so repeated reads of the same file at the same ref across
+    closely-spaced evaluations avoid redundant GitHub API calls.
+
     Returns the decoded UTF-8 text on HTTP 200, or ``None`` for any
     non-retrievable / non-decodable outcome (404, non-200, non-file payload,
     undecodable body, or transport error). Fail-safe like its read siblings:
     ``None`` never means "empty file", it means "could not read".
     """
+    # Check the in-memory content cache before hitting the GitHub API.
+    if use_content_cache:
+        cache_key = (owner, repo, ref, path)
+        try:
+            cached = _file_content_cache.get(cache_key)
+            if cached is not None and (time.monotonic() - cached[1]) < _FILE_CONTENT_CACHE_TTL_SECONDS:
+                import app.shared_state as _ss
+                _ss.github_cache_hits["read_content"] = _ss.github_cache_hits.get("read_content", 0) + 1
+                return cached[0]
+        except Exception:
+            pass  # Cache miss / stale — fall through to fetch.
+
     import base64
 
     headers = {
@@ -900,7 +929,21 @@ async def get_file_text_at_ref(
         content_b64 = payload.get("content")
         if not isinstance(content_b64, str):
             return None
-        return base64.b64decode(content_b64).decode()
+        text = base64.b64decode(content_b64).decode()
+
+        # Store in cache on success.
+        if use_content_cache and text is not None:
+            try:
+                cache_key = (owner, repo, ref, path)
+                _file_content_cache[cache_key] = (text, time.monotonic())
+                _file_content_cache.move_to_end(cache_key)  # LRU: most recently used
+                # Evict oldest entries over the size cap.
+                while len(_file_content_cache) > _FILE_CONTENT_CACHE_MAX_SIZE:
+                    _file_content_cache.popitem(last=False)  # Least recently used
+            except Exception:
+                pass  # Cache write failure is non-critical.
+
+        return text
     except Exception as e:  # noqa: BLE001 — never let a fetch error read as content
         logger.warning(
             "[GITHUB] Failed text fetch for %s on %s/%s@%s: %s",

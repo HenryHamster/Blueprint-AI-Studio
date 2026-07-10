@@ -478,7 +478,17 @@ export async function handleStrategic(
     // that runs fresh (no prior conversation) has no source-of-truth for the
     // purpose string and may echo a schema placeholder, exhausting retries.
     const intent = problemModel?.intent as Record<string, unknown> | undefined;
-    const currentPurpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : undefined;
+    // When intent.purpose is blank/schema-placeholder but intent.user_purpose
+    // is populated, fall back to user_purpose — the backend's
+    // _preserve_operator_intent would heal the blank from user_purpose on
+    // write-back, but the agent-side thinker validation rejects before that
+    // healing runs. Pre-applying the fallback here lets the thinker's repair
+    // prompt supply the real ground truth.
+    const rawPurpose = typeof intent?.purpose === 'string' ? intent.purpose.trim() : '';
+    const isPlaceholder = rawPurpose === '' || rawPurpose === '...' || /^<[^>]+>$/.test(rawPurpose);
+    const currentPurpose = isPlaceholder
+      ? (typeof intent?.user_purpose === 'string' ? intent.user_purpose.trim() : undefined)
+      : rawPurpose;
 
     // ── Problem-model size/health signal (soft) ──
     // Computed by the backend from the DURABLE pre-trim model (honest counts).

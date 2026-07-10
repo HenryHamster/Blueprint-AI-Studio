@@ -210,7 +210,7 @@ export function scheduleGithubTokenRefresh(
         const controller = new AbortController();
         const timeout = setTimeout(() => { controller.abort(); }, API_TIMEOUT);
         const res = await fetch(
-          `${getOrchestratorUrl()}/api/agent/github/token?task_id=${encodeURIComponent(taskId)}`,
+          `${getOrchestratorUrl()}/api/agent/github/token?task_id=${encodeURIComponent(taskId)}&force_refresh=true`,
           { headers: { ...getHeaders() }, signal: controller.signal },
         );
         clearTimeout(timeout);
