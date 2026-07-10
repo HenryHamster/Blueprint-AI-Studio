@@ -503,7 +503,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const baselineFailures = await captureTestBaseline(ws, statusRef, buildConfig, relatedFiles);
     if (baselineFailures !== null) {
       try {
-        fs.writeFileSync(
+        await fs.promises.writeFile(
           `/tmp/test_baseline_${taskId}.json`,
           JSON.stringify(Array.from(baselineFailures)),
           { mode: 0o644 },
@@ -988,7 +988,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const srRecoveryPath = `/tmp/self_review_${taskId}.json`;
     let srRecovery: Record<string, unknown> = {};
     try {
-      const raw = fs.readFileSync(srRecoveryPath, 'utf-8');
+      const raw = await fs.promises.readFile(srRecoveryPath, 'utf-8');
       if (raw) srRecovery = JSON.parse(raw) as Record<string, unknown>;
     } catch { /* may not exist */ }
     const srCategories = Array.isArray(srRecovery.categories) ? srRecovery.categories as string[] : [];
@@ -1130,7 +1130,7 @@ export async function handleCreate(
     try { git(['fetch', 'origin', `+refs/heads/${prBaseBranch}:refs/remotes/origin/${prBaseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]); } catch { /* ok */ }
     try {
       const mergeBase = git(['merge-base', 'HEAD', `origin/${prBaseBranch}`]).trim();
-      if (mergeBase) fs.writeFileSync(`/tmp/base_commit_${taskId}`, mergeBase);
+      if (mergeBase) await fs.promises.writeFile(`/tmp/base_commit_${taskId}`, mergeBase);
     } catch { /* ok */ }
     const title = strVal(task.title) || 'Operator-requested fresh review';
     await runFreshReviewerPass(taskId, title, rawPrompt || '', relatedFiles, ws, statusRef, model, task.project_context as Record<string, unknown> | undefined, false, false, true, operatorReviewFor, sensitivePathsFromMetadata(task.project_metadata as Record<string, unknown> | undefined));

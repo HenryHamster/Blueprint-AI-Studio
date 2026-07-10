@@ -522,22 +522,25 @@ def _serialize_max_plan_account_row(
 
 
 async def list_authoritative_max_plan_accounts(
-    session: AsyncSession, user_id: str
+    session: AsyncSession,
+    user_id: str,
+    *,
+    limit: int | None = None,
+    offset: int | None = None,
 ) -> list[dict[str, Any]]:
     """Authoritative persisted account roster overlaid with live pool fields."""
     from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
 
-    rows = (
-        (
-            await session.execute(
-                select(MaxPlanAccount)
-                .where(MaxPlanAccount.user_id == user_id)
-                .order_by(MaxPlanAccount.created_at, MaxPlanAccount.id)
-            )
-        )
-        .scalars()
-        .all()
+    q = (
+        select(MaxPlanAccount)
+        .where(MaxPlanAccount.user_id == user_id)
+        .order_by(MaxPlanAccount.created_at, MaxPlanAccount.id)
     )
+    if offset:
+        q = q.offset(offset)
+    if limit is not None:
+        q = q.limit(limit)
+    rows = (await session.execute(q)).scalars().all()
     async with _max_plan_pool_lock:
         mem_by_id = {
             str(account_id): dict(account)
@@ -569,14 +572,25 @@ _FAILURE_CLASS_BUCKET_GROUPS: dict[str, list[str]] = {
 
 @router.get("/max-plan-accounts")
 async def get_max_plan_accounts(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
+    user_id = current_user["user_id"]
+    total = (
+        await session.execute(
+            select(func.count())
+            .select_from(MaxPlanAccount)
+            .where(MaxPlanAccount.user_id == user_id)
+        )
+    ).scalar_one()
     accounts = await list_authoritative_max_plan_accounts(
-        session, current_user["user_id"]
+        session, user_id, limit=limit, offset=offset
     )
     return {
         "accounts": accounts,
+        "total": total,
         "generated_at": _utcnow().isoformat(),
     }
 

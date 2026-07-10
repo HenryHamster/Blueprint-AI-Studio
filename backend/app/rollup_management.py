@@ -1626,6 +1626,12 @@ async def _check_and_trigger_rollup(
             for _art in _pr_arts_result.scalars().all():
                 if _art.task_id not in _pr_art_by_task:
                     _pr_art_by_task[_art.task_id] = _art
+            # Batch-fetch all projects needed by unmerged children in one query.
+            _unmerged_project_ids = {c.project_id for c in unmerged}
+            _projects_result = await session.execute(
+                select(Project).where(Project.id.in_(_unmerged_project_ids))
+            )
+            _project_by_id: dict = {p.id: p for p in _projects_result.scalars().all()}
             for c in unmerged:
                 age = (now - c.updated_at).total_seconds() if c.updated_at else 0
                 if age < stale_threshold.total_seconds():
@@ -1727,7 +1733,7 @@ async def _check_and_trigger_rollup(
                 # review_loop.branch or first_payload.branch — synthesizing
                 # blueprint/task-{fix_id} yields a name no agent ever pushed,
                 # so respawned reviews would fail at `git clone --branch`.
-                project = await session.get(Project, c.project_id)
+                project = _project_by_id.get(c.project_id)
                 branch = resolve_task_branch(
                     c, _get_project_task_branch_namespace(project)
                 )

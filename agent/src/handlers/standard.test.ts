@@ -184,6 +184,10 @@ vi.mock('fs', () => {
     mkdirSync: vi.fn(),
     readdirSync: vi.fn().mockReturnValue([]),
     unlinkSync: vi.fn(),
+    promises: {
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      readFile: vi.fn().mockResolvedValue(''),
+    },
   };
   return { ...stub, default: stub };
 });
@@ -1071,23 +1075,23 @@ describe('test baseline capture', () => {
   });
 
   it('writes test_baseline file when captureTestBaseline returns a non-null set', async () => {
-    const { writeFileSync } = await import('fs');
+    const { default: fs } = await import('fs');
     vi.mocked(captureTestBaseline).mockResolvedValue(new Set(['test A', 'test B']));
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const baselineCalls = vi.mocked(writeFileSync).mock.calls.filter(c => String(c[0]).includes('test_baseline_'));
+    const baselineCalls = vi.mocked(fs.promises.writeFile).mock.calls.filter(c => (c[0] as string).includes('test_baseline_'));
     expect(baselineCalls).toHaveLength(1);
     expect(baselineCalls[0][0]).toBe(`/tmp/test_baseline_${TASK_ID}.json`);
-    expect(baselineCalls[0][1]).toContain('test A');
+    expect(baselineCalls[0][1] as string).toContain('test A');
   });
 
   it('does not write test_baseline file when captureTestBaseline returns null', async () => {
-    const { writeFileSync } = await import('fs');
-    vi.mocked(writeFileSync).mockClear();
+    const { default: fs } = await import('fs');
+    vi.mocked(fs.promises.writeFile).mockClear();
     vi.mocked(captureTestBaseline).mockResolvedValue(null);
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const baselineCalls = vi.mocked(writeFileSync).mock.calls.filter(c => String(c[0]).includes('test_baseline_'));
+    const baselineCalls = vi.mocked(fs.promises.writeFile).mock.calls.filter(c => (c[0] as string).includes('test_baseline_'));
     expect(baselineCalls).toHaveLength(0);
   });
 });
@@ -3443,11 +3447,11 @@ describe('runStandardHandler incomplete_review auto-trigger', () => {
     const { default: fs } = await import('fs');
     const idx = await import('../index.js');
     vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
-    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+    vi.mocked(fs.promises.readFile).mockImplementation((p: unknown) => {
       if (typeof p === 'string' && p.includes('self_review_')) {
-        return JSON.stringify({ verdict: 'pass', categories: ['incomplete_review'] });
+        return Promise.resolve(JSON.stringify({ verdict: 'pass', categories: ['incomplete_review'] }));
       }
-      return '';
+      return Promise.resolve('');
     });
     vi.mocked(idx.runClaudeCode).mockResolvedValue({
       exitCode: 0,
@@ -3468,15 +3472,15 @@ describe('runStandardHandler incomplete_review auto-trigger', () => {
     const { default: fs } = await import('fs');
     const idx = await import('../index.js');
     vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
-    vi.mocked(fs.readFileSync).mockImplementation((p: unknown) => {
+    vi.mocked(fs.promises.readFile).mockImplementation((p: unknown) => {
       if (typeof p === 'string' && p.includes('self_review_')) {
-        return JSON.stringify({
+        return Promise.resolve(JSON.stringify({
           verdict: 'pass',
           categories: ['incomplete_review'],
           reviewer_findings: [{ category: 'correctness', severity: 'HIGH', description: 'prior finding' }],
-        });
+        }));
       }
-      return '';
+      return Promise.resolve('');
     });
 
     await handleCreate(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());

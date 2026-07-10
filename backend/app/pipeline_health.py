@@ -79,6 +79,21 @@ async def _evaluate_sr_catch_rate_targets(
     if sr_trends.get("prompt_version_changed"):
         return
     categories = sr_trends.get("categories") or {}
+    all_titles = [
+        f"{_SR_CATCH_RATE_TARGET_ALERT_PREFIX}{cat}" for cat in targets
+    ]
+    existing_alerts = (
+        await session.execute(
+            select(Alert).where(
+                Alert.project_id == project_id,
+                Alert.task_id.is_(None),
+                Alert.severity == AlertSeverity.WARNING,
+                Alert.dismissed_at.is_(None),
+                Alert.title.in_(all_titles),
+            )
+        )
+    ).scalars().all()
+    existing_by_title: dict = {a.title: a for a in existing_alerts}
     for cat, target in targets.items():
         try:
             target_float = float(target)
@@ -88,21 +103,7 @@ async def _evaluate_sr_catch_rate_targets(
         current_hit_rate = cat_data.get("current_hit_rate")
         title = f"{_SR_CATCH_RATE_TARGET_ALERT_PREFIX}{cat}"
 
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.task_id.is_(None),
-                        Alert.severity == AlertSeverity.WARNING,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title == title,
-                    )
-                )
-            )
-            .scalars()
-            .first()
-        )
+        existing = existing_by_title.get(title)
         if current_hit_rate is not None and current_hit_rate >= target_float:
             if existing is not None:
                 existing.dismissed_at = _utcnow()
