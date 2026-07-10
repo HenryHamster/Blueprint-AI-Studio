@@ -306,13 +306,20 @@ async def compute_direction_drift(
             dir_id = payload.get("current_direction_id")
         if not dir_id:
             continue
-        per_direction_claims[dir_id] = per_direction_claims.get(
-            dir_id, 0
-        ) + _direction_claimed_changes(t)
-        # Merged PRs must have a PR artifact and the canonical integration
-        # landing signal; merge-equivalent unblock markers are not shipped.
-        if t.id in pr_artifact_task_ids and has_landed_signal(t):
-            per_direction_merged[dir_id] = per_direction_merged.get(dir_id, 0) + 1
+        # Gate claims on PR-artifact presence so claims and merges measure the
+        # same population: only tasks that opened a PR (have a PULL_REQUEST
+        # artifact) can claim a shipped change.  Without this gate, review/
+        # research/fix child tasks that share a direction_id but never open a
+        # PR of their own inflate claimed_changes_count while never contributing
+        # to actually_merged_prs, producing a structurally low consistency ratio.
+        if t.id in pr_artifact_task_ids:
+            per_direction_claims[dir_id] = per_direction_claims.get(
+                dir_id, 0
+            ) + _direction_claimed_changes(t)
+            # Merged PRs must also pass the canonical integration landing signal;
+            # merge-equivalent unblock markers are not counted as shipped.
+            if has_landed_signal(t):
+                per_direction_merged[dir_id] = per_direction_merged.get(dir_id, 0) + 1
 
     for d in directions:
         did = d.get("id")
