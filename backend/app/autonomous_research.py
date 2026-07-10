@@ -66,6 +66,7 @@ from app.capability_demand import (
 )
 from app.capability_registry import (
     annotate_capability_proof_status as _annotate_capability_proof_status,
+    registry_capability_evidence_refs_map,
     registry_capability_names,
     registry_capability_vocabulary,
 )
@@ -2236,6 +2237,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         _available_capabilities = _annotate_capability_proof_status(
             registry_capability_vocabulary(project.problem_model),
             getattr(project, "capability_proof_records", None),
+            registry_capability_evidence_refs_map(project.problem_model),
         )
         if _available_capabilities:
             research_payload["available_capabilities"] = _available_capabilities

@@ -136,6 +136,28 @@ def registry_capability_vocabulary(problem_model: object) -> list[dict]:
     return vocab
 
 
+def registry_capability_evidence_refs_map(problem_model: object) -> dict[str, list]:
+    """Build ``{canonical_cap_name: [EvidenceRef, ...]}`` from a problem_model.
+
+    Returns a map of every capability's ``evidence_refs`` indexed by its
+    canonical (normalized) name, matching the ``evidence_refs_map`` contract
+    that :func:`annotate_capability_proof_status` consumes as its tier-1
+    source of truth.  Capabilities with no ``evidence_refs`` (missing,
+    ``None``, or empty) are omitted so the annotator falls back to
+    proof-records for those, preserving backward compatibility.
+
+    IO-free — reads only from the in-memory model.
+    """
+    refs_map: dict[str, list] = {}
+    for raw_name, _status, _absorbs, evidence_refs in _iter_capability_evidence_entries(
+        problem_model
+    ):
+        normalized = normalize_capability_name(raw_name)
+        if normalized and isinstance(evidence_refs, list) and evidence_refs:
+            refs_map[normalized] = evidence_refs
+    return refs_map
+
+
 def annotate_capability_proof_status(
     vocab: list[dict],
     proof_records: dict | None,

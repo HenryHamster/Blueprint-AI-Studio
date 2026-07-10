@@ -799,6 +799,92 @@ async def test_fresh_attestation_no_expiry_attention_item(db_session):
     )
 
 
+def test_uncorroborated_attestation_escalates_beyond_flat_penalty():
+    """When NO criterion carries machine-verified evidence (covered=0, attested>0),
+    the attestation penalty is DOUBLED — escalation beyond the flat proportional penalty.
+
+    The flat penalty (ATTESTATION_PENALTY_WEIGHT * attested/total) applies when at
+    least one criterion has machine-verified coverage.  When ALL attested criteria
+    are uncorroborated (covered == 0), the penalty is multiplied by
+    UNCORROBORATED_PENALTY_MULTIPLIER so a version that relied entirely on operator
+    waivers scores visibly lower.
+    """
+    from app.release_scoring import (
+        compute_composite,
+        ATTESTATION_PENALTY_WEIGHT,
+        UNCORROBORATED_PENALTY_MULTIPLIER,
+    )
+
+    policy = {"threshold": 0.75}
+
+    # Case 1: Uncorroborated — all criteria are attested-only, zero machine evidence.
+    # flat penalty = ATTESTATION_PENALTY_WEIGHT * (2/2) = 0.15
+    # escalated    = 0.15 * UNCORROBORATED_PENALTY_MULTIPLIER(2.0) = 0.30
+    # confidence   = 1.0 * (1 - 0.30) = 0.70
+    result = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy=policy,
+        criterion_coverage={
+            "total": 2,
+            "covered": 0,
+            "attested": 2,
+            "partial": 0,
+            "uncovered": 0,
+        },
+    )
+    assert result["blocker"] is None
+    expected_penalty = ATTESTATION_PENALTY_WEIGHT * (2 / 2) * UNCORROBORATED_PENALTY_MULTIPLIER
+    assert result["confidence"] == pytest.approx(1.0 * (1.0 - expected_penalty))
+    assert result["sub_scores"].get("uncorroborated_attested") is True
+
+    # Case 2: Corroborated — attestation exists alongside machine-verified evidence.
+    # flat penalty = ATTESTATION_PENALTY_WEIGHT * (1/2) = 0.075
+    # NO escalation because covered=1 > 0.
+    # confidence   = 1.0 * (1 - 0.075) = 0.925
+    result2 = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy=policy,
+        criterion_coverage={
+            "total": 2,
+            "covered": 1,
+            "attested": 1,
+            "partial": 0,
+            "uncovered": 0,
+        },
+    )
+    assert result2["blocker"] is None
+    flat_penalty = ATTESTATION_PENALTY_WEIGHT * (1 / 2)
+    assert result2["confidence"] == pytest.approx(1.0 * (1.0 - flat_penalty))
+    assert result2["sub_scores"].get("uncorroborated_attested") is None
+
+    # Case 3: Partially uncorroborated — some criteria covered, some attested-only,
+    # but not ALL are attestation-only → no escalation (covered > 0).
+    result3 = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy=policy,
+        criterion_coverage={
+            "total": 3,
+            "covered": 1,
+            "attested": 2,
+            "partial": 0,
+            "uncovered": 0,
+        },
+    )
+    assert result3["blocker"] is None
+    flat_penalty3 = ATTESTATION_PENALTY_WEIGHT * (2 / 3)
+    assert result3["confidence"] == pytest.approx(1.0 * (1.0 - flat_penalty3))
+    assert result3["sub_scores"].get("uncorroborated_attested") is None
+
+
 # ---------------------------------------------------------------------------
 # get_criterion_by_key, criterion_ids propagation, and merge evidence recording
 # ---------------------------------------------------------------------------

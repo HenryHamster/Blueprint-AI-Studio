@@ -476,6 +476,83 @@ def resolve_dimension_states(
     return result
 
 
+# Dimensions the QualificationDimensionResult ledger writes (10 total, 8 of which
+# overlap with the 10 UI dimensions). The 2 UI-only dimensions NOT in the ledger
+# (criterion_coverage, goal_alignment) must still be derived from the blob.
+_LEDGER_DIMENSION_KEYS: frozenset[str] = frozenset({
+    "audit", "test_erosion", "smoketest", "ci",
+    "migration_identity", "migration_apply", "merge_grade", "debt_pressure",
+})
+
+
+def _ledger_status_to_ui(status: str) -> str:
+    """Map the ledger's status vocabulary to the UI dimension-state vocabulary.
+
+    The ledger writes ``passed``/``blocked``/``failed``/``unavailable``.
+    The UI expects ``passed``/``failed``/``unavailable``/``not_applicable``/``pending``.
+    ``blocked`` is the only vocabulary difference — mapped to ``failed`` for the UI.
+    """
+    return "failed" if status == "blocked" else status
+
+
+async def resolve_dimension_states_from_ledger(
+    session: AsyncSession,
+    version: ReleaseVersion,
+) -> list[dict[str, Any]]:
+    """Resolve per-dimension qualification state from the QualificationDimensionResult ledger.
+
+    When ledger rows exist for the version's current ``candidate_sha``, derive
+    dimension states from the ledger for the 8 overlapping dimensions (audit,
+    test_erosion, smoketest, ci, migration_identity, migration_apply, merge_grade,
+    debt_pressure) plus the synchronous blob derivation for the 2 dimensions the
+    ledger does not write (criterion_coverage, goal_alignment). When no ledger
+    rows exist for this candidate SHA, fall back entirely to the original
+    :func:`resolve_dimension_states` (pure, from ``last_qualification``).
+
+    Requires a DB session for the ledger query. Pure (no side effects).
+    """
+    qual = version.last_qualification if isinstance(version.last_qualification, dict) else {}
+    candidate_sha = qual.get("candidate_sha")
+
+    if not candidate_sha:
+        return resolve_dimension_states(version.last_qualification)
+
+    from app.models import QualificationDimensionResult  # noqa: PLC0415
+
+    rows = (
+        (
+            await session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id,
+                    QualificationDimensionResult.candidate_sha == candidate_sha,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not rows:
+        return resolve_dimension_states(version.last_qualification)
+
+    # Start with the full blob-derived state (all 10 dimensions). Then overwrite
+    # the 8 ledger-backed dimensions with ledger data. The 2 blob-only dimensions
+    # (criterion_coverage, goal_alignment) are preserved from the blob.
+    result = resolve_dimension_states(version.last_qualification)
+    ledger_map = {row.dimension: row for row in rows}
+
+    for entry in result:
+        key = entry["key"]
+        if key in _LEDGER_DIMENSION_KEYS:
+            row = ledger_map.get(key)
+            if row is not None:
+                entry["status"] = _ledger_status_to_ui(row.status)
+                entry["score"] = row.sub_score
+                entry["reason"] = row.blocker
+
+    return result
+
+
 async def resolve_open_version_qualification_state(
     session: AsyncSession,
     version: ReleaseVersion,

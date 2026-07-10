@@ -31919,10 +31919,13 @@ class TestBlindMergeGradeBlock:
     def test_compute_composite_attested_only_does_not_block_but_penalizes(self):
         """An attestation-covered criterion clears the blocker but reduces confidence.
 
-        With perfect sub-scores (existing_confidence == 1.0) and one fully-attested
-        criterion the penalty is ATTESTATION_PENALTY_WEIGHT * (1/1) = 0.15, so the
-        composite is 0.85 — non-zero (deadlock-breaker preserved) but visibly below
-        a machine-verified 1.0.
+        With perfect sub-scores (existing_confidence == 1.0), one fully-attested
+        criterion, and NO machine-verified evidence (covered=0, attested=1), the
+        penalty is ATTESTATION_PENALTY_WEIGHT * (1/1) * UNCORROBORATED_PENALTY_MULTIPLIER
+        = 0.30 (doubled because the attestation is completely uncorroborated), so the
+        composite is 0.70 — non-zero (deadlock-breaker preserved) but substantially
+        below a machine-verified 1.0 and below the promotion threshold when the
+        version relied entirely on an operator waiver with zero machine corroboration.
         """
         result = rq.compute_composite(
             ci_green=True,
@@ -31939,10 +31942,11 @@ class TestBlindMergeGradeBlock:
             },
         )
         assert result["blocker"] is None
-        # 1.0 * (1 - 0.15) == 0.85
-        assert result["confidence"] == 0.85
-        assert result["promote"] is True  # 0.85 >= threshold 0.75
+        # 1.0 * (1 - 0.15 * 2.0) == 0.70
+        assert result["confidence"] == 0.70
+        assert result["promote"] is False  # 0.70 < threshold 0.75
         assert result["sub_scores"]["attested_count"] == 1
+        assert result["sub_scores"].get("uncorroborated_attested") is True
 
     def test_compute_composite_attested_penalty_is_proportional(self):
         """The penalty scales with the attested fraction of total criteria."""

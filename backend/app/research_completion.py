@@ -95,6 +95,7 @@ from app.task_evaluators import (
 from app.capability_registry import (
     annotate_capability_proof_status,
     off_registry_capability_refs,
+    registry_capability_evidence_refs_map,
     registry_capability_names,
     registry_capability_vocabulary,
 )
@@ -1898,6 +1899,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _registry_vocab = annotate_capability_proof_status(
         registry_capability_vocabulary(getattr(project_obj, "problem_model", None)),
         getattr(project_obj, "capability_proof_records", None),
+        registry_capability_evidence_refs_map(getattr(project_obj, "problem_model", None)),
     )
     _annotate_capability_declarations(findings, _registry_names)
 

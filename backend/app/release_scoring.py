@@ -62,6 +62,13 @@ DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT = 0.15
 # machine evidence, not a hard block).  Configurable in one place.
 ATTESTATION_PENALTY_WEIGHT = 0.15
 
+#: Additional penalty multiplier applied when NO criterion carries machine-verified
+#: evidence (``coverage["covered"] == 0``) — i.e., every ``"attested"`` criterion
+#: is a pure operator waiver with zero machine corroboration.  The flat
+#: ATTESTATION_PENALTY_WEIGHT penalises the existence of attestations; this
+#: multiplier escalates when those attestations are completely uncorroborated.
+UNCORROBORATED_PENALTY_MULTIPLIER = 2.0
+
 
 def coerce_completion_debt_weight(weights_raw: Any) -> float:
     """Read the OPTIONAL ``completion_debt`` blend weight from a weights mapping.
@@ -637,6 +644,13 @@ def compute_composite(
     # without hard-blocking (the deadlock-breaker waiver is preserved).
     if attested_count > 0 and total_criteria > 0:
         penalty = ATTESTATION_PENALTY_WEIGHT * (attested_count / total_criteria)
+        # Escalate when attestations are completely uncorroborated — no criterion
+        # carries machine-verified evidence (covered == 0), meaning every
+        # attested criterion is a pure operator waiver with zero corroboration.
+        covered_count = int(criterion_coverage.get("covered") or 0)
+        if covered_count == 0:
+            penalty *= UNCORROBORATED_PENALTY_MULTIPLIER
+            sub_scores["uncorroborated_attested"] = True
         confidence *= 1.0 - penalty
 
     confidence = round(_clamp01(confidence), 4)

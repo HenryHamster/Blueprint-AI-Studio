@@ -26,6 +26,7 @@ from app.capability_proof import (
     record_gap_evidence,
     should_record_capability_proof,
 )
+from app.capability_registry import registry_capability_evidence_refs_map
 from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 from app.capability_trial_verdict import (
     evaluate_trial_verdict,
@@ -469,6 +470,124 @@ class TestCapabilityProofViews:
         assert enriched["capabilities"][0]["proof_records"][0]["proof_ref"] == "art-123"
         assert enriched["capabilities"][1]["proof_status"] == "unproven"
         assert "proof_records" not in enriched["capabilities"][1]
+
+
+class TestCapabilityBadgeReflectsEvidence:
+    """annotate_capability_proof_status: evidence_refs_map (tier-1) overrides
+    proof_records (tier-2) for capability badge accuracy.
+
+    The named test ``test_spawn_badge_reflects_reverified_capability_evidence``
+    exercises the exact defect: a capability with proof_records claiming proven
+    status but re-verified evidence_refs showing no proven refs must read
+    ``partial`` in the badge, not ``proven``.
+    """
+
+    def test_spawn_badge_reflects_reverified_capability_evidence(self):
+        """evidence_refs_map classification wins over proof_records existence check."""
+        vocab = [
+            {"name": "ci-pipeline", "status": "working"},
+            {"name": "repo-map", "status": "working"},
+            {"name": "unproven-cap", "status": "working"},
+        ]
+        proof_records = {
+            "ci-pipeline": [
+                {
+                    "task_id": "task-1",
+                    "proved_at": "2026-06-01T00:00:00Z",
+                    "proof_kind": "named_test",
+                    "proof_ref": "testing/test_ci.py::test_ci",
+                    "commit_sha": "abc",
+                }
+            ],
+            "repo-map": [
+                {
+                    "task_id": "task-2",
+                    "proved_at": "2026-06-02T00:00:00Z",
+                    "proof_kind": "named_test",
+                    "proof_ref": "testing/test_repo_map.py::test_map",
+                    "commit_sha": "def",
+                }
+            ],
+        }
+        evidence_refs_map = {
+            # ci-pipeline has evidence but none proven → partial
+            "ci-pipeline": [
+                {
+                    "kind": "named_test",
+                    "ref": "test_ci.py::test_ci",
+                    "proven": False,
+                    "source_id": "task-1",
+                }
+            ],
+            # repo-map has a proven ref → proven
+            "repo-map": [
+                {
+                    "kind": "named_test",
+                    "ref": "test_repo_map.py::test_map",
+                    "proven": True,
+                    "source_id": "task-2",
+                }
+            ],
+        }
+
+        annotated = annotate_capability_proof_status(
+            vocab, proof_records, evidence_refs_map
+        )
+
+        # ci-pipeline: evidence_refs_map has no proven ref → partial (tier-1 wins
+        # over tier-2 proof_records which would say "proven")
+        assert annotated[0]["proof_status"] == "partial", (
+            "ci-pipeline: evidence_refs shows only proven=False refs → partial, "
+            "despite proof_records marking it proven"
+        )
+        # repo-map: evidence_refs_map has a proven=True ref → proven
+        assert annotated[1]["proof_status"] == "proven", (
+            "repo-map: evidence_refs has proven=True → proven"
+        )
+        # unproven-cap: no entry in evidence_refs_map, falls back to proof_records
+        # which has no record → unproven
+        assert annotated[2]["proof_status"] == "unproven", (
+            "unproven-cap: no evidence_refs_map entry and no proof_record → unproven"
+        )
+        # Original vocab must be unmutated (fail-open contract)
+        assert "proof_status" not in vocab[0]
+
+    def test_registry_capability_evidence_refs_map_builds_correctly(self):
+        """registry_capability_evidence_refs_map extracts evidence_refs from problem_model."""
+        problem_model = {
+            "capabilities": [
+                {
+                    "name": "ci-pipeline",
+                    "status": "working",
+                    "evidence_refs": [
+                        {
+                            "kind": "named_test",
+                            "ref": "test_ci.py::test_ci",
+                            "proven": True,
+                        }
+                    ],
+                },
+                {"name": "empty-ev", "status": "working", "evidence_refs": []},
+                {"name": "no-refs", "status": "working"},
+                {"name": "planned-cap", "status": "planned"},
+            ]
+        }
+        refs_map = registry_capability_evidence_refs_map(problem_model)
+
+        assert "ci-pipeline" in refs_map, (
+            "ci-pipeline with non-empty evidence_refs must be present"
+        )
+        assert "empty-ev" not in refs_map, (
+            "empty-ev with empty evidence_refs must be omitted"
+        )
+        assert "no-refs" not in refs_map, (
+            "no-refs with missing evidence_refs must be omitted"
+        )
+        assert "planned-cap" not in refs_map, (
+            "planned-cap with no evidence_refs must be omitted"
+        )
+        assert len(refs_map["ci-pipeline"]) == 1
+        assert refs_map["ci-pipeline"][0]["proven"] is True
 
 
 # ── carry_proof_records_for_consolidation ─────────────────────────────────────

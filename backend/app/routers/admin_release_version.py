@@ -33,6 +33,7 @@ from app.qualification_state_resolver import (
     resolve_open_version_qualification_state,
     resolve_promotion_blocking_result,
     resolve_dimension_states,
+    resolve_dimension_states_from_ledger,
 )
 from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
@@ -322,7 +323,14 @@ async def _serialize_version_history_entry(
         # active criteria only; inactive audit rows may still appear in criteria.
         "criterion_coverage": criterion_coverage,
         # Per-dimension qualification state — additive, same shape as current_version.
-        "dimension_states": resolve_dimension_states(version.last_qualification),
+        # When a DB session is available, prefer the QualificationDimensionResult ledger
+        # (which survives re-qualification overwrites); otherwise fall back to the
+        # mutable last_qualification blob.
+        "dimension_states": (
+            await resolve_dimension_states_from_ledger(session, version)
+            if session is not None
+            else resolve_dimension_states(version.last_qualification)
+        ),
     }
 
 
@@ -840,7 +848,8 @@ async def get_version_lifecycle(
                 # Always a list (empty when no qualification has run); each entry
                 # has key, label, status, score, reason. Additive — never breaks
                 # older clients that ignore unknown fields.
-                "dimension_states": resolve_dimension_states(open_row.last_qualification),
+                # Prefers the QualificationDimensionResult ledger when populated.
+                "dimension_states": await resolve_dimension_states_from_ledger(session, open_row),
             }
 
         history_rows = (
