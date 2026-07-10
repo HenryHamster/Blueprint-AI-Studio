@@ -46,6 +46,7 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -604,6 +605,9 @@ _KNOWN_UNFAITHFUL_ALLOWLIST: frozenset[str] = frozenset({
     "test_reaper.py::test_orphan_project_batch_expired_before_merged_pr_classification",
     "test_reaper.py::test_orphan_project_batch_expired_before_open_pr_review_spawn",
     "test_warm_pool_maintainer.py::test_idle_reaper_continues_after_retire_failure",
+    # alembic serialization test: docstring describes greenlet-bridged DDL
+    # concurrency but the test exercises no ORM session — uses a fake engine.
+    "test_migration_apply_gate.py::test_concurrent_applies_are_serialized",
     # endpoint integration tests: load_only projection context in docstring;
     # the endpoint succeeds because the fix applies the right projection,
     # but the deferred-column MissingGreenlet fault is not directly injected.
@@ -642,7 +646,7 @@ def _unfaithful_greenlet_tests(path: Path) -> list[str]:
         if not node.name.startswith("test_"):
             continue
         docstring = ast.get_docstring(node)
-        if not docstring or "MissingGreenlet" not in docstring:
+        if not docstring or "greenlet" not in docstring.lower():
             continue
 
         # --- fidelity check 1: raise MissingGreenlet in body ---
@@ -746,6 +750,41 @@ class TestMissingGreenletTestsFaithful:
                 f"GREENLET_FIDELITY_FIXTURE_NAMES. Current _FIDELITY_FIXTURE_NAMES: "
                 f"{sorted(_FIDELITY_FIXTURE_NAMES)}"
             )
+
+    def test_greenlet_lowercase_docstring_is_scanned(self, tmp_path):
+        """A test whose docstring contains 'greenlet' in lowercase must be
+        flagged by the fidelity scanner.
+
+        Regression: before the docstring trigger was widened from the case-
+        sensitive literal 'MissingGreenlet' to the case-insensitive stem
+        'greenlet', a test describing its fault class as 'greenlet-bridged DDL'
+        (test_migration_apply_gate.py:349) or similar alternate phrasing escaped
+        the scan and could pass tautologically on SQLite.
+        """
+        # Exercise the production code constant in backend/conftest.py.
+        conftest_path = _BACKEND_ROOT / "conftest.py"
+        assert conftest_path.exists()
+        content = conftest_path.read_text()
+        assert "GREENLET_DOCSTRING_TRIGGER" in content, (
+            "backend/conftest.py must define GREENLET_DOCSTRING_TRIGGER "
+            "as the scan keyword for the MissingGreenlet fidelity guard."
+        )
+
+        # Verify the scanner catches a synthetic test whose docstring
+        # uses lowercase 'greenlet' without mentioning 'MissingGreenlet'.
+        test_file = tmp_path / "test_greenlet_fake.py"
+        test_file.write_text(textwrap.dedent("""\
+            async def test_greenlet_subject():
+                \"\"\"Uses greenlet-bridged DDL — can raise MissingGreenlet on SQLite.\"\"\"
+                pass
+        """))
+        violations = _unfaithful_greenlet_tests(test_file)
+        assert any("test_greenlet_subject" in v for v in violations), (
+            f"Lowercase 'greenlet' docstring was not flagged by the scanner. "
+            f"Expected temp test to appear in violations, got: {violations}. "
+            "The docstring trigger at _unfaithful_greenlet_tests may still "
+            "be missing case-insensitive 'greenlet' matching."
+        )
 
     def test_missing_greenlet_tests_are_faithful(self):
         """Scan all test_*.py files and fail if any test mentions MissingGreenlet

@@ -72,3 +72,11 @@ GREENLET_FIDELITY_FIXTURE_NAMES: tuple[str, ...] = (
     "expire_fidelity",       # restores _InstanceState._expire for one test
     "missing_greenlet_proxy",  # proxy factory that raises MissingGreenlet on poison
 )
+
+# Case-insensitive stem keyword that triggers the fidelity-docstring scan in
+# test_audit_finding_class_guards.py::_unfaithful_greenlet_tests.  Widen from
+# the literal "MissingGreenlet" to the stem "greenlet" so tests that describe
+# the identical fault class with standard alternate phrasings (greenlet_spawn,
+# "greenlet context", "greenlet-bridged DDL") are also caught.  Defined here in
+# the conftest so the fixture-manifest and scan-trigger are co-located.
+GREENLET_DOCSTRING_TRIGGER: str = "greenlet"
