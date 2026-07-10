@@ -102,6 +102,9 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # same "log and keep retrying" pattern (DB lookup races, GitHub API blips, merge retries).
 # Crashing here would leave a PR in limbo with no progress.
 "app/ci_completion.py" = ["BLE001"]
+# plan_completion.py resolves criterion_ids from the direction row at spawn time.
+# A lookup failure must not break the plan-decomposition loop (log-and-continue).
+"app/plan_completion.py" = ["BLE001"]
 # ci_merge_helpers.py was extracted from ci_completion.py; _post_merge_summary
 # carries the same best-effort "log and continue" broad-except pattern.
 "app/ci_merge_helpers.py" = ["BLE001"]

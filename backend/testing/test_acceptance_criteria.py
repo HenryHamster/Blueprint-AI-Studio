@@ -17,6 +17,7 @@ Exercises :mod:`app.acceptance_criteria`:
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
@@ -5784,3 +5785,92 @@ async def test_metrics_integrity_coverage_evidence_is_idempotent(db_session):
     assert len(await ac.get_evidence_for_criterion(db_session, criterion.id)) == 1
 
     mis._reset_observability_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# plan_completion criterion_ids propagation (real spawn path regression)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_plan_completion_propagates_criterion_ids_from_direction(db_session, mocker):
+    """A plan task with direction_id propagates criterion_ids to children.
+
+    Exercises the real plan-completion spawn path (not a synthetic
+    constructed-in-place Task) to confirm that children created by
+    _handle_plan_completion inherit criterion_ids from the parent direction
+    on the model AND direction_id in context.
+    """
+    from app.plan_completion import _handle_plan_completion
+    from testing.factories import make_project
+
+    project = make_project(name="PlanCriterionPropagation")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Plan-child criterion",
+    )
+
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-plan-prop",
+        data={"id": "d-plan-prop", "text": "Plan propagation test", "status": "active"},
+        status="active",
+        text="Plan propagation test",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+
+    plan_task = Task(
+        project_id=project.id,
+        title="Plan: propagate criteria",
+        payloads=[{"type": "plan", "prompt": "split work", "base_branch": "main"}],
+        context={"direction_id": "d-plan-prop"},
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(plan_task)
+    await db_session.commit()
+    await db_session.refresh(plan_task)
+
+    # Patch external calls that require network or DB — plan completion does
+    # not need these for child-task creation (they affect the parent status but
+    # not the children we are testing).  _ensure_branch must return a non-None
+    # Task so the plan-completion flow proceeds past the relock gate.
+    mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=plan_task,
+    )
+    mocker.patch("app.plan_completion.broadcast_to_project", new_callable=AsyncMock)
+
+    plan_logs = json.dumps({
+        "subtasks": [
+            {"title": "feat: implement", "prompt": "do the work", "scope": "small"},
+        ],
+    })
+
+    await _handle_plan_completion(plan_task, plan_logs, db_session)
+
+    children = (
+        (await db_session.execute(
+            select(Task).where(Task.parent_task_id == plan_task.id),
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+
+    # Criterion_ids propagated from direction onto the Task model column.
+    assert criterion.criterion_key in (child.criterion_ids or []), (
+        f"child.criterion_ids must include {criterion.criterion_key!r}; got {child.criterion_ids}"
+    )
+    # Direction_id propagated in child context.
+    assert (child.context or {}).get("direction_id") == "d-plan-prop", (
+        "child context must carry parent direction_id"
+    )
