@@ -44,7 +44,7 @@ from app.models import (
 from app.compute import provision_agent_vm  # noqa: F401  (re-exported for test patches; see main.py:108 docstring)
 from app.deployed_sha import resolve_deployed_sha
 from app.auth import get_current_user, get_current_user_optional, verify_agent_jwt
-from app.admin_helpers import _get_user_project, _get_user_task
+from app.admin_helpers import _get_user_project
 from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
@@ -1460,7 +1460,7 @@ async def resolve_artifact_download_url(
         StorageUriError,
         generate_download_signed_url,
         parse_artifact_uri,
-        task_id_for_artifact_uri,
+        verify_artifact_project_ownership,
     )
 
     # 1. Scheme + bucket allowlist. Reject malformed/out-of-bucket before any
@@ -1471,38 +1471,29 @@ async def resolve_artifact_download_url(
         logger.info("[ARTIFACT] rejected download reference: %s", exc)
         raise HTTPException(status_code=400, detail="Invalid artifact reference")
 
-    # 2. Bind the reference to its owning task or compute job, then authorize
-    # the caller for that project's membership. A reference that doesn't resolve
-    # to something the caller may access is indistinguishable from "not found".
-    owning_task_id = task_id_for_artifact_uri(storage_uri)
-    if owning_task_id is not None:
-        task = await _get_user_task(owning_task_id, current_user["user_id"], session)
-        if task.project_id != project_id:
-            # Reference belongs to a different project than the one the operator
-            # is viewing — reject as not-found rather than confirming it exists.
-            raise HTTPException(status_code=404, detail="Artifact not found")
-    else:
-        owning_compute_job_id = compute_job_id_for_artifact_uri(storage_uri)
-        if owning_compute_job_id is None:
-            raise HTTPException(status_code=404, detail="Artifact not found")
-        from app.models import ComputeJob  # noqa: PLC0415
+    # 2a. User membership in the claimed project.
+    await _get_user_project(project_id, current_user["user_id"], session)
+
+    # 2b. Artifact→project ownership via the centralized helper. A reference
+    # that doesn't resolve to a task or compute-job prefix is rejected as
+    # not-found so unrecognised prefixes can't be probed.
+    try:
+        await verify_artifact_project_ownership(storage_uri, project_id, session)
+    except StorageUriError:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    # 2c. Compute-job URIs have an additional guard: only the recorded terminal
+    # outputs are signable; unknown siblings under the same prefix are
+    # indistinguishable from "not found".
+    owning_compute_job_id = compute_job_id_for_artifact_uri(storage_uri)
+    if owning_compute_job_id is not None:
+        from app.models import ComputeJob, Artifact  # noqa: PLC0415
 
         job = await session.get(ComputeJob, owning_compute_job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="Artifact not found")
-        await _get_user_project(job.project_id, current_user["user_id"], session)
-        if job.project_id != project_id:
-            raise HTTPException(status_code=404, detail="Artifact not found")
-
-        # Project membership is necessary but not sufficient for compute-job
-        # URIs. Only the recorded terminal outputs are allowed; unknown siblings
-        # under the same prefix are indistinguishable from "not found".
         allowed_uris: set[str] = set()
-        if job.result_reference:
+        if job and job.result_reference:
             allowed_uris.add(job.result_reference)
-        if job.artifact_id is not None:
-            from app.models import Artifact  # noqa: PLC0415
-
+        if job and job.artifact_id is not None:
             artifact = await session.get(Artifact, job.artifact_id)
             if artifact is not None and artifact.storage_uri:
                 allowed_uris.add(artifact.storage_uri)
@@ -1517,7 +1508,7 @@ async def resolve_artifact_download_url(
         # Defensive: should be unreachable since step 1 validated the URI.
         raise HTTPException(status_code=400, detail="Invalid artifact reference")
     except Exception as exc:
-        logger.warning("[ARTIFACT] signing failed for task %s: %s", owning_task_id, exc)
+        logger.warning("[ARTIFACT] signing failed for %s: %s", storage_uri, exc)
         raise HTTPException(status_code=503, detail="Artifact storage unavailable")
     return {"url": url}
 
