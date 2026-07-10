@@ -31409,6 +31409,98 @@ class TestBlindMergeGradeBlock:
         assert result["blocker"] is None
         assert result["promote"] is True
 
+    # --- Attestation tier: penalize instead of hard-block ------------------
+
+    def test_compute_composite_attested_only_does_not_block_but_penalizes(self):
+        """An attestation-covered criterion clears the blocker but reduces confidence.
+
+        With perfect sub-scores (existing_confidence == 1.0) and one fully-attested
+        criterion the penalty is ATTESTATION_PENALTY_WEIGHT * (1/1) = 0.15, so the
+        composite is 0.85 — non-zero (deadlock-breaker preserved) but visibly below
+        a machine-verified 1.0.
+        """
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 1,
+                "covered": 0,
+                "attested": 1,
+                "partial": 0,
+                "uncovered": 0,
+            },
+        )
+        assert result["blocker"] is None
+        # 1.0 * (1 - 0.15) == 0.85
+        assert result["confidence"] == 0.85
+        assert result["promote"] is True  # 0.85 >= threshold 0.75
+        assert result["sub_scores"]["attested_count"] == 1
+
+    def test_compute_composite_attested_penalty_is_proportional(self):
+        """The penalty scales with the attested fraction of total criteria."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 2,
+                "covered": 1,
+                "attested": 1,
+                "partial": 0,
+                "uncovered": 0,
+            },
+        )
+        assert result["blocker"] is None
+        # penalty = 0.15 * (1/2) = 0.075 → 1.0 * 0.925 == 0.925
+        assert result["confidence"] == 0.925
+        assert result["sub_scores"]["attested_count"] == 1
+
+    def test_compute_composite_genuinely_uncovered_still_blocks_despite_attestation(self):
+        """A truly-uncovered criterion hard-blocks even when another is attested."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 2,
+                "covered": 0,
+                "attested": 1,
+                "partial": 0,
+                "uncovered": 1,
+            },
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "criterion_coverage_incomplete"
+        # attested_count is still recorded for observability under a blocker.
+        assert result["sub_scores"]["attested_count"] == 1
+
+    def test_compute_composite_partial_criterion_still_blocks_with_attestation(self):
+        """A 'partial' criterion (evidence but not covering/attested) still blocks."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 2,
+                "covered": 0,
+                "attested": 1,
+                "partial": 1,
+                "uncovered": 0,
+            },
+        )
+        assert result["confidence"] == 0.0
+        assert result["blocker"] == "criterion_coverage_incomplete"
+
 
 @pytest.mark.asyncio
 async def test_release_audit_payload_includes_version_goal(db_session, mocker):

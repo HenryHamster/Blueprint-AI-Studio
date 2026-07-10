@@ -12,6 +12,7 @@ import logging
 import secrets
 import uuid
 from collections import defaultdict
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy.exc
@@ -19,7 +20,7 @@ from sqlalchemy import func
 from sqlmodel import select
 
 from app.models import CriterionEvidence, Direction, VersionAcceptanceCriterion
-from app.time_utils import _utcnow
+from app.time_utils import _coerce_naive_utc, _utcnow
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -165,13 +166,22 @@ def _names_metrics_integrity_sweep(text: str | None) -> bool:
     return any(marker in lowered for marker in _METRICS_INTEGRITY_CRITERION_MARKERS)
 
 
+#: Coverage-tier constant: how long an ``operator_attestation`` evidence row
+#: counts as (lower-confidence) attested coverage before it expires and the
+#: criterion falls back to its underlying machine-evidence state.  Attestation
+#: is a visibly distinct, time-bounded tier — NOT full parity with the
+#: machine-verified evidence kinds recognised by :func:`_evidence_proves_covered`.
+#: Measured from ``detail["attested_at"]`` (ISO-8601); legacy rows lacking that
+#: key are treated as non-expiring so historical attestations are never silently
+#: dropped.  Module-level so the window is easy to adjust in one place.
+ATTESTATION_WINDOW_DAYS = 7
+
+
 def _evidence_proves_covered(e: CriterionEvidence) -> bool:
-    """Whether a single evidence record satisfies the 'covered' condition.
+    """Whether a single evidence record satisfies the machine-verified 'covered' condition.
 
     ``reachability`` is covered on its own; it represents the ancestry check
     that says the merge really reached the integration branch.
-    ``operator_attestation`` is covered on its own; the operator has explicitly
-    accepted the criterion, overriding any stuck-criterion deadlock.
     ``task_merge`` requires ``proven=True`` in ``detail`` — a bare merge badge
     without acceptance-proof is not sufficient to qualify the criterion.
     ``acceptance_window_recompute`` is covered on its own; it is a metric-derived
@@ -183,11 +193,15 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     :func:`record_metrics_integrity_coverage_evidence` only when the standing
     sweep has completed at least one tick (``ticks > 0``) in observe or enforce
     mode, so its presence encodes that the mechanism is actively operating.
+
+    ``operator_attestation`` is deliberately NOT covering here.  An operator
+    attestation is a lower-confidence, time-bounded waiver — see
+    :func:`_evidence_is_attested` and the ``'attested'`` coverage tier — so it
+    must not score with the same weight as machine-verified evidence.
+
     All other source_kinds are not sufficient on their own.
     """
     if e.source_kind == "reachability":
-        return True
-    if e.source_kind == "operator_attestation":
         return True
     if e.source_kind == ACCEPTANCE_WINDOW_EVIDENCE_KIND:
         return True
@@ -201,6 +215,39 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         # criterion is satisfied once the backfill writes the evidence row.
         return True
     return False
+
+
+def _evidence_is_attested(e: CriterionEvidence) -> bool:
+    """Whether a single evidence record is a NON-EXPIRED operator attestation.
+
+    Returns ``True`` only for ``source_kind == "operator_attestation"`` whose
+    ``detail["attested_at"]`` timestamp is within :data:`ATTESTATION_WINDOW_DAYS`
+    of now.  Semantics:
+
+      * A legacy attestation with no ``attested_at`` key (pre-tiering rows) is
+        treated as valid (non-expiring) — historical waivers are never silently
+        dropped.
+      * An unparseable ``attested_at`` value fails toward valid for the same
+        reason: the operator did attest; only a *demonstrably* stale timestamp
+        expires the waiver.
+      * A parseable timestamp older than the window returns ``False`` so the
+        criterion falls back to its underlying (partial/uncovered) state until
+        the operator re-attests and refreshes the timer.
+    """
+    if e.source_kind != "operator_attestation":
+        return False
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    attested_at_raw = detail.get("attested_at")
+    if not attested_at_raw:
+        # Legacy attestation (no timestamp) — treat as valid, non-expiring.
+        return True
+    try:
+        attested_at = _coerce_naive_utc(datetime.fromisoformat(str(attested_at_raw)))
+    except (TypeError, ValueError):
+        # Unparseable timestamp — the attestation exists; don't expire it on a
+        # formatting problem.
+        return True
+    return (_utcnow() - attested_at) <= timedelta(days=ATTESTATION_WINDOW_DAYS)
 
 
 MAX_CRITERIA_PER_VERSION = 50
@@ -398,18 +445,26 @@ async def get_evidence_for_criterion(
 def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     """Classify criterion coverage from its evidence list.
 
+    Priority: ``covered`` > ``attested`` > ``partial`` > ``uncovered``.
+
     Returns:
-      'covered'   — at least one record satisfies the covered condition
-                    (``reachability``, ``operator_attestation``, and
-                    ``acceptance_window_recompute`` always; ``task_merge`` only
-                    with ``detail["proven"] is True``)
-      'partial'   — evidence exists but none satisfy the covered condition
+      'covered'   — at least one record is machine-verified covering evidence
+                    (``reachability``, ``acceptance_window_recompute``,
+                    ``metrics_integrity_sweep``, ``audit_finding_backfill``
+                    always; ``task_merge`` only with ``detail["proven"] is True``)
+      'attested'  — no machine-verified evidence, but a NON-EXPIRED operator
+                    attestation is present (a lower-confidence, time-bounded
+                    waiver — see :func:`_evidence_is_attested`)
+      'partial'   — evidence exists but none is covering or a valid attestation
+                    (includes an EXPIRED attestation)
       'uncovered' — no evidence at all
     """
     if not evidence:
         return "uncovered"
     if any(_evidence_proves_covered(e) for e in evidence):
         return "covered"
+    if any(_evidence_is_attested(e) for e in evidence):
+        return "attested"
     return "partial"
 
 
@@ -498,6 +553,17 @@ async def direction_owns_uncovered_criterion(
     direction with ≥3 verified merges must not retire declaring success while an
     acceptance outcome it owns is still 'partial' or 'uncovered'.
 
+    NOTE: As of the attested-tier introduction, an ``'attested'`` criterion
+    (lower-confidence operator attestation) is treated as NOT covering for
+    direction-completion gating — only ``'covered'`` (machine-verified evidence
+    such as ``reachability``, ``task_merge`` with ``proven=True``,
+    ``acceptance_window_recompute``, ``metrics_integrity_sweep``, or
+    ``audit_finding_backfill``) is sufficient.  This is intentional: a direction
+    backed solely by operator attestation should not auto-retire as "successful"
+    without machine corroboration.  If the direction later acquires machine
+    evidence, the criterion coverage flips to ``'covered'`` and the direction
+    may complete normally.
+
     Resolution:
       * The direction's mapped keys come from the ``Direction`` row's first-class
         ``criterion_keys`` column (via :func:`app.directions_repo.get_direction_row`);
@@ -536,6 +602,11 @@ async def direction_owns_uncovered_criterion(
         uncovered_keys: list[str] = []
         for criterion in active:
             evidence = await get_evidence_for_criterion(session, criterion.id)
+            # Only 'covered' (machine-verified) satisfies direction completion.
+            # 'attested' (operator attestation without machine evidence) is a
+            # lower-confidence waiver — a direction should not auto-retire as
+            # "successful" based on attestation alone.  See the NOTE in the
+            # docstring for the full rationale.
             if compute_criterion_coverage(evidence) != "covered":
                 uncovered_keys.append(criterion.criterion_key)
 
@@ -1385,6 +1456,7 @@ async def get_version_coverage_summary(
         {
             'total': N,
             'covered': N,
+            'attested': N,
             'partial': N,
             'uncovered': N,
             'retracted': N,
@@ -1395,7 +1467,7 @@ async def get_version_coverage_summary(
                 {
                     'criterion_key': str,
                     'text': str,
-                    'coverage': 'covered' | 'partial' | 'uncovered',
+                    'coverage': 'covered' | 'attested' | 'partial' | 'uncovered',
                     'status': 'active' | 'retracted' | 'superseded',
                     'evidence_count': int,
                     'evidence_truncated': bool,
@@ -1406,9 +1478,13 @@ async def get_version_coverage_summary(
             ],
         }
 
-    ``total`` and the coverage buckets count active criteria only. Inactive rows
-    remain in ``criteria`` for audit, with ``retracted``/``superseded`` split by
-    lifecycle status and ``inactive`` carrying their aggregate. ``stuck_reason``
+    ``total`` and the coverage buckets (covered + attested + partial + uncovered)
+    count active criteria only, and ``total`` remains their sum for backward
+    compatibility. ``attested`` is the distinct, lower-confidence tier: active
+    criteria whose only covering signal is a non-expired operator attestation.
+    Inactive rows remain in ``criteria`` for audit, with
+    ``retracted``/``superseded`` split by lifecycle status and ``inactive``
+    carrying their aggregate. ``stuck_reason``
     is only non-``None`` for *uncovered* active criteria that have no active
     Direction mapping (see :func:`_classify_stuck_reasons`); covered, partial,
     and inactive criteria always carry ``None``. ``stuck_count`` is the number
@@ -1416,7 +1492,12 @@ async def get_version_coverage_summary(
     criteria that need direction remapping or operator attestation to ever
     become covered.
     """
-    counts: dict[str, int] = {"covered": 0, "partial": 0, "uncovered": 0}
+    counts: dict[str, int] = {
+        "covered": 0,
+        "attested": 0,
+        "partial": 0,
+        "uncovered": 0,
+    }
     inactive_counts: dict[str, int] = {"retracted": 0, "superseded": 0}
     criteria_detail = []
 
@@ -1491,6 +1572,7 @@ async def get_version_coverage_summary(
     return {
         "total": sum(counts.values()),
         "covered": counts["covered"],
+        "attested": counts["attested"],
         "partial": counts["partial"],
         "uncovered": counts["uncovered"],
         "retracted": inactive_counts["retracted"],

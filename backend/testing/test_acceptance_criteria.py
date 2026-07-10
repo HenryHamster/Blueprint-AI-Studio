@@ -28,6 +28,7 @@ from sqlmodel import select
 
 from app import acceptance_criteria as ac
 from app.operator_attention import build_operator_attention
+from app.time_utils import _utcnow
 from app.models import (
     CriterionEvidence,
     Direction,
@@ -2761,32 +2762,74 @@ class TestVersionLifecycleCriterionCoverage:
 # ---------------------------------------------------------------------------
 
 
-def test_operator_attestation_covers_criterion():
-    """operator_attestation source_kind must satisfy _evidence_proves_covered unconditionally.
+def test_operator_attestation_is_attested_tier_not_covered():
+    """operator_attestation is a DISTINCT lower-confidence 'attested' tier, not 'covered'.
 
-    This is the named acceptance test for the operator-attestation waiver feature.
-    It verifies that an operator_attestation evidence record flips coverage to
-    'covered' regardless of what detail it carries, mirroring the reachability
-    behaviour.  A criterion with only operator_attestation evidence must NOT
-    remain 'partial' or 'uncovered'.
+    This is the named acceptance test for the attestation-tiering feature.  An
+    operator_attestation evidence record must NOT satisfy the machine-verified
+    ``_evidence_proves_covered`` predicate; instead it yields the ``'attested'``
+    coverage tier so it scores below machine-verified evidence.  A non-expired
+    attestation still clears the criterion out of 'partial'/'uncovered'.
     """
     ev_no_detail = _make_evidence("operator_attestation")
-    assert ac._evidence_proves_covered(ev_no_detail) is True
+    # No longer machine-covered.
+    assert ac._evidence_proves_covered(ev_no_detail) is False
+    # But it IS a valid (legacy, timestamp-less) attestation.
+    assert ac._evidence_is_attested(ev_no_detail) is True
 
     ev_with_detail = _make_evidence("operator_attestation", detail={"reason": "accepted"})
-    assert ac._evidence_proves_covered(ev_with_detail) is True
+    assert ac._evidence_proves_covered(ev_with_detail) is False
+    assert ac._evidence_is_attested(ev_with_detail) is True
 
-    assert ac.compute_criterion_coverage([ev_no_detail]) == "covered"
-    assert ac.compute_criterion_coverage([ev_with_detail]) == "covered"
+    assert ac.compute_criterion_coverage([ev_no_detail]) == "attested"
+    assert ac.compute_criterion_coverage([ev_with_detail]) == "attested"
 
-    # A mix of non-covering evidence plus operator_attestation must still be covered.
+    # A mix of non-covering evidence plus operator_attestation is 'attested'
+    # (no machine-verified evidence present).
     ev_partial = _make_evidence("task_merge")  # no proven=True → not covering on its own
-    assert ac.compute_criterion_coverage([ev_partial, ev_with_detail]) == "covered"
+    assert ac.compute_criterion_coverage([ev_partial, ev_with_detail]) == "attested"
+
+
+def test_machine_verified_evidence_wins_over_attestation():
+    """Machine-verified evidence outranks an attestation → 'covered', not 'attested'."""
+    ev_attest = _make_evidence("operator_attestation", detail={"reason": "accepted"})
+    ev_proven = _make_evidence("task_merge", detail={"proven": True})
+    assert ac.compute_criterion_coverage([ev_attest, ev_proven]) == "covered"
+    # reachability also wins.
+    ev_reach = _make_evidence("reachability")
+    assert ac.compute_criterion_coverage([ev_attest, ev_reach]) == "covered"
+
+
+def test_expired_attestation_falls_back_to_partial():
+    """An operator_attestation older than the window is no longer 'attested'.
+
+    With no other evidence the criterion falls back to 'partial' (the row exists
+    but no longer counts as valid attestation coverage) until the operator
+    re-attests to refresh the timer.
+    """
+    stale_at = (
+        _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    ).isoformat()
+    ev_stale = _make_evidence("operator_attestation", detail={"attested_at": stale_at})
+    assert ac._evidence_is_attested(ev_stale) is False
+    assert ac.compute_criterion_coverage([ev_stale]) == "partial"
+
+    fresh_at = _utcnow().isoformat()
+    ev_fresh = _make_evidence("operator_attestation", detail={"attested_at": fresh_at})
+    assert ac._evidence_is_attested(ev_fresh) is True
+    assert ac.compute_criterion_coverage([ev_fresh]) == "attested"
+
+
+def test_attestation_unparseable_timestamp_stays_valid():
+    """An attestation with an unparseable attested_at is not expired on a format error."""
+    ev = _make_evidence("operator_attestation", detail={"attested_at": "not-a-date"})
+    assert ac._evidence_is_attested(ev) is True
+    assert ac.compute_criterion_coverage([ev]) == "attested"
 
 
 @pytest.mark.asyncio
 async def test_attest_endpoint_happy_path(client: AsyncClient, db_session):
-    """POST .../attest records operator_attestation evidence and coverage flips to 'covered'."""
+    """POST .../attest records timestamped operator_attestation evidence and coverage → 'attested'."""
     project = await _make_project_with_member(db_session, name="Attest-Happy")
     version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
     db_session.add(version)
@@ -2805,26 +2848,37 @@ async def test_attest_endpoint_happy_path(client: AsyncClient, db_session):
     data = resp.json()
     assert data["status"] == "ok"
     assert data["criterion_key"] == criterion.criterion_key
-    assert data["coverage"] == "covered"
+    assert data["coverage"] == "attested"
 
-    # Verify evidence persisted with the correct source_kind and detail.
+    # Verify evidence persisted with the correct source_kind, reason, and a
+    # parseable attested_at timestamp (the expiry-timer anchor).
     evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
     assert len(evidence) == 1
     assert evidence[0].source_kind == "operator_attestation"
-    assert evidence[0].detail == {"reason": "Direction retired; operator confirms criterion is satisfied"}
+    assert evidence[0].detail["reason"] == (
+        "Direction retired; operator confirms criterion is satisfied"
+    )
+    assert "attested_at" in evidence[0].detail
+    # attested_at must be an ISO-8601 string parseable by fromisoformat.
+    from datetime import datetime as _dt
+
+    _dt.fromisoformat(evidence[0].detail["attested_at"])
     assert evidence[0].source_id == _TEST_USER_ID
 
-    # GET coverage summary must now show 'covered'.
+    # GET coverage summary must now show the distinct 'attested' tier.
     summary = await ac.get_version_coverage_summary(db_session, version.id)
     by_key = {c["criterion_key"]: c for c in summary["criteria"]}
-    assert by_key[criterion.criterion_key]["coverage"] == "covered"
-    assert summary["covered"] == 1
+    assert by_key[criterion.criterion_key]["coverage"] == "attested"
+    assert summary["attested"] == 1
+    assert summary["covered"] == 0
     assert summary["uncovered"] == 0
+    # total remains the sum of all active criteria for backward compatibility.
+    assert summary["total"] == 1
 
 
 @pytest.mark.asyncio
-async def test_attest_endpoint_get_criteria_shows_covered(client: AsyncClient, db_session):
-    """GET /acceptance-criteria returns coverage='covered' after an attestation."""
+async def test_attest_endpoint_get_criteria_shows_attested(client: AsyncClient, db_session):
+    """GET /acceptance-criteria returns coverage='attested' after an attestation."""
     project = await _make_project_with_member(db_session, name="Attest-GetCoverage")
     version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
     db_session.add(version)
@@ -2841,10 +2895,11 @@ async def test_attest_endpoint_get_criteria_shows_covered(client: AsyncClient, d
     resp = await client.get(f"/api/admin/projects/{project.id}/acceptance-criteria")
     assert resp.status_code == 200, resp.text
     data = resp.json()
-    assert data["covered"] == 1
+    assert data["attested"] == 1
+    assert data["covered"] == 0
     assert data["uncovered"] == 0
     by_key = {c["criterion_key"]: c for c in data["criteria"]}
-    assert by_key[criterion.criterion_key]["coverage"] == "covered"
+    assert by_key[criterion.criterion_key]["coverage"] == "attested"
 
 
 @pytest.mark.asyncio
@@ -2931,14 +2986,13 @@ async def test_attest_endpoint_no_open_version(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
-async def test_attest_duplicate_attestation_is_idempotent(client: AsyncClient, db_session):
-    """Repeat attestation by the same operator on the same criterion returns 200, not 500.
+async def test_attest_duplicate_attestation_refreshes_expiry(client: AsyncClient, db_session):
+    """Repeat attestation by the same operator UPSERTS: refresh attested_at + reason, no new row.
 
-    The uq_criterionevidence_dedup index (migration 0365) covers operator attestations
-    because source_id=user_id is non-null.  A second POST .../attest by the same user
-    violates the unique constraint; the endpoint must catch IntegrityError, rollback, and
-    return the same idempotent {"status":"ok","criterion_key":...,"coverage":"covered"}
-    response instead of surfacing a 500.
+    A second POST .../attest by the same operator on the same criterion must
+    return 200 (not 500) and refresh the existing evidence row's ``attested_at``
+    timestamp (restarting the expiry timer) and ``reason`` — this is the operator
+    re-attest / renew path — while keeping exactly one evidence row.
     """
     project = await _make_project_with_member(db_session, name="Attest-Dup")
     version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
@@ -2958,26 +3012,43 @@ async def test_attest_duplicate_attestation_is_idempotent(client: AsyncClient, d
     data1 = resp1.json()
     assert data1["status"] == "ok"
     assert data1["criterion_key"] == criterion.criterion_key
-    assert data1["coverage"] == "covered"
+    assert data1["coverage"] == "attested"
 
-    # Second call by the same operator: violates uq_criterionevidence_dedup.
-    # Must return 200 with the same shape — NOT 500 — because duplicates are a no-op.
-    resp2 = await client.post(url, json={"reason": "accepted again"})
+    # Read the first attestation's detail back through the real GET read path (its
+    # own request session) so we never depend on cross-session visibility of the
+    # shared SQLite test connection.
+    get1 = await client.get(f"/api/admin/projects/{project.id}/acceptance-criteria")
+    crit1 = {c["criterion_key"]: c for c in get1.json()["criteria"]}[
+        criterion.criterion_key
+    ]
+    assert len(crit1["evidence"]) == 1
+    assert crit1["evidence"][0]["detail"]["reason"] == "accepted; direction retired"
+    first_attested_at = crit1["evidence"][0]["detail"]["attested_at"]
+
+    # Second call by the same operator: UPSERT refresh (not 500, not a new row).
+    resp2 = await client.post(url, json={"reason": "re-attested; still accepted"})
     assert resp2.status_code == 200, (
-        f"Duplicate attestation must return 200 (idempotent), got {resp2.status_code}: {resp2.text}"
+        f"Re-attestation must return 200 (idempotent upsert), got {resp2.status_code}: {resp2.text}"
     )
     data2 = resp2.json()
     assert data2["status"] == "ok"
     assert data2["criterion_key"] == criterion.criterion_key
-    assert data2["coverage"] == "covered"
+    assert data2["coverage"] == "attested"
 
-    # Verify exactly one evidence row was persisted (the second was a no-op).
-    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
-    assert len(evidence) == 1, (
-        f"Duplicate attestation must not create a second evidence row; found {len(evidence)}"
+    # Verify via the GET read path that exactly one evidence row remains, with a
+    # refreshed reason + timestamp (the renew semantics).
+    get2 = await client.get(f"/api/admin/projects/{project.id}/acceptance-criteria")
+    crit2 = {c["criterion_key"]: c for c in get2.json()["criteria"]}[
+        criterion.criterion_key
+    ]
+    assert len(crit2["evidence"]) == 1, (
+        f"Re-attestation must not create a second evidence row; found {len(crit2['evidence'])}"
     )
-    assert evidence[0].source_kind == "operator_attestation"
-    assert evidence[0].source_id == _TEST_USER_ID
+    assert crit2["coverage"] == "attested"
+    assert crit2["evidence"][0]["source_kind"] == "operator_attestation"
+    assert crit2["evidence"][0]["detail"]["reason"] == "re-attested; still accepted"
+    # attested_at is refreshed (>= the original; equal is acceptable on a fast clock).
+    assert crit2["evidence"][0]["detail"]["attested_at"] >= first_attested_at
 
 
 @pytest.mark.asyncio

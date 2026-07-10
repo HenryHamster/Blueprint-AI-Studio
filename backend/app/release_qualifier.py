@@ -2031,10 +2031,16 @@ async def run_qualification(
             _coverage = await get_version_coverage_summary(session, version.id)
             _total = int(_coverage.get("total") or 0)
             _covered = int(_coverage.get("covered") or 0)
+            _attested = int(_coverage.get("attested") or 0)
             # Mirror the release_scoring gate exactly: it fires when
-            # ``total > 0 and covered < total``, so the gate is CLEAR when no
-            # active criteria remain (total == 0) or every active one is covered.
-            criterion_coverage_recovered_same_sha = _total == 0 or _covered >= _total
+            # ``total > 0 and (total - covered - attested) > 0``, so the gate is
+            # CLEAR when no active criteria remain (total == 0), every active one
+            # is machine-covered, or the remaining ones are at least covered by a
+            # non-expired operator attestation (which clears the blocker but
+            # incurs the confidence penalty rather than wedging not_promoted).
+            criterion_coverage_recovered_same_sha = (
+                _total == 0 or (_total - _covered - _attested) <= 0
+            )
         except Exception:  # noqa: BLE001 — a coverage lookup failure stays cached (safe: no wrong re-run)
             logger.warning(
                 "[RELEASE_QUALIFIER] run_qualification: coverage-recovery check "

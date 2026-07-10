@@ -370,13 +370,16 @@ async def _reconcile_if_criterion_coverage_now_complete(
                 return False
 
             # Live coverage gate: mirror release_scoring — the gate fires when
-            # ``total > 0 and covered < total``, so it is CLEAR when no active
-            # criteria remain or every active one is covered.
+            # genuinely uncovered criteria remain (``total - covered - attested > 0``).
+            # Criteria covered only by a (non-expired) operator attestation are NOT
+            # genuinely uncovered — they clear the hard blocker and let the re-drive
+            # proceed even though they will incur a confidence penalty at score time.
             coverage = await get_version_coverage_summary(session, version.id)
             total = int(coverage.get("total") or 0)
             covered = int(coverage.get("covered") or 0)
+            attested = int(coverage.get("attested") or 0)
 
-            if total > 0 and covered < total:
+            if total > 0 and (total - covered - attested) > 0:
                 # Before giving up, attempt to backfill merge evidence for any
                 # uncovered criteria that have an active direction mapping.  Tasks
                 # that merged before the criterion-direction mapping was created
@@ -415,14 +418,16 @@ async def _reconcile_if_criterion_coverage_now_complete(
                         )
                         total = int(coverage.get("total") or 0)
                         covered = int(coverage.get("covered") or 0)
+                        attested = int(coverage.get("attested") or 0)
                         logger.info(
                             "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                             "backfilled evidence for %d direction(s) on v%d "
-                            "(total=%d covered=%d after backfill)",
+                            "(total=%d covered=%d attested=%d after backfill)",
                             len(keys_to_backfill),
                             version.version_number,
                             total,
                             covered,
+                            attested,
                         )
 
                 # Re-score the acceptance-window metric and, when the window is
@@ -437,14 +442,16 @@ async def _reconcile_if_criterion_coverage_now_complete(
                     coverage = await get_version_coverage_summary(session, version.id)
                     total = int(coverage.get("total") or 0)
                     covered = int(coverage.get("covered") or 0)
+                    attested = int(coverage.get("attested") or 0)
                     logger.info(
                         "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                         "recorded %d acceptance-window recompute evidence row(s) on v%d "
-                        "(total=%d covered=%d after recompute)",
+                        "(total=%d covered=%d attested=%d after recompute)",
                         window_recorded,
                         version.version_number,
                         total,
                         covered,
+                        attested,
                     )
 
                 # Record covering evidence for the data-integrity criterion when
@@ -459,17 +466,19 @@ async def _reconcile_if_criterion_coverage_now_complete(
                     coverage = await get_version_coverage_summary(session, version.id)
                     total = int(coverage.get("total") or 0)
                     covered = int(coverage.get("covered") or 0)
+                    attested = int(coverage.get("attested") or 0)
                     logger.info(
                         "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                         "recorded %d metrics-integrity sweep evidence row(s) on v%d "
-                        "(total=%d covered=%d after mis-sweep evidence)",
+                        "(total=%d covered=%d attested=%d after mis-sweep evidence)",
                         mis_recorded,
                         version.version_number,
                         total,
                         covered,
+                        attested,
                     )
 
-            if not (total == 0 or covered >= total):
+            if not (total == 0 or (covered + attested) >= total):
                 return False
 
             project = await session.get(Project, version.project_id)
@@ -508,11 +517,12 @@ async def _reconcile_if_criterion_coverage_now_complete(
             logger.info(
                 "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
                 "coverage cleared for candidate %s of v%d on unchanged automain "
-                "(total=%d covered=%d) — spawning fresh qualification",
+                "(total=%d covered=%d attested=%d) — spawning fresh qualification",
                 candidate_sha[:8],
                 version.version_number,
                 total,
                 covered,
+                attested,
             )
             result = await release_qualifier.run_qualification(
                 session, version.project_id, version
@@ -613,12 +623,13 @@ async def _fire_initial_qualification_if_coverage_complete(
 
             logger.info(
                 "[RELEASE_QUALIFIER] fire_initial_qualification: "
-                "coverage complete for v%d on %s (total=%d covered=%d) "
+                "coverage complete for v%d on %s (total=%d covered=%d attested=%d) "
                 "— spawning initial qualification",
                 version.version_number,
                 automain_sha[:8],
                 trigger.get("coverage_total", 0),
                 trigger.get("coverage_covered", 0),
+                trigger.get("coverage_attested", 0),
             )
             result = await release_qualifier.run_qualification(
                 session, version.project_id, version

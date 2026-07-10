@@ -116,6 +116,7 @@ const BUCKET_META: Record<string, { label: string; className: string }> = {
 
 const COVERAGE_BADGE: Record<CriterionCoverageEntry['coverage'], { label: string; className: string }> = {
   covered:   { label: 'covered',   className: 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' },
+  attested:  { label: 'attested',  className: 'bg-amber-600/20 text-amber-400 border border-amber-600/40' },
   partial:   { label: 'partial',   className: 'bg-amber-500/20 text-amber-400 border border-amber-500/30' },
   uncovered: { label: 'uncovered', className: 'bg-slate-700/60 text-slate-400 border border-slate-600/40' },
 };
@@ -140,14 +141,31 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
   const inactiveCount = coverage.inactive ?? rowInactiveCount;
   const retractedCount = coverage.retracted ?? coverage.criteria.filter((c) => c.status === 'retracted').length;
   const supersededCount = coverage.superseded ?? coverage.criteria.filter((c) => c.status === 'superseded').length;
+  // Attested criteria are a distinct, lower-confidence tier (operator's word,
+  // not machine-verified) and are NOT part of `covered`. Older backends omit
+  // the field entirely — treat undefined as 0.
+  const attestedCount = coverage.attested ?? 0;
 
   return (
     <div className="mb-3" data-testid="criterion-coverage-panel">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mb-1">
         <span className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500">Version acceptance criteria</span>
-        <span className="text-ui-sm text-slate-400 font-medium">
-          {coverage.total === 0 ? '0 active criteria' : `${coverage.covered}/${coverage.total} active covered`}
+        <span className="text-ui-sm text-slate-400 font-medium" data-testid="criterion-coverage-fraction">
+          {coverage.total === 0
+            ? '0 active criteria'
+            : attestedCount > 0
+              ? `${coverage.covered} verified + ${attestedCount} attested / ${coverage.total}`
+              : `${coverage.covered}/${coverage.total} active covered`}
         </span>
+        {attestedCount > 0 && (
+          <span
+            className="text-ui-sm text-amber-400"
+            data-testid="attested-count-badge"
+            title="Covered only by operator attestation (not machine-verified) — lower confidence and expiring"
+          >
+            {attestedCount} attested
+          </span>
+        )}
         {coverage.partial > 0 && <span className="text-ui-sm text-amber-400">{coverage.partial} partial</span>}
         {coverage.uncovered > 0 && <span className="text-ui-sm text-slate-500">{coverage.uncovered} uncovered</span>}
         {inactiveCount > 0 && (

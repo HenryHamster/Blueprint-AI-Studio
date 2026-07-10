@@ -50,6 +50,18 @@ MAX_COMPLETION_DEBT_WEIGHT = 0.5
 # so graduation actually changes the composite instead of being a no-op.
 DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT = 0.15
 
+# Confidence penalty applied when a version's acceptance criteria are ALL at
+# least covered-or-attested (no genuinely uncovered criterion), but some are
+# covered ONLY by a lower-confidence operator attestation rather than
+# machine-verified evidence.  The penalty is proportional to the attested
+# fraction: ``ATTESTATION_PENALTY_WEIGHT * (attested / total)``, applied as a
+# multiplier ``confidence *= (1 - penalty)`` after the weighted sum.  This makes
+# an attestation-covered criterion score visibly lower than one covered by
+# named_test / reachability / task_merge evidence, while preserving the
+# operator's deadlock-breaker waiver (the penalty is the cost of waiving without
+# machine evidence, not a hard block).  Configurable in one place.
+ATTESTATION_PENALTY_WEIGHT = 0.15
+
 
 def coerce_completion_debt_weight(weights_raw: Any) -> float:
     """Read the OPTIONAL ``completion_debt`` blend weight from a weights mapping.
@@ -430,10 +442,16 @@ def compute_composite(
         found that the candidate misses the frozen version goal
         (``"merge_grade_misses"``).  Checked before criterion coverage so an
         empty or not-yet-mapped acceptance-criteria set cannot mask the grade.
-      * ``criterion_coverage`` reports at least one uncovered version-scoped
-        acceptance criterion (``"criterion_coverage_incomplete"``).  Versions
-        with no criteria, or callers that pass ``None`` for backward
-        compatibility, skip this gate.
+      * ``criterion_coverage`` reports at least one GENUINELY uncovered
+        version-scoped acceptance criterion — ``total - covered - attested > 0``
+        (``"criterion_coverage_incomplete"``).  Criteria covered only by a
+        non-expired operator attestation do NOT hard-block; instead they incur a
+        proportional confidence penalty (``ATTESTATION_PENALTY_WEIGHT``) applied
+        after the weighted sum, so an attestation-covered version scores visibly
+        below a machine-verified one while the deadlock-breaker waiver survives.
+        Versions with no criteria, or callers that pass ``None`` for backward
+        compatibility, skip this gate.  ``sub_scores["attested_count"]`` records
+        the attested surface for observability whenever a summary is supplied.
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -536,9 +554,17 @@ def compute_composite(
     elif (
         criterion_coverage is not None
         and int(criterion_coverage.get("total") or 0) > 0
-        and int(criterion_coverage.get("covered") or 0)
-        < int(criterion_coverage.get("total") or 0)
+        and (
+            int(criterion_coverage.get("total") or 0)
+            - int(criterion_coverage.get("covered") or 0)
+            - int(criterion_coverage.get("attested") or 0)
+        )
+        > 0
     ):
+        # A GENUINELY uncovered criterion (partial or no-evidence) still hard-
+        # blocks.  Criteria covered only by a non-expired operator attestation
+        # are NOT counted here — they clear the blocker but incur the confidence
+        # penalty applied below (the attestation tier).
         blocker = "criterion_coverage_incomplete"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
@@ -564,6 +590,17 @@ def compute_composite(
     # only blended into confidence when completion_debt_weight > 0 in policy.
     if debt_pressure_score is not None:
         sub_scores["debt_pressure"] = _clamp01(debt_pressure_score)
+
+    # Attestation observability: record how many active criteria are covered
+    # ONLY by a (non-expired) operator attestation.  Always recorded when a
+    # coverage summary is supplied so operators can see the attested surface
+    # even when a blocker fired for a different reason.
+    attested_count = 0
+    total_criteria = 0
+    if criterion_coverage is not None:
+        attested_count = int(criterion_coverage.get("attested") or 0)
+        total_criteria = int(criterion_coverage.get("total") or 0)
+        sub_scores["attested_count"] = attested_count
 
     if blocker is not None:
         return {
@@ -592,6 +629,16 @@ def compute_composite(
         confidence = (1.0 - w_debt) * existing_confidence + w_debt * sub_scores["debt_pressure"]
     else:
         confidence = existing_confidence
+
+    # Attestation penalty: reaching here means no genuinely uncovered criterion
+    # blocked promotion, but some criteria may be covered ONLY by a lower-
+    # confidence operator attestation.  Apply a proportional multiplier so an
+    # attestation-covered version scores visibly below a machine-verified one,
+    # without hard-blocking (the deadlock-breaker waiver is preserved).
+    if attested_count > 0 and total_criteria > 0:
+        penalty = ATTESTATION_PENALTY_WEIGHT * (attested_count / total_criteria)
+        confidence *= 1.0 - penalty
+
     confidence = round(_clamp01(confidence), 4)
     return {
         "confidence": confidence,

@@ -1400,6 +1400,7 @@ async def compute_qualification_trigger_state(
           "summary": str,  # human-readable explanation
           "coverage_total": int,
           "coverage_covered": int,
+          "coverage_attested": int,
         }
 
     ``trigger_state`` is ``"armed"`` exactly when:
@@ -1407,13 +1408,16 @@ async def compute_qualification_trigger_state(
       - the version is in the "stabilize" phase, AND
       - no prior qualification attempt exists (``last_qualification is None``
         AND ``qualification_attempts == 0``), AND
-      - criterion coverage is complete: NOT (total > 0 and covered < total).
+      - criterion coverage is complete: NOT (total > 0 and covered + attested < total).
+        Criteria covered only by a (non-expired) operator attestation are treated as
+        sufficient for the initial trigger to arm — they clear the hard gate and let
+        the qualification proceed (the attestation penalty is applied at score time).
 
     ``reason`` codes when ``trigger_state == "blocked"``:
       - ``"no_open_version"``       — no open release version
       - ``"wrong_phase"``           — version exists but is not in stabilize phase
       - ``"prior_attempt_exists"``  — last_qualification is set OR qualification_attempts > 0
-      - ``"coverage_incomplete"``   — coverage gate would fire (total > 0 and covered < total)
+      - ``"coverage_incomplete"``   — coverage gate would fire (total > 0 and covered + attested < total)
     """
     from app.acceptance_criteria import get_version_coverage_summary  # noqa: PLC0415
 
@@ -1461,8 +1465,9 @@ async def compute_qualification_trigger_state(
     coverage = await get_version_coverage_summary(session, version.id)
     total = int(coverage.get("total") or 0)
     covered = int(coverage.get("covered") or 0)
+    attested = int(coverage.get("attested") or 0)
 
-    if total > 0 and covered < total:
+    if total > 0 and (total - covered - attested) > 0:
         return {
             "trigger_state": "blocked",
             "open_version_id": str(version.id),
@@ -1473,6 +1478,7 @@ async def compute_qualification_trigger_state(
             ),
             "coverage_total": total,
             "coverage_covered": covered,
+            "coverage_attested": attested,
         }
 
     return {
@@ -1484,6 +1490,7 @@ async def compute_qualification_trigger_state(
             f"and complete criterion coverage ({covered}/{total if total else 'none'})"
         ),
         "coverage_total": total,
+        "coverage_attested": attested,
         "coverage_covered": covered,
     }
 

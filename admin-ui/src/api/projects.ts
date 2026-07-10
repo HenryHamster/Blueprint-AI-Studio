@@ -445,7 +445,7 @@ export interface ChangelogEntry {
 export interface CriterionCoverageEntry {
   criterion_key: string;
   text: string;
-  coverage: 'covered' | 'partial' | 'uncovered';
+  coverage: 'covered' | 'attested' | 'partial' | 'uncovered';
   status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
   stuck_reason?: 'no_mapping' | 'direction_retired' | null;
@@ -455,6 +455,10 @@ export interface VersionCriterionCoverage {
   // Active criteria only; inactive criteria may still appear in criteria for audit.
   total: number;
   covered: number;
+  /** Active criteria covered ONLY by a non-expired operator attestation — a
+   *  distinct, lower-confidence tier that is NOT included in `covered`. May be
+   *  absent from older backends; treat undefined as 0. */
+  attested?: number;
   partial: number;
   uncovered: number;
   retracted?: number;

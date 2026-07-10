@@ -14,9 +14,12 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
+
+from app.time_utils import _utcnow
 
 from app import acceptance_criteria as ac
 from app.admin import _get_user_project_with_role
@@ -325,6 +328,14 @@ async def attest_criterion(
     This waiver path allows operators to unblock qualification when a criterion is
     permanently uncoverable (e.g. its mapped direction retired).  The attestation
     is operator-only and is never called by autonomous agents.
+
+    Operator attestation is a lower-confidence, TIME-BOUNDED coverage tier: the
+    recorded ``detail["attested_at"]`` timestamp starts an expiry timer
+    (:data:`app.acceptance_criteria.ATTESTATION_WINDOW_DAYS`).  A re-attestation
+    of an already-attested criterion is an UPSERT that refreshes ``attested_at``
+    (and ``reason``), so the operator can renew the waiver before it expires.
+    The returned ``coverage`` is ``"attested"`` — distinct from the
+    machine-verified ``"covered"`` tier.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
@@ -356,30 +367,62 @@ async def attest_criterion(
             status_code=409,
             detail=f"Criterion '{criterion_key}' is {row.status} and cannot be attested",
         )
+
+    attested_at = _utcnow().isoformat()
+    detail = {"reason": body.reason, "attested_at": attested_at}
+
+    # Upsert: try to INSERT a fresh attestation; on the uq_criterionevidence_dedup
+    # collision (a repeat attestation by the same operator on the same criterion —
+    # source_id=user_id is non-null so the partial unique index applies) refresh
+    # the existing row's ``detail`` with a direct UPDATE so the expiry timer
+    # restarts.  This is the operator re-attest / renew path — the waiver is
+    # renewable before it expires, rather than a silent no-op.
     evidence = CriterionEvidence(
         criterion_id=row.id,
         project_id=project_id,
         source_kind="operator_attestation",
         source_id=current_user["user_id"],
-        detail={"reason": body.reason},
+        detail=detail,
     )
     session.add(evidence)
     try:
         await session.commit()
     except IntegrityError:
-        # uq_criterionevidence_dedup covers attestations (source_id=user_id is non-null);
-        # a duplicate by the same operator is an intentional no-op — just return covered.
         await session.rollback()
-        return {"status": "ok", "criterion_key": criterion_key, "coverage": "covered"}
+        # Refresh the existing attestation's detail (attested_at + reason) via a
+        # Core UPDATE keyed on the dedup columns, so re-attestation renews the
+        # expiry timer without creating a duplicate row.
+        await session.execute(
+            sa_update(CriterionEvidence)
+            .where(
+                CriterionEvidence.criterion_id == row.id,
+                CriterionEvidence.source_kind == "operator_attestation",
+                CriterionEvidence.source_id == current_user["user_id"],
+            )
+            .values(detail=detail)
+        )
+        await session.commit()
+        logger.info(
+            "[AC] Operator attestation refreshed: project=%s criterion=%s user=%s "
+            "attested_at=%s reason=%r",
+            project_id,
+            criterion_key,
+            current_user["user_id"],
+            attested_at,
+            body.reason,
+        )
+        return {"status": "ok", "criterion_key": criterion_key, "coverage": "attested"}
 
     logger.info(
-        "[AC] Operator attestation recorded: project=%s criterion=%s user=%s reason=%r",
+        "[AC] Operator attestation recorded: project=%s criterion=%s user=%s "
+        "attested_at=%s reason=%r",
         project_id,
         criterion_key,
         current_user["user_id"],
+        attested_at,
         body.reason,
     )
-    return {"status": "ok", "criterion_key": criterion_key, "coverage": "covered"}
+    return {"status": "ok", "criterion_key": criterion_key, "coverage": "attested"}
 
 
 class ReconcileBackfillRequest(BaseModel):

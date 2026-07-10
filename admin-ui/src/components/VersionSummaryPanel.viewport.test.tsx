@@ -516,6 +516,117 @@ describe('VersionSummaryPanel — viewport regression', () => {
     }
   });
 
+  // ── attested (operator-attestation-only) coverage tier ──────────────────────
+
+  test('attested-only criterion renders the distinct amber "attested" badge', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 2,
+      covered: 1,
+      attested: 1,
+      partial: 0,
+      uncovered: 0,
+      criteria: [
+        { criterion_key: 'c-verified', text: 'Machine-verified criterion', coverage: 'covered', evidence_count: 2 },
+        { criterion_key: 'c-attested', text: 'Operator-attested criterion', coverage: 'attested', evidence_count: 1 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const row = host.querySelector('[data-testid="criterion-row-c-attested"]');
+    if (row === null) throw new Error('Expected criterion-row-c-attested element');
+    const badge = row.querySelector('span.rounded');
+    if (badge === null) throw new Error('Expected coverage badge span in attested row');
+    expect(badge.textContent).toBe('attested');
+    // Amber tier — visually distinct from emerald "covered" and slate "uncovered".
+    expect(badge.className).toContain('text-amber-400');
+    expect(badge.className).toContain('bg-amber-600/20');
+  });
+
+  test('header shows split "verified + attested" fraction when attested > 0', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 3,
+      covered: 1,
+      attested: 2,
+      partial: 0,
+      uncovered: 0,
+      criteria: [
+        { criterion_key: 'c1', text: 'Verified', coverage: 'covered', evidence_count: 1 },
+        { criterion_key: 'c2', text: 'Attested A', coverage: 'attested', evidence_count: 1 },
+        { criterion_key: 'c3', text: 'Attested B', coverage: 'attested', evidence_count: 1 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const fraction = host.querySelector('[data-testid="criterion-coverage-fraction"]');
+    if (fraction === null) throw new Error('Expected criterion-coverage-fraction element');
+    expect(fraction.textContent).toBe('1 verified + 2 attested / 3');
+    const attestedBadge = host.querySelector('[data-testid="attested-count-badge"]');
+    if (attestedBadge === null) throw new Error('Expected attested-count-badge when attested > 0');
+    expect(attestedBadge.textContent).toContain('2 attested');
+  });
+
+  test('header falls back to plain fraction and hides attested badge when attested is undefined', async () => {
+    // Older backend: no `attested` field at all — must be treated as 0.
+    const coverage: VersionCriterionCoverage = {
+      total: 2,
+      covered: 1,
+      partial: 0,
+      uncovered: 1,
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered', coverage: 'covered', evidence_count: 1 },
+        { criterion_key: 'c2', text: 'Uncovered', coverage: 'uncovered', evidence_count: 0 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const fraction = host.querySelector('[data-testid="criterion-coverage-fraction"]');
+    if (fraction === null) throw new Error('Expected criterion-coverage-fraction element');
+    expect(fraction.textContent).toBe('1/2 active covered');
+    if (host.querySelector('[data-testid="attested-count-badge"]') !== null) {
+      throw new Error('Expected no attested-count-badge when attested is undefined');
+    }
+  });
+
+  test('renders without horizontal overflow at 1200px with attested coverage', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 3,
+      covered: 1,
+      attested: 1,
+      partial: 0,
+      uncovered: 1,
+      criteria: [
+        { criterion_key: 'c1', text: 'Machine-verified acceptance criterion with a reasonably long description', coverage: 'covered', evidence_count: 3 },
+        { criterion_key: 'c2', text: 'Operator-attested criterion pending machine corroboration before expiry', coverage: 'attested', evidence_count: 1 },
+        { criterion_key: 'c3', text: 'Still-uncovered acceptance criterion awaiting evidence', coverage: 'uncovered', evidence_count: 0 },
+      ],
+    };
+    await expectNoOverflowAt(1200, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+      });
+    });
+  });
+
   test('criterion with null stuck_reason renders no stuck label', async () => {
     const coverage: VersionCriterionCoverage = {
       total: 1,
