@@ -473,6 +473,22 @@ export interface VersionCriterionCoverage {
   criteria: CriterionCoverageEntry[];
 }
 
+/** Per-dimension qualification state derived from last_qualification.
+ *  Surfaced in current_version.dimension_states and recent_versions entries. */
+export interface DimensionState {
+  /** Stable identifier: audit | test_erosion | smoketest | ci | migration_identity
+   *  | migration_apply | merge_grade | criterion_coverage | debt_pressure | goal_alignment */
+  key: string;
+  /** Human-readable name for display. */
+  label: string;
+  /** "passed" | "failed" | "unavailable" | "not_applicable" | "pending" */
+  status: string;
+  /** Numeric score in [0,1] when the dimension produces one; null otherwise. */
+  score: number | null;
+  /** Short reason string (blocker code or infra error). */
+  reason: string | null;
+}
+
 export interface CurrentVersion {
   version_number: number;
   phase: string;
@@ -554,6 +570,10 @@ export interface CurrentVersion {
   /** Event-driven qualification trigger explain-surface (additive; nullable).
    *  Answers 'why hasn't qualification fired / what will fire it next'. */
   qualification_trigger_state?: QualificationTriggerState | null;
+  /** Per-dimension qualification state. Always present when a qualification has
+   *  run; empty array when no qualification data is available. Additive field —
+   *  older backends omit it. */
+  dimension_states?: DimensionState[];
 }
 
 /** Auto-trigger mode for the qualification trigger resolver. */
@@ -623,6 +643,8 @@ export interface RecentVersion {
   acceptance_aggregate?: Record<string, number> | null;
   /** Version-scoped criterion coverage derived from the canonical acceptance contract. */
   criterion_coverage?: VersionCriterionCoverage | null;
+  /** Per-dimension qualification state — additive, same shape as CurrentVersion. */
+  dimension_states?: DimensionState[];
 }
 
 export interface PromotionReadinessConfidence {

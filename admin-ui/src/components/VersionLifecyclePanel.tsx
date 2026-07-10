@@ -50,6 +50,7 @@ import {
   ServingStatusBadge,
   ArtifactEvidenceList,
   ConfidenceSparkline,
+  DimensionBreakdown,
 } from './VersionLifecyclePanelPrimitives';
 
 const TRIGGER_AUTO_LABELS: Record<string, { label: string; cls: string }> = {
@@ -844,6 +845,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       </div>
                     ))}
                   </div>
+                )}
+                {cv.dimension_states && cv.dimension_states.length > 0 && (
+                  <DimensionBreakdown dimensions={cv.dimension_states} />
                 )}
                 {cv.last_qualification.blocker && (
                   <p className="text-ui-sm text-red-400 truncate">{cv.last_qualification.blocker}</p>

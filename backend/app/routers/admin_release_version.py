@@ -32,6 +32,7 @@ from app.qualification_state_resolver import (
     resolve_effective_qualification_state,
     resolve_open_version_qualification_state,
     resolve_promotion_blocking_result,
+    resolve_dimension_states,
 )
 from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
@@ -320,6 +321,8 @@ async def _serialize_version_history_entry(
         # Same shape as current_version. total/covered/partial/uncovered count
         # active criteria only; inactive audit rows may still appear in criteria.
         "criterion_coverage": criterion_coverage,
+        # Per-dimension qualification state — additive, same shape as current_version.
+        "dimension_states": resolve_dimension_states(version.last_qualification),
     }
 
 
@@ -833,6 +836,11 @@ async def get_version_lifecycle(
                 # nullable when compute fails). Answers 'why hasn't qualification
                 # fired / what will fire it next' per design doc efbe4182.
                 "qualification_trigger_state": _qualification_trigger_state,
+                # Per-dimension qualification state derived from last_qualification.
+                # Always a list (empty when no qualification has run); each entry
+                # has key, label, status, score, reason. Additive — never breaks
+                # older clients that ignore unknown fields.
+                "dimension_states": resolve_dimension_states(open_row.last_qualification),
             }
 
         history_rows = (

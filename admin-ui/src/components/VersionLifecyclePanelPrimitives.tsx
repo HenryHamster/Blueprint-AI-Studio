@@ -11,6 +11,7 @@ import type {
   ChallengerRefutedFinding,
   CiResolution,
   CurrentVersion,
+  DimensionState,
   GoalAlignment,
   LatestAudit,
   OutOfBandPromotion,
@@ -1214,6 +1215,60 @@ export function VersionLifecycleRefreshBanner({
           {refreshing ? 'Retrying...' : 'Retry'}
         </button>
       </div>
+    </div>
+  );
+}
+
+const DIMENSION_STATUS_DOT: Record<string, string> = {
+  passed: 'bg-emerald-500',
+  failed: 'bg-red-500',
+  unavailable: 'bg-amber-400',
+};
+
+/** Per-dimension breakdown of qualification state: colored status dot, label,
+ *  optional score, and reason text for failed/unavailable rows. */
+export function DimensionBreakdown({ dimensions }: { dimensions: DimensionState[] }) {
+  if (dimensions.length === 0) return null;
+  return (
+    <div data-testid="dimension-states" className="space-y-0.5 py-0.5">
+      {dimensions.map(d => {
+        const dotClass = DIMENSION_STATUS_DOT[d.status] ?? 'bg-neutral-500';
+        const isFailed = d.status === 'failed';
+        const isUnavailable = d.status === 'unavailable';
+        const isPassed = d.status === 'passed';
+        const rowBg = isFailed
+          ? 'bg-red-500/5 border border-red-500/20 rounded px-1.5'
+          : '';
+        return (
+          <div
+            key={d.key}
+            className={`flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-ui-sm ${rowBg}`}
+            data-dimension={d.key}
+            data-status={d.status}
+          >
+            <span
+              className={`inline-block w-2 h-2 rounded-full shrink-0 mt-0.5 ${dotClass}`}
+              aria-label={d.status}
+            />
+            <span className={isPassed ? 'text-neutral-500' : isFailed ? 'text-red-300 font-medium' : isUnavailable ? 'text-amber-300' : 'text-neutral-500'}>
+              {d.label}
+            </span>
+            {d.score != null && (
+              <span className="font-mono text-neutral-500">
+                {Math.round(d.score * 100)}%
+              </span>
+            )}
+            {d.reason && (
+              <span
+                className={`truncate max-w-[200px] ${isFailed ? 'text-red-400' : 'text-amber-400'}`}
+                title={d.reason}
+              >
+                {d.reason}
+              </span>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

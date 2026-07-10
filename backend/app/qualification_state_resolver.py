@@ -275,6 +275,207 @@ async def resolve_promotion_blocking_result(
     return None
 
 
+def resolve_dimension_states(
+    last_qualification: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Derive per-dimension qualification state from a raw ``last_qualification`` dict.
+
+    Pure (no DB access). Returns a list of dimension-state dicts, one per
+    qualification dimension, each with keys: ``key``, ``label``, ``status``
+    (one of ``"passed"``, ``"failed"``, ``"unavailable"``, ``"not_applicable"``,
+    ``"pending"``), ``score`` (float or None), ``reason`` (str or None).
+
+    Degradation rules (in priority order):
+      1. ``last_qualification`` is None/empty → all dimensions ``"pending"``
+      2. ``status == "infra_failure"`` → all dimensions ``"unavailable"`` with
+         the stored ``error`` as reason
+      3. ``status in ("pending", "qualifying")`` with no ``promotion_pending``
+         sub-key → all dimensions ``"pending"``
+      4. Otherwise derive per-dimension from ``blocker``, ``sub_scores``,
+         and evidence fields.
+    """
+    q: dict[str, Any] = last_qualification if isinstance(last_qualification, dict) else {}
+
+    _DIMENSIONS: list[tuple[str, str]] = [
+        ("audit", "Audit"),
+        ("test_erosion", "Test Erosion"),
+        ("smoketest", "Smoketest"),
+        ("ci", "CI"),
+        ("migration_identity", "Migration Identity"),
+        ("migration_apply", "Migration Apply"),
+        ("merge_grade", "Merge Grade"),
+        ("criterion_coverage", "Criterion Coverage"),
+        ("debt_pressure", "Debt Pressure"),
+        ("goal_alignment", "Goal Alignment"),
+    ]
+
+    _BLOCKER_TO_DIM: dict[str, str] = {
+        "ci_not_green": "ci",
+        "ci_unresolved": "ci",
+        "migration_identity_collision": "migration_identity",
+        "migration_apply_drift": "migration_apply",
+        "merge_grade_misses": "merge_grade",
+        "criterion_coverage_incomplete": "criterion_coverage",
+        "smoketest_startup_failed": "smoketest",
+        "audit_missing": "audit",
+        "test_file_deleted": "test_erosion",
+    }
+
+    def _all(status: str, reason: str | None = None) -> list[dict[str, Any]]:
+        return [
+            {"key": k, "label": lb, "status": status, "score": None, "reason": reason}
+            for k, lb in _DIMENSIONS
+        ]
+
+    if not q:
+        return _all("pending")
+
+    status = q.get("status")
+
+    if status == "infra_failure":
+        error = q.get("error") or "infra_failure"
+        return _all("unavailable", error)
+
+    if status in ("pending", "qualifying") and not q.get("promotion_pending"):
+        return _all("pending")
+
+    blocker: str | None = q.get("blocker")
+    sub_scores: dict[str, Any] = q.get("sub_scores") or {}
+    ci_resolution: dict[str, Any] = q.get("ci_resolution") or {}
+    smoketest_enabled: bool = bool(q.get("smoketest_enabled", True))
+    migration_safety = q.get("migration_safety")
+    migration_apply_safety = q.get("migration_apply_safety")
+    merge_grade_status = q.get("merge_grade_status")
+    merge_grade_coverage = q.get("merge_grade_coverage")
+    criterion_coverage: dict[str, Any] = q.get("criterion_coverage") or {}
+    goal_alignment = q.get("goal_alignment")
+
+    # The blocker dimension (if any) is always "failed".
+    blocker_dim: str | None = _BLOCKER_TO_DIM.get(blocker) if blocker else None
+    # When audit_missing fires, test_erosion is also effectively unavailable
+    # (both scores come from the same audit report).
+    audit_missing = blocker == "audit_missing"
+
+    result: list[dict[str, Any]] = []
+    for key, label in _DIMENSIONS:
+        dim_status: str
+        score: float | None = None
+        reason: str | None = None
+
+        if key == blocker_dim:
+            dim_status = "failed"
+            reason = blocker
+        elif key == "test_erosion" and audit_missing:
+            dim_status = "unavailable"
+            reason = "audit_missing"
+        elif key == "smoketest" and not smoketest_enabled:
+            dim_status = "not_applicable"
+        elif key in ("audit", "test_erosion"):
+            raw = sub_scores.get(key)
+            if raw is not None and float(raw) > 0.0:
+                dim_status = "passed"
+                score = float(raw)
+            elif raw is not None:
+                # score is 0.0 — either genuinely zero or a placeholder when
+                # blocked; surface as unavailable when no blocker fired for it.
+                dim_status = "unavailable"
+            else:
+                dim_status = "unavailable"
+        elif key == "smoketest":
+            raw = sub_scores.get("smoketest")
+            if raw is not None and float(raw) > 0.0:
+                dim_status = "passed"
+                score = float(raw)
+            elif raw is not None:
+                dim_status = "unavailable"
+            else:
+                dim_status = "unavailable"
+        elif key == "ci":
+            ci_state = ci_resolution.get("state")
+            if ci_state and ci_state not in ("", None):
+                dim_status = "passed"
+                reason = ci_state
+            else:
+                dim_status = "unavailable"
+        elif key == "migration_identity":
+            if migration_safety == "ok":
+                dim_status = "passed"
+            elif migration_safety == "block":
+                dim_status = "failed"
+                reason = "migration_identity_collision"
+            elif migration_safety == "defer":
+                dim_status = "unavailable"
+                reason = "migration_identity_defer"
+            else:
+                dim_status = "unavailable"
+        elif key == "migration_apply":
+            if migration_apply_safety == "ok":
+                dim_status = "passed"
+            elif migration_apply_safety == "block":
+                dim_status = "failed"
+                reason = "migration_apply_drift"
+            elif migration_apply_safety == "defer":
+                dim_status = "unavailable"
+                reason = "migration_apply_defer"
+            elif migration_apply_safety is None:
+                dim_status = "not_applicable"
+            else:
+                dim_status = "unavailable"
+        elif key == "merge_grade":
+            if merge_grade_status == "pass":
+                dim_status = "passed"
+                if merge_grade_coverage is not None:
+                    score = float(merge_grade_coverage)
+            elif merge_grade_status in ("not_applicable", "superseded_exempt",
+                                         "already_on_main_exempt"):
+                dim_status = "not_applicable"
+            elif merge_grade_status == "fail":
+                dim_status = "failed"
+                reason = "merge_grade_misses"
+            else:
+                dim_status = "unavailable"
+        elif key == "criterion_coverage":
+            total = int(criterion_coverage.get("total") or 0)
+            covered = int(criterion_coverage.get("covered") or 0)
+            if total == 0:
+                dim_status = "not_applicable"
+            elif covered >= total:
+                dim_status = "passed"
+                score = 1.0
+            else:
+                dim_status = "failed"
+                reason = "criterion_coverage_incomplete"
+        elif key == "debt_pressure":
+            raw = sub_scores.get("debt_pressure")
+            if raw is not None:
+                dim_status = "passed"
+                score = float(raw)
+            else:
+                dim_status = "unavailable"
+        elif key == "goal_alignment":
+            if goal_alignment is None:
+                dim_status = "unavailable"
+            elif isinstance(goal_alignment, dict):
+                ga_status = goal_alignment.get("status") or goal_alignment.get("verdict")
+                if ga_status in ("pass", "met", "aligned"):
+                    dim_status = "passed"
+                elif ga_status in ("fail", "unmet", "misaligned"):
+                    dim_status = "failed"
+                    reason = ga_status
+                else:
+                    dim_status = "passed"
+            else:
+                dim_status = "passed"
+        else:
+            dim_status = "unavailable"
+
+        result.append(
+            {"key": key, "label": label, "status": dim_status, "score": score, "reason": reason}
+        )
+
+    return result
+
+
 async def resolve_open_version_qualification_state(
     session: AsyncSession,
     version: ReleaseVersion,

@@ -501,6 +501,57 @@ const INFRA_STREAK_DATA: VersionLifecycleResponse = {
   staged_directions: [],
 };
 
+const DIMENSION_STATES_DATA: VersionLifecycleResponse = {
+  current_version: {
+    version_number: 15,
+    phase: 'stabilize',
+    phase_changed_at: '2026-07-10T08:00:00Z',
+    phase_reasoning: null,
+    goal: 'v15 qualification: resolve audit failures and re-qualify',
+    opened_at: '2026-07-01T00:00:00Z',
+    qualification_attempts: 5,
+    merged_task_count: 33,
+    in_flight_task_count: 0,
+    active_candidate_sha: 'abc1234def5678901234567890123456789012ab',
+    qualification_state: {
+      state: 'not_promoted',
+      summary: 'Qualification complete — not promoted (audit below threshold)',
+    },
+    last_qualification: {
+      candidate_sha: 'abc1234def5678901234567890123456789012ab',
+      confidence: 0.68,
+      threshold: 0.8,
+      sub_scores: {
+        audit: 0.62,
+        test_erosion: 0.95,
+        smoketest: 0.88,
+        debt_pressure: 0.9,
+      },
+      ci_resolution: { state: 'green', detail: 'all checks passed', resolved_sha: 'abc1234' },
+      started_at: '2026-07-10T07:00:00Z',
+      finalized_at: '2026-07-10T08:00:00Z',
+      status: 'not_promoted',
+      blocker: 'audit_below_threshold',
+      audit_missing_reason: null,
+      audit_reconciliation: null,
+    },
+    dimension_states: [
+      { key: 'audit', label: 'Audit', status: 'failed', score: 0.62, reason: 'audit_below_threshold' },
+      { key: 'test_erosion', label: 'Test Erosion', status: 'passed', score: 0.95, reason: null },
+      { key: 'smoketest', label: 'Smoke Test', status: 'passed', score: 0.88, reason: null },
+      { key: 'ci', label: 'CI', status: 'passed', score: null, reason: null },
+      { key: 'migration_identity', label: 'Migration Identity', status: 'unavailable', score: null, reason: 'heartbeat_stale' },
+      { key: 'merge_grade', label: 'Merge Grade', status: 'passed', score: null, reason: null },
+      { key: 'criterion_coverage', label: 'Criterion Coverage', status: 'passed', score: null, reason: null },
+    ],
+    latest_audit: null,
+    audit_evidence_state: 'none',
+  },
+  recent_versions: [],
+  promotion_enabled: false,
+  staged_directions: [],
+};
+
 describe('VersionLifecyclePanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -619,6 +670,40 @@ describe('VersionLifecyclePanel — viewport regression', () => {
     }
     if (!host?.textContent?.includes('release_audit heartbeat stale')) {
       throw new Error('Expected the infra-failure error text to render distinctly from the streak chip');
+    }
+  });
+
+  test('dimension states — no overflow at 375px', async () => {
+    await expectNoOverflowAt(375, makeRender(DIMENSION_STATES_DATA));
+  });
+
+  test('dimension states — no text truncation at 375px', async () => {
+    await expectNoTextTruncationAt(375, makeRender(DIMENSION_STATES_DATA));
+  });
+
+  test('dimension states — touch targets at 375px', async () => {
+    await expectMinTouchTargetAt(375, makeRender(DIMENSION_STATES_DATA), { selector: 'button, a[href]' });
+  });
+
+  test('dimension states — renders dimension-states section with failed and passed rows', async () => {
+    await makeRender(DIMENSION_STATES_DATA)();
+    const container = host;
+    if (!container) throw new Error('host not initialized');
+    const section = container.querySelector('[data-testid="dimension-states"]');
+    if (!section) {
+      throw new Error('Expected [data-testid="dimension-states"] to be present when dimension_states is populated');
+    }
+    const failedRow = section.querySelector('[data-status="failed"]');
+    if (!failedRow) {
+      throw new Error('Expected at least one failed dimension row inside dimension-states');
+    }
+    const passedRow = section.querySelector('[data-status="passed"]');
+    if (!passedRow) {
+      throw new Error('Expected at least one passed dimension row inside dimension-states');
+    }
+    const unavailableRow = section.querySelector('[data-status="unavailable"]');
+    if (!unavailableRow) {
+      throw new Error('Expected at least one unavailable dimension row inside dimension-states');
     }
   });
 

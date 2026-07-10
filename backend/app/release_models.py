@@ -19,6 +19,7 @@ from typing import Any, Dict, List
 import uuid
 from datetime import datetime
 
+from pydantic import BaseModel
 from sqlalchemy import (
     Boolean,
     Column,
@@ -1082,4 +1083,18 @@ class QualificationDimensionResult(SQLModel, table=True):
             name="uq_qualdimresult_version_sha_dimension",
         ),
     )
+
+
+class DimensionState(BaseModel):
+    """Read-side projection of a single qualification dimension's state.
+
+    Not a DB model — derived from ``last_qualification`` by
+    :func:`app.qualification_state_resolver.resolve_dimension_states`.
+    """
+
+    key: str
+    label: str
+    status: str  # "passed" | "failed" | "unavailable" | "not_applicable" | "pending"
+    score: float | None = None
+    reason: str | None = None
 

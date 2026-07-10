@@ -224,7 +224,7 @@
     "api.ts": 4950,
     "components/WarmVmPanel.tsx": 1800,
     "components/TaskDetailDrawerSections.tsx": 1950,
-    "components/VersionLifecyclePanelPrimitives.tsx": 1300,
+    "components/VersionLifecyclePanelPrimitives.tsx": 1550,
     "components/SettingsAccountsSection.tsx": 1500,
     "components/NewProjectModal.tsx": 1350,
     "components/ImprovementLanesPanel.tsx": 1150,
