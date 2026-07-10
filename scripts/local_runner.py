@@ -2875,6 +2875,21 @@ def _spawn_agent_task(
                 # visible inside the sandbox.
                 fpath = f["path"].lstrip("/")
                 fpath = os.path.join(workspace, fpath)
+                # Path-traversal guard: reject paths that would escape the
+                # workspace directory after normalization (e.g. ../ sequences).
+                resolved_dest = os.path.abspath(os.path.normpath(fpath))
+                resolved_ws = os.path.realpath(workspace)
+                if not (
+                    resolved_dest == resolved_ws
+                    or resolved_dest.startswith(resolved_ws + os.sep)
+                ):
+                    print(
+                        f"[runner] warning: credential file path "
+                        f"{f['path']!r} resolves outside workspace "
+                        f"— skipping",
+                        flush=True,
+                    )
+                    continue
                 fcontent = f["content"]
                 fmode = f.get("mode", "0600")
                 parent = os.path.dirname(fpath)

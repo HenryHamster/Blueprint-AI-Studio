@@ -4944,5 +4944,177 @@ class TestTaskLogPersistence(unittest.TestCase):
         self.assertEqual(removed, 0)
 
 
+# ── Credential file path-traversal guard ──────────────────────────────────────
+
+class TestCredentialFileTraversalGuard(unittest.TestCase):
+    """Path-traversal guard in _spawn_agent_task rejects credential-file paths
+    that would escape the per-task workspace directory."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _spawn_with_llm_files(self, workspace, llm_files):
+        """Drive _spawn_agent_task with mocked iso layer and the given llm_files.
+        Returns (spawned_flag, stdout_text)."""
+        active_tasks: dict = {}
+        agent_started_at: dict = {}
+        agent_teardown: dict = {}
+        fake_proc = MagicMock()
+        fake_proc.pid = 4321
+        fake_proc.stdout = io.BytesIO(b"")
+
+        plan = iso.ExecutionPlan(
+            backend=iso.BACKEND_BWRAP,
+            argv=["bwrap", "node", "..."],
+            env={"AGENT_SECRET_TOKEN": "s"},
+            container_name=None,
+        )
+
+        with patch.object(local_runner.iso, "decide_agent_backend",
+                          return_value=iso.BACKEND_BWRAP), \
+             patch.object(local_runner.iso, "plan_agent_execution",
+                          return_value=plan), \
+             patch.object(local_runner.subprocess, "Popen",
+                          return_value=fake_proc):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                spawned = local_runner._spawn_agent_task(
+                    task_id="task-xyz",
+                    task_type="research",
+                    agent_token="agent-tok",
+                    vm_instance_id="runner:local",
+                    orchestrator_url="https://api.example.com",
+                    workspace=workspace,
+                    caps=_bwrap_caps(),
+                    agent_binary=["node", "/agent/dist/index.js"],
+                    agent_image=None,
+                    active_tasks=active_tasks,
+                    agent_started_at=agent_started_at,
+                    agent_teardown=agent_teardown,
+                    lock=threading.Lock(),
+                    llm_files=llm_files,
+                )
+        return spawned, buf.getvalue()
+
+    def test_normal_in_workspace_path_writes(self):
+        """A legitimate relative path inside the workspace is written correctly."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": "home/user/.config/claude/config.json",
+                    "content": '{"provider": "anthropic"}',
+                }
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            dest = os.path.join(tmpdir, "home/user/.config/claude/config.json")
+            self.assertTrue(os.path.isfile(dest), "normal path must be written")
+            with open(dest) as f:
+                self.assertEqual(f.read(), '{"provider": "anthropic"}')
+            # No warning about skipping
+            self.assertNotIn("skipping", output.lower())
+
+    def test_simple_traversal_skipped_and_warns(self):
+        """A path with ../ is rejected (not written) and a warning is logged."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": "../escape.txt",
+                    "content": "SHOULD NOT BE WRITTEN",
+                }
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            # The file must not exist at its resolved (escaped) location
+            escaped = os.path.abspath(os.path.normpath(
+                os.path.join(tmpdir, "../escape.txt")
+            ))
+            self.assertFalse(os.path.isfile(escaped),
+                             "traversal path must not be written outside workspace")
+            # Nothing written inside workspace either
+            inside = os.path.join(tmpdir, "escape.txt")
+            self.assertFalse(os.path.isfile(inside),
+                             "traversal path must not be written inside workspace")
+
+            # Warning must mention the path and the word "skipping"
+            self.assertIn("outside workspace", output.lower())
+            self.assertIn("skipping", output.lower())
+
+    def test_deep_traversal_skipped(self):
+        """A deeper ../ sequence (../../x/y) is also rejected by the guard."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": "../../etc/__blueprint_escape_test",
+                    "content": "SHOULD NOT BE WRITTEN",
+                }
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            escaped = os.path.abspath(os.path.normpath(
+                os.path.join(tmpdir, "../../etc/__blueprint_escape_test")
+            ))
+            self.assertFalse(os.path.isfile(escaped),
+                             "deep traversal must not write outside workspace")
+            self.assertIn("outside workspace", output.lower())
+            self.assertIn("skipping", output.lower())
+
+    def test_mixed_paths_normal_writes_traversal_skipped(self):
+        """A normal path is still written when a traversal path is also present."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": ".config/claude/config.json",
+                    "content": '{"valid": true}',
+                },
+                {
+                    "path": "../escape.txt",
+                    "content": "SHOULD NOT BE WRITTEN",
+                },
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            # Normal file must be written
+            normal = os.path.join(tmpdir, ".config/claude/config.json")
+            self.assertTrue(os.path.isfile(normal),
+                            "normal path must still be written alongside traversal path")
+            with open(normal) as f:
+                self.assertEqual(f.read(), '{"valid": true}')
+
+            # Traversal file must not be written
+            escaped = os.path.abspath(os.path.normpath(
+                os.path.join(tmpdir, "../escape.txt")
+            ))
+            self.assertFalse(os.path.isfile(escaped),
+                             "traversal path must not be written despite sibling normal path")
+            self.assertIn("outside workspace", output.lower())
+            self.assertIn("skipping", output.lower())
+
+    def test_leading_slash_normalized_still_in_workspace(self):
+        """A leading-slash path is normalized to workspace-relative and passes."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": "/home/user/.config/credentials.json",
+                    "content": '{"key": "secret"}',
+                }
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            # The leading / is stripped by .lstrip("/"), then joined with workspace
+            dest = os.path.join(tmpdir, "home/user/.config/credentials.json")
+            self.assertTrue(os.path.isfile(dest),
+                            "leading-slash path must be treated as relative to workspace")
+            self.assertNotIn("skipping", output.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
