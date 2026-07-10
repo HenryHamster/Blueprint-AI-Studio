@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from app.acceptance_criteria import criterion_coverage_to_evidence_status
 from app.problem_model import (
     ARCHIVED_GAPS_DURABLE_MAX,
     CAPABILITIES_DURABLE_MAX,
@@ -56,6 +57,7 @@ from app.problem_model import (
     reconcile_gap_staffing_raw,
     reconcile_gap_staffing_raw_result,
     reconcile_gaps_for_retired_directions,
+    evidence_met_summary,
 )
 
 
@@ -5710,3 +5712,99 @@ def test_apply_agent_update_capability_evidence_refs_proposed_wins():
     assert merged_cap["evidence_refs"] == [
         {"kind": "backing_path", "ref": "new_path.py", "proven": True}
     ]
+
+
+# ---------------------------------------------------------------------------
+# criterion_coverage_to_evidence_status
+# ---------------------------------------------------------------------------
+
+
+def test_criterion_coverage_to_evidence_status_covered():
+    assert criterion_coverage_to_evidence_status("covered") == "proven"
+
+
+def test_criterion_coverage_to_evidence_status_partial():
+    assert criterion_coverage_to_evidence_status("partial") == "partial"
+
+
+def test_criterion_coverage_to_evidence_status_uncovered():
+    assert criterion_coverage_to_evidence_status("uncovered") == "unproven"
+
+
+def test_criterion_coverage_to_evidence_status_unknown():
+    assert criterion_coverage_to_evidence_status("bogus") == "unverified"
+    assert criterion_coverage_to_evidence_status("") == "unverified"
+
+
+# ---------------------------------------------------------------------------
+# evidence_met_summary
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_met_summary_capability_and_gap_tallies():
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="a",
+                status="working",
+                evidence_refs=[{"kind": "named_test", "ref": "t.py", "proven": True}],
+            ),
+            Capability(
+                name="b",
+                status="partial",
+                evidence_refs=[{"kind": "backing_path", "ref": "f.py", "proven": False}],
+            ),
+            Capability(name="c", status="planned"),  # no refs → unproven
+        ],
+        gaps=[
+            Gap(
+                id="g1",
+                name="g1",
+                evidence_refs=[{"kind": "named_test", "ref": "t.py", "proven": True}],
+            ),
+            Gap(id="g2", name="g2"),  # no refs → unproven
+        ],
+    )
+    summary = evidence_met_summary(model)
+    assert summary["capabilities"]["proven"] == 1
+    assert summary["capabilities"]["partial"] == 1
+    assert summary["capabilities"]["unproven"] == 1
+    assert summary["capabilities"]["contradicted"] == 0
+    assert summary["capabilities"]["unverified"] == 0
+    assert summary["gaps"]["proven"] == 1
+    assert summary["gaps"]["unproven"] == 1
+    assert "acceptance" not in summary
+
+
+def test_evidence_met_summary_with_coverage_summary():
+    model = ProblemModel()
+    coverage = {
+        "criteria": [
+            {"criterion_key": "c1", "coverage": "covered", "status": "active"},
+            {"criterion_key": "c2", "coverage": "partial", "status": "active"},
+            {"criterion_key": "c3", "coverage": "uncovered", "status": "active"},
+            {"criterion_key": "c4", "coverage": "covered", "status": "retracted"},  # inactive, skipped
+        ]
+    }
+    summary = evidence_met_summary(model, coverage_summary=coverage)
+    acc = summary["acceptance"]
+    assert acc["proven"] == 1
+    assert acc["partial"] == 1
+    assert acc["unproven"] == 1
+    assert acc["total"] == 3
+
+
+def test_evidence_met_summary_none_coverage_omits_acceptance_key():
+    model = ProblemModel()
+    summary = evidence_met_summary(model, coverage_summary=None)
+    assert "acceptance" not in summary
+
+
+def test_evidence_met_summary_empty_model():
+    summary = evidence_met_summary(ProblemModel())
+    assert summary["capabilities"] == {
+        "proven": 0, "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0
+    }
+    assert summary["gaps"] == {
+        "proven": 0, "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0
+    }

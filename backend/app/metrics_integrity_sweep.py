@@ -2909,6 +2909,9 @@ async def check_capability_claim_reconciliation(
         # Eligible: working/partial capabilities with at least one file-path-shaped
         # backing_path. planned capabilities are aspirational — never flagged.
         eligible: List[dict] = []
+        # Free-claim eligible: working/partial caps with NO backing_paths whose
+        # evidence_refs alone already contradict the declared status.
+        free_claim_eligible: List[dict] = []
         for cap in capabilities:
             if not isinstance(cap, dict):
                 continue
@@ -2916,6 +2919,8 @@ async def check_capability_claim_reconciliation(
                 continue
             paths = cap.get("backing_paths")
             if not isinstance(paths, list) or not paths:
+                # No backing_paths — candidate for the free-claim path.
+                free_claim_eligible.append(cap)
                 continue
             # Keep only paths that look like repo file paths; skip logical ids.
             file_paths = [
@@ -2926,7 +2931,7 @@ async def check_capability_claim_reconciliation(
                 continue
             eligible.append({"cap": cap, "file_paths": file_paths})
 
-        if not eligible:
+        if not eligible and not free_claim_eligible:
             results.append(
                 CheckResult(
                     check="capability_claim_reconciliation",
@@ -2938,7 +2943,7 @@ async def check_capability_claim_reconciliation(
             continue
 
         any_checked = True
-        audited = len(eligible)
+        audited = len(eligible) + len(free_claim_eligible)
         flagged_caps: List[str] = []
 
         for item in eligible:
@@ -2980,6 +2985,18 @@ async def check_capability_claim_reconciliation(
                         break
                 if claim_contradicts_evidence(cap.get("status"), evidence_status):
                     flagged_caps.append(cap_name)
+
+        # Free-claim path: caps declaring working/partial with no backing_paths.
+        # Flag only when evidence_refs alone already contradict the status
+        # (e.g. working + no evidence_refs → classify_evidence returns "unproven"
+        # and claim_contradicts_evidence("working", "unproven") is True).
+        for cap in free_claim_eligible:
+            refs = cap.get("evidence_refs")
+            refs_list = refs if isinstance(refs, list) else []
+            evidence_status = classify_evidence(refs_list)
+            if claim_contradicts_evidence(cap.get("status"), evidence_status):
+                cap_name = cap.get("name") or cap.get("id") or "unknown"
+                flagged_caps.append(cap_name)
 
         if flagged_caps:
             preview = ", ".join(flagged_caps[:3])

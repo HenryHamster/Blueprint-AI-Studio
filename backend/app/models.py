@@ -957,6 +957,67 @@ class MessagesSavedViews(SQLModel, table=True):
     )
 
 
+class ProjectTool(SQLModel, table=True):
+    """A per-project custom UI tool/panel registered against a single project.
+
+    Backs the per-project custom-tools framework: a project registers entries
+    (e.g. a whiteboard/canvas panel) that the admin-ui conditionally renders in
+    that project's workspace only. Tools never leak across projects — every
+    router handler resolves the row through ``_get_user_project_with_role`` on
+    ``project_id`` first.
+
+    ``config`` holds tool-kind-specific settings (validated against the kind's
+    ``config_schema`` in ``TOOL_KINDS``). ``content`` holds the tool's mutable
+    document (e.g. whiteboard strokes); it is written through an optimistic-lock
+    path that bumps ``content_revision`` and rejects a stale ``base_revision``
+    with HTTP 409, mirroring the design-doc revision guard.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    kind: str
+    slug: str
+    title: str
+    enabled: bool = Field(default=True)
+    placement: str = Field(default="project_section")
+    config: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    content: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    content_revision: int = Field(default=0)
+    created_by: str | None = None
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "slug", name="uq_project_tool_project_slug"
+        ),
+    )
+
+
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list

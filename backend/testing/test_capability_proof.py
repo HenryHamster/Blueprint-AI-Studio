@@ -23,6 +23,7 @@ from app.capability_proof import (
     enrich_problem_model_capability_proofs,
     record_capability_proof,
     record_capability_proof_from_trial,
+    record_gap_evidence,
     should_record_capability_proof,
 )
 from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
@@ -823,3 +824,175 @@ class TestRecordCapabilityProofEvidenceRefs:
         assert r["proven"] is True
         assert r["kind"] == _PROOF_KIND_TRIAL_ADOPTION
         assert r["ref"] == cap_name
+
+
+# ── record_gap_evidence ───────────────────────────────────────────────────────
+
+
+def _make_gap_project(gap_id: str, direction_id: str, extra_gap_fields: dict | None = None) -> MagicMock:
+    """Build a project with a direction linked to a gap."""
+    project = MagicMock()
+    project.capability_proof_records = {}
+    gap: dict = {"id": gap_id, "name": f"gap-{gap_id}", "description": "test gap"}
+    if extra_gap_fields:
+        gap.update(extra_gap_fields)
+    project.problem_model = {"gaps": [gap], "capabilities": []}
+    project.directions = [{"id": direction_id, "gap_id": gap_id, "status": "active"}]
+    return project
+
+
+class TestRecordGapEvidence:
+    def test_stamps_evidence_ref_on_gap_with_direction_id(self):
+        """A gap-linked task with a proven verdict produces evidence_refs on the right gap."""
+        gap_id = "gap-001"
+        direction_id = "dir-abc"
+        task = _make_task(
+            task_id="task-gap-001",
+            verdict=_named_test_verdict("testing/test_foo.py::test_gap"),
+        )
+        task.context["direction_id"] = direction_id
+        project = _make_gap_project(gap_id, direction_id)
+
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            record_gap_evidence(task, project)
+
+        gap = project.problem_model["gaps"][0]
+        refs = gap.get("evidence_refs", [])
+        assert len(refs) == 1
+        r = refs[0]
+        assert r["proven"] is True
+        assert r["kind"] == "named_test"
+        assert r["ref"] == "testing/test_foo.py::test_gap"
+        assert r["source_id"] == "task-gap-001"
+        assert "recorded_at" in r
+        mock_fm.assert_called_with(project, "problem_model")
+
+    def test_skips_when_verdict_not_proven(self):
+        """A task with an unproven verdict leaves evidence_refs untouched."""
+        gap_id = "gap-002"
+        direction_id = "dir-def"
+        task = _make_task(
+            task_id="task-gap-002",
+            verdict=_named_test_verdict(proven=False),
+        )
+        task.context["direction_id"] = direction_id
+        project = _make_gap_project(gap_id, direction_id)
+
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            record_gap_evidence(task, project)
+
+        gap = project.problem_model["gaps"][0]
+        assert gap.get("evidence_refs", []) == []
+        mock_fm.assert_not_called()
+
+    def test_skips_when_no_direction_id_in_context(self):
+        """A task with no direction_id in context is a no-op."""
+        project = _make_gap_project("gap-003", "dir-ghi")
+        task = _make_task(task_id="task-no-dir", verdict=_named_test_verdict())
+        # No direction_id in context.
+
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            record_gap_evidence(task, project)
+
+        gap = project.problem_model["gaps"][0]
+        assert gap.get("evidence_refs", []) == []
+        mock_fm.assert_not_called()
+
+    def test_skips_when_direction_not_found(self):
+        """A direction_id that does not exist in project.directions is a no-op."""
+        project = _make_gap_project("gap-004", "dir-jkl")
+        task = _make_task(task_id="task-bad-dir", verdict=_named_test_verdict())
+        task.context["direction_id"] = "dir-nonexistent"
+
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            record_gap_evidence(task, project)
+
+        gap = project.problem_model["gaps"][0]
+        assert gap.get("evidence_refs", []) == []
+        mock_fm.assert_not_called()
+
+    def test_skips_when_gap_not_found(self):
+        """A direction with gap_id that does not exist in problem_model.gaps is a no-op."""
+        project = _make_gap_project("gap-005", "dir-mno")
+        # Direction points to a gap_id not in problem_model.
+        project.directions = [{"id": "dir-mno", "gap_id": "gap-nonexistent"}]
+        task = _make_task(task_id="task-bad-gap", verdict=_named_test_verdict())
+        task.context["direction_id"] = "dir-mno"
+
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            record_gap_evidence(task, project)
+
+        gap = project.problem_model["gaps"][0]
+        assert gap.get("evidence_refs", []) == []
+        mock_fm.assert_not_called()
+
+    def test_dedup_by_source_id(self):
+        """Calling record_gap_evidence twice with the same task is idempotent."""
+        gap_id = "gap-006"
+        direction_id = "dir-pqr"
+        task = _make_task(task_id="task-dup-gap", verdict=_named_test_verdict())
+        task.context["direction_id"] = direction_id
+        project = _make_gap_project(gap_id, direction_id)
+
+        with patch("app.capability_proof.flag_modified"):
+            record_gap_evidence(task, project)
+            record_gap_evidence(task, project)
+
+        gap = project.problem_model["gaps"][0]
+        refs = gap.get("evidence_refs", [])
+        assert len(refs) == 1
+
+    def test_capped_at_max_entries(self):
+        """evidence_refs on a gap is capped at _MAX_PROOF_ENTRIES_PER_CAPABILITY."""
+        gap_id = "gap-007"
+        direction_id = "dir-stu"
+        existing_refs = [
+            {"kind": "named_test", "ref": f"test_{i}.py", "proven": True, "source_id": f"old-task-{i}"}
+            for i in range(_MAX_PROOF_ENTRIES_PER_CAPABILITY)
+        ]
+        project = _make_gap_project(gap_id, direction_id, {"evidence_refs": existing_refs[:]})
+        task = _make_task(task_id="task-new-gap", verdict=_named_test_verdict())
+        task.context["direction_id"] = direction_id
+
+        with patch("app.capability_proof.flag_modified"):
+            record_gap_evidence(task, project)
+
+        gap = project.problem_model["gaps"][0]
+        refs = gap.get("evidence_refs", [])
+        assert len(refs) == _MAX_PROOF_ENTRIES_PER_CAPABILITY
+        assert refs[-1]["source_id"] == "task-new-gap"
+
+    def test_fail_open_on_malformed_problem_model(self):
+        """If problem_model is None, record_gap_evidence does not raise."""
+        project = MagicMock()
+        project.problem_model = None
+        project.directions = [{"id": "dir-vwx", "gap_id": "gap-xyz"}]
+        task = _make_task(task_id="task-malformed", verdict=_named_test_verdict())
+        task.context["direction_id"] = "dir-vwx"
+
+        # Must not raise.
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            record_gap_evidence(task, project)
+
+        mock_fm.assert_not_called()
+
+    def test_evidence_ref_fields_are_complete(self):
+        """Verify all required EvidenceRef fields are present: kind, ref, proven, source_id, recorded_at."""
+        gap_id = "gap-008"
+        direction_id = "dir-yza"
+        task = _make_task(
+            task_id="task-fields",
+            verdict=_named_test_verdict("testing/test_gap_evidence.py::test_fields"),
+        )
+        task.context["direction_id"] = direction_id
+        project = _make_gap_project(gap_id, direction_id)
+
+        with patch("app.capability_proof.flag_modified"):
+            record_gap_evidence(task, project)
+
+        gap = project.problem_model["gaps"][0]
+        r = gap["evidence_refs"][0]
+        assert set(r.keys()) >= {"kind", "ref", "proven", "source_id", "recorded_at"}
+        assert r["proven"] is True
+        assert r["source_id"] == "task-fields"
+        assert r["ref"] == "testing/test_gap_evidence.py::test_fields"

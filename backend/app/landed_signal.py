@@ -387,6 +387,16 @@ def apply_merged_landed_signal(
                 getattr(task, "id", None),
                 exc_info=True,
             )
+        try:
+            from app.capability_proof import record_gap_evidence
+
+            record_gap_evidence(task, project)
+        except Exception:  # noqa: BLE001 — gap evidence stamp must never undo a real merge
+            logger.warning(
+                "[LANDED] gap evidence recording failed for task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
         # Onboarding-proof: record the first PR that landed on the project's
         # integration branch. This is the central merge-landed choke point that
         # already records the capability proof, so it mirrors that pattern

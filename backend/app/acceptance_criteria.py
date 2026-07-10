@@ -442,6 +442,21 @@ async def get_evidence_for_criterion(
     return list(result.scalars().all())
 
 
+def criterion_coverage_to_evidence_status(coverage: str) -> str:
+    """Map a criterion coverage string to the shared EvidenceStatus axis.
+
+    Mapping: ``"covered" → "proven"``, ``"partial" → "partial"``,
+    ``"uncovered" → "unproven"``, anything else → ``"unverified"``.
+    Pure, no IO.
+    """
+    _MAP: dict[str, str] = {
+        "covered": "proven",
+        "partial": "partial",
+        "uncovered": "unproven",
+    }
+    return _MAP.get(coverage, "unverified")
+
+
 def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     """Classify criterion coverage from its evidence list.
 

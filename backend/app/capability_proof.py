@@ -34,6 +34,7 @@ __all__ = [
     "enrich_problem_model_capability_proofs",
     "record_capability_proof",
     "record_capability_proof_from_trial",
+    "record_gap_evidence",
     "should_record_capability_proof",
 ]
 
@@ -352,6 +353,94 @@ def record_capability_proof_from_trial(
             "recorded_at": proved_at,
         },
     )
+
+
+def record_gap_evidence(task: Any, project: Any) -> None:
+    """Stamp EvidenceRef entries onto the Gap linked to this task's direction.
+
+    Resolves the gap via task.context["direction_id"] → project.directions → gap_id
+    → project.problem_model["gaps"].  Appends an EvidenceRef-shaped entry to the
+    gap's ``evidence_refs`` list when the task carries a proven acceptance verdict.
+
+    Non-raising: all errors are logged at WARNING level so this can never undo a
+    real merge.  Idempotent: deduplicates by source_id.
+    """
+    from app.time_utils import _utcnow
+
+    try:
+        context = getattr(task, "context", None) or {}
+        verdict = context.get(_CODE_ACCEPTANCE_VERDICT_KEY)
+        if not isinstance(verdict, dict) or verdict.get("proven") is not True:
+            return
+
+        direction_id = context.get("direction_id")
+        if not direction_id:
+            return
+
+        # Resolve direction → gap_id.
+        directions = getattr(project, "directions", None) or []
+        if not isinstance(directions, list):
+            return
+        gap_id: str | None = None
+        for d in directions:
+            if isinstance(d, dict) and d.get("id") == direction_id:
+                gap_id = d.get("gap_id")
+                break
+        if not gap_id:
+            return
+
+        # Resolve gap in problem_model.
+        pm = getattr(project, "problem_model", None)
+        if not isinstance(pm, dict):
+            return
+        gaps = pm.get("gaps")
+        if not isinstance(gaps, list):
+            return
+        target_gap: dict | None = None
+        for g in gaps:
+            if isinstance(g, dict) and g.get("id") == gap_id:
+                target_gap = g
+                break
+        if target_gap is None:
+            return
+
+        task_id = str(getattr(task, "id", "") or "")
+        proof_kind = _proof_kind_from_verdict(verdict)
+        proof_ref = _extract_proof_ref(verdict) or ""
+        recorded_at = _utcnow().isoformat()
+
+        ref_entry: dict[str, Any] = {
+            "kind": proof_kind,
+            "ref": proof_ref,
+            "proven": True,
+            "source_id": task_id,
+            "recorded_at": recorded_at,
+        }
+
+        refs: list = target_gap.setdefault("evidence_refs", [])
+        # Dedup by source_id.
+        if task_id and any(
+            isinstance(r, dict) and r.get("source_id") == task_id for r in refs
+        ):
+            return
+
+        refs.append(ref_entry)
+        if len(refs) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+            target_gap["evidence_refs"] = refs[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+
+        flag_modified(project, "problem_model")
+        logger.info(
+            "[GAP_EVIDENCE] recorded evidence for task %s gap_id=%s proof_kind=%s",
+            task_id,
+            gap_id,
+            proof_kind,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[GAP_EVIDENCE] failed to record gap evidence for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
 
 
 def carry_proof_records_for_consolidation(

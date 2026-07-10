@@ -620,6 +620,59 @@ def capability_evidence_status(cap: Capability) -> EvidenceStatus:
     return classify_evidence(cap.evidence_refs)
 
 
+def evidence_met_summary(
+    model: ProblemModel,
+    coverage_summary: dict | None = None,
+) -> dict:
+    """Unified evidence scorecard across all three claim surfaces.
+
+    Returns a dict with keys ``"capabilities"``, ``"gaps"``, and optionally
+    ``"acceptance"`` (only when ``coverage_summary`` is provided), each tallying
+    counts on the shared :data:`~app.evidence_primitive.EvidenceStatus` axis::
+
+        {
+            "capabilities": {"proven": n, "partial": n, "unproven": n,
+                             "contradicted": n, "unverified": n},
+            "gaps": {…same axes…},
+            "acceptance": {…same axes…, "total": t},
+        }
+
+    Pure, no IO. When ``coverage_summary`` is None, the ``"acceptance"`` key is
+    absent. Pass the dict from
+    :func:`~app.acceptance_criteria.get_version_coverage_summary` to include it.
+    """
+    from app.acceptance_criteria import criterion_coverage_to_evidence_status
+
+    _AXES: list[EvidenceStatus] = [
+        "proven", "partial", "unproven", "contradicted", "unverified"
+    ]
+
+    def _zero() -> dict:
+        return {a: 0 for a in _AXES}
+
+    cap_tally = _zero()
+    for cap in model.capabilities:
+        cap_tally[capability_evidence_status(cap)] += 1
+
+    gap_tally = _zero()
+    for gap in model.gaps:
+        gap_tally[gap_evidence_status(gap)] += 1
+
+    result: dict = {"capabilities": cap_tally, "gaps": gap_tally}
+
+    if coverage_summary is not None:
+        acc_tally = _zero()
+        for criterion in coverage_summary.get("criteria", []):
+            if criterion.get("status") != "active":
+                continue
+            cov = criterion.get("coverage", "")
+            acc_tally[criterion_coverage_to_evidence_status(cov)] += 1
+        acc_tally["total"] = sum(acc_tally[a] for a in _AXES)
+        result["acceptance"] = acc_tally
+
+    return result
+
+
 def parse_problem_model(raw: dict | None) -> ProblemModel:
     """Safely parse a JSONB blob into a ProblemModel.
 

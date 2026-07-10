@@ -3239,17 +3239,18 @@ async def test_capability_claim_reconciliation_planned_never_flagged(
 
 
 @pytest.mark.asyncio
-async def test_capability_claim_reconciliation_skips_empty_backing_paths(db):
-    """A working capability with no backing_paths is skipped (nothing to audit)."""
+async def test_capability_claim_reconciliation_empty_backing_paths_no_evidence_flagged(db):
+    """A working capability with empty backing_paths and no evidence_refs is
+    flagged by the free-claim path (claim_contradicts_evidence returns True)."""
     await _project_with_capabilities(
         db,
         [{"name": "repo_map", "status": "working", "backing_paths": []}],
     )
 
     results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
-    assert all(not r.flagged for r in results), results
-    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
-    assert skipped
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    assert "repo_map" in flagged[0].detail
 
 
 @pytest.mark.asyncio
@@ -3397,6 +3398,123 @@ async def test_capability_claim_reconciliation_ok_when_proven_ref_present(
     assert all(not r.flagged for r in results), results
     ok = [r for r in results if r.status == CheckStatus.OK]
     assert ok
+
+
+# --- Check: capability_claim_reconciliation (free-claim path) ----------------
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_free_claim_working_no_evidence_flagged(
+    db,
+):
+    """A working capability with no backing_paths and empty evidence_refs IS flagged."""
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "free_working",
+                "status": "working",
+                # No backing_paths — free-claim path applies.
+                "evidence_refs": [],
+            }
+        ],
+    )
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "capability_claim_reconciliation"
+    assert "free_working" in f.detail
+    assert f.severity == "warn"
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_free_claim_working_with_proven_ref_not_flagged(
+    db,
+):
+    """A working capability with no backing_paths but a proven evidence_ref IS NOT flagged."""
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "free_working_proven",
+                "status": "working",
+                "evidence_refs": [
+                    {
+                        "kind": "named_test",
+                        "ref": "backend/testing/test_something.py",
+                        "proven": True,
+                        "source_id": "task-xyz",
+                    }
+                ],
+            }
+        ],
+    )
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), f"expected no flags, got {results}"
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_free_claim_partial_no_evidence_not_flagged(
+    db,
+):
+    """A partial capability with no backing_paths and empty evidence_refs is NOT flagged."""
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "free_partial",
+                "status": "partial",
+                "evidence_refs": [],
+            }
+        ],
+    )
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), f"expected no flags for partial, got {results}"
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_backing_path_check_still_works_with_free_claim(
+    db, monkeypatch
+):
+    """The existing backing_path reconciliation path is unchanged when a free-claim
+    cap is also present in the same project."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "path_backed",
+                "status": "working",
+                "backing_paths": ["backend/app/removed.py"],
+                "evidence_refs": [],
+            },
+            {
+                "name": "free_working",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "backend/testing/test_ok.py", "proven": True}
+                ],
+            },
+        ],
+    )
+
+    async def _removed(path, *args, **kwargs):
+        return False  # all paths removed — backing_path cap should be flagged
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    # path_backed has all backing_paths removed → flagged; free_working has a proven ref → not flagged.
+    assert len(flagged) == 1, f"expected 1 flagged (path_backed only), got {results}"
+    assert "path_backed" in flagged[0].detail
 
 
 # --- Check: merged_pr_count_consistency --------------------------------------
