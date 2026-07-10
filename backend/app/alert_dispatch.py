@@ -1787,7 +1787,6 @@ from app.runner_health_alerts import (  # noqa: F401
     _RUNNER_ESCALATION_AGE_SECONDS_DEFAULT,
     _RUNNER_ESCALATION_FIRST_SECONDS,
     _RUNNER_ESCALATION_REPEAT_SECONDS,
-    _RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
     _RUNNER_LOW_DISK_EVENT_TYPE,
     _RUNNER_LOW_MEMORY_EVENT_TYPE,
     _fleet_no_healthy_runner_dedupe_key,
@@ -1795,7 +1794,6 @@ from app.runner_health_alerts import (  # noqa: F401
     _maybe_create_local_runner_hold_alert,
     _maybe_create_runner_deactivated_alert,
     _maybe_create_runner_degraded_alert,
-    _maybe_create_runner_cross_project_mismatch_alert,
     _maybe_create_runner_low_disk_alert,
     _maybe_create_runner_low_memory_alert,
     _maybe_escalate_runner_deactivated_alert,
@@ -1810,7 +1808,6 @@ from app.runner_health_alerts import (  # noqa: F401
     _runner_deactivated_dedupe_key,
     _runner_degraded_dedupe_key,
     _runner_escalation_last_notified,
-    _runner_cross_project_mismatch_dedupe_key,
     _runner_low_disk_dedupe_key,
     _runner_low_memory_dedupe_key,
     _runner_outage_escalated_keys,
@@ -1825,6 +1822,15 @@ from app.runner_health_alerts import (  # noqa: F401
     _maybe_create_runner_token_stale_alert,
     _resolve_runner_token_stale_alert,
     _runner_token_stale_dedupe_key,
+    # Repeated cross-project runner access alert
+    _RUNNER_CROSS_PROJECT_ACCESS_EVENT_TYPE,
+    _RUNNER_CROSS_PROJECT_ACCESS_THRESHOLD,
+    _RUNNER_CROSS_PROJECT_ACCESS_WINDOW_SECONDS,
+    _maybe_create_runner_cross_project_access_alert,
+    _record_runner_cross_project_mismatch,
+    _resolve_runner_cross_project_access_alert,
+    _runner_cross_project_access_dedupe_key,
+    _runner_cross_project_mismatch_timestamps,
 )
 
 # Stable title prefix for the per-project cost-telemetry-reconciliation-failure alert.

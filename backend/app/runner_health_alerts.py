@@ -14,7 +14,7 @@ delivery is deferred to ``app.notification_dispatch.dispatch_external_notificati
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -975,75 +975,6 @@ async def _resolve_fleet_no_healthy_runner_alert(
     return len(open_alerts)
 
 
-_RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE = "runner.cross_project_mismatch"
-
-
-def _runner_cross_project_mismatch_dedupe_key(
-    runner_id: "uuid.UUID | str", job_id: "uuid.UUID | str"
-) -> str:
-    return f"{_RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE}:{runner_id}:{job_id}"
-
-
-async def _maybe_create_runner_cross_project_mismatch_alert(
-    session: AsyncSession,
-    *,
-    project_id: "uuid.UUID",
-    runner_id: "uuid.UUID | str",
-    job_id: "uuid.UUID | str",
-    job_project_id: "uuid.UUID | str",
-    hostname: "str | None" = None,
-) -> bool:
-    """Create a deduplicated WARNING alert when a runner attempts to access a job
-    from a different project.
-
-    A self-hosted runner registered to one project should never touch compute
-    jobs belonging to another project. When this happens it almost always means
-    a misconfigured or leaked runner token. Surfaces in the operator Alerts banner
-    so the operator can investigate without grepping logs.
-
-    Deduplicated on ``runner.cross_project_mismatch:{runner_id}:{job_id}`` so
-    repeated report attempts for the SAME (runner, job) pair produce a single
-    alert row. Returns ``True`` when a NEW alert was created, else ``False``.
-    """
-    runner_label = hostname or f"runner {str(runner_id)[:8]}"
-    title = f"Runner cross-project access blocked: {runner_label}"
-    message = (
-        f"Self-hosted runner {runner_label} (id={str(runner_id)[:8]}) attempted "
-        f"to report on compute job {str(job_id)[:8]}, which belongs to a "
-        f"different project (project_id={str(job_project_id)[:8]}). Access was "
-        f"denied. This usually means a misconfigured or leaked runner token. "
-        f"Check runner registration and rotate the runner token if necessary."
-    )[:1000]
-
-    dedupe_key = _runner_cross_project_mismatch_dedupe_key(runner_id, job_id)
-    alert, created, _decision = await create_project_alert_if_allowed(
-        session,
-        project_id=project_id,
-        event_type=_RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
-        severity=AlertSeverity.WARNING,
-        title=title,
-        message=message,
-        source="runner",
-        dedupe_key=dedupe_key,
-        broadcast=False,
-    )
-    if alert is None:
-        return False
-    await session.commit()
-    if not created:
-        return False
-    await broadcast_to_project(
-        str(project_id),
-        "alert_created",
-        {
-            "alert_id": str(alert.id),
-            "severity": AlertSeverity.WARNING.value,
-            "title": title,
-        },
-    )
-    return True
-
-
 _RUNNER_LOW_DISK_EVENT_TYPE = "runner.low_disk"
 
 
@@ -1539,6 +1470,146 @@ async def _resolve_runner_low_memory_alert(
         select(Alert).where(
             Alert.project_id == project_id,
             Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
+# Cross-project access alert. The small process-local window deliberately
+# suppresses isolated stale-job races. It resets on restart and is not shared
+# across workers; the durable open alert itself remains in the database.
+_RUNNER_CROSS_PROJECT_ACCESS_EVENT_TYPE = "runner.cross_project_access"
+_RUNNER_CROSS_PROJECT_ACCESS_THRESHOLD = 3
+_RUNNER_CROSS_PROJECT_ACCESS_WINDOW_SECONDS = 300
+_runner_cross_project_mismatch_timestamps: dict[str, list[datetime]] = {}
+
+
+def _runner_cross_project_access_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_CROSS_PROJECT_ACCESS_EVENT_TYPE}:{runner_id}"
+
+
+def _record_runner_cross_project_mismatch(
+    runner_id: "uuid.UUID | str",
+    *,
+    now: "datetime | None" = None,
+) -> tuple[bool, int]:
+    """Record a mismatch and return whether the sliding-window threshold fired."""
+    key = str(runner_id)
+    ts_now = now if now is not None else _utcnow()
+    cutoff = ts_now - timedelta(seconds=_RUNNER_CROSS_PROJECT_ACCESS_WINDOW_SECONDS)
+    timestamps = [
+        timestamp
+        for timestamp in _runner_cross_project_mismatch_timestamps.get(key, [])
+        if timestamp > cutoff
+    ]
+    timestamps.append(ts_now)
+    _runner_cross_project_mismatch_timestamps[key] = timestamps
+    return len(timestamps) >= _RUNNER_CROSS_PROJECT_ACCESS_THRESHOLD, len(timestamps)
+
+
+async def _maybe_create_runner_cross_project_access_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    mismatch_count: int = 0,
+    attempt_project_id: "uuid.UUID | str | None" = None,
+) -> bool:
+    """Create one ERROR alert when a runner repeatedly crosses project boundaries."""
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    target_desc = (
+        f" targeting project {str(attempt_project_id)[:8]}" if attempt_project_id else ""
+    )
+    title = f"Runner cross-project access attempt: {runner_label}"
+    message = (
+        f"Self-hosted runner {runner_label} ({str(runner_id)[:8]}) has attempted "
+        f"to access jobs belonging to a different project{target_desc} "
+        f"{mismatch_count} time(s) in the last "
+        f"{_RUNNER_CROSS_PROJECT_ACCESS_WINDOW_SECONDS // 60} minutes. "
+        "This may indicate a misconfigured or compromised runner. Verify the "
+        "runner's project assignment and rotate its credentials if compromise "
+        "is suspected."
+    )[:1000]
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_CROSS_PROJECT_ACCESS_EVENT_TYPE,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_cross_project_access_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_CROSS_PROJECT_ACCESS",
+                {
+                    "runner_id": str(runner_id),
+                    "runner_label": runner_label,
+                    "mismatch_count": mismatch_count,
+                    "attempt_project_id": (
+                        str(attempt_project_id) if attempt_project_id else None
+                    ),
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "[NOTIFY] RUNNER_CROSS_PROJECT_ACCESS dispatch setup failed: %s", exc
+        )
+    return True
+
+
+async def _resolve_runner_cross_project_access_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss the runner alert and reset its process-local mismatch window."""
+    _runner_cross_project_mismatch_timestamps.pop(str(runner_id), None)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == _runner_cross_project_access_dedupe_key(runner_id),
             Alert.dismissed_at.is_(None),
         )
     )

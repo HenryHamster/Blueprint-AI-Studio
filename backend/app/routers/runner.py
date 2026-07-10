@@ -878,15 +878,29 @@ async def report_compute_job(
                 job_id,
                 mismatch_job.project_id,
             )
-            from app.runner_health_alerts import _maybe_create_runner_cross_project_mismatch_alert
-            await _maybe_create_runner_cross_project_mismatch_alert(
-                session,
-                project_id=runner.project_id,
-                runner_id=runner.id,
-                job_id=job_id,
-                job_project_id=mismatch_job.project_id,
-                hostname=getattr(runner, "hostname", None),
-            )
+            try:
+                from app.runner_health_alerts import (
+                    _maybe_create_runner_cross_project_access_alert,
+                    _record_runner_cross_project_mismatch,
+                )
+
+                should_alert, mismatch_count = _record_runner_cross_project_mismatch(
+                    runner.id
+                )
+                if should_alert:
+                    await _maybe_create_runner_cross_project_access_alert(
+                        session,
+                        project_id=runner.project_id,
+                        runner_id=runner.id,
+                        hostname=runner.hostname,
+                        mismatch_count=mismatch_count,
+                        attempt_project_id=mismatch_job.project_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] Failed to create cross-project-access alert for runner %s",
+                    runner.id,
+                )
         raise HTTPException(status_code=404, detail="compute job not found")
 
     _TERMINAL_STATUSES = {
