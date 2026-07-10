@@ -1178,6 +1178,99 @@ class TestDedupFilteredFindingsAddedToSalvage:
 
 
 @_pytest.mark.asyncio
+async def test_perf_finding_with_salvageable_reason_not_double_counted(db_session, mocker):
+    """A finding that is both type=='perf' AND filtered for a salvageable dedup reason
+    must appear in the salvage bundle exactly once, not twice.
+
+    Regression test for the double-counting bug where two separate loops both
+    appended to _salvage_candidates from the same _dedup_outcome.filtered list
+    with no mutual-exclusion guard between them.
+    """
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.finding_deduplication import DedupOutcome
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-salvage-no-double-count"
+    )
+
+    # A perf-type finding filtered for a salvageable reason ("region overlap with:").
+    # This triggers BOTH collection loops: loop 1 (type=="perf") AND loop 2
+    # (reason starts with "region overlap with:"). Without the fix, it would be
+    # appended twice.
+    perf_region_overlap_finding = dict(_make_finding(
+        "Perf: slow N+1 in task fetch loop",
+        direction_id=direction["id"],
+        finding_type="perf",
+    ))
+    perf_region_overlap_finding["description"] = "N+1 query in task fetch"
+    perf_region_overlap_finding["prompt"] = "Add selectinload to task relation"
+
+    surviving = _make_finding(
+        "Unrelated surviving fix", direction_id=direction["id"]
+    )
+
+    mock_outcome = DedupOutcome()
+    mock_outcome.deduplicated = [(0, surviving, "hash_s")]
+    mock_outcome.filtered = [
+        {
+            "title": perf_region_overlap_finding["title"][:120],
+            "direction_id": direction["id"],
+            "reason": "region overlap with: some-in-flight-task",
+            "finding": perf_region_overlap_finding,
+        }
+    ]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[perf_region_overlap_finding, surviving],
+    )
+    mocker.patch(
+        "app.research_completion.deduplicate_findings",
+        return_value=mock_outcome,
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # Salvage activity must record exactly 1 salvaged finding, not 2.
+    salvage_activity = (task.context or {}).get("salvage_activity")
+    assert salvage_activity is not None, (
+        "salvage_activity must be recorded for a perf finding with salvageable reason"
+    )
+    assert salvage_activity["salvaged_count"] == 1, (
+        f"Expected exactly 1 salvaged finding (no double-count), "
+        f"got {salvage_activity['salvaged_count']}"
+    )
+
+    # The salvage bundle payload must also contain exactly 1 entry.
+    result = await db_session.execute(
+        _select(_Task).where(_Task.parent_task_id == task.id)
+    )
+    child_tasks = result.scalars().all()
+    salvage_tasks = [
+        t
+        for t in child_tasks
+        if (t.context or {}).get("salvage_source_task_id") == str(task.id)
+    ]
+    assert len(salvage_tasks) == 1, (
+        f"Expected exactly 1 salvage bundle task, found {len(salvage_tasks)}"
+    )
+    payload = salvage_tasks[0].payloads[0]
+    assert payload["type"] == "salvage_bundle"
+    assert len(payload["salvaged_findings"]) == 1, (
+        f"Expected exactly 1 entry in salvaged_findings (no double-count), "
+        f"got {len(payload['salvaged_findings'])}"
+    )
+    entry = payload["salvaged_findings"][0]
+    assert "Perf: slow N+1" in entry["title"]
+
+
+@_pytest.mark.asyncio
 async def test_dedup_filtered_perf_finding_enters_salvage(db_session, mocker):
     """A perf-type finding dropped by the hash-dedup gate is captured in the
     salvage buffer and spawns a consolidated salvage-bundle task."""

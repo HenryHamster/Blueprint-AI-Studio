@@ -3339,6 +3339,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # evidence-overlap, retired-approach, archived-diagnosis gates). Per-finding
     # actionability thresholds are NOT relaxed — bundling filtered findings via
     # salvage avoids flooding the pipeline with individual tasks.
+    # Track finding object ids added here so the reason-based loop below
+    # does not add the same finding a second time.
+    _perf_salvaged_finding_ids: set[int] = set()
     for _filtered_entry in _dedup_outcome.filtered:
         _inner_finding = _filtered_entry.get("finding")
         if _inner_finding and _inner_finding.get("type") == "perf":
@@ -3346,6 +3349,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _filtered_entry.get("reason", "dedup_filtered")[:80]
             )
             _salvage_candidates.append(_inner_finding)
+            _perf_salvaged_finding_ids.add(id(_inner_finding))
 
     type_filtered_count = 0
     type_filtered_by_dir: dict[str, int] = {}
@@ -3409,6 +3413,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _key = (_filt.get("title", ""), _filt.get("direction_id"))
             _candidate_info = _findings_by_key.get(_key)
         if _candidate_info is None:
+            continue
+        # Skip findings already added by the perf-type loop above to avoid
+        # double-counting a finding that is both type=="perf" and filtered
+        # for a salvageable reason.
+        if id(_candidate_info) in _perf_salvaged_finding_ids:
             continue
         # Skip cross-cycle hash suppression.
         _candidate_hash = _title_to_fhash.get(_candidate_info.get("title", ""))
