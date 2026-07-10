@@ -1158,3 +1158,283 @@ async def test_provider_reported_only_cache_tokens_no_raw_input(db_session):
     assert result.provider_reported_within_tolerance is True
     assert result.provider_reported_delta == 0.0
     assert result.agent_accumulated_output_tokens == 100
+
+
+# ---------------------------------------------------------------------------
+# Edge-case coverage for agent_accumulated_output_tokens and type coercion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_api_call_summary_none(db_session):
+    """When api_call_summary is None (not just missing keys), the code handles
+    gracefully via the ``or {}`` fallback without raising."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with valid provider_reported_usage but api_call_summary = None.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary=None,
+        provider_reported_usage={
+            "input_tokens": 500,
+            "output_tokens": 200,
+            "cache_creation_input_tokens": 100,
+            "cache_read_input_tokens": 50,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+
+    # Provider data is present (cache tokens non-zero) → task is checked.
+    assert result.task_count == 1
+    # Agent accumulated values should default to 0 since api_call_summary was None.
+    assert result.agent_accumulated_input_tokens == 0
+    assert result.agent_accumulated_output_tokens == 0
+    assert result.agent_accumulated_cache_creation_input_tokens == 0
+    assert result.agent_accumulated_cache_read_input_tokens == 0
+    # Provider-reported values should still be read correctly.
+    assert result.provider_reported_input_tokens == 500
+    assert result.provider_reported_output_tokens == 200
+    assert result.provider_reported_cache_creation_input_tokens == 100
+    assert result.provider_reported_cache_read_input_tokens == 50
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_api_call_summary_empty_dict(db_session):
+    """When api_call_summary is an empty dict, agent-accumulated defaults to 0
+    without raising."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={},
+        provider_reported_usage={
+            "input_tokens": 300,
+            "output_tokens": 100,
+            "cache_creation_input_tokens": 50,
+            "cache_read_input_tokens": 25,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+
+    assert result.task_count == 1
+    assert result.agent_accumulated_input_tokens == 0
+    assert result.agent_accumulated_output_tokens == 0
+    # Provider values still propagate.
+    assert result.provider_reported_input_tokens == 300
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_output_tokens_divergence(db_session):
+    """When agent-accumulated output tokens diverge from provider-reported
+    output tokens, both values are independently reported (output divergence
+    does NOT affect the delta, which is input-only, but both fields must be
+    accurate)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Provider says output=200, agent accumulated output=250 (divergence).
+    task = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1000, output_tokens=250,
+        provider_input_tokens=1000,
+    )
+    # Override provider_reported_usage output_tokens to simulate divergence.
+    task.provider_reported_usage = {
+        "input_tokens": 1000,
+        "output_tokens": 200,  # Differs from api_call_summary's 250.
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+
+    assert result.task_count == 1
+    # Inputs match → delta=0, within_tolerance.
+    assert result.provider_reported_within_tolerance is True
+    assert result.provider_reported_delta == 0.0
+    # Output divergence is visible in the independent fields.
+    assert result.agent_accumulated_output_tokens == 250
+    assert result.provider_reported_output_tokens == 200
+    # Per-task detail also reflects the divergence.
+    assert result.per_task[0]["agent_accumulated_output_tokens"] == 250
+    assert result.per_task[0]["provider_reported_output_tokens"] == 200
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_string_token_values_coerced(db_session):
+    """String-type numeric values in provider_reported_usage are coerced to int
+    via ``int(x or 0)`` without raising."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # All values are strings that look like integers.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 3,
+        },
+        provider_reported_usage={
+            "input_tokens": "800",
+            "output_tokens": "400",
+            "cache_creation_input_tokens": "100",
+            "cache_read_input_tokens": "50",
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+
+    assert result.task_count == 1
+    # Provider values should have been coerced to int.
+    assert result.provider_reported_input_tokens == 800
+    assert result.provider_reported_output_tokens == 400
+    assert result.provider_reported_cache_creation_input_tokens == 100
+    assert result.provider_reported_cache_read_input_tokens == 50
+    # Agent values remain integer from api_call_summary.
+    assert result.agent_accumulated_input_tokens == 1000
+    assert result.agent_accumulated_output_tokens == 500
+
+
+@pytest.mark.asyncio
+async def test_reconcile_zero_token_attempt_skipped_in_direct_path(db_session):
+    """_compute_direct_path_costs skips attempts where both input_tokens and
+    output_tokens are 0 (line 223 continue). This covers the remaining uncovered
+    line in the legacy path.
+
+    Structure: bank a zero-token attempt, then add a non-zero current attempt.
+    The banked entry is a zero-token row in the history that hits the continue.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from datetime import timedelta
+    from app.models import bank_task_current_attempt
+
+    now = _utcnow()
+
+    # Start with a zero-token current attempt.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        api_call_summary={
+            "llm_call_count": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        vm_provisioned_at=now - timedelta(minutes=10),
+        vm_spot=True,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Bank the zero-token attempt — creates a history entry with (0, 0).
+    bank_task_current_attempt(task, stopped_at=now - timedelta(minutes=5))
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Set up a non-zero current attempt.
+    task.status = TaskStatus.COMPLETED
+    task.context = {"pr_merged": True}
+    task.provider = "openai"
+    task.model = "gpt-5.4"
+    task.vm_provisioned_at = now - timedelta(minutes=3)
+    task.vm_stopped_at = now
+    task.vm_spot = False
+    task.api_call_summary = {
+        "llm_call_count": 3,
+        "total_input_tokens": 500,
+        "total_output_tokens": 200,
+    }
+    await db_session.commit()
+
+    refreshed = await db_session.get(type(task), task.id)
+    result = reconcile_llm_cost([refreshed])
+
+    assert result.task_count == 1
+    # Only the banked attempt tokens (0, 0) is skipped via continue;
+    # only the current attempt (500, 200) should count.
+    assert result.total_input_tokens_snapshot_path == 500
+    assert result.total_input_tokens_direct_path == 500
+    assert result.within_tolerance is True
+    assert result.absolute_delta <= COST_TELEMETRY_TOLERANCE
+
+
+@pytest.mark.asyncio
+async def test_reconcile_llm_cost_asdict_has_all_reconciliation_fields(db_session):
+    """ReconciliationResult.asdict() produced by the legacy internal_recompute
+    path includes ALL dataclass fields, including the provider_reported_*
+    and agent_accumulated_* fields (which are at their defaults for this path).
+    This is a structural integrity test — asdict() must not omit fields."""
+    import json
+    import dataclasses
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_cost_task(
+        project.id,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        input_tokens=1000,
+        output_tokens=500,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_llm_cost([task])
+    d = result.asdict()
+
+    # Verify every dataclass field is present in the dict.
+    fields = {f.name for f in dataclasses.fields(result)}
+    dict_keys = set(d.keys())
+    missing = fields - dict_keys
+    assert not missing, f"asdict() is missing fields: {missing}"
+
+    # Round-trip through JSON.
+    serialized = json.dumps(d)
+    deserialized = json.loads(serialized)
+    # Spot-check that provider_reported fields survive serialization at defaults.
+    assert deserialized["agent_accumulated_output_tokens"] == 0
+    assert deserialized["provider_reported_output_tokens"] == 0
+    assert deserialized["source"] == "internal_recompute"
