@@ -542,6 +542,37 @@ export interface CurrentVersion {
   acceptance_aggregate?: Record<string, number> | null;
   /** Version-scoped criterion coverage derived from the canonical acceptance contract. */
   criterion_coverage?: VersionCriterionCoverage | null;
+  /** Event-driven qualification trigger explain-surface (additive; nullable).
+   *  Answers 'why hasn't qualification fired / what will fire it next'. */
+  qualification_trigger_state?: QualificationTriggerState | null;
+}
+
+/** Auto-trigger mode for the qualification trigger resolver. */
+export type QualificationTriggerAutoMode =
+  | 'armed'
+  | 'waiting'
+  | 'in_flight'
+  | 'capped'
+  | 'settled'
+  | 'observe'
+  | 'off';
+
+/** Output of explain_qualification_trigger — surfaced on the lifecycle endpoint
+ *  and strategic payload to answer 'why hasn't qualification fired'. */
+export interface QualificationTriggerState {
+  auto_trigger: QualificationTriggerAutoMode;
+  last_attempt: Record<string, unknown> | null;
+  next_expected_trigger: string;
+  blocking: string[];
+  attempts: { count: number; cap: number };
+  knob: 'on' | 'observe' | 'off';
+  evaluated_at: string;
+  decision?: {
+    fire: boolean;
+    trigger: string;
+    reason: string;
+    blocking: string[];
+  };
 }
 
 export interface RecentVersion {

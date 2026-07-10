@@ -652,20 +652,46 @@ async def agent_fetch_qualification(
             project_id,
         )
 
-    # Initial-qualification trigger-state signal (ADDITIVE). Answers 'why hasn't
-    # the FIRST qualification fired' — armed, or blocked because coverage is N/M,
-    # wrong phase, or already attempted. Computed via the shared classifier so the
-    # sweep and this read-surface cannot drift apart. Best-effort: a compute
-    # failure degrades to ``qualification_trigger_state: None`` without breaking
-    # the read or changing any existing key.
+    # Qualification trigger explain-surface (ADDITIVE). Answers 'why hasn't
+    # qualification fired / what will fire it next' — richer than the old
+    # initial-trigger-only signal.  Best-effort: a compute failure degrades to
+    # ``qualification_trigger_state: None`` without breaking the read.
     qualification_trigger_state: dict | None = None
     try:
-        from app.release_readiness import (  # noqa: PLC0415
-            compute_qualification_trigger_state,
+        from app.acceptance_criteria import (  # noqa: PLC0415
+            get_version_coverage_summary,
         )
+        from app.qualification_triggers import explain_qualification_trigger  # noqa: PLC0415
+        from app.release_readiness import compute_requalification_readiness  # noqa: PLC0415
+        from app.runtime_config_state import (  # noqa: PLC0415
+            get_auto_qualification_triggers_mode,
+        )
+        from app.time_utils import _utcnow  # noqa: PLC0415
 
-        qualification_trigger_state = await compute_qualification_trigger_state(
-            session, project_id
+        _lq = open_row.last_qualification or {}
+        _status = _lq.get("status")
+        _coverage_raw = await get_version_coverage_summary(session, open_row.id)
+        _coverage = {
+            "total": int(_coverage_raw.get("total") or 0),
+            "covered": int(_coverage_raw.get("covered") or 0),
+        }
+        _readiness = await compute_requalification_readiness(session, project_id)
+        qualification_trigger_state = explain_qualification_trigger(
+            phase=open_row.phase or "",
+            status=_status,
+            error_code=_lq.get("error") if _status == "error" else None,
+            qualification_attempts=open_row.qualification_attempts or 0,
+            coverage=_coverage,
+            requalification_ready=_readiness.get("requalification_ready"),
+            candidate_sha=_lq.get("candidate_sha"),
+            automain_sha=None,  # not fetched in the read path (no GitHub I/O)
+            automain_ci_state=None,
+            blocker=_lq.get("blocker"),
+            in_flight=_status == "pending",
+            promotion_in_flight=bool(_lq.get("promotion_pending")),
+            last_attempt=_lq if _lq else None,
+            knob=get_auto_qualification_triggers_mode(),
+            evaluated_at=_utcnow().isoformat(),
         )
     except Exception:
         logger.exception(

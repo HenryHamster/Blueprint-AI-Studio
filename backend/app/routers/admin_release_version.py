@@ -575,6 +575,58 @@ async def get_version_lifecycle(
                     project_id,
                 )
 
+        # Qualification trigger explain-surface (additive, read-only).  Answers
+        # 'why hasn't qualification fired' for the open version.  Best-effort: a
+        # failure computing it must never break the lifecycle read.
+        _qualification_trigger_state: Optional[Dict[str, Any]] = None
+        if open_row is not None:
+            try:
+                from app.acceptance_criteria import (  # noqa: PLC0415
+                    get_version_coverage_summary as _get_coverage,
+                )
+                from app.qualification_triggers import (  # noqa: PLC0415
+                    explain_qualification_trigger as _explain_trigger,
+                )
+                from app.release_readiness import (  # noqa: PLC0415
+                    compute_requalification_readiness as _compute_readiness,
+                )
+                from app.runtime_config_state import (  # noqa: PLC0415
+                    get_auto_qualification_triggers_mode as _get_trigger_mode,
+                )
+                from app.time_utils import _utcnow  # noqa: PLC0415
+
+                _lq = open_row.last_qualification or {}
+                _lq_status = _lq.get("status")
+                _cov_raw = await _get_coverage(session, open_row.id)
+                _cov = {
+                    "total": int(_cov_raw.get("total") or 0),
+                    "covered": int(_cov_raw.get("covered") or 0),
+                }
+                _rdns = await _compute_readiness(session, project_id)
+                _qualification_trigger_state = _explain_trigger(
+                    phase=open_row.phase or "",
+                    status=_lq_status,
+                    error_code=_lq.get("error") if _lq_status == "error" else None,
+                    qualification_attempts=open_row.qualification_attempts or 0,
+                    coverage=_cov,
+                    requalification_ready=_rdns.get("requalification_ready"),
+                    candidate_sha=_lq.get("candidate_sha"),
+                    automain_sha=None,  # not fetched in the read path
+                    automain_ci_state=None,
+                    blocker=_lq.get("blocker"),
+                    in_flight=_lq_status == "pending",
+                    promotion_in_flight=bool(_lq.get("promotion_pending")),
+                    last_attempt=_lq if _lq else None,
+                    knob=_get_trigger_mode(),
+                    evaluated_at=_utcnow().isoformat(),
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] qualification_trigger_state compute failed "
+                    "for project %s; serving lifecycle without the trigger signal",
+                    project_id,
+                )
+
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
             merged_count = await count_merged_since(
@@ -777,6 +829,10 @@ async def get_version_lifecycle(
                 # Shows the latest ci.yml run state for the integration-branch HEAD
                 # so operators can see full-suite health without a promotion PR.
                 "full_suite_ci_gate": full_suite_ci_gate,
+                # Event-driven qualification trigger explain-surface (additive;
+                # nullable when compute fails). Answers 'why hasn't qualification
+                # fired / what will fire it next' per design doc efbe4182.
+                "qualification_trigger_state": _qualification_trigger_state,
             }
 
         history_rows = (

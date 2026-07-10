@@ -1121,6 +1121,245 @@ async def _check_full_suite_drift_sentinel(
             return False
 
 
+async def _run_auto_qualification_trigger_sweep(
+    open_versions: list,
+    session: AsyncSession,
+    *,
+    session_factory=None,
+) -> None:
+    """Observe-mode event-driven qualification trigger sweep.
+
+    For each open version: gather qualification inputs, call
+    ``resolve_qualification_trigger``, and either log the decision (observe mode)
+    or call ``run_qualification`` (on mode).  This never replaces the bespoke
+    re-driver loops above — it runs in addition, providing a unified log surface
+    and a path to eventual consolidation.
+
+    Controlled by the ``auto_qualification_triggers`` runtime-config knob:
+      "off"     — skip entirely
+      "observe" — log decisions, spawn nothing (default Phase 0)
+      "on"      — call run_qualification for fire=True decisions
+    """
+    from app.runtime_config_state import get_auto_qualification_triggers_mode
+
+    mode = get_auto_qualification_triggers_mode()
+    if mode == "off":
+        return
+
+    from app import release_qualifier
+    from app.acceptance_criteria import get_version_coverage_summary
+    from app.qualification_triggers import resolve_qualification_trigger
+    from app.release_readiness import compute_requalification_readiness
+
+    _factory = session_factory or AsyncSessionLocal
+
+    for version in open_versions:
+        try:
+            await _run_auto_qualification_trigger_for_version(
+                version,
+                session,
+                mode=mode,
+                release_qualifier=release_qualifier,
+                get_version_coverage_summary=get_version_coverage_summary,
+                resolve_qualification_trigger=resolve_qualification_trigger,
+                compute_requalification_readiness=compute_requalification_readiness,
+                session_factory=_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[AUTO_QUAL_TRIGGER] sweep failed for version %s", version.id
+            )
+
+
+async def _run_auto_qualification_trigger_for_version(
+    version,
+    session: AsyncSession,
+    *,
+    mode: str,
+    release_qualifier,
+    get_version_coverage_summary,
+    resolve_qualification_trigger,
+    compute_requalification_readiness,
+    session_factory,
+) -> None:
+    """Run the trigger resolver for one open version and act per mode."""
+    from app import github
+
+    qual = version.last_qualification or {}
+    status = qual.get("status") if qual else None
+    error_code = qual.get("error") if status == "error" else None
+    blocker = qual.get("blocker") if qual else None
+    candidate_sha = qual.get("candidate_sha") if qual else None
+    qualification_attempts = version.qualification_attempts or 0
+
+    # Determine in-flight and promotion-in-flight guards cheaply from stored state.
+    in_flight = status == "pending"
+    promotion_in_flight = bool(qual.get("promotion_pending")) if qual else False
+
+    # Gather coverage (DB-only, cheap).
+    try:
+        coverage_raw = await get_version_coverage_summary(session, version.id)
+        coverage = {
+            "total": int(coverage_raw.get("total") or 0),
+            "covered": int(coverage_raw.get("covered") or 0),
+        }
+    except Exception:
+        logger.warning(
+            "[AUTO_QUAL_TRIGGER] coverage fetch failed for version %s — using None",
+            version.id,
+        )
+        coverage = None
+
+    # Gather requalification_ready (DB-only, cheap).
+    requalification_ready: bool | None = None
+    try:
+        readiness = await compute_requalification_readiness(
+            session, version.project_id
+        )
+        requalification_ready = readiness.get("requalification_ready")
+    except Exception:
+        logger.warning(
+            "[AUTO_QUAL_TRIGGER] readiness fetch failed for version %s — using None",
+            version.id,
+        )
+
+    # For T3 (dry_run + candidate advancement), fetch automain SHA and CI state.
+    # This is the only path that requires GitHub I/O in the sweep.
+    automain_sha: str | None = None
+    automain_ci_state: str | None = None
+    if status == "dry_run" and candidate_sha:
+        project = (
+            (
+                await session.execute(
+                    select(Project).where(Project.id == version.project_id)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if project is not None:
+            resolved = await release_qualifier._resolve_github_with_session(
+                session, project
+            )
+            if resolved is not None:
+                token, owner, repo = resolved
+                integration_branch, _ = release_qualifier._lts_branch_names(project)
+                try:
+                    automain_sha = await github.get_branch_sha(
+                        token, owner, repo, integration_branch
+                    )
+                except Exception:
+                    logger.warning(
+                        "[AUTO_QUAL_TRIGGER] could not resolve %s HEAD for version %s",
+                        integration_branch,
+                        version.id,
+                    )
+                # Only check CI state when the SHA has actually advanced.
+                if automain_sha and automain_sha != candidate_sha:
+                    try:
+                        from app.ci_resolution import _resolve_candidate_ci
+                        ci_result = await _resolve_candidate_ci(
+                            token, owner, repo, automain_sha
+                        )
+                        automain_ci_state = ci_result.get("state")
+                    except Exception:
+                        logger.warning(
+                            "[AUTO_QUAL_TRIGGER] CI state fetch failed for %s "
+                            "(version %s) — treating as unknown",
+                            automain_sha[:8] if automain_sha else "?",
+                            version.id,
+                        )
+
+    decision = resolve_qualification_trigger(
+        phase=version.phase or "",
+        status=status,
+        error_code=error_code,
+        qualification_attempts=qualification_attempts,
+        coverage=coverage,
+        requalification_ready=requalification_ready,
+        candidate_sha=candidate_sha,
+        automain_sha=automain_sha,
+        automain_ci_state=automain_ci_state,
+        blocker=blocker,
+        in_flight=in_flight,
+        promotion_in_flight=promotion_in_flight,
+    )
+
+    if decision.fire:
+        if mode == "observe":
+            logger.info(
+                "[AUTO_QUAL_TRIGGER] observe: would fire '%s' for version %s "
+                "(v%d, status=%s, trigger=%s)",
+                decision.trigger,
+                version.id,
+                version.version_number,
+                status,
+                decision.trigger,
+            )
+        else:  # mode == "on"
+            logger.info(
+                "[AUTO_QUAL_TRIGGER] firing '%s' for version %s "
+                "(v%d, status=%s)",
+                decision.trigger,
+                version.id,
+                version.version_number,
+                status,
+            )
+            async with session_factory() as fire_session:
+                try:
+                    locked_v = (
+                        (
+                            await fire_session.execute(
+                                select(release_version.ReleaseVersion).where(
+                                    release_version.ReleaseVersion.id == version.id
+                                )
+                            )
+                        )
+                        .scalars()
+                        .first()
+                    )
+                    if locked_v is None:
+                        return
+                    result = await release_qualifier.run_qualification(
+                        fire_session, locked_v.project_id, locked_v
+                    )
+                    if result and result.get("status") == "spawned":
+                        await fire_session.commit()
+                        logger.info(
+                            "[AUTO_QUAL_TRIGGER] spawned qualification for version %s "
+                            "(trigger=%s)",
+                            version.id,
+                            decision.trigger,
+                        )
+                    else:
+                        await fire_session.rollback()
+                        logger.info(
+                            "[AUTO_QUAL_TRIGGER] run_qualification returned '%s' "
+                            "for version %s (trigger=%s) — no spawn",
+                            (result or {}).get("status"),
+                            version.id,
+                            decision.trigger,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[AUTO_QUAL_TRIGGER] run_qualification failed for version %s",
+                        version.id,
+                    )
+                    try:
+                        await fire_session.rollback()
+                    except Exception:
+                        pass
+    else:
+        logger.debug(
+            "[AUTO_QUAL_TRIGGER] %s: hold for version %s (v%d, reason=%s, blocking=%s)",
+            mode,
+            version.id,
+            version.version_number,
+            decision.reason,
+            decision.blocking,
+        )
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -1904,6 +2143,18 @@ async def sweep_stuck_qualifications(
                 "for version %s",
                 version_id,
             )
+
+    # Event-driven qualification trigger resolver (Phase 0 — observe mode).
+    # For each open version: gather inputs, call resolve_qualification_trigger,
+    # and in "observe" mode log the would-fire decision without actually spawning.
+    # In "on" mode, call run_qualification for matched versions.
+    # This loop runs LAST so all re-driver paths above have already handled any
+    # version that transitioned state during this sweep cycle.
+    await _run_auto_qualification_trigger_sweep(
+        open_versions,
+        session,
+        session_factory=session_factory,
+    )
 
     # Lifecycle-stall checks: alert when an open version is stuck at either end
     # of the lifecycle — calcifying in stabilize (repeated hard-blocker
