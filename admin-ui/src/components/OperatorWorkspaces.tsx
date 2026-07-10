@@ -4,6 +4,7 @@ import {
   Users,
   Wrench,
 } from 'lucide-react';
+import { ProjectToolHost } from './ProjectToolHost';
 import { DirectionsPanel } from './DirectionsPanel';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { DashboardHome } from './DashboardHome';
@@ -260,6 +261,7 @@ export function ProjectWorkspace({
         { id: 'problem-model', label: 'Model' },
         { id: 'design-doc', label: 'Design' },
         { id: 'manage', label: 'Manage' },
+        { id: 'tools', label: 'Tools' },
       ]}
       activeTab={projectSection}
       onTabChange={onProjectSectionChange}
@@ -268,7 +270,18 @@ export function ProjectWorkspace({
       flush
       contentClassName="min-h-0 min-w-0 overflow-hidden"
     >
-      {projectSection !== 'manage' && !selectedProjectId ? (
+      {projectSection === 'tools' ? (
+        selectedProjectId ? (
+          <div className="min-h-0 overflow-auto p-4 custom-scrollbar">
+            <ProjectToolHost projectId={selectedProjectId} />
+          </div>
+        ) : (
+          <ProjectNoSelectionState
+            onOpenProjectManagement={onOpenProjectManagement}
+            onProjectSectionChange={onProjectSectionChange}
+          />
+        )
+      ) : projectSection !== 'manage' && !selectedProjectId ? (
         <ProjectNoSelectionState
           onOpenProjectManagement={onOpenProjectManagement}
           onProjectSectionChange={onProjectSectionChange}
