@@ -3343,6 +3343,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # does not add the same finding a second time.
     _perf_salvaged_finding_ids: set[int] = set()
     for _filtered_entry in _dedup_outcome.filtered:
+        if _filtered_entry.get("terminal_history"):
+            continue
         _inner_finding = _filtered_entry.get("finding")
         if _inner_finding and _inner_finding.get("type") == "perf":
             _inner_finding["deferred_reason"] = (
@@ -3403,6 +3405,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     _dedup_filtered_salvage: list[dict] = []
     for _filt in _dedup_outcome.filtered:
+        if _filt.get("terminal_history"):
+            continue
         _filt_reason = _filt.get("reason", "dedup filtered")
         if not any(_filt_reason.startswith(_sr) for _sr in _SALVAGEABLE_DEDUP_REASONS):
             continue

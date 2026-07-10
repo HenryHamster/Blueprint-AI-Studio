@@ -2916,7 +2916,16 @@ async def test_start_revalidates_adopt_candidate_and_spawns_fresh(
     # cadence spawn path in a standalone test).
     fresh_holder: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
+    async def fake_spawn(
+        session,
+        proj,
+        runner_id,
+        *,
+        session_id,
+        exam_ledger=None,
+        message_cursor=None,
+        session_summary=None,
+    ):
         # The real spawn wrapper BIRTHS the task with the resident context flags
         # (via extra_context); mirror that here so the fresh task carries them in
         # its first committed state, exactly as start now relies on (no post-spawn

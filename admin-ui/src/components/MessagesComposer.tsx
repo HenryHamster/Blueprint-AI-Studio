@@ -114,13 +114,18 @@ export function MessagesComposer({
     if (!onAddAttachment) return;
     const items = e.clipboardData?.items;
     if (!items) return;
+    let addedFile = false;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       if (item.kind === 'file') {
         const file = item.getAsFile();
-        if (file) onAddAttachment(file);
+        if (file) {
+          onAddAttachment(file);
+          addedFile = true;
+        }
       }
     }
+    if (addedFile) e.preventDefault();
   }
 
   function handleDragOver(e: React.DragEvent) {
@@ -221,7 +226,7 @@ export function MessagesComposer({
                 <button
                   type="button"
                   onClick={() => onRemoveAttachment?.(att.id)}
-                  className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center justify-center rounded p-0.5 text-neutral-500 opacity-0 transition-opacity hover:text-neutral-200 group-hover:opacity-100 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto"
+                  className="absolute right-0 top-1/2 flex min-h-[44px] min-w-[44px] -translate-y-1/2 items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity hover:text-neutral-200 focus-visible:opacity-100 group-hover:opacity-100"
                   aria-label={`Remove ${att.name}`}
                 >
                   <X className="h-3 w-3" />
@@ -240,7 +245,7 @@ export function MessagesComposer({
         className={`${minimal
           ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-workbench-border-strong/80 bg-workbench-card p-1 shadow-[0_10px_28px_rgba(0,0,0,0.20),inset_0_1px_0_rgba(255,255,255,0.035)]`
           : 'flex gap-2 items-end'
-        } ${dragOver ? 'ring-2 ring-emerald-500/50 border-emerald-500/30' : ''}`}>
+        } ${dragOver ? 'ring-2 ring-emerald-500/50 border-emerald-500/60' : ''}`}>
         {!minimal && (
           <MessageTypeDropdown value={newType} onChange={onChangeType} compact={minimal} />
         )}
@@ -264,7 +269,7 @@ export function MessagesComposer({
               disabled={composerDisabled}
               title="Attach file"
               aria-label="Attach file"
-              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40 md:min-h-8 md:min-w-8"
+              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40"
             >
               <Paperclip className="h-3.5 w-3.5" />
             </button>
@@ -307,7 +312,7 @@ export function MessagesComposer({
           aria-label="Send message"
           title="Send message"
           className={minimal
-            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-100 md:min-h-8 md:min-w-8'
+            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-100'
             : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
           }
         >

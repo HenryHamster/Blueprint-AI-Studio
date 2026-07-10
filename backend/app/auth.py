@@ -42,6 +42,10 @@ except Exception as e:  # noqa: BLE001 — module-load init must never crash the
 
 # We use HTTPBearer to automatically extract the "Authorization: Bearer <token>" header
 security = HTTPBearer()
+# Runner endpoints promise a 401 for both missing and invalid bearer tokens.
+# ``HTTPBearer`` otherwise rejects a missing header with 403 before the runner
+# dependency can apply that contract.
+runner_security = HTTPBearer(auto_error=False)
 
 
 def _validate_jwt_secret(secret: str, env_var: str) -> None:
@@ -396,14 +400,18 @@ async def verify_runner_token(
 
 
 async def get_current_runner(
-    credentials: HTTPAuthorizationCredentials = Security(security),
+    credentials: HTTPAuthorizationCredentials | None = Security(runner_security),
     session: AsyncSession = Depends(get_session),
 ) -> LocalRunner:
     """FastAPI dependency authenticating a pull-based fleet runner.
 
     Raises 401 when the bearer token does not resolve to a non-deleted runner.
     """
-    runner = await verify_runner_token(credentials.credentials, session)
+    runner = (
+        await verify_runner_token(credentials.credentials, session)
+        if credentials is not None
+        else None
+    )
     if runner is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

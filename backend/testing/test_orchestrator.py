@@ -1868,12 +1868,25 @@ class TestResearchCompletion:
             .all()
         )
 
-        assert len(children) == 1, (
-            "Only the non-duplicate finding should produce a child task"
+        implementation_children = [
+            child
+            for child in children
+            if (child.first_payload or {}).get("type") != "salvage_bundle"
+        ]
+        salvage_children = [
+            child
+            for child in children
+            if (child.first_payload or {}).get("type") == "salvage_bundle"
+        ]
+        assert len(implementation_children) == 1, (
+            "Only the non-duplicate finding should produce an implementation task"
+        )
+        assert len(salvage_children) == 1, (
+            "The in-flight duplicate should be retained in one consolidated salvage bundle"
         )
         assert (
-            "tracing" in children[0].title.lower()
-            or "middleware" in children[0].title.lower()
+            "tracing" in implementation_children[0].title.lower()
+            or "middleware" in implementation_children[0].title.lower()
         )
 
     # ── Burst-1 regression: duplicate active claim during post-spawn apply ───
@@ -2378,22 +2391,32 @@ class TestResearchCompletion:
         await _handle_research_completion(research_task, logs, db_session)
 
         await db_session.refresh(research_task)
-        assert research_task.status == TaskStatus.COMPLETED, (
-            f"Research task with 0 children should be COMPLETED, got {research_task.status}"
-        )
-        assert "auto-completed" in (research_task.latest_status_message or "").lower()
+        from sqlmodel import select as sql_select
 
-        # Verify direction note was written
-        await db_session.refresh(project)
-        d = next(
-            (d for d in (project.directions or []) if d.get("id") == direction_id), None
+        children = (
+            (
+                await db_session.execute(
+                    sql_select(Task).where(Task.parent_task_id == research_task.id)
+                )
+            )
+            .scalars()
+            .all()
         )
-        assert d is not None
-        notes = d.get("notes", [])
-        assert len(notes) >= 1, (
-            "A direction note should be appended for zero-child completion"
+        salvage_children = [
+            child
+            for child in children
+            if (child.first_payload or {}).get("type") == "salvage_bundle"
+        ]
+        assert len(children) == 1
+        assert len(salvage_children) == 1, (
+            "The deduplicated in-flight finding should be retained in a salvage bundle"
         )
-        assert "0 tasks" in notes[-1].get("msg", "")
+        assert research_task.status == TaskStatus.EVALUATING, (
+            "A research task that owns a salvage child must remain EVALUATING for rollup"
+        )
+        assert (research_task.context or {}).get("salvage_activity", {}).get(
+            "salvage_task_id"
+        ) == str(salvage_children[0].id)
 
 
 # ── Tests: classify_failure ──────────────────────────────────────────────────

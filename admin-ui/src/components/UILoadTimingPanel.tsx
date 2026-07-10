@@ -146,9 +146,9 @@ export function UILoadTimingPanel() {
           )}
         </div>
       </div>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-x-auto">
-        <table className="w-full text-xs">
-          <thead>
+      <div className="overflow-hidden rounded-lg border border-neutral-800/50 bg-neutral-900/50 md:overflow-x-auto">
+        <table className="block w-full text-xs md:table">
+          <thead className="hidden md:table-header-group">
             <tr className="text-ui-sm text-neutral-500 border-b border-neutral-800/50">
               <th className="text-left px-3 py-2 font-medium whitespace-nowrap" rowSpan={2}>Surface</th>
               {typeList.map(t => (
@@ -168,28 +168,61 @@ export function UILoadTimingPanel() {
               ])}
             </tr>
           </thead>
-          <tbody className="divide-y divide-neutral-800/30">
+          <tbody className="block divide-y divide-neutral-800/30 md:table-row-group">
             {rows.map(r => (
-              <tr key={r.surface}>
-                <td className="px-3 py-2 font-medium text-neutral-200 whitespace-nowrap">{r.surface}</td>
+              <tr key={r.surface} className="block px-3 py-2 md:table-row md:px-0 md:py-0">
+                <td className="block pb-1 font-medium text-neutral-200 md:table-cell md:px-3 md:py-2 md:whitespace-nowrap">{r.surface}</td>
                 {typeList.flatMap(t => {
                   const split = r.split[t];
                   if (!split) {
-                    return [<td key={`${t}-empty`} colSpan={6} className="text-center px-2 py-2 text-neutral-600">—</td>];
+                    return [
+                      <td key={`${t}-empty`} colSpan={6} className="flex justify-between gap-3 py-1 text-neutral-600 md:table-cell md:px-2 md:py-2 md:text-center">
+                        <span className="min-w-0 break-all text-left text-neutral-500 md:hidden">{t} · No samples</span>
+                        —
+                      </td>,
+                    ];
                   }
                   const beforeCells = split.before.count === 0
-                    ? [<td key={`${t}-bef-empty`} colSpan={3} className="text-center px-2 py-2 text-ui-sm text-neutral-600 italic">no baseline — overwritten by 200-sample cap</td>]
+                    ? [
+                        <td key={`${t}-bef-empty`} colSpan={3} className="flex justify-between gap-3 py-1 text-right text-ui-sm text-neutral-600 italic md:table-cell md:px-2 md:py-2 md:text-center">
+                          <span className="min-w-0 break-all text-left not-italic text-neutral-500 md:hidden">{t} · Before</span>
+                          no baseline — overwritten by 200-sample cap
+                        </td>,
+                      ]
                     : [
-                        <td key={`${t}-bef-p50`} className="text-right px-2 py-2 tabular-nums text-neutral-500">{fmtMs(split.before.p50)}</td>,
-                        <td key={`${t}-bef-p90`} className="text-right px-2 py-2 tabular-nums text-neutral-600">{fmtMs(split.before.p90)}</td>,
-                        <td key={`${t}-bef-n`} className="text-right px-2 py-2 tabular-nums text-neutral-600">{split.before.count}</td>,
+                        <td key={`${t}-bef-p50`} className="flex justify-between gap-3 py-1 text-right tabular-nums text-neutral-500 md:table-cell md:px-2 md:py-2">
+                          <span className="min-w-0 break-all text-left md:hidden">{t} · Before p50</span>
+                          {fmtMs(split.before.p50)}
+                        </td>,
+                        <td key={`${t}-bef-p90`} className="flex justify-between gap-3 py-1 text-right tabular-nums text-neutral-600 md:table-cell md:px-2 md:py-2">
+                          <span className="min-w-0 break-all text-left text-neutral-500 md:hidden">{t} · Before p90</span>
+                          {fmtMs(split.before.p90)}
+                        </td>,
+                        <td key={`${t}-bef-n`} className="flex justify-between gap-3 py-1 text-right tabular-nums text-neutral-600 md:table-cell md:px-2 md:py-2">
+                          <span className="min-w-0 break-all text-left text-neutral-500 md:hidden">{t} · Before N</span>
+                          {split.before.count}
+                        </td>,
                       ];
                   const afterCells = split.after.count === 0
-                    ? [<td key={`${t}-aft-empty`} colSpan={3} className="text-center px-2 py-2 text-ui-sm text-neutral-600 italic">no post-cutoff data</td>]
+                    ? [
+                        <td key={`${t}-aft-empty`} colSpan={3} className="flex justify-between gap-3 py-1 text-right text-ui-sm text-neutral-600 italic md:table-cell md:px-2 md:py-2 md:text-center">
+                          <span className="min-w-0 break-all text-left not-italic text-green-700 md:hidden">{t} · After</span>
+                          no post-cutoff data
+                        </td>,
+                      ]
                     : [
-                        <td key={`${t}-aft-p50`} className="text-right px-2 py-2 tabular-nums text-green-400">{fmtMs(split.after.p50)}</td>,
-                        <td key={`${t}-aft-p90`} className="text-right px-2 py-2 tabular-nums text-green-600">{fmtMs(split.after.p90)}</td>,
-                        <td key={`${t}-aft-n`} className="text-right px-2 py-2 tabular-nums text-neutral-500">{split.after.count}</td>,
+                        <td key={`${t}-aft-p50`} className="flex justify-between gap-3 py-1 text-right tabular-nums text-green-400 md:table-cell md:px-2 md:py-2">
+                          <span className="min-w-0 break-all text-left text-green-700 md:hidden">{t} · After p50</span>
+                          {fmtMs(split.after.p50)}
+                        </td>,
+                        <td key={`${t}-aft-p90`} className="flex justify-between gap-3 py-1 text-right tabular-nums text-green-600 md:table-cell md:px-2 md:py-2">
+                          <span className="min-w-0 break-all text-left text-green-700 md:hidden">{t} · After p90</span>
+                          {fmtMs(split.after.p90)}
+                        </td>,
+                        <td key={`${t}-aft-n`} className="flex justify-between gap-3 py-1 text-right tabular-nums text-neutral-500 md:table-cell md:px-2 md:py-2">
+                          <span className="min-w-0 break-all text-left text-green-700 md:hidden">{t} · After N</span>
+                          {split.after.count}
+                        </td>,
                       ];
                   return [...beforeCells, ...afterCells];
                 })}

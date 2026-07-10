@@ -948,11 +948,12 @@ class TestRunnerEndpoints:
             assert task.started_at is not None
 
             # Verify the response includes pooled credential info.
-            assert body.get("provider") == "anthropic"
-            assert body.get("auth_mode") == "oauth"
-            assert isinstance(body.get("llm_env"), dict)
-            assert "CLAUDE_CODE_OAUTH_TOKEN" in body["llm_env"]
-            assert body["llm_env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test-secret-token"
+            credentials = body.get("credentials")
+            assert isinstance(credentials, dict)
+            assert credentials["env"]["PROVIDER"] == "anthropic"
+            assert credentials["env"]["AUTH_MODE"] == "oauth"
+            assert credentials["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test-secret-token"
+            assert isinstance(credentials["files"], list)
         finally:
             _clear_pool()
 
@@ -1309,16 +1310,13 @@ class TestRunnerEndpoints:
             assert resp.status_code == 200
             body = resp.json()
 
-            # Provider/model/auth_mode are from the POOL, not from any local env.
-            assert body["provider"] == "deepseek"
-            assert body["auth_mode"] == "api_key"
-            # llm_env carries the credential env vars the runner must inject.
-            assert isinstance(body["llm_env"], dict)
-            assert body["llm_env"]["PROVIDER"] == "deepseek"
-            assert body["llm_env"]["AUTH_MODE"] == "api_key"
-            assert body["llm_env"]["DEEPSEEK_API_KEY"] == "sk-deepseek-pool-assigned-key"
-            # llm_files is present (even if empty for api_key providers).
-            assert isinstance(body["llm_files"], list)
+            # Credential metadata and secrets come from the pool, not local env.
+            credentials = body["credentials"]
+            assert credentials["env"]["PROVIDER"] == "deepseek"
+            assert credentials["env"]["AUTH_MODE"] == "api_key"
+            assert credentials["env"]["DEEPSEEK_API_KEY"] == "sk-deepseek-pool-assigned-key"
+            # files is present even when the provider only needs an API key.
+            assert isinstance(credentials["files"], list)
 
             # The task context must carry the resolved account identity so the
             # completion handler can release the account slot.
@@ -2312,7 +2310,9 @@ class TestRunnerEndpoints:
     ):
         """POST /api/runner/update-report with status=success creates an INFO Alert."""
         project = await _make_project(db_session)
-        runner, token = await _make_runner(db_session, project.id)
+        runner, token = await _make_runner(
+            db_session, project.id, hostname="runner-update-test"
+        )
 
         resp = await client.post(
             "/api/runner/update-report",
