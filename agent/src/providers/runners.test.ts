@@ -43,6 +43,7 @@ vi.mock('../index.js', () => ({
   recordToolUse: mockRecordToolUse,
   recordLlmCallStart: vi.fn(),
   recordLlmTokens: vi.fn(),
+  recordProviderReportedUsage: vi.fn(),
   recordNumTurns: vi.fn(),
   recordToolResultBytes: vi.fn(),
   estimateTokensFromChars: vi.fn().mockReturnValue(0),

@@ -14,7 +14,9 @@ from testing.factories import _utcnow, make_project, make_task
 
 from app.cost_telemetry_reconciliation import (
     COST_TELEMETRY_TOLERANCE,
+    PROVIDER_REPORTED_TOLERANCE,
     reconcile_llm_cost,
+    reconcile_provider_reported_usage,
     reconcile_task_llm_cost,
 )
 from app.llm_cost_attribution import LLM_TOKEN_PRICING
@@ -579,3 +581,209 @@ async def test_reconciliation_failure_triggers_alert(db_session):
         )
         alerts = result.scalars().all()
         assert len(alerts) == 1, "dedup should prevent a second alert"
+
+
+# ── Provider-reported usage reconciliation tests (Component B) ──────────
+
+
+def _make_provider_reported_task(
+    project_id, *,
+    provider, model, input_tokens, output_tokens,
+    cache_creation=0, cache_read=0,
+    provider_input_tokens=None, provider_cache_creation=None, provider_cache_read=None,
+    **kw,
+):
+    """Create a COMPLETED + merged task with BOTH api_call_summary and
+    provider_reported_usage set. Defaults the provider-reported values to
+    match the inclusive api_call_summary (input_tokens = provider input +
+    cache_creation + cache_read). Pass explicit ``provider_input_tokens``,
+    ``provider_cache_creation``, or ``provider_cache_read`` to simulate
+    divergence."""
+    p_input = provider_input_tokens if provider_input_tokens is not None else max(0, input_tokens - cache_creation - cache_read)
+    p_cache_creation = provider_cache_creation if provider_cache_creation is not None else cache_creation
+    p_cache_read = provider_cache_read if provider_cache_read is not None else cache_read
+
+    defaults = dict(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+            "total_cache_creation_input_tokens": cache_creation,
+            "total_cache_read_input_tokens": cache_read,
+            "llm_call_count": 5,
+        },
+        provider_reported_usage={
+            "input_tokens": p_input,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": p_cache_creation,
+            "cache_read_input_tokens": p_cache_read,
+        },
+        provider=provider,
+        model=model,
+    )
+    defaults.update(kw)
+    return make_task(**defaults)
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_matches_on_known_tasks(db_session):
+    """Tasks with matching provider_reported_usage and api_call_summary pass
+    the provider-reported reconciliation check."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task 1: 1000 uncached input + 200 cache_creation + 300 cache_read = 1500 total.
+    t1 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1500, output_tokens=500,
+        cache_creation=200, cache_read=300,
+        provider_input_tokens=1000, provider_cache_creation=200, provider_cache_read=300,
+    )
+    db_session.add(t1)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1])
+
+    assert result.source == "provider_reported"
+    assert result.task_count == 1
+    assert result.provider_reported_within_tolerance is True
+    assert result.provider_reported_delta == 0.0
+
+    # Verify aggregated totals.
+    assert result.provider_reported_input_tokens == 1000
+    assert result.provider_reported_output_tokens == 500
+    assert result.provider_reported_cache_creation_input_tokens == 200
+    assert result.provider_reported_cache_read_input_tokens == 300
+    assert result.agent_accumulated_input_tokens == 1500
+
+    # Per-task detail.
+    assert len(result.per_task) == 1
+    assert result.per_task[0]["provider_reported_delta"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_detects_divergence(db_session):
+    """When the agent's api_call_summary diverges from provider_reported_usage,
+    the reconciliation fires (within_tolerance=False). This proves the check is
+    no longer tautological — it can actually fail."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Provider says 1500 total input (1000 uncached + 200 creation + 300 read).
+    # Agent accumulated 1700 instead (accumulation bug — 200 extra tokens).
+    t1 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1700, output_tokens=500,
+        cache_creation=200, cache_read=300,
+        provider_input_tokens=1000, provider_cache_creation=200, provider_cache_read=300,
+    )
+    db_session.add(t1)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1])
+
+    assert result.source == "provider_reported"
+    assert result.task_count == 1
+    # Delta = |1500 - 1700| / 1500 = 200/1500 = 0.1333... >> 0.001
+    assert result.provider_reported_within_tolerance is False
+    assert result.provider_reported_delta > PROVIDER_REPORTED_TOLERANCE
+
+    # Verify the detail accurately reflects the divergence.
+    assert result.agent_accumulated_input_tokens == 1700
+    assert result.provider_reported_input_tokens == 1000
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_skips_null(db_session):
+    """Tasks without provider_reported_usage (NULL/no data) are silently
+    skipped without failing the reconciliation."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with api_call_summary but NO provider_reported_usage.
+    t1 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1500, output_tokens=500,
+    )
+    # Unset provider_reported_usage (simulate old agent).
+    t1.provider_reported_usage = None
+    db_session.add(t1)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1])
+
+    # Skipped — task_count=0 because no task had provider_reported_usage data.
+    assert result.source == "provider_reported"
+    assert result.task_count == 0
+    assert result.provider_reported_within_tolerance is True
+    assert result.provider_reported_delta == 0.0
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_mixed_providers(db_session):
+    """Anthropic tasks are checked; non-Anthropic tasks without
+    provider_reported_usage are skipped."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Anthropic task WITH provider_reported_usage — should be checked.
+    t1 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1500, output_tokens=500,
+        cache_creation=200, cache_read=300,
+        provider_input_tokens=1000, provider_cache_creation=200, provider_cache_read=300,
+    )
+    # OpenAI task without provider_reported_usage — should be skipped.
+    t2 = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 3,
+        },
+        provider="openai", model="gpt-5.4",
+    )
+    db_session.add_all([t1, t2])
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1, t2])
+
+    assert result.source == "provider_reported"
+    assert result.task_count == 1  # Only Anthropic task counted.
+    assert result.provider_reported_within_tolerance is True
+    assert result.agent_accumulated_input_tokens == 1500
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_empty_task_list(db_session):
+    """Empty task list returns source=provider_reported with task_count=0."""
+    result = reconcile_provider_reported_usage([])
+
+    assert result.source == "provider_reported"
+    assert result.task_count == 0
+    assert result.provider_reported_within_tolerance is True
+    assert result.provider_reported_delta == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_llm_cost_sets_source(db_session):
+    """The legacy reconcile_llm_cost returns source='internal_recompute'."""
+    result = reconcile_llm_cost([])
+
+    assert result.source == "internal_recompute"

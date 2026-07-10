@@ -4957,6 +4957,14 @@ async def agent_heartbeat(
             ]
         task.api_call_summary = summary
 
+    # Provider-reported token usage (Component B of cost-telemetry
+    # reconciliation). Posted by the agent as a nested object alongside the
+    # flat-spread api_call_summary fields. Persisted as-is so the
+    # reconciliation can cross-check against api_call_summary. Backwards-
+    # compatible: older agents that don't emit this leave the column NULL.
+    if req.provider_reported_usage is not None:
+        task.provider_reported_usage = req.provider_reported_usage
+
     # Per-task structured-output format-compliance telemetry (equipping
     # direction d-46468a41), sibling to api_call_summary. Cumulative counters
     # posted on every heartbeat — last write wins. Backwards-compatible: older

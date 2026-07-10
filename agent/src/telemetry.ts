@@ -41,6 +41,21 @@ let _totalInputTokens = 0; // @per-role
 let _totalOutputTokens = 0; // @per-role
 let _totalCacheCreationInputTokens = 0; // @per-role
 let _totalCacheReadInputTokens = 0; // @per-role
+
+// ── Provider-reported usage accumulator (Component B, independent cost reconciliation) ─
+// SEPARATE from the api_call_summary counters above. Sums the RAW provider-reported
+// usage fields from Anthropic messages.create() response.usage objects (input_tokens,
+// output_tokens, cache_creation_input_tokens, cache_read_input_tokens) through an
+// INDEPENDENT code path. The backend cross-checks these against the api_call_summary
+// values to detect accumulation bugs, double-counting, or dropped-call accounting.
+// This path is only populated from actual provider API responses, never from
+// character-count estimation (text-output fallback), so it provides a genuine
+// ground-truth comparison for Anthropic provider tasks.
+// @per-role — reset between roles.
+let _providerInputTokens = 0;
+let _providerOutputTokens = 0;
+let _providerCacheCreationInputTokens = 0;
+let _providerCacheReadInputTokens = 0;
 let _viewportScreenshotForwardedCount = 0; // @per-role
 let _totalNumTurns = 0; // @per-role
 let _totalToolResultBytes = 0; // @per-role
@@ -78,6 +93,37 @@ export function recordLlmTokens(
   }
   if (Number.isFinite(cacheReadTokens) && cacheReadTokens > 0) {
     _totalCacheReadInputTokens += Math.floor(cacheReadTokens);
+  }
+}
+
+/** Record raw provider-reported token usage from an Anthropic messages.create()
+ *  response.usage object. Uses a SEPARATE accumulator from recordLlmTokens so the
+ *  backend can cross-check the two paths and detect accumulation bugs.
+ *
+ *  Called only from sites that receive actual provider API response.usage objects
+ *  (not text-output fallback estimation). Values are the RAW provider-reported
+ *  fields as received, NOT the inclusive-normalized totals:
+ *  - `inputTokens` = raw response.usage.input_tokens (uncached input only)
+ *  - `outputTokens` = raw response.usage.output_tokens
+ *  - `cacheCreationTokens` = raw response.usage.cache_creation_input_tokens
+ *  - `cacheReadTokens` = raw response.usage.cache_read_input_tokens */
+export function recordProviderReportedUsage(
+  inputTokens: number,
+  outputTokens: number,
+  cacheCreationTokens = 0,
+  cacheReadTokens = 0,
+): void {
+  if (Number.isFinite(inputTokens) && inputTokens > 0) {
+    _providerInputTokens += Math.floor(inputTokens);
+  }
+  if (Number.isFinite(outputTokens) && outputTokens > 0) {
+    _providerOutputTokens += Math.floor(outputTokens);
+  }
+  if (Number.isFinite(cacheCreationTokens) && cacheCreationTokens > 0) {
+    _providerCacheCreationInputTokens += Math.floor(cacheCreationTokens);
+  }
+  if (Number.isFinite(cacheReadTokens) && cacheReadTokens > 0) {
+    _providerCacheReadInputTokens += Math.floor(cacheReadTokens);
   }
 }
 
@@ -154,7 +200,22 @@ export function getLlmTelemetry(): {
   prompt_size_bytes: number | null;
   prompt_section_count: number | null;
   prompt_section_sizes: Array<{ name: string; bytes: number }> | null;
+  /** Provider-reported usage from response.usage objects (Component B).
+   *  Nested object so the backend can structure-parse it independently from the
+   *  flat-spread api_call_summary fields. Absent when no LLM calls were made
+   *  (all zeroes) or when only character-estimated tokens exist. */
+  provider_reported_usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+  } | null;
 } {
+  const hasProviderReportedUsage =
+    _providerInputTokens > 0
+    || _providerOutputTokens > 0
+    || _providerCacheCreationInputTokens > 0
+    || _providerCacheReadInputTokens > 0;
   return {
     llm_call_count: _llmCallCount,
     total_input_tokens: _totalInputTokens,
@@ -167,6 +228,14 @@ export function getLlmTelemetry(): {
     prompt_size_bytes: _promptSizeBytes,
     prompt_section_count: _promptSectionCount,
     prompt_section_sizes: _promptSectionSizes,
+    provider_reported_usage: hasProviderReportedUsage
+      ? {
+          input_tokens: _providerInputTokens,
+          output_tokens: _providerOutputTokens,
+          cache_creation_input_tokens: _providerCacheCreationInputTokens,
+          cache_read_input_tokens: _providerCacheReadInputTokens,
+        }
+      : null,
   };
 }
 
@@ -177,6 +246,10 @@ export function resetLlmTelemetry(): void {
   _totalOutputTokens = 0;
   _totalCacheCreationInputTokens = 0;
   _totalCacheReadInputTokens = 0;
+  _providerInputTokens = 0;
+  _providerOutputTokens = 0;
+  _providerCacheCreationInputTokens = 0;
+  _providerCacheReadInputTokens = 0;
   _viewportScreenshotForwardedCount = 0;
   _totalNumTurns = 0;
   _totalToolResultBytes = 0;

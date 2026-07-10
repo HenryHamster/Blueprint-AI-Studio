@@ -14,7 +14,7 @@ import {
 } from '../constants.js';
 import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
-  recordLlmTokens, recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
+  recordLlmTokens, recordProviderReportedUsage, recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper, retryPostShellFn } from '../prompt.js';
 import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn } from '../token-file.js';
@@ -1378,6 +1378,15 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               const usage = (obj as { result?: string; usage?: Record<string, unknown> }).usage;
               if (!isNested && usage && typeof usage === 'object') {
+                // Provider-reported path (Component B): capture raw provider usage
+                // BEFORE normalization — separate accumulator independent from
+                // recordLlmTokens so the backend can cross-check the two paths.
+                const rawInputTokens = Number(usage.input_tokens ?? 0);
+                const rawOutputTokens = Number(usage.output_tokens ?? 0);
+                const rawCacheCreation = Number(usage.cache_creation_input_tokens ?? 0);
+                const rawCacheRead = Number(usage.cache_read_input_tokens ?? 0);
+                recordProviderReportedUsage(rawInputTokens, rawOutputTokens, rawCacheCreation, rawCacheRead);
+
                 const normalizedUsage = normalizeProviderTokenUsage(usage);
                 if (normalizedUsage) {
                   recordLlmTokens(

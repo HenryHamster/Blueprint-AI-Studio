@@ -1186,6 +1186,17 @@ class Task(SQLModel, table=True):
     format_compliance_summary: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Provider-reported token usage from the agent's independent accumulator
+    # (Component B of cost-telemetry reconciliation). Sourced from the raw
+    # Anthropic messages.create() response.usage object, accumulated through a
+    # SEPARATE code path from api_call_summary so the reconciliation can
+    # cross-check the two paths and detect accumulation bugs. Backwards-
+    # compatible — agents that don't ship this field leave it NULL.
+    # Shape: {"input_tokens": int, "output_tokens": int,
+    #         "cache_creation_input_tokens": int, "cache_read_input_tokens": int}
+    provider_reported_usage: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
     # Retry-attribution banking now has dedicated nullable columns. The
     # accessors below still fall back to legacy context keys so in-flight rows
     # written before the migration keep their banked totals during rollout.

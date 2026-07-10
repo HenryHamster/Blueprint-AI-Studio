@@ -123,6 +123,7 @@ const {
     'getResidentTurnLatencyTelemetry',
     'recordLlmCallStart',
     'recordLlmTokens',
+    'recordProviderReportedUsage',
     'recordNumTurns',
     'recordResidentTurnLatency',
     'recordToolResultBytes',

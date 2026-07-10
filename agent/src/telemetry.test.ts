@@ -82,6 +82,7 @@ describe('LLM telemetry', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
+      provider_reported_usage: null,
     });
   });
   it('accumulates call counts and token totals', () => {
@@ -101,6 +102,7 @@ describe('LLM telemetry', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
+      provider_reported_usage: null,
     });
   });
   it('ignores invalid token values (NaN, negative, Infinity)', () => {
@@ -119,6 +121,7 @@ describe('LLM telemetry', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
+      provider_reported_usage: null,
     });
   });
   it('resets all counters', () => {
@@ -137,6 +140,7 @@ describe('LLM telemetry', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
+      provider_reported_usage: null,
     });
   });
   it('breaks out cache-creation and cache-read while total_input_tokens stays the inclusive sum', () => {
