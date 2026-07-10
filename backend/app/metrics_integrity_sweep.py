@@ -2857,6 +2857,10 @@ async def check_capability_claim_reconciliation(
     :func:`app.source_ref_validation._path_exists_at_head` and flags the
     capability only when EVERY path is definitively removed.
 
+    Also flags capabilities whose ``evidence_refs`` contradict their declared
+    status via :func:`app.evidence_primitive.claim_contradicts_evidence`, mirroring
+    the gap evidence_claim_reconciliation check.
+
     CRITICAL HONESTY RULE (mirrors ``evidence_claim_reconciliation`` exactly): the
     path helper returns True / False / None. Only a definite ``False`` for ALL
     declared paths triggers a flag. A single ``True`` (still present) OR a single
@@ -2870,6 +2874,7 @@ async def check_capability_claim_reconciliation(
     durable capability. Bounded to ``ctx.max_projects`` projects.
     """
     from app import source_ref_validation as _srv
+    from app.evidence_primitive import claim_contradicts_evidence, classify_evidence
     from app.models import Project
 
     projects = (
@@ -2945,9 +2950,31 @@ async def check_capability_claim_reconciliation(
                     break
                 # exists is False — definitely removed; keep checking remaining paths.
 
+            cap_name = cap.get("name") or cap.get("id") or "unknown"
             if all_removed:
-                cap_name = cap.get("name") or cap.get("id") or "unknown"
                 flagged_caps.append(cap_name)
+                continue
+
+            # Second check: evidence_refs contradiction (mirrors gap reconciliation).
+            refs = cap.get("evidence_refs")
+            if isinstance(refs, list):
+                evidence_status = classify_evidence(refs)
+                # Re-verify proven path-backed refs — a definite removal overrides
+                # to "contradicted" exactly as evidence_claim_reconciliation does.
+                for ref in refs:
+                    if not isinstance(ref, dict) or ref.get("proven") is not True:
+                        continue
+                    ref_str = ref.get("ref")
+                    if not isinstance(ref_str, str) or not ref_str:
+                        continue
+                    if not _srv._looks_like_file_path(ref_str):
+                        continue
+                    path_exists = await _srv._path_exists_at_head(ref_str)
+                    if path_exists is False:
+                        evidence_status = "contradicted"
+                        break
+                if claim_contradicts_evidence(cap.get("status"), evidence_status):
+                    flagged_caps.append(cap_name)
 
         if flagged_caps:
             preview = ", ".join(flagged_caps[:3])
