@@ -112,8 +112,9 @@ class ReconciliationResult:
     provider_reported_output_tokens: int = 0
     provider_reported_cache_creation_input_tokens: int = 0
     provider_reported_cache_read_input_tokens: int = 0
-    # Agent-accumulated inclusive input total from api_call_summary.
+    # Agent-accumulated inclusive totals from api_call_summary.
     agent_accumulated_input_tokens: int = 0
+    agent_accumulated_output_tokens: int = 0
     agent_accumulated_cache_creation_input_tokens: int = 0
     agent_accumulated_cache_read_input_tokens: int = 0
 
@@ -166,6 +167,7 @@ class ReconciliationResult:
                 self.provider_reported_cache_read_input_tokens
             ),
             "agent_accumulated_input_tokens": self.agent_accumulated_input_tokens,
+            "agent_accumulated_output_tokens": self.agent_accumulated_output_tokens,
             "agent_accumulated_cache_creation_input_tokens": (
                 self.agent_accumulated_cache_creation_input_tokens
             ),
@@ -403,6 +405,7 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
     total_provider_cache_creation = 0
     total_provider_cache_read = 0
     total_agent_input = 0
+    total_agent_output = 0
     total_agent_cache_creation = 0
     total_agent_cache_read = 0
     checked_count = 0
@@ -422,6 +425,7 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         p_cache_read = int(provider_usage.get("cache_read_input_tokens", 0) or 0)
 
         a_input = int(api_summary.get("total_input_tokens", 0) or 0)
+        a_output = int(api_summary.get("total_output_tokens", 0) or 0)
         a_cache_creation = int(
             api_summary.get("total_cache_creation_input_tokens", 0) or 0
         )
@@ -438,6 +442,7 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         total_provider_cache_creation += p_cache_creation
         total_provider_cache_read += p_cache_read
         total_agent_input += a_input
+        total_agent_output += a_output
         total_agent_cache_creation += a_cache_creation
         total_agent_cache_read += a_cache_read
         checked_count += 1
@@ -455,6 +460,7 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
             "provider_reported_cache_creation_input_tokens": p_cache_creation,
             "provider_reported_cache_read_input_tokens": p_cache_read,
             "agent_accumulated_input_tokens": a_input,
+            "agent_accumulated_output_tokens": a_output,
             "agent_accumulated_cache_creation_input_tokens": a_cache_creation,
             "agent_accumulated_cache_read_input_tokens": a_cache_read,
             "provider_reported_delta": round(task_delta, 6),
@@ -476,6 +482,7 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         provider_reported_cache_creation_input_tokens=total_provider_cache_creation,
         provider_reported_cache_read_input_tokens=total_provider_cache_read,
         agent_accumulated_input_tokens=total_agent_input,
+        agent_accumulated_output_tokens=total_agent_output,
         agent_accumulated_cache_creation_input_tokens=total_agent_cache_creation,
         agent_accumulated_cache_read_input_tokens=total_agent_cache_read,
         provider_reported_delta=delta,

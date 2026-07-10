@@ -695,9 +695,13 @@ async def test_provider_reported_detects_divergence(db_session):
     # Delta = |1500 - 1700| / 1500 = 200/1500 = 0.1333... >> 0.001
     assert result.provider_reported_within_tolerance is False
     assert result.provider_reported_delta > PROVIDER_REPORTED_TOLERANCE
+    # Explicit magnitude bound: 13.3% is robustly over a 0.1% threshold
+    # (not marginal like 0.11%), confirming a genuine accumulation error.
+    assert result.provider_reported_delta > 0.10
 
     # Verify the detail accurately reflects the divergence.
     assert result.agent_accumulated_input_tokens == 1700
+    assert result.agent_accumulated_output_tokens == 500
     assert result.provider_reported_input_tokens == 1000
 
 
