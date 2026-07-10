@@ -109,6 +109,7 @@ const STRATEGIC_READ_MODEL_REFRESH_EVENTS = new Set([
   'alert_dismissed',
   'message_created',
   'message_updated',
+  'messages_superseded',
   'strategic_updated',
   'strategic_cycle_started',
   'strategic_cycle_completed',
@@ -488,6 +489,7 @@ export function useLogViewer({
       if (projectEventApplies && (
         msg.event === 'message_created'
         || msg.event === 'message_updated'
+        || msg.event === 'messages_superseded'
         || refetchSurfaces.has('messages')
       )) {
         refreshMessages();
