@@ -1064,6 +1064,118 @@ class TestDedupFilteredFindingsAddedToSalvage:
             "No salvage_bundle task should be spawned for cross-cycle suppressed findings"
         )
 
+    @_pytest.mark.asyncio
+    async def test_evidence_overlap_dedup_captured_and_salvaged(
+        self, db_session, mocker
+    ):
+        """A non-perf finding dropped by the Jaccard evidence-overlap dedup gate
+        is captured with its full payload in the salvage bundle task."""
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-evidence-salvage"
+        )
+
+        # A non-perf improvement finding with full rich context that will
+        # be filtered by evidence overlap (Jaccard similiary dedup).
+        matched_finding = _make_finding(
+            "Matched finding title",
+            direction_id=direction["id"],
+            finding_type="improvement",
+        )
+        # A finding that is filtered as evidence-overlap duplicate
+        evidence_overlap_finding = dict(_make_finding(
+            "Performance: N+1 query in user lookup",
+            direction_id=direction["id"],
+            finding_type="improvement",
+        ))
+        evidence_overlap_finding["description"] = (
+            "N+1 query in user lookup causes 500ms page load"
+        )
+        evidence_overlap_finding["prompt"] = "Add selectinload to user relation"
+        evidence_overlap_finding["related_files"] = [
+            "backend/app/user_service.py",
+        ]
+        evidence_overlap_finding["claims"] = [
+            {"claim": "N+1 detected in user lookup", "confidence": "high"}
+        ]
+        evidence_overlap_finding["sources"] = [
+            {"ref": "perf_profile_v3.json", "trust": "high"}
+        ]
+        evidence_overlap_finding["severity"] = "medium"
+
+        surviving = _make_finding(
+            "Unrelated fix", direction_id=direction["id"]
+        )
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_survive")]
+        mock_outcome.evidence_overlap_count = 1
+        mock_outcome.filtered = [
+            {
+                "title": evidence_overlap_finding["title"][:120],
+                "direction_id": direction["id"],
+                "reason": "evidence overlap with: Matched finding title",
+                "finding": evidence_overlap_finding,
+            }
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[matched_finding, evidence_overlap_finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # ── Assert salvage activity was recorded on parent ──
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        assert salvage_activity is not None, (
+            "salvage_activity must be recorded when evidence-overlap filtered "
+            "findings are captured in salvage candidates"
+        )
+        assert salvage_activity["salvaged_count"] >= 1, (
+            f"Expected >=1 salvaged finding, got {salvage_activity['salvaged_count']}"
+        )
+
+        # ── Assert a salvage bundle child task was spawned ──
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t
+            for t in child_tasks
+            if (t.context or {}).get("salvage_source_task_id") == str(task.id)
+        ]
+        assert len(salvage_tasks) == 1, (
+            f"Expected 1 salvage bundle task, found {len(salvage_tasks)} "
+            f"among {len(child_tasks)} total child tasks"
+        )
+
+        # ── Assert full payload is preserved in the salvage bundle ──
+        payload = salvage_tasks[0].payloads[0]
+        assert payload["type"] == "salvage_bundle"
+        entry = payload["salvaged_findings"][0]
+        assert "Performance: N+1" in entry["title"]
+        assert "dedup: evidence overlap with:" in (entry["discard_reason"] or "").lower()
+        assert entry["direction_id"] == direction["id"]
+        assert entry["prompt"] == "Add selectinload to user relation"
+        assert entry["description"] == "N+1 query in user lookup causes 500ms page load"
+        assert entry["related_files"] == ["backend/app/user_service.py"]
+        assert len(entry["claims"]) == 1
+        assert entry["claims"][0]["claim"] == "N+1 detected in user lookup"
+
 
 @_pytest.mark.asyncio
 async def test_dedup_filtered_perf_finding_enters_salvage(db_session, mocker):

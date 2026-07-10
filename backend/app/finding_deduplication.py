@@ -883,9 +883,12 @@ class DedupOutcome:
     evidence_overlap_count: int = 0
     retired_approach_count: int = 0
     archived_diagnoses_count: int = 0
-    # Per-skip reason records: {title, direction_id, reason} for each filtered
-    # finding, so the research agent can be told exactly what was rejected and
-    # why on its next cycle. Reasons are short literals (≤80 chars).
+    # Per-skip reason records: {title, direction_id, reason, finding} for each
+    # filtered finding. ``finding`` carries the full original payload (description,
+    # evidence, file citations, severity, sources, claims, etc.) so downstream
+    # salvage consumers can inspect type, severity, and context of skipped findings
+    # without a separate lookup. ``reason`` is a short literal (≤80 chars) and
+    # ``title`` is truncated to 120 chars for the research-agent feedback loop.
     filtered: list[dict] = field(default_factory=list)
 
 
