@@ -94,7 +94,7 @@ def _build_capability_proof_summary(proof_records: Dict[str, Any]) -> Dict[str, 
 @limiter.limit("30/minute")
 async def get_all_projects(
     request: Request,
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     archived: bool = Query(False),
     session: AsyncSession = Depends(get_session),

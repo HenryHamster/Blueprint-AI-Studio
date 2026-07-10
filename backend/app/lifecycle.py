@@ -101,7 +101,7 @@ async def _emit_crash_alert(
     alert_title = f"Background service crashed: {name}"
     async with session_factory() as alert_session:
         project_ids = (
-            (await alert_session.execute(select(Project.id))).scalars().all()
+            (await alert_session.execute(select(Project.id).limit(5000))).scalars().all()
         )
         if not project_ids:
             return 0
@@ -152,7 +152,7 @@ async def _emit_crash_episode_alert(
     episode_title = f"Background service crash episode: {name}"
     created = 0
     async with session_factory() as ep_session:
-        ep_project_ids = (await ep_session.execute(select(Project.id))).scalars().all()
+        ep_project_ids = (await ep_session.execute(select(Project.id).limit(5000))).scalars().all()
         if not ep_project_ids:
             return 0
         existing_alerts = (
@@ -300,7 +300,7 @@ async def _seed_completion_debt_design_doc():
 
         async with AsyncSessionLocal() as seed_session:
             project_ids = (
-                (await seed_session.execute(select(Project.id))).scalars().all()
+                (await seed_session.execute(select(Project.id).limit(5000))).scalars().all()
             )
             seeded = 0
             for project_id in project_ids:
@@ -350,7 +350,7 @@ async def _seed_routing_verdict_from_snapshot():
             project_rows = (
                 (
                     await seed_session.execute(
-                        select(Project).options(load_only(Project.id, Project.design_doc, raiseload=True))
+                        select(Project).options(load_only(Project.id, Project.design_doc, raiseload=True)).limit(5000)
                     )
                 )
                 .scalars()
@@ -1077,7 +1077,7 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id))).scalars().all()
+                        (await scan_session.execute(select(Project.id).limit(5000))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
@@ -1219,7 +1219,7 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id))).scalars().all()
+                        (await scan_session.execute(select(Project.id).limit(5000))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
@@ -1610,7 +1610,7 @@ async def lifespan(app):
                                     project_ids = (
                                         (
                                             await alert_session.execute(
-                                                select(Project.id)
+                                                select(Project.id).limit(5000)
                                             )
                                         )
                                         .scalars()

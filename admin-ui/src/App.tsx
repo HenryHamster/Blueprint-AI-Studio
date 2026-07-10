@@ -20,8 +20,8 @@ import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs
 import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then(m => ({ default: m.TaskDetailDrawer })));
 import { ToastContainer } from './components/Toasts';
-import { AlertsPopover } from './components/AlertsPopover';
-import { FleetDetailDrawer } from './components/FleetDetailDrawer';
+const AlertsPopover = lazy(() => import('./components/AlertsPopover').then(m => ({ default: m.AlertsPopover })));
+const FleetDetailDrawer = lazy(() => import('./components/FleetDetailDrawer').then(m => ({ default: m.FleetDetailDrawer })));
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
@@ -34,8 +34,8 @@ import { BulkActionBar } from './components/BulkActionBar';
 import type { SortBy } from './components/KanbanBoard';
 import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
 import { Pagination } from './components/Pagination';
-import { UserManagement } from './components/UserManagement';
-import { ProjectMembers } from './components/ProjectMembers';
+const UserManagement = lazy(() => import('./components/UserManagement').then(m => ({ default: m.UserManagement })));
+const ProjectMembers = lazy(() => import('./components/ProjectMembers').then(m => ({ default: m.ProjectMembers })));
 const MessagesPanel = lazy(() => import('./components/MessagesPanel').then(m => ({ default: m.MessagesPanel })));
 const ActivityFeed = lazy(() => import('./components/ActivityFeed'));
 const StrategicContextWorkspace = lazy(() => import('./components/StrategicContextWorkspace').then(m => ({ default: m.StrategicContextWorkspace })));
@@ -1191,6 +1191,7 @@ export default function App() {
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
         return (
+        <Suspense fallback={null}>
         <ProjectMembers
           projectId={projectId}
           members={s.projectMembers}
@@ -1199,6 +1200,7 @@ export default function App() {
           onUpdateRole={(memberId, role) => s.updateProjectMemberRole(projectId, memberId, role)}
           onRemove={(memberId) => s.removeProjectMember(projectId, memberId)}
         />
+        </Suspense>
         );
       })()}
       <VersionMismatchBanner />
@@ -1225,6 +1227,7 @@ export default function App() {
       ) : (
         <WorkbenchFrame>
       {s.showUserManagement && s.userRole === 'admin' ? (
+        <Suspense fallback={null}>
         <UserManagement
           users={s.allowedUsers}
           currentUserEmail={s.user?.email || ''}
@@ -1233,6 +1236,7 @@ export default function App() {
           onRemove={s.removeAllowedUser}
           onClose={() => s.setShowUserManagement(false)}
         />
+        </Suspense>
       ) : activeTab === 'chat' ? (
         <WorkbenchSurface
           title="Strategic"
@@ -1705,7 +1709,7 @@ export default function App() {
 
       {s.logTask && (
         <ErrorBoundary level="panel">
-        <Suspense fallback={<WorkspaceSkeleton />}>
+        <Suspense fallback={null}>
         <TaskDetailDrawer
           task={s.logTask}
           tasks={s.tasks}
@@ -1778,6 +1782,7 @@ export default function App() {
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
 
       {s.showAlertsPopover && combinedAlerts.length > 0 && (
+        <Suspense fallback={null}>
         <AlertsPopover
           alerts={combinedAlerts}
           onDismiss={(id) => {
@@ -1794,9 +1799,11 @@ export default function App() {
           activeInvestigationTaskIds={srInvestigationTaskIds}
           onClose={() => s.setShowAlertsPopover(false)}
         />
+        </Suspense>
       )}
 
       {s.showFleetDetail && (
+        <Suspense fallback={null}>
         <FleetDetailDrawer
           onClose={() => s.setShowFleetDetail(false)}
           onViewTask={handleViewTask}
@@ -1805,6 +1812,7 @@ export default function App() {
           fleetRunnersRefreshSignal={s.fleetRunnersRefreshSignal}
           live={s.wsConnected}
         />
+        </Suspense>
       )}
 
       {s.confirmDialog && (

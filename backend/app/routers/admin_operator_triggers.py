@@ -178,6 +178,7 @@ async def trigger_self_audit(
                     Task.project_id == project.id,
                     Task.status.in_(active_statuses),
                 )
+                .limit(1000)
             )
         )
         .scalars()
