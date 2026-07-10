@@ -852,6 +852,21 @@ async def report_compute_job(
     )
     job = result.scalars().first()
     if job is None:
+        # Check whether the job exists under a different project — if so, emit a
+        # structured warning so operators can detect misconfigured runners.
+        mismatch_result = await session.execute(
+            select(ComputeJob).where(ComputeJob.id == job_id).limit(1)
+        )
+        mismatch_job = mismatch_result.scalars().first()
+        if mismatch_job is not None:
+            logger.warning(
+                "[RUNNERS] Cross-project access mismatch: runner_id=%s runner_project_id=%s "
+                "job_id=%s job_actual_project_id=%s — runner cannot access jobs from another project",
+                runner.id,
+                runner.project_id,
+                job_id,
+                mismatch_job.project_id,
+            )
         raise HTTPException(status_code=404, detail="compute job not found")
 
     _TERMINAL_STATUSES = {

@@ -7,6 +7,7 @@ enforce a minimum ``viewer``/``member``/``owner`` level. Re-exports
 ``modify_task_apply`` so router modules import task mutation from one place.
 """
 
+import logging
 import uuid
 
 from fastapi import HTTPException
@@ -14,7 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import Task, Project, ProjectMember
-from app.admin_task_mutations import modify_task_apply as modify_task_apply  # noqa: F401
+from app.admin_task_mutations import modify_task_apply as modify_task_apply
+
+logger = logging.getLogger(__name__)
 
 _ROLE_LEVEL = {"viewer": 0, "member": 1, "owner": 2}
 
@@ -40,6 +43,12 @@ async def _get_user_project(
         )
     ).scalar_one_or_none()
     if not member:
+        logger.warning(
+            "cross_user_project_access_denied project_id=%s user_id=%s owner=%s",
+            project_id,
+            user_id,
+            project.user_id,
+        )
         raise HTTPException(status_code=404, detail="Project not found")
     return project
 

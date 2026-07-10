@@ -5206,3 +5206,47 @@ async def test_runner_polling_endpoint_rate_limited(
     assert resp_b.status_code == 200, (
         f"Runner B should not be throttled, got {resp_b.status_code}"
     )
+
+
+@pytest.mark.asyncio
+async def test_report_compute_job_cross_project_emits_warning(
+    client: AsyncClient, db_session, caplog
+):
+    """When a runner reports a compute job that belongs to a different project,
+    a structured WARNING is emitted with runner_id, runner_project_id, job_id,
+    and job_actual_project_id so operators can detect misconfigured runners."""
+    import logging
+
+    project_a = await _make_project(db_session, name="Project A")
+    project_b = await _make_project(db_session, name="Project B")
+    runner_a, token_a = await _make_runner(db_session, project_a.id)
+
+    # Create a RUNNING job that belongs to project_b, pinned to runner_a's id
+    # (simulates a misconfiguration where the runner was re-registered to a new project
+    # but still knows about old job IDs, or vice versa).
+    job = ComputeJob(
+        project_id=project_b.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"runner_target_id": str(runner_a.id)},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    with caplog.at_level(logging.WARNING, logger="blueprint"):
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={"exec_status": "running"},
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+
+    assert resp.status_code == 404
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    mismatch_warnings = [r for r in warning_records if "Cross-project" in r.getMessage()]
+    assert len(mismatch_warnings) == 1, f"Expected 1 cross-project warning, got {len(mismatch_warnings)}"
+    msg = mismatch_warnings[0].getMessage()
+    assert str(runner_a.id) in msg
+    assert str(project_a.id) in msg
+    assert str(job.id) in msg
+    assert str(project_b.id) in msg
