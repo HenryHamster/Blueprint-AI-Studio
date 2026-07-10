@@ -398,7 +398,7 @@ async def test_rollup_loop_landed_cb_called_after_successful_rollup(sweep_db, mo
 
 @pytest.mark.asyncio
 async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
-    sweep_db, mocker
+    sweep_db, mocker, expire_fidelity
 ):
     """Regression test for audit finding 94eb541158680276.
 
@@ -430,11 +430,16 @@ async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
         Subsequent calls: just record the task id to verify they complete.
         """
         if not call_task_ids:
+            # Snapshot id BEFORE rollback — task.id on an expired object raises
+            # MissingGreenlet under fidelity mode (real _expire active).
+            _task_id = task.id
             # First call: simulate internal rollback, return normally (no re-raise).
             with contextlib.suppress(Exception):
                 await session.rollback()
+            # Record execute count BEFORE any re-fetch, so we can prove a
+            # re-query happened between the first and second rollup call.
             execute_counts_at_rollup_calls.append(execute_spy.call_count)
-            call_task_ids.append(task.id)
+            call_task_ids.append(_task_id)
             return True
         execute_counts_at_rollup_calls.append(execute_spy.call_count)
         call_task_ids.append(task.id)
@@ -456,20 +461,21 @@ async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
     )
     execute_spy = mocker.spy(sweep_db, "execute")
 
-    # With the bug (PostgreSQL/asyncpg): accessing task.status on the second
-    # task's expired object raises MissingGreenlet before
-    # _check_and_trigger_rollup is called, so only 1 call is made and this
-    # await propagates the MissingGreenlet out of run_post_orphan_sweep.
+    # Snapshot IDs before the sweep: the mock calls session.rollback() which
+    # expires all session objects. Under fidelity mode (real _expire active),
+    # accessing .id on an expired object raises MissingGreenlet. child1/child2
+    # are re-fetched by the production code so they survive, but parent1/parent2
+    # are NOT in orphaned_task_ids and remain expired after the sweep.
+    child1_id, child2_id = child1.id, child2.id
+
     # With the fix: the sweep re-batches after detecting the internal rollback
     # (via the returned rolled_back=True sentinel) and processes both tasks.
-    # In SQLite/aiosqlite: lazy-refresh works in async context, so the bug
-    # doesn't raise — both tasks are processed regardless, validating the fix.
     landed = AsyncMock()
     await run_post_orphan_sweep(
         sweep_db,
         orphaned_tasks=[child1, child2],
         orphan_commit_ok=True,
-        orphaned_task_ids=[child1.id, child2.id],
+        orphaned_task_ids=[child1_id, child2_id],
         deferred_parent_requeues=[],
         reaper_old_vms={},
         progress_cb=lambda: None,
@@ -478,9 +484,9 @@ async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
 
     # Both tasks must be processed — the second one must NOT be skipped due to
     # expired-object access failure after the first task's internal rollback.
-    both_ids = {child1.id, child2.id}
+    both_ids = {child1_id, child2_id}
     assert set(call_task_ids) == both_ids, (
-        f"Expected both {child1.id} and {child2.id} to be processed. "
+        f"Expected both {child1_id} and {child2_id} to be processed. "
         f"Got: {call_task_ids}. "
         "If only one task was processed, the second was likely blocked by "
         "MissingGreenlet (expired ORM object after internal rollback)."
@@ -497,3 +503,162 @@ async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
     assert execute_counts_at_rollup_calls[1] > execute_counts_at_rollup_calls[0], (
         "The rollup batch must be re-queried after a silent internal rollback"
     )
+
+
+@pytest.mark.asyncio
+async def test_landed_cb_gets_fresh_parent_after_silent_rollback(sweep_db, mocker):
+    """landed_cb receives the correct parent_task_id even after a silent rollback.
+
+    Regression test for the stale-ORM bug: after _check_and_trigger_rollup
+    performs a silent session.rollback() and returns True, the sweep re-batches
+    _rollup_task_batch but previously still called landed_cb(task.parent_task_id)
+    on the OLD expired task object. On asyncpg that attribute access raises
+    MissingGreenlet; on aiosqlite the lazy-refresh silently succeeds but the
+    wrong (pre-rollback) object is used.
+
+    Fix: re-assign task from the fresh batch before calling landed_cb.
+    """
+    call_task_ids: list = []
+
+    async def _internal_rollback_first(task, session, **kwargs):
+        if not call_task_ids:
+            with contextlib.suppress(Exception):
+                await session.rollback()
+            call_task_ids.append(task.id)
+            return True  # signal silent rollback
+        call_task_ids.append(task.id)
+
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup",
+        side_effect=_internal_rollback_first,
+    )
+    mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", _noop_asl())
+
+    project = await _make_project(sweep_db)
+    parent1 = await _make_task(sweep_db, project.id, status=TaskStatus.EVALUATING)
+    parent2 = await _make_task(sweep_db, project.id, status=TaskStatus.EVALUATING)
+    child1 = await _make_task(
+        sweep_db, project.id, status=TaskStatus.FAILED, parent_task_id=parent1.id
+    )
+    child2 = await _make_task(
+        sweep_db, project.id, status=TaskStatus.FAILED, parent_task_id=parent2.id
+    )
+
+    landed = AsyncMock()
+    await run_post_orphan_sweep(
+        sweep_db,
+        orphaned_tasks=[child1, child2],
+        orphan_commit_ok=True,
+        orphaned_task_ids=[child1.id, child2.id],
+        deferred_parent_requeues=[],
+        reaper_old_vms={},
+        progress_cb=lambda: None,
+        landed_cb=landed,
+    )
+
+    # Both tasks must be processed.
+    assert set(call_task_ids) == {child1.id, child2.id}
+
+    # landed_cb must be called for each child with the correct parent id.
+    # This fails without the fix if task.parent_task_id is accessed on the
+    # expired pre-rollback object (MissingGreenlet on asyncpg).
+    landed_calls = {args[0]: args[1] for args, _ in landed.await_args_list}
+    assert parent1.id in landed_calls, (
+        f"landed_cb was not called with parent1.id={parent1.id}. "
+        f"Calls: {list(landed_calls.keys())}. "
+        "The stale-ORM bug likely prevented task.parent_task_id access."
+    )
+    assert parent2.id in landed_calls, (
+        f"landed_cb was not called with parent2.id={parent2.id}. "
+        f"Calls: {list(landed_calls.keys())}."
+    )
+    assert landed_calls[parent1.id] is sweep_db
+    assert landed_calls[parent2.id] is sweep_db
+
+
+@pytest.mark.asyncio
+async def test_expired_attribute_after_rollback_raises_under_fidelity_mode(
+    sweep_db, mocker, expire_fidelity
+):
+    """Fidelity mode makes expired-attribute access raise on SQLite/aiosqlite,
+    matching asyncpg production behaviour.
+
+    Part A — calibration: verify that accessing a mapped attribute on an expired
+    ORM object raises after session.rollback() when fidelity mode (real _expire)
+    is active. Without fidelity mode the root conftest no-ops _expire and this
+    bug class is invisible to SQLite tests.
+
+    Part B — production exercise: run run_post_orphan_sweep with a
+    silent-rollback scenario under fidelity mode. The production fixes (re-batch
+    the rollup task dict, re-assign task from the fresh dict before landed_cb,
+    and re-fetch post_reap_tasks after the rollup loop) ensure every attribute
+    access downstream uses non-expired objects even when real expiry is active.
+    """
+    project = await _make_project(sweep_db)
+    project_id = project.id  # snapshot raw UUID before rollback expiry
+
+    # ── Part A: calibration ──────────────────────────────────────────────────
+    canary = await _make_task(sweep_db, project_id, status=TaskStatus.FAILED)
+    await sweep_db.rollback()  # with real _expire: marks canary expired
+
+    with pytest.raises(Exception):
+        # Accessing a mapped attribute on an expired object raises under fidelity
+        # mode (aiosqlite MissingGreenlet, same as asyncpg in production).
+        _ = canary.status  # noqa: F841
+
+    # ── Part B: production code completes under fidelity mode ────────────────
+    # Use project_id (raw UUID, captured before rollback) — no ORM attribute read.
+    parent1 = await _make_task(sweep_db, project_id, status=TaskStatus.EVALUATING)
+    parent2 = await _make_task(sweep_db, project_id, status=TaskStatus.EVALUATING)
+    child1 = await _make_task(
+        sweep_db, project_id, status=TaskStatus.FAILED, parent_task_id=parent1.id
+    )
+    child2 = await _make_task(
+        sweep_db, project_id, status=TaskStatus.FAILED, parent_task_id=parent2.id
+    )
+
+    call_ids: list = []
+
+    async def _silent_rollback_first(task, session, **kwargs):
+        if not call_ids:
+            # Snapshot id BEFORE rollback — task.id after rollback is expired
+            # and raises MissingGreenlet under fidelity mode.
+            _task_id = task.id
+            with contextlib.suppress(Exception):
+                await session.rollback()
+            call_ids.append(_task_id)
+            return True  # signal silent rollback so sweep re-batches
+        call_ids.append(task.id)
+
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup",
+        side_effect=_silent_rollback_first,
+    )
+    mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", _noop_asl())
+
+    # Snapshot IDs before the sweep: the mock calls session.rollback() which
+    # expires parent1/parent2 (they are NOT in orphaned_task_ids so the sweep's
+    # re-fetches won't refresh them). Accessing .id on an expired object raises
+    # MissingGreenlet under fidelity mode.
+    child1_id, child2_id = child1.id, child2.id
+    parent1_id, parent2_id = parent1.id, parent2.id
+
+    landed = AsyncMock()
+    # Must NOT raise even under fidelity mode: the production code re-batches
+    # and re-assigns task before landed_cb, then re-fetches post_reap_tasks
+    # after the rollup loop so the safeguard and dead-PR loops get fresh objects.
+    await run_post_orphan_sweep(
+        sweep_db,
+        orphaned_tasks=[child1, child2],
+        orphan_commit_ok=True,
+        orphaned_task_ids=[child1_id, child2_id],
+        deferred_parent_requeues=[],
+        reaper_old_vms={},
+        progress_cb=lambda: None,
+        landed_cb=landed,
+    )
+
+    assert set(call_ids) == {child1_id, child2_id}
+    landed_parent_ids = {args[0] for args, _ in landed.await_args_list}
+    assert parent1_id in landed_parent_ids
+    assert parent2_id in landed_parent_ids

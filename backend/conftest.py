@@ -15,6 +15,7 @@
 #    without a round-trip.  Tests that need the post-commit DB state still
 #    call `await db_session.refresh(obj)` explicitly.
 
+import pytest
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 from sqlalchemy.orm.state import InstanceState as _InstanceState
 
@@ -44,3 +45,19 @@ def _noop_expire(
 
 
 _InstanceState._expire = _noop_expire  # type: ignore[assignment]
+
+
+@pytest.fixture
+def expire_fidelity():
+    """Restore real SQLAlchemy object expiry for one test (fidelity mode).
+
+    The root conftest globally no-ops InstanceState._expire so the aiosqlite
+    test environment does not raise MissingGreenlet on lazy-loads after
+    session.rollback(). This fixture temporarily restores the original _expire
+    for the duration of one test, making expired attribute access raise — the
+    same behaviour asyncpg produces in production. Use it to guard against
+    MissingGreenlet-class regressions on the cheap SQLite path.
+    """
+    _InstanceState._expire = _orig_instance_expire  # type: ignore[assignment]
+    yield
+    _InstanceState._expire = _noop_expire  # type: ignore[assignment]
