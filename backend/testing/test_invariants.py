@@ -2486,10 +2486,50 @@ class TestPreMergeDualHeadGuardCoverage:
         assert len(ci_calls) == 2
         ci_guard_assignments = _guard_assignments(ci_func)
         assert len(ci_guard_assignments) == 1
-        ci_guard_stmt, ci_verdict_vars = ci_guard_assignments[0]
-        # ci_completion.py stores the raw guard result in _guard_result, then
-        # derives _ok_to_merge via coerce_migration_guard_result(_guard_result).
-        assert ci_verdict_vars == {"_guard_result"}
+        ci_guard_stmt, ci_intermediate_vars = ci_guard_assignments[0]
+
+        # The guard result may flow through a coerce helper (two-step shape) or
+        # be assigned directly to the effective verdict tuple (single-step shape).
+        # Detect a downstream coerce_migration_guard_result call that consumes the
+        # intermediate variable(s) and derive the effective ok/hold variables from
+        # whichever step actually produces them.
+        ci_coerce_assignments = []
+        for _node in ast.walk(ci_func):
+            if not isinstance(_node, ast.stmt):
+                continue
+            _coerce_vars = _ast_assign_targets_for_predicated_call(
+                _node,
+                call_predicate=lambda _call: (
+                    _ast_called_name(_call) == "coerce_migration_guard_result"
+                    and any(
+                        isinstance(_arg, ast.Name) and _arg.id in ci_intermediate_vars
+                        for _arg in _call.args
+                    )
+                ),
+            )
+            if _coerce_vars:
+                ci_coerce_assignments.append((_node, _coerce_vars))
+
+        if ci_coerce_assignments:
+            # Two-step flow: guard → intermediate var → coerce → verdict vars
+            assert len(ci_coerce_assignments) == 1
+            ci_coerce_stmt, _ = ci_coerce_assignments[0]
+            # _ok_to_merge is derived from the coerce targets; find its assignment
+            ci_ok_stmts = sorted(
+                [
+                    _n
+                    for _n in ast.walk(ci_func)
+                    if isinstance(_n, ast.stmt)
+                    and "_ok_to_merge" in _assigned_names(_n)
+                ],
+                key=lambda _n: getattr(_n, "lineno", 0),
+            )
+            assert len(ci_ok_stmts) >= 1, "_ok_to_merge must be assigned after coerce"
+            ci_effective_guard_stmt = ci_ok_stmts[0]
+        else:
+            # Single-step flow: guard call assigns directly to verdict tuple
+            assert ci_intermediate_vars == {"_guard_result"}
+            ci_effective_guard_stmt = ci_guard_stmt
         ci_fail_closed = next(
             stmt
             for stmt in ast.walk(ci_func)
@@ -2510,8 +2550,8 @@ class TestPreMergeDualHeadGuardCoverage:
         # The raw guard result must not be reassigned after the guard call.
         assert not _name_assignments_after(
             ci_func,
-            "_guard_result",
-            getattr(ci_guard_stmt, "lineno", 0),
+            "_ok_to_merge",
+            getattr(ci_effective_guard_stmt, "lineno", 0),
         )
 
         assert len(task_calls) == 1
