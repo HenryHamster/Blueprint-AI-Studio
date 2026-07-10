@@ -39,7 +39,16 @@ from app.acceptance_gate import (
 )
 from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
-from app.models import Artifact, ArtifactConsumption, ArtifactType, Task, TaskStatus
+from app.models import (
+    Artifact,
+    ArtifactConsumption,
+    ArtifactType,
+    CriterionEvidence,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+    VersionAcceptanceCriterion,
+)
 from app.payload_schemas import AcceptanceEvidence
 from testing.factories import make_project
 
@@ -2078,3 +2087,100 @@ async def test_backfill_acceptance_verdicts_upgrades_false_negative(db_session):
     assert updated is not None
     assert updated.get("proven") is True, "verdict should be upgraded to proven"
     assert updated.get("backfilled") is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_verdicts_no_starvation(db_session):
+    """ORDER BY + NOT EXISTS ensures repeated backfill calls cover all
+    >200 false-negative tasks (no starvation), and already-proven tasks
+    with CriterionEvidence rows are excluded from the query.
+    """
+    from datetime import datetime, timezone
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    # Create an open release version so record_task_merge_evidence
+    # persists CriterionEvidence rows for upgraded tasks — this is
+    # required by the NOT EXISTS filter to advance the LIMIT window.
+    version = ReleaseVersion(project_id=project.id)
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-backfill-starvation-test",
+        text="Backfill starvation test criterion",
+    )
+    db_session.add(criterion)
+    await db_session.flush()
+    criterion_key = criterion.criterion_key
+
+    FIX_TS = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+
+    def _make_candidate(*, proven: bool) -> Task:
+        task = _make_code_task(
+            acceptance_evidence={
+                "kind": "named_test",
+                "test_path": "backend/testing/test_invariants.py",
+            },
+            changed_files=[
+                "backend/app/acceptance_gate.py",
+                "backend/testing/test_invariants.py",
+            ],
+        )
+        task.project_id = project.id
+        task.completed_at = FIX_TS
+        task.criterion_ids = [criterion_key]
+        ctx = dict(task.context or {})
+        ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+            "satisfied": True,
+            "proven": proven,
+            "kind": "named_test",
+            "reason": "simulated for starvation test",
+        }
+        task.context = ctx
+        return task
+
+    # ── Already-proven tasks (have CriterionEvidence rows) ──────────────
+    ALREADY_PROVEN = 10
+    for _ in range(ALREADY_PROVEN):
+        task = _make_candidate(proven=True)
+        db_session.add(task)
+        await db_session.flush()
+        ev = CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind="task_merge",
+            source_id=str(task.id),
+            detail={"proven": True},
+        )
+        db_session.add(ev)
+    await db_session.flush()
+
+    # ── False-negative tasks (satisfied=True, proven=False, no evidence) ─
+    FALSE_NEGATIVE = 205
+    for _ in range(FALSE_NEGATIVE):
+        task = _make_candidate(proven=False)
+        db_session.add(task)
+    await db_session.flush()
+
+    # ── Run backfill until all false-negatives are consumed ─────────────
+    total_upgraded = 0
+    for iteration in range(5):
+        upgraded = await backfill_acceptance_verdicts(db_session)
+        total_upgraded += upgraded
+        if upgraded == 0:
+            break
+
+    assert total_upgraded == FALSE_NEGATIVE, (
+        f"Expected {FALSE_NEGATIVE} upgrades (all false-negative tasks), "
+        f"got {total_upgraded}; {ALREADY_PROVEN} already-proven tasks "
+        f"should have been excluded via NOT EXISTS"
+    )
+
+    # Confirm idempotent: a final pass returns 0
+    final = await backfill_acceptance_verdicts(db_session)
+    assert final == 0, "No false negatives should remain after full sweep"

@@ -45,6 +45,7 @@ from typing import Any, Callable, Iterable, Mapping
 from app.ci_resolution import is_degraded_unverified_reason
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
 from app.landed_signal import merge_verification_status
+from sqlalchemy import String, cast, exists, not_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -52,6 +53,7 @@ from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.artifact_prerequisites import downstream_artifact_logical_key
 from app.models import Artifact
 from app.models import ArtifactConsumption
+from app.models import CriterionEvidence
 from app.models import Project
 from app.models import Task
 from app.models import TaskStatus
@@ -1104,14 +1106,14 @@ def summarize_version_acceptance_aggregate(
 
 
 # ---------------------------------------------------------------------------
-# One-time backfill: false-negative acceptance verdicts (pre-fix)
+# Backfill: false-negative acceptance verdicts (pre-fix)
 # ---------------------------------------------------------------------------
 
 
 async def backfill_acceptance_verdicts(session) -> int:
-    """One-time backfill: re-evaluate pre-fix named_test acceptance verdicts
-    that may have been false-negatives before the ``_CROSS_CUTTING_TEST_FILES``
-    semantic-grounding fix (8acdd3780, 2026-07-09T09:23 UTC).
+    """Re-evaluate pre-fix named_test acceptance verdicts that may have been
+    false-negatives before the ``_CROSS_CUTTING_TEST_FILES`` semantic-grounding
+    fix (8acdd3780, 2026-07-09T09:23 UTC).
 
     Finds merged tasks whose recorded verdict is ``named_test`` with
     ``satisfied=True`` but ``proven=False``, re-evaluates with the current
@@ -1120,6 +1122,12 @@ async def backfill_acceptance_verdicts(session) -> int:
     verdict is ``proven=True``.
 
     Bounded to 200 tasks per call so the reaper cycle is never blocked.
+    Selection is ordered by ``completed_at`` ascending (oldest-first) so the
+    LIMIT window advances deterministically across successive reaper cycles.
+    Tasks that already have a proven ``CriterionEvidence`` row are excluded
+    from the query to avoid re-scanning already-proven rows and to keep the
+    window moving toward unprocessed candidates.
+
     Best-effort: individual evidence-recording failures are logged and
     skipped without aborting the remaining tasks.
 
@@ -1129,11 +1137,24 @@ async def backfill_acceptance_verdicts(session) -> int:
 
     FIX_TIMESTAMP = datetime(2026, 7, 9, 9, 23, 0, tzinfo=timezone.utc)
 
+    # Exclude tasks that already have a proven CriterionEvidence row from a
+    # prior backfill run so the LIMIT window advances to unprocessed tasks.
+    _proven_exists = (
+        exists(
+            select(1).where(
+                CriterionEvidence.source_kind == "task_merge",
+                CriterionEvidence.source_id == cast(Task.id, String),
+                CriterionEvidence.detail["proven"].astext == "true",
+            )
+        )
+        .correlate(Task)
+    )
     result = await session.execute(
         select(Task).where(
             Task.status == TaskStatus.COMPLETED,
             Task.completed_at < FIX_TIMESTAMP,
-        ).limit(200)
+            not_(_proven_exists),
+        ).order_by(Task.completed_at.asc()).limit(200)
     )
     tasks = list(result.scalars().all())
 
