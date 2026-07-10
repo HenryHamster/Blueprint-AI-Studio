@@ -13054,6 +13054,43 @@ class TestAnnotateCapabilityProofStatus:
 
         assert _annotate_capability_proof_status is annotate_capability_proof_status
 
+    def test_capability_proof_badge_reflects_reverified_evidence_status(self):
+        """evidence_refs_map overrides proof_records for the badge.
+
+        A capability that has durable proof_records (historically proven) but
+        whose evidence_refs have been re-verified and show no proven=True ref
+        must NOT show 'proven' — the re-verified status takes precedence over
+        the write-once record-existence check.
+        """
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [
+            {"name": "ci-pipeline", "status": "working"},
+            {"name": "repo-map", "status": "working"},
+            {"name": "untracked", "status": "planned"},
+        ]
+        # proof_records says both ci-pipeline and repo-map are "proven" (old logic)
+        proof_records = {
+            "ci-pipeline": [{"task_id": "t1", "proof_kind": "named_test", "proof_ref": "test_ci.py::test_merge", "commit_sha": "abc"}],
+            "repo-map": [{"task_id": "t2", "proof_kind": "named_test", "proof_ref": "test_map.py::test_map", "commit_sha": "def"}],
+        }
+        # evidence_refs_map: ci-pipeline re-verified — backing code removed, proven=False
+        #                    repo-map re-verified — still present, proven=True
+        evidence_refs_map = {
+            "ci-pipeline": [{"kind": "named_test", "ref": "test_ci.py::test_merge", "proven": False}],
+            "repo-map": [{"kind": "named_test", "ref": "test_map.py::test_map", "proven": True}],
+        }
+        out = _annotate_capability_proof_status(vocab, proof_records, evidence_refs_map)
+
+        # repo-map: evidence_refs has proven=True → "proven" (consistent with old logic)
+        assert out[1]["proof_status"] == "proven"
+        # ci-pipeline: evidence_refs has proven=False only → classify_evidence → "partial"
+        # (refs exist but none is proven=True), overriding the stale proof_record
+        assert out[0]["proof_status"] == "partial"
+        assert out[0]["proof_status"] != "proven"
+        # untracked: no entry in evidence_refs_map → falls back to proof_records → "unproven"
+        assert out[2]["proof_status"] == "unproven"
+
 
 # ── _verify_capability_backing_paths: advisory capability verification ────────
 
