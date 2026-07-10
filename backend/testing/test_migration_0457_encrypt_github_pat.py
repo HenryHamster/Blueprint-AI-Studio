@@ -9,6 +9,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from cryptography.fernet import Fernet
 
@@ -62,7 +63,7 @@ def test_upgrade_does_not_import_candidate_app_module(monkeypatch):
         assert _stored_pat(conn) == "secret-manager-resource"
 
 
-def test_upgrade_and_downgrade_round_trip_with_sqlalchemy_2(monkeypatch):
+def test_upgrade_and_irreversible_downgrade_with_sqlalchemy_2(monkeypatch):
     migration = _load_migration_0457()
     key = Fernet.generate_key().decode()
     monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
@@ -76,5 +77,6 @@ def test_upgrade_and_downgrade_round_trip_with_sqlalchemy_2(monkeypatch):
         encrypted = _stored_pat(conn)
         assert encrypted != "secret-manager-resource"
 
-        migration.downgrade()
-        assert _stored_pat(conn) == "secret-manager-resource"
+        with pytest.raises(NotImplementedError, match="rollback not supported"):
+            migration.downgrade()
+        assert _stored_pat(conn) == encrypted
