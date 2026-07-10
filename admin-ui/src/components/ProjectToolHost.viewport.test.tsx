@@ -19,46 +19,43 @@ import { fetchProjectTools } from '../api/projectTools';
 const SAMPLE_TOOLS = [
   {
     id: 'tool-1',
-    project_id: 'proj-a',
     kind: 'mock-widget',
-    label: 'Mock Widget',
-    config: {},
+    slug: 'mock-widget',
+    title: 'Mock Widget',
     enabled: true,
-    created_at: '2026-01-01T00:00:00Z',
-    updated_at: '2026-01-01T00:00:00Z',
+    placement: 'project_section',
+    content_revision: 0,
   },
   {
     id: 'tool-2',
-    project_id: 'proj-a',
     kind: 'mock-chart',
-    label: 'Mock Chart with a Longer Label That Tests Truncation Behavior',
-    config: {},
+    slug: 'mock-chart',
+    title: 'Mock Chart with a Longer Title That Tests Truncation Behavior',
     enabled: true,
-    created_at: '2026-01-01T00:00:00Z',
-    updated_at: '2026-01-01T00:00:00Z',
+    placement: 'project_section',
+    content_revision: 0,
   },
   {
     id: 'tool-3',
-    project_id: 'proj-a',
     kind: 'mock-table',
-    label: 'Mock Table',
-    config: {},
+    slug: 'mock-table',
+    title: 'Mock Table',
     enabled: true,
-    created_at: '2026-01-01T00:00:00Z',
-    updated_at: '2026-01-01T00:00:00Z',
+    placement: 'project_section',
+    content_revision: 0,
   },
 ];
 
 function MockWidget({ tool }: ToolComponentProps) {
-  return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.label} content</div>;
+  return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.title} content</div>;
 }
 
 function MockChart({ tool }: ToolComponentProps) {
-  return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.label} chart</div>;
+  return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.title} chart</div>;
 }
 
 function MockTable({ tool }: ToolComponentProps) {
-  return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.label} table</div>;
+  return <div className="rounded bg-neutral-800 p-2 text-xs text-neutral-300">{tool.title} table</div>;
 }
 
 beforeAll(() => {
@@ -127,13 +124,12 @@ describe('ProjectToolHost — viewport regression', () => {
     vi.mocked(fetchProjectTools).mockResolvedValue([
       {
         id: 'tool-unknown',
-        project_id: 'proj-a',
         kind: 'unregistered-kind',
-        label: 'Unknown Tool',
-        config: {},
+        slug: 'unregistered-kind',
+        title: 'Unknown Tool',
         enabled: true,
-        created_at: '2026-01-01T00:00:00Z',
-        updated_at: '2026-01-01T00:00:00Z',
+        placement: 'project_section',
+        content_revision: 0,
       },
     ]);
     host = document.createElement('div');

@@ -2,6 +2,7 @@
 import { StrictMode, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
+import './appTools'
 import App from './App.tsx'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { getIdToken } from './firebase'

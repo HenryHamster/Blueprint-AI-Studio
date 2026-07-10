@@ -74,7 +74,7 @@ export function ProjectToolHost({ projectId }: Props) {
         if (!ToolComponent) return null;
         return (
           <div key={tool.id} className="min-w-0">
-            <WorkbenchPanel title={tool.label}>
+            <WorkbenchPanel title={tool.title}>
               <ToolComponent projectId={projectId} tool={tool} />
             </WorkbenchPanel>
           </div>

@@ -353,3 +353,50 @@ async def test_seed_requires_owner(client: AsyncClient, db_session):
     project = await _make_project_member(db_session, role="member")
     resp = await client.post(f"{_BASE}/projects/{project.id}/tools/seed")
     assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Client contract: list response shape must match the TS ProjectTool interface
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_tools_response_shape_matches_client_contract(
+    client: AsyncClient, db_session
+):
+    """The GET /tools list response must match the TypeScript ProjectTool interface.
+
+    The TS client (fetchProjectTools) unwraps {"tools": [...]} and uses:
+      id, kind, slug, title, enabled, placement, content_revision.
+    "label" must NOT appear (old name that caused the original contract bug).
+    "content" must NOT appear (lean projection; fetched separately via /content).
+    """
+    project = await _make_project_member(db_session)
+    seed = await client.post(f"{_BASE}/projects/{project.id}/tools/seed")
+    assert seed.status_code == 200
+
+    resp = await client.get(f"{_BASE}/projects/{project.id}/tools")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Outer envelope the TS client unwraps
+    assert "tools" in body, "response must be {'tools': [...]}, not a bare array"
+    assert isinstance(body["tools"], list)
+
+    tool = body["tools"][0]
+    # Fields the TS ProjectTool interface reads
+    required_fields = {"id", "kind", "slug", "title", "enabled", "placement", "content_revision"}
+    missing = required_fields - set(tool.keys())
+    assert not missing, f"list item missing fields expected by TS client: {sorted(missing)}"
+
+    # "label" was the old (wrong) field name — must not be present
+    assert "label" not in tool, "field 'label' must not appear; TS interface uses 'title'"
+    # content is fetched separately via /content endpoint (lean projection)
+    assert "content" not in tool, "lean list projection must not include content blob"
+
+    # Spot-check field types align with TS interface
+    assert isinstance(tool["id"], str)
+    assert isinstance(tool["title"], str) and tool["title"]
+    assert isinstance(tool["slug"], str) and tool["slug"]
+    assert isinstance(tool["enabled"], bool)
+    assert isinstance(tool["content_revision"], int)
