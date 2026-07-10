@@ -80,8 +80,10 @@ Scope: silent behavioral regressions from broad version jumps in `backend/requir
 
 **Change:** Bumped to 6.9.0 in PR #11796; rolled back to 6.8.0 in PR #11811 due to CI instability.  
 **Our usage (auth.py):** `firebase_admin.initialize_app()` at module load (GCP default credentials); `firebase_auth.verify_id_token(token)` for operator user authentication. The init is wrapped in a bare-`except` to tolerate already-initialized state and placeholder secrets in local dev.  
-**Status:** 6.8.0 is 4 versions ahead of the original 6.4.0. The regression at 6.9.0 was not root-caused; it is stable at 6.8.0.  
-**Verdict: PARTIAL ROLLBACK** — pinned at 6.8.0 pending root-cause analysis of the 6.9.0 CI failure. No behavioral regression at 6.8.0 vs. 6.4.0 was observed in auth flows.
+**Root cause of 6.9.0 CI failure (identified v24):** `firebase-admin==6.9.0` adds a hard dependency on `httpx==0.28.1`, which directly conflicts with the `httpx>=0.27.2,<0.28` pin in `requirements.txt`. The `httpx<0.28` upper bound was introduced in PR #11811 alongside the rollback (as a stopgap for a separate httpx 0.28 breakage). The dependency resolver cannot satisfy both constraints simultaneously, making `pip install` fail — a deterministic conflict, not transient CI flakiness.  
+**Path to unpin:** Relax `httpx<0.28` to remove the upper bound (PR #11824 already migrated the one breaking usage pattern). This unblocks `firebase-admin>=6.9.0`. Upgrading to `firebase-admin>=7.0.0` additionally requires bumping `google-cloud-storage` from `==2.19.0` to `>=3.1.1` (7.x tightened this lower bound). Neither change was made here because they are multi-package bumps outside this spike's scope.  
+**Current state:** Stable at 6.8.0 with comprehensive auth test coverage added in v24 (`testing/test_firebase_auth_coverage.py`). The 6.8.0 API surface (`initialize_app`, `verify_id_token`, all five expected exception classes) is confirmed compatible with our usage pattern.  
+**Verdict: ROOT CAUSE IDENTIFIED** — the 6.9.0 CI failure was a dependency conflict (`firebase-admin==6.9.0` requires `httpx==0.28.1` vs. our `httpx<0.28` upper bound). Remaining at 6.8.0 until a deliberate multi-package bump is scheduled.
 
 ---
 
@@ -96,6 +98,6 @@ Scope: silent behavioral regressions from broad version jumps in `backend/requir
 | PyJWT | 2.8.0 | 2.13.0 | CLEAN |
 | httpx | 0.25.2 | ≥0.27.2 | RESOLVED (#11824) |
 | uvicorn | 0.24.0 | 0.49.0 | CLEAN |
-| firebase-admin | 6.4.0 | 6.8.0 | PARTIAL ROLLBACK |
+| firebase-admin | 6.4.0 | 6.8.0 | ROOT CAUSE IDENTIFIED |
 
 **Overall:** No unaddressed breaking behavioral regressions. The one real break (httpx `app=` removal) was caught in CI and fixed. The firebase-admin 6.9.0 issue was mitigated via rollback to 6.8.0.

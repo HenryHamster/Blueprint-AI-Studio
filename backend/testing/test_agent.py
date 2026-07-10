@@ -4789,6 +4789,30 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     assert entries["build-commands"]["content"] == "npm run build"
     assert "lint-rules" in entries
 
+    # Get single playbook entry by key
+    resp_key = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get", "key": "build-commands"},
+        headers=headers,
+    )
+    assert resp_key.status_code == 200
+    data_key = resp_key.json()
+    assert data_key["status"] == "ok"
+    assert data_key["op"] == "get"
+    key_entries = data_key["entries"]
+    assert "build-commands" in key_entries
+    assert key_entries["build-commands"]["content"] == "npm run build"
+    assert "lint-rules" not in key_entries
+
+    # Get non-existent key returns empty entries
+    resp_miss = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get", "key": "nonexistent-key"},
+        headers=headers,
+    )
+    assert resp_miss.status_code == 200
+    assert resp_miss.json()["entries"] == {}
+
     # List keys
     resp4 = await client.post(
         "/api/agent/playbook",
@@ -4802,6 +4826,71 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     await db_session.refresh(project)
     assert "playbook/lint-rules" in project.design_doc
     assert "playbook/build-commands" in project.design_doc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_playbook_get_with_key(client: AsyncClient, db_session):
+    """Key-scoped get returns a single entry; no-key returns all; unknown key returns empty."""
+    project = Project(name="Playbook Key Test", user_id="test-user-456")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do something"}],
+        vm_instance_id="agent-vm-playbook-key",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-playbook-key")
+    headers = {"x-agent-token": token}
+
+    # Set two playbook entries
+    for kv in [("key-one", "value-one"), ("key-two", "value-two")]:
+        resp = await client.post(
+            "/api/agent/playbook",
+            json={"task_id": str(task.id), "op": "set", "key": kv[0], "value": kv[1]},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+
+    # Get with a specific key — returns only that entry
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get", "key": "key-one"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["op"] == "get"
+    assert set(data["entries"].keys()) == {"key-one"}
+    assert data["entries"]["key-one"]["content"] == "value-one"
+
+    # Get with non-existent key — returns empty dict
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get", "key": "nonexistent"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["entries"] == {}
+
+    # Get with no key — returns all entries (backward compatible)
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert set(data["entries"].keys()) == {"key-one", "key-two"}
 
 
 @pytest.mark.asyncio
@@ -5290,6 +5379,265 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     idx = project.design_doc["_file_to_system"]
     assert "backend/app/auth.py" not in idx
     assert idx["backend/app/database.py"] == "database"
+
+
+@pytest.mark.asyncio
+async def test_design_doc_file_to_system_index_key_paths(
+    client: AsyncClient, db_session,
+):
+    """Setting a systems/* page with ``key_paths`` field populates _file_to_system."""
+    project = Project(name="KeyPaths Index Test", user_id="test-user-kp")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-kp-test",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-kp-test", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # Set a system page using key_paths convention
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/reaper",
+            "value": {
+                "name": "Reaper",
+                "key_paths": [
+                    "backend/app/reaper.py",
+                    "backend/app/reaper_post_orphan_sweep.py",
+                ],
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+    assert idx["backend/app/reaper.py"] == "reaper"
+    assert idx["backend/app/reaper_post_orphan_sweep.py"] == "reaper"
+
+    # Set a second system page using key_files convention
+    resp2 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/runner",
+            "value": {
+                "name": "Runner",
+                "key_files": [
+                    "backend/app/routers/runner.py",
+                ],
+            },
+        },
+        headers=headers,
+    )
+    assert resp2.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+    assert idx["backend/app/routers/runner.py"] == "runner"
+    # key_paths entries still present
+    assert idx["backend/app/reaper.py"] == "reaper"
+
+    # Delete key_paths-based system; index should no longer contain its files
+    resp3 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "delete",
+            "key": "systems/reaper",
+        },
+        headers=headers,
+    )
+    assert resp3.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+    assert "backend/app/reaper.py" not in idx
+    assert idx["backend/app/routers/runner.py"] == "runner"
+
+
+@pytest.mark.asyncio
+async def test_design_doc_file_to_system_index_mixed_conventions(
+    client: AsyncClient, db_session,
+):
+    """Systems/* pages with different field-name conventions (key_paths, key_files, modules)
+    all contribute to _file_to_system."""
+    project = Project(name="Mixed Conventions Test", user_id="test-user-mixed")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-mixed-test",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-mixed-test", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # Page using key_paths (majority convention)
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/auth",
+            "value": {
+                "name": "Auth",
+                "key_paths": ["backend/app/auth.py"],
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    # Page using modules (earliest convention)
+    resp2 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/database",
+            "value": {
+                "name": "Database",
+                "modules": ["backend/app/database.py", "backend/app/models.py"],
+            },
+        },
+        headers=headers,
+    )
+    assert resp2.status_code == 200
+
+    # Page using key_files (minority convention)
+    resp3 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "systems/agent",
+            "value": {
+                "name": "Agent",
+                "key_files": ["agent/src/index.ts"],
+            },
+        },
+        headers=headers,
+    )
+    assert resp3.status_code == 200
+
+    await db_session.refresh(project)
+    idx = project.design_doc["_file_to_system"]
+
+    # Entries from all three conventions must be present
+    assert idx["backend/app/auth.py"] == "auth"
+    assert idx["backend/app/database.py"] == "database"
+    assert idx["backend/app/models.py"] == "database"
+    assert idx["agent/src/index.ts"] == "agent"
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_architecture_context_via_key_paths_convention(
+    client: AsyncClient, db_session,
+):
+    """Architecture context injection works when _file_to_system is populated
+    via the key_paths field-name convention (previously silently dropped)."""
+    project = Project(name="Arch Ctx KeyPaths", user_id="test-user-arch-kp")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    setup_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-arch-kp-setup",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(setup_task)
+    await db_session.commit()
+    await db_session.refresh(setup_task)
+
+    token = create_agent_token(
+        str(setup_task.id), "agent-vm-arch-kp-setup", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # Populate a systems/* page using key_paths convention
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(setup_task.id),
+            "op": "set",
+            "key": "systems/rollup",
+            "value": {
+                "name": "Rollup Manager",
+                "status": "mature",
+                "ready_for_features": True,
+                "description": "Handles research rollup generation and salvage bundling.",
+                "key_paths": ["backend/app/rollup_management.py"],
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, f"Setup set failed: {resp.text}"
+
+    await db_session.refresh(project)
+    idx = project.design_doc.get("_file_to_system", {})
+    assert isinstance(idx, dict), f"_file_to_system not a dict: {idx}"
+    assert idx.get("backend/app/rollup_management.py") == "rollup", (
+        f"Expected rollup in index, got: {idx}"
+    )
+
+    # Now claim a create task whose related_files matches the key_paths entry
+    claim_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Refactor rollup manager"}],
+        vm_instance_id="agent-vm-arch-kp-claim",
+        context={"related_files": ["backend/app/rollup_management.py"]},
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    claim_token = create_agent_token(
+        str(claim_task.id), "agent-vm-arch-kp-claim"
+    )
+    resp2 = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": claim_token}
+    )
+    assert resp2.status_code == 200, f"Claim failed: {resp2.text}"
+
+    data = resp2.json()
+    project_ctx = data.get("project_context", {})
+    assert "architecture_context" in project_ctx, (
+        f"Expected architecture_context via key_paths convention, "
+        f"got project_context keys: {list(project_ctx.keys())}"
+    )
+    arch_ctx = project_ctx["architecture_context"]
+    assert len(arch_ctx) == 1
+    assert arch_ctx[0]["name"] == "Rollup Manager"
+    assert arch_ctx[0]["status"] == "mature"
+    assert arch_ctx[0]["ready_for_features"] is True
 
 
 @pytest.mark.asyncio
@@ -25819,3 +26167,75 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
         headers=headers,
     )
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_design_doc_set_shrink_allowed_when_over_cap(
+    client: AsyncClient, db_session
+):
+    """A write that does NOT increase total size succeeds even when the corpus is
+    already over DESIGN_DOC_MAX_BYTES.  A write that WOULD grow it further is
+    still rejected.  Regression test for the one-way-ratchet bug where the
+    unconditional >cap check blocked all writes once the corpus exceeded 500KB."""
+    from app.task_locking import DESIGN_DOC_MAX_BYTES
+
+    # Pre-populate the doc over the cap (use a reserved key so it bypasses the
+    # endpoint's per-write size guard but contributes to the JSON size on disk).
+    big_blob = "x" * (DESIGN_DOC_MAX_BYTES + 10_000)
+    project = Project(
+        name="Over-Cap Shrink Test",
+        user_id="test-user-overcap",
+        design_doc={"_oversized_internal": big_blob, "existing-key": "small-value"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-overcap",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-overcap", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # Re-setting "existing-key" to its same small value must succeed (no growth).
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "existing-key",
+            "value": "small-value",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, (
+        f"Expected 200 for same-size write over cap, got {resp.status_code}: {resp.json()}"
+    )
+
+    # Writing a new key with a large value (that would grow the total) must be rejected.
+    growing_value = "y" * 10_000
+    resp2 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "new-big-key",
+            "value": growing_value,
+        },
+        headers=headers,
+    )
+    assert resp2.status_code == 400, (
+        f"Expected 400 for size-growing write over cap, got {resp2.status_code}"
+    )
+    assert "too large" in resp2.json().get("detail", "").lower() or "too large" in str(
+        resp2.json()
+    ).lower(), f"Expected 'too large' in error detail: {resp2.json()}"

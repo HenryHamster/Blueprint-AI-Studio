@@ -19,7 +19,6 @@ import contextlib
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock
-from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -418,9 +417,7 @@ async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
     whenever rolled_back=True is returned.
     """
     call_task_ids: list = []
-    # Capture a reference to the first task ORM object seen after the
-    # internal rollback so we can check its expired state below.
-    _post_rollback_obj_refs: list = []
+    execute_counts_at_rollup_calls: list[int] = []
 
     async def _internal_rollback_first_then_return_true(
         task, session, **kwargs
@@ -436,12 +433,10 @@ async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
             # First call: simulate internal rollback, return normally (no re-raise).
             with contextlib.suppress(Exception):
                 await session.rollback()
-            # Signal the silent rollback to the caller so it re-batches.
-            # Capture the OLD (now-expired) task object reference for
-            # expired-state assertion below.
-            _post_rollback_obj_refs.append(task)
+            execute_counts_at_rollup_calls.append(execute_spy.call_count)
             call_task_ids.append(task.id)
             return True
+        execute_counts_at_rollup_calls.append(execute_spy.call_count)
         call_task_ids.append(task.id)
 
     mocker.patch(
@@ -459,6 +454,7 @@ async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
     child2 = await _make_task(
         sweep_db, project.id, status=TaskStatus.FAILED, parent_task_id=parent2.id
     )
+    execute_spy = mocker.spy(sweep_db, "execute")
 
     # With the bug (PostgreSQL/asyncpg): accessing task.status on the second
     # task's expired object raises MissingGreenlet before
@@ -493,22 +489,11 @@ async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
         f"Expected exactly 2 rollup calls (one per FAILED child), got {len(call_task_ids)}"
     )
 
-    # DB-backend-independent assertion: after the internal rollback, the OLD
-    # ORM object IS expired (session.rollback() always expires regardless of
-    # expire_on_commit). The fix must re-batch so the next loop iteration
-    # reads a FRESH object — otherwise PostgreSQL/asyncpg would raise
-    # MissingGreenlet on a sync lazy-refresh. Verify the fix actually
-    # re-fetched by checking that the OLD reference is expired and that the
-    # batch dict now holds a DIFFERENT (re-fetched) object for the same id.
-    if _post_rollback_obj_refs:
-        _old_task = _post_rollback_obj_refs[0]
-        # The old object should be expired after rollback.
-        assert inspect(_old_task).expired, (
-            "ORM object should be expired after silent rollback. "
-            "If not expired, the test setup is masking the real bug."
-        )
-    # Verify the batch was re-fetched: child1.id should be in _rollup_task_batch
-    # with a fresh (non-expired) object. We cannot directly access the batch
-    # dict (it's local to run_post_orphan_sweep), but we can verify that both
-    # tasks were processed — which requires fresh objects in the batch after
-    # the re-batch — and that no MissingGreenlet was raised.
+    # SQLAlchemy's identity map may refresh the same Python object during the
+    # re-query, so checking ``inspect(old).expired`` after the sweep is not a
+    # reliable proof of re-batching. Instead, prove that an execute occurred
+    # between the first rollup call's rollback signal and the second rollup call.
+    assert len(execute_counts_at_rollup_calls) == 2
+    assert execute_counts_at_rollup_calls[1] > execute_counts_at_rollup_calls[0], (
+        "The rollup batch must be re-queried after a silent internal rollback"
+    )

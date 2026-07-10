@@ -45,6 +45,7 @@ from app.problem_model import (
     check_gap_id_write,
     classify_gap_link,
     compute_model_size_signal,
+    capability_evidence_status,
     gap_evidence_status,
     gc_problem_model,
     is_empty,
@@ -5594,3 +5595,118 @@ def test_full_round_trip_both_write_paths_source_null_and_placeholder():
     assert final["intent"]["source"]["type"] == "user_message"
     assert final["intent"]["user_purpose"] == "Operator steering purpose."
     assert final["intent"]["current_focus"] == "phase 2"
+
+
+# ---------------------------------------------------------------------------
+# Capability.evidence_refs and capability_evidence_status
+# ---------------------------------------------------------------------------
+
+
+def test_capability_evidence_refs_defaults_empty():
+    """A Capability with no evidence_refs parses and the field defaults to []."""
+    cap = Capability(name="Task dispatch", status="working")
+    assert cap.evidence_refs == []
+
+
+def test_capability_evidence_refs_round_trip():
+    """Round-trip a Capability with evidence_refs through model_dump/model_validate."""
+    cap = Capability(
+        name="Strategic cycles",
+        status="partial",
+        evidence_refs=[
+            {"kind": "named_test", "ref": "backend/testing/test_foo.py", "proven": True},
+            {"kind": "backing_path", "ref": "backend/app/foo.py", "proven": False},
+        ],
+    )
+    dumped = cap.model_dump()
+    assert dumped["evidence_refs"][0]["kind"] == "named_test"
+    assert dumped["evidence_refs"][0]["proven"] is True
+    restored = Capability.model_validate(dumped)
+    assert restored.evidence_refs == cap.evidence_refs
+
+
+def test_capability_missing_evidence_refs_back_compat_validates():
+    """A stored capability payload lacking evidence_refs validates under extra='forbid'."""
+    raw = {
+        "revision": 2,
+        "capabilities": [
+            {"name": "Task dispatch", "status": "working"},
+        ],
+    }
+    model = parse_problem_model(raw)
+    assert model.capabilities[0].evidence_refs == []
+    restored = parse_problem_model(model.model_dump())
+    assert restored.capabilities[0].evidence_refs == []
+
+
+def test_capability_evidence_status_proven():
+    """capability_evidence_status returns 'proven' when evidence_refs has a proven=True entry."""
+    cap = Capability(
+        name="Task dispatch",
+        status="working",
+        evidence_refs=[{"kind": "named_test", "ref": "test_foo.py", "proven": True}],
+    )
+    assert capability_evidence_status(cap) == "proven"
+
+
+def test_capability_evidence_status_partial():
+    """capability_evidence_status returns 'partial' with refs that exist but none proven."""
+    cap = Capability(
+        name="Task dispatch",
+        status="working",
+        evidence_refs=[{"kind": "named_test", "ref": "test_foo.py", "proven": False}],
+    )
+    assert capability_evidence_status(cap) == "partial"
+
+
+def test_capability_evidence_status_unproven():
+    """capability_evidence_status returns 'unproven' with empty evidence_refs."""
+    cap = Capability(name="Task dispatch", status="working")
+    assert capability_evidence_status(cap) == "unproven"
+
+
+def test_capability_evidence_status_unverified():
+    """capability_evidence_status returns 'unverified' with structurally uncheckable refs.
+
+    Bypass Pydantic validation via model_construct to inject non-dict entries
+    (the only way to produce the 'unverified' branch in classify_evidence —
+    a TypedDict would always be a dict and therefore 'partial' or 'proven').
+    """
+    cap = Capability.model_construct(
+        name="Task dispatch",
+        status="working",
+        evidence_refs=["not a dict"],  # non-dict entries → classify_evidence → "unverified"
+    )
+    assert capability_evidence_status(cap) == "unverified"
+
+
+def test_apply_agent_update_capability_evidence_refs_proposed_wins():
+    """evidence_refs follows proposed-wins through _upsert_by_key/_merge_cap_preserving."""
+    current = {
+        "revision": 1,
+        "capabilities": [
+            {
+                "name": "Task dispatch",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "old_test.py", "proven": False}
+                ],
+            }
+        ],
+    }
+    proposed = {
+        "capabilities": [
+            {
+                "name": "Task dispatch",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "backing_path", "ref": "new_path.py", "proven": True}
+                ],
+            }
+        ],
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-07-10T12:00:00")
+    merged_cap = new_raw["capabilities"][0]
+    assert merged_cap["evidence_refs"] == [
+        {"kind": "backing_path", "ref": "new_path.py", "proven": True}
+    ]

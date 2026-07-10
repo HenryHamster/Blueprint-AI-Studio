@@ -2580,7 +2580,8 @@ async def test_list_dead_letters_returns_rows(db_session):
     )
     await nd._write_dead_letter(entry, reason="exhausted", last_status=503)
 
-    rows = await list_dead_letters(db_session, project_id=pid)
+    rows, total = await list_dead_letters(db_session, project_id=pid)
+    assert total == 1
     assert len(rows) == 1
     row = rows[0]
     assert row["project_id"] == str(pid)
@@ -2599,8 +2600,9 @@ async def test_list_dead_letters_returns_empty_for_project_with_no_dead_letters(
     from app.notification_dispatch import list_dead_letters
 
     pid = uuid.uuid4()
-    rows = await list_dead_letters(db_session, project_id=pid)
+    rows, total = await list_dead_letters(db_session, project_id=pid)
     assert rows == []
+    assert total == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2787,7 +2789,8 @@ class TestDeadLetterRouter:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert data == []
+        assert data["items"] == []
+        assert data["total"] == 0
 
     @pytest.mark.asyncio
     async def test_list_dead_letters_with_rows(self, client, db_session):
@@ -2813,12 +2816,14 @@ class TestDeadLetterRouter:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert len(data) == 2
+        assert data["total"] == 2
+        items = data["items"]
+        assert len(items) == 2
         # Newest first (evicted written second)
-        assert data[0]["reason"] == "evicted"
-        assert data[1]["reason"] == "exhausted"
+        assert items[0]["reason"] == "evicted"
+        assert items[1]["reason"] == "exhausted"
         # Admin user sees full webhook_url
-        assert data[0]["webhook_url"] == "https://hooks.example.com/dl1"
+        assert items[0]["webhook_url"] == "https://hooks.example.com/dl1"
 
     @pytest.mark.asyncio
     async def test_list_dead_letters_invalid_uuid_returns_400(self, client, db_session):

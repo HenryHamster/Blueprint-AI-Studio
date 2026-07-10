@@ -3738,7 +3738,7 @@ async def _process_post_commit(
                                         },
                                     )
                                     logger.info(
-                                        f"[REVIEW PIPELINE] Rollup PR #{pr_number}: review approved, handed to CI gate (parent {_orig.id})"
+                                        f"[REVIEW PIPELINE] Rollup PR #{pr_number}: review approved, handed to CI gate (parent {_orig_id_str})"
                                     )
                                     return {"status": "accepted"}
                         except Exception as _rollup_e:

@@ -178,6 +178,16 @@ class Capability(BaseModel):
     this key when empty so a model with no consolidation serializes
     byte-identically to before the field existed."""
 
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list)
+    """Structured, machine-checkable pointers at the evidence backing this
+    capability, mirroring :attr:`Gap.evidence_refs` exactly — same type, same
+    default, same proposed-wins merge contract (``_merge_cap_preserving`` returns
+    the proposed value wholesale). Optional and default-empty so every stored
+    JSONB model and older agent payload validates unchanged under
+    ``extra='forbid'``. The reconciliation sweep
+    (``metrics_integrity_sweep.check_capability_claim_reconciliation``) overrides
+    the derived status to ``contradicted`` when a proven ref is disproved."""
+
 
 # ---------------------------------------------------------------------------
 # Gaps
@@ -597,6 +607,17 @@ def gap_evidence_status(gap: Gap) -> EvidenceStatus:
     ref against ground truth; a caller that does so (the reconciliation sweep)
     overrides the result to ``contradicted`` when a proven ref is disproved."""
     return classify_evidence(gap.evidence_refs)
+
+
+def capability_evidence_status(cap: Capability) -> EvidenceStatus:
+    """Derived evidence status for a capability, mirroring :func:`gap_evidence_status`.
+
+    Thin wrapper over :func:`app.evidence_primitive.classify_evidence` on the
+    capability's ``evidence_refs``. Pure and stored-flag-only — it never
+    re-verifies a ref against ground truth; the reconciliation sweep
+    (``metrics_integrity_sweep.check_capability_claim_reconciliation``) overrides
+    the result to ``contradicted`` when a proven ref is definitively disproved."""
+    return classify_evidence(cap.evidence_refs)
 
 
 def parse_problem_model(raw: dict | None) -> ProblemModel:

@@ -2801,6 +2801,47 @@ def _preflight(
     }
 
 
+def _safe_credential_path(fpath: str, workspace_root: str) -> str:
+    """Validate and resolve a credential file path, rejecting directory traversal.
+
+    The backend supplies ``fpath`` as a sandbox-absolute path (e.g.
+    ``/root/.config/claude/settings.json``). Leading ``/`` is stripped
+    so the path is relative to *workspace_root* (which is bind-mounted at
+    the sandbox root for both bwrap and docker backends).
+
+    Raises ``ValueError`` on any path containing ``..`` segments or whose
+    resolved absolute path falls outside *workspace_root* — so a compromised
+    or buggy orchestrator cannot write credential files to arbitrary host
+    locations via e.g. ``../../.ssh/authorized_keys``.
+    """
+    # Defense-in-depth: reject '..' path segments before any processing.
+    stripped = fpath.lstrip("/")
+    for component in stripped.split("/"):
+        if component == "..":
+            raise ValueError(
+                f"credential path contains '..' (directory traversal): {fpath!r}"
+            )
+
+    # Resolve relative to workspace root and verify containment.
+    full_path = os.path.abspath(os.path.join(workspace_root, stripped))
+    ws_abs = os.path.abspath(workspace_root)
+
+    try:
+        rel = os.path.relpath(full_path, ws_abs)
+    except ValueError:
+        raise ValueError(
+            f"credential path {fpath!r} resolves outside workspace "
+            f"{ws_abs!r} (os.path.relpath failed)"
+        )
+    if rel.startswith("..") or os.path.isabs(rel):
+        raise ValueError(
+            f"credential path {fpath!r} resolves to {full_path}, "
+            f"which is outside workspace {ws_abs}"
+        )
+
+    return full_path
+
+
 def _spawn_agent_task(
     *,
     task_id: str,
@@ -2869,27 +2910,7 @@ def _spawn_agent_task(
     if llm_files:
         for f in llm_files:
             try:
-                # Strip leading / so the path is relative to the workspace
-                # (which is bind-mounted at the sandbox root for both bwrap
-                # and docker backends), ensuring the credential file is
-                # visible inside the sandbox.
-                fpath = f["path"].lstrip("/")
-                fpath = os.path.join(workspace, fpath)
-                # Path-traversal guard: reject paths that would escape the
-                # workspace directory after normalization (e.g. ../ sequences).
-                resolved_dest = os.path.abspath(os.path.normpath(fpath))
-                resolved_ws = os.path.realpath(workspace)
-                if not (
-                    resolved_dest == resolved_ws
-                    or resolved_dest.startswith(resolved_ws + os.sep)
-                ):
-                    print(
-                        f"[runner] warning: credential file path "
-                        f"{f['path']!r} resolves outside workspace "
-                        f"— skipping",
-                        flush=True,
-                    )
-                    continue
+                fpath = _safe_credential_path(f["path"], workspace)
                 fcontent = f["content"]
                 fmode = f.get("mode", "0600")
                 parent = os.path.dirname(fpath)
@@ -3427,7 +3448,7 @@ def main() -> None:
             # before spawn) and as llm_files (written inside the sandbox).
             _creds = body.get("credentials") or {}
             credential_env: dict[str, str] = _creds.get("env", {})
-            credential_files: list[dict[str, Any]] = _creds.get("files", [])
+            credential_files: list[dict[str, typing.Any]] = _creds.get("files", [])
             llm_env = credential_env
             llm_files = credential_files
             if credential_env:

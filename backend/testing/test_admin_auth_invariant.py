@@ -28,7 +28,12 @@ from app.main import app
 # When a route genuinely should be unauthenticated (e.g. a public health check
 # under /api/admin for infra monitoring), add its path here with a comment
 # explaining why auth is intentionally absent.
-ALLOWLIST: set[str] = {}
+ALLOWLIST: set[str] = {
+    # POST /api/admin/token authenticates via direct ADMIN_API_KEY comparison
+    # (not Depends(get_current_user) / require_admin), because it is the
+    # token-issuance endpoint that exchanges the shared secret for a JWT.
+    "/api/admin/token",
+}
 
 # get_metrics_reader is a narrowly scoped read-only auth dep that accepts
 # agent JWTs; it is a valid auth callable for metrics-only endpoints.

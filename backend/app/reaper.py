@@ -2275,6 +2275,26 @@ async def reaper_service():
                         # post-rollback-expired ORM attribute.
                         _reaper_old_vms.pop(str(task_id), None)
                         del _deferred_parent_requeues[_dq_len_at_row_start:]
+                        # Re-batch-fetch remaining orphan tasks after rollback to
+                        # avoid N+1 per-row session.get() on the next iterations.
+                        # The rollback expires all cached ORM objects; a single
+                        # IN-query here is faster than one SELECT per remaining row.
+                        _remaining_ids = _orphaned_task_ids[_orphan_loop_idx + 1:]
+                        if _remaining_ids:
+                            try:
+                                _refreshed = (
+                                    (
+                                        await session.execute(
+                                            select(Task).where(Task.id.in_(_remaining_ids))
+                                        )
+                                    )
+                                    .scalars()
+                                    .all()
+                                )
+                                for _rt in _refreshed:
+                                    _orphan_task_map[_rt.id] = _rt
+                            except Exception:  # noqa: BLE001
+                                pass  # fallback: per-row session.get() handles misses
 
                         # Benign per-row idempotency collision: the requeue→QUEUED /
                         # →EVALUATING mutation tried to enter

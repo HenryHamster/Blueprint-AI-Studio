@@ -330,7 +330,12 @@ def test_all_admin_routes_require_auth():
     # Intentional exceptions — should stay empty. If a route is intentionally
     # public (for example, a monitored liveness probe), add its path here with
     # a short comment explaining why the public surface is deliberate.
-    public_allowlist: dict[str, str] = {}
+    public_allowlist: dict[str, str] = {
+        # POST /api/admin/token authenticates via direct ADMIN_API_KEY comparison
+        # (not Depends(get_current_user) / require_admin), because it is the
+        # token-issuance endpoint that exchanges the shared secret for a JWT.
+        "/api/admin/token": "exchanges ADMIN_API_KEY for short-lived JWT",
+    }
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
     # JWTs; it is a valid auth callable for metrics-only endpoints.
@@ -1646,8 +1651,12 @@ class TestSchemaRevisionSync:
             ):
                 body = body[1:]
 
-            # Pure data-only migrations (upgrade body is only op.execute calls)
-            # are inherently one-way — accept any downgrade body for them.
+            # Pure data-only migrations (upgrade body is only op.execute or
+            # op.get_bind calls) are inherently one-way — accept any downgrade
+            # body for them.  op.get_bind() is the raw-SQL variant of
+            # op.execute(): both perform data transformation without schema
+            # changes; the downgrade reverse-transforms the same data.
+            _DATA_ONLY_OP_ATTRS = {"execute", "get_bind"}
             upgrade = next(
                 (
                     n
@@ -1665,7 +1674,9 @@ class TestSchemaRevisionSync:
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == "op"
                 ]
-                if up_calls and all(c.func.attr == "execute" for c in up_calls):
+                if up_calls and all(
+                    c.func.attr in _DATA_ONLY_OP_ATTRS for c in up_calls
+                ):
                     continue
 
             # Empty or only `pass`
@@ -2481,8 +2492,50 @@ class TestPreMergeDualHeadGuardCoverage:
         assert len(ci_calls) == 2
         ci_guard_assignments = _guard_assignments(ci_func)
         assert len(ci_guard_assignments) == 1
-        ci_guard_stmt, ci_verdict_vars = ci_guard_assignments[0]
-        assert ci_verdict_vars == {"_ok_to_merge", "_hold_reason"}
+        ci_guard_stmt, ci_intermediate_vars = ci_guard_assignments[0]
+
+        # The guard result may flow through a coerce helper (two-step shape) or
+        # be assigned directly to the effective verdict tuple (single-step shape).
+        # Detect a downstream coerce_migration_guard_result call that consumes the
+        # intermediate variable(s) and derive the effective ok/hold variables from
+        # whichever step actually produces them.
+        ci_coerce_assignments = []
+        for _node in ast.walk(ci_func):
+            if not isinstance(_node, ast.stmt):
+                continue
+            _coerce_vars = _ast_assign_targets_for_predicated_call(
+                _node,
+                call_predicate=lambda _call: (
+                    _ast_called_name(_call) == "coerce_migration_guard_result"
+                    and any(
+                        isinstance(_arg, ast.Name) and _arg.id in ci_intermediate_vars
+                        for _arg in _call.args
+                    )
+                ),
+            )
+            if _coerce_vars:
+                ci_coerce_assignments.append((_node, _coerce_vars))
+
+        if ci_coerce_assignments:
+            # Two-step flow: guard → intermediate var → coerce → verdict vars
+            assert len(ci_coerce_assignments) == 1
+            ci_coerce_stmt, _ = ci_coerce_assignments[0]
+            # _ok_to_merge is derived from the coerce targets; find its assignment
+            ci_ok_stmts = sorted(
+                [
+                    _n
+                    for _n in ast.walk(ci_func)
+                    if isinstance(_n, ast.stmt)
+                    and "_ok_to_merge" in _assigned_names(_n)
+                ],
+                key=lambda _n: getattr(_n, "lineno", 0),
+            )
+            assert len(ci_ok_stmts) >= 1, "_ok_to_merge must be assigned after coerce"
+            ci_effective_guard_stmt = ci_ok_stmts[0]
+        else:
+            # Single-step flow: guard call assigns directly to verdict tuple
+            assert ci_intermediate_vars == {"_guard_result"}
+            ci_effective_guard_stmt = ci_guard_stmt
         ci_fail_closed = next(
             stmt
             for stmt in ast.walk(ci_func)
@@ -2500,10 +2553,11 @@ class TestPreMergeDualHeadGuardCoverage:
         assert min(call.lineno for call in ci_calls) > getattr(
             ci_fail_closed, "end_lineno", ci_fail_closed.lineno
         )
+        # The raw guard result must not be reassigned after the guard call.
         assert not _name_assignments_after(
             ci_func,
             "_ok_to_merge",
-            getattr(ci_guard_stmt, "lineno", 0),
+            getattr(ci_effective_guard_stmt, "lineno", 0),
         )
 
         assert len(task_calls) == 1

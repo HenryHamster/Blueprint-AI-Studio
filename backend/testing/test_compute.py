@@ -13436,3 +13436,45 @@ async def test_dead_runner_pin_cleared_on_requeue_falls_over_to_gcp(
         f"After runner_target_id is cleared, create_compute_job must not route "
         f"to {RUNNER_SUBPROCESS_BACKEND_NAME} (got {job.backend!r})"
     )
+
+
+def test_materialize_local_manifest_rejects_path_traversal():
+    """_materialize_local_manifest rejects paths with '..' segments or that resolve outside root."""
+    with pytest.raises(ValueError, match="Path traversal"):
+        compute._materialize_local_manifest(
+            "test-vm-traverse",
+            {"files": [{"path": "../../../etc/passwd", "content": "evil"}]},
+        )
+
+
+def test_materialize_local_manifest_rejects_deep_traversal():
+    """_materialize_local_manifest rejects paths with nested '..' segments."""
+    with pytest.raises(ValueError, match="Path traversal"):
+        compute._materialize_local_manifest(
+            "test-vm-deep",
+            {"files": [{"path": "subdir/../../../../etc/shadow", "content": "evil"}]},
+        )
+
+
+def test_materialize_local_manifest_rejects_trailing_dotdot():
+    """_materialize_local_manifest rejects paths ending with '..' under disguise."""
+    with pytest.raises(ValueError, match="Path traversal"):
+        compute._materialize_local_manifest(
+            "test-vm-dotdot",
+            {"files": [{"path": "safe/..", "content": "evil"}]},
+        )
+
+
+def test_materialize_local_manifest_accepts_normal_path():
+    """_materialize_local_manifest accepts a normal path and writes the file."""
+    env = compute._materialize_local_manifest(
+        "test-vm-normal",
+        {"files": [{"path": "/tmp/safe.txt", "content": "hello"}], "env": {"OUTPUT": "/tmp/safe.txt"}},
+    )
+    from pathlib import Path
+    import tempfile
+    expected_root = Path(tempfile.gettempdir()) / "blueprint-agent-state" / "test-vm-normal"
+    expected_file = expected_root / "tmp" / "safe.txt"
+    assert expected_file.read_text(encoding="utf-8") == "hello"
+    assert "OUTPUT" in env
+    assert env["OUTPUT"] == str(expected_file)

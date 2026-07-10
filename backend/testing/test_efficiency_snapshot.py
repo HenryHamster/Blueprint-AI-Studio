@@ -26,6 +26,8 @@ from app.efficiency_snapshot import (
     AXIS_REWORK_COST_SHARE,
     AXIS_SALVAGE_COUNT,
     AXIS_SALVAGE_MERGE_RATE,
+    AXIS_ACCEPTANCE_PROVEN_RATE,
+    AXIS_ACCEPTANCE_SATISFIED_RATE,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
     CACHE_CREATION_INPUT_RATE_MULTIPLIER,
@@ -5663,6 +5665,52 @@ def test_compact_llm_cost_attribution():
     assert create_row["cost_usd"] > 0
 
 
+def test_compact_llm_cost_attribution_surfaces_unpriced_combos():
+    """_compact_llm_cost_attribution includes unpriced_combos: empty when all
+    tasks are priced, populated when tasks run on unpriced (provider, model)."""
+    import uuid
+
+    from app.efficiency_snapshot import LLM_TOKEN_PRICING, _compact_llm_cost_attribution
+    from testing.factories import make_task
+
+    project_id = uuid.uuid4()
+
+    # Known-priced model — unpriced_combos should be empty.
+    priced_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 4,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    cost = _compact_llm_cost_attribution([priced_task])
+    assert "unpriced_combos" in cost
+    assert cost["unpriced_combos"] == []
+
+    # Unpriced combo — should appear in the list.
+    unpriced_task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "llm_call_count": 2,
+        },
+        provider="deepseek",
+        model="deepseek-chaos-1",
+    )
+    # Provider:model must NOT be in LLM_TOKEN_PRICING for this test to be valid.
+    assert ("deepseek", "deepseek-chaos-1") not in LLM_TOKEN_PRICING
+
+    cost2 = _compact_llm_cost_attribution([unpriced_task])
+    assert "unpriced_combos" in cost2
+    assert "deepseek:deepseek-chaos-1" in cost2["unpriced_combos"]
+
+
 def test_per_turn_metrics_present_when_num_turns_reported():
     """mean_turns_per_call, mean_input_tokens_per_turn, mean_uncached_input_tokens_per_call,
     and cache_read_share are computed correctly when tasks report num_turns."""
@@ -10338,6 +10386,59 @@ async def test_self_repair_burn_share_alert_threshold(db_session, mocker):
     assert marker == "healthy"
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="SQLite StaticPool reads stale state after DELETE in same session",
+)
+async def test_self_repair_burn_share_alert_includes_top_schemas(db_session, mocker):
+    """Alert message includes top offending schemas when by_schema data is present."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with high repair overhead and per-schema breakdown.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 7000,
+            "total_output_tokens": 3000,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        format_compliance_summary={
+            "format_error_total": 8,
+            "format_repair_attempts": 8,
+            "format_repair_successes": 4,
+            "format_repair_infra_failures": 0,
+            "format_repair_input_tokens": 2000,
+            "format_repair_output_tokens": 1000,
+            "format_repair_attempts_by_schema": {"TaskPayload": 5, "ResearchOutput": 3},
+            "format_repair_successes_by_schema": {"TaskPayload": 2, "ResearchOutput": 2},
+            "format_repair_infra_failures_by_schema": {},
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    fired = await maybe_alert_self_repair_burn_share(db_session, project.id)
+    assert fired is True
+
+    alerts = await _self_repair_burn_share_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    msg = alerts[0].message
+    # Top schemas should appear in the message ordered by repair_attempts descending
+    assert "TaskPayload (5 attempts)" in msg
+    assert "ResearchOutput (3 attempts)" in msg
+    assert "Top offending schemas" in msg
+
+
 def test_llm_cost_attribution_strategic_cycle_cost_per_event():
     """llm_cost_attribution block includes strategic_cycle_cost_per_event with
     cycle_count, total_usd, and per_event_usd when StrategicCycle rows exist.
@@ -11790,3 +11891,16 @@ async def test_model_routing_efficiency_persisted_in_snapshot(db_session):
     assert len(read_prs["by_provider"]) == len(by_provider), (
         "by_provider row count must match between write and read"
     )
+
+
+def test_acceptance_proof_rate_axes_registered():
+    """AXIS_ACCEPTANCE_PROVEN_RATE and AXIS_ACCEPTANCE_SATISFIED_RATE must be
+    registered in ALL_AXES and AXIS_CONSUMERS with at least a pending disposition.
+    """
+    assert AXIS_ACCEPTANCE_PROVEN_RATE in ALL_AXES
+    assert AXIS_ACCEPTANCE_PROVEN_RATE == "acceptance_proven_rate"
+    assert AXIS_ACCEPTANCE_PROVEN_RATE in AXIS_CONSUMERS
+
+    assert AXIS_ACCEPTANCE_SATISFIED_RATE in ALL_AXES
+    assert AXIS_ACCEPTANCE_SATISFIED_RATE == "acceptance_satisfied_rate"
+    assert AXIS_ACCEPTANCE_SATISFIED_RATE in AXIS_CONSUMERS

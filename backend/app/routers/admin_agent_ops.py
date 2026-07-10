@@ -109,6 +109,7 @@ from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
     lock_project_or_429 as _lock_project_or_429,
     task_lock,
+    with_design_doc_locked as _with_design_doc_locked,
     with_directions_locked as _with_directions_locked,
     with_vision_locked as _with_vision_locked,
 )
@@ -172,6 +173,7 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "record_finding_resolution",
     "consume_knowledge",
     "dismiss_knowledge",
+    "request_qualification",
 })
 
 
@@ -298,6 +300,74 @@ class DesignDocUpdate(BaseModel):
     value: Any | None = None
 
 
+def _get_file_list_from_system_page(doc_val: dict) -> list[str]:
+    """Extract the file path list from a ``systems/*`` design-doc page.
+
+    Systems pages were authored with different field-name conventions for
+    listing their covered files: ``key_paths`` (majority convention),
+    ``key_files`` (a few pages), or ``modules`` (earliest pages).  This helper
+    checks each in preference order and returns entries from the first one that
+    is a non-empty list of strings, so the caller (the ``_file_to_system``
+    reverse-index builder) never depends on a single unenforced field name.
+    """
+    for field in ("key_paths", "key_files", "modules"):
+        files = doc_val.get(field)
+        if isinstance(files, list):
+            return [f for f in files if isinstance(f, str)]
+    return []
+
+
+async def backfill_file_to_system_index(session: AsyncSession) -> int:
+    """One-time startup backfill: recompute ``_file_to_system`` for every
+    project that has a non-empty ``design_doc``.
+
+    Uses :func:`_with_design_doc_locked` for each project so the canonical
+    locking helper is used for all ``project.design_doc`` writes.
+
+    The reverse-index was originally built only from the ``modules`` field
+    name, but most ``systems/*`` pages use ``key_paths`` (or ``key_files``).
+    This sweep applies the corrected field-reading logic (via
+    :func:`_get_file_list_from_system_page`) to every existing systems page,
+    bringing the index in sync without waiting for each page to be re-set.
+
+    Returns the number of projects whose index was actually updated.
+    """
+    project_ids = (
+        (
+            await session.execute(
+                select(Project.id).where(
+                    Project.design_doc.isnot(None),
+                    Project.design_doc != {},
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    updated_count = 0
+    for project_id in project_ids:
+        _was_updated = False
+
+        def _mutate(doc: dict) -> None:
+            nonlocal _was_updated
+            rebuilt: dict[str, str] = {}
+            for doc_key, doc_val in doc.items():
+                if doc_key.startswith("systems/") and isinstance(doc_val, dict):
+                    sys_id = doc_key[len("systems/") :]
+                    for fpath in _get_file_list_from_system_page(doc_val):
+                        rebuilt[fpath] = sys_id
+            current = doc.get("_file_to_system")
+            if isinstance(current, dict) and current == rebuilt:
+                return  # already correct
+            doc["_file_to_system"] = rebuilt
+            _was_updated = True
+
+        await _with_design_doc_locked(session, project_id, _mutate)
+        if _was_updated:
+            updated_count += 1
+    return updated_count
+
+
 @router.post("/api/agent/design-doc")
 @limiter.limit("60/minute")
 async def update_design_doc(
@@ -392,9 +462,20 @@ async def update_design_doc(
             raise HTTPException(
                 status_code=400, detail=f"Value too large ({val_size} bytes, max 50KB)"
             )
+        # Measure only agent-facing keys: reserved keys have their own internal
+        # retention caps and must not consume the agent-write budget.
+        old_agent_keys_doc = {
+            k: v for k, v in doc.items() if k not in _RESERVED_DESIGN_DOC_KEYS
+        }
+        old_size = len(_json.dumps(old_agent_keys_doc))
         doc[key] = payload.value
-        total_size = len(_json.dumps(doc))
-        if total_size > DESIGN_DOC_MAX_BYTES:
+        new_agent_keys_doc = {
+            k: v for k, v in doc.items() if k not in _RESERVED_DESIGN_DOC_KEYS
+        }
+        total_size = len(_json.dumps(new_agent_keys_doc))
+        # Allow writes that shrink or don't grow the corpus even when already over cap
+        # (matches the canonical with_design_doc_locked logic in task_locking.py).
+        if total_size > DESIGN_DOC_MAX_BYTES and total_size > old_size:
             del doc[key]  # rollback
             raise HTTPException(
                 status_code=400,
@@ -406,9 +487,8 @@ async def update_design_doc(
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
                     sys_id = doc_key[len("systems/") :]
-                    for fpath in doc_val.get("modules", []):
-                        if isinstance(fpath, str):
-                            file_to_system_map[fpath] = sys_id
+                    for fpath in _get_file_list_from_system_page(doc_val):
+                        file_to_system_map[fpath] = sys_id
             doc["_file_to_system"] = file_to_system_map
     elif payload.op == "delete":
         doc.pop(key, None)
@@ -418,9 +498,8 @@ async def update_design_doc(
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
                     sys_id = doc_key[len("systems/") :]
-                    for fpath in doc_val.get("modules", []):
-                        if isinstance(fpath, str):
-                            file_to_system_deleted_map[fpath] = sys_id
+                    for fpath in _get_file_list_from_system_page(doc_val):
+                        file_to_system_deleted_map[fpath] = sys_id
             doc["_file_to_system"] = file_to_system_deleted_map
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
@@ -501,8 +580,33 @@ async def update_playbook(
     if op == "get":
         project = await session.get(Project, task.project_id)
         doc = project.design_doc or {} if project else {}
-        entries = {}
         my_id = str(task.id)
+
+        # Single-key scoped retrieval
+        if payload.key and payload.key.strip():
+            full_key = f"playbook/{payload.key.strip()}"
+            v = doc.get(full_key) if doc else None
+            if isinstance(v, dict):
+                pending_source = v.get("pending_source")
+                if pending_source and pending_source != my_id:
+                    return {"status": "ok", "op": op, "entries": {}}
+                return {
+                    "status": "ok",
+                    "op": op,
+                    "entries": {
+                        payload.key.strip(): {
+                            "content": v.get("content", ""),
+                            "updated_at": v.get("updated_at", ""),
+                            "source_task_id": v.get("source_task_id", ""),
+                            "branch": v.get("branch", ""),
+                            "head_sha": v.get("head_sha", ""),
+                        }
+                    },
+                }
+            return {"status": "ok", "op": op, "entries": {}}
+
+        # No specific key — return all entries (existing behavior)
+        entries = {}
         for k, v in doc.items():
             if k.startswith("playbook/") and isinstance(v, dict):
                 # Hide pending entries written by OTHER non-completed tasks —
@@ -5275,6 +5379,55 @@ async def strategic_operation(
                 "status": "ok",
                 "op": "dismiss_knowledge",
                 "document_id": str(doc_id),
+            }
+        )
+
+    elif payload.op == "request_qualification":
+        # Dedicated one-off qualification trigger. Does NOT touch ProblemModel at
+        # all — it calls the same underlying qualify logic that set_problem_model
+        # uses via its qualify_request rider, but reached directly so the agent
+        # (or operator) can request a fresh qualification run without having to
+        # construct a set_problem_model payload.
+        #
+        # Data shape: {"reason": "<string>"}. reason is optional — an absent or
+        # empty reason is treated as "". Wrong-phase is a no-op (same behavior as
+        # qualify_request via set_problem_model). The qualification runs
+        # post-commit on its own fresh session for the same structural reason as
+        # the set_problem_model path: avoid holding any DB lock during slow GitHub
+        # I/O (CI-compliance scan + run_qualification).
+        from app.strategic_completion import (
+            _apply_qualify_request_post_commit,
+            extract_qualify_request,
+        )
+
+        qualify_request = extract_qualify_request(
+            data if isinstance(data, dict) else {}
+        )
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        _rq_task_id = task.id
+        _rq_project_id = project.id
+        await session.commit()
+        await _apply_qualify_request_post_commit(
+            qualify_request,
+            task_id=_rq_task_id,
+            project_id=_rq_project_id,
+            path="api_inline_request_qualification",
+        )
+        logger.info(
+            "[STRATEGIC API] request_qualification applied for task %s project %s "
+            "(reason=%r) — release qualifier ran if open version is in stabilize",
+            _rq_task_id,
+            _rq_project_id,
+            (qualify_request or {}).get("reason"),
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "request_qualification",
+                "reason_received": (qualify_request or {}).get("reason") or None,
             }
         )
 

@@ -356,8 +356,15 @@ async def next_task(
     except Exception:
         logger.exception(
             "[RUNNERS] Failed to resolve LLM credentials for task %s; "
-            "continuing without per-task credentials",
+            "rolling back dispatch so task stays claimable",
             task.id,
+        )
+        task.started_at = None
+        session.add(task)
+        await session.commit()
+        return JSONResponse(
+            {"pool_exhausted": True},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
     await session.commit()
@@ -852,6 +859,30 @@ async def report_compute_job(
     )
     job = result.scalars().first()
     if job is None:
+        # Check whether the job exists under a different project — if so, emit a
+        # structured warning so operators can detect misconfigured runners.
+        mismatch_result = await session.execute(
+            select(ComputeJob).where(ComputeJob.id == job_id).limit(1)
+        )
+        mismatch_job = mismatch_result.scalars().first()
+        if mismatch_job is not None:
+            logger.warning(
+                "[RUNNERS] Cross-project access mismatch: runner_id=%s runner_project_id=%s "
+                "job_id=%s job_actual_project_id=%s — runner cannot access jobs from another project",
+                runner.id,
+                runner.project_id,
+                job_id,
+                mismatch_job.project_id,
+            )
+            from app.runner_health_alerts import _maybe_create_runner_cross_project_mismatch_alert
+            await _maybe_create_runner_cross_project_mismatch_alert(
+                session,
+                project_id=runner.project_id,
+                runner_id=runner.id,
+                job_id=job_id,
+                job_project_id=mismatch_job.project_id,
+                hostname=getattr(runner, "hostname", None),
+            )
         raise HTTPException(status_code=404, detail="compute job not found")
 
     _TERMINAL_STATUSES = {

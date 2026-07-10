@@ -36,7 +36,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 
-from sqlalchemy import func as _func
+from sqlalchemy import func as _func, inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -638,6 +638,17 @@ async def _project_resource_dispatch_defer_message(
     """Return an operator-readable resource-envelope deferral reason, if any."""
     if project_cache is not None and task.project_id in project_cache:
         project = project_cache[task.project_id]
+        # A per-task rollback expires every ORM instance in the session.  The
+        # dispatch cache intentionally survives those contained rollbacks, so a
+        # cached Project may no longer have build_config loaded.  Reading it
+        # synchronously through resolve_project_* would then attempt async I/O
+        # outside greenlet_spawn and raise MissingGreenlet.  Refresh the one
+        # resource-envelope column explicitly before any synchronous helper
+        # touches it; healthy cache hits remain query-free.
+        if project is not None:
+            state = sa_inspect(project)
+            if "build_config" in state.expired_attributes:
+                await session.refresh(project, attribute_names=["build_config"])
     else:
         project = await session.get(Project, task.project_id)
         if project_cache is not None:

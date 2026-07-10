@@ -466,10 +466,11 @@ export async function handleStrategicResident(
     for (const block of blocks) {
       if (block.type === 'text') {
         result.push({ type: 'text' as const, text: block.text });
-      } else {
-        // block.type is 'image' — validated at compile time by ContentBlock type
+      } else if (block.type === 'image') {
         result.push({ type: 'image' as const, source: block.source });
       }
+      // text_url blocks are resolved by materializeContentBlocks before this point;
+      // if one slips through (a bug), skip it silently rather than crashing.
     }
     return result;
   }

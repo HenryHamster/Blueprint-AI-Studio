@@ -1,5 +1,5 @@
 import { AlertTriangle, CheckCircle } from 'lucide-react';
-import { Skeleton } from './DashboardMetricCards';
+import { Skeleton } from './DashboardMetricCardsPrimitives';
 import { timeAgo } from '../utils/time';
 import { splitConvergenceVerdict } from '../utils/convergenceVerdict';
 import { StrategicChallengeChip } from './StrategicChallengeChip';

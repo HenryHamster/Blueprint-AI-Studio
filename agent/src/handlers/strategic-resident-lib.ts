@@ -29,6 +29,12 @@ export const MAX_IMAGES_PER_TURN = 8;
  */
 export const MAX_IMAGE_DOWNLOAD_BYTES = Math.floor(MAX_IMAGE_BASE64_LENGTH * 3 / 4);
 
+/**
+ * Maximum bytes to fetch for a URL-sourced text/code file attachment.
+ * Larger files are truncated to this limit before being inlined as text.
+ */
+export const MAX_TEXT_ATTACHMENT_BYTES = 512 * 1024; // 512 KB
+
 const MODEL_IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
 
 export interface ResidentInboundMessage {
@@ -517,7 +523,35 @@ export interface ImageBlockBase64Source { type: 'base64'; media_type: string; da
 export interface ImageBlockUrlSource { type: 'url'; url: string; media_type: string; name?: string; }
 export type ImageBlockSource = ImageBlockBase64Source | ImageBlockUrlSource;
 export interface ImageBlock { type: 'image'; source: ImageBlockSource; }
-export type ContentBlock = TextBlock | ImageBlock;
+/** Internal transport block: a text/code file to be fetched from a signed GCS URL by materializeContentBlocks. */
+export interface TextUrlBlock { type: 'text_url'; url: string; name: string; mime_type: string; }
+export type ContentBlock = TextBlock | ImageBlock | TextUrlBlock;
+
+const TEXT_LIKE_APP_MIMES = new Set([
+  'application/json', 'application/javascript', 'application/xml',
+  'application/yaml', 'application/x-yaml', 'application/toml',
+  'application/sql', 'application/x-sh', 'application/x-shellscript',
+]);
+
+/**
+ * Whether a MIME type represents human-readable text that can be decoded and presented inline.
+ */
+function isTextLikeMime(mimeType: string): boolean {
+  if (typeof mimeType !== 'string') return false;
+  if (mimeType.startsWith('text/')) return true;
+  return TEXT_LIKE_APP_MIMES.has(mimeType.split(';')[0].trim().toLowerCase());
+}
+
+/**
+ * Build a one-line reference block for an opaque (non-text, non-image) file attachment.
+ */
+function buildFileReference(att: Record<string, unknown>): string {
+  const name = str(att.name, 'file');
+  const mimeType = str(att.mime_type, 'application/octet-stream');
+  const sizeBytes = typeof att.size_bytes === 'number' ? att.size_bytes : null;
+  const sizeStr = sizeBytes !== null ? `, ${sizeBytes} bytes` : '';
+  return `[File attachment: ${name} (${mimeType}${sizeStr})]`;
+}
 
 export interface AttachmentFetchResponse {
   ok: boolean;
@@ -558,8 +592,10 @@ function attachmentUnavailableBlock(source: ImageBlockUrlSource, reason: string)
 /**
  * Extract message content as content blocks (text + image attachments from
  * context.attachments). Images can arrive as inline base64 data or as GCS
- * signed URLs (the scalable path for operator-uploaded files). Text-only
- * messages produce a single text block.
+ * signed URLs (the scalable path for operator-uploaded files). Non-image
+ * attachments with text/* MIME types are decoded and emitted as text blocks;
+ * opaque files (PDF, binary, URL-only) are emitted as a one-line reference
+ * block. Text-only messages produce a single text block.
  */
 export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] {
   const blocks: ContentBlock[] = [];
@@ -573,33 +609,62 @@ export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] 
       let imageCount = 0;
       for (const att of raw as Array<Record<string, unknown>>) {
         if (imageCount >= MAX_IMAGES_PER_TURN) break;
-        if (str(att.type) !== 'image') continue;
-        const mediaType = normalizeImageMediaType(att.mime_type);
-        if (!mediaType) continue;
-        // Inline base64 data — preferred when available.
-        if (typeof att.data === 'string' && att.data && att.data.length <= MAX_IMAGE_BASE64_LENGTH) {
-          blocks.push({
-            type: 'image',
-            source: { type: 'base64', media_type: mediaType, data: att.data },
-          });
-          imageCount++;
-        } else if (typeof att.url === 'string' && att.url) {
-          const url = att.url.trim();
-          // GCS signed URL — fallback when data is absent or oversized. The URL
-          // is an internal transport detail; materializeContentBlocks fetches it
-          // and converts it to base64 before the model sees the turn.
-          if (isAllowedAttachmentDownloadUrl(url)) {
+        if (str(att.type) === 'image') {
+          const mediaType = normalizeImageMediaType(att.mime_type);
+          if (!mediaType) continue;
+          // Inline base64 data — preferred when available.
+          if (typeof att.data === 'string' && att.data && att.data.length <= MAX_IMAGE_BASE64_LENGTH) {
             blocks.push({
               type: 'image',
-              source: { type: 'url', url, media_type: mediaType, name: attachmentName(att.name) || undefined },
+              source: { type: 'base64', media_type: mediaType, data: att.data },
             });
-          } else {
-            blocks.push(attachmentUnavailableBlock(
-              { type: 'url', url: '', media_type: mediaType, name: attachmentName(att.name) || undefined },
-              'unsupported download URL',
-            ));
+            imageCount++;
+          } else if (typeof att.url === 'string' && att.url) {
+            const url = att.url.trim();
+            // GCS signed URL — fallback when data is absent or oversized. The URL
+            // is an internal transport detail; materializeContentBlocks fetches it
+            // and converts it to base64 before the model sees the turn.
+            if (isAllowedAttachmentDownloadUrl(url)) {
+              blocks.push({
+                type: 'image',
+                source: {
+                  type: 'url',
+                  url,
+                  media_type: mediaType,
+                  name: attachmentName(att.name) || undefined,
+                },
+              });
+            } else {
+              blocks.push(attachmentUnavailableBlock(
+                { type: 'url', url: '', media_type: mediaType, name: attachmentName(att.name) || undefined },
+                'unsupported download URL',
+              ));
+            }
+            imageCount++;
           }
-          imageCount++;
+        } else {
+          // Non-image attachment: decode text-like content or emit a reference block.
+          const attData = typeof att.data === 'string' ? att.data : '';
+          const mimeType = str(att.mime_type);
+          if (attData && isTextLikeMime(mimeType)) {
+            try {
+              const decoded = Buffer.from(attData, 'base64').toString('utf-8');
+              const name = str(att.name, 'file');
+              blocks.push({ type: 'text', text: `[Attachment: ${name}]\n${decoded}` });
+            } catch {
+              blocks.push({ type: 'text', text: buildFileReference(att) });
+            }
+          } else if (!attData && typeof att.url === 'string' && att.url && isTextLikeMime(mimeType)) {
+            // URL-only text/code file (uploaded to GCS) — defer fetch to materializeContentBlocks.
+            const url = att.url.trim();
+            if (isAllowedAttachmentDownloadUrl(url)) {
+              blocks.push({ type: 'text_url', url, name: str(att.name, 'file'), mime_type: mimeType });
+            } else {
+              blocks.push({ type: 'text', text: buildFileReference(att) });
+            }
+          } else {
+            blocks.push({ type: 'text', text: buildFileReference(att) });
+          }
         }
       }
     }
@@ -621,6 +686,27 @@ export async function materializeContentBlocks(
 ): Promise<ContentBlock[]> {
   const result: ContentBlock[] = [];
   for (const block of blocks) {
+    if (block.type === 'text_url') {
+      if (!isAllowedAttachmentDownloadUrl(block.url)) {
+        result.push({ type: 'text', text: `[Attachment "${block.name}" could not be loaded: unsupported download URL.]` });
+        continue;
+      }
+      try {
+        const resp = await fetchImpl(block.url);
+        if (!resp.ok) {
+          result.push({ type: 'text', text: `[Attachment "${block.name}" could not be loaded: download failed (${resp.status}).]` });
+          continue;
+        }
+        const bytes = Buffer.from(await resp.arrayBuffer());
+        const sliced = bytes.length > MAX_TEXT_ATTACHMENT_BYTES ? bytes.subarray(0, MAX_TEXT_ATTACHMENT_BYTES) : bytes;
+        const text = sliced.toString('utf-8');
+        const truncNote = bytes.length > MAX_TEXT_ATTACHMENT_BYTES ? '\n[... truncated]' : '';
+        result.push({ type: 'text', text: `[Attachment: ${block.name}]\n${text}${truncNote}` });
+      } catch {
+        result.push({ type: 'text', text: `[Attachment "${block.name}" could not be loaded: download failed.]` });
+      }
+      continue;
+    }
     if (block.type !== 'image' || block.source.type !== 'url') {
       result.push(block);
       continue;

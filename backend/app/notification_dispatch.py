@@ -243,18 +243,33 @@ def get_notification_stats(project_id: Any = None) -> dict:
     }
 
 
-async def list_dead_letters(session: AsyncSession, project_id: Any) -> list[dict]:
-    """List NotificationDeadLetter rows for a project, newest first.
+async def list_dead_letters(
+    session: AsyncSession,
+    project_id: Any,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """List NotificationDeadLetter rows for a project, newest first, with pagination.
 
-    Returns a list of dicts with id, project_id, event_type, reason, attempts,
-    last_status, webhook_url, payload, body, and created_at for each row.
+    Returns a (items, total) tuple where items is a list of dicts with id,
+    project_id, event_type, reason, attempts, last_status, webhook_url, payload,
+    body, and created_at for each row, and total is the unpaginated count.
     """
+    from sqlalchemy import func as _func
     from sqlmodel import select as _dl_select
+
+    base_where = NotificationDeadLetter.project_id == str(project_id)
+    total_result = await session.execute(
+        _dl_select(_func.count()).select_from(NotificationDeadLetter).where(base_where)
+    )
+    total = total_result.scalar_one()
 
     result = await session.execute(
         _dl_select(NotificationDeadLetter)
-        .where(NotificationDeadLetter.project_id == str(project_id))
+        .where(base_where)
         .order_by(NotificationDeadLetter.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
     rows = result.scalars().all()
     return [
@@ -271,7 +286,7 @@ async def list_dead_letters(session: AsyncSession, project_id: Any) -> list[dict
             "created_at": r.created_at.isoformat(),
         }
         for r in rows
-    ]
+    ], total
 
 
 async def redrive_dead_letter(session: AsyncSession, dead_letter_id: str, project_id: str) -> dict:

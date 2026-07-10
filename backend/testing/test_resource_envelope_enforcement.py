@@ -261,6 +261,48 @@ async def test_dispatch_passes_task_under_vm_cap(db_session):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_resource_cache_refreshes_project_expired_by_rollback(db_session):
+    """A rollback-expired cached Project must not lazy-load in async context."""
+    project = make_project(
+        build_config={"resource_envelope": {"max_concurrent_vms": 3}}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id)
+    db_session.add(task)
+    await db_session.commit()
+
+    project_cache = {}
+    active_counts = {project.id: 1}
+    assert (
+        await _project_resource_dispatch_defer_message(
+            db_session,
+            task,
+            active_counts,
+            project_cache=project_cache,
+        )
+        is None
+    )
+
+    cached_project = project_cache[project.id]
+    db_session.expire(cached_project, ["build_config"])
+
+    # Before the fix this second call synchronously lazy-loaded build_config
+    # from the expired cache entry and raised sqlalchemy.exc.MissingGreenlet.
+    assert (
+        await _project_resource_dispatch_defer_message(
+            db_session,
+            task,
+            active_counts,
+            project_cache=project_cache,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_dispatch_projected_count_stops_double_admit(db_session, mocker):
     """With cap=1 and active=0, only the first of two queued tasks is admitted."""
     project = make_project(

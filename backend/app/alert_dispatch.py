@@ -1231,6 +1231,7 @@ async def _maybe_create_self_repair_burn_share_alert(
     burn_share: float,
     threshold: float,
     severity: AlertSeverity = AlertSeverity.WARNING,
+    top_schemas: list[tuple[str, int]] | None = None,
 ) -> None:
     """Create a deduplicated operator Alert when a project's self-repair burn-share
     exceeds the efficiency ceiling.
@@ -1261,12 +1262,18 @@ async def _maybe_create_self_repair_burn_share_alert(
         return
     burn_share_pct = (burn_share * 100) if burn_share is not None else 0.0
     threshold_pct = threshold * 100
+    schema_suffix = ""
+    if top_schemas:
+        schema_lines = ", ".join(
+            f"{name} ({attempts} attempts)" for name, attempts in top_schemas
+        )
+        schema_suffix = f" Top offending schemas: {schema_lines}."
     message = (
         f"Self-repair tokens consumed {burn_share_pct:.1f}% of total LLM tokens, "
         f"exceeding the efficiency ceiling of {threshold_pct:.1f}%. High repair "
         f"overhead indicates multiple format-recovery attempts are required; "
         f"investigate whether recent prompt or schema changes have degraded "
-        f"structured-output success rates."
+        f"structured-output success rates.{schema_suffix}"
     )[:1000]
     alert = Alert(
         project_id=project_id,
@@ -1780,6 +1787,7 @@ from app.runner_health_alerts import (  # noqa: F401
     _RUNNER_ESCALATION_AGE_SECONDS_DEFAULT,
     _RUNNER_ESCALATION_FIRST_SECONDS,
     _RUNNER_ESCALATION_REPEAT_SECONDS,
+    _RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
     _RUNNER_LOW_DISK_EVENT_TYPE,
     _RUNNER_LOW_MEMORY_EVENT_TYPE,
     _fleet_no_healthy_runner_dedupe_key,
@@ -1787,6 +1795,7 @@ from app.runner_health_alerts import (  # noqa: F401
     _maybe_create_local_runner_hold_alert,
     _maybe_create_runner_deactivated_alert,
     _maybe_create_runner_degraded_alert,
+    _maybe_create_runner_cross_project_mismatch_alert,
     _maybe_create_runner_low_disk_alert,
     _maybe_create_runner_low_memory_alert,
     _maybe_escalate_runner_deactivated_alert,
@@ -1801,6 +1810,7 @@ from app.runner_health_alerts import (  # noqa: F401
     _runner_deactivated_dedupe_key,
     _runner_degraded_dedupe_key,
     _runner_escalation_last_notified,
+    _runner_cross_project_mismatch_dedupe_key,
     _runner_low_disk_dedupe_key,
     _runner_low_memory_dedupe_key,
     _runner_outage_escalated_keys,

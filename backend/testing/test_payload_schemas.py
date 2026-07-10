@@ -330,6 +330,7 @@ EXPECTED_TYPES = {
     "web_research",
     "design",
     "repo_bootstrap",
+    "salvage_bundle",
 }
 
 
@@ -1677,3 +1678,70 @@ def test_visual_evidence_resolve_found_and_missing():
     result_none = resolve_visual_evidence(project_id, component, width, None)
     assert result_none["resolved"] is False
     assert result_none["status"] == "unverified"
+
+
+# ---------------------------------------------------------------------------
+# Salvage bundle payload contract — Python producer ↔ TS consumer seam
+# ---------------------------------------------------------------------------
+
+
+def test_salvage_bundle_payload_contract():
+    """_build_salvage_payload must emit exactly the keys handleSalvageBundle reads.
+
+    The TS consumer reads: title, discard_reason, prompt, description, claims,
+    related_files (and uses '(untitled)'/'unknown' fallbacks for missing values).
+    A producer-side rename would silently degrade consumed bundles while both
+    sides' existing unit tests keep passing — this test pins the contract.
+    """
+    from app.research_completion import _build_salvage_payload
+
+    import uuid
+
+    source_id = uuid.uuid4()
+    candidates = [
+        {
+            "title": "Fix the leaky abstraction",
+            "deferred_reason": "scope too large",
+            "direction_id": "dir-abc",
+            "prompt": "Refactor the storage layer",
+            "description": "The storage abstraction leaks implementation details.",
+            "related_files": [{"path": "backend/app/storage.py"}],
+            "claims": [{"claim": "reduces coupling"}],
+            "sources": [],
+        },
+        {
+            # minimal entry — omits optional fields
+            "title": None,
+            "description": "A minimal finding with no prompt",
+        },
+    ]
+
+    result = _build_salvage_payload(candidates, source_id)
+
+    # Top-level structure
+    assert result["type"] == "salvage_bundle"
+    assert result["source_task_id"] == str(source_id)
+    assert result["total_discarded"] == 2
+    findings = result["salvaged_findings"]
+    assert len(findings) == 2
+
+    # Required keys consumed by handleSalvageBundle must be present in every entry
+    ts_consumer_keys = {"title", "discard_reason", "prompt", "description", "related_files", "claims"}
+    for entry in findings:
+        for key in ts_consumer_keys:
+            assert key in entry, f"Missing TS-consumer key '{key}' in salvaged_findings entry: {entry}"
+
+    # First entry: rich data round-trips correctly
+    f0 = findings[0]
+    assert f0["title"] == "Fix the leaky abstraction"
+    assert f0["discard_reason"] == "scope too large"
+    assert f0["prompt"] == "Refactor the storage layer"
+    assert "storage abstraction" in (f0["description"] or "")
+    assert f0["related_files"] == [{"path": "backend/app/storage.py"}]
+    assert f0["claims"] == [{"claim": "reduces coupling"}]
+
+    # Second entry: None title falls back to description[:80]; missing deferred_reason → "unknown"
+    f1 = findings[1]
+    assert f1["title"] == "A minimal finding with no prompt"[:80]
+    assert f1["discard_reason"] == "unknown"
+    assert f1["prompt"] is None  # absent in input → None in output (TS falls back gracefully)

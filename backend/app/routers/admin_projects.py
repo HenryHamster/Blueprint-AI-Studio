@@ -1326,6 +1326,16 @@ async def pause_all_autonomous(
 ):
     """Disable autonomous mode on all projects at once."""
     user_project_ids = _user_project_ids(current_user["user_id"])
+    user_project_count = int(
+        (
+            await session.scalar(
+                select(func.count())
+                .select_from(ProjectMember)
+                .where(ProjectMember.user_id == current_user["user_id"])
+            )
+        )
+        or 0
+    )
     projects = (
         (
             await session.execute(
@@ -1340,12 +1350,12 @@ async def pause_all_autonomous(
         .scalars()
         .all()
     )
-    # _user_project_ids returns a SELECT for use inside .in_(), not a list, so
-    # detect cap truncation from the fetched page size instead of counting it.
-    if len(projects) == 500:
+    if user_project_count > 500:
         logger.warning(
-            "pause-all: fetch hit the 500-project cap; projects beyond the "
-            "cap were NOT paused"
+            "pause-all: user has %d projects but cap limited fetch to 500; "
+            "%d projects were NOT paused",
+            user_project_count,
+            user_project_count - 500,
         )
     for p in projects:
         p.autonomous_enabled = False

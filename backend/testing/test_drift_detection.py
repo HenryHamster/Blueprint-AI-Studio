@@ -148,9 +148,9 @@ async def test_over_claimer_sets_over_claim_flag(
     db_session,
     project_with_directions,
 ):
-    """5 claims + 1 merged → consistency=0.2, over_claim_flag set."""
+    """5 PR-opening tasks + 1 merged → consistency=0.2, over_claim_flag set."""
     project = project_with_directions
-    # 5 tasks claim shipped, only 1 has merged PR
+    # 5 tasks opened PRs (have PR artifacts), only 1 actually merged
     await _make_completed_task(
         db_session,
         project,
@@ -164,7 +164,7 @@ async def test_over_claimer_sets_over_claim_flag(
             project,
             direction_id="d-overclaim",
             pr_merged=False,
-            has_pr_artifact=False,
+            has_pr_artifact=True,  # PR opened but not yet merged
         )
 
     drift = await compute_direction_drift(db_session, project)
@@ -184,7 +184,7 @@ async def test_stalled_direction_sets_stalled_flag(
     db_session,
     project_with_directions,
 ):
-    """5 claims + 0 merged → stalled_despite_churn_flag set."""
+    """5 PR-opening tasks + 0 merged → stalled_despite_churn_flag set."""
     project = project_with_directions
     for _ in range(5):
         await _make_completed_task(
@@ -192,7 +192,7 @@ async def test_stalled_direction_sets_stalled_flag(
             project,
             direction_id="d-stalled",
             pr_merged=False,
-            has_pr_artifact=False,
+            has_pr_artifact=True,  # PR opened but none merged
         )
 
     drift = await compute_direction_drift(db_session, project)
@@ -245,7 +245,7 @@ async def test_per_system_rollup_aggregates_directions(
             pr_merged=True,
             has_pr_artifact=True,
         )
-    # d-overclaim: 5 claims, 1 merged
+    # d-overclaim: 5 PR-opening tasks, 1 merged
     await _make_completed_task(
         db_session,
         project,
@@ -259,7 +259,7 @@ async def test_per_system_rollup_aggregates_directions(
             project,
             direction_id="d-overclaim",
             pr_merged=False,
-            has_pr_artifact=False,
+            has_pr_artifact=True,  # PR opened but not merged
         )
 
     drift = await compute_direction_drift(db_session, project)
@@ -575,14 +575,14 @@ async def test_custom_thresholds_from_runtime_config_are_respected(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    # 2 tasks claim shipped, none merged — won't flag with default min=3, will with min=2
+    # 2 tasks opened PRs, none merged — won't flag with default min=3, will with min=2
     for _ in range(2):
         await _make_completed_task(
             db_session,
             project,
             direction_id="d-threshold",
             pr_merged=False,
-            has_pr_artifact=False,
+            has_pr_artifact=True,  # PR opened but not merged
         )
 
     patched_config = {
@@ -921,3 +921,92 @@ async def test_drift_history_series_returns_empty_for_no_history(db_session):
 
     series = await drift_history_series(db_session, project.id, "d-empty-series")
     assert series == []
+
+
+# ── Test: PR lifecycle cluster counts as one claim ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pr_lifecycle_cluster_counts_as_one_claim(
+    db_session,
+    project_with_directions,
+):
+    """A full lifecycle cluster (create+fix+review) for one PR counts as one claim.
+
+    The create task opens a PR (has a PULL_REQUEST artifact).  The fix and
+    review child tasks share the same direction_id but never open a separate
+    PR artifact — they are lifecycle children of the same code-change.  Only
+    the PR-opening task should count toward claimed_changes_count; fix/review
+    tasks without their own artifact must not inflate the claim count.
+    """
+    project = project_with_directions
+
+    # Create task opens the PR — has a PR artifact.
+    await _make_completed_task(
+        db_session,
+        project,
+        direction_id="d-healthy",
+        pr_merged=True,
+        has_pr_artifact=True,
+    )
+    # Fix task: lifecycle child of the same PR; no separate PR artifact.
+    await _make_completed_task(
+        db_session,
+        project,
+        direction_id="d-healthy",
+        pr_merged=False,
+        has_pr_artifact=False,
+        plan_output={"summary": "Applied fix to PR"},
+    )
+    # Review task: another lifecycle child; no separate PR artifact.
+    await _make_completed_task(
+        db_session,
+        project,
+        direction_id="d-healthy",
+        pr_merged=False,
+        has_pr_artifact=False,
+        plan_output={"findings": ["looks good"]},
+    )
+
+    drift = await compute_direction_drift(db_session, project)
+    sig = drift["by_direction"]["d-healthy"]
+    # Only the create task (with PR artifact) counts as a claim; fix and review
+    # tasks without their own artifact must NOT inflate the count.
+    assert sig["claimed_changes_count"] == 1, (
+        "only the PR-opening task should count; fix/review children without "
+        "a PR artifact must not contribute to claimed_changes_count"
+    )
+    assert sig["actually_merged_prs"] == 1
+    assert sig["claim_shipped_consistency"] == 1.0
+    assert sig["over_claim_flag"] is False
+    assert sig["stalled_despite_churn_flag"] is False
+
+
+# ── Test: completed task without PR artifact does not count as claim ──────────
+
+
+@pytest.mark.asyncio
+async def test_completed_task_without_pr_artifact_does_not_count_as_claim(
+    db_session,
+    project_with_directions,
+):
+    """A COMPLETED task with plan_output but no PR artifact contributes 0 claims."""
+    project = project_with_directions
+
+    # Task is COMPLETED and has a rich plan_output — but no PR artifact.
+    await _make_completed_task(
+        db_session,
+        project,
+        direction_id="d-healthy",
+        pr_merged=False,
+        has_pr_artifact=False,
+        plan_output={"summary": "Research complete", "findings": ["f1", "f2"]},
+    )
+
+    drift = await compute_direction_drift(db_session, project)
+    sig = drift["by_direction"]["d-healthy"]
+    assert sig["claimed_changes_count"] == 0, (
+        "a completed task without a PULL_REQUEST artifact must not count as a claim"
+    )
+    assert sig["actually_merged_prs"] == 0
+    assert sig["claim_shipped_consistency"] == 1.0

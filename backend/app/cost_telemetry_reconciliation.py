@@ -112,14 +112,21 @@ class ReconciliationResult:
     provider_reported_output_tokens: int = 0
     provider_reported_cache_creation_input_tokens: int = 0
     provider_reported_cache_read_input_tokens: int = 0
-    # Agent-accumulated inclusive input total from api_call_summary.
+    # Agent-accumulated inclusive totals from api_call_summary.
     agent_accumulated_input_tokens: int = 0
+    agent_accumulated_output_tokens: int = 0
     agent_accumulated_cache_creation_input_tokens: int = 0
     agent_accumulated_cache_read_input_tokens: int = 0
 
+    # Overall relative delta for provider-reported usage, defined as the larger
+    # of the input-token and output-token deltas below.
+    provider_reported_delta: float = 0.0
     # Relative delta between provider-reported total input (input_tokens +
     # cache_creation + cache_read) and agent-accumulated total_input_tokens.
-    provider_reported_delta: float = 0.0
+    provider_reported_input_delta: float = 0.0
+    # Relative delta between provider-reported output_tokens and
+    # agent-accumulated total_output_tokens.
+    provider_reported_output_delta: float = 0.0
     provider_reported_within_tolerance: bool = True
     provider_reported_tolerance: float = PROVIDER_REPORTED_TOLERANCE
 
@@ -166,6 +173,7 @@ class ReconciliationResult:
                 self.provider_reported_cache_read_input_tokens
             ),
             "agent_accumulated_input_tokens": self.agent_accumulated_input_tokens,
+            "agent_accumulated_output_tokens": self.agent_accumulated_output_tokens,
             "agent_accumulated_cache_creation_input_tokens": (
                 self.agent_accumulated_cache_creation_input_tokens
             ),
@@ -173,6 +181,8 @@ class ReconciliationResult:
                 self.agent_accumulated_cache_read_input_tokens
             ),
             "provider_reported_delta": self.provider_reported_delta,
+            "provider_reported_input_delta": self.provider_reported_input_delta,
+            "provider_reported_output_delta": self.provider_reported_output_delta,
             "provider_reported_within_tolerance": self.provider_reported_within_tolerance,
             "provider_reported_tolerance": self.provider_reported_tolerance,
             "task_count": self.task_count,
@@ -379,9 +389,11 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
     captured before normalization. Divergence indicates an accumulation bug,
     double-counting, or dropped-call accounting in the agent.
 
-    Tolerance: relative delta <= 0.1% on the inclusive input token total
+    Tolerance: relative delta <= 0.1% on both the inclusive input token total
     (``provider_reported_input_tokens + cache_creation + cache_read`` vs
-    ``api_call_summary.total_input_tokens``).
+    ``api_call_summary.total_input_tokens``) and output token total
+    (``provider_reported_output_tokens`` vs
+    ``api_call_summary.total_output_tokens``).
 
     What this proves: that the agent counts Anthropic provider tokens
     correctly for its own calls. What it does NOT prove: pricing table
@@ -403,6 +415,7 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
     total_provider_cache_creation = 0
     total_provider_cache_read = 0
     total_agent_input = 0
+    total_agent_output = 0
     total_agent_cache_creation = 0
     total_agent_cache_read = 0
     checked_count = 0
@@ -422,6 +435,7 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         p_cache_read = int(provider_usage.get("cache_read_input_tokens", 0) or 0)
 
         a_input = int(api_summary.get("total_input_tokens", 0) or 0)
+        a_output = int(api_summary.get("total_output_tokens", 0) or 0)
         a_cache_creation = int(
             api_summary.get("total_cache_creation_input_tokens", 0) or 0
         )
@@ -430,7 +444,12 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         )
 
         # Skip tasks with no provider-reported data (NULL or all-zero).
-        if p_input <= 0 and p_cache_creation <= 0 and p_cache_read <= 0:
+        if (
+            p_input <= 0
+            and p_output <= 0
+            and p_cache_creation <= 0
+            and p_cache_read <= 0
+        ):
             continue
 
         total_provider_input += p_input
@@ -438,15 +457,30 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         total_provider_cache_creation += p_cache_creation
         total_provider_cache_read += p_cache_read
         total_agent_input += a_input
+        total_agent_output += a_output
         total_agent_cache_creation += a_cache_creation
         total_agent_cache_read += a_cache_read
         checked_count += 1
 
-        # Compute per-task delta between provider-reported total input and
-        # agent-accumulated total_input_tokens.
-        provider_total = p_input + p_cache_creation + p_cache_read
-        agent_total = a_input
-        task_delta = abs(provider_total - agent_total) / provider_total if provider_total > 0 else 0.0
+        # Compute per-task deltas between provider-reported and agent-accumulated
+        # input/output totals. A non-zero agent total against a zero provider
+        # denominator is a full divergence.
+        provider_total_input = p_input + p_cache_creation + p_cache_read
+        agent_total_input = a_input
+        task_input_delta = (
+            abs(provider_total_input - agent_total_input) / provider_total_input
+            if provider_total_input > 0
+            else 1.0
+            if agent_total_input > 0
+            else 0.0
+        )
+        task_output_delta = (
+            abs(p_output - a_output) / p_output
+            if p_output > 0
+            else 1.0
+            if a_output > 0
+            else 0.0
+        )
 
         per_task.append({
             "task_id": str(task.id) if hasattr(task, "id") and task.id else None,
@@ -455,18 +489,33 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
             "provider_reported_cache_creation_input_tokens": p_cache_creation,
             "provider_reported_cache_read_input_tokens": p_cache_read,
             "agent_accumulated_input_tokens": a_input,
+            "agent_accumulated_output_tokens": a_output,
             "agent_accumulated_cache_creation_input_tokens": a_cache_creation,
             "agent_accumulated_cache_read_input_tokens": a_cache_read,
-            "provider_reported_delta": round(task_delta, 6),
+            "provider_reported_delta": round(
+                max(task_input_delta, task_output_delta), 6
+            ),
+            "provider_reported_input_delta": round(task_input_delta, 6),
+            "provider_reported_output_delta": round(task_output_delta, 6),
         })
 
     provider_total_input = total_provider_input + total_provider_cache_creation + total_provider_cache_read
     agent_total_input = total_agent_input
-    delta = (
+    input_delta = (
         abs(provider_total_input - agent_total_input) / provider_total_input
         if provider_total_input > 0
+        else 1.0
+        if agent_total_input > 0
         else 0.0
     )
+    output_delta = (
+        abs(total_provider_output - total_agent_output) / total_provider_output
+        if total_provider_output > 0
+        else 1.0
+        if total_agent_output > 0
+        else 0.0
+    )
+    delta = max(input_delta, output_delta)
     within_tolerance = delta <= PROVIDER_REPORTED_TOLERANCE
 
     return ReconciliationResult(
@@ -476,9 +525,12 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         provider_reported_cache_creation_input_tokens=total_provider_cache_creation,
         provider_reported_cache_read_input_tokens=total_provider_cache_read,
         agent_accumulated_input_tokens=total_agent_input,
+        agent_accumulated_output_tokens=total_agent_output,
         agent_accumulated_cache_creation_input_tokens=total_agent_cache_creation,
         agent_accumulated_cache_read_input_tokens=total_agent_cache_read,
         provider_reported_delta=delta,
+        provider_reported_input_delta=input_delta,
+        provider_reported_output_delta=output_delta,
         provider_reported_within_tolerance=within_tolerance,
         provider_reported_tolerance=PROVIDER_REPORTED_TOLERANCE,
         task_count=checked_count,

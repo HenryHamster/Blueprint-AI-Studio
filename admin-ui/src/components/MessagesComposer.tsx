@@ -1,4 +1,4 @@
-import { useId, useRef, useState, type ChangeEvent, type ClipboardEvent, type DragEvent, type RefObject } from 'react';
+import { useRef, useState, type RefObject } from 'react';
 import { Command, X, Send, Reply, Paperclip, FileText, Image } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
@@ -77,10 +77,7 @@ export function MessagesComposer({
   chrome = 'full',
 }: MessagesComposerProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const attachmentHelpId = useId();
-  const attachmentStatusId = useId();
   const [dragOver, setDragOver] = useState(false);
-
   // Auto-resize textarea — max 3 rows (~96px).
   function handleTextareaInput() {
     const el = textareaRef.current;
@@ -104,49 +101,49 @@ export function MessagesComposer({
   const hintText = composerHintCopy(newType, hintArming, strategistBusy);
   const showHint = Boolean(disabledReason) || !minimal || Boolean(strategistBusy) || lastArming === 'not_armed';
   const hasAttachments = pendingAttachments != null && pendingAttachments.length > 0;
-  const attachmentControlsDisabled = composerDisabled || submitting || Boolean(uploading);
 
   // ── File handlers ──────────────────────────────────────────────────────────
-  function handleFileChange(e: ChangeEvent<HTMLInputElement>) {
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const files = e.target.files;
-    if (!files || !onAddAttachment || attachmentControlsDisabled) {
-      e.target.value = '';
-      return;
-    }
+    if (!files || !onAddAttachment) return;
     for (let i = 0; i < files.length; i++) onAddAttachment(files[i]);
     e.target.value = '';
   }
 
-  function handlePaste(e: ClipboardEvent<HTMLTextAreaElement>) {
-    if (!onAddAttachment || attachmentControlsDisabled) return;
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    if (!onAddAttachment) return;
     const items = e.clipboardData?.items;
     if (!items) return;
+    let addedFile = false;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       if (item.kind === 'file') {
         const file = item.getAsFile();
-        if (file) onAddAttachment(file);
+        if (file) {
+          onAddAttachment(file);
+          addedFile = true;
+        }
       }
     }
+    if (addedFile) e.preventDefault();
   }
 
-  function handleDragOver(e: DragEvent<HTMLDivElement>) {
-    if (!onAddAttachment || attachmentControlsDisabled) return;
+  function handleDragOver(e: React.DragEvent) {
     e.preventDefault();
     e.stopPropagation();
     setDragOver(true);
   }
-  function handleDragLeave(e: DragEvent<HTMLDivElement>) {
-    if (!dragOver) return;
+  function handleDragLeave(e: React.DragEvent) {
     e.preventDefault();
     e.stopPropagation();
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
     setDragOver(false);
   }
-  function handleDrop(e: DragEvent<HTMLDivElement>) {
-    if (!onAddAttachment || attachmentControlsDisabled) return;
+  function handleDrop(e: React.DragEvent) {
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
+    if (!onAddAttachment) return;
     const files = e.dataTransfer?.files;
     if (!files) return;
     for (let i = 0; i < files.length; i++) onAddAttachment(files[i]);
@@ -203,20 +200,8 @@ export function MessagesComposer({
         onChange={handleFileChange}
         className="hidden"
         tabIndex={-1}
-        disabled={attachmentControlsDisabled}
-        aria-label="Choose files to attach"
         accept="image/*,.pdf,.txt,.csv,.json,.xml,.md,.log,.yaml,.yml,.env,.cfg,.ini,.toml,.js,.ts,.py,.go,.rs,.java,.kt,.swift,.sql,.sh,.bat,.ps1"
       />
-      <span id={attachmentHelpId} className="sr-only">
-        Attach files with the paperclip button, paste files into the message field, or drop files onto the composer.
-      </span>
-      <span id={attachmentStatusId} className="sr-only" aria-live="polite">
-        {uploading
-          ? 'Uploading attachments'
-          : hasAttachments
-            ? `${pendingAttachments?.length ?? 0} attachment${pendingAttachments?.length === 1 ? '' : 's'} selected`
-            : 'No attachments selected'}
-      </span>
 
       {/* Attachment preview strip */}
       {hasAttachments && pendingAttachments && (
@@ -241,8 +226,7 @@ export function MessagesComposer({
                 <button
                   type="button"
                   onClick={() => onRemoveAttachment?.(att.id)}
-                  disabled={attachmentControlsDisabled}
-                  className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center justify-center rounded p-0.5 text-neutral-500 opacity-0 transition-opacity hover:text-neutral-200 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40 group-hover:disabled:opacity-40 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto"
+                  className="absolute right-0 top-1/2 flex min-h-[44px] min-w-[44px] -translate-y-1/2 items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity hover:text-neutral-200 focus-visible:opacity-100 group-hover:opacity-100"
                   aria-label={`Remove ${att.name}`}
                 >
                   <X className="h-3 w-3" />
@@ -258,14 +242,10 @@ export function MessagesComposer({
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
-        role="group"
-        aria-label="Message composer"
-        aria-describedby={`${attachmentHelpId} ${attachmentStatusId}`}
-        aria-disabled={attachmentControlsDisabled || undefined}
         className={`${minimal
           ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-workbench-border-strong/80 bg-workbench-card p-1 shadow-[0_10px_28px_rgba(0,0,0,0.20),inset_0_1px_0_rgba(255,255,255,0.035)]`
           : 'flex gap-2 items-end'
-        } ${dragOver ? 'ring-2 ring-emerald-500/50 border-emerald-500/30' : ''}`}>
+        } ${dragOver ? 'ring-2 ring-emerald-500/50 border-emerald-500/60' : ''}`}>
         {!minimal && (
           <MessageTypeDropdown value={newType} onChange={onChangeType} compact={minimal} />
         )}
@@ -286,10 +266,10 @@ export function MessagesComposer({
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={attachmentControlsDisabled}
+              disabled={composerDisabled}
               title="Attach file"
               aria-label="Attach file"
-              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40 md:min-h-8 md:min-w-8"
+              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40"
             >
               <Paperclip className="h-3.5 w-3.5" />
             </button>
@@ -299,7 +279,7 @@ export function MessagesComposer({
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={attachmentControlsDisabled}
+            disabled={composerDisabled}
             title="Attach file"
             aria-label="Attach file"
             className="flex shrink-0 items-center justify-center rounded-xl bg-neutral-900/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
@@ -332,7 +312,7 @@ export function MessagesComposer({
           aria-label="Send message"
           title="Send message"
           className={minimal
-            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-100 md:min-h-8 md:min-w-8'
+            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-100'
             : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
           }
         >

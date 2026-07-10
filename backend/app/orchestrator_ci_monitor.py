@@ -16,6 +16,8 @@ re-exported from ``app.orchestrator`` so ``from app.orchestrator import ...``
 keeps working for existing callers and tests.
 """
 
+from __future__ import annotations
+
 import logging
 import uuid
 from datetime import datetime
@@ -179,14 +181,14 @@ class _ProjectSnapshot:
     """
 
     __slots__ = (
+        "build_config",
+        "github_owner",
+        "github_repo",
         "id",
         "integration_branch",
-        "promotion_target",
-        "name",
         "is_self_repo",
-        "github_repo",
-        "github_owner",
-        "build_config",
+        "name",
+        "promotion_target",
     )
 
     def __init__(self, project: Project) -> None:
@@ -306,7 +308,7 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
     # plain ORM cache unusable after any early-skip rollback path.  Write paths
     # that need a tracked ORM Project re-fetch individually (rare — merged PR
     # signal, test-command re-detection, recovered test persistence).
-    _preloaded_projects: dict[uuid.UUID, "_ProjectSnapshot"] = {}
+    _preloaded_projects: dict[uuid.UUID, _ProjectSnapshot] = {}
     if ci_waiting_task_ids:
         _project_ids_raw = (
             (
@@ -332,13 +334,39 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
 
     def _get_project(
         project_id: uuid.UUID | None,
-    ) -> "_ProjectSnapshot" | None:
+    ) -> _ProjectSnapshot | None:
         """Resolve a project from the pre-loaded cache, falling back to None
         when the id is absent or not in the batch (should not occur in practice
         since all task project_ids were collected above)."""
         if project_id is None:
             return None
         return _preloaded_projects.get(project_id)
+
+    async def _resnapshot_project(
+        project: Project | None,
+    ) -> _ProjectSnapshot | None:
+        """Refresh and replace a cached project snapshot after a write helper.
+
+        The CI sweep intentionally uses non-ORM snapshots so rollbacks cannot
+        expire the hot-path project cache. Rare self-heal helpers re-fetch and
+        commit tracked ORM Projects, though; after they mutate build_config the
+        same poll must re-run gate predicates against a fresh snapshot rather
+        than the stale preloaded one.
+        """
+        if project is None:
+            return None
+        try:
+            await session.refresh(project)
+        except Exception:
+            logger.warning(
+                "[CI] Could not refresh project %s after build_config self-heal",
+                getattr(project, "id", None),
+                exc_info=True,
+            )
+            return _get_project(getattr(project, "id", None))
+        snapshot = _ProjectSnapshot(project)
+        _preloaded_projects[snapshot.id] = snapshot
+        return snapshot
 
     for ci_task_id in ci_waiting_task_ids:
         # Heartbeat per task: this loop is O(EVALUATING backlog) and
@@ -1710,6 +1738,11 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                                     session,
                                     ref=_ci_base_ref,
                                 )
+                                if _redetected:
+                                    _ci_proj = (
+                                        await _resnapshot_project(_ci_proj_orm)
+                                        or _ci_proj
+                                    )
                                 if (
                                     _redetected
                                     and ci_resolution.should_run_no_ci_test_gate(
@@ -2404,11 +2437,16 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                                     if ci_task.project_id is not None
                                     else None
                                 )
-                                await maybe_redetect_ci_presence(
+                                _esc_redetected = await maybe_redetect_ci_presence(
                                     _esc_proj_orm,
                                     session,
                                     ref=_esc_base,
                                 )
+                                if _esc_redetected:
+                                    _esc_proj = (
+                                        await _resnapshot_project(_esc_proj_orm)
+                                        or _esc_proj
+                                    )
                             _esc_action = (
                                 _ci_res.resolve_no_checks_escalation(
                                     _esc_proj,

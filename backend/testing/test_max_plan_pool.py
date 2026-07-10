@@ -17,6 +17,7 @@ import pytest
 from app.time_utils import _utcnow
 from app.providers.base import UsageSnapshot
 from app.max_plan_pool import (
+    _CREDENTIAL_SWEEP_INTERVAL_SECONDS,
     _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
     _HEALTH_WINDOW_SECONDS,
     _LATENCY_MIN_SAMPLES,
@@ -58,6 +59,7 @@ from app.max_plan_pool import (
     _usage_snapshot_summary,
     alternate_account_recovery_deadline,
     cascade_disabled_models,
+    credential_sweep_service,
     describe_pool_blockage,
     disable_account_for_auth,
     disable_account_model,
@@ -65,6 +67,7 @@ from app.max_plan_pool import (
     get_all_account_health_summaries,
     record_account_startup_failure,
     recheck_disabled_accounts,
+    release_max_plan_account,
     select_max_plan_account,
     select_max_plan_account_balanced,
     summarize_pool_state,
@@ -3281,3 +3284,234 @@ async def test_persist_rate_limit_usage_no_row_is_noop(monkeypatch):
 
     # Should not raise
     await _persist_rate_limit_usage_to_db("nonexistent-id", snap)
+
+
+# ── Credential sweep and release secret clearing ───────────────────────────
+
+
+def _sm_acct(**kw) -> dict:
+    """Account backed by a Secret Manager secret_blob_ref."""
+    base = {
+        "id": "sm1",
+        "name": "sm-account",
+        "enabled": True,
+        "active_tasks": 0,
+        "oauth_token": "resolved-secret",
+        "runtime_secret": "resolved-secret",
+        "secret_blob_ref": "projects/proj/secrets/mysecret/versions/latest",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "runtime_ready": True,
+    }
+    base.update(kw)
+    return base
+
+
+class TestReleaseMaxPlanAccountSecretClear:
+    """release_max_plan_account clears runtime_secret when active_tasks hits 0."""
+
+    async def test_clears_runtime_secret_on_idle_sm_account(self):
+        acct = _sm_acct(active_tasks=1)
+        _account_by_id["sm1"] = acct
+        await release_max_plan_account("sm1")
+        assert acct["active_tasks"] == 0
+        assert "runtime_secret" not in acct
+
+    async def test_does_not_clear_when_tasks_still_active(self):
+        acct = _sm_acct(active_tasks=2)
+        _account_by_id["sm1"] = acct
+        await release_max_plan_account("sm1")
+        assert acct["active_tasks"] == 1
+        assert acct.get("runtime_secret") == "resolved-secret"
+
+    async def test_does_not_clear_for_non_sm_account(self):
+        acct = _sm_acct(active_tasks=1, secret_blob_ref=None)
+        acct["oauth_token"] = "direct-token"
+        acct["runtime_secret"] = "direct-token"
+        _account_by_id["sm1"] = acct
+        await release_max_plan_account("sm1")
+        assert acct["active_tasks"] == 0
+        assert acct.get("runtime_secret") == "direct-token"
+
+    async def test_does_not_clear_for_non_projects_blob_ref(self):
+        acct = _sm_acct(active_tasks=1, secret_blob_ref="s3://bucket/key")
+        _account_by_id["sm1"] = acct
+        await release_max_plan_account("sm1")
+        assert acct["active_tasks"] == 0
+        assert acct.get("runtime_secret") == "resolved-secret"
+
+    async def test_unknown_account_is_noop(self):
+        # Should not raise
+        await release_max_plan_account("nonexistent")
+
+
+class TestCredentialSweepService:
+    """credential_sweep_service clears runtime_secret for idle SM-backed accounts."""
+
+    async def test_sweep_clears_idle_sm_account(self, monkeypatch):
+        acct = _sm_acct(active_tasks=0)
+        _account_by_id["sm1"] = acct
+
+        call_count = 0
+
+        async def fast_sleep(n):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise asyncio.CancelledError()
+
+        monkeypatch.setattr("app.max_plan_pool.asyncio.sleep", fast_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await credential_sweep_service()
+
+        assert "runtime_secret" not in acct
+
+    async def test_sweep_skips_active_account(self, monkeypatch):
+        acct = _sm_acct(active_tasks=1)
+        _account_by_id["sm1"] = acct
+
+        call_count = 0
+
+        async def fast_sleep(n):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise asyncio.CancelledError()
+
+        monkeypatch.setattr("app.max_plan_pool.asyncio.sleep", fast_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await credential_sweep_service()
+
+        assert acct.get("runtime_secret") == "resolved-secret"
+
+    async def test_sweep_skips_non_sm_account(self, monkeypatch):
+        acct = _sm_acct(active_tasks=0, secret_blob_ref=None)
+        acct["runtime_secret"] = "direct-token"
+        _account_by_id["sm1"] = acct
+
+        call_count = 0
+
+        async def fast_sleep(n):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                raise asyncio.CancelledError()
+
+        monkeypatch.setattr("app.max_plan_pool.asyncio.sleep", fast_sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await credential_sweep_service()
+
+        assert acct.get("runtime_secret") == "direct-token"
+
+    def test_sweep_interval_is_5_minutes(self):
+        assert _CREDENTIAL_SWEEP_INTERVAL_SECONDS == 300
+
+
+class TestMaybeRefreshAccountSecret:
+    """_maybe_refresh_account_secret re-fetches from Secret Manager when cleared."""
+
+    async def test_refetches_when_runtime_secret_cleared(self, monkeypatch):
+        from app.max_plan_pool import _maybe_refresh_account_secret
+
+        acct = _sm_acct(runtime_secret=None, oauth_token=None)
+
+        async def fake_get_secret(ref):
+            return "fresh-secret"
+
+        monkeypatch.setattr("app.secrets_manager.get_user_secret", fake_get_secret)
+        await _maybe_refresh_account_secret(acct)
+
+        assert acct["runtime_secret"] == "fresh-secret"
+        assert acct["oauth_token"] == "fresh-secret"
+
+    async def test_refreshes_only_runtime_secret_for_non_oauth_provider(self, monkeypatch):
+        from app.max_plan_pool import _maybe_refresh_account_secret
+
+        acct = _sm_acct(
+            runtime_secret=None,
+            oauth_token=None,
+            provider="vertex",
+            auth_mode="service_account",
+        )
+
+        async def fake_get_secret(ref):
+            return "fresh-vertex-secret"
+
+        monkeypatch.setattr("app.secrets_manager.get_user_secret", fake_get_secret)
+        await _maybe_refresh_account_secret(acct)
+
+        assert acct["runtime_secret"] == "fresh-vertex-secret"
+        # oauth_token is NOT set for non-ANTHROPIC/OAUTH accounts
+        assert acct.get("oauth_token") is None
+
+    async def test_skips_when_secret_already_present(self, monkeypatch):
+        from app.max_plan_pool import _maybe_refresh_account_secret
+
+        acct = _sm_acct(runtime_secret="existing-secret")
+        calls = []
+
+        async def fake_get_secret(ref):
+            calls.append(ref)
+            return "should-not-be-called"
+
+        monkeypatch.setattr("app.secrets_manager.get_user_secret", fake_get_secret)
+        await _maybe_refresh_account_secret(acct)
+        assert calls == []
+        assert acct["runtime_secret"] == "existing-secret"
+
+    async def test_skips_when_no_sm_blob_ref(self, monkeypatch):
+        from app.max_plan_pool import _maybe_refresh_account_secret
+
+        acct = _sm_acct(runtime_secret=None, secret_blob_ref=None)
+        calls = []
+
+        async def fake_get_secret(ref):
+            calls.append(ref)
+            return "should-not-be-called"
+
+        monkeypatch.setattr("app.secrets_manager.get_user_secret", fake_get_secret)
+        await _maybe_refresh_account_secret(acct)
+        assert calls == []
+
+    async def test_handles_secret_fetch_failure_gracefully(self, monkeypatch):
+        from app.max_plan_pool import _maybe_refresh_account_secret
+
+        acct = _sm_acct(runtime_secret=None)
+
+        async def exploding_get(ref):
+            raise RuntimeError("SM unavailable")
+
+        monkeypatch.setattr("app.secrets_manager.get_user_secret", exploding_get)
+        # Should not raise
+        await _maybe_refresh_account_secret(acct)
+        assert acct.get("runtime_secret") is None
+
+
+class TestSelectRefreshesSecret:
+    """select_max_plan_account calls _maybe_refresh_account_secret after selection."""
+
+    _USER = "u"
+
+    def _setup(self, acct):
+        _max_plan_pools[self._USER] = [acct]
+        _account_by_id[acct["id"]] = acct
+
+    async def test_select_calls_refresh_helper(self, monkeypatch):
+        acct = _sm_acct(active_tasks=0)
+        self._setup(acct)
+
+        refresh_calls = []
+
+        async def fake_refresh(a):
+            refresh_calls.append(a["id"])
+
+        monkeypatch.setattr("app.max_plan_pool._maybe_refresh_account_secret", fake_refresh)
+        result = await select_max_plan_account(self._USER)
+
+        assert result is not None
+        assert result["id"] == "sm1"
+        assert refresh_calls == ["sm1"]
+
+    async def test_select_returns_none_on_empty_pool(self):
+        result = await select_max_plan_account("no-such-user")
+        assert result is None

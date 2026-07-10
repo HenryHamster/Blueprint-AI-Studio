@@ -12,6 +12,7 @@ Covers the critical functions:
 import ast
 import contextlib
 import importlib
+import inspect
 import json
 import os
 import uuid
@@ -4971,6 +4972,13 @@ async def test_process_post_commit_review_approve_merge_proceeds_when_guard_ok(
     )
 
     merge_mock.assert_awaited_once()
+
+
+def test_rollup_handoff_log_uses_precommit_parent_id_snapshot():
+    """The post-commit log must not dereference an expired rollup parent."""
+    source = inspect.getsource(_process_post_commit)
+    assert "(parent {_orig_id_str})" in source
+    assert "(parent {_orig.id})" not in source
 
 
 @pytest.mark.asyncio

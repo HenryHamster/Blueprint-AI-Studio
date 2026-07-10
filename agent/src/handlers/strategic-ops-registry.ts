@@ -126,6 +126,8 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Mark a knowledge document as consumed — the strategist has read and acted on it.' },
   { op: 'dismiss_knowledge', alias: 'dismiss-knowledge', cli: true, prompt: true, internalReason: null,
     description: 'Mark a knowledge document as dismissed — not actionable, with an optional reason.' },
+  { op: 'request_qualification', alias: 'request-qualification', cli: true, prompt: true, internalReason: null,
+    description: 'Request a fresh release-qualification run directly, without going through set_problem_model.' },
 ];
 
 /** Registry entries surfaced on the `./strategic` CLI, in canonical order. */

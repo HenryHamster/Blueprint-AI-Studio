@@ -2956,6 +2956,122 @@ async def test_propagate_landed_descendants_returns_stamped_and_is_idempotent(
     assert again == []
 
 
+@pytest.mark.asyncio
+async def test_propagate_landed_descendants_copies_coverage_data(cleanup_db):
+    """The BFS sweep copies test_coverage_result from the parent task into
+    each qualifying descendant's context so the coverage_delta acceptance gate
+    can find measured coverage data instead of failing closed.
+
+    When the parent has no test_coverage_result (e.g. a research/plan task
+    with no code change), descendants are unaffected — the propagation is
+    a no-op.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.landed_signal import has_landed_signal
+
+    COVERAGE_VALUE = {"coverage_pct": 85.0}
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    # ── CASE 1: parent has coverage → descendant inherits it ──────────────
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "test_coverage_result": COVERAGE_VALUE,
+        },
+    )
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, cleanup_db
+    )
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child)
+
+    assert has_landed_signal(child), (
+        "descendant must be stamped landed_on_integration"
+    )
+    assert child.id in {t.id for t in stamped}
+
+    child_ctx = child.context or {}
+    assert child_ctx.get("test_coverage_result") == COVERAGE_VALUE, (
+        "descendant context must contain the parent's test_coverage_result"
+    )
+
+    # ── CASE 2: existing per-descendant coverage is never overwritten ────
+    COVERAGE_OVERRIDE = {"coverage_pct": 95.0}
+    child2 = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            "test_coverage_result": COVERAGE_OVERRIDE,
+        },
+    )
+    stamped2 = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, cleanup_db
+    )
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child2)
+    assert child2.id in {t.id for t in stamped2}
+    assert (
+        child2.context or {}
+    ).get("test_coverage_result") == COVERAGE_OVERRIDE, (
+        "existing per-descendant test_coverage_result must not be overwritten"
+    )
+
+    # ── CASE 3: parent without coverage → descendant context unchanged ────
+    parent_no_cov = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    child3 = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent_no_cov.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    stamped3 = await _propagate_landed_to_staging_merged_descendants(
+        parent_no_cov.id, cleanup_db
+    )
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child3)
+    assert child3.id in {t.id for t in stamped3}
+    assert child3.context is None or "test_coverage_result" not in child3.context, (
+        "descendant must NOT have test_coverage_result when parent lacks it"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _do_rollup_post_merge_housekeeping: multi-direction refresh
 # ---------------------------------------------------------------------------

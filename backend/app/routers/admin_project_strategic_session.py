@@ -485,7 +485,6 @@ _ATTACHMENT_CONTENT_TYPE_RE = re.compile(
 
 def _sanitize_message_attachment_filename(filename: str) -> str:
     """Return a single safe GCS object-name segment for an uploaded attachment."""
-
     raw = (filename or "").strip().replace("\\", "/")
     name = raw.rsplit("/", 1)[-1].strip()
     name = _ATTACHMENT_SAFE_FILENAME_RE.sub("_", name).strip("._")
@@ -502,7 +501,6 @@ def _sanitize_message_attachment_filename(filename: str) -> str:
 
 def _attachment_content_type(content_type: str | None) -> str:
     """Validate the Content-Type header that will be bound into the signed PUT."""
-
     value = (content_type or "").strip()
     if not value:
         return _ATTACHMENT_DEFAULT_CONTENT_TYPE
@@ -1954,7 +1952,8 @@ async def create_project_strategic_session_message(
         message_type=parse_operator_message_type(payload.message_type),
         content=(
             payload.content
-            if payload.content.strip() or not _message_context_has_attachments(payload.context)
+            if payload.content.strip()
+            or not _message_context_has_attachments(payload.context)
             else "Sent attachment."
         ),
         context=payload.context,

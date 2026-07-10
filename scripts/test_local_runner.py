@@ -3932,6 +3932,121 @@ class TestAgentBackendPreference(unittest.TestCase):
         self.assertEqual(backend, iso.BACKEND_DOCKER)
 
 
+class TestSafeCredentialPath(unittest.TestCase):
+    """_safe_credential_path rejects directory traversal and out-of-workspace paths."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _valid(self, fpath: str) -> str:
+        """Helper: assert path is accepted, return resolved path."""
+        return local_runner._safe_credential_path(fpath, self._tmpdir)
+
+    def _invalid(self, fpath: str) -> None:
+        """Helper: assert path raises ValueError."""
+        with self.assertRaises(ValueError):
+            local_runner._safe_credential_path(fpath, self._tmpdir)
+
+    def test_normal_path_with_leading_slash_is_accepted(self):
+        """A normal path under /root is resolved relative to workspace root."""
+        resolved = self._valid("/root/.config/claude/settings.json")
+        self.assertTrue(resolved.startswith(self._tmpdir))
+        self.assertTrue(
+            resolved.endswith(
+                os.path.join("root", ".config", "claude", "settings.json")
+            )
+        )
+        self.assertTrue(os.path.isabs(resolved))
+
+    def test_path_without_leading_slash_is_accepted(self):
+        """Paths without a leading slash also resolve correctly."""
+        resolved = self._valid("home/user/config.yaml")
+        self.assertEqual(
+            resolved,
+            os.path.join(self._tmpdir, "home", "user", "config.yaml"),
+        )
+
+    def test_deep_safe_path_is_accepted(self):
+        """A deeply nested path without traversal is accepted."""
+        resolved = self._valid("/a/b/c/d/e/f/g/h/file.txt")
+        self.assertTrue(resolved.startswith(self._tmpdir))
+        self.assertTrue(
+            resolved.endswith(
+                os.path.join("a", "b", "c", "d", "e", "f", "g", "h", "file.txt")
+            )
+        )
+
+    def test_leading_dot_dot_is_rejected(self):
+        """Path starting with '..' is rejected."""
+        self._invalid("../.ssh/authorized_keys")
+
+    def test_leading_dot_dot_with_leading_slash_is_rejected(self):
+        """Path like '/../../.ssh/authorized_keys' is rejected."""
+        self._invalid("/../../.ssh/authorized_keys")
+
+    def test_dot_dot_in_middle_is_rejected(self):
+        """Path with '..' in the middle is rejected."""
+        self._invalid("root/../etc/passwd")
+
+    def test_deep_dot_dot_chain_is_rejected(self):
+        """Path like 'a/b/../../../../etc/hosts' is rejected."""
+        self._invalid("a/b/../../../../etc/hosts")
+
+    def test_multiple_dot_dot_segments_is_rejected(self):
+        """Path with multiple '..' components like '../../dir/../other' is rejected."""
+        self._invalid("../../dir/../other")
+
+    def test_dot_dot_at_end_is_rejected(self):
+        """Path ending with '..' is rejected."""
+        self._invalid("safe/dir/..")
+
+    def test_encoded_dot_dot_via_backslash_is_still_detected(self):
+        """A '..' segment hidden behind \\x2e encoding is NOT bypassed (literal check)."""
+        with self.assertRaises(ValueError):
+            # '\x2e\x2e' is the string ".." — our check on decoded string catches it
+            local_runner._safe_credential_path("safe/\x2e\x2e/escaped", self._tmpdir)
+
+    def test_path_that_resolves_outside_workspace_via_symlink_is_rejected(self):
+        """A path that resolves outside workspace via abspath is rejected."""
+        import tempfile
+        outside = tempfile.mkdtemp()
+        try:
+            with self.assertRaises(ValueError):
+                # /tmp/something/../../outside resolves to /outside which is outside workspace
+                local_runner._safe_credential_path("/../../" + os.path.basename(outside), self._tmpdir)
+        finally:
+            os.rmdir(outside)
+
+    def test_deep_traversal_from_workspace_is_rejected(self):
+        """A path appending '../../..' from within the workspace is rejected."""
+        self._invalid("some/sub/dir/../../../etc/passwd")
+
+    def test_workspace_itself_is_safe(self):
+        """A path of just '' or '.' relative resolves to workspace root."""
+        resolved = self._valid("")
+        self.assertEqual(resolved, os.path.abspath(self._tmpdir))
+
+        resolved2 = self._valid(".")
+        expected = os.path.abspath(os.path.join(self._tmpdir, "."))
+        self.assertEqual(resolved2, expected)
+
+    def test_rejects_bare_dot_dot(self):
+        """Bare '..' is rejected."""
+        self._invalid("..")
+
+    def test_spawn_agent_task_uses_safe_credential_path(self):
+        """The production credential-file writer must call the tested guard."""
+        import inspect
+
+        src = inspect.getsource(local_runner._spawn_agent_task)
+        self.assertIn("_safe_credential_path", src)
+
+
 class TestCredentialPersistence(unittest.TestCase):
     """Token persistence: save/load round-trip, file permissions, fallback behaviour."""
 

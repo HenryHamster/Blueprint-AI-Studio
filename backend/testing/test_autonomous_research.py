@@ -3772,12 +3772,16 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
             Task.project_id == project.id, Task.parent_task_id == task.id
         )
     )
-    assert len(result.scalars().all()) == 0, (
-        "Word-overlap duplicate must not create a task"
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, (
+        "Word-overlap duplicate must be consolidated into one salvage task"
     )
+    salvage = child_tasks[0]
+    assert salvage.first_payload.get("type") == "salvage_bundle"
+    assert salvage.context.get("salvage_source_task_id") == str(task.id)
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED, (
-        "Research task must be auto-completed when all findings are duplicates"
+    assert task.status == TaskStatus.EVALUATING, (
+        "Research task must await its salvage child when all direct findings are duplicates"
     )
 
 
@@ -15052,11 +15056,20 @@ async def test_directed_completed_guard_uses_direction_unproductive_window(db_se
 async def test_idle_research_skips_paused_project(db_session, mocker):
     """`_check_idle_research` must not spawn work for a paused project even when
     autonomous_enabled is True and it has an active direction; a non-paused
-    sibling still spawns."""
+    sibling still spawns.  The Project passed to the spawn must be persistent
+    in the per-project session, not detached from an earlier batch session."""
     from app.autonomous_research import _check_idle_research
+    from conftest import TestingSessionLocal
+
+    async def _assert_project_owned_by_spawn_session(project, session):
+        assert project in session, (
+            "idle-research must load Project in the same session used for spawning"
+        )
 
     spawn_spy = mocker.patch(
-        "app.autonomous_research._spawn_research_task", new_callable=AsyncMock
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        side_effect=_assert_project_owned_by_spawn_session,
     )
     mocker.patch("app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock)
     mocker.patch(
@@ -15066,17 +15079,9 @@ async def test_idle_research_skips_paused_project(db_session, mocker):
     mocker.patch(
         "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
     )
-    # _check_idle_research opens its own ``async with AsyncSessionLocal()``
-    # session; bind it to the test's own db_session (via a no-op context
-    # manager) so it sees the rows committed below and never builds the
-    # production lazy engine in the test environment.
-    import contextlib
-
-    @contextlib.asynccontextmanager
-    async def _session_cm():
-        yield db_session
-
-    mocker.patch("app.autonomous_research.AsyncSessionLocal", lambda: _session_cm())
+    # Every call returns a genuinely distinct session.  Reusing db_session for
+    # all contexts masks cross-session detached-instance bugs.
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
 
     paused = Project(
         name="Idle Paused",
@@ -15112,22 +15117,24 @@ async def test_idle_research_skips_paused_project(db_session, mocker):
 @pytest.mark.asyncio
 async def test_post_merge_research_skips_paused_project(db_session, mocker):
     """`_check_autonomous_research` (post-merge hook) must skip a paused project
-    while still spawning for a non-paused project on the same repo."""
+    while still spawning for a non-paused project on the same repo, with the
+    Project attached to the per-project spawn session."""
     from app.autonomous_research import _check_autonomous_research
+    from conftest import TestingSessionLocal
+
+    async def _assert_project_owned_by_spawn_session(project, session):
+        assert project in session, (
+            "post-merge research must load Project in the spawn-owning session"
+        )
 
     spawn_spy = mocker.patch(
-        "app.autonomous_research._spawn_research_task", new_callable=AsyncMock
+        "app.autonomous_research._spawn_research_task",
+        new_callable=AsyncMock,
+        side_effect=_assert_project_owned_by_spawn_session,
     )
-    # _check_autonomous_research opens its own ``async with
-    # AsyncSessionLocal()`` session; bind it to the test's own db_session so it
-    # sees the committed rows below.
-    import contextlib
-
-    @contextlib.asynccontextmanager
-    async def _session_cm():
-        yield db_session
-
-    mocker.patch("app.autonomous_research.AsyncSessionLocal", lambda: _session_cm())
+    # Exercise the production ownership boundary with separate enumeration and
+    # per-project sessions.
+    mocker.patch("app.autonomous_research.AsyncSessionLocal", TestingSessionLocal)
 
     owner, repo = "acme", "widgets"
     paused = Project(

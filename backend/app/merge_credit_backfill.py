@@ -183,9 +183,23 @@ async def backfill_landed_rollup_merge_credit(
             await session.commit()
             total_stamped += len(stamped)
 
-            for rep_id in dir_reps.values():
+            # Batch-fetch all rep tasks in one query after the commit (which
+            # expires ORM instances) rather than issuing per-rep session.get.
+            rep_ids = list(dir_reps.values())
+            if rep_ids:
+                _reps_by_id = {
+                    str(r.id): r
+                    for r in (
+                        await session.execute(
+                            select(Task).where(Task.id.in_(rep_ids))
+                        )
+                    ).scalars().all()
+                }
+            else:
+                _reps_by_id = {}
+            for rep_id in rep_ids:
                 try:
-                    rep = await session.get(Task, rep_id)
+                    rep = _reps_by_id.get(str(rep_id))
                     if rep is None:
                         continue
                     await refresh_direction_outcomes_after_merge(rep, session)

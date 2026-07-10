@@ -948,11 +948,12 @@ class TestRunnerEndpoints:
             assert task.started_at is not None
 
             # Verify the response includes pooled credential info.
-            assert body.get("provider") == "anthropic"
-            assert body.get("auth_mode") == "oauth"
-            assert isinstance(body.get("llm_env"), dict)
-            assert "CLAUDE_CODE_OAUTH_TOKEN" in body["llm_env"]
-            assert body["llm_env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test-secret-token"
+            credentials = body.get("credentials")
+            assert isinstance(credentials, dict)
+            assert credentials["env"]["PROVIDER"] == "anthropic"
+            assert credentials["env"]["AUTH_MODE"] == "oauth"
+            assert credentials["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test-secret-token"
+            assert isinstance(credentials["files"], list)
         finally:
             _clear_pool()
 
@@ -1164,12 +1165,13 @@ class TestRunnerEndpoints:
         assert task_instance.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
-    async def test_next_task_returns_200_with_null_credentials_on_exception(
+    async def test_next_task_rolls_back_dispatch_on_credential_exception(
         self, client: AsyncClient, db_session
     ):
         """When an unexpected exception occurs during credential resolution,
-        next-task returns 200 with credentials: null so the runner falls back
-        to host env vars instead of failing the poll entirely."""
+        next-task must roll back the dispatch marker (started_at = None) and
+        return 503 with pool_exhausted=True so the task stays claimable rather
+        than being dispatched without credentials."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
 
@@ -1195,17 +1197,17 @@ class TestRunnerEndpoints:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        # Fallback: 200 with null credentials — the task is dispatched but lacks
-        # per-task LLM credentials, so the runner falls back to host env vars.
-        assert resp.status_code == 200
-        assert resp.json()["credentials"] is None
+        # Dispatch must be rolled back: 503 with pool_exhausted=True so the
+        # runner retries rather than receiving a task it can't execute.
+        assert resp.status_code == 503
+        assert resp.json() == {"pool_exhausted": True}
 
-        # Task context was NOT stamped (the exception aborted credential resolution).
+        # Task context was NOT stamped and dispatch marker was rolled back.
         await db_session.refresh(task_instance)
         assert task_instance.llm_account_id is None
         assert task_instance.status == TaskStatus.PROVISIONING  # unchanged
-        # started_at IS set (unlike the pool-exhausted path, dispatch is not rolled back).
-        assert task_instance.started_at is not None
+        # started_at must be None — task is still claimable.
+        assert task_instance.started_at is None
 
     @pytest.mark.asyncio
     async def test_agent_claim_after_runner_dispatch_transitions_to_in_progress(
@@ -1309,16 +1311,13 @@ class TestRunnerEndpoints:
             assert resp.status_code == 200
             body = resp.json()
 
-            # Provider/model/auth_mode are from the POOL, not from any local env.
-            assert body["provider"] == "deepseek"
-            assert body["auth_mode"] == "api_key"
-            # llm_env carries the credential env vars the runner must inject.
-            assert isinstance(body["llm_env"], dict)
-            assert body["llm_env"]["PROVIDER"] == "deepseek"
-            assert body["llm_env"]["AUTH_MODE"] == "api_key"
-            assert body["llm_env"]["DEEPSEEK_API_KEY"] == "sk-deepseek-pool-assigned-key"
-            # llm_files is present (even if empty for api_key providers).
-            assert isinstance(body["llm_files"], list)
+            # Credential metadata and secrets come from the pool, not local env.
+            credentials = body["credentials"]
+            assert credentials["env"]["PROVIDER"] == "deepseek"
+            assert credentials["env"]["AUTH_MODE"] == "api_key"
+            assert credentials["env"]["DEEPSEEK_API_KEY"] == "sk-deepseek-pool-assigned-key"
+            # files is present even when the provider only needs an API key.
+            assert isinstance(credentials["files"], list)
 
             # The task context must carry the resolved account identity so the
             # completion handler can release the account slot.
@@ -2312,7 +2311,9 @@ class TestRunnerEndpoints:
     ):
         """POST /api/runner/update-report with status=success creates an INFO Alert."""
         project = await _make_project(db_session)
-        runner, token = await _make_runner(db_session, project.id)
+        runner, token = await _make_runner(
+            db_session, project.id, hostname="runner-update-test"
+        )
 
         resp = await client.post(
             "/api/runner/update-report",
@@ -5206,3 +5207,47 @@ async def test_runner_polling_endpoint_rate_limited(
     assert resp_b.status_code == 200, (
         f"Runner B should not be throttled, got {resp_b.status_code}"
     )
+
+
+@pytest.mark.asyncio
+async def test_report_compute_job_cross_project_emits_warning(
+    client: AsyncClient, db_session, caplog
+):
+    """When a runner reports a compute job that belongs to a different project,
+    a structured WARNING is emitted with runner_id, runner_project_id, job_id,
+    and job_actual_project_id so operators can detect misconfigured runners."""
+    import logging
+
+    project_a = await _make_project(db_session, name="Project A")
+    project_b = await _make_project(db_session, name="Project B")
+    runner_a, token_a = await _make_runner(db_session, project_a.id)
+
+    # Create a RUNNING job that belongs to project_b, pinned to runner_a's id
+    # (simulates a misconfiguration where the runner was re-registered to a new project
+    # but still knows about old job IDs, or vice versa).
+    job = ComputeJob(
+        project_id=project_b.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"runner_target_id": str(runner_a.id)},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    with caplog.at_level(logging.WARNING, logger="blueprint"):
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={"exec_status": "running"},
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+
+    assert resp.status_code == 404
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    mismatch_warnings = [r for r in warning_records if "Cross-project" in r.getMessage()]
+    assert len(mismatch_warnings) == 1, f"Expected 1 cross-project warning, got {len(mismatch_warnings)}"
+    msg = mismatch_warnings[0].getMessage()
+    assert str(runner_a.id) in msg
+    assert str(project_a.id) in msg
+    assert str(job.id) in msg
+    assert str(project_b.id) in msg

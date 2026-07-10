@@ -20,6 +20,7 @@ from sqlmodel import select
 from app.auth import get_current_user
 from app.branch_resolution import classify_rollup_merge_outcome
 from app.database import get_session
+from app.field_encryption import encrypt_field
 from app.github import (
     GITHUB_CLIENT_ID,
     GITHUB_WEBHOOK_SECRET,
@@ -107,11 +108,12 @@ async def register_github_pat(
     integration = (await session.execute(stmt)).scalars().first()
 
     if integration:
-        integration.github_pat = secret_name
+        integration.github_pat = encrypt_field(secret_name)
         integration.updated_at = _utcnow()
     else:
         integration = UserIntegration(
-            user_id=current_user["user_id"], github_pat=secret_name
+            user_id=current_user["user_id"],
+            github_pat=encrypt_field(secret_name),
         )
 
     session.add(integration)

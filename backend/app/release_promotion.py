@@ -120,6 +120,7 @@ async def _resolve_github_with_session(
         )
 
     if not token and project.user_id:
+        from app.field_encryption import decrypt_field
         from app.github import generate_installation_access_token
         from app.models import UserIntegration
         from app.secrets_manager import get_user_secret
@@ -148,7 +149,8 @@ async def _resolve_github_with_session(
                 )
         if not token and integration and integration.github_pat:
             try:
-                token = await get_user_secret(integration.github_pat)
+                decrypted_pat_ref = decrypt_field(integration.github_pat)
+                token = await get_user_secret(decrypted_pat_ref)
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "[RELEASE_QUALIFIER] PAT retrieval failed for %s/%s",

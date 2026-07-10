@@ -601,6 +601,40 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     parent_finding_hash = (task.context or {}).get("finding_hash")
     parent_finding_challenge = (task.context or {}).get("finding_challenge")
 
+    # Resolve criterion_ids from the parent direction so plan-spawned children
+    # inherit them — same pattern as research_completion.py's
+    # _direction_criterion_cache.  Best-effort: if the direction row is missing
+    # or has no active keys, children get an empty list and
+    # record_task_merge_evidence falls back to direction lookup at merge time.
+    _plan_criterion_ids: list[str] = []
+    if parent_direction_id:
+        try:
+            from app.directions_repo import get_direction_row as _get_dir_row
+
+            _dir_row = await _get_dir_row(session, task.project_id, parent_direction_id)
+            if _dir_row is not None and _dir_row.criterion_keys:
+                from app.acceptance_criteria import (
+                    filter_active_criterion_keys as _filter_active,
+                )
+                from app.release_version import (
+                    current_open_version as _cur_open_ver,
+                )
+
+                _open_ver = await _cur_open_ver(session, task.project_id)
+                _cached_ids = await _filter_active(
+                    session,
+                    task.project_id,
+                    list(_dir_row.criterion_keys),
+                    release_version_id=_open_ver.id if _open_ver is not None else None,
+                )
+                if _cached_ids:
+                    _plan_criterion_ids = _cached_ids
+        except Exception:
+            logger.debug(
+                "[PLAN] criterion_keys lookup failed for direction %s",
+                parent_direction_id,
+            )
+
     # Pre-validate: identify which subtasks will be skipped and check for unsatisfiable dependencies.
     # Do this before creating any child tasks so we can fail cleanly if a spawned subtask
     # depends on a skipped (non-eligible) producer.
@@ -988,6 +1022,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             title=subtask_def.get("title", "Untitled subtask"),
             description=subtask_def.get("prompt", ""),
             parent_task_id=task.id,
+            criterion_ids=_plan_criterion_ids,
             requires_approval=child_requires_approval,
             payloads=[child_payload],
             context={

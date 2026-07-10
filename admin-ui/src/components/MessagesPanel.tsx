@@ -1,16 +1,14 @@
-/* eslint-disable react-hooks/immutability, react-hooks/refs, react-hooks/set-state-in-effect */
+/* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { auth, getIdToken } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
 import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
 import { parseTimestamp, timeAgo } from '../utils/time';
-import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
-import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow } from './muteWindow';
-import { type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './savedViews';
-import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './temporaryMutes';
+import { type EventPref, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
+import { type TemporaryMutes } from './temporaryMutes';
 import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
-import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
+import { saveServerNoisePrefs } from './serverSync';
 import type { MessageAttachment, ProjectMessage } from '../types/messages';
 import {
   computeStrategicStreamingTurn,
@@ -21,6 +19,7 @@ import {
 import { StrategicStreamingBubble, StrategicActivityStrip } from './StrategicLiveTurn';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
+import { useMessagesPanelFilters } from './useMessagesPanelFilters';
 import { MessagesListView } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
@@ -32,14 +31,9 @@ import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import {
-  createPendingAttachment,
-  removePendingAttachment,
-  revokePendingAttachmentPreviews,
-  uploadPendingMessageAttachments,
-} from './messageAttachmentUpload';
-import {
   createStrategicSessionMessage,
   fetchStrategicConversation,
+  getMessageAttachmentUploadUrl,
   type StrategicContextPackageDescriptor,
   type StrategicMessageTarget,
   type StrategicStateResponse,
@@ -49,6 +43,9 @@ import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/s
 
 const DEFAULT_VIEW_ID = '__default__';
 const MESSAGE_CONTEXT_SELECTED_REF_DESCRIPTOR_LIMIT = 8;
+// Mirrors MAX_IMAGE_DOWNLOAD_BYTES in agent/src/handlers/strategic-resident-lib.ts.
+// Images above this threshold are uploaded but the agent silently skips them.
+const MAX_AGENT_IMAGE_BYTES = Math.floor(13_000_000 * 3 / 4);
 
 // Receipt shown for at most 2 hours after a steer fires, preventing stale "picked up"
 // messages that grow without bound, and blocking stale receipts from resurfacing after
@@ -243,23 +240,6 @@ function strategicRefreshFromReadModel(
   return null;
 }
 
-function viewMatches(
-  view: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
-  state: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
-): boolean {
-  if (view.query !== state.query) return false;
-  if (view.sort !== state.sort) return false;
-  if (view.showResolved !== state.showResolved) return false;
-  if (view.routineExpanded !== state.routineExpanded) return false;
-  if (view.showOnlyNew !== state.showOnlyNew) return false;
-  const aKeys = Object.keys(view.prefs);
-  const bKeys = Object.keys(state.prefs);
-  if (aKeys.length !== bKeys.length) return false;
-  for (const k of aKeys) {
-    if (view.prefs[k] !== state.prefs[k]) return false;
-  }
-  return true;
-}
 
 export type MessagesPanelVariant = 'modal' | 'page';
 
@@ -323,29 +303,6 @@ export interface MessagesPanelProps {
   strategicSessionTranscript?: StrategicSessionDelta[];
 }
 
-type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
-
-function messagesPanelPrefsKey(userId?: string | null): string {
-  return `messages_panel_prefs:${userId || 'anonymous'}`;
-}
-
-function loadMessagesPanelPrefs(userId?: string | null): MessagesPanelPrefs {
-  try {
-    const raw = localStorage.getItem(messagesPanelPrefsKey(userId));
-    if (!raw) return { version: 1, routineExpanded: false, showResolved: false, criticalOnly: false };
-    const parsed = JSON.parse(raw) as Partial<MessagesPanelPrefs>;
-    if (parsed.version !== 1 || typeof parsed.routineExpanded !== 'boolean' || typeof parsed.showResolved !== 'boolean' || typeof parsed.criticalOnly !== 'boolean') {
-      return { version: 1, routineExpanded: false, showResolved: false, criticalOnly: false };
-    }
-    return parsed as MessagesPanelPrefs;
-  } catch {
-    return { version: 1, routineExpanded: false, showResolved: false, criticalOnly: false };
-  }
-}
-
-function saveMessagesPanelPrefs(userId: string | null | undefined, prefs: MessagesPanelPrefs): void {
-  try { localStorage.setItem(messagesPanelPrefsKey(userId), JSON.stringify(prefs)); } catch { /* ignore */ }
-}
 
 function composerDraftKey(userId?: string | null, projectId?: string | null): string {
   return `messages_composer_draft:${userId || 'anonymous'}:${projectId || 'unknown'}`;
@@ -412,6 +369,15 @@ function messageListsEqual(a: ProjectMessage[], b: ProjectMessage[]): boolean {
   return a.length === b.length && a.every((message, i) => messagesEqual(message, b[i]));
 }
 
+function revokePendingAttachmentPreviews(attachments: PendingAttachment[]): void {
+  for (const attachment of attachments) {
+    if (attachment.previewUrl && typeof URL.revokeObjectURL === 'function') {
+      URL.revokeObjectURL(attachment.previewUrl);
+    }
+  }
+}
+
+
 export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
@@ -449,16 +415,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [newContent, setNewContent] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.content ?? '');
   const [submitting, setSubmitting] = useState(false);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
-  const [uploading, setUploading] = useState(false);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
-  // eslint-disable-next-line react-hooks/refs
-  pendingAttachmentsRef.current = pendingAttachments;
-  const clearPendingAttachments = useCallback(() => {
-    setPendingAttachments(prev => {
-      revokePendingAttachmentPreviews(prev);
-      pendingAttachmentsRef.current = [];
-      return [];
-    });
+  const [uploading, setUploading] = useState(false);
+  useEffect(() => {
+    pendingAttachmentsRef.current = pendingAttachments;
+  }, [pendingAttachments]);
+  useEffect(() => () => {
+    revokePendingAttachmentPreviews(pendingAttachmentsRef.current);
+    pendingAttachmentsRef.current = [];
   }, []);
   // Synchronous in-flight guard. `submitting` state updates asynchronously, so
   // two rapid keypresses (double-Enter) can both read the pre-update value and
@@ -563,21 +527,38 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     return pinnedTarget?.projectId === projectId ? pinnedTarget.messageId : null;
   }, []);
 
-  // Collapsed resolved
-  const [showResolved, setShowResolved] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).showResolved);
-  // Routine ops group collapsed by default
-  const [routineExpanded, setRoutineExpanded] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).routineExpanded);
-  // Critical-only severity filter for incident triage
-  const [criticalOnly, setCriticalOnly] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).criticalOnly);
-  // Track which grouped-chip event_type keys are expanded
-  const [expandedGroupKeys, setExpandedGroupKeys] = useState<Set<string>>(new Set());
-  // Per-event-type mute/surface preferences (scoped to project)
-  const [eventPrefs, setEventPrefs] = useState<Record<string, EventPref>>(() =>
-    loadEventPrefs(auth.currentUser?.email, selectedProjectId),
-  );
-  const [showPrefsPanel, setShowPrefsPanel] = useState(false);
-  const [sortMode, setSortMode] = useState<'importance' | 'recent'>('importance');
-  const [searchQuery, setSearchQuery] = useState('');
+  const {
+    showResolved, setShowResolved,
+    routineExpanded, setRoutineExpanded,
+    criticalOnly, setCriticalOnly,
+    expandedGroupKeys, setExpandedGroupKeys,
+    eventPrefs, setEventPrefs,
+    showPrefsPanel, setShowPrefsPanel,
+    sortMode, setSortMode,
+    searchQuery, setSearchQuery,
+    muteWindow, setMuteWindowPersisted,
+    tempMutes,
+    showTempMuteMenu, setShowTempMuteMenu,
+    savedViews,
+    activeViewId,
+    showSaveDialog,
+    saveDialogMode,
+    saveDialogName, setSaveDialogName,
+    saveDialogDescription, setSaveDialogDescription,
+    saveDialogError, setSaveDialogError,
+    openKebabId, setOpenKebabId,
+    kebabRef,
+    showOnlyNew, setShowOnlyNew,
+    activeTabModified,
+    updatePref,
+    addTemporaryMute,
+    applyView,
+    openSaveDialog,
+    openRenameDialog,
+    closeSaveDialog,
+    commitSaveDialog,
+    deleteView,
+  } = useMessagesPanelFilters(selectedProjectId);
   const [webhookStats, setWebhookStats] = useState<WebhookStats | null>(null);
   // Pending strategic-refresh marker (project.vision._strategic_refresh): set when
   // operator steering arms a cycle, cleared backend-side once the autonomous loop
@@ -587,27 +568,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const completionReceiptTone = lastCycleCompletion ? getCompletionReceiptTone(lastCycleCompletion.status) : null;
   // In-flight guard for the "cancel armed steer" affordance on the pending badge.
   const [cancellingRefresh, setCancellingRefresh] = useState(false);
-  const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
-  const [tempMutes, setTempMutes] = useState<TemporaryMutes>(() =>
-    loadTemporaryMutes(auth.currentUser?.email, selectedProjectId),
-  );
-  const [showTempMuteMenu, setShowTempMuteMenu] = useState(false);
-
-  // Saved views — named filter combos persisted per-user-per-project. activeViewId
-  // tracks which tab is currently applied; when the operator mutates any underlying
-  // filter the active tab is rendered as "modified" but state is not auto-cleared.
-  const [savedViews, setSavedViews] = useState<SavedView[]>(() =>
-    loadSavedViews(auth.currentUser?.email, selectedProjectId),
-  );
-  const [activeViewId, setActiveViewId] = useState<string>(DEFAULT_VIEW_ID);
-  const [showSaveDialog, setShowSaveDialog] = useState(false);
-  const [saveDialogMode, setSaveDialogMode] = useState<'create' | 'rename'>('create');
-  const [saveDialogTargetId, setSaveDialogTargetId] = useState<string | null>(null);
-  const [saveDialogName, setSaveDialogName] = useState('');
-  const [saveDialogDescription, setSaveDialogDescription] = useState('');
-  const [saveDialogError, setSaveDialogError] = useState<string | null>(null);
-  const [openKebabId, setOpenKebabId] = useState<string | null>(null);
-  const kebabRef = useRef<HTMLDivElement>(null);
 
   const openMessageCommandSurface = useCallback(() => {
     focusComposerTextarea();
@@ -618,8 +578,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [dividerTime, setDividerTime] = useState<number | null>(null);
   const dividerTimeRef = useRef<number | null>(null);
   const dividerDismissedRef = useRef(false);
-  // Toggle to show only messages newer than the divider time
-  const [showOnlyNew, setShowOnlyNew] = useState(false);
 
   const dismissDivider = useCallback(() => {
     if (!dividerDismissedRef.current && selectedProjectId) {
@@ -692,7 +650,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         (msgBubbles[0] as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
     }, 100);
-  }, []);
+  }, [setShowOnlyNew]);
 
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
@@ -718,23 +676,18 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // eslint-disable-next-line react-hooks/refs
   tempMutesRef.current = tempMutes;
 
-  // Reset toast suppression state when switching projects so that the next
+  // Reset per-component state when switching projects so that the next
   // fetch is treated as an initial load for the new project (avoids a flood
   // of toasts for project B's pre-existing open BLOCKER/BUG/FEEDBACK items).
-  // Also reload event prefs and initialize divider time for new project.
+  // Filter/prefs state is reset by useMessagesPanelFilters.
   useEffect(() => {
     let active = true;
     seenMessageIdsRef.current = new Set();
     seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
-    const localPrefs = loadEventPrefs(auth.currentUser?.email, selectedProjectId);
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setEventPrefs(localPrefs);
-    setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
     optimisticStrategicRefreshRef.current = null;
     if (!usesStrategicReadModelRef.current) setStrategicRefresh(null);
-    setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
     const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
@@ -758,72 +711,21 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           void postBackendLastSeen(selectedProjectId, now);
         }
       });
-      // Prefer server noise prefs over localStorage — picks up prefs set on another device.
-      fetchServerNoisePrefs(selectedProjectId).then(serverPrefs => {
-        if (!active) return;
-        if (serverPrefs !== null) {
-          setEventPrefs(serverPrefs);
-          saveEventPrefs(auth.currentUser?.email, selectedProjectId, serverPrefs);
-        }
-      });
-      // Prefer server temp-mutes over localStorage — expiry semantics preserved (expired entries dropped).
-      fetchServerTempMutes(selectedProjectId).then(serverMutes => {
-        if (!active) return;
-        if (serverMutes !== null) {
-          setTempMutes(serverMutes);
-          saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, serverMutes);
-        }
-      });
-      // Prefer server mute-window over localStorage — undefined = fetch failed, keep local fallback.
-      fetchServerMuteWindow(selectedProjectId).then(serverWin => {
-        if (!active) return;
-        if (serverWin !== undefined) {
-          setMuteWindow(serverWin);
-          if (serverWin !== null) {
-            saveMuteWindow(auth.currentUser?.email, selectedProjectId, serverWin);
-          } else {
-            clearMuteWindow(auth.currentUser?.email, selectedProjectId);
-          }
-        }
-      });
     }
-    // Reload saved views for the new project — views never bleed across projects.
-    setSavedViews(loadSavedViews(auth.currentUser?.email, selectedProjectId));
-    setActiveViewId(DEFAULT_VIEW_ID);
-    setOpenKebabId(null);
     // Reload composer draft for the new project — drafts are scoped per-project
     // so switching projects shows that project's in-progress draft, not another's.
     const draft = loadComposerDraft(auth.currentUser?.email, selectedProjectId);
     setNewContent(draft?.content ?? '');
     setNewType(draft?.type ?? 'FEEDBACK');
-    clearPendingAttachments();
+    setPendingAttachments(prev => {
+      revokePendingAttachmentPreviews(prev);
+      pendingAttachmentsRef.current = [];
+      return [];
+    });
     setUploading(false);
-    if (selectedProjectId) {
-      // Prefer server saved views over localStorage — picks up views created on another device.
-      fetchServerSavedViews(selectedProjectId).then(serverViews => {
-        if (!active) return;
-        if (serverViews !== null) {
-          setSavedViews(serverViews);
-          saveSavedViews(auth.currentUser?.email, selectedProjectId, serverViews);
-        }
-      });
-    }
     return () => { active = false; };
-  }, [selectedProjectId, clearPendingAttachments]);
+  }, [selectedProjectId]);
 
-  useEffect(() => {
-    return () => revokePendingAttachmentPreviews(pendingAttachmentsRef.current);
-  }, []);
-
-  // Close kebab menu on outside click — same pattern as MessageTypeDropdown.
-  useEffect(() => {
-    if (!openKebabId) return;
-    function handleClickOutside(e: MouseEvent) {
-      if (kebabRef.current && !kebabRef.current.contains(e.target as Node)) setOpenKebabId(null);
-    }
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [openKebabId]);
 
   useEffect(() => {
     if (!focusComposerSignal) return;
@@ -1077,39 +979,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     return () => window.clearTimeout(timer);
   }, [highlightedMessageId]);
 
-  // Persist + apply a mute-window change (arm/extend pass a window, clear passes null).
-  // MuteWindowMenu owns its own open/close UI state and pushes changes back through here.
-  const setMuteWindowPersisted = useCallback((win: MuteWindow | null) => {
-    if (win) {
-      saveMuteWindow(auth.currentUser?.email, selectedProjectId, win);
-      if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, win);
-    } else {
-      clearMuteWindow(auth.currentUser?.email, selectedProjectId);
-      if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, null);
-    }
-    setMuteWindow(win);
-  }, [selectedProjectId]);
 
-  function updatePref(et: string, pref: EventPref) {
-    setEventPrefs(prev => {
-      const next = pref === 'routine'
-        ? Object.fromEntries(Object.entries(prev).filter(([k]) => k !== et)) as Record<string, EventPref>
-        : { ...prev, [et]: pref };
-      saveEventPrefs(auth.currentUser?.email, selectedProjectId, next);
-      if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, next);
-      return next;
-    });
-  }
-
-  function addTemporaryMute(eventType: string, durationMs: number) {
-    setTempMutes(prev => {
-      const next = { ...prev, [eventType]: Date.now() + durationMs };
-      saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, next);
-      if (selectedProjectId) void saveServerTempMutes(selectedProjectId, next);
-      return next;
-    });
-    setShowTempMuteMenu(false);
-  }
 
   const getTop3NoisyEventTypes = useCallback((): Array<[string, number]> => {
     if (routineOpen.length === 0) return [];
@@ -1125,155 +995,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     return Object.entries(eventTypeCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
   }, [routineOpen]);
 
-  const activeView = useMemo(
-    () => savedViews.find(v => v.id === activeViewId) ?? null,
-    [savedViews, activeViewId],
-  );
 
-  // Active tab is "modified" when current panel state diverges from its saved
-  // snapshot. For Default the baseline is the empty/initial state.
-  const activeTabModified = useMemo(() => {
-    const current = { query: searchQuery, prefs: eventPrefs, sort: sortMode, showResolved, routineExpanded, showOnlyNew };
-    if (activeViewId === DEFAULT_VIEW_ID) {
-      return !viewMatches(
-        { query: '', prefs: {}, sort: 'importance', showResolved: false, routineExpanded: false, showOnlyNew: false },
-        current,
-      );
-    }
-    if (!activeView) return false;
-    return !viewMatches(activeView, current);
-  }, [activeView, activeViewId, searchQuery, eventPrefs, sortMode, showResolved, routineExpanded, showOnlyNew]);
-
-  function applyView(viewId: string) {
-    setOpenKebabId(null);
-    if (viewId === DEFAULT_VIEW_ID) {
-      setActiveViewId(DEFAULT_VIEW_ID);
-      setSearchQuery('');
-      setEventPrefs({});
-      saveEventPrefs(auth.currentUser?.email, selectedProjectId, {});
-      if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, {});
-      setSortMode('importance');
-      setShowResolved(false);
-      setRoutineExpanded(false);
-      setShowOnlyNew(false);
-      return;
-    }
-    const view = savedViews.find(v => v.id === viewId);
-    if (!view) return;
-    setActiveViewId(view.id);
-    setSearchQuery(view.query);
-    setEventPrefs(view.prefs);
-    saveEventPrefs(auth.currentUser?.email, selectedProjectId, view.prefs);
-    if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, view.prefs);
-    setSortMode(view.sort);
-    setShowResolved(view.showResolved);
-    setRoutineExpanded(view.routineExpanded);
-    setShowOnlyNew(view.showOnlyNew);
-  }
-
-  function openSaveDialog() {
-    setSaveDialogMode('create');
-    setSaveDialogTargetId(null);
-    setSaveDialogName('');
-    setSaveDialogDescription('');
-    setSaveDialogError(null);
-    setShowSaveDialog(true);
-  }
-
-  function openRenameDialog(view: SavedView) {
-    setSaveDialogMode('rename');
-    setSaveDialogTargetId(view.id);
-    setSaveDialogName(view.name);
-    setSaveDialogDescription(view.description ?? '');
-    setSaveDialogError(null);
-    setShowSaveDialog(true);
-    setOpenKebabId(null);
-  }
-
-  function closeSaveDialog() {
-    setShowSaveDialog(false);
-    setSaveDialogError(null);
-  }
-
-  function commitSaveDialog() {
-    const name = saveDialogName.trim();
-    if (!name) {
-      setSaveDialogError('Name is required');
-      return;
-    }
-    if (saveDialogMode === 'create') {
-      if (savedViews.length >= SAVED_VIEWS_CAP) {
-        setSaveDialogError(`Cap reached (${SAVED_VIEWS_CAP}). Delete a view to add another.`);
-        return;
-      }
-      const view: SavedView = {
-        id: `view_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        name,
-        description: saveDialogDescription.trim() || undefined,
-        query: searchQuery,
-        prefs: eventPrefs,
-        sort: sortMode,
-        showResolved,
-        routineExpanded,
-        showOnlyNew,
-        createdAt: Date.now(),
-      };
-      const next = [...savedViews, view];
-      setSavedViews(next);
-      saveSavedViews(auth.currentUser?.email, selectedProjectId, next);
-      if (selectedProjectId) void saveServerSavedViews(selectedProjectId, next);
-      setActiveViewId(view.id);
-    } else if (saveDialogTargetId) {
-      const next = savedViews.map(v =>
-        v.id === saveDialogTargetId
-          ? { ...v, name, description: saveDialogDescription.trim() || undefined }
-          : v,
-      );
-      setSavedViews(next);
-      saveSavedViews(auth.currentUser?.email, selectedProjectId, next);
-      if (selectedProjectId) void saveServerSavedViews(selectedProjectId, next);
-    }
-    closeSaveDialog();
-  }
-
-  function deleteView(viewId: string) {
-    const next = savedViews.filter(v => v.id !== viewId);
-    setSavedViews(next);
-    saveSavedViews(auth.currentUser?.email, selectedProjectId, next);
-    if (selectedProjectId) void saveServerSavedViews(selectedProjectId, next);
-    setOpenKebabId(null);
-    if (activeViewId === viewId) setActiveViewId(DEFAULT_VIEW_ID);
-  }
-
-  useEffect(() => {
-    saveMessagesPanelPrefs(auth.currentUser?.email, { version: 1, routineExpanded, showResolved, criticalOnly });
-  }, [routineExpanded, showResolved, criticalOnly]);
-
-  // Auto-clear mute window when it expires
-  const muteExpiresAt = muteWindow?.expiresAt;
-  useEffect(() => {
-    if (!muteExpiresAt) return;
-    const interval = setInterval(() => {
-      if (Date.now() >= muteExpiresAt) {
-        clearMuteWindow(auth.currentUser?.email, selectedProjectId);
-        setMuteWindow(null);
-      }
-    }, 30_000);
-    return () => clearInterval(interval);
-  }, [muteExpiresAt, selectedProjectId]);
-
-  // Auto-clean expired temporary mutes
-  useEffect(() => {
-    const now = Date.now();
-    const cleaned = Object.fromEntries(
-      Object.entries(tempMutes).filter(([, expiresAt]) => expiresAt > now)
-    );
-    if (Object.keys(cleaned).length !== Object.keys(tempMutes).length) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setTempMutes(cleaned);
-      saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, cleaned);
-    }
-  }, [selectedProjectId, tempMutes]);
 
   const fetchMessages = useCallback(async () => {
     const requestSeq = fetchMessagesRequestSeqRef.current + 1;
@@ -1538,20 +1260,55 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   }
 
   function handleAddAttachment(file: File) {
-    if (submittingRef.current) return;
+    if (submittingRef.current || uploading) return;
+    if (file.size > 50 * 1024 * 1024) {
+      addToast('File exceeds the 50 MB size limit and was skipped', 'error');
+      return;
+    }
+    if (file.type?.startsWith('image/') && file.size > MAX_AGENT_IMAGE_BYTES) {
+      addToast('This image exceeds ~9.75 MB and may not be visible to the strategist', 'info');
+    }
+    const id = `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    let previewUrl: string | null = null;
+    if (file.type?.startsWith('image/') && file.size < 10_000_000 && typeof URL.createObjectURL === 'function') {
+      try {
+        previewUrl = URL.createObjectURL(file);
+      } catch {
+        previewUrl = null;
+      }
+    }
     setPendingAttachments(prev => {
-      const next = [...prev, createPendingAttachment(file)];
+      const next = [...prev, {
+        id,
+        file,
+        previewUrl,
+        mime_type: file.type || 'application/octet-stream',
+        name: file.name,
+        size_bytes: file.size,
+      }];
       pendingAttachmentsRef.current = next;
       return next;
     });
   }
 
   function handleRemoveAttachment(id: string) {
-    if (submittingRef.current) return;
+    if (submittingRef.current || uploading) return;
     setPendingAttachments(prev => {
-      const next = removePendingAttachment(prev, id);
+      const att = prev.find(a => a.id === id);
+      if (att?.previewUrl && typeof URL.revokeObjectURL === 'function') {
+        URL.revokeObjectURL(att.previewUrl);
+      }
+      const next = prev.filter(a => a.id !== id);
       pendingAttachmentsRef.current = next;
       return next;
+    });
+  }
+
+  function clearPendingAttachments() {
+    setPendingAttachments(prev => {
+      revokePendingAttachmentPreviews(prev);
+      pendingAttachmentsRef.current = [];
+      return [];
     });
   }
 
@@ -1559,7 +1316,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const submittedContent = newContent.trim();
     const attachmentsForSubmit = pendingAttachmentsRef.current;
     if (!selectedProjectId || (!submittedContent && attachmentsForSubmit.length === 0)) return;
-    if (replyTo && replyTo.message_type === 'QUESTION' && replyTo.status === 'open' && !submittedContent) return;
     // Synchronous guard first — reject re-entrant calls before the async
     // `setSubmitting` has a chance to re-render, so rapid double-Enter cannot
     // launch two requests.
@@ -1571,6 +1327,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       // via PATCH — the backend posts a question_answer NOTE (linked back to the
       // question) and marks the question resolved so the strategist sees it answered.
       if (replyTo && replyTo.message_type === 'QUESTION' && replyTo.status === 'open') {
+        if (attachmentsForSubmit.length > 0) {
+          addToast('Remove attachments before answering a question', 'error');
+          return;
+        }
         const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${replyTo.id}`, {
           method: 'PATCH',
@@ -1593,14 +1353,36 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         await fetchMessages();
         return;
       }
-      let uploadedAttachments: MessageAttachment[] = [];
+      // Upload pending attachments to GCS before sending the message.
+      const uploadedAttachments: MessageAttachment[] = [];
       if (attachmentsForSubmit.length > 0) {
         setUploading(true);
         try {
-          uploadedAttachments = await uploadPendingMessageAttachments(selectedProjectId, attachmentsForSubmit);
-        } catch (err) {
-          addToast(err instanceof Error ? err.message : 'Failed to upload attachment', 'error');
-          return;
+          for (const att of attachmentsForSubmit) {
+            try {
+              const { upload_url, download_url } = await getMessageAttachmentUploadUrl(
+                selectedProjectId,
+                att.name,
+                att.mime_type,
+              );
+              const uploadRes = await fetch(upload_url, {
+                method: 'PUT',
+                headers: { 'Content-Type': att.mime_type },
+                body: att.file,
+              });
+              if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
+              uploadedAttachments.push({
+                type: att.mime_type?.startsWith('image/') ? 'image' : 'attachment',
+                mime_type: att.mime_type,
+                name: att.name,
+                size_bytes: att.size_bytes,
+                url: download_url,
+              });
+            } catch {
+              addToast(`Failed to upload ${att.name}`, 'error');
+              return;
+            }
+          }
         } finally {
           setUploading(false);
         }
@@ -1741,6 +1523,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
+      setUploading(false);
     }
   }
 

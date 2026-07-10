@@ -178,6 +178,11 @@ Before pushing, ensure these invariants pass:
    - `criterion_coverage_incomplete` means at least one version acceptance criterion is not fully covered
    - Uncovered criteria and stuck/partial criteria both block promotion until remapped to active direction work or explicitly attested by an operator
 
+6. **Pre-merge dual-head guard shape** (`test_invariants.py::TestPreMergeDualHeadGuardCoverage`)
+   - AST-parses `backend/app/ci_completion.py` and `backend/app/task_completion.py` to pin the exact variable-assignment shape around calls to `enforce_premerge_migration_guard` — verifies the guard result is checked fail-closed (early exit) before any `merge_pull_request` call, and that the effective ok/hold-reason variables are never reassigned after the check
+   - If a legitimate refactor changes how the guard result is assigned/unpacked (e.g. introducing an intermediate normalization step), this test WILL break even though nothing is actually less safe — update the test's AST assertions to match the new shape while preserving the same fail-closed/no-reassignment-after-check invariant it's designed to protect; do not just loosen the assertion to make it pass
+   - This is a narrow, deliberately strict test (see the class docstring) — it exists specifically to prevent an allowance from quietly widening into a full trust zone, so treat any failure here as worth understanding fully, not skipping
+
 ### Common Test Patterns
 
 #### Testing Task State Transitions

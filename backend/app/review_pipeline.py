@@ -2333,6 +2333,46 @@ async def _spawn_pipeline_task(
             )
         return (None, False)
 
+    # ── No-op fix short-circuit ─────────────────────────────────────────
+    # The immediately-preceding fix completed with zero net diff
+    # (``./done --already-done`` / ``no_op_reason`` set). The deliverable is
+    # already present on the target branch via another path, so spawning a
+    # fresh review would only loop: the review would find the branch behind
+    # again (same change already in base), spawn another futile fix that
+    # also produces zero diff, and the cycle repeats until churn halt.
+    #
+    # Close the chain as converged immediately instead.  On the Nth
+    # consecutive no-op the churn halt above catches it; for N < limit we
+    # short-circuit here.  The churn counter is still incremented by the
+    # block above for observability, but we never reach the spawn logic.
+    if _source_noop_fix:
+        logger.info(
+            f"[PIPELINE] No-op fix for PR #{pr_number}: zero net diff after "
+            f"rebase — closing review/fix chain as converged (deliverable "
+            f"already satisfied)"
+        )
+        source_task.latest_status_message = (
+            f"No-op fix — deliverable already present for PR #{pr_number}; "
+            f"closing review/fix chain."
+        )
+        if orig_task is not None:
+            _set_review_loop_terminal_outcome(
+                orig_task,
+                kind="converged",
+                reason="noop_fix_already_satisfied",
+                pr_number=pr_number,
+                iterations=supersede_churn_count,
+                detail=(
+                    "Fix task completed with zero net diff — the deliverable "
+                    "is already present on the target branch via another path. "
+                    "No review needed."
+                ),
+            )
+        _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+        session.add(source_task)
+        await session.commit()
+        return (None, False)
+
     # Mid-retry defer: when spawning a review, treat the chain as busy if a
     # same-PR fix is FAILED/CANCELLED with an infra failure_category within the
     # grace window AND still has retry budget remaining — the fix will be requeued

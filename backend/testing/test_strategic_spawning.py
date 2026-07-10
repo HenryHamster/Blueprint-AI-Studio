@@ -22,6 +22,8 @@ from sqlalchemy import select, update
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
 from app.models import (
+    Artifact,
+    ArtifactType,
     LocalRunner,
     Project,
     Task,
@@ -1266,6 +1268,7 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "origin_provenance",
         "sweep_id",
         "arm_label",
+        "lifecycle_status",
     }
 
 
@@ -6307,25 +6310,32 @@ async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(
         )
     await db_session.commit()
 
-    # Create 5 completed claim-tasks with no PR artifacts → stalled_despite_churn
+    # Create 5 completed claim-tasks with unmerged PR artifacts.
     for i in range(5):
+        task = Task(
+            project_id=project.id,
+            title=f"trend claim {i}",
+            description="",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "x",
+                    "current_direction_id": "d-trend01",
+                }
+            ],
+            context={"direction_id": "d-trend01"},
+            plan_output={"summary": "shipped"},
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(task)
+        await db_session.flush()
         db_session.add(
-            Task(
-                project_id=project.id,
-                title=f"trend claim {i}",
-                description="",
-                status=TaskStatus.COMPLETED,
-                created_by="ORCHESTRATOR",
-                payloads=[
-                    {
-                        "type": "create",
-                        "prompt": "x",
-                        "current_direction_id": "d-trend01",
-                    }
-                ],
-                context={"direction_id": "d-trend01"},
-                plan_output={"summary": "shipped"},
-                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.PULL_REQUEST,
+                pr_url=f"https://github.com/test/repo/pull/{task.id.hex[:8]}",
             )
         )
     await db_session.commit()
@@ -13052,6 +13062,43 @@ class TestAnnotateCapabilityProofStatus:
         from app.strategic_spawning import _annotate_capability_proof_status
 
         assert _annotate_capability_proof_status is annotate_capability_proof_status
+
+    def test_capability_proof_badge_reflects_reverified_evidence_status(self):
+        """evidence_refs_map overrides proof_records for the badge.
+
+        A capability that has durable proof_records (historically proven) but
+        whose evidence_refs have been re-verified and show no proven=True ref
+        must NOT show 'proven' — the re-verified status takes precedence over
+        the write-once record-existence check.
+        """
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [
+            {"name": "ci-pipeline", "status": "working"},
+            {"name": "repo-map", "status": "working"},
+            {"name": "untracked", "status": "planned"},
+        ]
+        # proof_records says both ci-pipeline and repo-map are "proven" (old logic)
+        proof_records = {
+            "ci-pipeline": [{"task_id": "t1", "proof_kind": "named_test", "proof_ref": "test_ci.py::test_merge", "commit_sha": "abc"}],
+            "repo-map": [{"task_id": "t2", "proof_kind": "named_test", "proof_ref": "test_map.py::test_map", "commit_sha": "def"}],
+        }
+        # evidence_refs_map: ci-pipeline re-verified — backing code removed, proven=False
+        #                    repo-map re-verified — still present, proven=True
+        evidence_refs_map = {
+            "ci-pipeline": [{"kind": "named_test", "ref": "test_ci.py::test_merge", "proven": False}],
+            "repo-map": [{"kind": "named_test", "ref": "test_map.py::test_map", "proven": True}],
+        }
+        out = _annotate_capability_proof_status(vocab, proof_records, evidence_refs_map)
+
+        # repo-map: evidence_refs has proven=True → "proven" (consistent with old logic)
+        assert out[1]["proof_status"] == "proven"
+        # ci-pipeline: evidence_refs has proven=False only → classify_evidence → "partial"
+        # (refs exist but none is proven=True), overriding the stale proof_record
+        assert out[0]["proof_status"] == "partial"
+        assert out[0]["proof_status"] != "proven"
+        # untracked: no entry in evidence_refs_map → falls back to proof_records → "unproven"
+        assert out[2]["proof_status"] == "unproven"
 
 
 # ── _verify_capability_backing_paths: advisory capability verification ────────

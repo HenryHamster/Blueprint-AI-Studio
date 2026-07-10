@@ -817,3 +817,34 @@ BLUEPRINT_RUNNER_MIN_DISK_BYTES=2147483648 blueprint-runner run
 **Exit codes:** `blueprint-runner check` exits 0 when the orchestrator is
 reachable, the token is valid/401, and at least one task class is claimable.
 Exit 1 means setup is incomplete.
+
+---
+
+## Troubleshooting: GitHub App installation token errors
+
+These errors appear in agent task logs and indicate a problem with the GitHub
+App installation's permissions or token validity — **not** something the runner
+itself can fix. Do not attempt runner restarts or re-enrollment; escalate to
+whoever manages the GitHub App installation for your organization.
+
+**`Git push failed: credential helper at /home/agent/.blueprint/git-credential-helper provides read-only GitHub App installation token (ghs_ prefix) -- cannot push to origin.`**
+
+The GitHub App installation token (`ghs_…`) is valid but was issued with
+read-only repository permissions. The runner's credential helper correctly
+fetched this token, but it lacks the `contents: write` scope needed to push.
+
+_Remediation:_ In your GitHub organization's App installation settings, grant
+the Blueprint GitHub App **Read and write** access to repository contents, then
+re-run the affected task.
+
+**`GitHub App installation token (ghs_***...) returns HTTP 401 Bad credentials for all push attempts and API calls -- the ghs_ token has expired.`**
+
+The installation token has expired. GitHub App installation tokens are
+short-lived (≤1 hour); if the token was cached or the runner's clock is skewed,
+it can expire mid-task.
+
+_Remediation:_ Verify that the runner host's system clock is accurate (NTP
+synchronized). If expiry is happening frequently, check whether the GitHub App
+installation itself is still active and that the App has not been suspended or
+uninstalled. Do not attempt to have the runner self-heal an expired installation
+token — re-running the task will cause the credential helper to fetch a fresh one.

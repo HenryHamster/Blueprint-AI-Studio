@@ -28296,7 +28296,7 @@ async def test_get_message_attachment_upload_url_sanitizes_filename_and_content_
     await db_session.commit()
 
     mock_blob = MagicMock()
-    mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed"
+    mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-upload"
     mock_bucket = MagicMock()
     mock_bucket.blob.return_value = mock_blob
     mock_client = MagicMock()

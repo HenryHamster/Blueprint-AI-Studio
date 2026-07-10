@@ -928,6 +928,7 @@ def deduplicate_findings(
         (f.get("title", ""), f.get("sources", []), f.get("claims", []))
         for f in recent_terminal_findings
     ]
+    terminal_evidence_count = len(evidence_list)
 
     for orig_i, finding in indexed_findings:
         title = finding.get("title", f"Research finding #{orig_i + 1}")
@@ -1065,6 +1066,11 @@ def deduplicate_findings(
             continue
 
         # Evidence-overlap check: compare sources and claims against already-deduped findings
+        terminal_evidence_dup, _ = _check_evidence_overlap(
+            finding.get("sources", []),
+            finding.get("claims", []),
+            evidence_list[:terminal_evidence_count],
+        )
         is_evidence_dup, matched_evidence_title = _check_evidence_overlap(
             finding.get("sources", []),
             finding.get("claims", []),
@@ -1082,6 +1088,7 @@ def deduplicate_findings(
                     "direction_id": finding_dir_id,
                     "reason": reason[:80],
                     "finding": finding,
+                    "terminal_history": terminal_evidence_dup,
                 }
             )
             continue
