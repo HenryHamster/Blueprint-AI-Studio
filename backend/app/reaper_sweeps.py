@@ -1318,20 +1318,33 @@ async def sweep_closed_handmerge_prs(session) -> int:
         for task in preserved_tasks
     ]
 
+    # Batch-fetch PULL_REQUEST artifacts for tasks that lack handmerge_pr_number
+    # in context, to avoid N+1 queries inside the loop.
+    _missing_pr_ids = [
+        t_id
+        for _, t_id, _, ctx in task_snapshots
+        if not isinstance(ctx.get("handmerge_pr_number"), int)
+    ]
+    _artifact_by_task: dict = {}
+    if _missing_pr_ids:
+        _art_rows = (
+            await session.execute(
+                _select(_Artifact).where(
+                    _Artifact.task_id.in_(_missing_pr_ids),
+                    _Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        ).scalars().all()
+        for _art in _art_rows:
+            _artifact_by_task[_art.task_id] = _art
+
     resolved = 0
     for task, t_id, t_project_id, ctx in task_snapshots:
         pr_number = ctx.get("handmerge_pr_number")
         if not isinstance(pr_number, int):
             # Fall back to the PULL_REQUEST artifact for tasks preserved before
             # handmerge_pr_number was stored in context.
-            artifact = (
-                await session.execute(
-                    _select(_Artifact).where(
-                        _Artifact.task_id == t_id,
-                        _Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                    )
-                )
-            ).scalar_one_or_none()
+            artifact = _artifact_by_task.get(t_id)
             if artifact and artifact.pr_url:
                 try:
                     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])

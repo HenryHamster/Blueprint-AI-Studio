@@ -2064,14 +2064,34 @@ async def sweep_lane_pilot_kill_verdict(session: AsyncSession) -> int:
     ).all()
     project_ids = list({row[0] for row in rows})
 
+    # Batch-fetch all projects and snapshot capability_adoption_verdicts as plain
+    # dicts to avoid N+1 session.get calls inside the loop. After the first
+    # apply_lane_pilot_kill_in_transaction (which commits), ORM instances expire,
+    # so we snapshot the field we need rather than holding ORM references.
+    if project_ids:
+        _proj_rows = (
+            await session.execute(
+                select(Project).where(Project.id.in_(project_ids))
+            )
+        ).scalars().all()
+        _verdicts_by_id: dict = {
+            str(p.id): dict(p.capability_adoption_verdicts)
+            if isinstance(p.capability_adoption_verdicts, dict)
+            else None
+            for p in _proj_rows
+        }
+        _found_ids = {str(p.id) for p in _proj_rows}
+    else:
+        _verdicts_by_id = {}
+        _found_ids = set()
+
     kills_applied = 0
     for project_id in project_ids:
         try:
             # Skip projects that already have a durable KILL recorded.
-            project = await session.get(Project, project_id)
-            if project is None:
+            if str(project_id) not in _found_ids:
                 continue
-            verdicts = getattr(project, "capability_adoption_verdicts", None)
+            verdicts = _verdicts_by_id.get(str(project_id))
             if isinstance(verdicts, dict):
                 entry = verdicts.get(LANE_PILOT_CAP_NAME)
                 if isinstance(entry, dict) and entry.get("verdict") == "KILL":

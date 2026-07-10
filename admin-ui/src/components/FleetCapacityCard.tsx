@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { AlertTriangle } from 'lucide-react';
-import { Skeleton } from './DashboardMetricCards';
+import { Skeleton } from './DashboardMetricCardsPrimitives';
 import { snapshotFreshness } from '../utils/time';
 import type { AgentServingShasResponse, FleetUtilizationResponse } from '../api';
 

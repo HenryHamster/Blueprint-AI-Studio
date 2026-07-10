@@ -1609,10 +1609,13 @@ async def check_near_cap_size_warning(ctx: SweepContext) -> List[CheckResult]:
 
     from app.size_limit_policy import _is_chronic_offender, parse_bump_history
 
+    def _load_json_file(path: str) -> Any:
+        with open(path) as fh:
+            return _json.load(fh)
+
     # 1. Load caps from the tracked JSON.
     try:
-        with open(_NEAR_CAP_LIMITS_PATH) as fh:
-            all_limits = _json.load(fh)
+        all_limits = await asyncio.to_thread(_load_json_file, _NEAR_CAP_LIMITS_PATH)
     except (OSError, ValueError):
         return [
             CheckResult(
@@ -1656,8 +1659,10 @@ async def check_near_cap_size_warning(ctx: SweepContext) -> List[CheckResult]:
         if not os.path.isfile(path):
             continue
         try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                count = len(fh.readlines())
+            def _count_lines(p: str) -> int:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    return len(fh.readlines())
+            count = await asyncio.to_thread(_count_lines, path)
         except OSError:
             continue
 

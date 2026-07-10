@@ -556,6 +556,8 @@ class _DeadLetterRedriveRequest(BaseModel):
 @router.get("/notification-dispatch/dead-letters")
 async def list_dead_letters(
     project_id: str = Query(...),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -565,14 +567,14 @@ async def list_dead_letters(
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid project_id format")
     await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
-    rows = await _nd.list_dead_letters(session, project_id=pid)
+    rows, total = await _nd.list_dead_letters(session, project_id=pid, limit=limit, offset=offset)
     # Mask webhook_url for non-admin callers — webhook URLs embed auth tokens
     # (Slack, Discord, PagerDuty) and must not leak to non-admin project members.
     # This matches the pattern in admin_settings._build_notification_config_response.
     if current_user.get("role") != "admin":
         for r in rows:
             r["webhook_url"] = ""
-    return rows
+    return {"items": rows, "total": total, "limit": limit, "offset": offset}
 
 
 @router.post("/notification-dispatch/dead-letters/redrive")

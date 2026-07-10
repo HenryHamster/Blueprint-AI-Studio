@@ -1,5 +1,5 @@
 import { ExternalLink, GitMerge } from 'lucide-react';
-import { Skeleton } from './DashboardMetricCards';
+import { Skeleton } from './DashboardMetricCardsPrimitives';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';

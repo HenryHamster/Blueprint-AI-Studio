@@ -135,9 +135,12 @@ export interface DeadLetterEntry {
 export async function fetchDeadLetters(
   projectId: string,
   signal?: AbortSignal,
-): Promise<DeadLetterEntry[]> {
+  limit = 100,
+  offset = 0,
+): Promise<{ items: DeadLetterEntry[]; total: number; limit: number; offset: number }> {
+  const params = new URLSearchParams({ project_id: projectId, limit: String(limit), offset: String(offset) });
   const res = await apiFetch(
-    `/api/admin/notification-dispatch/dead-letters?project_id=${encodeURIComponent(projectId)}`,
+    `/api/admin/notification-dispatch/dead-letters?${params}`,
     undefined,
     2,
     30000,

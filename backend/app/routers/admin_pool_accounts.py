@@ -521,7 +521,10 @@ def _serialize_max_plan_account_row(
 
 
 async def list_authoritative_max_plan_accounts(
-    session: AsyncSession, user_id: str
+    session: AsyncSession,
+    user_id: str,
+    limit: int = 100,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Authoritative persisted account roster overlaid with live pool fields."""
     from app.max_plan_pool import _account_by_id, _max_plan_pool_lock
@@ -532,6 +535,8 @@ async def list_authoritative_max_plan_accounts(
                 select(MaxPlanAccount)
                 .where(MaxPlanAccount.user_id == user_id)
                 .order_by(MaxPlanAccount.created_at, MaxPlanAccount.id)
+                .limit(limit)
+                .offset(offset)
             )
         )
         .scalars()
