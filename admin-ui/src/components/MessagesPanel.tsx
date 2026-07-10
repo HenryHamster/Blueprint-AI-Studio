@@ -44,6 +44,9 @@ import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/s
 
 const DEFAULT_VIEW_ID = '__default__';
 const MESSAGE_CONTEXT_SELECTED_REF_DESCRIPTOR_LIMIT = 8;
+// Mirrors MAX_IMAGE_DOWNLOAD_BYTES in agent/src/handlers/strategic-resident-lib.ts.
+// Images above this threshold are uploaded but the agent silently skips them.
+const MAX_AGENT_IMAGE_BYTES = Math.floor(13_000_000 * 3 / 4);
 
 // Receipt shown for at most 2 hours after a steer fires, preventing stale "picked up"
 // messages that grow without bound, and blocking stale receipts from resurfacing after
@@ -1544,6 +1547,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     if (file.size > 50 * 1024 * 1024) {
       addToast('File exceeds the 50 MB size limit and was skipped', 'error');
       return;
+    }
+    if (file.type?.startsWith('image/') && file.size > MAX_AGENT_IMAGE_BYTES) {
+      addToast('This image exceeds ~9.75 MB and may not be visible to the strategist', 'info');
     }
     const id = `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     let previewUrl: string | null = null;

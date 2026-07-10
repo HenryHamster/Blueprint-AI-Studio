@@ -5779,6 +5779,64 @@ describe('MessagesPanel attachment integration', () => {
     expect(el.querySelector('[aria-label^="Remove"]')).toBeNull();
   });
 
+  test('image over ~9.75MB triggers a warning toast but is still accepted', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    // 10 MB image — above the agent cap (~9.75 MB) but below the 50 MB hard limit
+    const file = new File(['x'], 'large.png', { type: 'image/png' });
+    Object.defineProperty(file, 'size', { value: 10 * 1024 * 1024 });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    Object.defineProperty(fileInput, 'files', { value: dt.files, writable: true, configurable: true });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
+
+    // Warning toast must fire (not an error — file is accepted)
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('may not be visible to the strategist'),
+      'info',
+    );
+    // File must still be accepted as an attachment chip
+    await waitFor(() => {
+      expect(el.querySelector('[aria-label^="Remove"]')).not.toBeNull();
+    });
+  });
+
+  test('non-image file over ~9.75MB does NOT trigger the image warning toast', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    // 10 MB PDF — above the agent image cap but not an image
+    const file = new File(['x'], 'report.pdf', { type: 'application/pdf' });
+    Object.defineProperty(file, 'size', { value: 10 * 1024 * 1024 });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    Object.defineProperty(fileInput, 'files', { value: dt.files, writable: true, configurable: true });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
+
+    // No warning toast for non-image files
+    expect(addToast).not.toHaveBeenCalledWith(
+      expect.stringContaining('may not be visible to the strategist'),
+      'info',
+    );
+    // File must still be accepted as an attachment chip
+    await waitFor(() => {
+      expect(el.querySelector('[aria-label^="Remove"]')).not.toBeNull();
+    });
+  });
+
   test('object URL preview failure still renders attachment chip', async () => {
     const addToast = vi.fn();
     _setupAttachmentMock([]);
