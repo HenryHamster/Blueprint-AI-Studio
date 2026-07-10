@@ -395,6 +395,20 @@ async def _try_runner_dispatch(
             "[RUNNERS] Failed to commit runner pin for task %s", task.id
         )
         await session.rollback()
+        # The rollback expired every session-bound ORM instance (independent of
+        # expire_on_commit=False). A subsequent attribute read on ``task`` in
+        # the dispatch loop (e.g. ``_hold_strategic_local_runner_task`` at
+        # orchestrator.py:2842) would then fire a sync lazy-load from async
+        # context and raise MissingGreenlet, quarantining a healthy task.
+        # Re-pickling from the DB is async-safe because ``refresh()`` goes
+        # through the session's async API, and the rollback has already opened
+        # a new implicit transaction for the read.
+        try:
+            await session.refresh(task)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to refresh task %s after rollback", task.id
+            )
         return False
     # Only charge the in-cycle pin slot once the pin is durably committed — a
     # rolled-back pin above must not consume the runner's per-cycle capacity.

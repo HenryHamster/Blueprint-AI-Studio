@@ -724,24 +724,29 @@ export async function handleStrategicResident(
     }
   };
 
-  // ── Git read-token background refresh ────────────────────────────────────────
-  // Periodically calls /api/agent/git-read-token and updates the credential
-  // helper's token file so `git fetch origin` keeps working beyond the 60-minute
-  // GitHub App installation token TTL. Self-scheduling named function expression
-  // so the timer reference is always non-null and cleared cleanly in the finally.
+  // ── Git token background refresh (push-capable) ──────────────────────────────
+  // Periodically calls /api/agent/github/token and updates the credential
+  // helper's token file so `git fetch origin` and `git push` keep working
+  // beyond the 60-minute GitHub App installation token TTL. Uses the
+  // push-capable endpoint (not the read-only /api/agent/git-read-token) so
+  // in-session writes (strategic ops that push or use the credential) do not
+  // get a stale read-only token after the first 8-minute refresh cycle.
+  // Self-scheduling named function expression so the timer reference is always
+  // non-null and cleared cleanly in the finally.
   let gitTokenRefreshTimer: ReturnType<typeof setTimeout>;
   function gitReadTokenRefreshTick(): void {
     void (async () => {
       try {
-        const result = await apiGet('/api/agent/git-read-token') as { token?: string } | null;
-        if (result?.token) {
-          writeGitTokenFile(result.token);
-          sendLog(ws, '[resident] git read token refreshed\n');
+        const result = await apiGet(`/api/agent/github/token?task_id=${encodeURIComponent(taskId)}`) as { data?: { token?: string } } | null;
+        const newToken = result?.data?.token;
+        if (newToken) {
+          writeGitTokenFile(newToken);
+          sendLog(ws, '[resident] git token refreshed (push-capable)\n');
         } else {
-          sendLog(ws, '[resident] git read token refresh: empty response (keeping existing token)\n');
+          sendLog(ws, '[resident] git token refresh: empty response (keeping existing token)\n');
         }
       } catch (e) {
-        sendLog(ws, `[resident] git read token refresh failed (keeping existing token): ${String(e)}\n`);
+        sendLog(ws, `[resident] git token refresh failed (keeping existing token): ${String(e)}\n`);
       }
       gitTokenRefreshTimer = setTimeout(gitReadTokenRefreshTick, GIT_TOKEN_REFRESH_MS);
     })();

@@ -265,14 +265,15 @@ describe('scheduleGithubTokenRefresh refresh callback (no token in remote URL)',
     expect(vi.mocked(setupGitCredentialHelper).mock.calls.flat().join(' ')).not.toContain(FRESH_TOKEN);
   });
 
-  it('read-only task: refreshes the token file only, touches no git auth config', async () => {
+  it('read-only task: refreshes all token files (same as write task — stale git creds break push too)', async () => {
     scheduleGithubTokenRefresh('task-ro', '/tmp/ws', 'owner', 'repo', true);
     await vi.advanceTimersByTimeAsync(GITHUB_TOKEN_REFRESH_MS);
     stopGithubTokenRefresh();
 
     expectCalledWith(writeGithubTokenFile, FRESH_TOKEN);
-    expect(vi.mocked(writeGitTokenFile)).not.toHaveBeenCalled();
-    expect(vi.mocked(setupGitCredentialHelper)).not.toHaveBeenCalled();
+    expectCalledWith(writeGitTokenFile, FRESH_TOKEN);
+    expectCalledWith(setupGitCredentialHelper, 'owner', 'repo', '/tmp/ws');
+    expect(vi.mocked(setupGitCredentialHelper).mock.calls.flat().join(' ')).not.toContain(FRESH_TOKEN);
   });
 
   it('stale generation refresh does not re-arm after teardown', async () => {

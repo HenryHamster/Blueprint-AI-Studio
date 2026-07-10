@@ -178,12 +178,16 @@ let githubRefreshGeneration = 0;
  *   1. Calls GET /api/agent/github/token?task_id=<taskId> (hits backend cache —
  *      zero GitHub API calls when the 50-min backend cache is warm).
  *   2. Writes the fresh token to GITHUB_TOKEN_FILE via writeGithubTokenFile.
- *   3. If NOT read-only: refreshes the on-disk git token file and (re)configures
- *      the credential helper that serves it, keeping the persisted origin URL
- *      clean (https://github.com/owner/repo.git) so the installation token is
- *      never written into .git/config nor exposed in the git process argv.
- *      Reuses git-credential.ts — the same mechanism the strategic resident
- *      installs at role start — rather than embedding the token in the URL.
+ *   3. Refreshes the on-disk git token file and (re)configures the credential
+ *      helper that serves it, keeping the persisted origin URL clean
+ *      (https://github.com/owner/repo.git) so the installation token is never
+ *      written into .git/config nor exposed in the git process argv.  Reuses
+ *      git-credential.ts — the same mechanism the strategic resident installs
+ *      at role start — rather than embedding the token in the URL.  A stale
+ *      credential file causes ``git push`` (and any GitHub git operation
+ *      through the credential helper) to fail once the 60-minute installation
+ *      token TTL passes, even for read-style tasks whose initial clone
+ *      succeeded with the fresh role-start token.
  *   4. Reschedules itself.
  */
 export function scheduleGithubTokenRefresh(
@@ -219,23 +223,26 @@ export function scheduleGithubTokenRefresh(
           const newToken = (data.data)?.token;
           if (newToken) {
             writeGithubTokenFile(newToken);
-            if (!isReadOnly) {
-              // Keep the installation token OUT of the persisted remote URL /
-              // .git/config and out of the git process argv. Rather than
-              // `git remote set-url origin https://x-access-token:<token>@…`
-              // (which lands the secret in .git/config for the task lifetime and
-              // briefly in the git argv), refresh the on-disk token file and
-              // (re)configure the credential helper that reads it, leaving the
-              // origin URL clean. Git then fetches fresh credentials from the
-              // helper on every network call. Reuses the same mechanism the
-              // strategic resident installs (git-credential.ts) instead of
-              // inventing a divergent one. Best-effort: a failure here just
-              // leaves the previously-configured auth in place.
-              try {
-                writeGitTokenFile(newToken);
-                setupGitCredentialHelper(owner, repo, workspace);
-              } catch { /* best effort */ }
-            }
+            // Keep the installation token OUT of the persisted remote URL /
+            // .git/config and out of the git process argv. Rather than
+            // `git remote set-url origin https://x-access-token:<token>@…`
+            // (which lands the secret in .git/config for the task lifetime and
+            // briefly in the git argv), refresh the on-disk token file and
+            // (re)configure the credential helper that reads it, leaving the
+            // origin URL clean. Git then fetches fresh credentials from the
+            // helper on every network call. Reuses the same mechanism the
+            // strategic resident installs (git-credential.ts) instead of
+            // inventing a divergent one. Best-effort: a failure here just
+            // leaves the previously-configured auth in place.
+            // Always runs — even for read-style tasks — because a stale
+            // credential file causes git push (and any git operation through
+            // the credential helper) to fail once the 60-minute installation
+            // token TTL passes, while the task originally cloned successfully
+            // with the fresh role-start token.
+            try {
+              writeGitTokenFile(newToken);
+              setupGitCredentialHelper(owner, repo, workspace);
+            } catch { /* best effort */ }
             log('GitHub token refresh: succeeded');
           } else {
             log('GitHub token refresh: backend returned no token — continuing with current token');
