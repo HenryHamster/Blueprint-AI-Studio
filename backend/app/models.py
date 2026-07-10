@@ -2088,6 +2088,7 @@ class ComputeJob(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_computejob_project_status", "project_id", "status"),
+        Index("ix_computejob_project_status_created", "project_id", "status", "created_at"),
         Index("ix_computejob_task_status", "task_id", "status"),
         Index("ix_computejob_backend_external", "backend", "external_compute_id"),
         Index("ix_computejob_status_deadline", "status", "wall_clock_deadline"),
@@ -2679,6 +2680,7 @@ class Alert(SQLModel, table=True):
         Index("ix_alert_project_domain", "project_id", "domain"),
         Index("ix_alert_project_event_type", "project_id", "event_type"),
         Index("ix_alert_project_source", "project_id", "source"),
+        Index("ix_alert_project_created_at", "project_id", "created_at"),
         Index(
             "ux_alert_active_dedupe_key",
             "project_id",
@@ -3724,6 +3726,7 @@ class KnowledgeDocument(SQLModel, table=True):
             "source_kind",
             "lifecycle_status",
         ),
+        Index("ix_knowledge_document_project_lifecycle_created", "project_id", "lifecycle_status", "created_at"),
     )
 
 
