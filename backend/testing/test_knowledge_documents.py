@@ -5320,3 +5320,527 @@ async def test_build_pending_followups_excludes_research_audit(db_session):
     ids = {e["id"] for e in entries}
     assert str(doc_design.id) in ids, "design doc should appear"
     assert str(doc_audit.id) not in ids, "research_audit doc must NOT appear in lifecycle followups"
+
+
+# ── lifecycle ops: null lifecycle_status edge cases ──────────────────────
+
+
+async def _make_null_lifecycle_doc(db_session, project, task):
+    """Create a KnowledgeDocument then force lifecycle_status=NULL via raw SQL.
+
+    The ORM model defines lifecycle_status as NOT NULL with a default of
+    'pending', which prevents setting None through the ORM. Using raw SQL
+    bypasses the default and simulates legacy docs created before migration
+    0446 or via out-of-band code paths that bypass the ORM default.
+
+    Returns the doc with lifecycle_status set to ``None``, or marks the test
+    as skipped if the database driver enforces NOT NULL (PostgreSQL with a
+    fully-applied migration) and refuses the NULL assignment.
+    """
+    import sqlalchemy.exc
+    from app.models import SourceKind
+    from sqlalchemy import text
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Null lifecycle doc",
+        summary="A doc with null lifecycle_status.",
+        body="# Null lifecycle",
+        lifecycle_status="pending",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+    try:
+        await db_session.execute(
+            text("UPDATE knowledgedocument SET lifecycle_status = NULL WHERE id = :id"),
+            {"id": doc.id},
+        )
+        await db_session.commit()
+        await db_session.refresh(doc)
+    except sqlalchemy.exc.IntegrityError:
+        pytest.skip(
+            "Database refuses NULL lifecycle_status (NOT NULL constraint). "
+            "Production docs with null lifecycle_status exist due to an "
+            "outstanding schema gap; this test exercises behavior in "
+            "environments that can reproduce that state."
+        )
+        return None  # unreachable
+    return doc
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_followup_null_lifecycle_returns_409(
+    client: AsyncClient, db_session,
+):
+    """dismiss_knowledge_followup returns 409 when lifecycle_status is null.
+
+    Legacy KnowledgeDocuments created before lifecycle_status was enforced
+    (migration 0446) may have lifecycle_status=NULL. The followup dismiss op
+    requires exactly 'pending' and must reject null explicitly.
+    """
+    from app.auth import create_agent_token
+
+    project = make_project(name="null-lifecycle-dismiss")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Src for null lifecycle dismiss",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = await _make_null_lifecycle_doc(db_session, project, src_task)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review for null lifecycle",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="vm-null-lifecycle-dismiss",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-null-lifecycle-dismiss", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge_followup",
+            "data": {
+                "document_id": str(doc.id),
+                "reason": "Test dismiss of null lifecycle doc",
+            },
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert "lifecycle_status" in body.get("detail", "")
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_followup_null_lifecycle_returns_409(
+    client: AsyncClient, db_session,
+):
+    """consume_knowledge_followup returns 409 when lifecycle_status is null."""
+    from app.auth import create_agent_token
+
+    project = make_project(name="null-lifecycle-consume")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Src for null lifecycle consume",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = await _make_null_lifecycle_doc(db_session, project, src_task)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review for null lifecycle consume",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="vm-null-lifecycle-consume",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-null-lifecycle-consume", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge_followup",
+            "data": {
+                "document_id": str(doc.id),
+            },
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert "lifecycle_status" in body.get("detail", "")
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_followup_consumed_returns_409(
+    client: AsyncClient, db_session,
+):
+    """dismiss_knowledge_followup returns 409 when lifecycle_status is already 'consumed'."""
+    from app.auth import create_agent_token
+    from app.models import SourceKind
+
+    project = make_project(name="dismiss-consumed")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Src for dismiss of consumed",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=src_task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Consumed doc",
+        summary="Already consumed doc.",
+        body="# Consumed",
+        lifecycle_status="consumed",
+        consumed_at=_utcnow_func(),
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="vm-dismiss-consumed",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-dismiss-consumed", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge_followup",
+            "data": {
+                "document_id": str(doc.id),
+                "reason": "Try dismiss consumed doc",
+            },
+        },
+    )
+    assert resp.status_code == 409, resp.text
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_followup_dismissed_returns_409(
+    client: AsyncClient, db_session,
+):
+    """consume_knowledge_followup returns 409 when lifecycle_status is already 'dismissed'."""
+    from app.auth import create_agent_token
+    from app.models import SourceKind
+
+    project = make_project(name="consume-dismissed")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Src for consume of dismissed",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=src_task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Dismissed doc",
+        summary="Already dismissed doc.",
+        body="# Dismissed",
+        lifecycle_status="dismissed",
+        dismissed_at=_utcnow_func(),
+        dismissed_reason="Not relevant",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="vm-consume-dismissed",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-consume-dismissed", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge_followup",
+            "data": {
+                "document_id": str(doc.id),
+            },
+        },
+    )
+    assert resp.status_code == 409, resp.text
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_followup_missing_reason_returns_400(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge_followup returns 400 when reason is empty or missing."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    # Empty reason
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge_followup",
+            "data": {
+                "document_id": str(doc.id),
+                "reason": "",
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "reason" in resp.text.lower()
+
+    # Missing reason key entirely
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge_followup",
+            "data": {"document_id": str(doc.id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+    assert "reason" in resp.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_followup_not_found_returns_404(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge_followup returns 404 when the document does not exist."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    unknown_id = uuid.uuid4()
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge_followup",
+            "data": {
+                "document_id": str(unknown_id),
+                "reason": "Doc does not exist",
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_followup_not_found_returns_404(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """consume_knowledge_followup returns 404 when the document does not exist."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    unknown_id = uuid.uuid4()
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge_followup",
+            "data": {"document_id": str(unknown_id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_followup_data_not_dict_returns_400(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge_followup returns 400 when data is not a dict."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge_followup",
+            "data": "not-a-dict",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_followup_data_not_dict_returns_400(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """consume_knowledge_followup returns 400 when data is not a dict."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge_followup",
+            "data": "not-a-dict",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_null_lifecycle_succeeds(
+    client: AsyncClient, db_session,
+):
+    """dismiss_knowledge (non-followup variant) works on null lifecycle_status docs.
+
+    Unlike dismiss_knowledge_followup, the simpler dismiss op does not require
+    lifecycle_status to be 'pending' — it directly sets it to 'dismissed'. This
+    is the correct escape hatch for legacy docs with null lifecycle_status.
+    """
+    from app.auth import create_agent_token
+
+    project = make_project(name="null-dismiss-op")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Src for null dismiss op",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = await _make_null_lifecycle_doc(db_session, project, src_task)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review for null dismiss op",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="vm-null-dismiss-op",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-null-dismiss-op", task_type="strategic_review")
+    reason = "Superseded by later design"
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {
+                "knowledge_document_id": str(doc.id),
+                "reason": reason,
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "dismiss_knowledge"
+
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "dismissed"
+    assert doc.dismissed_at is not None
+    assert doc.dismissed_reason == reason
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_null_lifecycle_succeeds(
+    client: AsyncClient, db_session,
+):
+    """consume_knowledge (non-followup variant) works on null lifecycle_status docs."""
+    from app.auth import create_agent_token
+
+    project = make_project(name="null-consume-op")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Src for null consume op",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = await _make_null_lifecycle_doc(db_session, project, src_task)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review for null consume op",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="vm-null-consume-op",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-null-consume-op", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": str(doc.id)},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "consume_knowledge"
+
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "consumed"
+    assert doc.consumed_at is not None
