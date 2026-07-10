@@ -1835,7 +1835,29 @@ async def spawn_corroboration_task(
     attestation itself is never blocked by a spawn failure.
     """
     try:
-        from app.models import Task  # noqa: PLC0415
+        from app.models import Task, TaskStatus  # noqa: PLC0415
+
+        # Dedup: skip spawning when a non-terminal corroboration task already
+        # exists for this criterion.  The attest endpoint calls this on BOTH
+        # fresh attestation and re-attestation (renewal), so without this
+        # guard every re-attest would create a duplicate task.
+        existing = await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.title == f"Verify: {criterion_key}",
+                Task.status.not_in(
+                    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+                ),
+            )
+        )
+        if existing.scalars().first() is not None:
+            logger.info(
+                "[AC] Corroboration task already exists for criterion %s "
+                "(project %s) — skipping spawn",
+                criterion_key,
+                project_id,
+            )
+            return
 
         task = Task(
             project_id=project_id,

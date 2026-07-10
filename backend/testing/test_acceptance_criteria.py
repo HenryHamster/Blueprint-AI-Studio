@@ -6726,3 +6726,71 @@ async def test_attestation_spawns_corroboration_task(client: AsyncClient, db_ses
     assert "Verify: " in spawned.title, (
         f"Task title {spawned.title!r} should start with 'Verify:'"
     )
+
+
+@pytest.mark.asyncio
+async def test_reattest_does_not_duplicate_corroboration_task(
+    client: AsyncClient, db_session
+):
+    """Re-attestation must NOT spawn a second corroboration task.
+
+    Acceptance evidence for the dedup fix: a criterion that is attested,
+    then re-attested (renewed) by the same operator must result in exactly
+    ONE ``'Verify: {criterion_key}'`` Task row, not two.  The second POST
+    goes through the UPSERT (IntegrityError) path which also calls
+    ``spawn_corroboration_task`` — the dedup guard in that function must
+    skip the second spawn.
+    """
+    project = await _make_project_with_member(
+        db_session, name="ReAttest-No-Dup"
+    )
+    version = ReleaseVersion(
+        project_id=project.id, version_number=1, status="open"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion for re-attest dedup"
+    )
+
+    url = (
+        f"/api/admin/projects/{project.id}"
+        f"/acceptance-criteria/{criterion.criterion_key}/attest"
+    )
+
+    # First attestation — should spawn 1 corroboration task.
+    resp1 = await client.post(url, json={"reason": "First attest — spawn"})
+    assert resp1.status_code == 200, resp1.text
+
+    # Second attestation (re-attest / renewal) — should NOT spawn a
+    # second corroboration task.
+    resp2 = await client.post(
+        url, json={"reason": "Re-attest — should not duplicate"}
+    )
+    assert resp2.status_code == 200, resp2.text
+
+    # Query for corroboration tasks: there must be exactly one.
+    from app.models import Task as _Task
+
+    tasks = (
+        (
+            await db_session.execute(
+                select(_Task).where(
+                    _Task.project_id == project.id,
+                    _Task.title == f"Verify: {criterion.criterion_key}",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1, (
+        f"Re-attestation must not create a duplicate corroboration task; "
+        f"expected 1, found {len(tasks)}"
+    )
+    spawned = tasks[0]
+    assert spawned.status == TaskStatus.QUEUED
+    assert spawned.criterion_ids == [criterion.criterion_key]
+    assert spawned.created_by == "SYSTEM_AUTO_REVIEW"
