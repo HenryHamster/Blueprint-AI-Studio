@@ -463,6 +463,14 @@ async def reconcile_backfill(
             session, open_version
         )
 
+    # Unverified-merge backfill: tasks whose staging merge fell open could never
+    # record evidence via record_task_merge_evidence (because the verdict is
+    # proven=False).  This runs in parallel with the direction merge evidence
+    # backfill to give those tasks a recovery path to criterion coverage.
+    unverified_evidence = await ac.backfill_unverified_merge_evidence(
+        session, project_id, direction_key=body.direction_key
+    )
+
     if body.direction_key is not None:
         # Backfill a single direction.
         rows = await ac.backfill_direction_merge_evidence(
@@ -473,6 +481,7 @@ async def reconcile_backfill(
             "results": [{"direction_key": body.direction_key, "evidence_recorded": rows}],
             "total_evidence_recorded": rows,
             "acceptance_window_evidence_recorded": window_evidence,
+            "unverified_merge_evidence_recorded": unverified_evidence,
         }
 
     # Backfill all directions in the project.
@@ -510,15 +519,17 @@ async def reconcile_backfill(
 
     logger.info(
         "[AC] reconcile-backfill: project=%s directions=%d total_recorded=%d "
-        "acceptance_window_evidence=%d",
+        "acceptance_window_evidence=%d unverified_merge_evidence=%d",
         project_id,
         len(direction_keys),
         total,
         window_evidence,
+        unverified_evidence,
     )
     return {
         "status": "ok",
         "results": results,
         "total_evidence_recorded": total,
         "acceptance_window_evidence_recorded": window_evidence,
+        "unverified_merge_evidence_recorded": unverified_evidence,
     }

@@ -254,12 +254,24 @@ def mark_landed_on_integration(task: Task) -> None:
     import avoids the module-load cycle (``acceptance_gate`` imports this module
     for its constants).
     """
+    had_non_merge_unblock = NON_MERGE_UNBLOCK_REASON_KEY in (task.context or {})
     ctx = {
         **(task.context or {}),
         LANDED_SIGNAL_KEY: True,
         LANDED_ON_INTEGRATION_KEY: True,
     }
     ctx.pop(NON_MERGE_UNBLOCK_REASON_KEY, None)
+    # When a staging-merged child is promoted to integration-landed, clear the
+    # stale unverified_merge_reason the staging CI monitor stamped.  Staging
+    # branches genuinely lack CI, but the task now reaches integration through
+    # the rollup parent, whose CI serves as the real verification gate.  Only
+    # clear when _non_merge_unblock_reason was present (the task was previously
+    # staging-merged), so direct integration merges with legitimate unverified
+    # reasons are unaffected.
+    if had_non_merge_unblock:
+        review_loop = ctx.get(REVIEW_LOOP_KEY)
+        if isinstance(review_loop, dict):
+            review_loop.pop(UNVERIFIED_MERGE_REASON_KEY, None)
     task.context = ctx
     try:
         from app.acceptance_gate import record_code_acceptance_verdict

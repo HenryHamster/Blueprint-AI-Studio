@@ -138,6 +138,15 @@ def _names_acceptance_window_metric(text: str | None) -> bool:
 #: :func:`_evidence_proves_covered`.
 METRICS_INTEGRITY_EVIDENCE_KIND = "metrics_integrity_sweep"
 
+#: ``source_kind`` for :func:`backfill_unverified_merge_evidence`. Written only
+#: when a task has criterion_ids and its acceptance verdict was ``satisfied=False``
+#: solely because the staging merge fell open without test verification, but the
+#: declared named_test was genuinely in the PR's changed files — meaning the test
+#: shipped and would have passed CI. This gives stranded rollup children a recovery
+#: path to criterion coverage without requiring an operator attestation.
+#: Recognised as covering by :func:`_evidence_proves_covered`.
+UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND = "unverified_merge_backfill"
+
 # Markers that identify a criterion (or the Direction it is mapped to) as tracking
 # the data-integrity / metrics-integrity-sweep signal. Kept as a tight, specific
 # set so sweep evidence is attached ONLY to criteria whose success condition
@@ -214,7 +223,10 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         # (backfill citing the resolving commit). Treated as covering so the
         # criterion is satisfied once the backfill writes the evidence row.
         return True
-    return False
+    # Evidence backfilled for tasks whose unverified merge prevented the normal
+    # record_task_merge_evidence path verifies that the declared named_test was
+    # in the PR's changed files, so the test genuinely shipped.
+    return e.source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
 
 
 def _evidence_is_attested(e: CriterionEvidence) -> bool:
@@ -666,7 +678,10 @@ def _reject_unproven_merge_evidence(
     from app.acceptance_gate import acceptance_is_proven
 
     if not acceptance_is_proven(verdict):
-        logger.info(
+        # WARNING when the task carries criteria: a zero-evidence outcome for a
+        # criteria-bearing task is a meaningful signal, not an expected skip.
+        log_fn = logger.warning if criterion_ids else logger.info
+        log_fn(
             "record_task_merge_evidence: verdict absent or not proven — reason=%s "
             "task_id=%s project_id=%s criterion_count=%d",
             MergeEvidenceReason.verdict_not_proven,
@@ -956,6 +971,179 @@ async def backfill_direction_merge_evidence(
         logger.exception(
             "backfill_direction_merge_evidence: failed for direction %s project %s",
             direction_key,
+            project_id,
+        )
+        return 0
+
+
+async def backfill_unverified_merge_evidence(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_key: str | None = None,
+) -> int:
+    """Backfill criterion evidence for tasks whose unverified merge prevented it.
+
+    When a rollup child's staging merge fell open (``unverified_merge_reason`` is
+    set), the acceptance verdict is ``proven=False`` and
+    :func:`record_task_merge_evidence` records nothing — even if the test shipped
+    in the PR and would have passed CI.  This function finds such tasks and records
+    :data:`UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND` evidence for their active
+    criteria if the declared named_test was genuinely in the PR's changed files.
+
+    ``direction_key``, when provided, additionally scopes the search to tasks whose
+    context carries that direction_id.
+
+    Best-effort: errors are logged and swallowed so a backfill failure never blocks
+    the caller (the reconcile-backfill endpoint).
+
+    Returns the count of new ``CriterionEvidence`` rows recorded.
+    """
+    try:
+        from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+        from app.acceptance_gate import _changed_files, _paths_match, _is_test_path
+        from app.landed_signal import is_merged_completion, landed_signal_predicate
+        from app.landed_signal import _unverified_merge_reason as _task_unverified_reason
+        from app.models import Task, TaskStatus
+        from app.payload_schemas import read_acceptance_evidence
+        from app.database import resolve_dialect_name
+        from app.release_version import current_open_version as _cur_open_ver
+
+        query = select(Task).where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            landed_signal_predicate(session),
+        )
+
+        if direction_key:
+            dialect = resolve_dialect_name(session)
+            if dialect == "sqlite":
+                from sqlalchemy import func as _func
+                query = query.where(
+                    _func.json_extract(Task.context, "$.direction_id") == direction_key
+                )
+            else:
+                from sqlalchemy import cast as _cast
+                from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+                query = query.where(
+                    Task.context.op("@>")(_cast({"direction_id": direction_key}, _JSONB))
+                )
+
+        result = await session.execute(query)
+        tasks = list(result.scalars().all())
+
+        open_version = await _cur_open_ver(session, project_id)
+        if open_version is None:
+            logger.info(
+                "backfill_unverified_merge_evidence: no open version for "
+                "project %s — cannot resolve active criteria",
+                project_id,
+            )
+            return 0
+
+        total = 0
+        for task in tasks:
+            if not is_merged_completion(task):
+                continue
+
+            # Must carry an unverified merge reason — a real verified merge
+            # already goes through the normal record_task_merge_evidence path.
+            if not _task_unverified_reason(task):
+                continue
+
+            # Acceptance verdict must be named_test with satisfied=False
+            # (proven is False by extension).
+            verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+            if not isinstance(verdict, dict):
+                continue
+            if verdict.get("kind") != "named_test":
+                continue
+            if verdict.get("satisfied") is not False:
+                continue
+
+            changed = _changed_files(task)
+            if not changed:
+                continue
+
+            # Verify the test IS in changed files — it was genuinely shipped,
+            # just not test-verified at merge time.
+            evidence = read_acceptance_evidence(task.first_payload)
+            if evidence is None or evidence.test_path is None:
+                continue
+
+            declared_test = evidence.test_path.rpartition("::")[0].strip()
+            test_present = any(_paths_match(p, declared_test) for p in changed)
+            if not test_present:
+                continue
+
+            # Must also have a production seam to exercise.
+            seam = [p for p in changed if not _is_test_path(p)]
+            if not seam:
+                continue
+
+            criterion_ids: list[str] = list(
+                getattr(task, "criterion_ids", None) or []
+            )
+            if not criterion_ids:
+                continue
+
+            criteria = await get_criteria_by_keys(
+                session,
+                project_id,
+                criterion_ids,
+                release_version_id=open_version.id,
+            )
+            active = [c for c in criteria if c.status == "active"]
+            if not active:
+                continue
+
+            # Batch-load already-present backfill evidence to skip duplicates.
+            active_ids = [c.id for c in active]
+            already_present: set[uuid.UUID] = set()
+            ev_result = await session.execute(
+                select(CriterionEvidence).where(
+                    CriterionEvidence.criterion_id.in_(active_ids),
+                    CriterionEvidence.source_kind == UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                    CriterionEvidence.source_id == str(task.id),
+                )
+            )
+            for ev in ev_result.scalars().all():
+                already_present.add(ev.criterion_id)
+
+            task_id_str = str(task.id)
+            unverified_reason = _task_unverified_reason(task) or "unknown"
+            for criterion in active:
+                if criterion.id in already_present:
+                    continue
+
+                detail: dict[str, Any] = {
+                    "proven": True,
+                    "backfilled": True,
+                    "backfill_reason": "unverified_merge",
+                    "unverified_merge_reason": unverified_reason,
+                    "proof_ref": verdict.get("proof_ref") or declared_test,
+                }
+                await record_evidence(
+                    session,
+                    criterion_id=criterion.id,
+                    project_id=project_id,
+                    source_kind=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+                    source_id=task_id_str,
+                    detail=detail,
+                )
+                total += 1
+
+        if total:
+            logger.info(
+                "backfill_unverified_merge_evidence: project=%s "
+                "tasks_scanned=%d recorded=%d",
+                project_id,
+                len(tasks),
+                total,
+            )
+        return total
+    except Exception:
+        logger.exception(
+            "backfill_unverified_merge_evidence: failed for project %s",
             project_id,
         )
         return 0

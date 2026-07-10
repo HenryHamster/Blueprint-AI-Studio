@@ -23323,6 +23323,157 @@ class TestStrategistSpawnCriterionIds:
             f"got {resp3.status_code}: {resp3.text}"
         )
 
+    @pytest.mark.asyncio
+    async def test_direction_criterion_keys_require_acceptance_evidence(
+        self, client: AsyncClient, db_session
+    ):
+        """Direction-derived criterion_keys without named_test acceptance_evidence
+        is rejected (400).
+
+        When criterion_ids come from the direction row (not the explicit
+        strategist payload), the guard must still reject non-named_test
+        acceptance_evidence — otherwise the spawned task would get a proven=False
+        verdict at merge time and never record criterion evidence.
+        """
+        import uuid as _uuid
+        from app.auth import create_agent_token
+        from app.models import Direction, VersionAcceptanceCriterion
+
+        project = Project(name="DirCritKeyReqAESpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        rv = await _make_open_version(db_session, project.id)
+        dir_key = f"c-dir-{_uuid.uuid4().hex[:8]}"
+        db_session.add(
+            VersionAcceptanceCriterion(
+                project_id=project.id,
+                release_version_id=rv.id,
+                criterion_key=dir_key,
+                status="active",
+                text="Direction criterion requiring evidence",
+            )
+        )
+        await db_session.commit()
+
+        direction_id_str = f"d-{_uuid.uuid4().hex[:8]}"
+        direction = Direction(
+            project_id=project.id,
+            direction_key=direction_id_str,
+            status="active",
+            text="Direction with criterion_keys",
+            data={"id": direction_id_str, "status": "active", "text": "Direction"},
+            criterion_keys=[dir_key],
+        )
+        db_session.add(direction)
+        await db_session.commit()
+
+        project.directions = [
+            {"id": direction_id_str, "status": "active", "text": "Direction"}
+        ]
+        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+        _flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for dir-crit-no-evidence",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-dir-crit-no-ae-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-dir-crit-no-ae-test",
+            task_type="strategic_review",
+        )
+
+        # Case 1: direction_id (direction has criterion_keys) without acceptance_evidence → 400
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with direction criterion_keys but no evidence",
+                    "prompt": "Investigate the direction-criterion gap",
+                    "direction_id": direction_id_str,
+                },
+            },
+        )
+        assert resp.status_code == 400, (
+            f"expected 400 when direction criterion_keys lacks acceptance_evidence, "
+            f"got {resp.status_code}: {resp.text}"
+        )
+        msg = resp.json().get("detail") or resp.json().get("error", {}).get("message", "")
+        assert "acceptance_evidence" in msg, (
+            f"error must mention acceptance_evidence, got: {msg!r}"
+        )
+        assert "named_test" in msg, (
+            f"error must mention named_test, got: {msg!r}"
+        )
+
+        # Case 2: direction_id with non-named_test acceptance_evidence → 400
+        resp2 = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with direction criterion_keys wrong evidence",
+                    "prompt": "Investigate the direction-criterion gap",
+                    "direction_id": direction_id_str,
+                    "acceptance_evidence": {
+                        "kind": "observable_behavior",
+                        "description": "the task produces a passing test",
+                    },
+                },
+            },
+        )
+        assert resp2.status_code == 400, (
+            f"expected 400 when direction criterion_keys has non-named_test evidence, "
+            f"got {resp2.status_code}: {resp2.text}"
+        )
+        msg2 = resp2.json().get("detail") or resp2.json().get("error", {}).get("message", "")
+        assert "named_test" in msg2, (
+            f"error must mention named_test, got: {msg2!r}"
+        )
+
+        # Case 3: direction_id with named_test acceptance_evidence → 200
+        resp3 = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with direction criterion_keys and named_test",
+                    "prompt": "Investigate the direction-criterion gap",
+                    "direction_id": direction_id_str,
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_admin_routers.py",
+                    },
+                },
+            },
+        )
+        assert resp3.status_code == 200, (
+            f"expected 200 when direction criterion_keys has named_test evidence, "
+            f"got {resp3.status_code}: {resp3.text}"
+        )
+
 
 @pytest.mark.asyncio
 async def test_qa_task_receives_rejection_patterns(client: AsyncClient, db_session):

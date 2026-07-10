@@ -20,9 +20,13 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
 )
 from app.branch_resolution import get_project_integration_branch
-from app.landed_signal import apply_merged_landed_signal, mark_landed_on_integration
+from app.landed_signal import (
+    apply_merged_landed_signal,
+    mark_landed_on_integration,
+    NON_MERGE_UNBLOCK_REASON_KEY,
+)
 from app.models import Project, Task, TaskStatus
-from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY, LANDED_ON_INTEGRATION_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -394,3 +398,104 @@ async def test_first_autonomous_improvement_stamp_is_idempotent(db_session):
     assert (project.build_config or {}).get(
         "first_autonomous_improvement_at"
     ) == first_value
+
+
+# ---------------------------------------------------------------------------
+# Stale unverified_merge_reason clearing on staging→integration promotion
+# ---------------------------------------------------------------------------
+
+
+def test_stale_unverified_reason_cleared_on_promotion_to_integration():
+    """When a staging-merged child is promoted to integration-landed, the stale
+    unverified_merge_reason is cleared so the acceptance verdict evaluates
+    _merge_was_test_verified correctly.
+
+    A staging-merged child carries _non_merge_unblock_reason (set by
+    mark_unblocked_non_merge when the PR merged to a staging branch) and
+    review_loop["unverified_merge_reason"]="internal_staging_base" (stamped
+    by the CI monitor because staging branches lack CI).  When the rollup
+    parent lands on integration and propagation calls
+    mark_landed_on_integration(child), the stale staging-branch reason must
+    be cleared — the task now reaches integration through the rollup, whose
+    CI serves as the real verification gate.  Only clearing when
+    _non_merge_unblock_reason was present ensures direct integration merges
+    with legitimate unverified reasons are unaffected.
+    """
+    task = _make_code_task_with_evidence(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+            "test_id": "test_widget_handles_empty",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason="internal_staging_base",
+    )
+    # Staging-merge marker: _non_merge_unblock_reason present on original context.
+    task.context = {
+        **(task.context or {}),
+        NON_MERGE_UNBLOCK_REASON_KEY: "merged_pr_non_integration_branch",
+    }
+
+    mark_landed_on_integration(task)
+
+    # The stale staging-branch unverified_merge_reason must be cleared.
+    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    assert isinstance(review_loop, dict)
+    assert UNVERIFIED_MERGE_REASON_KEY not in review_loop
+
+    # The landing flags must be stamped correctly.
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+    assert NON_MERGE_UNBLOCK_REASON_KEY not in task.context
+
+    # The acceptance verdict must be proven=True — the cleared reason lets
+    # _merge_was_test_verified return True, and the test+prod files match.
+    assert CODE_ACCEPTANCE_VERDICT_KEY in (task.context or {})
+    verdict = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert verdict["satisfied"] is True, f"verdict unsatisfied: {verdict.get('reason')}"
+    assert verdict["proven"] is True, f"verdict not proven: {verdict.get('reason')}"
+    assert verdict["kind"] == "named_test"
+    bucket = classify_merged_acceptance_context(task.context)
+    assert bucket == "proven", f"expected 'proven', got {bucket!r}"
+
+
+def test_unverified_merge_reason_preserved_on_direct_landing():
+    """A direct integration merge with a legitimate unverified_merge_reason
+    (e.g., kill_switch_off) and NO _non_merge_unblock_reason must preserve
+    the reason — the task was never staging-merged, so the reason is real.
+
+    The guard must be narrow: only tasks that were previously staging-merged
+    (had _non_merge_unblock_reason) get their unverified_merge_reason cleared.
+    A direct landing with a real unverified reason must keep it so the
+    acceptance verdict correctly reflects that the merge was not CI-verified.
+    """
+    task = _make_code_task_with_evidence(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+            "test_id": "test_widget_handles_empty",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason="kill_switch_off",
+    )
+    # No _non_merge_unblock_reason — this is a direct integration merge.
+
+    mark_landed_on_integration(task)
+
+    # The legitimate unverified_merge_reason must NOT be cleared.
+    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    assert isinstance(review_loop, dict)
+    assert review_loop.get(UNVERIFIED_MERGE_REASON_KEY) == "kill_switch_off"
+
+    # The landing flags must be stamped correctly.
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+
+    # The acceptance verdict must reflect the unverified merge:
+    # _merge_was_test_verified returns False, so the named_test gate
+    # records satisfied=False (the merge fell open without verification).
+    assert CODE_ACCEPTANCE_VERDICT_KEY in (task.context or {})
+    verdict = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert verdict["satisfied"] is False, f"expected unsatisfied, got {verdict}"
+    assert verdict["proven"] is False
+    assert verdict["kind"] == "named_test"
+    bucket = classify_merged_acceptance_context(task.context)
+    assert bucket == "declared_unsatisfied", f"expected 'declared_unsatisfied', got {bucket!r}"

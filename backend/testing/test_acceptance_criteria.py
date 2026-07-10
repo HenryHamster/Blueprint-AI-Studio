@@ -2583,6 +2583,10 @@ async def test_spawn_task_endpoint_propagates_criterion_ids(
                 "prompt": "investigate stability regression",
                 "title": "Stability research",
                 "direction_id": direction_key,
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "testing/test_acceptance_criteria.py",
+                },
             },
         },
     )
@@ -4048,6 +4052,54 @@ async def test_record_task_merge_evidence_logs_verdict_not_proven(db_session, ca
     assert result == 0
     assert any(MergeEvidenceReason.verdict_not_proven in r.message for r in caplog.records), (
         f"Expected verdict_not_proven in log; got: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_verdict_not_proven_level_reflects_criteria(
+    db_session, caplog
+):
+    """verdict_not_proven is at WARNING level when criterion_ids are present.
+
+    The log level promotes from INFO (no criteria, expected skip) to WARNING
+    (criteria present but none recorded — a zero-evidence outcome for a
+    criteria-bearing task that operators should be able to detect).
+    """
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "LogVerdictLevel")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Level-test criterion"
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        context={CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": False, "proven": False}},
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with caplog.at_level(logging.DEBUG, logger="app.acceptance_criteria"):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert result == 0
+    verdict_records = [
+        r
+        for r in caplog.records
+        if MergeEvidenceReason.verdict_not_proven in r.message
+    ]
+    assert len(verdict_records) >= 1, (
+        f"Expected verdict_not_proven in log; got: {[r.message for r in caplog.records]}"
+    )
+    assert verdict_records[0].levelno == logging.WARNING, (
+        f"Expected WARNING level, got "
+        f"{logging.getLevelName(verdict_records[0].levelno)}"
     )
 
 
@@ -5945,3 +5997,438 @@ async def test_plan_completion_propagates_criterion_ids_from_direction(db_sessio
     assert (child.context or {}).get("direction_id") == "d-plan-prop", (
         "child context must carry parent direction_id"
     )
+
+
+# ---------------------------------------------------------------------------
+# backfill_unverified_merge_evidence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_covers_unproven_verdict(db_session):
+    """Unverified-merge task whose named_test shipped SHOULD get backfill evidence.
+
+    When a task merges with unverified_merge_reason set, the acceptance verdict
+    is proven=False and record_task_merge_evidence records nothing. The backfill
+    must find such tasks, verify the test was in changed files, and record
+    unverified_merge_backfill evidence so the criterion reaches 'covered'.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeCoverage")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Unverified merge criterion",
+        created_by="strategist",
+    )
+
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key="d-unver-cover",
+        data={"id": "d-unver-cover", "text": "Unverified coverage", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+
+    # Simulate a completed task with unverified merge, where the named_test was
+    # genuinely in changed files but the merge fell open (no CI verification).
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_unverified_merge.py::test_feature_x",
+            },
+        }],
+        context={
+            "direction_id": "d-unver-cover",
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+            "_pr_changed_files": [
+                "testing/test_unverified_merge.py",
+                "backend/app/target_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "declared named_test 'testing/test_unverified_merge.py::test_feature_x' "
+                          "did not run green under a real merge-test verdict "
+                          "(the merge fell open without verification)",
+                "proof_ref": "testing/test_unverified_merge.py::test_feature_x",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Before backfill: the criterion has no evidence.
+    evidence_before = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence_before == [], "No evidence before backfill"
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+
+    assert recorded == 1, (
+        f"Expected 1 evidence row for 1 criterion; got {recorded}"
+    )
+    evidence_after = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_after) == 1
+    assert evidence_after[0].source_kind == ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND
+    assert evidence_after[0].source_id == str(task.id)
+    assert evidence_after[0].detail is not None
+    assert evidence_after[0].detail.get("proven") is True
+    assert evidence_after[0].detail.get("backfill_reason") == "unverified_merge"
+    assert evidence_after[0].detail.get("unverified_merge_reason") == "verify_setup_failed"
+
+    coverage = ac.compute_criterion_coverage(evidence_after)
+    assert coverage == "covered", f"Expected 'covered', got '{coverage}'"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_skips_verified_merge(db_session):
+    """Verified merges are NOT touched by the unverified-merge backfill."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeSkipVerified")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Verified merge criterion",
+    )
+
+    # Task with a VERIFIED merge (review_loop exists but no unverified_merge_reason).
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "verified"}],
+        context={
+            "direction_id": "d-verified",
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {"pr_number": 1},
+            "_pr_changed_files": [
+                "testing/test_verified.py",
+                "backend/app/verified_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "some reason",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 0, "Verified merge must not produce unverified-merge backfill evidence"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence == [], "Verified merge must not produce evidence via unverified backfill"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_skips_test_not_in_changed(db_session):
+    """Unverified-merge task whose test WASN'T in changed files gets NO backfill."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeSkipMissingTest")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Criterion for missing-test task",
+    )
+
+    # Task with unverified merge and a named_test that is NOT in changed files.
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add missing test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_never_added.py::test_whatever",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "ci_setup_failed"},
+            "_pr_changed_files": [
+                "backend/app/some_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "declared named_test 'testing/test_never_added.py::test_whatever' "
+                          "is not among the PR's changed files",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 0, "Task with test not in changed files must NOT get backfill evidence"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence == [], "No evidence expected"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_skips_no_criterion_ids(db_session):
+    """Task with no criterion_ids gets no backfill evidence."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeSkipNoCriterion")
+    version = await _make_version(db_session, project)
+
+    # Create a criterion but do NOT link it to the task.
+    await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Unlinked criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "no criteria",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_no_criteria.py::test_x",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+            "_pr_changed_files": [
+                "testing/test_no_criteria.py",
+                "backend/app/some_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "unverified merge",
+            },
+        },
+        # No criterion_ids — should yield no evidence.
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 0, "Task without criterion_ids must not produce backfill evidence"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_idempotent(db_session):
+    """Second call to backfill_unverified_merge_evidence records 0 new rows."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeIdempotent")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Idempotent criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "idempotent test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_idempotent.py::test_x",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "no_detectable_test_command"},
+            "_pr_changed_files": [
+                "testing/test_idempotent.py",
+                "backend/app/idempotent_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "unverified merge",
+                "proof_ref": "testing/test_idempotent.py::test_x",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    first = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert first == 1, f"First call should record 1 row; got {first}"
+
+    second = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert second == 0, "Second call must be idempotent (0 new rows)"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1, "Should still be exactly 1 evidence row"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_scopes_by_direction(db_session):
+    """When direction_key is provided, only tasks in that direction are considered."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeScope")
+    version = await _make_version(db_session, project)
+
+    criterion_target = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Target direction criterion",
+    )
+    criterion_other = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Other direction criterion",
+    )
+
+    for dk, crit in [("d-target-scope", criterion_target), ("d-other-scope", criterion_other)]:
+        dir_row = Direction(
+            project_id=project.id,
+            direction_key=dk,
+            data={"id": dk, "text": dk, "status": "active"},
+            status="active",
+            criterion_keys=[crit.criterion_key],
+        )
+        db_session.add(dir_row)
+
+    # Task in the OTHER direction.
+    other_task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "other",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_other.py::test_x",
+            },
+        }],
+        context={
+            "direction_id": "d-other-scope",
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "verify_setup_failed"},
+            "_pr_changed_files": [
+                "testing/test_other.py",
+                "backend/app/other_module.py",
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "unverified merge",
+            },
+        },
+        criterion_ids=[criterion_target.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(other_task)
+    await db_session.commit()
+
+    # Backfill scoped to the TARGET direction — should see 0 tasks.
+    recorded = await ac.backfill_unverified_merge_evidence(
+        db_session, project.id, direction_key="d-target-scope"
+    )
+    assert recorded == 0, "No tasks in target direction should produce 0 evidence"
+
+    # Confirm no evidence was recorded.
+    ev_target = await ac.get_evidence_for_criterion(db_session, criterion_target.id)
+    assert ev_target == [], "No evidence for target criterion"
+
+
+@pytest.mark.asyncio
+async def test_backfill_unverified_merge_skips_no_seam_files(db_session):
+    """Unverified-merge task with test-only diff gets no backfill evidence.
+
+    A named_test that ships NO production seam cannot exercise the changed code,
+    so the backfill must skip it just like the original named_test gate would.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
+
+    project = await _make_project(db_session, "UnverifiedMergeNoSeam")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "No-seam criterion",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "test-only",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_only.py::test_x",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            REVIEW_LOOP_KEY: {UNVERIFIED_MERGE_REASON_KEY: "ci_setup_failed"},
+            "_pr_changed_files": [
+                "testing/test_only.py",
+                # No production file — test-only diff.
+            ],
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "unverified merge",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_unverified_merge_evidence(db_session, project.id)
+    assert recorded == 0, "Test-only diff must not produce backfill evidence"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence == [], "No evidence for test-only diff"
