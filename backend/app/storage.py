@@ -119,6 +119,49 @@ def compute_job_id_for_artifact_uri(storage_uri: str) -> uuid.UUID | None:
         return None
 
 
+async def verify_artifact_project_ownership(
+    storage_uri: str,
+    project_id: uuid.UUID,
+    session,
+) -> None:
+    """Assert that storage_uri belongs to project_id before any URL signing.
+
+    Resolves the task UUID or compute-job UUID embedded in the URI path, fetches
+    the corresponding DB row, and confirms its ``project_id`` matches the supplied
+    ``project_id``. Raises :class:`StorageUriError` when the URI does not resolve
+    to a recognised task or compute-job prefix (the caller cannot authorise it via
+    ownership). Raises ``fastapi.HTTPException`` 404 when the resolved owner
+    belongs to a different project — indistinguishable from "not found" so that
+    cross-project UUID probing leaks nothing.
+
+    Callers are still responsible for enforcing user membership in ``project_id``
+    separately; this function only checks the artifact→project binding.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    task_uuid = task_id_for_artifact_uri(storage_uri)
+    if task_uuid is not None:
+        from app.models import Task  # noqa: PLC0415
+
+        task = await session.get(Task, task_uuid)
+        if task is None or task.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        return
+
+    job_uuid = compute_job_id_for_artifact_uri(storage_uri)
+    if job_uuid is not None:
+        from app.models import ComputeJob  # noqa: PLC0415
+
+        job = await session.get(ComputeJob, job_uuid)
+        if job is None or job.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        return
+
+    raise StorageUriError(
+        "storage reference does not resolve to a task or compute-job prefix"
+    )
+
+
 # Cloud Run delivers the default service account as token-only
 # ``google.auth.compute_engine.credentials.Credentials`` — an OAuth access token
 # with NO private key — so google-cloud-storage's *local* V4 signer raises

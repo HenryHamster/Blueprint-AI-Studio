@@ -2507,6 +2507,7 @@ class TestPreMergeDualHeadGuardCoverage:
         assert min(call.lineno for call in ci_calls) > getattr(
             ci_fail_closed, "end_lineno", ci_fail_closed.lineno
         )
+        # The raw guard result must not be reassigned after the guard call.
         assert not _name_assignments_after(
             ci_func,
             "_guard_result",
