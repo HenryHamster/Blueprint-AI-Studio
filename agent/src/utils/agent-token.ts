@@ -157,8 +157,14 @@ export function stopProactiveTokenRefresh(): void {
   if (tokenRefreshTimer) { clearTimeout(tokenRefreshTimer); tokenRefreshTimer = null; }
 }
 
-/** How often to proactively refresh the GitHub installation token (45 min). */
-const GITHUB_TOKEN_REFRESH_MS = 45 * 60 * 1000;
+/** How often to proactively refresh the GitHub installation token.
+ *
+ * The backend caches installation tokens for up to ~50 minutes while GitHub's
+ * token TTL is 60 minutes. A task can therefore start with a token that has
+ * only ~10 minutes of useful life left. Refresh every 8 minutes so git pushes
+ * do not inherit an almost-expired cached token before the first refresh fires.
+ */
+const GITHUB_TOKEN_REFRESH_MS = 8 * 60 * 1000;
 
 export let githubTokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -173,7 +179,7 @@ export let githubTokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let githubRefreshGeneration = 0;
 
 /**
- * Schedule a proactive GitHub installation token refresh every 45 min, mirroring
+ * Schedule a proactive GitHub installation token refresh every 8 min, mirroring
  * scheduleProactiveTokenRefresh for the agent JWT. On each fire:
  *   1. Calls GET /api/agent/github/token?task_id=<taskId> (hits backend cache —
  *      zero GitHub API calls when the 50-min backend cache is warm).
