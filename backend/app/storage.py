@@ -179,6 +179,23 @@ async def generate_download_signed_url(
     A failure of the underlying GCS client (credentials, network, missing
     object signing key) is re-raised as the original exception for the caller to
     map to a storage-unavailable response.
+
+    **Caller responsibility — ownership check:** This function does not enforce
+    task-to-project ownership; it only validates bucket membership and signs.
+    Callers that accept a user-supplied ``gs://`` URI *must* verify that the
+    referenced object belongs to the requesting project before calling:
+
+    * Use :func:`task_id_for_artifact_uri` to extract the owning task UUID from a
+      ``tasks/<uuid>/`` reference, then confirm ``task.project_id`` matches the
+      caller's project.
+    * Use :func:`compute_job_id_for_artifact_uri` for ``compute-jobs/<uuid>/``
+      references, then confirm ``job.project_id`` matches.
+    * Reject (404) any URI that cannot be bound to a project-owned record —
+      fail closed rather than leaking whether the object exists.
+
+    All production callers currently satisfy this contract; see
+    ``GET /api/admin/artifacts/download-url`` in ``main.py`` for the reference
+    implementation.
     """
     bucket_name, object_name = parse_artifact_uri(storage_uri)
 
