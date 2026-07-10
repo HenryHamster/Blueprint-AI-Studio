@@ -26102,3 +26102,75 @@ async def test_design_doc_playbook_and_reserved_keys_protected(
         headers=headers,
     )
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_design_doc_set_shrink_allowed_when_over_cap(
+    client: AsyncClient, db_session
+):
+    """A write that does NOT increase total size succeeds even when the corpus is
+    already over DESIGN_DOC_MAX_BYTES.  A write that WOULD grow it further is
+    still rejected.  Regression test for the one-way-ratchet bug where the
+    unconditional >cap check blocked all writes once the corpus exceeded 500KB."""
+    from app.task_locking import DESIGN_DOC_MAX_BYTES
+
+    # Pre-populate the doc over the cap (use a reserved key so it bypasses the
+    # endpoint's per-write size guard but contributes to the JSON size on disk).
+    big_blob = "x" * (DESIGN_DOC_MAX_BYTES + 10_000)
+    project = Project(
+        name="Over-Cap Shrink Test",
+        user_id="test-user-overcap",
+        design_doc={"_oversized_internal": big_blob, "existing-key": "small-value"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-overcap",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-overcap", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # Re-setting "existing-key" to its same small value must succeed (no growth).
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "existing-key",
+            "value": "small-value",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, (
+        f"Expected 200 for same-size write over cap, got {resp.status_code}: {resp.json()}"
+    )
+
+    # Writing a new key with a large value (that would grow the total) must be rejected.
+    growing_value = "y" * 10_000
+    resp2 = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "new-big-key",
+            "value": growing_value,
+        },
+        headers=headers,
+    )
+    assert resp2.status_code == 400, (
+        f"Expected 400 for size-growing write over cap, got {resp2.status_code}"
+    )
+    assert "too large" in resp2.json().get("detail", "").lower() or "too large" in str(
+        resp2.json()
+    ).lower(), f"Expected 'too large' in error detail: {resp2.json()}"

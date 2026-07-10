@@ -461,14 +461,20 @@ async def update_design_doc(
             raise HTTPException(
                 status_code=400, detail=f"Value too large ({val_size} bytes, max 50KB)"
             )
-        doc[key] = payload.value
         # Measure only agent-facing keys: reserved keys have their own internal
         # retention caps and must not consume the agent-write budget.
-        agent_keys_doc = {
+        old_agent_keys_doc = {
             k: v for k, v in doc.items() if k not in _RESERVED_DESIGN_DOC_KEYS
         }
-        total_size = len(_json.dumps(agent_keys_doc))
-        if total_size > DESIGN_DOC_MAX_BYTES:
+        old_size = len(_json.dumps(old_agent_keys_doc))
+        doc[key] = payload.value
+        new_agent_keys_doc = {
+            k: v for k, v in doc.items() if k not in _RESERVED_DESIGN_DOC_KEYS
+        }
+        total_size = len(_json.dumps(new_agent_keys_doc))
+        # Allow writes that shrink or don't grow the corpus even when already over cap
+        # (matches the canonical with_design_doc_locked logic in task_locking.py).
+        if total_size > DESIGN_DOC_MAX_BYTES and total_size > old_size:
             del doc[key]  # rollback
             raise HTTPException(
                 status_code=400,
