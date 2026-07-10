@@ -1176,6 +1176,437 @@ class TestDedupFilteredFindingsAddedToSalvage:
         assert len(entry["claims"]) == 1
         assert entry["claims"][0]["claim"] == "N+1 detected in user lookup"
 
+    @_pytest.mark.asyncio
+    async def test_all_files_covered_by_open_pr_salvaged(
+        self, db_session, mocker
+    ):
+        """Findings filtered because all their files are covered by an open PR are salvaged.
+
+        'all files covered by open PR' is a salvageable reason: the finding is
+        blocked by in-flight work, not already resolved. It must enter the salvage
+        bundle so it is not silently dropped when a PR is open for all its files.
+        """
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-open-pr"
+        )
+
+        blocked_finding = dict(_make_finding(
+            "Improve auth caching while PR open",
+            direction_id=direction["id"],
+            finding_type="improvement",
+        ))
+        blocked_finding["prompt"] = "Add in-process cache to auth.py"
+        blocked_finding["related_files"] = ["backend/app/auth.py"]
+
+        surviving = _make_finding(
+            "Unrelated surviving fix", direction_id=direction["id"]
+        )
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_surv")]
+        mock_outcome.file_overlap_count = 1
+        mock_outcome.filtered = [
+            {
+                "title": "Improve auth caching while PR open"[:120],
+                "direction_id": direction["id"],
+                "reason": "all files covered by open PR",
+                "finding": blocked_finding,
+            }
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[blocked_finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        assert salvage_activity is not None, (
+            "salvage_activity must be recorded when a finding is filtered "
+            "because all its files are covered by an open PR"
+        )
+        assert salvage_activity["salvaged_count"] >= 1
+
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t
+            for t in child_tasks
+            if (t.context or {}).get("salvage_source_task_id") == str(task.id)
+        ]
+        assert len(salvage_tasks) == 1, (
+            f"Expected 1 salvage bundle task for 'all files covered by open PR', "
+            f"found {len(salvage_tasks)}"
+        )
+        payload = salvage_tasks[0].payloads[0]
+        entry = payload["salvaged_findings"][0]
+        assert "Improve auth caching" in entry["title"]
+        assert "dedup: all files covered by open PR" in (entry["discard_reason"] or "")
+        assert entry["direction_id"] == direction["id"]
+        assert entry["prompt"] == "Add in-process cache to auth.py"
+
+    @_pytest.mark.asyncio
+    async def test_retired_approach_excluded_from_salvage(
+        self, db_session, mocker
+    ):
+        """Findings filtered because their approach was retired are NOT salvaged.
+
+        'retired approach:' indicates the direction has already been tried and
+        abandoned. The salvage gate must exclude these: salvaging a retired
+        approach would re-queue dead-end work that the strategist already rejected.
+        """
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-retired"
+        )
+
+        retired_finding = _make_finding(
+            "Retry retired cache approach",
+            direction_id=direction["id"],
+            finding_type="improvement",
+        )
+        surviving = _make_finding(
+            "Unrelated surviving fix", direction_id=direction["id"]
+        )
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_surv")]
+        mock_outcome.retired_approach_count = 1
+        mock_outcome.filtered = [
+            {
+                "title": "Retry retired cache approach"[:120],
+                "direction_id": direction["id"],
+                "reason": "retired approach: in-memory-cache-strategy",
+                "finding": retired_finding,
+            }
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[retired_finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # Retired-approach findings must NOT be salvaged.
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        if salvage_activity is not None:
+            assert salvage_activity["salvaged_count"] == 0, (
+                f"Retired-approach findings should not be salvaged, "
+                f"got {salvage_activity['salvaged_count']}"
+            )
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t
+            for t in child_tasks
+            if (t.first_payload or {}).get("type") == "salvage_bundle"
+        ]
+        assert len(salvage_tasks) == 0, (
+            "No salvage_bundle task should be spawned for retired-approach filtered findings"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_archived_diagnosis_excluded_from_salvage(
+        self, db_session, mocker
+    ):
+        """Findings filtered as archived diagnoses are NOT salvaged.
+
+        'archived diagnosis:' indicates the analysis is known-stale — its root
+        cause was already investigated and closed. The salvage gate must exclude
+        these: re-queuing an archived diagnosis wastes resources on work the
+        strategist marked done.
+        """
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-archived"
+        )
+
+        archived_finding = _make_finding(
+            "Revisit archived auth diagnosis",
+            direction_id=direction["id"],
+            finding_type="improvement",
+        )
+        surviving = _make_finding(
+            "Unrelated surviving fix", direction_id=direction["id"]
+        )
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_surv")]
+        mock_outcome.archived_diagnoses_count = 1
+        mock_outcome.filtered = [
+            {
+                "title": "Revisit archived auth diagnosis"[:120],
+                "direction_id": direction["id"],
+                "reason": "archived diagnosis: auth-session-ttl-stale",
+                "finding": archived_finding,
+            }
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[archived_finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # Archived-diagnosis findings must NOT be salvaged.
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        if salvage_activity is not None:
+            assert salvage_activity["salvaged_count"] == 0, (
+                f"Archived-diagnosis findings should not be salvaged, "
+                f"got {salvage_activity['salvaged_count']}"
+            )
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t
+            for t in child_tasks
+            if (t.first_payload or {}).get("type") == "salvage_bundle"
+        ]
+        assert len(salvage_tasks) == 0, (
+            "No salvage_bundle task should be spawned for archived-diagnosis filtered findings"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_fallback_key_lookup_when_finding_key_absent(
+        self, db_session, mocker
+    ):
+        """Filtered entries without a 'finding' key fall back to _findings_by_key lookup.
+
+        The dedup loop builds a title+direction_id keyed dict from the parsed
+        findings list so old-format filtered entries (no 'finding' key) can still
+        be recovered. This tests that backward-compat fallback path.
+        """
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-fallback-lookup"
+        )
+
+        # A finding that will be filtered — but the filtered entry omits 'finding'.
+        target_finding = dict(_make_finding(
+            "Legacy lookup finding",
+            direction_id=direction["id"],
+            finding_type="improvement",
+        ))
+        target_finding["prompt"] = "Implement legacy fix"
+        target_finding["related_files"] = ["backend/app/legacy.py"]
+
+        surviving = _make_finding(
+            "Unrelated surviving fix", direction_id=direction["id"]
+        )
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_surv")]
+        # Filtered entry WITHOUT 'finding' key — triggers _findings_by_key fallback
+        mock_outcome.filtered = [
+            {
+                "title": "Legacy lookup finding"[:120],
+                "direction_id": direction["id"],
+                "reason": "region overlap with: in-flight task",
+                # No "finding" key — forces fallback to title+direction_id lookup
+            }
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[target_finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # The fallback lookup should still recover and salvage the finding.
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        assert salvage_activity is not None, (
+            "salvage_activity must be recorded even when fallback _findings_by_key "
+            "lookup is used instead of the 'finding' key"
+        )
+        assert salvage_activity["salvaged_count"] >= 1
+
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t
+            for t in child_tasks
+            if (t.context or {}).get("salvage_source_task_id") == str(task.id)
+        ]
+        assert len(salvage_tasks) == 1, (
+            f"Expected 1 salvage bundle task via fallback lookup, "
+            f"found {len(salvage_tasks)}"
+        )
+        payload = salvage_tasks[0].payloads[0]
+        entry = payload["salvaged_findings"][0]
+        assert "Legacy lookup finding" in entry["title"]
+        assert "dedup:" in (entry["discard_reason"] or "")
+
+    @_pytest.mark.asyncio
+    async def test_combined_decay_and_dedup_filtered_in_single_bundle(
+        self, db_session, mocker
+    ):
+        """Decay-based and dedup-filtered candidates merge into one salvage bundle.
+
+        When a research cycle both decays a repeatedly-deferred finding AND has
+        a dedup-filtered finding with a salvageable reason, they should combine
+        into a single salvage_bundle task rather than being silently dropped or
+        spawning separate tasks.
+        """
+        from app.finding_deduplication import DedupOutcome
+        from test_autonomous_research import _make_finding, _patch_research_externals
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-dedup-combined-salvage"
+        )
+
+        # A prior-deferred finding that has been deferred too many times → decays
+        decayed = dict(_make_finding(
+            "Ultra-low-confidence repeated finding",
+            direction_id=direction["id"],
+        ))
+        decayed["actionability_grade"] = "LOW"
+        decayed["deferred_reason"] = "ultra_low_confidence"
+        decayed["deferred_count"] = 4  # >= 4 threshold for ultra_low_confidence
+        task.context = {
+            **(task.context or {}),
+            "prior_deferred_findings": [decayed],
+        }
+        db_session.add(task)
+        await db_session.commit()
+
+        # A new finding that is dedup-filtered for a salvageable reason
+        blocked_finding = dict(_make_finding(
+            "Region-blocked new improvement",
+            direction_id=direction["id"],
+            finding_type="improvement",
+        ))
+        blocked_finding["prompt"] = "Implement the blocked improvement"
+        surviving = _make_finding(
+            "Unrelated surviving fix", direction_id=direction["id"]
+        )
+
+        mock_outcome = DedupOutcome()
+        mock_outcome.deduplicated = [(0, surviving, "hash_surv")]
+        mock_outcome.filtered = [
+            {
+                "title": "Region-blocked new improvement"[:120],
+                "direction_id": direction["id"],
+                "reason": "region overlap with: in-flight PR task",
+                "finding": blocked_finding,
+            }
+        ]
+
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[blocked_finding, surviving],
+        )
+        mocker.patch(
+            "app.research_completion.deduplicate_findings",
+            return_value=mock_outcome,
+        )
+        mocker.patch(
+            "app.research_completion._assess_project_spawn_health",
+            return_value=(False, None),
+        )
+
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+        # Both the decayed and dedup-filtered finding must be merged into one bundle.
+        salvage_activity = (task.context or {}).get("salvage_activity")
+        assert salvage_activity is not None, (
+            "salvage_activity must be recorded when both decay and dedup-filtered "
+            "findings are present"
+        )
+        assert salvage_activity["salvaged_count"] == 2, (
+            f"Expected 2 salvaged findings (1 decay + 1 dedup-filtered), "
+            f"got {salvage_activity['salvaged_count']}"
+        )
+
+        result = await db_session.execute(
+            _select(_Task).where(_Task.parent_task_id == task.id)
+        )
+        child_tasks = result.scalars().all()
+        salvage_tasks = [
+            t
+            for t in child_tasks
+            if (t.context or {}).get("salvage_source_task_id") == str(task.id)
+        ]
+        assert len(salvage_tasks) == 1, (
+            f"Expected exactly 1 combined salvage bundle task, "
+            f"found {len(salvage_tasks)}"
+        )
+        payload = salvage_tasks[0].payloads[0]
+        assert payload["total_discarded"] == 2
+        titles = {e["title"] for e in payload["salvaged_findings"]}
+        assert any("Ultra-low-confidence" in t for t in titles), (
+            "Decayed finding must appear in the combined salvage bundle"
+        )
+        assert any("Region-blocked" in t for t in titles), (
+            "Dedup-filtered finding must appear in the combined salvage bundle"
+        )
+        # Verify discard_reason annotations distinguish the two sources
+        reasons = {e["discard_reason"] for e in payload["salvaged_findings"]}
+        assert any("ultra_low_confidence" in (r or "") for r in reasons)
+        assert any("dedup:" in (r or "") for r in reasons)
+
 
 @_pytest.mark.asyncio
 async def test_perf_finding_with_salvageable_reason_not_double_counted(db_session, mocker):

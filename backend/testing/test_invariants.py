@@ -1651,8 +1651,12 @@ class TestSchemaRevisionSync:
             ):
                 body = body[1:]
 
-            # Pure data-only migrations (upgrade body is only op.execute calls)
-            # are inherently one-way — accept any downgrade body for them.
+            # Pure data-only migrations (upgrade body is only op.execute or
+            # op.get_bind calls) are inherently one-way — accept any downgrade
+            # body for them.  op.get_bind() is the raw-SQL variant of
+            # op.execute(): both perform data transformation without schema
+            # changes; the downgrade reverse-transforms the same data.
+            _DATA_ONLY_OP_ATTRS = {"execute", "get_bind"}
             upgrade = next(
                 (
                     n
@@ -1670,7 +1674,9 @@ class TestSchemaRevisionSync:
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == "op"
                 ]
-                if up_calls and all(c.func.attr == "execute" for c in up_calls):
+                if up_calls and all(
+                    c.func.attr in _DATA_ONLY_OP_ATTRS for c in up_calls
+                ):
                     continue
 
             # Empty or only `pass`
