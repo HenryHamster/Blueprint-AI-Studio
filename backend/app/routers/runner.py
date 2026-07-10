@@ -356,8 +356,15 @@ async def next_task(
     except Exception:
         logger.exception(
             "[RUNNERS] Failed to resolve LLM credentials for task %s; "
-            "continuing without per-task credentials",
+            "rolling back dispatch so task stays claimable",
             task.id,
+        )
+        task.started_at = None
+        session.add(task)
+        await session.commit()
+        return JSONResponse(
+            {"pool_exhausted": True},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
     await session.commit()

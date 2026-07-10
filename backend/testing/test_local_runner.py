@@ -1165,12 +1165,13 @@ class TestRunnerEndpoints:
         assert task_instance.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
-    async def test_next_task_returns_200_with_null_credentials_on_exception(
+    async def test_next_task_rolls_back_dispatch_on_credential_exception(
         self, client: AsyncClient, db_session
     ):
         """When an unexpected exception occurs during credential resolution,
-        next-task returns 200 with credentials: null so the runner falls back
-        to host env vars instead of failing the poll entirely."""
+        next-task must roll back the dispatch marker (started_at = None) and
+        return 503 with pool_exhausted=True so the task stays claimable rather
+        than being dispatched without credentials."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
 
@@ -1196,17 +1197,17 @@ class TestRunnerEndpoints:
                 headers={"Authorization": f"Bearer {token}"},
             )
 
-        # Fallback: 200 with null credentials — the task is dispatched but lacks
-        # per-task LLM credentials, so the runner falls back to host env vars.
-        assert resp.status_code == 200
-        assert resp.json()["credentials"] is None
+        # Dispatch must be rolled back: 503 with pool_exhausted=True so the
+        # runner retries rather than receiving a task it can't execute.
+        assert resp.status_code == 503
+        assert resp.json() == {"pool_exhausted": True}
 
-        # Task context was NOT stamped (the exception aborted credential resolution).
+        # Task context was NOT stamped and dispatch marker was rolled back.
         await db_session.refresh(task_instance)
         assert task_instance.llm_account_id is None
         assert task_instance.status == TaskStatus.PROVISIONING  # unchanged
-        # started_at IS set (unlike the pool-exhausted path, dispatch is not rolled back).
-        assert task_instance.started_at is not None
+        # started_at must be None — task is still claimable.
+        assert task_instance.started_at is None
 
     @pytest.mark.asyncio
     async def test_agent_claim_after_runner_dispatch_transitions_to_in_progress(
