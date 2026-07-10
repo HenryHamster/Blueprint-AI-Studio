@@ -791,3 +791,370 @@ async def test_reconcile_llm_cost_sets_source(db_session):
     result = reconcile_llm_cost([])
 
     assert result.source == "internal_recompute"
+
+
+# ---------------------------------------------------------------------------
+# provider_reported_usage: agent_accumulated_output_tokens coverage
+# ---------------------------------------------------------------------------
+# These tests exercise the agent_accumulated_output_tokens field added to
+# ReconciliationResult so that output-token aggregation is machine-checked.
+# c-88ff386c: 'cost telemetry matches actual spend within tolerance'
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_output_tokens_aggregates_across_multiple_tasks(db_session):
+    """agent_accumulated_output_tokens is the sum of output tokens across all
+    provider-checked tasks (multi-task aggregation path)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1500, output_tokens=300,
+        cache_creation=200, cache_read=300,
+        provider_input_tokens=1000, provider_cache_creation=200, provider_cache_read=300,
+    )
+    t2 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=2000, output_tokens=700,
+        cache_creation=500, cache_read=500,
+        provider_input_tokens=1000, provider_cache_creation=500, provider_cache_read=500,
+    )
+    db_session.add_all([t1, t2])
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1, t2])
+
+    assert result.source == "provider_reported"
+    assert result.task_count == 2
+    # Output tokens should be the sum across both tasks.
+    assert result.agent_accumulated_output_tokens == 300 + 700
+    # Input tokens should also aggregate.
+    assert result.agent_accumulated_input_tokens == 1500 + 2000
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_asdict_includes_agent_accumulated_output_tokens(db_session):
+    """ReconciliationResult.asdict() must include agent_accumulated_output_tokens
+    when produced by reconcile_provider_reported_usage (the independent
+    cross-check path). The legacy reconcile_llm_cost path does not populate
+    this field; this test pins the provider_reported path specifically."""
+    import json
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1500, output_tokens=400,
+        cache_creation=200, cache_read=300,
+        provider_input_tokens=1000, provider_cache_creation=200, provider_cache_read=300,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+    d = result.asdict()
+
+    # Key must be present and have the correct value.
+    assert "agent_accumulated_output_tokens" in d, (
+        "asdict() must include agent_accumulated_output_tokens"
+    )
+    assert d["agent_accumulated_output_tokens"] == 400
+    # Round-trip: asdict must remain JSON-serializable.
+    serialized = json.dumps(d)
+    deserialized = json.loads(serialized)
+    assert deserialized["agent_accumulated_output_tokens"] == 400
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_per_task_detail_includes_agent_accumulated_output_tokens(db_session):
+    """The per_task diagnostic breakdown must include agent_accumulated_output_tokens
+    for each checked task so operators can identify per-task output-token discrepancies."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1500, output_tokens=250,
+        cache_creation=200, cache_read=300,
+        provider_input_tokens=1000, provider_cache_creation=200, provider_cache_read=300,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+
+    assert len(result.per_task) == 1
+    entry = result.per_task[0]
+    assert "agent_accumulated_output_tokens" in entry, (
+        "per_task detail must include agent_accumulated_output_tokens"
+    )
+    assert entry["agent_accumulated_output_tokens"] == 250
+    # Provider-reported output should also be in the detail.
+    assert entry["provider_reported_output_tokens"] == 250
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_cache_token_fields_aggregate_correctly(db_session):
+    """agent_accumulated_cache_creation_input_tokens and
+    agent_accumulated_cache_read_input_tokens aggregate correctly across
+    all provider-checked tasks."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1500, output_tokens=300,
+        cache_creation=200, cache_read=300,
+        provider_input_tokens=1000, provider_cache_creation=200, provider_cache_read=300,
+    )
+    t2 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=2000, output_tokens=500,
+        cache_creation=400, cache_read=600,
+        provider_input_tokens=1000, provider_cache_creation=400, provider_cache_read=600,
+    )
+    db_session.add_all([t1, t2])
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1, t2])
+
+    # Cache creation: 200 + 400
+    assert result.agent_accumulated_cache_creation_input_tokens == 600
+    # Cache read: 300 + 600
+    assert result.agent_accumulated_cache_read_input_tokens == 900
+    # Provider-side cache tokens should also aggregate.
+    assert result.provider_reported_cache_creation_input_tokens == 600
+    assert result.provider_reported_cache_read_input_tokens == 900
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_tolerance_boundary_at_threshold(db_session):
+    """A delta exactly at PROVIDER_REPORTED_TOLERANCE (0.001 = 0.1%) is
+    within tolerance (boundary inclusive)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Provider says 1000 tokens; agent says 1001 (delta = 1/1000 = 0.001 exactly).
+    t1 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1001, output_tokens=200,
+        provider_input_tokens=1001,
+    )
+    db_session.add(t1)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1])
+
+    # agent=1001, provider=1001 → delta=0.0 → within tolerance.
+    assert result.provider_reported_within_tolerance is True
+    assert result.provider_reported_delta == 0.0
+
+    # Now create divergence of exactly 0.1% (1 token per 1000).
+    t2 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1001, output_tokens=200,
+        provider_input_tokens=1000,
+    )
+    db_session.add(t2)
+    await db_session.commit()
+
+    result2 = reconcile_provider_reported_usage([t2])
+
+    # |1000 - 1001| / 1000 = 0.001 exactly → within_tolerance (<=).
+    assert result2.provider_reported_delta == pytest.approx(0.001, abs=1e-9)
+    assert result2.provider_reported_within_tolerance is True
+    assert result2.provider_reported_tolerance == PROVIDER_REPORTED_TOLERANCE
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_just_above_tolerance_fails(db_session):
+    """A delta that exceeds PROVIDER_REPORTED_TOLERANCE by even a small margin
+    correctly trips within_tolerance=False. Regression guard for the boundary
+    check (must be <= not <)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Provider says 1000; agent says 1002 → |2|/1000 = 0.002 > 0.001.
+    t1 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1002, output_tokens=200,
+        provider_input_tokens=1000,
+    )
+    db_session.add(t1)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1])
+
+    assert result.provider_reported_within_tolerance is False
+    assert result.provider_reported_delta > PROVIDER_REPORTED_TOLERANCE
+    assert result.provider_reported_delta == pytest.approx(0.002, abs=1e-9)
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_output_tokens_zero_when_missing_from_api_summary(db_session):
+    """When api_call_summary has no total_output_tokens key, agent_accumulated_output_tokens
+    defaults to 0 without raising."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 1000,
+            # No total_output_tokens key.
+            "total_cache_creation_input_tokens": 200,
+            "total_cache_read_input_tokens": 300,
+            "llm_call_count": 5,
+        },
+        provider_reported_usage={
+            "input_tokens": 500,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 300,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+
+    assert result.task_count == 1
+    assert result.agent_accumulated_output_tokens == 0
+    # Input reconciliation should still work.
+    assert result.provider_reported_input_tokens == 500
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_provider_output_tokens_aggregate(db_session):
+    """provider_reported_output_tokens aggregates across multiple tasks even
+    though it is not used in the delta calculation (which is input-only)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=1000, output_tokens=150,
+        provider_input_tokens=1000,
+    )
+    t2 = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=2000, output_tokens=350,
+        provider_input_tokens=2000,
+    )
+    db_session.add_all([t1, t2])
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([t1, t2])
+
+    # provider_reported_usage["output_tokens"] defaults to input_tokens match value in helper.
+    assert result.provider_reported_output_tokens == 150 + 350
+    assert result.agent_accumulated_output_tokens == 150 + 350
+    assert result.task_count == 2
+    assert result.provider_reported_within_tolerance is True
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_skip_task_with_all_zero_provider_tokens(db_session):
+    """A task where all provider-reported token counts are zero is treated as
+    having no provider data and is skipped (task_count not incremented).
+    This prevents tasks without Anthropic API data from falsely contributing
+    a zero-delta to the reconciliation."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with provider_reported_usage all zeros.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 200,
+            "llm_call_count": 2,
+        },
+        provider_reported_usage={
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+
+    # All-zero provider counts → skipped (same condition as no data).
+    assert result.task_count == 0
+    assert result.agent_accumulated_output_tokens == 0
+    assert result.provider_reported_within_tolerance is True
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_only_cache_tokens_no_raw_input(db_session):
+    """A task with only cache_creation / cache_read provider tokens (input_tokens=0)
+    is NOT skipped — cache tokens count as having real provider data."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_provider_reported_task(
+        project.id,
+        provider="anthropic", model="claude-sonnet-4-6",
+        input_tokens=500, output_tokens=100,
+        cache_creation=300, cache_read=200,
+        # Raw input=0, but cache tokens are non-zero.
+        provider_input_tokens=0,
+        provider_cache_creation=300,
+        provider_cache_read=200,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+
+    # cache_creation=300 + cache_read=200 → non-zero → task IS checked.
+    assert result.task_count == 1
+    # agent says total_input = 500; provider says 0+300+200 = 500 → delta=0.
+    assert result.provider_reported_within_tolerance is True
+    assert result.provider_reported_delta == 0.0
+    assert result.agent_accumulated_output_tokens == 100

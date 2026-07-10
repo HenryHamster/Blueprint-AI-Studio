@@ -4142,6 +4142,242 @@ async def test_record_task_merge_evidence_logs_direction_fetch_failed(db_session
 
 
 # ---------------------------------------------------------------------------
+# Criterion evidence gap: direction with empty criterion_keys produces no_criteria
+# ---------------------------------------------------------------------------
+# Covers the failure mode where a task carries direction_id in context but the
+# Direction row has no criterion_keys, and the task itself has no criterion_ids —
+# the function silently returns 0 with reason=no_criteria instead of recording
+# evidence for the direction's criteria.  These tests pin that behavior so
+# regressions in direction-to-criterion propagation are caught at the unit level
+# rather than discovered via live criterion_coverage drift.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_direction_empty_criterion_keys_produces_no_criteria(
+    db_session, caplog
+):
+    """A task with direction_id in context whose Direction row has no criterion_keys
+    AND the task itself has no criterion_ids produces the no_criteria reason.
+
+    This documents the gap: if the Direction row was not updated with criterion_keys
+    before the task merged, no evidence is recorded even though the task and the
+    direction both exist.
+    """
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "EmptyCriterionKeys")
+
+    # Direction exists but has NO criterion_keys.
+    direction_row = Direction(
+        project_id=project.id,
+        direction_key="d-empty-criterion-keys",
+        data={"id": "d-empty-criterion-keys", "text": "Some direction", "status": "active"},
+        status="active",
+        criterion_keys=[],
+    )
+    db_session.add(direction_row)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="Child task with no criterion propagation",
+        payloads=[{"type": "create", "prompt": "implement something"}],
+        context={
+            "direction_id": "d-empty-criterion-keys",
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test ran green",
+            },
+        },
+        criterion_ids=[],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger="app.acceptance_criteria"):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert result == 0, (
+        "Expected 0 evidence rows: direction has no criterion_keys and task has no criterion_ids"
+    )
+    assert any(MergeEvidenceReason.no_criteria in r.message for r in caplog.records), (
+        f"Expected no_criteria logged; got: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_direction_missing_from_db_with_no_task_criterion_ids(
+    db_session, caplog
+):
+    """A task whose direction_id points to a Direction that does not exist in the
+    DB AND whose task.criterion_ids is empty produces the no_criteria reason.
+
+    This covers the propagation gap for a child task spawned from a research task
+    before the direction-to-criterion mapping was created: no Direction row exists
+    for the spawned child's direction_id, so no criterion_keys are found.
+    """
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "MissingDirection")
+
+    # No direction row is created in the DB.
+    task = Task(
+        project_id=project.id,
+        title="Child task pointing to nonexistent direction",
+        payloads=[{"type": "create", "prompt": "implement something"}],
+        context={
+            "direction_id": "d-does-not-exist",
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test ran green",
+            },
+        },
+        criterion_ids=[],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger="app.acceptance_criteria"):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert result == 0, (
+        "Expected 0: direction does not exist and task has no criterion_ids"
+    )
+    assert any(MergeEvidenceReason.no_criteria in r.message for r in caplog.records), (
+        f"Expected no_criteria logged; got: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_no_direction_id_no_criterion_ids_produces_no_criteria(
+    db_session, caplog
+):
+    """A task with neither direction_id in context NOR criterion_ids directly set
+    produces the no_criteria reason, even with a proven acceptance verdict.
+
+    This is the canonical failure mode for a child implementation task spawned
+    from a research task when the orchestrator does not propagate either
+    direction_id or criterion_ids to the child: the proven verdict is ignored and
+    no evidence rows are written.
+    """
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "NoPropagation")
+
+    task = Task(
+        project_id=project.id,
+        title="Orphaned child task — no direction or criterion linkage",
+        payloads=[{"type": "create", "prompt": "implement cost telemetry reconciliation"}],
+        context={
+            # Deliberately omit direction_id.
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test_cost_telemetry_reconciliation.py ran green",
+            },
+        },
+        criterion_ids=[],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger="app.acceptance_criteria"):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert result == 0, (
+        "A proven verdict must NOT record evidence when criterion_ids is empty "
+        "and no direction_id is in context"
+    )
+    assert any(MergeEvidenceReason.no_criteria in r.message for r in caplog.records), (
+        f"Expected no_criteria logged; got: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_direction_with_criterion_keys_records_even_without_task_criterion_ids(
+    db_session,
+):
+    """A task with empty criterion_ids BUT with direction_id pointing to a Direction
+    that DOES have criterion_keys correctly records evidence via the direction path.
+
+    This is the positive counterpart: demonstrates that the late-mapping rescue
+    mechanism works when the Direction row is fully populated with criterion_keys,
+    even if the task was spawned before the mapping existed.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "DirectionMappedAfterSpawn")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Cost telemetry matches provider-reported tokens",
+        created_by="strategist",
+    )
+
+    direction_row = Direction(
+        project_id=project.id,
+        direction_key="d-cost-telemetry",
+        data={"id": "d-cost-telemetry", "text": "Cost reduction direction", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(direction_row)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="Cost telemetry PR — criterion added to direction after spawn",
+        payloads=[{"type": "create", "prompt": "implement cost telemetry"}],
+        context={
+            "direction_id": "d-cost-telemetry",
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test_cost_telemetry_reconciliation.py ran green with seam change",
+            },
+        },
+        criterion_ids=[],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    recorded = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert recorded == 2, (
+        f"Expected 2 evidence rows (task_merge + reachability) for 1 criterion; got {recorded}"
+    )
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 2
+    assert {e.source_kind for e in evidence} == {"task_merge", "reachability"}
+    assert all(e.detail.get("proven") is True for e in evidence)
+    task_merge_ev = next(e for e in evidence if e.source_kind == "task_merge")
+    assert task_merge_ev.detail.get("direction_key") == "d-cost-telemetry"
+    coverage = ac.compute_criterion_coverage(evidence)
+    assert coverage == "covered"
+
+
+# ---------------------------------------------------------------------------
 # record_acceptance_window_coverage_evidence
 # ---------------------------------------------------------------------------
 
