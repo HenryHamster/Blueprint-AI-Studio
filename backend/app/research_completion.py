@@ -5609,11 +5609,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     from app.capability_registry import (
         capability_need_blocked_by_proof_gate,
         capability_need_proof_status,
-        capability_proof_enforce_enabled,
         registry_satisfies_capability_need,
         working_capability_names,
         working_capability_proof_status,
     )
+    from app.shared_state import runtime_config as _rc
     from app.task_blocked import build_need, enter_blocked_state
 
     _prereq_candidates = list(existing_tasks) + list(child_tasks)
@@ -5926,7 +5926,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     if capability_need_blocked_by_proof_gate(
                         prereq_need,
                         _working_registry_proof,
-                        enforce=capability_proof_enforce_enabled(),
+                        mode=str(_rc.get("capability_proof_gate_mode", "off") or "off"),
                     ):
                         # ENFORCE mode: an unproven/partial 'working' capability
                         # does NOT satisfy the prerequisite. Gate the dependent —

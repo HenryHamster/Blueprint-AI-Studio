@@ -177,6 +177,7 @@ def test_registry_contains_initial_checks():
         "capability_claim_reconciliation",
         "merged_pr_count_consistency",
         "criterion_evidence_count_integrity",
+        "capability_proof_gate_gap",
     } <= names
 
 
@@ -3875,3 +3876,126 @@ async def test_criterion_evidence_count_integrity_runs_in_sweep_tick(db):
     # The check name must appear in the registered set.
     names = {c.name for c in registered_checks()}
     assert "criterion_evidence_count_integrity" in names
+
+
+# --- Check: capability_proof_gate_gap ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_flags_unproven_working(db):
+    """A project with working capabilities that carry no proven evidence is flagged.
+
+    This is the named acceptance test. It exercises the end-to-end path:
+    - a ``working`` capability with empty evidence_refs → proof_status ``unproven``
+    - the check reads the project's problem_model and flags the capability
+    - delta == number of unproven working capabilities
+    - detail names the capability
+    - the check is flag-only (never mutates the problem_model)
+
+    Uses a real merge-test verdict context (working capability + no evidence) so
+    the assertion is concrete and non-trivially true.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    # Two working capabilities: one unproven (no evidence_refs), one proven.
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],  # no proof → unproven
+            },
+            {
+                "name": "ci-integration",
+                "status": "working",
+                "evidence_refs": [{"proven": True, "ref": "backend/app/ci.py"}],
+            },
+            {
+                "name": "future-feature",
+                "status": "planned",  # planned → not included in working set
+                "evidence_refs": [],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 flagged result for project, got {results}"
+    f = flagged[0]
+    assert f.check == "capability_proof_gate_gap"
+    # self_reported = total working capabilities (2: repo-map + ci-integration)
+    assert f.self_reported == 2
+    # ground_truth = proven count (1: ci-integration)
+    assert f.ground_truth == 1
+    # delta = unproven count (1: repo-map)
+    assert f.delta == 1
+    assert "repo-map" in f.detail
+    assert "proven" in f.detail
+
+    # Flag-only: problem_model must be unchanged
+    await db.refresh(project)
+    caps = (project.problem_model or {}).get("capabilities", [])
+    repo_map = next((c for c in caps if c.get("name") == "repo-map"), None)
+    assert repo_map is not None
+    assert repo_map["evidence_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_ok_when_all_proven(db):
+    """All working capabilities with proven evidence produce an OK result."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [{"proven": True, "ref": "backend/app/x.py"}],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    assert not any(r.flagged for r in results if r.subject == pid)
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1
+    assert ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_skips_with_no_capabilities(db):
+    """A project with an empty capabilities list produces a SKIPPED result."""
+    project = await _project(db)
+    # No problem_model set → SKIPPED
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    skipped = [r for r in results if r.subject in (pid, "global") and r.status == CheckStatus.SKIPPED]
+    assert len(skipped) >= 1

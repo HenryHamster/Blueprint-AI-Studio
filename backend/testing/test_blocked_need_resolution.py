@@ -536,31 +536,43 @@ def test_working_capability_proof_status_accepts_dict_form_problem_model():
 # ---------------------------------------------------------------------------
 
 
-def test_capability_proof_enforce_disabled_by_default(monkeypatch):
-    """Unset / "0" / junk values → observe mode (fail-safe default)."""
-    from app.capability_registry import capability_proof_enforce_enabled
+def test_capability_proof_gate_mode_defaults_to_off(monkeypatch):
+    """Unset / junk env var → "off" (safest default)."""
+    from app.capability_registry import capability_proof_gate_mode
 
-    monkeypatch.delenv("CAPABILITY_PROOF_ENFORCE", raising=False)
-    assert capability_proof_enforce_enabled() is False
-    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "0")
-    assert capability_proof_enforce_enabled() is False
-    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "yes")  # not exactly "1"
-    assert capability_proof_enforce_enabled() is False
+    monkeypatch.delenv("CAPABILITY_PROOF_GATE_MODE", raising=False)
+    assert capability_proof_gate_mode() == "off"
+    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "")
+    assert capability_proof_gate_mode() == "off"
+    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "garbage")
+    assert capability_proof_gate_mode() == "off"
 
 
-def test_capability_proof_enforce_enabled_when_flag_set(monkeypatch):
-    """Exactly "1" (whitespace-tolerant) → enforce mode; read at call time."""
-    from app.capability_registry import capability_proof_enforce_enabled
+def test_capability_proof_gate_mode_reads_env_var(monkeypatch):
+    """All three valid modes round-trip through the env var."""
+    from app.capability_registry import capability_proof_gate_mode
 
-    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "1")
-    assert capability_proof_enforce_enabled() is True
-    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", " 1 ")
-    assert capability_proof_enforce_enabled() is True
+    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "off")
+    assert capability_proof_gate_mode() == "off"
+    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "observe")
+    assert capability_proof_gate_mode() == "observe"
+    monkeypatch.setenv("CAPABILITY_PROOF_GATE_MODE", "enforce")
+    assert capability_proof_gate_mode() == "enforce"
+
+
+def test_capability_proof_gate_mode_override_takes_precedence():
+    """The override kwarg takes precedence over the env var."""
+    from app.capability_registry import capability_proof_gate_mode
+
+    assert capability_proof_gate_mode(override="off") == "off"
+    assert capability_proof_gate_mode(override="observe") == "observe"
+    assert capability_proof_gate_mode(override="enforce") == "enforce"
+    assert capability_proof_gate_mode(override="invalid") == "off"  # fail-safe
 
 
 def test_proof_gate_blocks_unproven_only_under_enforce():
     """The shared gate predicate: enforce + not-proven ⇒ blocked; every other
-    combination (observe mode, proven cap, no-match need) ⇒ not blocked."""
+    combination (off/observe mode, proven cap, no-match need) ⇒ not blocked."""
     from app.capability_registry import capability_need_blocked_by_proof_gate
 
     proof = {
@@ -575,20 +587,24 @@ def test_proof_gate_blocks_unproven_only_under_enforce():
 
     # Enforce: unproven AND partial are gated; proven and no-match are not.
     assert capability_need_blocked_by_proof_gate(
-        unproven_need, proof, enforce=True
+        unproven_need, proof, mode="enforce"
     ) is True
     assert capability_need_blocked_by_proof_gate(
-        partial_need, proof, enforce=True
+        partial_need, proof, mode="enforce"
     ) is True
     assert capability_need_blocked_by_proof_gate(
-        proven_need, proof, enforce=True
+        proven_need, proof, mode="enforce"
     ) is False
     assert capability_need_blocked_by_proof_gate(
-        nomatch_need, proof, enforce=True
+        nomatch_need, proof, mode="enforce"
     ) is False
-    # Observe: nothing is gated, even an unproven match.
+    # Off mode: nothing is gated.
     assert capability_need_blocked_by_proof_gate(
-        unproven_need, proof, enforce=False
+        unproven_need, proof, mode="off"
+    ) is False
+    # Observe mode: nothing is gated either.
+    assert capability_need_blocked_by_proof_gate(
+        unproven_need, proof, mode="observe"
     ) is False
 
 
@@ -603,7 +619,7 @@ def _capability_blocker_task(ref: str, project_id=None):
     return task
 
 
-def _classify_capability_need(ref: str, proof_map: dict) -> dict:
+def _classify_capability_need(ref: str, proof_map: dict, *, proof_gate_mode: str = "off") -> dict:
     """Run ``_classify_blocker_needs`` with every candidate cache pre-populated
     (so no DB/session is touched) and the registry proof map injected — returns
     the disposition dict, isolating the registry/proof-gate branch."""
@@ -620,19 +636,20 @@ def _classify_capability_need(ref: str, proof_map: dict) -> dict:
             dead_cache={pid: []},
             knowledge_cache={pid: []},
             registry_cache={pid: proof_map},
+            proof_gate_mode=proof_gate_mode,
         )
     )
 
 
-def test_unproven_working_capability_does_not_satisfy_need_in_enforce_mode(monkeypatch):
+def test_unproven_working_capability_does_not_satisfy_need_in_enforce_mode():
     """ACCEPTANCE EVIDENCE. Enforce mode + a need whose ref matches a ``working``
     registry capability with ``proof_status=unproven`` must NOT satisfy the
     prerequisite — the blocked-resume sweep leaves the need in ``residual`` (the
     dependent stays BLOCKED) instead of routing it to ``completed_needs``."""
-    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "1")
-
     proof = {"seeded-evaluation-harness": "unproven"}
-    disp = _classify_capability_need("seeded-evaluation-harness", proof)
+    disp = _classify_capability_need(
+        "seeded-evaluation-harness", proof, proof_gate_mode="enforce"
+    )
 
     # The unproven working capability does NOT satisfy the need under enforce:
     # it stays residual (task remains BLOCKED) and is NOT marked completed.
@@ -644,13 +661,13 @@ def test_unproven_working_capability_does_not_satisfy_need_in_enforce_mode(monke
     assert disp["dead"] is False
 
 
-def test_proven_working_capability_satisfies_need_in_enforce_mode(monkeypatch):
+def test_proven_working_capability_satisfies_need_in_enforce_mode():
     """Enforce mode does NOT gate a PROVEN working capability: the need is still
     satisfied by the codebase (routed to ``completed_needs``, not residual)."""
-    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "1")
-
     proof = {"seeded-evaluation-harness": "proven"}
-    disp = _classify_capability_need("seeded-evaluation-harness", proof)
+    disp = _classify_capability_need(
+        "seeded-evaluation-harness", proof, proof_gate_mode="enforce"
+    )
 
     assert disp["completed_needs"] == [
         {"kind": "capability", "ref": "seeded-evaluation-harness"}
@@ -658,13 +675,13 @@ def test_proven_working_capability_satisfies_need_in_enforce_mode(monkeypatch):
     assert disp["residual"] == []
 
 
-def test_observe_mode_still_satisfies_unproven(monkeypatch):
-    """Observe mode (the default) still treats an unproven working capability as
+def test_observe_mode_still_satisfies_unproven():
+    """Observe mode still treats an unproven working capability as
     satisfied — the need routes to ``completed_needs`` exactly as before."""
-    monkeypatch.delenv("CAPABILITY_PROOF_ENFORCE", raising=False)
-
     proof = {"seeded-evaluation-harness": "unproven"}
-    disp = _classify_capability_need("seeded-evaluation-harness", proof)
+    disp = _classify_capability_need(
+        "seeded-evaluation-harness", proof, proof_gate_mode="observe"
+    )
 
     assert disp["completed_needs"] == [
         {"kind": "capability", "ref": "seeded-evaluation-harness"}
@@ -672,19 +689,79 @@ def test_observe_mode_still_satisfies_unproven(monkeypatch):
     assert disp["residual"] == []
 
 
-def test_blocked_resume_sweep_routes_unproven_by_mode(monkeypatch):
+def test_off_mode_still_satisfies_unproven():
+    """Off mode (the default) still treats an unproven working capability as
+    satisfied — the need routes to ``completed_needs`` exactly as before."""
+    proof = {"seeded-evaluation-harness": "unproven"}
+    disp = _classify_capability_need(
+        "seeded-evaluation-harness", proof, proof_gate_mode="off"
+    )
+
+    assert disp["completed_needs"] == [
+        {"kind": "capability", "ref": "seeded-evaluation-harness"}
+    ]
+    assert disp["residual"] == []
+
+
+def test_blocked_resume_sweep_routes_unproven_by_mode():
     """The blocked-resume sweep routes an unproven working-capability need to
-    ``residual`` under enforce and to ``completed_needs`` under observe — the two
-    modes diverge only on the unproven-match path (partial gates the same way)."""
+    ``residual`` under enforce and to ``completed_needs`` under observe/off — the
+    three modes diverge only on the unproven-match path (partial gates the same way)."""
     proof = {"seeded-evaluation-harness": "partial"}
 
-    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "1")
-    enforced = _classify_capability_need("seeded-evaluation-harness", proof)
+    enforced = _classify_capability_need(
+        "seeded-evaluation-harness", proof, proof_gate_mode="enforce"
+    )
     assert enforced["residual"] and not enforced["completed_needs"]
 
-    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "0")
-    observed = _classify_capability_need("seeded-evaluation-harness", proof)
+    observed = _classify_capability_need(
+        "seeded-evaluation-harness", proof, proof_gate_mode="observe"
+    )
     assert observed["completed_needs"] and not observed["residual"]
+
+    off = _classify_capability_need(
+        "seeded-evaluation-harness", proof, proof_gate_mode="off"
+    )
+    assert off["completed_needs"] and not off["residual"]
+
+
+def test_capability_proof_gate_mode_three_way():
+    """ACCEPTANCE EVIDENCE. The three-way mode knob (off/observe/enforce) controls
+    whether an unproven 'working' capability satisfies a blocked-task need:
+
+    - ``off`` (default, safest) — the gate is entirely disabled; an unproven
+      working capability resolves the need exactly as before the gate existed.
+    - ``observe`` — same resolution behavior as off, but serves as the visual
+      readiness check: the unproven resolution is visible in logs/heat so the
+      operator can assess impact before flipping to enforce.
+    - ``enforce`` — an unproven working capability does NOT satisfy the need;
+      the dependent stays BLOCKED (need routed to residual, not completed_needs).
+    """
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        capability_proof_gate_mode,
+    )
+
+    proof = {"seeded-evaluation-harness": "unproven"}
+    need = {"kind": "capability", "ref": "seeded-evaluation-harness"}
+
+    # ---- off mode ----
+    assert capability_proof_gate_mode(override="off") == "off"
+    assert (
+        capability_need_blocked_by_proof_gate(need, proof, mode="off") is False
+    )
+
+    # ---- observe mode ----
+    assert capability_proof_gate_mode(override="observe") == "observe"
+    assert (
+        capability_need_blocked_by_proof_gate(need, proof, mode="observe") is False
+    )
+
+    # ---- enforce mode ----
+    assert capability_proof_gate_mode(override="enforce") == "enforce"
+    assert (
+        capability_need_blocked_by_proof_gate(need, proof, mode="enforce") is True
+    )
 
 
 def test_capability_ambiguous_resolves_to_canonical():

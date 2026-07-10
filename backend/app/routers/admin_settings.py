@@ -106,6 +106,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "autonomous_research_interval_minutes",
         "autonomous_spawn_budget_categories",
         "autonomous_spawn_budget_mode",
+        "capability_proof_gate_mode",
         "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
@@ -423,6 +424,9 @@ async def get_settings(
         ),
         "metrics_integrity_sweep_mode": str(
             _runtime_config.get("metrics_integrity_sweep_mode", "observe")
+        ),
+        "capability_proof_gate_mode": str(
+            _runtime_config.get("capability_proof_gate_mode", "off") or "off"
         ),
         "metrics_integrity_sweep_interval_minutes": int(
             _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
@@ -1141,6 +1145,16 @@ async def _apply_settings(
         _runtime_config["metrics_integrity_sweep_mode"] = val
         if val == "enforce":
             _debt_keys_to_resolve.append("dormant_knob:metrics_integrity_sweep_mode")
+    if "capability_proof_gate_mode" in payload:
+        val = str(payload["capability_proof_gate_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="capability_proof_gate_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["capability_proof_gate_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:capability_proof_gate_mode")
     for _mi_key, _mi_lo, _mi_hi in (
         ("metrics_integrity_sweep_interval_minutes", 1, 1440),
         ("metrics_integrity_sweep_max_checks", 1, 1000),

@@ -397,6 +397,7 @@ async def _classify_blocker_needs(
     dead_cache: dict,
     knowledge_cache: dict,
     registry_cache: dict,
+    proof_gate_mode: str = "off",
 ) -> dict:
     """Classify EVERY recorded need of a blocked task against the live foundations.
 
@@ -438,7 +439,6 @@ async def _classify_blocker_needs(
     from app.capability_registry import (
         capability_need_blocked_by_proof_gate,
         capability_need_proof_status,
-        capability_proof_enforce_enabled,
         registry_satisfies_capability_need,
     )
 
@@ -532,7 +532,7 @@ async def _classify_blocker_needs(
         if registry_satisfies_capability_need(need, working_caps):
             _proof_status = capability_need_proof_status(need, working_proof)
             if capability_need_blocked_by_proof_gate(
-                need, working_proof, enforce=capability_proof_enforce_enabled()
+                need, working_proof, mode=proof_gate_mode
             ):
                 # ENFORCE mode: an unproven/partial 'working' capability does NOT
                 # satisfy the need. Leave it in ``residual`` (do NOT route to
@@ -1209,6 +1209,10 @@ async def sweep_unblock_blocked_tasks(
         # blocked dependent can wait on MORE THAN ONE prerequisite. Classify EVERY
         # recorded need once against the live active / completed / dead foundation
         # sets, then apply the disposition — resume only when ALL needs resolve.
+        from app.shared_state import runtime_config as _blocker_rt_config
+        _proof_gate_mode = str(
+            _blocker_rt_config.get("capability_proof_gate_mode", "off") or "off"
+        )
         disp = await _classify_blocker_needs(
             task,
             session,
@@ -1217,6 +1221,7 @@ async def sweep_unblock_blocked_tasks(
             dead_cache=dead_cache,
             knowledge_cache=knowledge_cache,
             registry_cache=registry_cache,
+            proof_gate_mode=_proof_gate_mode,
         )
 
         # Already escalated terminally — leave parked for the operator. On
@@ -1553,6 +1558,10 @@ async def _event_driven_unblock_project(
         ctx = task.context or {}
         parked = bool(ctx.get("_blocked_escalated"))
         try:
+            from app.shared_state import runtime_config as _blocker_rt_config
+            _proof_gate_mode = str(
+                _blocker_rt_config.get("capability_proof_gate_mode", "off") or "off"
+            )
             disp = await _classify_blocker_needs(
                 task,
                 session,
@@ -1561,6 +1570,7 @@ async def _event_driven_unblock_project(
                 dead_cache=dead_cache,
                 knowledge_cache=knowledge_cache,
                 registry_cache=registry_cache,
+                proof_gate_mode=_proof_gate_mode,
             )
             if not disp["had_needs"]:
                 continue

@@ -64,7 +64,12 @@ exceeds the canonical count; the delta is the rollup double-count), and
 ``criterion_evidence_count_integrity`` (independently counts CriterionEvidence
 rows per criterion with a direct COUNT(*) and flags any criterion whose
 self-reported evidence_count from get_version_coverage_summary diverges from
-the actual row count; the delta is the silent miscount).
+the actual row count; the delta is the silent miscount), and
+``capability_proof_gate_gap`` (scans each project's problem_model capabilities and
+flags per-project the count of ``working`` capabilities whose ``proof_status`` is
+not ``proven`` — these capabilities satisfy prerequisite resolution today but would
+be blocked if the proof gate were flipped to enforce, so the flag tells operators
+exactly how many capabilities need real evidence before the gate can be enabled).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -3326,6 +3331,133 @@ async def check_criterion_evidence_count_integrity(
                 status=CheckStatus.SKIPPED,
                 subject="global",
                 detail="no criteria with evidence to audit across all projects",
+            )
+        ]
+    return results
+
+
+@register_check(
+    "capability_proof_gate_gap",
+    "Scan each project's working capabilities and flag per-project the count whose "
+    "proof_status is not 'proven' — these would be blocked if the proof gate were "
+    "enforced, exposing the readiness gap without mutating any capability.",
+)
+async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult]:
+    """Ground truth: a capability declared ``working`` that carries no proven
+    evidence is a claim the repo asserts without machine-backed verification. It
+    satisfies prerequisite resolution today, but if the operator flips the proof
+    gate to enforce mode it would immediately re-block every dependent that named
+    it. This check makes that exposure visible per project.
+
+    The check reads each project's ``problem_model.capabilities`` via
+    :func:`app.capability_registry.working_capability_proof_status`, which returns
+    the canonical name → :data:`EvidenceStatus` map for every ``working``
+    capability. Capabilities whose proof_status is anything other than ``proven``
+    (i.e. ``unproven`` / ``partial`` / ``unverified``) are the gate-readiness gap.
+
+    * ``self_reported`` = total ``working`` capabilities in the project.
+    * ``ground_truth``  = count already carrying ``proven`` evidence.
+    * ``delta``         = count that would be newly blocked by enforce mode.
+
+    Flag-only and read-only in every mode — never mutates any capability. Bounded
+    to ``ctx.max_projects`` projects.
+    """
+    from app.capability_registry import working_capability_proof_status
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.problem_model).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="capability_proof_gate_gap",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_working = False
+    for project_id, raw_pm in projects:
+        pid = str(project_id)
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        caps_list = pm.get("capabilities") if pm else None
+        if not isinstance(caps_list, list) or not caps_list:
+            results.append(
+                CheckResult(
+                    check="capability_proof_gate_gap",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no capabilities in problem_model",
+                )
+            )
+            continue
+
+        proof_by_name = working_capability_proof_status(pm)
+        if not proof_by_name:
+            results.append(
+                CheckResult(
+                    check="capability_proof_gate_gap",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no working capabilities to audit",
+                )
+            )
+            continue
+
+        any_working = True
+        total_working = len(proof_by_name)
+        unproven_names = [
+            name for name, status in proof_by_name.items() if status != "proven"
+        ]
+        proven_count = total_working - len(unproven_names)
+
+        if unproven_names:
+            preview = ", ".join(sorted(unproven_names)[:3])
+            if len(unproven_names) > 3:
+                preview += f" (+{len(unproven_names) - 3} more)"
+            results.append(
+                CheckResult(
+                    check="capability_proof_gate_gap",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total_working,
+                    ground_truth=proven_count,
+                    delta=len(unproven_names),
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{len(unproven_names)} working capability(ies) lack proven "
+                        "evidence and would be blocked by proof-gate enforce mode: "
+                        f"{preview}"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="capability_proof_gate_gap",
+                    status=CheckStatus.OK,
+                    self_reported=total_working,
+                    ground_truth=proven_count,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"all {total_working} working capability(ies) carry proven evidence"
+                    ),
+                )
+            )
+
+    if not any_working and not any(r.flagged for r in results):
+        return [
+            CheckResult(
+                check="capability_proof_gate_gap",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects with working capabilities found",
             )
         ]
     return results

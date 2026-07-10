@@ -330,47 +330,59 @@ def capability_need_proof_status(
     return proof_status_by_name.get(normalized)
 
 
-def capability_proof_enforce_enabled() -> bool:
-    """True when proof-gate ENFORCE mode is active for capability resolution.
+def capability_proof_gate_mode(override: str | None = None) -> str:
+    """Return the current proof gate mode: ``"off"``, ``"observe"``, or ``"enforce"``.
 
-    Reads the ``CAPABILITY_PROOF_ENFORCE`` env var *at call time* — never cached
-    at import — so the gate can be toggled at runtime without a restart. Default
-    is observe mode: unset or ``"0"`` → ``False`` (an unproven ``working``
-    capability still satisfies a prerequisite; the observe-mode wiring only logs
-    a warning). ``"1"`` → ``True`` (enforce: an unproven/partial ``working``
-    capability does NOT satisfy the prerequisite, so the dependent stays gated).
-    Any other value is treated as observe mode, keeping the fail-safe default of
-    "do not re-block runnable work" unless enforcement is explicitly requested.
+    When ``override`` is provided, validates and returns it (so callers can
+    inject a ``runtime_config`` value rather than always reading the env var).
+    Otherwise reads from the ``CAPABILITY_PROOF_GATE_MODE`` env var *at call
+    time* — never cached at import — so the gate can be toggled at runtime
+    without a restart. Default is ``"off"`` (the safest default: the gate never
+    blocks; the env var does not even need to exist).
+
+    ``"off"`` — the proof gate is disabled; unproven working capabilities
+    unconditionally satisfy prerequisites (identical to the pre-gate behaviour).
+
+    ``"observe"`` — the proof gate logs warnings for unproven resolutions but
+    does NOT change resolution behaviour (useful for evaluating impact before
+    flipping to enforce).
+
+    ``"enforce"`` — an unproven/partial/contradicted ``working`` capability does
+    NOT satisfy the prerequisite; the dependent stays gated.
     """
-    return os.getenv("CAPABILITY_PROOF_ENFORCE", "0").strip() == "1"
+    if override is not None:
+        return override if override in ("off", "observe", "enforce") else "off"
+    raw = os.getenv("CAPABILITY_PROOF_GATE_MODE", "off").strip().lower()
+    return raw if raw in ("off", "observe", "enforce") else "off"
 
 
 def capability_need_blocked_by_proof_gate(
     need: Mapping,
     proof_status_by_name: Mapping[str, EvidenceStatus],
     *,
-    enforce: bool,
+    mode: str = "off",
 ) -> bool:
-    """True iff enforce mode should BLOCK this capability need on proof status.
+    """True iff ``mode`` is ``"enforce"`` and proof status blocks this capability need.
 
     The single shared gate predicate both consumers (the spawn-time resolver and
     the blocked-resume sweep) call before their observe-mode warning branch, so
     the "not proven ⇒ blocked when enforcing" decision lives in exactly one
     place. Returns ``True`` only when ALL of the following hold:
 
-    * ``enforce`` mode is active,
+    * ``mode`` is ``"enforce"``,
     * ``need`` matches a ``working`` registry capability (via
       :func:`capability_need_proof_status`), and
     * that capability's proof status is anything other than ``"proven"`` — i.e.
       ``unproven`` / ``partial`` / ``unverified`` / ``contradicted`` — mirroring
       the same "not proven" threshold the observe-mode warning uses.
 
-    Returns ``False`` in observe mode, for a no-match need (not registry-
-    satisfied at all, so normal resolution applies), and for a proven capability.
-    In every ``False`` case the caller treats the need exactly as observe mode
-    does, so enabling enforce only changes the unproven-match path.
+    Returns ``False`` in ``"off"`` or ``"observe"`` mode, for a no-match need
+    (not registry-satisfied at all, so normal resolution applies), and for a
+    proven capability. In every ``False`` case the caller treats the need exactly
+    as observe mode does, so switching to enforce only changes the unproven-match
+    path.
     """
-    if not enforce:
+    if mode != "enforce":
         return False
     proof_status = capability_need_proof_status(need, proof_status_by_name)
     if proof_status is None:
