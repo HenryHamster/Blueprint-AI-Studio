@@ -146,7 +146,7 @@ async def _attempt_merge_with_retry_and_escalation(
     session: AsyncSession,
     *,
     source: str,
-    precomputed_migration_guard: tuple[bool, str | None] | None = None,
+    precomputed_migration_guard: object | None = None,
     precomputed_size_cap: tuple[str, str | None] | None = None,
 ) -> bool:
     """Both gates are open — try to merge. Mutates ``task`` in place; caller commits.
@@ -266,10 +266,16 @@ async def _attempt_merge_with_retry_and_escalation(
         # the row lock).  Fall back to running the guard inline for all other
         # callers (CI-completion, promotion, hotfix back-merge) where the guard
         # already runs outside the critical lock window.
+        from app.migration_guard_recovery import (
+            coerce_migration_guard_result,
+            mark_migration_guard_deferred,
+            spawn_migration_guard_fix_task,
+        )
+
         if precomputed_migration_guard is not None:
-            _ok_to_merge, _hold_reason = precomputed_migration_guard
+            _guard_result = precomputed_migration_guard
         else:
-            _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
+            _guard_result = await enforce_premerge_migration_guard(
                 gh_token,
                 owner,
                 repo,
@@ -281,7 +287,18 @@ async def _attempt_merge_with_retry_and_escalation(
                     else None
                 ),
             )
+        _guard_verdict, _hold_reason = coerce_migration_guard_result(_guard_result)
+        _ok_to_merge = _guard_verdict == "ok"
         if not _ok_to_merge:
+            if _guard_verdict == "defer":
+                mark_migration_guard_deferred(
+                    task,
+                    review_loop=ci_loop,
+                    reason=_hold_reason,
+                    context_snapshot=dict(task.context or {}),
+                )
+                session.add(task)
+                return False
             reservation_task_id = uuid.UUID(ci_orig_id) if ci_orig_id else task.id
             reservation = await get_migration_reservation_for_task(
                 session, task_id=reservation_task_id
@@ -344,6 +361,18 @@ async def _attempt_merge_with_retry_and_escalation(
             task.latest_status_message = (
                 f"Merge held — Alembic dual-head guard: {_hold_reason}"
             )[:500]
+            await spawn_migration_guard_fix_task(
+                task,
+                session,
+                pr_number=ci_pr_number,
+                branch=ci_branch,
+                base_branch=ci_base,
+                original_task_id=ci_orig_id,
+                guard_reason=_hold_reason,
+                review_loop=ci_loop,
+                context_snapshot=dict(task.context or {}),
+                complete_source_on_fix_spawn=True,
+            )
             session.add(task)
             return False
 

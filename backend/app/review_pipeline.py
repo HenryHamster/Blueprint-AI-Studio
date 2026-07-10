@@ -1289,6 +1289,37 @@ def build_merge_conflict_fix_prompt(
     return prompt
 
 
+def build_migration_guard_fix_prompt(
+    *,
+    pr_number: int | str,
+    base_branch: str,
+    guard_reason: str,
+) -> str:
+    """Prompt for a deterministic Alembic pre-merge guard recovery task."""
+    return (
+        f"PR #{pr_number} cannot merge into `{base_branch}` because Blueprint's "
+        "pre-merge Alembic combined-chain guard found a deterministic migration "
+        "chain conflict.\n\n"
+        f"Guard reason: {guard_reason[:1000]}\n\n"
+        "Your task is only to repair the PR's Alembic migration chain so it is "
+        f"valid against the current `{base_branch}` branch.\n\n"
+        "  1. Inspect the PR's added/modified files under "
+        "`backend/alembic/versions` and the current migration heads on the base "
+        "branch.\n"
+        "  2. Renumber any PR migration revision that already exists on the base "
+        "branch to the next unused revision id, and update the filename and "
+        "in-file `revision` consistently.\n"
+        "  3. Rechain the PR migration's `down_revision` onto the current base "
+        "head. If the PR contains a sequence of migrations, preserve their "
+        "relative order and rechain each descendant onto the newly renumbered "
+        "predecessor.\n"
+        "  4. Do not edit, delete, or rename migrations that already exist on "
+        "the base branch; only rewrite this PR's migration files.\n"
+        "  5. Run the relevant Alembic/backend checks, then commit and "
+        "force-push with `--force-with-lease`."
+    )
+
+
 async def _check_fix_mid_retry_defer(
     source_task: Task,
     session: AsyncSession,
@@ -2624,7 +2655,7 @@ async def _spawn_pipeline_task(
     # review or a different fix iteration). Override with spawn parameters.
     if task_type == "panel_review":
         _spawn_lane = LANE_ARBITRATION
-    elif fix_reason in ("merge_conflict", "update_branch_failed"):
+    elif fix_reason in ("merge_conflict", "update_branch_failed", "migration_guard"):
         _spawn_lane = LANE_CONFLICT
     elif fix_reason == "ci_failure":
         _spawn_lane = LANE_CI

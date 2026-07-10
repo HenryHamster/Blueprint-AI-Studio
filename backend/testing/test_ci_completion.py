@@ -3549,8 +3549,8 @@ _DUAL_HEAD_DIFF = (
 
 
 @pytest.mark.asyncio
-async def test_merge_held_on_dual_head_migration(db_session, mocker):
-    """A PR adding a colliding revision id is HELD: merge not called, returns False."""
+async def test_merge_dual_head_migration_spawns_guard_fix(db_session, mocker):
+    """A deterministic dual-head block spawns a migration fix and exits CI wait."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
     mocker.patch("app.github.create_pr_comment", return_value=None)
@@ -3580,6 +3580,11 @@ async def test_merge_held_on_dual_head_migration(db_session, mocker):
         "app.github.merge_pull_request",
         AsyncMock(return_value={"merged": True}),
     )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(return_value=(fake_fix, True)),
+    )
 
     project = Project(name="dual-head hold", user_id="test-user")
     db_session.add(project)
@@ -3596,9 +3601,89 @@ async def test_merge_held_on_dual_head_migration(db_session, mocker):
 
     assert result is False, "Guard must hold the merge on a dual-head collision"
     merge_mock.assert_not_called()
-    assert task.status == TaskStatus.EVALUATING, "Held merge leaves task EVALUATING"
-    assert "dual-head" in (task.latest_status_message or "").lower()
-    assert "0002" in (task.latest_status_message or "")
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.kwargs.get("fix_reason") == "migration_guard"
+    assert spawn_mock.await_args.kwargs.get("suppress_warm_handoff") is True
+    assert "0002" in (spawn_mock.await_args.kwargs.get("fix_prompt") or "")
+    assert task.status == TaskStatus.COMPLETED
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_waiting") is False
+    assert review_loop.get("ci_passed") is False
+    assert review_loop.get("migration_guard_state") == "fix_spawned"
+    assert review_loop.get("migration_guard_fix_spawned") == str(fake_fix.id)
+    assert review_loop.get("ci_fix_spawned") == str(fake_fix.id)
+    assert "_migration_finalization" not in (task.context or {})
+    assert "spawned migration fix" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_merge_dual_head_fix_spawn_defer_retries_ci_wait(db_session, mocker):
+    """A transient migration-fix spawn deferral remains retryable."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.review_pipeline import SPAWN_REASON_DEFERRED, SPAWN_REASON_KEY
+
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0002_dup.py",
+                    "status": "added",
+                    "patch": '+"""dup migration"""\n+revision = "0002"\n+down_revision = "0001"',
+                }
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        AsyncMock(return_value=_DUAL_HEAD_DIFF),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        AsyncMock(return_value=["0001_init.py", "0002_existing.py"]),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+
+    async def _defer_spawn(source_task, *_args, **_kwargs):
+        source_task.context = {
+            **(source_task.context or {}),
+            SPAWN_REASON_KEY: SPAWN_REASON_DEFERRED,
+        }
+        return None, False
+
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(side_effect=_defer_spawn),
+    )
+
+    project = Project(name="dual-head deferred fix spawn", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    merge_mock.assert_not_called()
+    spawn_mock.assert_awaited_once()
+    assert task.status == TaskStatus.EVALUATING
+    assert task.requires_approval is not True
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_waiting") is True
+    assert review_loop.get("ci_passed") is True
+    assert review_loop.get("migration_guard_state") == "fix_deferred"
+    assert review_loop.get("migration_guard_fix_spawned") is None
+    assert "spawn was deferred" in (task.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio
@@ -3691,13 +3776,21 @@ async def test_merge_held_on_migration_fetch_failure(db_session, mocker):
         "app.github.merge_pull_request",
         AsyncMock(return_value={"merged": True}),
     )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(return_value=(None, False)),
+    )
 
     project = Project(name="guard defer", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = _make_task(db_session, project)
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"ci_waiting": True, "ci_passed": True},
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -3707,7 +3800,12 @@ async def test_merge_held_on_migration_fetch_failure(db_session, mocker):
 
     assert result is False, "A failed safety fetch must hold the merge (defer)"
     merge_mock.assert_not_called()
+    spawn_mock.assert_not_called()
     assert task.status == TaskStatus.EVALUATING
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("migration_guard_state") == "deferred"
+    assert review_loop.get("ci_waiting") is True
+    assert review_loop.get("ci_passed") is True
 
 
 @pytest.mark.asyncio
@@ -3738,13 +3836,21 @@ async def test_migration_guard_hold_reason_includes_http_exception_detail(
         "app.github.merge_pull_request",
         AsyncMock(return_value={"merged": True}),
     )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(return_value=(None, False)),
+    )
 
     project = Project(name="guard http exc", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = _make_task(db_session, project)
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"ci_waiting": True, "ci_passed": True},
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -3754,6 +3860,7 @@ async def test_migration_guard_hold_reason_includes_http_exception_detail(
 
     assert result is False, "HTTPException from guard must hold the merge"
     merge_mock.assert_not_called()
+    spawn_mock.assert_not_called()
     status_msg = task.latest_status_message or ""
     assert "upstream error" in status_msg, (
         f"HTTPException detail must appear in status message, got: {status_msg!r}"
