@@ -173,6 +173,7 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "record_finding_resolution",
     "consume_knowledge",
     "dismiss_knowledge",
+    "request_qualification",
 })
 
 
@@ -5378,6 +5379,55 @@ async def strategic_operation(
                 "status": "ok",
                 "op": "dismiss_knowledge",
                 "document_id": str(doc_id),
+            }
+        )
+
+    elif payload.op == "request_qualification":
+        # Dedicated one-off qualification trigger. Does NOT touch ProblemModel at
+        # all — it calls the same underlying qualify logic that set_problem_model
+        # uses via its qualify_request rider, but reached directly so the agent
+        # (or operator) can request a fresh qualification run without having to
+        # construct a set_problem_model payload.
+        #
+        # Data shape: {"reason": "<string>"}. reason is optional — an absent or
+        # empty reason is treated as "". Wrong-phase is a no-op (same behavior as
+        # qualify_request via set_problem_model). The qualification runs
+        # post-commit on its own fresh session for the same structural reason as
+        # the set_problem_model path: avoid holding any DB lock during slow GitHub
+        # I/O (CI-compliance scan + run_qualification).
+        from app.strategic_completion import (
+            _apply_qualify_request_post_commit,
+            extract_qualify_request,
+        )
+
+        qualify_request = extract_qualify_request(
+            data if isinstance(data, dict) else {}
+        )
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        _rq_task_id = task.id
+        _rq_project_id = project.id
+        await session.commit()
+        await _apply_qualify_request_post_commit(
+            qualify_request,
+            task_id=_rq_task_id,
+            project_id=_rq_project_id,
+            path="api_inline_request_qualification",
+        )
+        logger.info(
+            "[STRATEGIC API] request_qualification applied for task %s project %s "
+            "(reason=%r) — release qualifier ran if open version is in stabilize",
+            _rq_task_id,
+            _rq_project_id,
+            (qualify_request or {}).get("reason"),
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "request_qualification",
+                "reason_received": (qualify_request or {}).get("reason") or None,
             }
         )
 
