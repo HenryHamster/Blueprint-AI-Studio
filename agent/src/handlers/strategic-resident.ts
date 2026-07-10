@@ -737,7 +737,7 @@ export async function handleStrategicResident(
   function gitReadTokenRefreshTick(): void {
     void (async () => {
       try {
-        const result = await apiGet(`/api/agent/github/token?task_id=${encodeURIComponent(taskId)}`) as { data?: { token?: string } } | null;
+        const result = await apiGet(`/api/agent/github/token?task_id=${encodeURIComponent(taskId)}&force_refresh=true`) as { data?: { token?: string } } | null;
         const newToken = result?.data?.token;
         if (newToken) {
           writeGitTokenFile(newToken);

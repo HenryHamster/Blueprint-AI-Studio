@@ -64,7 +64,7 @@ def _get_client() -> httpx.AsyncClient:
     if _github_client is None or _github_client.is_closed:
         _github_client = httpx.AsyncClient(
             timeout=15.0,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=25),
         )
     return _github_client
 

@@ -874,22 +874,62 @@ export async function runThinkerWithGate(
           const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
           const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
           if (isSchemaPlaceholder) {
-            sendLog(
-              ws,
-              `\n[ERROR] Final problem_model file has invalid intent.purpose after all retry attempts: "${purpose}"\n`,
-            );
-            try {
-              await persistAndPostStatus(taskId, {
-                task_id: taskId,
-                status: 'FAILED',
-                artifact_type: 'ERROR_LOG',
-                logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
-                failure_category: 'strategic_thinker_artifacts_missing',
-              });
-            } catch (e) {
-              sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+            // Auto-heal: if the model carries a non-empty user_purpose (the
+            // durable operator-set backstop), restore intent.purpose from it
+            // rather than failing.  The backend's _preserve_operator_intent
+            // applies the same fallback on write-back, but the thinker gate
+            // fires BEFORE the model ever reaches the backend — the heal here
+            // lets the strategic cycle complete when the durable model has a
+            // blank purpose (agent-writable, intentionally permitted) while
+            // user_purpose still holds the operator's real text.
+            const userPurpose = typeof intent.user_purpose === 'string' ? intent.user_purpose.trim() : '';
+            if (userPurpose && userPurpose !== '...' && !/^<[^>]+>$/.test(userPurpose)) {
+              intent.purpose = userPurpose;
+              if (intent.source == null) {
+                intent.source = { type: 'user_message', excerpt: userPurpose.slice(0, 120) };
+              }
+              try {
+                fs.writeFileSync(problemModelPath, `${JSON.stringify(finalModel, null, 2)}\n`);
+                sendLog(
+                  ws,
+                  `\n[INFO] Auto-healed blank intent.purpose from user_purpose: "${userPurpose.slice(0, 80)}"\n`,
+                );
+              } catch (writeErr) {
+                sendLog(
+                  ws,
+                  `\n[WARNING] Healed intent.purpose from user_purpose but failed to write file: ${String(writeErr)}\n`,
+                );
+                try {
+                  await persistAndPostStatus(taskId, {
+                    task_id: taskId,
+                    status: 'FAILED',
+                    artifact_type: 'ERROR_LOG',
+                    logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
+                    failure_category: 'strategic_thinker_artifacts_missing',
+                  });
+                } catch (e) {
+                  sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+                }
+                return { ok: false };
+              }
+            } else {
+              sendLog(
+                ws,
+                `\n[ERROR] Final problem_model file has invalid intent.purpose after all retry attempts: "${purpose}"\n`,
+              );
+              try {
+                await persistAndPostStatus(taskId, {
+                  task_id: taskId,
+                  status: 'FAILED',
+                  artifact_type: 'ERROR_LOG',
+                  logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
+                  failure_category: 'strategic_thinker_artifacts_missing',
+                });
+              } catch (e) {
+                sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+              }
+              return { ok: false };
             }
-            return { ok: false };
           }
         }
       } else {
