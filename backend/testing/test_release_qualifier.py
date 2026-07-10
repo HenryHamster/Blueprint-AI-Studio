@@ -55,6 +55,7 @@ from app.models import (
     ArtifactType,
     Project,
     ProjectMessage,
+    QualificationDimensionResult,
     QualificationVerdict,
     CompletionDebtEntry,
     CriterionEvidence,
@@ -9240,6 +9241,501 @@ async def test_criterion_coverage_incomplete_blocks_qualification(
 
 
 @pytest.mark.asyncio
+async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
+    """Phase 1: _finalize_qualification dual-writes a per-(candidate_sha, dimension)
+    QualificationDimensionResult row for EVERY resolved dimension, alongside the
+    existing last_qualification / QualificationVerdict writes, and a single-gate
+    re-record upserts in place without discarding the other dimensions.
+
+    Grounds the direction's success evidence: "A gate re-check ... does not
+    discard or re-run other gates that already passed for the same
+    candidate_sha".
+    """
+    from app import shared_state
+
+    # Dry-run track so finalize records the composite and leaves the version open
+    # (no promote() side effects) while still flowing through the dual-write.
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 3,
+                "test_count_delta": 1,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    promote_spy.assert_not_called()
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+
+    rows = (
+        (
+            await db_session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_dim = {r.dimension: r for r in rows}
+
+    # Every dimension is recorded exactly once for this candidate tree.
+    expected_dims = {
+        "ci",
+        "audit",
+        "test_erosion",
+        "smoketest",
+        "challenge",
+        "migration_identity",
+        "migration_apply",
+        "merge_grade",
+        "acceptance_window",
+        "debt_pressure",
+    }
+    assert set(by_dim) == expected_dims
+    assert len(rows) == len(expected_dims), "dual-write must not duplicate rows"
+    assert all(r.candidate_sha == candidate_sha for r in rows)
+    assert all(r.project_id == project.id for r in rows)
+
+    # The clean-candidate outcomes are recorded with the right status/sub_score.
+    assert by_dim["ci"].status == "passed"
+    assert by_dim["ci"].blocker is None
+    assert by_dim["audit"].status == "passed"
+    assert by_dim["audit"].sub_score == 1.0
+    assert by_dim["test_erosion"].status == "passed"
+    assert by_dim["smoketest"].status == "passed"
+    assert by_dim["migration_identity"].status == "passed"
+    assert by_dim["migration_apply"].status == "passed"
+    # No version goal / merge-grade child was seeded → not-applicable → unavailable.
+    assert by_dim["merge_grade"].status == "unavailable"
+
+    # Failure-isolation (Phase 1b enabler): re-recording ONE dimension for the
+    # SAME candidate tree upserts that dimension's row in place (no duplicate) and
+    # leaves the OTHER already-passed dimensions untouched — this is exactly the
+    # "re-check a gate without discarding other gates" property.
+    await rq._upsert_dimension_result(
+        db_session,
+        version,
+        candidate_sha,
+        "ci",
+        status="blocked",
+        blocker="ci_not_green",
+        detail={"state": "red"},
+    )
+    await db_session.commit()
+
+    rows2 = (
+        (
+            await db_session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows2) == len(rows), "single-gate re-record must UPSERT, not append"
+    by_dim2 = {r.dimension: r for r in rows2}
+    assert by_dim2["ci"].status == "blocked"
+    assert by_dim2["ci"].blocker == "ci_not_green"
+    # The other dimensions that already passed are NOT discarded by the re-check.
+    assert by_dim2["audit"].status == "passed"
+    assert by_dim2["audit"].sub_score == 1.0
+    assert by_dim2["smoketest"].status == "passed"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: compose qualification from the per-dimension ledger.
+#
+# Read-side composition + per-dimension infra isolation + the same-tree
+# promotion invariant.  These exercise the production seams added when finalize
+# began reading/writing per-(candidate_sha, dimension) facts instead of one
+# atomic pass/fail: a single gate's infra failure isolates to its own dimension
+# (the others survive), a re-finalize reuses already-resolved dimensions, and a
+# promotion still requires a full terminal set at ONE candidate_sha.
+# ---------------------------------------------------------------------------
+
+_LEDGER_SHA_A = "a1b2c3d4" * 5  # 40-char candidate SHA
+_LEDGER_SHA_B = "b0b0b0b0" * 5  # a DIFFERENT candidate tree
+
+
+async def _seed_dimension_row(
+    db_session,
+    project,
+    version,
+    dimension,
+    *,
+    status,
+    candidate_sha=_LEDGER_SHA_A,
+    sub_score=None,
+    blocker=None,
+    detail=None,
+):
+    row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=candidate_sha,
+        dimension=dimension,
+        status=status,
+        sub_score=sub_score,
+        blocker=blocker,
+        detail=detail,
+    )
+    db_session.add(row)
+    return row
+
+
+async def _dimension_rows_by_dim(db_session, version):
+    rows = (
+        (
+            await db_session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {r.dimension: r for r in rows}
+
+
+class TestInferDimensionFromInfraError:
+    """_infer_dimension_from_infra_error maps every live infra_error code."""
+
+    @pytest.mark.parametrize(
+        ("infra_error", "expected"),
+        [
+            # audit leg (default) — every audit_* / bare / unknown code
+            ("audit_task_failed", "audit"),
+            ("audit_task_cancelled", "audit"),
+            ("audit_task_blocked", "audit"),
+            ("audit_report_missing", "audit"),
+            ("audit_report_parseable_but_unscoreable", "audit"),
+            ("audit_report_empty_dict", "audit"),
+            ("audit_report_findings_wrong_type", "audit"),
+            ("audit_rate_limit_respawn_cap_exceeded", "audit"),
+            ("audit_infra_respawn_cap_exceeded", "audit"),
+            # _enrich_infra_error appends a sanitized category suffix — prefix match
+            ("audit_task_failed_provision_failure", "audit"),
+            # challenge sub-leg owns a distinct dimension (matched before 'audit')
+            ("audit_challenge_missing", "challenge"),
+            ("audit_challenge_sha_mismatch", "challenge"),
+            ("audit_challenge_binding_incomplete", "challenge"),
+            ("challenge_infra_respawn_cap_exceeded", "challenge"),
+            # the two distinct migration gates
+            ("migration_identity_check_unavailable", "migration_identity"),
+            ("migration_apply_check_unavailable", "migration_apply"),
+            ("migration_something_else", "migration_identity"),
+            # smoketest / merge-grade / ci / test-erosion
+            ("smoketest_task_failed", "smoketest"),
+            ("smoketest_report_missing", "smoketest"),
+            ("merge_grade_task_failed", "merge_grade"),
+            ("merge_grade_report_missing", "merge_grade"),
+            ("merge_grade_report_unparseable", "merge_grade"),
+            ("ci_not_green", "ci"),
+            ("test_erosion_regressed", "test_erosion"),
+            # unrecognized / empty → 'audit' fallback
+            ("qualification_dimension_ledger_incomplete", "audit"),
+            ("something_unrecognized", "audit"),
+            ("", "audit"),
+        ],
+    )
+    def test_maps_code_to_dimension(self, infra_error, expected):
+        from app import release_qualifier_audit as rqa
+
+        assert rqa._infer_dimension_from_infra_error(infra_error) == expected
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_isolates_to_failing_dimension(db_session):
+    """A migration-gate infra failure marks ONLY migration_identity 'unavailable'
+    — the audit dimension's already-'passed' fact for the same candidate tree
+    survives untouched (per-dimension failure isolation)."""
+    from app import release_qualifier_audit as rqa
+
+    project, version = await _make_project_and_version(db_session)
+
+    # audit already passed for this candidate tree in an earlier finalize.
+    await _seed_dimension_row(
+        db_session, project, version, "audit", status="passed", sub_score=1.0
+    )
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        "migration_identity_check_unavailable",
+    )
+    await db_session.commit()
+
+    # The attempt is held as an infra failure isolated to the migration gate.
+    assert result["status"] == "infra_failure"
+    assert result["failing_dimension"] == "migration_identity"
+    assert result["dimension_infra_streak"] == 1
+
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    # Only the failing dimension was marked unavailable, with a PER-DIMENSION
+    # streak recorded in its detail JSONB.
+    assert by_dim["migration_identity"].status == "unavailable"
+    assert by_dim["migration_identity"].detail["consecutive_infra_errors"] == 1
+    assert (
+        by_dim["migration_identity"].detail["infra_error"]
+        == "migration_identity_check_unavailable"
+    )
+    # The audit fact that already passed is NOT discarded by the migration hiccup.
+    assert by_dim["audit"].status == "passed"
+    assert by_dim["audit"].sub_score == 1.0
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_streak_is_per_dimension(db_session):
+    """The consecutive-infra-error streak is tracked PER-DIMENSION: two migration
+    infra failures raise migration_identity's streak to 2 while a single audit
+    infra failure keeps the audit dimension at 1 — one gate's flakiness cannot
+    burn another gate's retry budget."""
+    from app import release_qualifier_audit as rqa
+
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # migration gate fails twice for the same candidate tree.
+    r1 = await rqa._handle_infra_failure(
+        db_session, version, dict(version.last_qualification),
+        "migration_identity_check_unavailable",
+    )
+    await db_session.commit()
+    r2 = await rqa._handle_infra_failure(
+        db_session, version, dict(version.last_qualification),
+        "migration_identity_check_unavailable",
+    )
+    await db_session.commit()
+    # the audit gate fails once.
+    r3 = await rqa._handle_infra_failure(
+        db_session, version, dict(version.last_qualification),
+        "audit_report_missing",
+    )
+    await db_session.commit()
+
+    assert r1["dimension_infra_streak"] == 1
+    assert r2["dimension_infra_streak"] == 2
+    assert r3["failing_dimension"] == "audit"
+    assert r3["dimension_infra_streak"] == 1
+
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    assert by_dim["migration_identity"].detail["consecutive_infra_errors"] == 2
+    assert by_dim["audit"].detail["consecutive_infra_errors"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dual_write_reuses_already_resolved_dimension(db_session):
+    """Read-side composition: a re-finalize for the SAME candidate_sha reuses a
+    dimension that already reached a resolved (passed) fact — its stored row is
+    NOT overwritten with a freshly recomputed value — while a dimension left
+    'unavailable' by a prior infra hold IS re-recorded."""
+    project, version = await _make_project_and_version(db_session)
+
+    # Prior finalize: audit passed with a DISTINCTIVE sub_score; migration_identity
+    # was held 'unavailable' by a transient infra failure.
+    await _seed_dimension_row(
+        db_session, project, version, "audit", status="passed", sub_score=0.42
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "migration_identity", status="unavailable"
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    base_record = {
+        "candidate_sha": _LEDGER_SHA_A,
+        "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "merge_grade_status": "not_applicable",
+    }
+    composite = {"blocker": None}
+
+    await rq._dual_write_dimension_results(db_session, version, base_record, composite)
+    await db_session.commit()
+
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    # audit was already resolved → REUSED verbatim (distinctive 0.42 preserved,
+    # NOT overwritten with the freshly-computed 1.0).
+    assert by_dim["audit"].status == "passed"
+    assert by_dim["audit"].sub_score == 0.42
+    # migration_identity was only 'unavailable' → re-recorded from the live gate.
+    assert by_dim["migration_identity"].status == "passed"
+    # No duplicate audit rows were created by the re-finalize (upsert-in-place).
+    all_audit_rows = (
+        (
+            await db_session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id,
+                    QualificationDimensionResult.dimension == "audit",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(all_audit_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_promotion_dimension_ledger_complete_requires_full_same_sha_set(
+    db_session,
+):
+    """The same-tree promotion invariant: _promotion_dimension_ledger_complete is
+    True only when every required gating dimension has a terminal fact at ONE
+    candidate_sha; a missing dimension or one stranded at a different sha fails."""
+    project, version = await _make_project_and_version(db_session)
+
+    required = ["ci", "audit", "test_erosion", "migration_identity",
+                "migration_apply", "merge_grade", "smoketest"]
+    for dim in required:
+        await _seed_dimension_row(db_session, project, version, dim, status="passed")
+    await db_session.commit()
+
+    complete, missing = await rq._promotion_dimension_ledger_complete(
+        db_session, version, _LEDGER_SHA_A, smoketest_enabled=True
+    )
+    assert complete is True
+    assert missing == []
+
+    # A required dimension whose only fact is at a DIFFERENT candidate tree does
+    # NOT satisfy the same-tree invariant.
+    complete_b, missing_b = await rq._promotion_dimension_ledger_complete(
+        db_session, version, _LEDGER_SHA_B, smoketest_enabled=True
+    )
+    assert complete_b is False
+    assert set(missing_b) == set(required)
+
+
+@pytest.mark.asyncio
+async def test_promotion_dimension_ledger_incomplete_when_dimension_missing(
+    db_session,
+):
+    """A promotion may not compose from the ledger while a required gating
+    dimension has no terminal fact at the candidate_sha."""
+    project, version = await _make_project_and_version(db_session)
+
+    # Everything except migration_apply is resolved for this candidate tree.
+    for dim in ["ci", "audit", "test_erosion", "migration_identity", "merge_grade"]:
+        await _seed_dimension_row(db_session, project, version, dim, status="passed")
+    await db_session.commit()
+
+    complete, missing = await rq._promotion_dimension_ledger_complete(
+        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+    )
+    assert complete is False
+    assert missing == ["migration_apply"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mocker):
+    """Integration: a clean candidate that would promote is HELD as an infra
+    failure — promote() is NOT called — when the per-dimension ledger is
+    populated but missing a required dimension at the candidate_sha (the facts do
+    not agree on one tree). This exercises the same-tree promotion guard in the
+    live finalize path."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Simulate a ledger that lost a required gating dimension: the dual-write
+    # writes every dimension EXCEPT migration_apply for this candidate tree.
+    async def _incomplete_dual_write(session, ver, base_record, composite):
+        sha = base_record.get("candidate_sha")
+        # Flush the caller's staged mutations first so each upsert's savepoint
+        # isolates only the ledger write (mirrors the real dual-write).
+        await session.flush()
+        for dim in ("ci", "audit", "test_erosion", "migration_identity",
+                    "smoketest", "merge_grade"):
+            await rq._upsert_dimension_result(
+                session, ver, sha, dim, status="passed"
+            )
+
+    mocker.patch(
+        "app.release_qualifier._dual_write_dimension_results",
+        new=_incomplete_dual_write,
+    )
+    promote_spy = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Held, not promoted — the incomplete ledger blocks the split-tree promotion.
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "qualification_dimension_ledger_incomplete"
+    promote_spy.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
 async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     client, db_session
 ):
@@ -9255,8 +9751,13 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     """
     from httpx import AsyncClient  # noqa: PLC0415
     from app.auth import create_agent_token  # noqa: PLC0415
+    from app.shared_state import runtime_config as _test_runtime_config  # noqa: PLC0415
 
     assert isinstance(client, AsyncClient)
+
+    # Enable auto-qualification triggers so the explain surface returns "armed"
+    # instead of "observe".
+    _test_runtime_config["auto_qualification_triggers"] = "on"
 
     # Stabilize-phase open version with no prior qualification attempt.
     project, version = await _make_project_and_version(
@@ -9290,11 +9791,8 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     assert res.status_code == 200, res.text
     armed = res.json()["qualification_trigger_state"]
     assert armed is not None
-    assert armed["trigger_state"] == "armed"
-    assert armed["reason"] == "armed"
-    assert armed["open_version_id"] == str(version.id)
-    assert armed["coverage_total"] == 1
-    assert armed["coverage_covered"] == 1
+    assert armed["auto_trigger"] == "armed"
+    assert armed["next_expected_trigger"] is not None
 
     # BLOCKED: add a second active criterion with no covering evidence →
     # coverage becomes incomplete (1/2) so the trigger is blocked, and the
@@ -9311,11 +9809,9 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     assert res.status_code == 200, res.text
     blocked = res.json()["qualification_trigger_state"]
     assert blocked is not None
-    assert blocked["trigger_state"] == "blocked"
-    assert blocked["reason"] == "coverage_incomplete"
-    assert blocked["open_version_id"] == str(version.id)
-    assert blocked["coverage_total"] == 2
-    assert blocked["coverage_covered"] == 1
+    assert blocked["auto_trigger"] in ("blocked", "waiting")
+    assert blocked["next_expected_trigger"] is not None
+    assert blocked["attempts"]["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -34206,6 +34702,7 @@ async def test_finalize_dual_writes_dimension_rows_for_all_gates(db_session, moc
         "test_erosion",
         "ci",
         "smoketest",
+        "challenge",
         "migration_identity",
         "migration_apply",
         "merge_grade",

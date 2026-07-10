@@ -966,17 +966,30 @@ class AuditFindingResolution(SQLModel, table=True):
 
 
 class QualificationDimensionResult(SQLModel, table=True):
-    """Per-(candidate_sha, dimension) verdict ledger for qualification gates.
+    """Per-(candidate_sha, dimension) qualification fact ledger (Phase 1).
 
-    Phase 1a of the per-dimension fact ledger redesign (knowledge doc
-    28f9d31a).  The existing ``_finalize_qualification`` dual-writes one row per
-    gate here alongside the existing ``last_qualification`` / ``QualificationVerdict``
-    path (which is left entirely unchanged).  The read-side cutover is Phase 1b
-    (a separate follow-up task).
+    Design doc "From Batch Attempts to a Per-Dimension Fact Ledger: Restructuring
+    Qualification for Failure-Isolation and Incremental Scoring" (section 3).
 
-    UNIQUE(release_version_id, candidate_sha, dimension) makes each row
-    immutable-once-terminal-per-SHA: a new candidate writes new rows rather than
-    mutating old ones.
+    Today a qualification attempt is monolithic: ``_finalize_qualification``
+    computes every gate/dimension, folds them into one ``last_qualification``
+    blob (overwritten every finalize) plus one immutable ``QualificationVerdict``
+    row, and a single failed gate discards the whole audit.  This table records
+    ONE row PER dimension PER candidate tree, so a later re-check of one gate can
+    re-run and re-record only its own ``(release_version_id, candidate_sha,
+    dimension)`` fact without discarding the other dimensions that already
+    passed for the same tree.
+
+    Phase 1 is a DUAL-WRITE: ``_finalize_qualification`` writes these rows
+    ALONGSIDE the existing ``last_qualification`` / ``QualificationVerdict``
+    writes and changes no decision logic.  Writes are best-effort — a failure to
+    record a dimension row must NEVER break or roll back a qualification or
+    promotion (mirrors ``_record_qualification_verdict``).
+
+    A unique constraint on ``(release_version_id, candidate_sha, dimension)``
+    makes a repeat write for the same tree an UPSERT (latest write wins) rather
+    than a duplicate; ``release_qualifier._upsert_dimension_result`` performs
+    that SELECT-then-INSERT/UPDATE upsert.
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -999,48 +1012,58 @@ class QualificationDimensionResult(SQLModel, table=True):
         ),
     )
 
-    # The automain HEAD SHA this result is FOR (the same SHA snapped into
-    # last_qualification["candidate_sha"]).
-    candidate_sha: str = Field(
-        sa_column=Column(String(40), nullable=False),
+    # The candidate tree (automain HEAD SHA) this dimension result is FOR.
+    # Nullable per migration linter rules and to match QualificationVerdict; in
+    # practice always set at finalize (the upsert key relies on it).
+    candidate_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
     )
 
-    # Gate name: audit | migration_identity | migration_apply | ci | smoketest
-    #            | merge_grade | test_erosion | acceptance_window | debt_pressure
+    # Which qualification dimension this row records — one of: audit,
+    # migration_identity, migration_apply, ci, smoketest, merge_grade,
+    # test_erosion, acceptance_window, debt_pressure, challenge.
     dimension: str = Field(
         sa_column=Column(String(32), nullable=False),
     )
 
-    # Gate outcome: passed | failed | blocked | unavailable | pending
+    # Outcome for this dimension: passed | failed | blocked | unavailable | pending.
     status: str = Field(
         sa_column=Column(String(16), nullable=False),
     )
 
-    # Feed into compute_composite (mirrors the per-dimension sub_score slot).
+    # Per-dimension score in [0,1] when the dimension is numerically scored
+    # (audit / test_erosion / smoketest / merge-grade coverage / debt pressure /
+    # acceptance fraction).  NULL for the boolean/verdict dimensions.
     sub_score: float | None = Field(
         default=None,
         sa_column=Column(Float, nullable=True),
     )
 
-    # Hard-blocker code when this dimension forces confidence 0.0.
+    # Hard-blocker code when this dimension forced the composite confidence to
+    # 0.0 (e.g. ci_not_green, migration_apply_drift, audit_missing), else NULL.
     blocker: str | None = Field(
         default=None,
         sa_column=Column(String(64), nullable=True),
     )
 
-    # Content-hash of the audited surface (for cross-SHA reuse, audit/migration dims).
+    # Content hash of the audited surface, for cross-SHA fact reuse in later
+    # phases (a commit differing only in CI/fixture files can reuse the fact).
     audited_surface_hash: str | None = Field(
         default=None,
         sa_column=Column(String(64), nullable=True),
     )
 
-    # Dimension-specific evidence (findings, migration detail, CI resolution, …).
-    detail: Dict[str, Any] | None = Field(
+    # Dimension-specific evidence (ci_resolution, migration detail, merge-grade
+    # certificate, acceptance aggregate, debt snapshot, challenge summary, ...).
+    detail: Any | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )
 
-    # The child agent task that produced this result, when applicable.
+    # The child agent task that produced this dimension's evidence, when any
+    # (audit / smoketest / challenge / merge-grade); NULL for gates computed
+    # inline (ci / migration_identity / migration_apply).
     producing_task_id: uuid.UUID | None = Field(
         default=None,
         sa_column=Column(GUID(), nullable=True),
@@ -1056,12 +1079,7 @@ class QualificationDimensionResult(SQLModel, table=True):
             "release_version_id",
             "candidate_sha",
             "dimension",
-            name="uq_qualificationdimensionresult_version_sha_dim",
-        ),
-        Index(
-            "ix_qualificationdimensionresult_project_computed",
-            "project_id",
-            "computed_at",
+            name="uq_qualdimresult_version_sha_dimension",
         ),
     )
 

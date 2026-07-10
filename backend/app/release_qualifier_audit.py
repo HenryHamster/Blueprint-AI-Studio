@@ -127,6 +127,44 @@ def _infer_infra_leg(infra_error: str) -> str:
     return "audit"
 
 
+def _infer_dimension_from_infra_error(infra_error: str) -> str:
+    """Map an infra_error code to the qualification ledger dimension it belongs to.
+
+    Per-dimension failure isolation (Phase 1, design doc "From Batch Attempts to a
+    Per-Dimension Fact Ledger"): when a qualifier run holds on an infrastructure
+    failure, ONLY the failing dimension's ``(candidate_sha, dimension)`` fact is
+    marked unavailable — the dimensions that already resolved for the same
+    candidate tree are preserved.  Codes are matched by prefix because
+    ``_enrich_infra_error`` may append a sanitized agent-failure-category suffix
+    (e.g. ``"audit_task_failed_provision_failure"``).  Ordering is deliberate: the
+    ``audit_challenge*`` codes are a sub-leg of the audit but own a distinct
+    ``challenge`` dimension, so they are matched before the bare ``audit`` prefix,
+    and ``migration_identity`` / ``migration_apply`` before the bare ``migration``
+    fallback.  Unrecognized codes default to ``audit`` — the dominant,
+    always-present dimension — matching ``_infer_infra_leg``'s fallback.
+    """
+    code = (infra_error or "").lower()
+    if code.startswith("audit_challenge") or code.startswith("challenge"):
+        return "challenge"
+    if code.startswith("migration_identity"):
+        return "migration_identity"
+    if code.startswith("migration_apply"):
+        return "migration_apply"
+    if code.startswith("migration"):
+        return "migration_identity"
+    if code.startswith("smoketest"):
+        return "smoketest"
+    if code.startswith("merge_grade"):
+        return "merge_grade"
+    if code.startswith("ci"):
+        return "ci"
+    if code.startswith("test_erosion"):
+        return "test_erosion"
+    if code.startswith("audit"):
+        return "audit"
+    return "audit"
+
+
 def _infra_failure_signature(
     infra_error: str, child_failures: list[dict[str, Any]]
 ) -> str:
@@ -842,12 +880,21 @@ async def _handle_infra_failure(
         "attempt_history": attempt_history,
     }
 
+    # Per-dimension failure isolation (Phase 1): infer WHICH dimension the infra
+    # failure belongs to so only that (candidate_sha, dimension) ledger fact is
+    # marked unavailable below — the other dimensions that already resolved for
+    # this candidate tree keep their rows.
+    failing_dimension = _infer_dimension_from_infra_error(infra_error)
+
     record: dict[str, Any] = {
         "candidate_sha": qual.get("candidate_sha"),
         "ci_green": qual.get("ci_green"),
         "smoketest_enabled": qual.get("smoketest_enabled", True),
         "status": "infra_failure",
         "error": infra_error,
+        # Which single dimension this infra failure isolated to (the other
+        # dimensions' ledger facts survive) — surfaced for operator diagnosis.
+        "failing_dimension": failing_dimension,
         "infra_failure_signature": signature,
         "previous_infra_failure_signature": previous_signature,
         "same_error_as_prior": same_error_as_prior,
@@ -875,6 +922,22 @@ async def _handle_infra_failure(
         ),
     )
     session.add(version)
+
+    # Per-dimension failure isolation (Phase 1): record ONLY the failing
+    # dimension as 'unavailable' in the per-(candidate_sha, dimension) ledger,
+    # tracking a PER-DIMENSION infra-error streak in the row's detail — so this
+    # gate's flakiness cannot burn another gate's retry budget and the other
+    # dimensions' already-resolved facts for this candidate tree are untouched.
+    # Best-effort: a ledger write failure must never break the infra-failure hold.
+    _rq = _release_qualifier_module()
+    dimension_infra_streak = await _rq._record_infra_dimension_unavailable(
+        session,
+        version,
+        qual.get("candidate_sha"),
+        failing_dimension,
+        infra_error=infra_error,
+        signature=signature,
+    )
 
     if (
         current_streak >= _MIN_INFRA_ERROR_STREAK
@@ -973,6 +1036,11 @@ async def _handle_infra_failure(
         "same_error_as_prior": same_error_as_prior,
         "same_error_different_candidate": same_error_different_candidate,
         "consecutive_infra_errors": current_streak,
+        # Per-dimension isolation (Phase 1): which single dimension was marked
+        # unavailable, and that dimension's own infra-error streak (distinct from
+        # the attempt-level ``consecutive_infra_errors`` above).
+        "failing_dimension": failing_dimension,
+        "dimension_infra_streak": dimension_infra_streak,
     }
 
 

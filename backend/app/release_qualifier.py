@@ -3089,55 +3089,494 @@ async def _count_project_actionable_open_completion_debt(
     return int((await session.execute(stmt)).scalar_one() or 0)
 
 
+async def _upsert_dimension_result(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+    dimension: str,
+    *,
+    status: str,
+    sub_score: float | None = None,
+    blocker: str | None = None,
+    detail: Any | None = None,
+    producing_task_id: Any | None = None,
+    audited_surface_hash: str | None = None,
+) -> None:
+    """Best-effort UPSERT of ONE per-(candidate_sha, dimension) qualification fact.
+
+    Phase 1 dual-write (design doc "From Batch Attempts to a Per-Dimension Fact
+    Ledger", section 3).  SELECT-then-INSERT/UPDATE on the unique
+    ``(release_version_id, candidate_sha, dimension)`` key so a later re-check of
+    a single gate re-records ONLY its own fact (latest write wins) without
+    touching the other dimensions that already passed for the same candidate
+    tree.  SELECT-then-write (not a dialect-specific ON CONFLICT upsert) keeps
+    the helper portable across the SQLite test gate and the Postgres runtime.
+
+    CRITICAL: recording must NEVER break or roll back a qualification/promotion
+    (mirrors ``_record_qualification_verdict``).  The read+write runs inside a
+    SAVEPOINT (``begin_nested``) wrapped in try/except; any failure — a malformed
+    row, or (until the sibling migration lands) a missing table — is rolled back
+    to the savepoint leaving the OUTER transaction intact, logged, and swallowed.
+    Purely additive: no existing write or decision is affected.  The caller is
+    expected to have flushed its own staged mutations into the outer transaction
+    first, so this savepoint isolates only the ledger write.
+    """
+    # A per-tree fact is only meaningful with a candidate SHA (the upsert key
+    # relies on it).  Skip silently otherwise — additive, best-effort.
+    if not candidate_sha:
+        return
+
+    _producing_uuid: uuid.UUID | None = None
+    if producing_task_id:
+        try:
+            _producing_uuid = uuid.UUID(str(producing_task_id))
+        except (ValueError, TypeError, AttributeError):
+            _producing_uuid = None
+
+    _sub_score: float | None = None
+    if isinstance(sub_score, (int, float)) and not isinstance(sub_score, bool):
+        _sub_score = float(sub_score)
+
+    try:
+        async with session.begin_nested():
+            existing = (
+                await session.execute(
+                    select(QualificationDimensionResult).where(
+                        QualificationDimensionResult.release_version_id == version.id,
+                        QualificationDimensionResult.candidate_sha == candidate_sha,
+                        QualificationDimensionResult.dimension == dimension,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                existing.status = status
+                existing.sub_score = _sub_score
+                existing.blocker = blocker
+                existing.audited_surface_hash = audited_surface_hash
+                existing.detail = detail
+                existing.producing_task_id = _producing_uuid
+                existing.computed_at = _utcnow()
+                session.add(existing)
+            else:
+                session.add(
+                    QualificationDimensionResult(
+                        project_id=version.project_id,
+                        release_version_id=version.id,
+                        candidate_sha=candidate_sha,
+                        dimension=dimension,
+                        status=status,
+                        sub_score=_sub_score,
+                        blocker=blocker,
+                        audited_surface_hash=audited_surface_hash,
+                        detail=detail,
+                        producing_task_id=_producing_uuid,
+                    )
+                )
+            await session.flush()
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort, never fatal
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to upsert dimension result '%s' for v%s "
+            "(non-fatal — additive ledger only): %s",
+            dimension,
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+
+
+# Per-dimension ledger status vocabulary (design doc "From Batch Attempts to a
+# Per-Dimension Fact Ledger", section 3).  A dimension is RESOLVED when its gate
+# reached a real pass/fail/blocked outcome; it is TERMINAL (for the same-tree
+# promotion invariant) when it additionally reached a legitimate not-applicable
+# 'unavailable' (e.g. smoketest disabled, merge-grade exempt).  'pending' and a
+# missing row are neither.  An infra failure records 'unavailable' — RESOLVED is
+# deliberately narrower than TERMINAL so a re-finalize RE-RUNS an infra-held
+# dimension while REUSING the ones that already truly passed/failed/blocked.
+_LEDGER_RESOLVED_STATUSES: frozenset[str] = frozenset({"passed", "failed", "blocked"})
+_LEDGER_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"passed", "failed", "blocked", "unavailable"}
+)
+
+# Gates that must every one have a terminal fact at the SAME candidate_sha before
+# a promotion may compose from the ledger — the informational dimensions
+# (challenge / acceptance_window / debt_pressure) never gate promotion and are
+# excluded.  smoketest is required only when the run had it enabled (audit H3).
+_PROMOTION_REQUIRED_DIMENSIONS: tuple[str, ...] = (
+    "ci",
+    "audit",
+    "test_erosion",
+    "migration_identity",
+    "migration_apply",
+    "merge_grade",
+)
+
+
+async def _load_prior_dimension_results(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> dict[str, QualificationDimensionResult]:
+    """Return the per-dimension ledger rows already recorded for this candidate.
+
+    Read side of the per-dimension fact ledger (Phase 1).  Keyed by dimension,
+    scoped to ``(release_version_id, candidate_sha)`` so facts from a DIFFERENT
+    candidate tree are never mixed in — preserving the batch model's "everything
+    scored the same tree" guarantee.  Best-effort: any read failure (including a
+    missing table before the sibling migration lands) degrades to an empty map so
+    finalize continues exactly as before.
+    """
+    if not candidate_sha:
+        return {}
+    try:
+        rows = (
+            (
+                await session.execute(
+                    select(QualificationDimensionResult).where(
+                        QualificationDimensionResult.release_version_id == version.id,
+                        QualificationDimensionResult.candidate_sha == candidate_sha,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    except Exception as exc:  # noqa: BLE001 — read is best-effort, never fatal
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to load prior dimension ledger for v%s "
+            "(non-fatal — composing from live gates): %s",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+        return {}
+    return {r.dimension: r for r in rows}
+
+
+async def _record_infra_dimension_unavailable(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+    dimension: str,
+    *,
+    infra_error: str,
+    signature: str | None = None,
+) -> int:
+    """Mark ONE dimension 'unavailable' in the ledger on an infrastructure failure.
+
+    Per-dimension failure isolation (Phase 1): an infra failure in a single gate
+    records ONLY that ``(candidate_sha, dimension)`` fact as unavailable — the
+    other dimensions that already resolved for the same candidate tree keep their
+    rows untouched (the upsert only ever writes this one dimension's row).  The
+    consecutive-infra-error streak is tracked PER-DIMENSION in the row's ``detail``
+    JSONB, so one gate's flakiness cannot burn another gate's retry budget.
+
+    Best-effort — mirrors ``_upsert_dimension_result`` and never breaks finalize.
+    Returns the new per-dimension streak (0 when the write is skipped, e.g. no
+    candidate SHA).
+    """
+    if not candidate_sha:
+        return 0
+    prior_streak = 0
+    try:
+        existing = (
+            await session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id,
+                    QualificationDimensionResult.candidate_sha == candidate_sha,
+                    QualificationDimensionResult.dimension == dimension,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None and isinstance(existing.detail, dict):
+            prior = existing.detail.get("consecutive_infra_errors")
+            if isinstance(prior, int) and not isinstance(prior, bool):
+                prior_streak = prior
+    except Exception as exc:  # noqa: BLE001 — best-effort read of the prior streak
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to read prior infra streak for dimension "
+            "'%s' on v%s (non-fatal): %s",
+            dimension,
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+        prior_streak = 0
+    new_streak = prior_streak + 1
+    await _upsert_dimension_result(
+        session,
+        version,
+        candidate_sha,
+        dimension,
+        status="unavailable",
+        blocker=None,
+        detail={
+            "infra_error": infra_error,
+            "infra_failure_signature": signature,
+            "consecutive_infra_errors": new_streak,
+        },
+    )
+    return new_streak
+
+
+async def _promotion_dimension_ledger_complete(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+    *,
+    smoketest_enabled: bool = True,
+) -> tuple[bool, list[str]]:
+    """Is there a full set of terminal dimension facts at ONE candidate_sha?
+
+    The batch model's invariant — every gate scored the SAME candidate tree —
+    carried onto the per-dimension ledger: a promotion may only compose from the
+    ledger when every required gating dimension has a TERMINAL row (not pending,
+    not missing) at ``candidate_sha``.  A required dimension whose only fact is at
+    a DIFFERENT candidate_sha does not count (``_load_prior_dimension_results`` is
+    already sha-scoped).  Returns ``(complete, missing_dimensions)``.
+    """
+    required = list(_PROMOTION_REQUIRED_DIMENSIONS)
+    if smoketest_enabled:
+        required.append("smoketest")
+    prior = await _load_prior_dimension_results(session, version, candidate_sha)
+    missing = [
+        dim
+        for dim in required
+        if dim not in prior or prior[dim].status not in _LEDGER_TERMINAL_STATUSES
+    ]
+    return (not missing, missing)
+
+
 async def _dual_write_dimension_results(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
-    candidate_sha: str,
-    dimension_rows: list[dict[str, Any]],
+    base_record: dict[str, Any],
+    composite: dict[str, Any],
 ) -> None:
-    """Dual-write per-dimension rows to QualificationDimensionResult (Phase 1a).
+    """Dual-write every resolved qualification dimension as its own ledger row.
 
-    Each entry in ``dimension_rows`` is a dict with keys matching the
-    QualificationDimensionResult columns.  Rows are upserted on the
-    (release_version_id, candidate_sha, dimension) unique key — an existing
-    terminal row for the same (version, sha, dim) is left unchanged (the
-    UNIQUE constraint causes the INSERT to be skipped via ON CONFLICT DO
-    NOTHING so rows are effectively immutable once written).
+    Phase 1 of the per-dimension fact ledger (design doc "From Batch Attempts to
+    a Per-Dimension Fact Ledger").  Called from ``_finalize_qualification`` once
+    the composite ``base_record`` is fully assembled — i.e. after EVERY gate /
+    dimension has resolved (CI, audit, test-erosion, smoketest, challenge, both
+    migration gates, merge-grade, acceptance-window, debt-pressure).  Deriving
+    the per-dimension facts from the already-assembled ``base_record`` +
+    ``composite`` keeps the write in ONE additive place that cannot alter control
+    flow, rather than threading a mutation through the ~1300-line finalize body
+    (all three terminal paths — not_promoted / dry_run / promote — flow through
+    this single point).
 
-    Best-effort: a failure to write never breaks or rolls back finalization.
+    ADDITIVE to the composite / ``last_qualification`` / ``QualificationVerdict``
+    writes — it changes no decision.  READ-SIDE COMPOSITION (Phase 1): a
+    dimension that already reached a RESOLVED (passed/failed/blocked) fact at this
+    same ``candidate_sha`` in an earlier finalize is REUSED verbatim — its stored
+    row is left untouched rather than overwritten with the freshly recomputed
+    value.  So a finalize re-run after a transient infra failure re-records ONLY
+    the dimensions that were still unavailable, and the gates that already passed
+    for this candidate tree are neither re-run into the ledger nor discarded.
+    Each written row goes through best-effort ``_upsert_dimension_result``.
     """
-    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+    candidate_sha = base_record.get("candidate_sha")
+    if not candidate_sha:
+        # No candidate tree → no meaningful per-tree fact; skip the whole block.
+        return
 
-    for row in dimension_rows:
-        try:
-            stmt = (
-                pg_insert(QualificationDimensionResult)
-                .values(
-                    id=uuid.uuid4(),
-                    project_id=version.project_id,
-                    release_version_id=version.id,
-                    candidate_sha=candidate_sha,
-                    dimension=row["dimension"],
-                    status=row["status"],
-                    sub_score=row.get("sub_score"),
-                    blocker=row.get("blocker"),
-                    audited_surface_hash=row.get("audited_surface_hash"),
-                    detail=row.get("detail"),
-                    producing_task_id=row.get("producing_task_id"),
-                    computed_at=_utcnow(),
-                )
-                .on_conflict_do_nothing(
-                    constraint="uq_qualificationdimensionresult_version_sha_dim"
-                )
-            )
-            await session.execute(stmt)
-        except Exception as exc:  # noqa: BLE001 — best-effort, never break finalize
-            logger.warning(
-                "[RELEASE_QUALIFIER] v%d dual-write dimension %r failed: %s",
-                version.version_number,
-                row.get("dimension"),
-                exc,
-            )
+    # Read side: dimensions already RESOLVED for this candidate tree are reused
+    # verbatim (skip re-recording), isolating a re-check to the still-unresolved
+    # gates.  Best-effort — an empty map degrades to "write every dimension".
+    prior_resolved = {
+        dim: row
+        for dim, row in (
+            await _load_prior_dimension_results(session, version, candidate_sha)
+        ).items()
+        if row.status in _LEDGER_RESOLVED_STATUSES
+    }
+
+    sub_scores = base_record.get("sub_scores") or {}
+    blocker = composite.get("blocker")
+    ci_green = bool(base_record.get("ci_green"))
+    smoketest_enabled = bool(base_record.get("smoketest_enabled", True))
+
+    def _score(key: str) -> float | None:
+        v = sub_scores.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        return None
+
+    def _own_blocker(codes: set[str]) -> str | None:
+        return blocker if blocker in codes else None
+
+    def _mig_status(verdict: Any) -> str:
+        if verdict == "block":
+            return "blocked"
+        if verdict == "defer":
+            return "unavailable"
+        if verdict in ("ok", "pass"):
+            return "passed"
+        return "unavailable"
+
+    audit_score = _score("audit")
+    if blocker == "audit_missing":
+        audit_status = "blocked"
+    elif audit_score is not None and audit_score < 1.0:
+        audit_status = "failed"
+    else:
+        audit_status = "passed"
+
+    if not smoketest_enabled:
+        smoketest_status = "unavailable"
+    elif blocker == "smoketest_startup_failed":
+        smoketest_status = "blocked"
+    else:
+        smoketest_status = "passed"
+
+    mg_status_raw = base_record.get("merge_grade_status")
+    if mg_status_raw == "pass":
+        merge_grade_status = "passed"
+    elif mg_status_raw in ("fail", "misses"):
+        merge_grade_status = "failed"
+    else:
+        merge_grade_status = "unavailable"
+    mg_coverage = base_record.get("merge_grade_coverage")
+
+    challenge_verdicts = base_record.get("challenge_verdicts")
+    acc_fraction = sub_scores.get("acceptance_window_fraction")
+    debt_score = _score("debt_pressure")
+
+    specs: list[dict[str, Any]] = [
+        {
+            "dimension": "ci",
+            "status": "passed" if ci_green else "blocked",
+            "sub_score": None,
+            "blocker": _own_blocker({"ci_not_green", "ci_unresolved"}),
+            "detail": base_record.get("ci_resolution"),
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "audit",
+            "status": audit_status,
+            "sub_score": audit_score,
+            "blocker": _own_blocker({"audit_missing"}),
+            "audited_surface_hash": base_record.get("candidate_diff_hash"),
+            "detail": {
+                "audit_missing_reason": base_record.get("audit_missing_reason"),
+                "audit_findings_total": base_record.get("audit_findings_total"),
+                "excluded_audit_findings_total": base_record.get("excluded_audit_findings_total"),
+            },
+            "producing_task_id": base_record.get("audit_task_id"),
+        },
+        {
+            "dimension": "test_erosion",
+            "status": "blocked" if blocker == "test_file_deleted" else "passed",
+            "sub_score": _score("test_erosion"),
+            "blocker": _own_blocker({"test_file_deleted"}),
+            "detail": base_record.get("test_erosion_detail"),
+            "producing_task_id": base_record.get("audit_task_id"),
+        },
+        {
+            "dimension": "smoketest",
+            "status": smoketest_status,
+            "sub_score": _score("smoketest") if smoketest_enabled else None,
+            "blocker": _own_blocker({"smoketest_startup_failed"}),
+            "detail": base_record.get("smoketest_detail"),
+            "producing_task_id": base_record.get("smoketest_task_id"),
+        },
+        {
+            "dimension": "challenge",
+            "status": "passed" if challenge_verdicts else "unavailable",
+            "sub_score": None,
+            "blocker": None,
+            "detail": {
+                "verdicts": challenge_verdicts,
+                "challenger_refuted_audit_findings": base_record.get("challenger_refuted_audit_findings"),
+            },
+            "producing_task_id": base_record.get("audit_challenge_task_id"),
+        },
+        {
+            "dimension": "migration_identity",
+            "status": _mig_status(base_record.get("migration_safety")),
+            "sub_score": None,
+            "blocker": _own_blocker({"migration_identity_collision"}),
+            "detail": {
+                "verdict": base_record.get("migration_safety"),
+                "detail": base_record.get("migration_safety_detail"),
+            },
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "migration_apply",
+            "status": _mig_status(base_record.get("migration_apply_safety")),
+            "sub_score": None,
+            "blocker": _own_blocker({"migration_apply_drift"}),
+            "detail": {
+                "verdict": base_record.get("migration_apply_safety"),
+                "detail": base_record.get("migration_apply_safety_detail"),
+            },
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "merge_grade",
+            "status": merge_grade_status,
+            "sub_score": (
+                float(mg_coverage)
+                if isinstance(mg_coverage, (int, float)) and not isinstance(mg_coverage, bool)
+                else None
+            ),
+            "blocker": _own_blocker({"merge_grade_misses"}),
+            "detail": base_record.get("merge_grade"),
+            "producing_task_id": base_record.get("merge_grade_task_id"),
+        },
+        {
+            "dimension": "acceptance_window",
+            "status": "passed" if acc_fraction is not None else "unavailable",
+            "sub_score": (
+                float(acc_fraction)
+                if isinstance(acc_fraction, (int, float)) and not isinstance(acc_fraction, bool)
+                else None
+            ),
+            "blocker": None,
+            "detail": {
+                k: v for k, v in sub_scores.items() if str(k).startswith("acceptance_window")
+            },
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "debt_pressure",
+            "status": "passed" if debt_score is not None else "unavailable",
+            "sub_score": debt_score,
+            "blocker": None,
+            "detail": base_record.get("completion_debt"),
+            "producing_task_id": None,
+        },
+    ]
+
+    try:
+        await session.flush()
+    except Exception as exc:  # noqa: BLE001 — best-effort; never break finalize
+        logger.warning(
+            "[RELEASE_QUALIFIER] v%s dimension-ledger pre-flush failed (%s); "
+            "skipping additive dual-write",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+        return
+
+    for spec in specs:
+        if spec["dimension"] in prior_resolved:
+            # Already resolved (passed/failed/blocked) for this candidate tree in
+            # an earlier finalize — reuse the stored fact, do NOT re-record or
+            # overwrite it.  This is the read-side composition: a re-check after a
+            # transient failure re-runs ONLY the still-unavailable dimensions and
+            # never discards the ones that already passed for the same tree.
+            continue
+        await _upsert_dimension_result(
+            session,
+            version,
+            candidate_sha,
+            spec["dimension"],
+            status=spec["status"],
+            sub_score=spec["sub_score"],
+            blocker=spec["blocker"],
+            detail=spec["detail"],
+            producing_task_id=spec["producing_task_id"],
+            audited_surface_hash=spec.get("audited_surface_hash"),
+        )
 
 
 async def _finalize_qualification(
@@ -4321,175 +4760,11 @@ async def _finalize_qualification(
     extended_sub_scores = dict(composite["sub_scores"])
     extended_sub_scores.update(acceptance_window)
 
-    # --- Phase 1a: dual-write per-dimension rows (no behavior change) -------
-    # Write one QualificationDimensionResult row per gate as the existing code
-    # path computed it.  The decision logic below is unchanged — these rows are
-    # observability-only until the Phase 1b read-side cutover.
-    if candidate_sha:
-        _composite_blocker = composite.get("blocker")
-        _sub = composite["sub_scores"]
-
-        _dim_ci_status: str
-        if _composite_blocker in ("ci_not_green", "ci_unresolved"):
-            _dim_ci_status = "blocked"
-        elif ci_green:
-            _dim_ci_status = "passed"
-        else:
-            _dim_ci_status = "failed"
-
-        _dim_audit_status: str
-        if _composite_blocker == "audit_missing":
-            _dim_audit_status = "blocked"
-        elif audit_score is not None and audit_score > 0.0:
-            _dim_audit_status = "passed"
-        else:
-            _dim_audit_status = "failed"
-
-        _dim_erosion_status: str
-        if _composite_blocker == "test_file_deleted":
-            _dim_erosion_status = "blocked"
-        elif test_erosion_score is None or test_erosion_score >= 1.0:
-            _dim_erosion_status = "passed"
-        else:
-            _dim_erosion_status = "failed"
-
-        _dim_smoke_status: str
-        if not smoketest_enabled:
-            _dim_smoke_status = "passed"
-        elif _composite_blocker == "smoketest_startup_failed":
-            _dim_smoke_status = "blocked"
-        elif smoketest_score is None:
-            _dim_smoke_status = "unavailable"
-        elif smoketest_score > 0.0:
-            _dim_smoke_status = "passed"
-        else:
-            _dim_smoke_status = "failed"
-
-        _dim_migration_id_status = (
-            "blocked" if migration_verdict == "block" else "passed"
-        )
-        _dim_migration_apply_status = (
-            "blocked" if apply_verdict == "block" else "passed"
-        )
-
-        _dim_merge_grade_status: str
-        if not merge_grade_task_id:
-            _dim_merge_grade_status = "passed"
-        elif _composite_blocker == "merge_grade_misses":
-            _dim_merge_grade_status = "blocked"
-        elif merge_grade_cert.get("status") in (
-            "pass", "not_applicable", "superseded_exempt", "already_on_main_exempt"
-        ):
-            _dim_merge_grade_status = "passed"
-        else:
-            _dim_merge_grade_status = "failed"
-
-        _dim_acceptance_status = (
-            "blocked" if _composite_blocker == "criterion_coverage_incomplete"
-            else "passed"
-        )
-        _dim_debt_status = "passed"  # additive/observe only in Phase 1a
-
-        _audit_task_uuid: uuid.UUID | None = None
-        try:
-            if audit_task_id:
-                _audit_task_uuid = uuid.UUID(str(audit_task_id))
-        except (ValueError, TypeError):
-            pass
-        _smoke_task_uuid: uuid.UUID | None = None
-        try:
-            if smoketest_task_id:
-                _smoke_task_uuid = uuid.UUID(str(smoketest_task_id))
-        except (ValueError, TypeError):
-            pass
-        _merge_grade_task_uuid: uuid.UUID | None = None
-        try:
-            if merge_grade_task_id:
-                _merge_grade_task_uuid = uuid.UUID(str(merge_grade_task_id))
-        except (ValueError, TypeError):
-            pass
-
-        _dimension_rows: list[dict[str, Any]] = [
-            {
-                "dimension": "ci",
-                "status": _dim_ci_status,
-                "sub_score": _sub.get("ci"),
-                "blocker": _composite_blocker if _dim_ci_status == "blocked" else None,
-                "detail": {"ci_green": ci_green, "ci_resolution": ci_resolution},
-            },
-            {
-                "dimension": "audit",
-                "status": _dim_audit_status,
-                "sub_score": _sub.get("audit"),
-                "blocker": _composite_blocker if _dim_audit_status == "blocked" else None,
-                "audited_surface_hash": qual.get("candidate_diff_hash"),
-                "producing_task_id": _audit_task_uuid,
-                "detail": {
-                    "audit_score": audit_score,
-                    "audit_missing_reason": audit_missing_reason,
-                },
-            },
-            {
-                "dimension": "test_erosion",
-                "status": _dim_erosion_status,
-                "sub_score": _sub.get("test_erosion"),
-                "blocker": _composite_blocker if _dim_erosion_status == "blocked" else None,
-                "producing_task_id": _audit_task_uuid,
-                "detail": {"test_erosion_score": test_erosion_score},
-            },
-            {
-                "dimension": "smoketest",
-                "status": _dim_smoke_status,
-                "sub_score": _sub.get("smoketest"),
-                "blocker": _composite_blocker if _dim_smoke_status == "blocked" else None,
-                "producing_task_id": _smoke_task_uuid,
-                "detail": {"smoketest_score": smoketest_score, "enabled": smoketest_enabled},
-            },
-            {
-                "dimension": "migration_identity",
-                "status": _dim_migration_id_status,
-                "blocker": _composite_blocker if _dim_migration_id_status == "blocked" else None,
-                "detail": {
-                    "verdict": migration_verdict,
-                    "detail": migration_detail,
-                },
-            },
-            {
-                "dimension": "migration_apply",
-                "status": _dim_migration_apply_status,
-                "blocker": _composite_blocker if _dim_migration_apply_status == "blocked" else None,
-                "detail": {
-                    "verdict": apply_verdict,
-                    "detail": apply_detail,
-                },
-            },
-            {
-                "dimension": "merge_grade",
-                "status": _dim_merge_grade_status,
-                "sub_score": merge_grade_cert.get("coverage"),
-                "blocker": _composite_blocker if _dim_merge_grade_status == "blocked" else None,
-                "producing_task_id": _merge_grade_task_uuid,
-                "detail": merge_grade_cert,
-            },
-            {
-                "dimension": "acceptance_window",
-                "status": _dim_acceptance_status,
-                "blocker": _composite_blocker if _dim_acceptance_status == "blocked" else None,
-                "detail": {k: v for k, v in acceptance_window.items()},
-            },
-            {
-                "dimension": "debt_pressure",
-                "status": _dim_debt_status,
-                "sub_score": _sub.get("debt_pressure"),
-                "detail": {
-                    "score": _debt_pressure_score,
-                    "mode": _resolve_completion_debt_weight_mode(),
-                },
-            },
-        ]
-        await _dual_write_dimension_results(
-            session, version, candidate_sha, _dimension_rows
-        )
+    # --- Dual-write handled by _dual_write_dimension_results after base_record
+    # is fully assembled (below), where all dimensions including challenge are
+    # derived from the assembled composite.  The Phase 1a block that wrote
+    # mid-finalize variables as raw rows was subsumed by the comprehensive
+    # per-dimension write at the end of this function.
 
     finalized_at = _utcnow().isoformat()
     base_record: dict[str, Any] = {
@@ -4609,6 +4884,16 @@ async def _finalize_qualification(
         composite["sub_scores"],
         promotion_enabled,
     )
+
+    # --- Per-dimension fact ledger dual-write (Phase 1, purely additive) -----
+    # Every gate/dimension has now resolved into base_record + composite.  Write
+    # each as its own (candidate_sha, dimension) ledger row ALONGSIDE the
+    # existing last_qualification / QualificationVerdict writes so a later
+    # single-gate re-check can re-record only its own fact without discarding the
+    # dimensions that already passed for this tree.  Best-effort — never breaks
+    # or rolls back the qualification.  Runs before the decision branch so all
+    # three terminal paths (not_promoted / dry_run / promote) are covered once.
+    await _dual_write_dimension_results(session, version, base_record, composite)
 
     # --- Decide -------------------------------------------------------------
     if not composite["promote"]:
@@ -4783,6 +5068,44 @@ async def _finalize_qualification(
             extra={"error": "missing_candidate_sha"},
         )
         return {"status": "error", "error": "missing_candidate_sha"}
+
+    # Same-tree promotion invariant (Phase 1): a promotion composes from the
+    # per-dimension ledger only when every required gating dimension has a
+    # TERMINAL fact at THIS candidate_sha — the batch model's "everything scored
+    # the same tree" guarantee carried onto the ledger.  The dual-write above
+    # populated exactly these rows for the candidate moments ago, so the common
+    # path is complete; a populated-but-incomplete ledger (a required dimension
+    # missing or stranded at a different sha) means the facts do NOT agree on one
+    # tree, so HOLD as an infra failure rather than promote on a split verdict.
+    # Fail OPEN when the ledger is entirely empty for this candidate (the
+    # best-effort dual-write did not land) so a transient ledger-write failure
+    # never blocks an otherwise-qualified promotion.
+    _ledger_complete, _missing_dims = await _promotion_dimension_ledger_complete(
+        session, version, candidate_sha, smoketest_enabled=smoketest_enabled
+    )
+    if not _ledger_complete:
+        _prior_any = await _load_prior_dimension_results(
+            session, version, candidate_sha
+        )
+        if _prior_any:
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d ledger incomplete at promote "
+                "(candidate=%s missing/split dimensions=%s) — holding rather than "
+                "promoting on facts that do not agree on one tree",
+                version.version_number,
+                (candidate_sha or "")[:8],
+                _missing_dims,
+            )
+            return await _handle_infra_failure(
+                session, version, qual, "qualification_dimension_ledger_incomplete"
+            )
+        logger.warning(
+            "[RELEASE_QUALIFIER] v%d per-dimension ledger empty at promote "
+            "(candidate=%s) — best-effort dual-write did not land; promoting on "
+            "the live composite (fail-open)",
+            version.version_number,
+            (candidate_sha or "")[:8],
+        )
 
     # Delegate to promote().  Credentials are NOT pre-resolved here on purpose
     # (concern 2): credential resolution is GitHub I/O, and at this point the
