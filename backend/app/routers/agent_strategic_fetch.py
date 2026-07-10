@@ -30,7 +30,7 @@ from app.database import get_session
 from app.direction_outcomes import proven_merged_count, reachable_merged_count, verified_merged_count
 from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
 from app.message_convergence import get_message_link, resolve_message_ref
-from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task
+from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task, UiLoadTimingSample
 from app.project_message_projection import agent_fetch_message_dict
 from app.qualification_state_resolver import apply_verdict_substitution
 from app.routers.agent import verify_agent_token
@@ -1463,3 +1463,33 @@ async def agent_fetch_spend_ceiling(
             "spend_ceiling_reached": recent_total >= ceiling,
         },
     }
+
+
+@router.get("/projects/{project_id}/ui-load-timing")
+@limiter.limit("60/minute")
+async def agent_fetch_ui_load_timing(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return admin-UI initial-load timing samples grouped by surface.
+
+    Mirrors GET /api/admin/ui-load-timing so the strategic agent can verify the
+    >50% page-ready improvement retirement threshold without a human JWT. Each
+    surface entry is a list of {ts, page_ready_ms, sample_type} objects ordered
+    oldest-first (up to 5000 rows total). Read-only; cross-project access returns 404."""
+    await _resolve_agent_project(project_id, token, session)
+    rows = (
+        await session.execute(
+            select(UiLoadTimingSample)
+            .order_by(UiLoadTimingSample.recorded_at.asc())
+            .limit(5000)
+        )
+    ).scalars().all()
+    surfaces: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        surfaces.setdefault(row.surface, []).append(
+            {"ts": row.recorded_at.isoformat(), "page_ready_ms": row.page_ready_ms, "sample_type": row.sample_type}
+        )
+    return {"status": "success", "data": {"surfaces": surfaces}}
