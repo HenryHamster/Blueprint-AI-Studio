@@ -2111,6 +2111,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             ):
                 _finding_give_up["adversarial_gate_cause"] = _give_up_cause
             _salvage_candidates.extend(_decayed)
+        # Include TTL-expired deferred findings in the salvage bundle so they
+        # are durably captured instead of only logged and silently dropped.
+        # This runs unconditionally: stale discarded findings exist independently
+        # of whether any repeatedly deferred findings decayed this cycle.
+        _salvage_candidates.extend(_stale_discarded)
         prior_actionable = _kept
         # Stale-targeting: a deferred finding carries the integration HEAD it was
         # generated against. On re-dispatch, ask whether any cited file changed

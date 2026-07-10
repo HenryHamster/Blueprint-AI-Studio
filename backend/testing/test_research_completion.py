@@ -1355,6 +1355,35 @@ class TestDeferredFindingStaleDiscard:
         assert "5d" in log_msg
         assert "48h" not in log_msg
 
+    def test_stale_ttl_findings_added_to_salvage_candidates(self):
+        """TTL-expired deferred findings become salvage candidates."""
+        now = _utcnow()
+        stale_finding = {
+            "title": "stale-ttl-finding",
+            "originally_researched_at": (now - timedelta(days=10)).isoformat(),
+            "deferred_reason": "low_actionability",
+            "direction_id": "d-stale",
+        }
+        fresh_finding = {
+            "title": "fresh-finding",
+            "originally_researched_at": (now - timedelta(days=1)).isoformat(),
+            "deferred_reason": "low_actionability",
+            "direction_id": "d-fresh",
+        }
+
+        fresh, stale = self._apply_stale_filter(
+            [stale_finding, fresh_finding],
+            ttl_days=7,
+        )
+        salvage_candidates = list(stale)
+
+        assert len(salvage_candidates) == 1
+        assert salvage_candidates[0]["title"] == "stale-ttl-finding"
+        assert salvage_candidates[0]["direction_id"] == "d-stale"
+        assert salvage_candidates[0]["deferred_reason"] == "low_actionability"
+        assert len(fresh) == 1
+        assert fresh[0]["title"] == "fresh-finding"
+
 
 class TestActionabilityGradeNormalization:
     """Normalization step: missing or invalid actionability_grade defaults to MEDIUM with a warning."""
@@ -19388,7 +19417,7 @@ class TestDecayThresholdDBIntegration:
       - adversarial_gate:            count >= 3  → salvage
       - prereq_deferred_same_cycle:  count >= 3  → salvage
       - low_actionability:           count >= 3  → salvage (when challenge disabled)
-      - originally_researched_at older than TTL  → dropped (NOT salvaged)
+      - originally_researched_at older than TTL  → salvage
     """
 
     # ------------------------------------------------------------------
@@ -19585,7 +19614,7 @@ class TestDecayThresholdDBIntegration:
         assert payload["salvaged_findings"][0]["discard_reason"] == "low_actionability"
 
     # ------------------------------------------------------------------
-    # Edge cases: below threshold → kept; stale TTL → dropped (not salvaged)
+    # Edge cases: below threshold → kept; stale TTL → salvaged
     # ------------------------------------------------------------------
 
     @_pytest.mark.asyncio
@@ -19637,12 +19666,8 @@ class TestDecayThresholdDBIntegration:
         )
 
     @_pytest.mark.asyncio
-    async def test_stale_ttl_finding_dropped_not_salvaged(self, db_session, mocker):
-        """Findings older than the TTL are silently dropped, NOT bundled into salvage.
-
-        The stale-discard gate (lines 1968-1997) removes findings before the
-        count-based decay check, so they never reach _salvage_candidates.
-        """
+    async def test_stale_ttl_finding_creates_salvage(self, db_session, mocker):
+        """Findings older than the TTL are bundled into salvage."""
         _project, direction, task = await _grader_project_and_task(
             db_session, "d-dcyint-stale01"
         )
@@ -19663,21 +19688,25 @@ class TestDecayThresholdDBIntegration:
         await self._run_completion(task, mocker, db_session, direction["id"])
 
         salvage_list = await self._get_salvage_tasks(task, db_session)
-        assert len(salvage_list) == 0, (
-            "Stale-discarded findings (beyond TTL) must NOT enter the salvage bundle; "
-            "only count-threshold decayed findings are salvaged"
+        assert len(salvage_list) == 1, (
+            "Stale-discarded findings (beyond TTL) must enter the salvage bundle"
         )
-        assert (task.context or {}).get("salvage_activity") is None
+        payload = salvage_list[0].first_payload
+        assert len(payload["salvaged_findings"]) == 1
+        entry = payload["salvaged_findings"][0]
+        assert "Stale finding" in entry["title"]
+        assert entry["discard_reason"] == "ultra_low_confidence"
+        assert (task.context or {}).get("salvage_activity") is not None
 
     # ------------------------------------------------------------------
-    # Mixed-findings: only decayed ones enter the bundle
+    # Mixed-findings: decayed and stale ones enter the bundle
     # ------------------------------------------------------------------
 
     @_pytest.mark.asyncio
-    async def test_mixed_findings_only_decayed_enter_salvage(
+    async def test_mixed_findings_decayed_and_stale_enter_salvage(
         self, db_session, mocker
     ):
-        """Mix: decayed → salvage; below-threshold → kept; stale → silently dropped."""
+        """Mix: decayed and stale → salvage; below-threshold → kept."""
         _project, direction, task = await _grader_project_and_task(
             db_session, "d-dcyint-mix01"
         )
@@ -19707,14 +19736,25 @@ class TestDecayThresholdDBIntegration:
 
         salvage_list = await self._get_salvage_tasks(task, db_session)
         assert len(salvage_list) == 1, (
-            "Exactly one salvage bundle should exist; only the at-threshold finding decays"
+            "Exactly one salvage bundle should exist for discarded findings"
         )
         payload = salvage_list[0].first_payload
-        assert len(payload["salvaged_findings"]) == 1, (
-            "Only the at-threshold finding should appear in the salvage payload"
+        assert len(payload["salvaged_findings"]) == 2, (
+            "Both the at-threshold and stale findings should appear in the salvage payload"
         )
-        assert "Decayed finding" in payload["salvaged_findings"][0]["title"]
-        assert payload["salvaged_findings"][0]["discard_reason"] == "degradation_gate"
+        entries_by_title = {
+            entry["title"]: entry for entry in payload["salvaged_findings"]
+        }
+        assert "Decayed finding" in entries_by_title
+        assert "Stale finding" in entries_by_title
+        assert (
+            entries_by_title["Decayed finding"]["discard_reason"]
+            == "degradation_gate"
+        )
+        assert (
+            entries_by_title["Stale finding"]["discard_reason"]
+            == "ultra_low_confidence"
+        )
 
     @_pytest.mark.asyncio
     async def test_multiple_decay_reasons_bundled_into_one_task(
