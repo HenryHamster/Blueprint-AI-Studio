@@ -59,6 +59,8 @@ _FAILURE_STREAK_DEGRADED_THRESHOLD = 3
 _SUCCESS_STALE_SECONDS = 1800  # 30 min
 # Advisory low-disk flag (does not by itself degrade a runner).
 _LOW_DISK_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+# Advisory low-memory flag (does not by itself degrade a runner).
+_LOW_MEMORY_FREE_BYTES = 512 * 1024 * 1024  # 512 MiB
 _STRATEGIC_LOCAL_TASK_TYPES = sorted(STRATEGIC_TASK_TYPES)
 _KNOWN_TASK_TYPES = {task_type.value for task_type in TaskType}
 
@@ -169,6 +171,22 @@ def _runner_int_telemetry(
     return None
 
 
+def _runner_float_telemetry(
+    capabilities: Dict[str, Any] | None, key: str
+) -> float | None:
+    """Read a non-negative float telemetry value stashed on capabilities.
+
+    Used for the display-only trust telemetry (``cpu_load_avg``) the runner
+    reports on each heartbeat. Tolerant of absent/None/malformed values.
+    """
+    raw = (capabilities or {}).get(key)
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw) if float(raw) >= 0.0 else None
+    return None
+
+
 def _runner_max_concurrent(capabilities: Dict[str, Any] | None) -> int | None:
     raw = (capabilities or {}).get("max_concurrent")
     if isinstance(raw, bool):
@@ -249,6 +267,14 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         runner.capabilities, "gpu_utilization_pct"
     )
     disk_low = disk_free_bytes is not None and disk_free_bytes < _LOW_DISK_FREE_BYTES
+    memory_free_bytes = _runner_int_telemetry(
+        runner.capabilities, "memory_free_bytes"
+    )
+    memory_low = (
+        memory_free_bytes is not None
+        and memory_free_bytes < _LOW_MEMORY_FREE_BYTES
+    )
+    cpu_load_avg = _runner_float_telemetry(runner.capabilities, "cpu_load_avg")
 
     # device_status is the operator-facing tone. "degraded" is distinct from
     # "connected": the runner is live (recent heartbeat) but its jobs are failing,
@@ -291,12 +317,21 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "consecutive_job_failures": consecutive_job_failures,
         "disk_free_bytes": disk_free_bytes,
         "disk_low": disk_low,
+        "memory_free_bytes": memory_free_bytes,
+        "memory_low": memory_low,
+        "cpu_load_avg": cpu_load_avg,
         "gpu_utilization_pct": gpu_utilization_pct,
         "failure_streak_threshold": _FAILURE_STREAK_DEGRADED_THRESHOLD,
     }
 
 
 def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
+    now = _utcnow()
+    token_age_days = (
+        max(0, int((now - runner.token_created_at).total_seconds() / 86400))
+        if runner.token_created_at
+        else None
+    )
     return {
         "id": str(runner.id),
         "hostname": runner.hostname,
@@ -308,6 +343,7 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
             runner.last_seen_at.isoformat() if runner.last_seen_at else None
         ),
         "created_at": runner.created_at.isoformat() if runner.created_at else None,
+        "token_age_days": token_age_days,
     }
 
 
@@ -340,6 +376,7 @@ async def register_runner(
     )
     token = create_runner_token(runner.id)
     runner.token_hash = hash_runner_token(token)
+    runner.token_created_at = _utcnow()
     session.add(runner)
     await session.commit()
     await session.refresh(runner)
@@ -417,6 +454,7 @@ async def rotate_runner_token(
 
     token = create_runner_token(runner.id)
     runner.token_hash = hash_runner_token(token)
+    runner.token_created_at = _utcnow()
     summary_status = runner.status
     summary_hostname = runner.hostname
     session.add(runner)
@@ -446,25 +484,37 @@ async def _release_unpulled_runner_pins(
     session: AsyncSession,
     runner_id: uuid.UUID,
 ) -> int:
-    """Release tasks pinned to a runner before the runner pulled them."""
-    pinned = (
-        await session.execute(
-            select(Task).where(
-                Task.status == TaskStatus.PROVISIONING,
-                Task.started_at.is_(None),
-                Task.vm_instance_id == f"runner:{runner_id}",
+    """Release tasks pinned to a runner before the runner pulled them.
+
+    Uses batched LIMIT queries to avoid loading thousands of pinned tasks
+    into memory at once (following the same pattern as projects.py for
+    batched task cancellation).
+    """
+    total = 0
+    _BATCH_SIZE = 500
+    while True:
+        pinned = (
+            await session.execute(
+                select(Task).where(
+                    Task.status == TaskStatus.PROVISIONING,
+                    Task.started_at.is_(None),
+                    Task.vm_instance_id == f"runner:{runner_id}",
+                ).limit(_BATCH_SIZE)
             )
-        )
-    ).scalars().all()
-    for task in pinned:
-        task.status = TaskStatus.QUEUED
-        task.vm_instance_id = None
-        task.vm_provisioned_at = None
-        new_ctx = dict(task.context or {})
-        new_ctx.pop("runner_target_id", None)
-        task.context = new_ctx
-        session.add(task)
-    return len(pinned)
+        ).scalars().all()
+        if not pinned:
+            break
+        for task in pinned:
+            task.status = TaskStatus.QUEUED
+            task.vm_instance_id = None
+            task.vm_provisioned_at = None
+            new_ctx = dict(task.context or {})
+            new_ctx.pop("runner_target_id", None)
+            task.context = new_ctx
+            session.add(task)
+        total += len(pinned)
+        await session.flush()
+    return total
 
 
 @router.delete("/projects/{project_id}/runners/{runner_id}")
@@ -569,6 +619,7 @@ async def fleet_runners_health_summary(
         "stale": 0,
         "offline": 0,
         "low_disk": 0,
+        "low_memory": 0,
     }
     per_project_entries: List[Dict[str, Any]] = []
 
@@ -581,6 +632,7 @@ async def fleet_runners_health_summary(
             "stale": 0,
             "offline": 0,
             "low_disk": 0,
+            "low_memory": 0,
             "runners": [],
         }
         for runner in project_runners:
@@ -598,8 +650,10 @@ async def fleet_runners_health_summary(
                 entry["offline"] += 1
             if view["health"].get("disk_low"):
                 entry["low_disk"] += 1
+            if view["health"].get("memory_low"):
+                entry["low_memory"] += 1
 
-        for key in ("total", "connected", "degraded", "stale", "offline", "low_disk"):
+        for key in ("total", "connected", "degraded", "stale", "offline", "low_disk", "low_memory"):
             fleet[key] += entry[key]
 
         per_project_entries.append(entry)

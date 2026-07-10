@@ -1,4 +1,6 @@
-import { useId } from 'react';
+/* eslint-disable react-refresh/only-export-components */
+
+import { useId, useMemo } from 'react';
 import { ArrowUpRight } from 'lucide-react';
 import type {
   StrategicContextCanvasEdge,
@@ -14,7 +16,7 @@ interface StrategicContextMapProps {
   onOpenTarget?: (target?: StrategicContextTarget | null) => void;
 }
 
-interface PositionedNode {
+export interface PositionedNode {
   node: StrategicContextCanvasNode;
   index: number;
   rawLayer: number;
@@ -24,7 +26,7 @@ interface PositionedNode {
   y: number;
 }
 
-interface PositionedEdge {
+export interface PositionedEdge {
   edge: StrategicContextCanvasEdge;
   source: PositionedNode;
   target: PositionedNode;
@@ -33,7 +35,7 @@ interface PositionedEdge {
   labelY: number;
 }
 
-const VIEWBOX_WIDTH = 1000;
+export const VIEWBOX_WIDTH = 1000;
 const NODE_WIDTH = 168;
 const NODE_HEIGHT = 88;
 const ROW_GAP = 118;
@@ -88,7 +90,7 @@ function edgeKey(edge: StrategicContextCanvasEdge, index: number): string {
   return `${edge.source}:${edge.target}:${edge.label ?? 'link'}:${index}`;
 }
 
-function computeLayout(
+export function computeLayout(
   nodes: StrategicContextCanvasNode[],
   edges: StrategicContextCanvasEdge[],
 ): { positionedNodes: PositionedNode[]; positionedEdges: PositionedEdge[]; height: number; visibleEdges: StrategicContextCanvasEdge[] } {
@@ -284,7 +286,7 @@ export function StrategicContextMap({ canvas, onOpenTarget }: StrategicContextMa
   const markerId = useId().replace(/:/g, '');
   const nodes = canvas?.nodes ?? [];
   const edges = canvas?.edges ?? [];
-  const layout = computeLayout(nodes, edges);
+  const layout = useMemo(() => computeLayout(nodes, edges), [nodes, edges]);
   const hiddenEdgeCount = Math.max(0, edges.length - layout.visibleEdges.length);
 
   if (nodes.length === 0) {

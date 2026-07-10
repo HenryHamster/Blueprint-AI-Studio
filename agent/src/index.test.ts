@@ -929,6 +929,7 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
+      provider_reported_usage: null,
     });
     expect(_getWarmStartForTesting()).toBe(true);
   });
@@ -7365,6 +7366,7 @@ describe('LLM telemetry counters', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
+      provider_reported_usage: null,
     });
   });
 
@@ -7385,6 +7387,7 @@ describe('LLM telemetry counters', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
+      provider_reported_usage: null,
     });
   });
 
@@ -7404,6 +7407,7 @@ describe('LLM telemetry counters', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
+      provider_reported_usage: null,
     });
   });
 
@@ -7423,6 +7427,7 @@ describe('LLM telemetry counters', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
+      provider_reported_usage: null,
     });
   });
 });

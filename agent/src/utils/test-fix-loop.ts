@@ -40,7 +40,7 @@ import {
   detectTestRunners, isDockerRunner, describeRunnerDirectory,
   parseFailingTests, buildTargetedPytestRunners,
   classifySetupFailure, classifyTestExecution, matchesEnvironmentFailureSignature,
-  extractTestCoverage, runnerFromCommand,
+  extractTestCoverage, extractLineCoverage, extractChangedLineCoverage, runnerFromCommand,
 } from './test-runners.js';
 
 // Build + buffer a FixLoopEvent from one wrapper-loop iteration. Centralized
@@ -494,6 +494,11 @@ export interface TestFixLoopOptions {
   maxFixAttempts?: number;
   phaseLabel?: string;
   runnersOverride?: TestRunner[];
+  /** Map of repo-relative file path → number of changed/added lines, used to
+   *  compute diff-aware changed-line coverage (``changed_lines_coverage_pct``)
+   *  alongside the total ``line_coverage_pct``.  Only used when coverage
+   *  instrumentation (pytest-cov) is active. */
+  changedLineCounts?: Record<string, number>;
 }
 
 function describeRunnerSetupCommand(runner: TestRunner): { cmd: string; args: string[]; label: string } | null {
@@ -539,7 +544,7 @@ export async function testFixLoop(
   relatedFiles?: string[],
   analysisContext?: string,
   options: TestFixLoopOptions = {},
-): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number } }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number }; line_coverage_pct?: number; changed_lines_coverage_pct?: number }> {
   let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
   const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
@@ -864,6 +869,18 @@ export async function testFixLoop(
     // the field is simply omitted from the verdict. Visibility only — never
     // changes pass/fail or detected.
     const coverage = extractTestCoverage(runnerOutputs.join('\n')) ?? undefined;
+    // Line/statement coverage percentage from pytest-cov terminal output.
+    // Populated only when the test runner includes coverage instrumentation
+    // (--cov-report=term-missing). When absent (no instrumentation active),
+    // line_coverage_pct is undefined and the backend falls back to the
+    // test-count-based coverage computation.
+    const lineCoveragePct = extractLineCoverage(runnerOutputs.join('\n')) ?? undefined;
+    // Diff-aware changed-line coverage: weighted per-file coverage by changed-line
+    // count per file.  Only computed when the PR diff data is available (passed via
+    // options.changedLineCounts) and coverage instrumentation is active.
+    const changedLineCoveragePct = (options.changedLineCounts && lineCoveragePct !== undefined)
+      ? extractChangedLineCoverage(runnerOutputs.join('\n'), options.changedLineCounts) ?? undefined
+      : undefined;
 
     // Partial-setup detection: at least one runner ran AND at least one OTHER
     // runner failed setup/environment. The failed runner's suite never
@@ -926,6 +943,8 @@ export async function testFixLoop(
         passed: true, testFailuresDetected: false, noTestsExecuted,
         noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
         coverage,
+        line_coverage_pct: lineCoveragePct,
+        changed_lines_coverage_pct: changedLineCoveragePct,
       };
     }
 
@@ -985,7 +1004,7 @@ export async function testFixLoop(
       });
       sendLog(ws, `Test failures unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
       const failureSummary = combinedFailures.slice(-8000) + setupNote;
-      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, coverage };
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, line_coverage_pct: lineCoveragePct, changed_lines_coverage_pct: changedLineCoveragePct, coverage };
     }
     fingerprintHistory.push(fingerprint);
     errorTextHistory.push(combinedFailures);
@@ -998,7 +1017,7 @@ export async function testFixLoop(
       });
       sendLog(ws, `Test fix loop divergence detected (${divergence}) — abandoning to avoid wasted iterations.\n`);
       const failureSummary = combinedFailures.slice(-8000) + setupNote;
-      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, coverage };
+      return { passed: false, testFailuresDetected: true, failureSummary, partialSetupFailed: partialSetupFailed || undefined, line_coverage_pct: lineCoveragePct, changed_lines_coverage_pct: changedLineCoveragePct, coverage };
     }
     // On retry (attempt >= 1), record what the previous Claude call
     // actually changed + the test failures that persisted, so the next
@@ -1101,6 +1120,8 @@ export async function testFixLoop(
         noTestsReason: noTestsExecuted ? (sawAllSkipped ? 'all_skipped' : 'no_real_tests') : undefined,
         partialSetupFailed: partialSetupFailed || undefined,
         coverage,
+        line_coverage_pct: lineCoveragePct,
+        changed_lines_coverage_pct: changedLineCoveragePct,
       };
     }
   }

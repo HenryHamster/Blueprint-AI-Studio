@@ -48,6 +48,7 @@ async def rotate_agent_credentials(
         get_task_llm_provider,
     )
     from app.providers.registry import get_provider
+    from app.field_encryption import encrypt_field
     from app.secrets_manager import store_user_secret
     from app.warm_pool import get_pool_vm
 
@@ -178,7 +179,7 @@ async def rotate_agent_credentials(
             detail="Secret rotation temporarily unavailable, retry shortly",
         ) from exc
 
-    account.secret_blob_ref = new_ref
+    account.secret_blob_ref = encrypt_field(new_ref)
     if result.provider_metadata:
         account.provider_metadata = result.provider_metadata
     session.add(account)

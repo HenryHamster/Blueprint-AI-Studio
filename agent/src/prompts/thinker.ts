@@ -89,13 +89,11 @@ function buildStrategicFingerprintPrompt(
     previousDecisionOutcomes: p.previousDecisionOutcomes ? '<previous-decision-outcomes>' : '',
     pastRetirementCritiquesSection: p.pastRetirementCritiquesSection ? '<past-retirement-critiques>' : '',
     retiredDirectionsSummarySection: p.retiredDirectionsSummarySection ? '<retired-directions-summary>' : '',
-    dirSummaryText: '<dir-summary>',
-    dirHealthSummary: '<dir-health>',
+    directionPortfolioSection: '<direction-portfolio>',
     stagedDirectionsSection: p.stagedDirectionsSection ? '<staged-directions>' : '',
     userPausedSection: p.userPausedSection ? '<user-paused>' : '',
     rejectedProposalsSection: p.rejectedProposalsSection ? '<rejected-proposals>' : '',
     operatorOverridesSection: p.operatorOverridesSection ? '<operator-overrides>' : '',
-    portfolioCompositionText: '<portfolio-composition>',
     modelHealthSection: p.modelHealthSection ? '<model-health>' : '',
     pruneCandidatesSection: p.pruneCandidatesSection ? '<prune-candidates>' : '',
     systemMaturitySection: p.systemMaturitySection ? '<system-maturity>' : '',
@@ -112,9 +110,11 @@ function buildStrategicFingerprintPrompt(
     efficiencySnapshotSection: p.efficiencySnapshotSection ? '<efficiency-snapshot>' : '',
     ciComplianceSection: p.ciComplianceSection ? '<ci-compliance>' : '',
     completionDebtSection: p.completionDebtSection ? '<completion-debt>' : '',
+    pendingFollowupsSection: p.pendingFollowupsSection ? '<pending-followups>' : '',
     availableCapabilitiesSection: p.availableCapabilitiesSection ? '<available-capabilities>' : '',
     sweepComparisonSection: p.sweepComparisonSection ? '<sweep-comparison>' : '',
     localRunnerSection: p.localRunnerSection ? '<local-runner>' : '',
+    compactionHintsSection: p.compactionHintsSection ? '<compaction-hints>' : '',
     payloadStalenessSection: p.payloadStalenessSection ? '<payload-staleness>' : '',
   };
   const prompt = buildThinkerPrompt(canonical);
@@ -176,8 +176,13 @@ export interface ThinkerPromptParams {
   previousDecisionOutcomes: string;
   pastRetirementCritiquesSection: string;
   retiredDirectionsSummarySection: string;
-  dirSummaryText: string;
-  dirHealthSummary: string;
+  /**
+   * Consolidated direction portfolio section combining the health header,
+   * per-direction listing, and portfolio statistics (category mix, system
+   * coverage, concentration, scope) into one block. Replaces the prior three
+   * separate sections (dirSumText, dirHealthSummary, portfolioCompositionText).
+   */
+  directionPortfolioSection: string;
   /**
    * Rendered block listing directions already STAGED for the next version
    * (status=staged, with their staged_for_version). Built from the payload's
@@ -189,7 +194,6 @@ export interface ThinkerPromptParams {
   userPausedSection: string;
   rejectedProposalsSection: string;
   operatorOverridesSection: string;
-  portfolioCompositionText: string;
   modelHealthSection: string;
   /**
    * Concrete prune candidates — present only when the model is large/oversized
@@ -233,6 +237,13 @@ export interface ThinkerPromptParams {
    */
   completionDebtSection?: string;
   /**
+   * Pending knowledge follow-ups section — documents the strategist has not
+   * yet consumed or dismissed. Built from the strategic payload's
+   * `pending_followups` field. Optional so existing constructions/tests that
+   * omit it still compile; '' renders nothing.
+   */
+  pendingFollowupsSection?: string;
+  /**
    * Shared capability vocabulary section (canonical registry names + statuses)
    * plus the uniform provides_capability / prerequisite declaration guidance.
    * Built from the strategic payload's `available_capabilities` field. Optional
@@ -261,6 +272,14 @@ export interface ThinkerPromptParams {
    * '' renders nothing (also omitted when staleness is absent or indeterminate).
    */
   payloadStalenessSection?: string;
+  /**
+   * Gap compaction candidates: active gaps whose combined history + past_moves
+   * entries exceed the threshold. Renders a list of gap names + entry counts so
+   * the strategist can apply targeted ``_compactions`` watermarks without
+   * manually inspecting every gap. Optional so existing tests that omit it
+   * still compile; '' renders nothing.
+   */
+  compactionHintsSection?: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -320,15 +339,9 @@ ${p.designDocJson ? '_The above is an OVERVIEW INDEX of the design document — 
 
 ${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; retained for bootstrap reference only)\n${p.visionJson}\n` : ''}
 ${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
-## Current research directions
-${p.dirSummaryText}
-
-## Direction Health
-${p.dirHealthSummary}
+${p.directionPortfolioSection}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
-## Portfolio Composition
-${p.portfolioCompositionText}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.residentExamLeadsSection ? `\n${p.residentExamLeadsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.residentExamLeadsSection ? `\n${p.residentExamLeadsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
 ${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
@@ -373,7 +386,7 @@ On **every** \`create-direction\` and \`update-direction\` call, emit a \`recomm
 
 **The convergence guardrail:** every audit ends in a decision — a goal, a direction, or a concrete task. Reconnaissance that produces no commitment is drift, not diligence. If a cycle's audit yields no committed next step, that is a failure to converge — NOT "keeping watch." This line separates audit-first from the idle/observe drift failure mode the prompt already warns against.
 
-**Model-size hygiene (soft).** The "Problem-model size (soft signal)" section above (when present) reports how heavy your durable problem_model has grown. Healthy is **<=12 active gaps / <=20 capabilities / <=8 active friction**; a dimension at **>=1.5x** is \`growing\`, **>=2x** is \`large\`, **>=3x** is \`oversized\` (worst dimension wins). When the status is \`large\` or \`oversized\`, the model is getting too big to audit in one pass — **before** opening new gaps or capabilities this cycle, prioritize closing/archiving resolved gaps and consolidating overlapping capabilities to bring it back down. This is a signal to weigh, **never a hard cap**: if a genuinely needed new gap is warranted, still open it. The model grows without bound otherwise, and a model you can't read in one pass is one you can't defend.
+**Model-size hygiene (soft).** The "Problem-model size" section above reports weight. Healthy: **<=12 active gaps / <=20 capabilities / <=8 active friction** — dimension >=1.5x = \`growing\`, >=2x = \`large\`, >=3x = \`oversized\`. When \`large\`/\`oversized\`, close resolved entries before opening new ones (**never a hard cap**). A model you can't read in one pass is one you can't defend.
 
 ${p.selfImprovementBlock}
 
@@ -416,7 +429,7 @@ For each existing gap: open, progressing, or closed? For each new gap you're ope
 ## 3. Moves
 Directions to retire (one-sentence reason each) and to create (name the gap_id each closes, a \`success_evidence\` string describing the observable outcome that proves the direction is done, a \`retirement_condition\` string describing the measurable trigger for retirement, and a \`dedup_reasoning\` object naming the 0–3 closest existing or retired directions you considered and a one-line justification why the new direction is distinct).
 
-**Criterion-coverage check before retirement.** When proposing to retire a direction, first check whether it is the sole covering direction for any acceptance criterion. A direction with a \`criterion_keys\` field in the direction list, or the sole mapper for a criterion in the acceptance-criteria block, is criterion-carrying — retiring it would leave that criterion permanently uncoverable (the backend gate \`direction_owns_uncovered_criterion\` will block the retirement). Before retiring such a direction, either: (a) retract the orphaned criterion via Section 8 with a \`reason\` explaining why it is permanently uncoverable and no realistic path to covering it remains, or (b) keep the direction active until another direction covers the criterion. Do NOT retire a criterion-carrying direction without first addressing its criterion — a retirement that silently orphans a criterion will be rejected.
+**Criterion-coverage before retirement.** Before retiring a direction, verify it is not sole mapper for any criterion (\`criterion_keys\` or sole mapper = criterion-carrying — backend \`direction_owns_uncovered_criterion\` blocks orphaned criteria). If sole mapper: (a) retract via Section 8 (explain why permanently uncoverable), or (b) keep direction active. Do NOT retire criterion-carrying without addressing the criterion first.
 
 Parallel moves are fine and encouraged when non-clashing. When two directions are genuinely independent (no shared files, no logical dependency, no real conflict risk), create/dispatch BOTH now rather than staging one behind the other — dispatched work runs concurrently in the pipeline and there is no context-switching cost to you; sequence only when there is a real dependency.
 
@@ -424,13 +437,15 @@ Parallel moves are fine and encouraged when non-clashing. When two directions ar
 
 **Experiment commissions.** When you hold a MEASURABLE conjecture — a hypothesis that can be settled empirically by running a command and observing a declared metric, rather than by reading code or the web — you can commission a budget-gated \`compute_experiment\` directly (the Executor has the spawn-task command for it). Use this move when all four conditions hold: (1) the conjecture is falsifiable (there is a clear success criterion expressible as a metric + comparator + threshold), (2) the only way to resolve it is to run compute and measure an output, (3) a reasonable spend cap and deadline can be stated up front, and (4) no cheaper read-only research would settle it first. The launch contract the Executor sends requires: a \`command\` string to execute, a positive \`spend_cap_usd\`, a positive \`deadline_seconds\`, and an OPTIONAL \`success_criterion\` of \`{metric, operator, threshold}\` (where \`operator\` is one of \`<\`, \`>\`, \`<=\`, \`>=\`). For multi-arm (A/B) comparisons, use \`arms: [{name, command}]\` instead of a single \`command\`, and supply \`declared_metric\` (the exact key each arm's command writes to \`$BLUEPRINT_RESULT_FILE\`); \`declared_metric\` is required when \`arms\` is present. The platform runs each arm with an isolated result path and assembles the \`{"arms": {name: {metric: value}}}\` comparison block automatically — arm commands simply write their metric as usual. A free-text \`prompt\` is optional because \`hypothesis\` serves as the description. Note: experiments above the configured per-experiment spend threshold require operator spend-approval — the backend gates this automatically and will pause the task for approval if needed.
 
-**Metric capture is MANDATORY.** The \`command\` (and each arm's command) MUST write the declared metric as a JSON object to the file at \`$BLUEPRINT_RESULT_FILE\` — e.g. \`... && python -c "import json,os; json.dump({'<metric>': <value>}, open(os.environ['BLUEPRINT_RESULT_FILE'],'w'))"\` — or print that JSON object as the LAST line of stdout. Use your real declared-metric key in place of \`<metric>\`. A command that exits 0 but never emits the value silently loses the metric: the \`success_criterion\` is then evaluated unmeasured and FAILS (\`compute_unmeasured_criterion\`) — a run that finished cannot pass as a hypothesis that was measured. State this contract explicitly in the command you commission.
+**Metric capture is MANDATORY.** Each command MUST emit the declared metric as JSON to \`$BLUEPRINT_RESULT_FILE\` (e.g. \`python -c "import json,os; json.dump({'<metric>':<value>},open(os.environ['BLUEPRINT_RESULT_FILE'],'w'))"\`) or as the LAST stdout line. A command exiting 0 without emitting the metric = \`success_criterion\` unmeasured → FAILS (\`compute_unmeasured_criterion\`). State this contract in your commissioned command.
 
 **Containerized / GPU runtimes.** When the experiment needs a specific runtime stack (CUDA / cuDNN / NGC), include \`container_image\` (an NGC image URI, e.g. \`nvcr.io/nvidia/tensorflow:25.01\`) so the command runs inside that image. Use \`accelerator\` (e.g. \`T4\`, \`L4\`, \`V100\`) to request a single GPU. Before authoring a GPU experiment, heed the local-runner availability note above (when present): if no GPU runner is live, hold the experiment rather than author it.
 
 Name the hypothesis, the command (or arms), the metric being measured, and what the outcome changes.
 
 **Sweep synthesis.** When the "Completed experiment sweeps" section above lists a sweep where every arm shows a verdict (MET or NOT MET), synthesize a comparative conclusion before proposing a follow-on move: which arm won, by how much, and what it implies. Then propose exactly one concrete next step — adopt the winning arm in an implementation direction, commission a deeper follow-on experiment to resolve ambiguity, or retire the hypothesis as settled if the answer is conclusive. Use \`./fetch knowledge <id>\` to read an arm's full analysis body before concluding. Do not leave a complete sweep without a move.
+
+**Knowledge follow-up disposition (REQUIRED when pending).** When the "Pending Knowledge Follow-ups" section above lists documents the strategist has not yet consumed or dismissed, you MUST dispose each one this cycle: call \`consume-knowledge-followup\` for documents whose findings you acted on or incorporated into a direction, or \`dismiss-knowledge-followup\` for documents that are not actionable, with a short reason each time. Every pending document your sweep encounters must be resolved — the system tracks undecided follow-ups each cycle and the cost of re-deriving already-completed research far exceeds the one-time cost of reading and disposing. Do not leave a complete sweep with unresolved follow-ups.
 
 **Pick the right dispatch — does the work need ONGOING steering, or does it finish once built?**
 - **\`create-direction\`** — work that needs SUSTAINED building and improvement across many cycles: you develop, refine, and extend it over time rather than finishing it in one pass. Directions are the project's spine — a healthy portfolio of several genuine ones is expected; keep it. Each carries a real \`success_evidence\` / \`retirement_condition\` and retires when it's played out.
@@ -440,13 +455,13 @@ Name the hypothesis, the command (or arms), the metric being measured, and what 
 - **\`dispose-completion-debt\`** — dispose of an open completion-debt ledger entry: \`"resolved"\` (requires evidence that the obligation was actually met) or \`"dismissed"\` (requires a reason the obligation is no longer relevant). Use this only when the open-completion-debt section lists entries and you have a clear verdict; never fabricate evidence.
 - **\`activate-direction\`** — manually reactivate a staged or user-paused direction back to active. Use when the operator or the analysis concludes that the direction's hold condition no longer applies and work should resume immediately rather than waiting for the next version-promote cycle.
 
-**Staging (next-version work).** A fifth move exists alongside create/update/retire: you can **stage** a direction to begin only after the current version promotes and the next one opens. A staged direction is inert — it spawns no work — until that version-open transition auto-activates it; it can also be manually reactivated earlier with \`activate-direction\` if the hold condition resolves mid-version. The "Staged for next version" block above lists what is already staged; **do not re-propose work that is already staged there.**
+**Staging (next-version work).** A fifth move: **stage** a direction to begin only after the current version promotes. A staged direction is inert until auto-activated at version-open (or early via \`activate-direction\`). Do NOT re-propose work already in the "Staged for next version" block above.
 
-Staging is NOT deferral, and it is not an escape from the "you're not allowed to defer" rule. Staging is itself a DECISION — a hard call that the work genuinely belongs to the NEXT version's scope, not this one. The natural case: the project is in its stabilize/hardening phase (see the version-phase section, when present) and a strong *build-phase* idea appears that would pollute the current version's scope if started now — stage it so it activates cleanly when the next build phase opens. Use it for genuinely next-version-scoped work. Do NOT use it to dodge a within-cycle call: if work belongs to THIS version, create it active now; if it's not worth doing, retire/don't-create it. "I'm not sure, I'll stage it" is deferral wearing staging's clothes — make the call instead.
+Staging is NOT deferral — it is a DECISION that work belongs to next version's scope, not an escape from "you're not allowed to defer." Use it when a *build-phase* idea appears during stabilize/hardening that would pollute current scope. Do NOT use it to dodge a within-cycle call: create active or don't. "I'll stage it" when uncertain is deferral in disguise — make the call.
 
-To stage a genuinely new next-version idea, create it with the staged flag (a single atomic op — the Executor passes \`"staged": true\` on create-direction, so the direction is born staged and never passes through a research-eligible active state). To stage an existing active direction whose work you've decided belongs to the next version, stage it by id.
+New ideas: create with \`"staged": true\` (single atomic op — born staged, never research-eligible). Existing active directions: stage by id.
 
-**Stabilize is hardening time, not idle time.** When the version-phase section shows the current version in its **stabilize** phase, the restraint is narrow: don't *start* new feature/build directions that would pollute this version's scope — stage those instead (per the Staging block above). That restraint is NOT license to stop opening directions. Stabilize is exactly when quality work earns its keep: hardening, test coverage, error handling, cleanup, dead-code removal, risk-reducing refactors, and closing carried audit findings. Keep the lanes full with that work. A stabilize cycle that opens zero directions and writes "holding / nothing to start / do not manufacture lanes" is the single failure mode this phase most invites — and it is wrong. "No gap in hand" is never a reason to idle; it is a reason to **go find one**. Commission an audit — a read-only \`research\`/\`web_research\` pass, or an \`audit\`/\`fundamentals\`-mode direction — that surfaces the concrete hardening work, then drive those findings to merged PRs. If you cannot name one thing worth hardening, polishing, or cleaning in the system you're stabilizing, you have not looked yet — looking is the move.
+**Stabilize is hardening time, not idle time.** Don't start new feature/build directions during stabilize — stage them instead. That is NOT license to stop opening directions: quality work earns its keep here (hardening, tests, error cleanup, refactors, audit findings). A stabilize cycle with zero opened directions is the failure mode — **do not manufacture lanes**, but "no gap in hand" is a reason to **go find one**: Commission an audit that surfaces real hardening work, then drive it to merged PRs. If you can't name one thing worth hardening, you haven't looked yet.
 
 ## 3.5. Retired-direction critique (REQUIRED)
 

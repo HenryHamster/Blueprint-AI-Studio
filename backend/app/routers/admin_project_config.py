@@ -37,6 +37,7 @@ from app.admin import _get_user_project_with_role
 from app.resource_envelope import (
     get_project_recent_spend_usd,
     resolve_project_hardware_policy,
+    resolve_project_pause_on_ceiling_exceeded,
     resolve_project_require_local_runner,
     resolve_project_spend_ceiling,
     resolve_project_spend_warning_fraction,
@@ -842,10 +843,12 @@ def _resource_envelope_response(
         "allowed_machine_types": allowed_machines,
         "allowed_accelerator_types": allowed_accels,
         "require_local_runner": resolve_project_require_local_runner(project),
+        "pause_on_ceiling_exceeded": resolve_project_pause_on_ceiling_exceeded(project),
         "active_vm_count": active_vm_count,
         "recent_spend_usd": float(recent_spend_usd),
         "recent_spend_compute_usd": float(spend_breakdown["compute"]),
         "recent_spend_agent_vm_usd": float(spend_breakdown["agent_vm"]),
+        "recent_spend_llm_usd": float(spend_breakdown["llm"]),
         "recent_spend_idle_usd": float(spend_breakdown["idle"]),
         "is_throttled": (
             spend_ceiling_usd is not None and recent_spend_usd >= spend_ceiling_usd
@@ -1312,6 +1315,7 @@ async def update_resource_envelope_config(
         "allowed_machine_types",
         "allowed_accelerator_types",
         "require_local_runner",
+        "pause_on_ceiling_exceeded",
     }
     if not body:
         raise HTTPException(

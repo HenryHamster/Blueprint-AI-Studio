@@ -948,11 +948,12 @@ class TestRunnerEndpoints:
             assert task.started_at is not None
 
             # Verify the response includes pooled credential info.
-            assert body.get("provider") == "anthropic"
-            assert body.get("auth_mode") == "oauth"
-            assert isinstance(body.get("llm_env"), dict)
-            assert "CLAUDE_CODE_OAUTH_TOKEN" in body["llm_env"]
-            assert body["llm_env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test-secret-token"
+            credentials = body.get("credentials")
+            assert isinstance(credentials, dict)
+            assert credentials["env"]["PROVIDER"] == "anthropic"
+            assert credentials["env"]["AUTH_MODE"] == "oauth"
+            assert credentials["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test-secret-token"
+            assert isinstance(credentials["files"], list)
         finally:
             _clear_pool()
 
@@ -1049,6 +1050,164 @@ class TestRunnerEndpoints:
             assert resp2.status_code == 204
         finally:
             _clear_pool()
+
+    @pytest.mark.asyncio
+    async def test_next_task_returns_credentials_when_pool_account_resolved(
+        self, client: AsyncClient, db_session
+    ):
+        """next-task returns llm_env and llm_files when the account pool
+        resolves an LLM account for the task, and stamps the task context with
+        llm_account_id / llm_provider / llm_auth_mode / llm_model."""
+        from app.max_plan_pool import LLMSelectionResult
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task_instance = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task_instance)
+        await db_session.commit()
+
+        mock_selection = LLMSelectionResult(
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-opus-4-8",
+            quality_tier="opus",
+            account={
+                "id": "acct-001",
+                "oauth_token": "sk-ant-test-token",
+                "runtime_secret": "sk-ant-test-token",
+                "claude_config_json": None,
+                "provider_metadata": {},
+            },
+            settings={},
+        )
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=mock_selection),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "credentials" in body
+        creds = body["credentials"]
+        assert creds is not None
+        assert "env" in creds
+        assert "files" in creds
+        env = creds["env"]
+        assert env.get("PROVIDER") == "anthropic"
+        assert env.get("AUTH_MODE") == "oauth"
+        # Provider-specific secret should be present in the llm_env.
+        assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-test-token"
+
+        # Verify task context was stamped for cost attribution.
+        await db_session.refresh(task_instance)
+        assert task_instance.llm_account_id == "acct-001"
+        assert task_instance.context.get("llm_account_id") == "acct-001"
+        assert task_instance.context.get("llm_provider") == "anthropic"
+        assert task_instance.context.get("llm_auth_mode") == "oauth"
+        assert task_instance.context.get("llm_model") == "claude-opus-4-8"
+        assert task_instance.status == TaskStatus.PROVISIONING  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_next_task_returns_null_credentials_when_no_pool_account(
+        self, client: AsyncClient, db_session
+    ):
+        """next-task returns 204 when no LLM account is resolved — the task stays
+        in PROVISIONING for the next poll cycle, and no context fields are stamped."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task_instance = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "title": "no pool account"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task_instance)
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(return_value=None),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # When no LLM account is resolved, the handler returns 503
+        # with pool_exhausted=True, rolling back the dispatch marker
+        # so the task stays claimable by a future poll cycle.
+        assert resp.status_code == 503
+        assert resp.json() == {"pool_exhausted": True}
+
+        # Task context was NOT stamped since select_llm_runtime_for_task returned None.
+        await db_session.refresh(task_instance)
+        assert task_instance.llm_account_id is None  # not stamped
+        assert task_instance.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_next_task_rolls_back_dispatch_on_credential_exception(
+        self, client: AsyncClient, db_session
+    ):
+        """When an unexpected exception occurs during credential resolution,
+        next-task must roll back the dispatch marker (started_at = None) and
+        return 503 with pool_exhausted=True so the task stays claimable rather
+        than being dispatched without credentials."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task_instance = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "title": "cred resolution exception"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task_instance)
+        await db_session.commit()
+
+        with patch(
+            "app.shared_state.runtime_config",
+            new={"provider_selection_mode": "exclusive"},
+        ), patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new=AsyncMock(side_effect=RuntimeError("pool connection lost")),
+        ):
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # Dispatch must be rolled back: 503 with pool_exhausted=True so the
+        # runner retries rather than receiving a task it can't execute.
+        assert resp.status_code == 503
+        assert resp.json() == {"pool_exhausted": True}
+
+        # Task context was NOT stamped and dispatch marker was rolled back.
+        await db_session.refresh(task_instance)
+        assert task_instance.llm_account_id is None
+        assert task_instance.status == TaskStatus.PROVISIONING  # unchanged
+        # started_at must be None — task is still claimable.
+        assert task_instance.started_at is None
 
     @pytest.mark.asyncio
     async def test_agent_claim_after_runner_dispatch_transitions_to_in_progress(
@@ -1152,16 +1311,13 @@ class TestRunnerEndpoints:
             assert resp.status_code == 200
             body = resp.json()
 
-            # Provider/model/auth_mode are from the POOL, not from any local env.
-            assert body["provider"] == "deepseek"
-            assert body["auth_mode"] == "api_key"
-            # llm_env carries the credential env vars the runner must inject.
-            assert isinstance(body["llm_env"], dict)
-            assert body["llm_env"]["PROVIDER"] == "deepseek"
-            assert body["llm_env"]["AUTH_MODE"] == "api_key"
-            assert body["llm_env"]["DEEPSEEK_API_KEY"] == "sk-deepseek-pool-assigned-key"
-            # llm_files is present (even if empty for api_key providers).
-            assert isinstance(body["llm_files"], list)
+            # Credential metadata and secrets come from the pool, not local env.
+            credentials = body["credentials"]
+            assert credentials["env"]["PROVIDER"] == "deepseek"
+            assert credentials["env"]["AUTH_MODE"] == "api_key"
+            assert credentials["env"]["DEEPSEEK_API_KEY"] == "sk-deepseek-pool-assigned-key"
+            # files is present even when the provider only needs an API key.
+            assert isinstance(credentials["files"], list)
 
             # The task context must carry the resolved account identity so the
             # completion handler can release the account slot.
@@ -1176,13 +1332,13 @@ class TestRunnerEndpoints:
             _clear_pool()
 
     @pytest.mark.asyncio
-    async def test_next_task_returns_204_when_pool_exhausted(
+    async def test_next_task_returns_503_when_pool_exhausted(
         self, client: AsyncClient, db_session
     ):
         """When no eligible account exists in the pool, /next-task must return
-        204 and leave started_at unset so the task remains claimable once an
-        account frees up.  A 204 is the correct "nothing available" signal,
-        not a 5xx or a task dispatched without credentials."""
+        503 with pool_exhausted=True and leave started_at unset so the task
+        remains claimable once an account frees up.  A 503 signals resource
+        exhaustion distinct from "no tasks available" (204)."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
         # Do NOT seed any account — the pool is empty.
@@ -1202,7 +1358,8 @@ class TestRunnerEndpoints:
                 "/api/runner/next-task",
                 headers={"Authorization": f"Bearer {token}"},
             )
-            assert resp.status_code == 204
+            assert resp.status_code == 503
+            assert resp.json() == {"pool_exhausted": True}
 
             # started_at must NOT be set — the task was not dispatched.
             await db_session.refresh(task)
@@ -1210,6 +1367,112 @@ class TestRunnerEndpoints:
             assert task.status == TaskStatus.PROVISIONING
         finally:
             _clear_pool()
+
+    @pytest.mark.asyncio
+    async def test_decline_task_releases_back_to_queued(
+        self, client: AsyncClient, db_session
+    ):
+        """Runner-declined task moves from PROVISIONING back to QUEUED.
+
+        Edge cases covered inline: wrong runner → no-op, wrong status → no-op."""
+        project = await _make_project(db_session)
+        r1, t1 = await _make_runner(db_session, project.id)
+        r2, _ = await _make_runner(db_session, project.id, hostname="other")
+
+        # ── Happy path: decline own PROVISIONING task ──
+        task1 = Task(
+            project_id=project.id, payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{r1.id}",
+            context={"runner_target_id": str(r1.id)},
+            started_at=_utcnow(),
+        )
+        # Pinned to r2 — r1 can't release it.
+        task2 = Task(
+            project_id=project.id, payloads=[{"type": "review"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{r2.id}",
+            context={"runner_target_id": str(r2.id)},
+            started_at=_utcnow(),
+        )
+        # Wrong status — decline only releases PROVISIONING.
+        task3 = Task(
+            project_id=project.id, payloads=[{"type": "fix"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id=f"runner:{r1.id}",
+            context={"runner_target_id": str(r1.id)},
+            started_at=_utcnow(),
+        )
+        db_session.add_all([task1, task2, task3])
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/decline-task",
+            json={"task_id": str(task1.id)},
+            headers={"Authorization": f"Bearer {t1}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True}
+
+        await db_session.refresh(task1)
+        assert task1.status == TaskStatus.QUEUED
+        assert task1.vm_instance_id is None
+        assert task1.vm_provisioned_at is None
+        assert task1.started_at is None
+        assert "runner_target_id" not in (task1.context or {})
+
+        # task2 pinned to r2 — NOT released by r1's decline.
+        await db_session.refresh(task2)
+        assert task2.status == TaskStatus.PROVISIONING
+        assert task2.vm_instance_id == f"runner:{r2.id}"
+
+        # task3 in IN_PROGRESS — NOT released by decline.
+        await db_session.refresh(task3)
+        assert task3.status == TaskStatus.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_decline_task_releases_pool_account(
+        self, client: AsyncClient, db_session
+    ):
+        """Declining a task releases the LLM pool account slot."""
+        _clear_pool()
+        acct = _seed_pool_account(active_tasks=1)
+        acct_id = acct["id"]
+        assert acct["active_tasks"] == 1  # pre-condition: slot is claimed
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = Task(
+            project_id=project.id, payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={
+                "runner_target_id": str(runner.id),
+                "llm_account_id": acct_id,
+            },
+            llm_account_id=acct_id,
+            started_at=_utcnow(),
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/decline-task",
+            json={"task_id": str(task.id)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+
+        # Pool slot was released back.
+        assert acct["active_tasks"] == 0
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.llm_account_id is None
+        ctx = task.context or {}
+        assert "llm_account_id" not in ctx
+        assert "llm_provider" not in ctx
 
     @pytest.mark.asyncio
     async def test_heartbeat_updates_last_seen(
@@ -2042,6 +2305,100 @@ class TestRunnerEndpoints:
             prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"] == old_at
         )
 
+    @pytest.mark.asyncio
+    async def test_update_report_creates_alert_on_success(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/runner/update-report with status=success creates an INFO Alert."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session, project.id, hostname="runner-update-test"
+        )
+
+        resp = await client.post(
+            "/api/runner/update-report",
+            json={
+                "status": "success",
+                "old_version": "a" * 40,
+                "new_version": "b" * 40,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+
+        # Verify an alert was created.
+        rows = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.event_type == "runner.self_update",
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        alert = rows[0]
+        assert alert.severity == AlertSeverity.INFO
+        assert "succeeded" in alert.title
+        assert runner.hostname in alert.title or str(runner.id)[:8] in alert.title
+        assert "aaaaaaaaaa → bbbbbbbbbb" in alert.message
+
+    @pytest.mark.asyncio
+    async def test_update_report_creates_alert_on_failure(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/runner/update-report with status=failure creates a WARNING Alert."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        resp = await client.post(
+            "/api/runner/update-report",
+            json={"status": "failure"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+
+        rows = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.event_type == "runner.self_update",
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        alert = rows[0]
+        assert alert.severity == AlertSeverity.WARNING
+        assert "failed" in alert.title
+
+    @pytest.mark.asyncio
+    async def test_update_report_rejects_invalid_status(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/runner/update-report rejects unknown status."""
+        project = await _make_project(db_session)
+        _runner, token = await _make_runner(db_session, project.id)
+
+        resp = await client.post(
+            "/api/runner/update-report",
+            json={"status": "unknown"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_update_report_requires_auth(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/runner/update-report returns 401 without a valid token."""
+        resp = await client.post(
+            "/api/runner/update-report",
+            json={"status": "success"},
+        )
+        assert resp.status_code == 401
 
 # ── Durable artifact upload endpoint (FIX M1, backend side) ───────────────────
 
@@ -4850,3 +5207,47 @@ async def test_runner_polling_endpoint_rate_limited(
     assert resp_b.status_code == 200, (
         f"Runner B should not be throttled, got {resp_b.status_code}"
     )
+
+
+@pytest.mark.asyncio
+async def test_report_compute_job_cross_project_emits_warning(
+    client: AsyncClient, db_session, caplog
+):
+    """When a runner reports a compute job that belongs to a different project,
+    a structured WARNING is emitted with runner_id, runner_project_id, job_id,
+    and job_actual_project_id so operators can detect misconfigured runners."""
+    import logging
+
+    project_a = await _make_project(db_session, name="Project A")
+    project_b = await _make_project(db_session, name="Project B")
+    runner_a, token_a = await _make_runner(db_session, project_a.id)
+
+    # Create a RUNNING job that belongs to project_b, pinned to runner_a's id
+    # (simulates a misconfiguration where the runner was re-registered to a new project
+    # but still knows about old job IDs, or vice versa).
+    job = ComputeJob(
+        project_id=project_b.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"runner_target_id": str(runner_a.id)},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    with caplog.at_level(logging.WARNING, logger="blueprint"):
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={"exec_status": "running"},
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+
+    assert resp.status_code == 404
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    mismatch_warnings = [r for r in warning_records if "Cross-project" in r.getMessage()]
+    assert len(mismatch_warnings) == 1, f"Expected 1 cross-project warning, got {len(mismatch_warnings)}"
+    msg = mismatch_warnings[0].getMessage()
+    assert str(runner_a.id) in msg
+    assert str(project_a.id) in msg
+    assert str(job.id) in msg
+    assert str(project_b.id) in msg

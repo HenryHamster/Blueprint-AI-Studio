@@ -822,7 +822,7 @@ class LocalGPUComputeBackend:
 
     async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
         result = await self._delegate.launch(spec)
-        gpu_info = detect_local_gpu()
+        gpu_info = await asyncio.to_thread(detect_local_gpu)
         if gpu_info is not None:
             result.metadata["local_gpu"] = gpu_info
         return result
@@ -1458,11 +1458,11 @@ async def collect_terminal_artifact_reference(
     """
     try:
         if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
-            return _collect_local_artifact_reference(job)
+            return await asyncio.to_thread(_collect_local_artifact_reference, job)
         if job.backend == GCP_BACKEND_NAME:
             return await _collect_gcp_artifact_reference(job)
         if job.backend == RUNNER_SUBPROCESS_BACKEND_NAME:
-            return _collect_runner_artifact_reference(job)
+            return await asyncio.to_thread(_collect_runner_artifact_reference, job)
     except Exception:
         logger.warning(
             "Durable-artifact detection failed for compute job %s",

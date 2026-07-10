@@ -5,6 +5,40 @@ import { sendLog, WORKSPACE } from '../index.js';
 import type { BuildConfig, FailureCategory } from '../index.js';
 import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
 
+// ── Cached git ls-files ──────────────────────────────────────────────────────
+// Multiple functions in this module run `git ls-files`.  The output is
+// identical for the lifetime of a task workspace, so cache it once.
+let _cachedTrackedFiles: string[] | null = null;
+
+function getTrackedFiles(): string[] {
+  if (_cachedTrackedFiles === null) {
+    try {
+      _cachedTrackedFiles = execFileSync('git', ['ls-files'], { cwd: WORKSPACE, encoding: 'utf-8' })
+        .split('\n')
+        .filter(Boolean);
+    } catch {
+      _cachedTrackedFiles = [];
+    }
+  }
+  return _cachedTrackedFiles;
+}
+
+/** Clear the ls-files cache so a fresh enumeration runs on the next call. */
+export function clearTrackedFilesCache(): void { _cachedTrackedFiles = null; }
+
+// ── Cached repo-map computation ──────────────────────────────────────────────
+// buildRepoMap reads every tracked source file and parses imports — cheap to
+// recompute only when HEAD moves, expensive to run on every prompt build.
+interface RepoMapCacheEntry {
+  headCommit: string;
+  inDegree: Map<string, number>;
+  fileImports: Map<string, string[]>;
+}
+const _repoMapCache = new Map<string, RepoMapCacheEntry>();
+
+/** Clear the repo-map cache so the next buildRepoMap call recomputes. */
+export function clearRepoMapCache(): void { _repoMapCache.clear(); }
+
 export function buildFileTree(ws: WebSocket | null): string {
   try {
     // Get files ranked by recent git activity
@@ -21,11 +55,9 @@ export function buildFileTree(ws: WebSocket | null): string {
         .map(([f]) => f);
     } catch { /* fallback to unsorted */ }
 
-    // Get all tracked files
-    const allFiles = execFileSync('git', ['ls-files'],
-      { cwd: WORKSPACE, encoding: 'utf-8' })
-      .split('\n')
-      .filter(f => f && !f.includes('node_modules/') && !f.includes('dist/'));
+    // Get all tracked files (cached — git ls-files output is stable per workspace session)
+    const allFiles = getTrackedFiles()
+      .filter(f => !f.includes('node_modules/') && !f.includes('dist/'));
 
     // Merge: recent files first, then remaining alphabetically
     const recentSet = new Set(recentFiles);
@@ -64,6 +96,9 @@ const NON_SOURCE_BASENAMES = new Set([
  */
 export function countSourceFiles(): number | null {
   try {
+    // Deliberately bypasses getTrackedFiles() — countSourceFiles must
+    // distinguish "scan error" (return null) from "empty repo" (return 0),
+    // but getTrackedFiles() swallows errors and returns [].
     const out = execFileSync('git', ['ls-files'], { cwd: WORKSPACE, encoding: 'utf-8' });
     const files = out
       .split('\n')
@@ -323,8 +358,10 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
     const dirConfigs = buildConfig?.directories ?? [];
 
 
+    // Phase 1: Convention-based discovery (one pass over related files — uses
+    // cached ls-files for directory scans instead of spawning per-directory
+    // child processes).
     for (const relFile of relatedFiles) {
-      // Convention-based discovery: use buildConfig.directories if available, else hardcoded Blueprint paths
       let discoveredByConvention = false;
 
       if (dirConfigs.length > 0) {
@@ -343,16 +380,15 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
           } else if ((dir.type === 'node') && relFile.match(/\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
             const testPath = relFile.replace(/\.(tsx?|jsx?)$/, (ext) => `.test${ext}`);
             processTestFile(testPath);
-            // Also search for any test files in this directory
+            // Scan this directory for test files (from cached ls-files, no child process)
             try {
-              const nodeTestFiles = execFileSync('git', ['ls-files', dirPrefix + '/'],
-                { cwd: WORKSPACE, encoding: 'utf-8' })
-                .split('\n')
-                .filter(f => f.includes('.test.') || f.includes('.spec.'));
+              const prefix = dirPrefix + '/';
+              const nodeTestFiles = getTrackedFiles()
+                .filter(f => f.startsWith(prefix) && (f.includes('.test.') || f.includes('.spec.')));
               for (const tf of nodeTestFiles) processTestFile(tf);
             } catch { /* skip */ }
           } else {
-            // Unknown type: fall through to grep-based discovery
+            // Unknown type: fall through to grep-based discovery (phase 2 below)
             discoveredByConvention = false;
           }
         }
@@ -368,60 +404,74 @@ export function discoverRelatedTests(ws: WebSocket | null, relatedFiles: string[
           processTestFile(testPath);
           discoveredByConvention = true;
         } else if (relFile.startsWith('agent/')) {
-          // Search for any test files in agent/
+          // Search for any test files in agent/ (from cached ls-files)
           try {
-            const agentTestFiles = execFileSync('git', ['ls-files', 'agent/'],
-              { cwd: WORKSPACE, encoding: 'utf-8' })
-              .split('\n')
-              .filter(f => f.includes('.test.') || f.includes('test_') || f.includes('/tests/'));
+            const agentTestFiles = getTrackedFiles()
+              .filter(f => f.startsWith('agent/') && (f.includes('.test.') || f.includes('test_') || f.includes('/tests/')));
             for (const tf of agentTestFiles) processTestFile(tf);
           } catch { /* skip */ }
           discoveredByConvention = true;
         }
       }
+      void discoveredByConvention;
+    }
 
-      // Grep-based discovery: find test files importing from this module (always run)
+    // Phase 2: Batched grep-based discovery — collect all module names and run
+    // a single `git grep` instead of one per related file (N+1 → 1).
+    const moduleNamesForGrep = relatedFiles
+      .map(f => f.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '')
+      .filter(Boolean);
+    if (moduleNamesForGrep.length > 0) {
       try {
-        const moduleName = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?|py)$/, '') || '';
-        if (moduleName) {
-          const grepResult = execFileSync('git', ['grep', '-l', moduleName, '--', '*test*'],
-            { cwd: WORKSPACE, encoding: 'utf-8' });
-          for (const tf of grepResult.split('\n').filter(Boolean)) {
-            processTestFile(tf);
-          }
+        // Escape regex-special chars and join into a single alternation
+        const escaped = moduleNamesForGrep.map(n => n.replace(/[.+*?^${}()|[\]\\]/g, '\\$&'));
+        const combined = escaped.join('|');
+        const grepResult = execFileSync('git', ['grep', '-lE', combined, '--', '*test*'],
+          { cwd: WORKSPACE, encoding: 'utf-8' });
+        for (const tf of grepResult.split('\n').filter(Boolean)) {
+          processTestFile(tf);
         }
       } catch { /* no matches */ }
+    }
 
-      // Import-based discovery: search test files for direct import statements referencing this module
+    // Phase 3: Batched import-based discovery — collect Python dotted-paths and
+    // TS stems, then run at most 2 greps instead of N × 2.
+    const pyImportPatterns: string[] = [];
+    const tsImportStems: string[] = [];
+    for (const relFile of relatedFiles) {
+      if (relFile.endsWith('.py')) {
+        const pyModulePath = relFile
+          .replace(/^backend\//, '')
+          .replace(/\.py$/, '')
+          .replace(/\//g, '.');
+        pyImportPatterns.push(`(from ${pyModulePath} import|import ${pyModulePath})`);
+      } else if (relFile.match(/\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
+        const stem = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?)$/, '') || '';
+        if (stem) tsImportStems.push(stem.replace(/[.+*?^${}()|[\]\\]/g, '\\$&'));
+      }
+    }
+    if (pyImportPatterns.length > 0) {
       try {
-        if (relFile.endsWith('.py')) {
-          // e.g. 'backend/app/orchestrator.py' → 'app.orchestrator'
-          const pyModulePath = relFile
-            .replace(/^backend\//, '')
-            .replace(/\.py$/, '')
-            .replace(/\//g, '.');
-          const importPattern = `(from ${pyModulePath} import|import ${pyModulePath})`;
-          const pyGrepResult = execFileSync('git', ['grep', '-lE', importPattern, '--', '*test*'],
-            { cwd: WORKSPACE, encoding: 'utf-8' });
-          for (const tf of pyGrepResult.split('\n').filter(Boolean)) {
-            processTestFile(tf);
-          }
-        } else if (relFile.match(/\.(tsx?|jsx?)$/) && !relFile.includes('.test.')) {
-          // e.g. 'agent/src/prompt.ts' → stem 'prompt'
-          const stem = relFile.split('/').pop()?.replace(/\.(tsx?|jsx?)$/, '') || '';
-          if (stem) {
-            // Match import ... from '*/prompt', '*/prompt.js', '*/prompt.ts' etc.
-            const tsImportPattern = `from ['"][^'"]*/${stem}(\\.js|\\.ts|\\.tsx)?['"]`;
-            const tsGrepResult = execFileSync('git', ['grep', '-lE', tsImportPattern, '--', '*test*'],
-              { cwd: WORKSPACE, encoding: 'utf-8' });
-            for (const tf of tsGrepResult.split('\n').filter(Boolean)) {
-              processTestFile(tf);
-            }
-          }
+        const combined = pyImportPatterns.join('|');
+        const pyGrepResult = execFileSync('git', ['grep', '-lE', combined, '--', '*test*'],
+          { cwd: WORKSPACE, encoding: 'utf-8' });
+        for (const tf of pyGrepResult.split('\n').filter(Boolean)) {
+          processTestFile(tf);
         }
       } catch { /* no matches */ }
-
-      void discoveredByConvention; // used for control flow, not needed after loop
+    }
+    if (tsImportStems.length > 0) {
+      try {
+        const stemPattern = tsImportStems.length === 1
+          ? tsImportStems[0]
+          : `(${tsImportStems.join('|')})`;
+        const tsImportPattern = `from ['"][^'"]*/${stemPattern}(\\.js|\\.ts|\\.tsx)?['"]`;
+        const tsGrepResult = execFileSync('git', ['grep', '-lE', tsImportPattern, '--', '*test*'],
+          { cwd: WORKSPACE, encoding: 'utf-8' });
+        for (const tf of tsGrepResult.split('\n').filter(Boolean)) {
+          processTestFile(tf);
+        }
+      } catch { /* no matches */ }
     }
 
     if (testEntries.length === 0) return '';
@@ -632,9 +682,8 @@ export function extractModuleInterfaces(ws: WebSocket | null, relatedFiles: stri
 export function buildRepoMap(ws: WebSocket | null, opts?: { taskPrompt?: string; relatedFiles?: string[] }): string {
   const CAP = 3000;
   try {
-    const allFiles = execFileSync('git', ['ls-files'], { cwd: WORKSPACE, encoding: 'utf-8' })
-      .split('\n')
-      .filter(f => f &&
+    const allFiles = getTrackedFiles()
+      .filter(f =>
         /\.(py|ts|tsx|js|jsx|mjs)$/.test(f) &&
         !f.includes('node_modules/') &&
         !f.includes('/dist/') &&
@@ -649,61 +698,83 @@ export function buildRepoMap(ws: WebSocket | null, opts?: { taskPrompt?: string;
 
     const fileSet = new Set(allFiles);
 
+    // ── Repo-map cache: reuse the expensive inDegree/fileImports computation
+    // when HEAD hasn't moved.  The ranking pass below is cheap and always
+    // recomputed so taskPrompt / relatedFiles stay fresh.
+    let headCommit = '';
+    try {
+      headCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: WORKSPACE, encoding: 'utf-8' }).trim();
+    } catch { /* leave empty — cache miss */ }
+    const cacheEntry = headCommit ? _repoMapCache.get(WORKSPACE) : undefined;
+
     // inDegree is keyed on full file paths to avoid cross-package basename collisions
-    const inDegree = new Map<string, number>();
+    let inDegree: Map<string, number>;
     // fileImports tracks each file's resolved imports for task-adjacency computation
-    const fileImports = new Map<string, string[]>();
+    let fileImports: Map<string, string[]>;
 
-    for (const file of allFiles) {
-      let lines: string[];
-      try {
-        lines = fs.readFileSync(`${WORKSPACE}/${file}`, 'utf-8').split('\n').slice(0, 100);
-      } catch { continue; }
+    if (cacheEntry && cacheEntry.headCommit === headCommit) {
+      inDegree = new Map(cacheEntry.inDegree);
+      fileImports = new Map(cacheEntry.fileImports);
+    } else {
+      inDegree = new Map<string, number>();
+      fileImports = new Map<string, string[]>();
 
-      const isPython = file.endsWith('.py');
-      const fileDir = file.split('/').slice(0, -1).join('/');
-      const importsForFile: string[] = [];
-      for (const line of lines) {
-        let resolved: string | null = null;
+      for (const file of allFiles) {
+        let lines: string[];
+        try {
+          lines = fs.readFileSync(`${WORKSPACE}/${file}`, 'utf-8').split('\n').slice(0, 100);
+        } catch { continue; }
 
-        if (!isPython) {
-          // Only resolve relative imports — package imports are not tracked files
-          const m = line.match(/from\s+['"]([^'"]+)['"]/);
-          if (m && m[1].startsWith('.')) {
-            const spec = m[1].replace(/\.(js|ts|tsx|jsx|mjs)$/, '');
-            const joined = fileDir ? fileDir + '/' + spec : spec;
-            const segments = joined.split('/');
-            const normalized: string[] = [];
-            for (const seg of segments) {
-              if (seg === '..') normalized.pop();
-              else if (seg !== '.') normalized.push(seg);
+        const isPython = file.endsWith('.py');
+        const fileDir = file.split('/').slice(0, -1).join('/');
+        const importsForFile: string[] = [];
+        for (const line of lines) {
+          let resolved: string | null = null;
+
+          if (!isPython) {
+            // Only resolve relative imports — package imports are not tracked files
+            const m = line.match(/from\s+['"]([^'"]+)['"]/);
+            if (m && m[1].startsWith('.')) {
+              const spec = m[1].replace(/\.(js|ts|tsx|jsx|mjs)$/, '');
+              const joined = fileDir ? fileDir + '/' + spec : spec;
+              const segments = joined.split('/');
+              const normalized: string[] = [];
+              for (const seg of segments) {
+                if (seg === '..') normalized.pop();
+                else if (seg !== '.') normalized.push(seg);
+              }
+              const candidateStem = normalized.join('/');
+              for (const ext of ['.ts', '.tsx', '.js', '.jsx']) {
+                if (fileSet.has(candidateStem + ext)) { resolved = candidateStem + ext; break; }
+              }
+              if (!resolved && fileSet.has(candidateStem)) resolved = candidateStem;
             }
-            const candidateStem = normalized.join('/');
-            for (const ext of ['.ts', '.tsx', '.js', '.jsx']) {
-              if (fileSet.has(candidateStem + ext)) { resolved = candidateStem + ext; break; }
+          } else {
+            // Python: resolve dotted module path to a unique tracked file
+            let dotted: string | null = null;
+            const m1 = line.match(/^from\s+\.*([\w.]+)\s+import\s+/);
+            if (m1) dotted = m1[1];
+            else { const m2 = line.match(/^import\s+([\w.]+)/); if (m2) dotted = m2[1]; }
+            if (dotted) {
+              const asPath = dotted.split('.').join('/') + '.py';
+              const matches = allFiles.filter(f => f === asPath || f.endsWith('/' + asPath));
+              // Drop ambiguous matches — only attribute when exactly one file matches
+              if (matches.length === 1) resolved = matches[0];
             }
-            if (!resolved && fileSet.has(candidateStem)) resolved = candidateStem;
           }
-        } else {
-          // Python: resolve dotted module path to a unique tracked file
-          let dotted: string | null = null;
-          const m1 = line.match(/^from\s+\.*([\w.]+)\s+import\s+/);
-          if (m1) dotted = m1[1];
-          else { const m2 = line.match(/^import\s+([\w.]+)/); if (m2) dotted = m2[1]; }
-          if (dotted) {
-            const asPath = dotted.split('.').join('/') + '.py';
-            const matches = allFiles.filter(f => f === asPath || f.endsWith('/' + asPath));
-            // Drop ambiguous matches — only attribute when exactly one file matches
-            if (matches.length === 1) resolved = matches[0];
+
+          if (resolved) {
+            inDegree.set(resolved, (inDegree.get(resolved) ?? 0) + 1);
+            importsForFile.push(resolved);
           }
         }
-
-        if (resolved) {
-          inDegree.set(resolved, (inDegree.get(resolved) ?? 0) + 1);
-          importsForFile.push(resolved);
-        }
+        fileImports.set(file, importsForFile);
       }
-      fileImports.set(file, importsForFile);
+
+      // Cache the expensive computation keyed by HEAD commit
+      if (headCommit) {
+        _repoMapCache.set(WORKSPACE, { headCommit, inDegree, fileImports });
+      }
     }
 
     if (inDegree.size === 0) return '';

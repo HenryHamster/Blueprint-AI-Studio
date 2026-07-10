@@ -236,6 +236,7 @@ def test_code_review_gated_task_types_derived_from_registry():
         "qa",
         "deps",
         "docs",
+        "salvage_bundle",
     }
     derived = frozenset(
         cap.id.value

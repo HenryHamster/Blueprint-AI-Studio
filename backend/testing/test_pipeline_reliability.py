@@ -144,6 +144,18 @@ async def orch_db(mocker):
     _orch_module._last_orphan_check = now
     _orch_module._last_evaluating_timeout_check = now
     _orch_module._last_deadlock_check = now
+    _orch_module._last_anomaly_state_persist = now
+    _orch_module._last_anomaly_sweep = now
+    _orch_module._last_post_commit_sweep = now
+    _orch_module._last_sidecar_sweep = now
+    _orch_module._last_bootstrap_recovery_sweep = now
+    _orch_module._last_lane_baseline_backfill = now
+    _orch_module._last_merge_credit_backfill = now
+    _orch_module._last_v22_finding_backfill = now
+    _orch_module._last_runner_deactivation_sweep = now
+    _orch_module._last_runner_degraded_sweep = now
+    _orch_module._last_runner_escalation_sweep = now
+    _orch_module._last_local_runner_hold_sweep = now
 
     # Clear task_results so failure-rate gate doesn't trigger
     _shared_state.deploy_monitoring["task_results"].clear()

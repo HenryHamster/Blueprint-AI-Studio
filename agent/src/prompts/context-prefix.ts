@@ -8,7 +8,7 @@ import { formatProjectContext } from './project-context.js';
 // (self-review calibration + first-review rejection patterns) are only
 // meaningful for reviewed code work, so both render for exactly these types.
 // Cannot import the Python frozenset cross-language; kept as a mirrored literal.
-export const REVIEW_GATED_TASK_TYPES = ['create', 'fix', 'refactor', 'migrate', 'qa', 'docs', 'deps'];
+export const REVIEW_GATED_TASK_TYPES = ['create', 'fix', 'refactor', 'migrate', 'qa', 'docs', 'deps', 'salvage_bundle'];
 
 // Utility task types that should receive only durable operator steering
 // (user_purpose + constraints) and NOT the rolling agent current_focus narrative.
@@ -192,6 +192,134 @@ export function synthesizeFailureHotspots(
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .slice(0, 5)
     .map(([file, count]) => ({ file, count }));
+}
+
+// Render a condensed direction-context section for co-batch tasks (3+ active
+// siblings from the same direction). Omits verbose sections that duplicate what
+// sibling tasks already receive (narrative, evidence, prior analysis, etc.),
+// keeping only the structural metadata the agent needs to orient itself.
+export function formatCondensedDirectionContext(dirCtx: Record<string, unknown>): string {
+  const dcLines: string[] = ['## Direction Context (condensed — batch sibling)'];
+  const title = strVal(dirCtx.title);
+  if (title) dcLines.push(`**Goal:** ${title}`);
+  const priority = strVal(dirCtx.priority);
+  if (priority) dcLines.push(`**Priority:** ${priority}`);
+  const implConstraints = strVal(dirCtx.implementation_constraints);
+  if (implConstraints) dcLines.push(`**Implementation constraints:** ${implConstraints}`);
+
+  // Contract — what "done" means
+  const contract = dirCtx.contract as Record<string, unknown> | undefined;
+  if (contract && typeof contract === 'object') {
+    const completionCriteria = strVal(contract.completion_criteria);
+    if (completionCriteria) dcLines.push(`**Completion criteria:** ${completionCriteria}`);
+    const successEvidence = strVal(contract.success_evidence);
+    if (successEvidence) dcLines.push(`**Success evidence:** ${successEvidence}`);
+    const retirementCondition = strVal(contract.retirement_condition);
+    if (retirementCondition) dcLines.push(`**Retirement condition:** ${retirementCondition}`);
+  }
+
+  // failed_approaches — compact list
+  const failedApproaches = Array.isArray(dirCtx.failed_approaches) ? dirCtx.failed_approaches as unknown[] : [];
+  if (failedApproaches.length > 0) {
+    dcLines.push('**Avoid (already tried and failed):**');
+    for (const fa of failedApproaches) {
+      if (typeof fa === 'string') {
+        dcLines.push(`- ${fa}`);
+      } else if (fa && typeof fa === 'object') {
+        const obj = fa as Record<string, unknown>;
+        const text = strVal(obj.text);
+        if (text) {
+          const ftype = strVal(obj.failure_type);
+          const parts = [`- ${text}`];
+          if (ftype) parts.push(`[${ftype}]`);
+          dcLines.push(parts.join(' '));
+        }
+      }
+    }
+  }
+
+  // recent_outcomes — single line
+  const recentOutcomes = Array.isArray(dirCtx.recent_outcomes) ? dirCtx.recent_outcomes as Array<Record<string, unknown>> : [];
+  if (recentOutcomes.length > 0) {
+    const parts = recentOutcomes.map(o => `${Number(o.prs_merged ?? 0)}/${Number(o.tasks_created ?? 0)} merged`);
+    dcLines.push(`Recent cycles: ${parts.join(', ')}`);
+  }
+
+  // failure_stage_pattern
+  const failureStagePattern = dirCtx.failure_stage_pattern as Record<string, unknown> | undefined;
+  if (failureStagePattern) {
+    const msg = strVal(failureStagePattern.message);
+    if (msg) {
+      const rate = Number(failureStagePattern.rate);
+      const header = Number.isFinite(rate) && rate > 0
+        ? `**Failure pattern (${Math.round(rate * 100)}% of recent failures):**`
+        : `**Failure pattern:**`;
+      dcLines.push(`${header} ${msg}`);
+    }
+  }
+
+  // scope_success_rates — single-line summary only
+  const scopeRates = dirCtx.scope_success_rates as Record<string, Record<string, unknown>> | undefined;
+  if (scopeRates && typeof scopeRates === 'object') {
+    const scopeOrder = ['small', 'medium', 'large', 'ci_failure'];
+    const entries = Object.entries(scopeRates).sort(([a], [b]) => {
+      const ai = scopeOrder.indexOf(a);
+      const bi = scopeOrder.indexOf(b);
+      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    });
+    const parts: string[] = [];
+    for (const [scope, counts] of entries) {
+      const created = Number(counts.created ?? 0);
+      const merged = Number(counts.merged ?? 0);
+      if (created < 1) continue;
+      const pct = Math.round((merged / created) * 100);
+      const failed = Number(counts.failed ?? 0);
+      const suffix = failed > 0 ? `, ${failed} failed` : '';
+      parts.push(`${scope} ${merged}/${created} (${pct}%${suffix})`);
+    }
+    if (parts.length > 0) {
+      dcLines.push(`Scope merge rates: ${parts.join(', ')}`);
+    }
+  }
+
+  // review_iteration stats
+  const rollingMedianIter = typeof dirCtx.review_iteration_rolling_median === 'number'
+    ? dirCtx.review_iteration_rolling_median
+    : null;
+  if (rollingMedianIter !== null) {
+    const lastCycleIter = typeof dirCtx.review_iteration_last_cycle === 'number'
+      ? dirCtx.review_iteration_last_cycle
+      : null;
+    const lastCycleSuffix = lastCycleIter !== null && lastCycleIter !== rollingMedianIter
+      ? ` (last cycle: ${lastCycleIter.toFixed(1)})`
+      : '';
+    dcLines.push(
+      `Recent PRs on this direction averaged ${rollingMedianIter.toFixed(1)} review iterations${lastCycleSuffix}; tight scope merges faster.`,
+    );
+  }
+
+  // failure_hotspots
+  const failureHotspots = synthesizeFailureHotspots(dirCtx);
+  if (failureHotspots.length > 0) {
+    const parts = failureHotspots.map(h => `${h.file} (${h.count}x)`).join(', ');
+    dcLines.push(`Files appearing in multiple recent failures: ${parts} — changes to these files need extra care.`);
+  }
+
+  // top 1 of top_first_review_issues
+  type DirectionFirstReviewIssue = { description: string; count: number; category: string };
+  const dirTopIssues = Array.isArray(dirCtx.top_first_review_issues)
+    ? dirCtx.top_first_review_issues as DirectionFirstReviewIssue[]
+    : [];
+  if (dirTopIssues.length > 0) {
+    const top = dirTopIssues[0];
+    dcLines.push(`**Most common review issue in this direction:** "${top.description}" (seen ${top.count}x, category: ${top.category})`);
+    if (dirTopIssues.length > 1) {
+      dcLines.push(`Additional review issues exist — check full context via \`./fetch direction\` for the complete list.`);
+    }
+  }
+
+  dcLines.push('');
+  return dcLines.join('\n') + '\n';
 }
 
 export function formatProjectVision(vision: Record<string, unknown> | undefined): string {
@@ -413,8 +541,15 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
       if (directionId) meta.push(`direction: ${directionId}`);
       const sourceKind = strVal(entry.source_kind);
       if (sourceKind) meta.push(sourceKind);
+      const lifecycleStatus = strVal(entry.lifecycle_status);
+      if (lifecycleStatus && lifecycleStatus !== 'pending') {
+        meta.push(`lifecycle: ${lifecycleStatus}`);
+      }
       const metaSuffix = meta.length > 0 ? ` (${meta.join(', ')})` : '';
       let badges = '';
+      if (lifecycleStatus === 'pending') {
+        badges += ' [PENDING]';
+      }
       if (sourceKind === 'compute_experiment') {
         const criterionMet = entry.criterion_met;
         const unavailableCause = strVal(entry.unavailable_cause);
@@ -526,6 +661,15 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
   // Append direction context section when present (title, priority, failed approaches)
   const dirCtx = task.direction_context as Record<string, unknown> | undefined;
   if (dirCtx) {
+    // Condensed mode for co-batch tasks: 3+ active siblings from the same
+    // direction. Omit verbose sections (narrative, evidence, prior analysis)
+    // that duplicate across sibling tasks.
+    const batchSiblingCount = typeof dirCtx.co_batch_sibling_count === 'number'
+      ? dirCtx.co_batch_sibling_count
+      : 0;
+    if (batchSiblingCount >= 3) {
+      prefix += formatCondensedDirectionContext(dirCtx);
+    } else {
     const dcLines: string[] = ['## Direction Context'];
     const title = strVal(dirCtx.title);
     if (title) dcLines.push(`**Goal:** ${title}`);
@@ -876,6 +1020,7 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
     }
     dcLines.push('');
     prefix += dcLines.join('\n') + '\n';
+    }
   }
 
   // Append architecture context section when present

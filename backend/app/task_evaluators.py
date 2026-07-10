@@ -198,6 +198,7 @@ def review_is_high_stakes(
     trunk_branches: Collection[str],
     diff_non_test_lines: int | None = None,
     diff_non_test_file_count: int | None = None,
+    is_observable_behavior: bool = False,
 ) -> bool:
     """Predicate: does this ordinary ``review`` verdict warrant a second opinion?
 
@@ -220,6 +221,12 @@ def review_is_high_stakes(
     source task's ``_pr_diff_summary`` / ``_pr_changed_files`` context; when
     absent the size exemption is skipped (fail-open toward challenging).
 
+    Override: when ``is_observable_behavior`` is True (the reviewed task's
+    acceptance evidence is ``observable_behavior`` — the self-reported proof
+    path with no machine-checkable assertion), the small-diff exemption is
+    skipped and the review is always treated as high-stakes regardless of
+    diff size.
+
     Kept as a single function so operators can re-broaden or further narrow it
     without touching the lifecycle wiring.
     """
@@ -229,6 +236,14 @@ def review_is_high_stakes(
         and base_branch in trunk_branches
     ):
         return False
+
+    # observable_behavior tasks always warrant a second opinion regardless of
+    # diff size — they are the only evidence kind that produces
+    # satisfied=True, proven=False (entirely self-reported with no
+    # machine-checkable assertion). A small diff does not make that weaker
+    # proof path more trustworthy.
+    if is_observable_behavior:
+        return True
 
     if diff_non_test_lines is not None and diff_non_test_file_count is not None:
         min_lines = int(_runtime_config.get("review_second_opinion_min_lines", 50))
@@ -2147,3 +2162,134 @@ def parse_finding_challenge_verdict(
         source_task_id=source_task_id,
         finding_hash=finding_hash,
     )
+
+
+# ── Blind multi-reviewer redundancy ────────────────────────────────────────
+
+# Context key optionally set on a spawned blind multi-reviewer task, pointing at
+# the source task whose assessment is being independently re-evaluated.
+BLIND_REVIEW_SOURCE_KEY = "blind_review_for_task_id"
+
+
+async def spawn_blind_multi_reviewer(
+    source_task: Task,
+    session: AsyncSession,
+    *,
+    verdict: str,
+    issues: list | None,
+    feedback: str,
+    pr_number,
+    branch: str,
+    base_branch: str,
+    original_task_id: str,
+    original_prompt: str,
+    investigated_files: list | None,
+    reviewer_count: int = 3,
+) -> Task | None:
+    """Spawn a blind multi-reviewer ``panel_review`` task and park the source.
+
+    N=``reviewer_count`` redundant independent reviewers evaluate the same PR
+    blind to each other and to any self-assessment, with the aggregated gate
+    outcome determined by majority vote (2/3 threshold) inside the handler.
+
+    Reuses the ``REVIEW_SECOND_OPINION_SOURCE_KEY`` lifecycle so the blind
+    review's completion routes through the existing second-opinion
+    reconciliation path (``_resolve_review_second_opinion``). The source task
+    is parked EVALUATING until the blind review resolves.
+
+    Returns the spawned ``Task``, or ``None`` when a review is already in
+    flight or already resolved (single-shot guard).
+    """
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    ctx = dict(source_task.context or {})
+    _recon = ctx.get(REVIEW_SECOND_OPINION_RECONCILIATION_KEY)
+    _own_record = _recon is not None and (
+        not isinstance(_recon, dict)
+        or _recon.get("review_task_id") == str(source_task.id)
+    )
+    if ctx.get(REVIEW_SECOND_OPINION_AWAITING_KEY) or _own_record:
+        return None
+
+    _viewport_shots = source_task.first_payload.get("viewport_shot_entries")
+    _viewport_source = source_task.first_payload.get("viewport_source_task_id")
+
+    reviewer = Task(
+        project_id=source_task.project_id,
+        title=f"[BLIND REVIEW] multi-reviewer redundancy for PR #{pr_number}",
+        description=(
+            "N redundant independent blind reviewers evaluate the same PR "
+            "without seeing each other's findings or the source assessment. "
+            "Majority vote (2/3 threshold) determines the gate outcome."
+        ),
+        parent_task_id=None,
+        payloads=[
+            {
+                "type": "panel_review",
+                "pr_number": pr_number,
+                "branch": branch,
+                "base_branch": base_branch,
+                "original_prompt": original_prompt,
+                "is_blind": True,
+                "blind_reviewer_count": reviewer_count,
+                **(
+                    {"viewport_shot_entries": _viewport_shots, "viewport_source_task_id": _viewport_source}
+                    if _viewport_shots
+                    else {}
+                ),
+            }
+        ],
+        context={
+            REVIEW_SECOND_OPINION_SOURCE_KEY: str(source_task.id),
+            BLIND_REVIEW_SOURCE_KEY: str(source_task.id),
+            "pr_number": pr_number,
+            "branch": branch,
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=source_task.priority,
+    )
+    session.add(reviewer)
+
+    # Park the source task EVALUATING until the blind review resolves.
+    source_task.status = TaskStatus.EVALUATING
+    source_task.latest_status_message = (
+        f"Awaiting independent blind multi-reviewer verdict on PR #{pr_number} "
+        f"(N={reviewer_count} reviewers, 2/3 majority threshold)"
+    )[:500]
+    ctx[REVIEW_SECOND_OPINION_AWAITING_KEY] = True
+    ctx[REVIEW_SECOND_OPINION_PARKED_KEY] = {
+        "verdict": verdict,
+        "issues": list(issues or []),
+        "feedback": (feedback or "")[:5000],
+        "pr_number": pr_number,
+        "branch": branch,
+        "base_branch": base_branch,
+        "original_task_id": original_task_id,
+        "original_prompt": original_prompt,
+        "investigated_files": list(investigated_files or []),
+    }
+    source_task.context = ctx
+    flag_modified(source_task, "context")
+    session.add(source_task)
+    await session.commit()
+    await session.refresh(reviewer)
+
+    ctx2 = dict(source_task.context or {})
+    ctx2[REVIEW_SECOND_OPINION_AWAITING_KEY] = str(reviewer.id)
+    source_task.context = ctx2
+    flag_modified(source_task, "context")
+    session.add(source_task)
+    await session.commit()
+
+    logger.info(
+        "[BLIND REVIEW] Spawned multi-reviewer %s for task %s "
+        "(PR #%s, N=%d, primary verdict %s); source parked EVALUATING",
+        reviewer.id,
+        source_task.id,
+        pr_number,
+        reviewer_count,
+        verdict,
+    )
+    return reviewer

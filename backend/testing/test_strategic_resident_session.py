@@ -1464,7 +1464,7 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
 
     created: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None, session_summary=None):
         # Mimic the canonical spawn: create + commit a strategic_review task.
         t = Task(
             project_id=proj.id,
@@ -1529,7 +1529,7 @@ async def test_start_compensation_receives_plain_snapshotted_project_id(
     # Snapshot the expected id while ``project`` is still loaded (before the run).
     expected_id = project.id
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None, session_summary=None):
         t = Task(
             project_id=proj.id,
             title="spawned resident",
@@ -2916,7 +2916,16 @@ async def test_start_revalidates_adopt_candidate_and_spawns_fresh(
     # cadence spawn path in a standalone test).
     fresh_holder: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
+    async def fake_spawn(
+        session,
+        proj,
+        runner_id,
+        *,
+        session_id,
+        exam_ledger=None,
+        message_cursor=None,
+        session_summary=None,
+    ):
         # The real spawn wrapper BIRTHS the task with the resident context flags
         # (via extra_context); mirror that here so the fresh task carries them in
         # its first committed state, exactly as start now relies on (no post-spawn
@@ -3433,6 +3442,79 @@ async def test_exam_ledger_round_trips_through_task_context(db_session):
 
 
 @pytest.mark.asyncio
+async def test_session_summary_round_trips_through_task_context(db_session):
+    """FULL-RESTART round-trip: the ``set_session_summary`` op's persisted
+    ``_session_summary`` is carried forward into the NEXT resident session's
+    ``task.context["_session_summary"]`` so the agent receives "Prior session
+    context" on restart instead of starting blank.
+
+    A real restart ENDS the prior resident task and starts a fresh session on a
+    NEW (spawned/adopted) task; the summary the op wrote onto the OLD task's
+    context is not reachable from the new task. This test persists a summary
+    into the session-1 blob (via the same path ``set_session_summary`` takes),
+    drives that task terminal, starts a second session that ADOPTS a fresh
+    ``strategic_review`` task, and asserts the SAME summary round-trips
+    losslessly through the new task's context (read back via a FRESH session).
+    """
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap1 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Write _session_summary into the session-1 blob (the same path
+    # set_session_summary uses so it survives a restart).
+    SUMMARY = "Research revealed three key gap areas to investigate."
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = read_resident_session(vision)
+    assert blob is not None, "session-1 blob must exist"
+    blob["_session_summary"] = SUMMARY
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Confirm the blob now carries the summary.
+    fresh_project = await db_session.get(Project, project.id)
+    fresh_blob = read_resident_session(fresh_project.vision)
+    assert fresh_blob is not None
+    assert fresh_blob.get("_session_summary") == SUMMARY
+
+    # Simulate a real restart: the old resident task goes terminal and a fresh
+    # adoptable strategic_review is queued to host the next session.
+    task1 = await db_session.get(Task, task1.id)
+    task1.status = TaskStatus.COMPLETED
+    db_session.add(task1)
+    task2 = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # Start session 2 → adopts task2, carrying the summary forward from the
+    # prior session blob into the NEW task's context.
+    project = await db_session.get(Project, project.id)
+    snap2 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap2["session_id"] != snap1["session_id"]
+    assert str(snap2["task_id"]) == str(task2.id)
+
+    # Read back via a FRESH session (the task.context an agent restart sees).
+    factory = _dedicated_session_factory(db_session)
+    async with factory() as s:
+        fresh_task2 = await s.get(Task, task2.id)
+        carried = (fresh_task2.context or {}).get("_session_summary")
+    assert carried is not None, "_session_summary not carried into the new session's task"
+    assert carried == SUMMARY
+
+    # The carried _session_summary is NOT leaked by the operator-facing snapshot.
+    fresh_project = await db_session.get(Project, project.id)
+    snap_dict = resident_session_snapshot(fresh_project.vision)
+    assert snap_dict is not None and "_session_summary" not in snap_dict
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_note_malformed_json_is_ignored(db_session):
     """A malformed or non-dict note is silently ignored: the blob is updated
     normally (no crash, no _exam_ledger written), and the response is valid."""
@@ -3936,3 +4018,168 @@ async def test_heartbeat_without_turn_latency_summary_is_liveness_ok(db_session)
     stored = blob.get("_turn_latency_summary")
     assert isinstance(stored, dict)
     assert stored["operator"]["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Restart continuity — memory notes and session summary survive into the
+# NEXT resident session's bootstrap.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_restart_loads_memory_notes(db_session):
+    """Memory notes written via set_memory appear in the bootstrap payload of the
+    NEXT spawned resident task (the restart-continuity claim)."""
+    project = await _make_project_with_member(db_session)
+    # Bypass the bootstrap-pending guard.
+    project.is_self_repo = True
+    # Seed strategic memory notes on the project (set_memory op writes these).
+    project.strategic_memory_notes = [
+        {
+            "note": "Always verify claims before escalating them.",
+            "set_at": "2026-01-01T00:00:00",
+        },
+        {
+            "note": "Prefer concrete action over abstract discussion.",
+            "set_at": "2026-01-02T00:00:00",
+        },
+    ]
+    flag_modified(project, "strategic_memory_notes")
+    flag_modified(project, "is_self_repo")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _make_live_local_runner(db_session, project)
+
+    # No adoptable strategic_review task exists -> spawn path.
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snapshot["status"] == "active"
+    assert snapshot["task_id"]
+
+    # The spawned task's bootstrap payload must include strategic_memory_notes.
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    strategic = [
+        t for t in tasks if (t.first_payload or {}).get("type") == "strategic_review"
+    ]
+    assert len(strategic) == 1
+    payload = strategic[0].first_payload or {}
+    notes = payload.get("strategic_memory_notes")
+    assert notes is not None, (
+        f"strategic_memory_notes missing from payload keys: {list(payload.keys())}"
+    )
+    assert len(notes) == 2
+    assert notes[0]["note"] == "Always verify claims before escalating them."
+    assert notes[1]["note"] == "Prefer concrete action over abstract discussion."
+
+
+@pytest.mark.asyncio
+async def test_session_restart_loads_session_summary(db_session):
+    """A session summary written during session A is carried forward into a freshly
+    spawned session B's task context (restart-continuity claim)."""
+    project = await _make_project_with_member(db_session)
+    project.is_self_repo = True
+    flag_modified(project, "is_self_repo")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _make_live_local_runner(db_session, project)
+
+    # Session A: start and write a session summary to the blob.
+    snap_a = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap_a["status"] == "active"
+
+    # Write a session summary to the blob (what set_session_summary does).
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["_session_summary"] = (
+        "Research revealed three key gap areas to investigate."
+    )
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Stop session A.
+    project = await db_session.get(Project, project.id)
+    ended = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert ended["status"] == "ended"
+
+    # Session B: start fresh (spawn path since session A's task was cancelled).
+    project = await db_session.get(Project, project.id)
+    snap_b = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap_b["status"] == "active"
+    assert snap_b["task_id"] != snap_a["task_id"]
+
+    # Session B's task context must carry the session summary forward.
+    from uuid import UUID
+    task_b = await db_session.get(Task, UUID(snap_b["task_id"]))
+    assert task_b is not None
+    ctx = task_b.context or {}
+    assert ctx.get("_session_summary") == (
+        "Research revealed three key gap areas to investigate."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Compaction hints: gap history threshold-based signal for the strategist
+# ---------------------------------------------------------------------------
+
+
+def test_compaction_hints_surfaced_when_gap_history_exceeds_threshold():
+    """_build_compaction_hints returns a list of hints when any active gap's
+    combined history + past_moves entries cross the threshold, and None when
+    no gap qualifies."""
+    from app.strategic_spawning import (
+        _COMPACTION_HISTORY_ENTRY_THRESHOLD,
+        _build_compaction_hints,
+    )
+
+    # Below threshold — no hints expected.
+    thin_history = [{"ts": "2026-01-01T00:00:00Z"} for _ in range(_COMPACTION_HISTORY_ENTRY_THRESHOLD - 2)]
+    below = _build_compaction_hints(
+        {"gaps": [{"id": "g-ok", "name": "Safe gap", "status": "active", "history": thin_history}]}
+    )
+    assert below is None, f"Expected None below threshold, got {below}"
+
+    # At threshold — should produce a hint.
+    at_threshold = [{"ts": "2026-01-01T00:00:00Z"} for _ in range(_COMPACTION_HISTORY_ENTRY_THRESHOLD)]
+    at = _build_compaction_hints(
+        {"gaps": [{"id": "g-heavy", "name": "Heavy gap", "status": "active", "history": at_threshold, "past_moves": []}]}
+    )
+    assert at is not None
+    assert at[0]["gap_id"] == "g-heavy"
+    assert at[0]["history_entry_count"] == _COMPACTION_HISTORY_ENTRY_THRESHOLD
+    assert at[0]["past_moves_count"] == 0
+    assert at[0]["total_entries"] == _COMPACTION_HISTORY_ENTRY_THRESHOLD
+
+    # Past_moves also count toward the total.
+    with_history = [{"ts": "2026-01-01T00:00:00Z"} for _ in range(5)]
+    with_moves = [{"move": "reviewed"} for _ in range(_COMPACTION_HISTORY_ENTRY_THRESHOLD - 5 + 1)]
+    combined = _build_compaction_hints(
+        {"gaps": [{"id": "g-combined", "name": "Combined gap", "status": "active", "history": with_history, "past_moves": with_moves}]}
+    )
+    assert combined is not None
+    assert combined[0]["gap_id"] == "g-combined"
+    assert combined[0]["total_entries"] == len(with_history) + len(with_moves)
+
+    # Non-active gaps are ignored.
+    non_active = _build_compaction_hints(
+        {"gaps": [{"id": "g-closed", "name": "Closed gap", "status": "closed", "history": at_threshold}]}
+    )
+    assert non_active is None
+
+    # None / empty input.
+    assert _build_compaction_hints(None) is None
+    assert _build_compaction_hints({}) is None

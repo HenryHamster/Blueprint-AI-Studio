@@ -307,7 +307,7 @@ class AcceptanceEvidence(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["named_test", "observable_behavior", "downstream_artifact", "visual"]
+    kind: Literal["named_test", "observable_behavior", "downstream_artifact", "visual", "coverage_delta"]
     # named_test
     test_path: str | None = None
     test_id: str | None = None
@@ -319,6 +319,8 @@ class AcceptanceEvidence(BaseModel):
     component: str | None = None
     viewport_width: int | None = Field(default=None, ge=1, le=4096)
     assertion_type: str | None = None
+    # coverage_delta — minimum coverage percentage (0-100)
+    threshold: float | None = Field(default=None, ge=0, le=100)
 
     @model_validator(mode="before")
     @classmethod
@@ -369,6 +371,12 @@ class AcceptanceEvidence(BaseModel):
                 raise ValueError(
                     "visual acceptance_evidence requires viewport_width to be set "
                     "(must be an integer in 1–4096)"
+                )
+        elif self.kind == "coverage_delta":
+            if self.threshold is None:
+                raise ValueError(
+                    "coverage_delta acceptance_evidence requires a numeric "
+                    "threshold (coverage percentage 0–100)"
                 )
         return self
 
@@ -1204,6 +1212,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.web_research: WebResearchPayload,
     TaskType.design: DesignPayload,
     TaskType.repo_bootstrap: RepoBootstrapPayload,
+    TaskType.salvage_bundle: BasePayload,
 }
 
 

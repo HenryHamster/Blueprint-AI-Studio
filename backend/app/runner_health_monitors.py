@@ -2,10 +2,10 @@
 
 Owns the periodic sweeps that detect and alert on degraded runner states:
 stale-runner-deactivation escalations, degraded runners, low-disk conditions,
-and fleet-wide no-healthy-runner events.  All helpers take the caller's
-``session`` and lazily import alert primitives from ``app.alert_dispatch``
-(which re-exports the runner alert helpers from ``app.runner_health_alerts``)
-to avoid load-time circular deps.
+idle-GPU conditions, and fleet-wide no-healthy-runner events.  All helpers take
+the caller's ``session`` and lazily import alert primitives from
+``app.alert_dispatch`` (which re-exports the runner alert helpers from
+``app.runner_health_alerts``) to avoid load-time circular deps.
 
 ``_RUNNER_LIVENESS_SECONDS`` is the canonical definition of the runner
 heartbeat window — used by both the dispatch and monitoring layers.  It is
@@ -16,9 +16,11 @@ callers keep working without change.
 Re-exported symbols:
   _RUNNER_LIVENESS_SECONDS, _RUNNER_DEGRADED_FAILURE_THRESHOLD,
   _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT,
+  _RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT,
   _sweep_runner_deactivated_escalations,
-  _check_low_disk_runners, _check_fleet_no_healthy_runner,
-  _check_degraded_runners
+  _check_low_disk_runners, _check_low_memory_runners,
+  _check_fleet_no_healthy_runner,
+  _check_degraded_runners, _check_idle_gpu_runners
 """
 
 import logging
@@ -47,6 +49,10 @@ _RUNNER_DEGRADED_FAILURE_THRESHOLD = 3
 # Default free-disk floor (bytes) below which a live runner is considered low-disk.
 # 1 GB — configurable at runtime via ``runner_low_disk_threshold_bytes``.
 _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT = 1_073_741_824  # 1 GiB
+
+# Default free-memory floor (bytes) below which a live runner is considered low-
+# memory.  512 MB — configurable at runtime via ``runner_low_memory_threshold_bytes``.
+_RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT = 536_870_912  # 512 MiB
 
 
 async def _sweep_runner_deactivated_escalations(session: AsyncSession) -> None:
@@ -85,6 +91,36 @@ async def _sweep_runner_deactivated_escalations(session: AsyncSession) -> None:
         )
     ).scalars().all()
 
+    # Batch-fetch all referenced runners in a single query
+    runner_ids: set[uuid.UUID] = set()
+    for alert in rows:
+        if not alert.dedupe_key:
+            continue
+        parts = alert.dedupe_key.split(":", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            runner_ids.add(uuid.UUID(parts[1]))
+        except ValueError:
+            continue
+
+    runners_map: dict[str, LocalRunner] = {}
+    if runner_ids:
+        runners = (
+            await session.execute(
+                select(LocalRunner).where(LocalRunner.id.in_(list(runner_ids)))
+            )
+        ).scalars().all()
+        runners_map = {str(r.id): r for r in runners}
+
+    # Extract plain fields before the loop; _maybe_escalate_runner_deactivated_alert
+    # commits (runner_health_alerts.py:260), expiring all LocalRunner ORM objects,
+    # and the rollback handler also expires them. Reading an expired object's
+    # attributes triggers MissingGreenlet on subsequent loop iterations.
+    runner_info: dict[str, dict[str, str | None]] = {}
+    for rid, r in runners_map.items():
+        runner_info[rid] = {"status": r.status, "hostname": r.hostname}
+
     for alert in rows:
         if not alert.dedupe_key:
             continue
@@ -96,15 +132,15 @@ async def _sweep_runner_deactivated_escalations(session: AsyncSession) -> None:
             runner_id = uuid.UUID(parts[1])
         except ValueError:
             continue
-        runner = await session.get(LocalRunner, runner_id)
-        if runner is None or runner.status == "active":
+        info = runner_info.get(str(runner_id))
+        if info is None or info["status"] == "active":
             continue
         try:
             await _maybe_escalate_runner_deactivated_alert(
                 session,
                 project_id=alert.project_id,
                 runner_id=runner_id,
-                hostname=runner.hostname,
+                hostname=info["hostname"],
             )
         except Exception:
             logger.exception(
@@ -214,6 +250,218 @@ async def _check_low_disk_runners(session: AsyncSession) -> None:
             except Exception:
                 logger.exception(
                     "[RUNNERS] rollback after low-disk alert resolve failed for %s",
+                    runner_id,
+                )
+
+
+async def _check_idle_gpu_runners(session: AsyncSession) -> None:
+    """Detect GPU runners with low GPU utilization and alert/resolve.
+
+    Queries active runners with recent heartbeats that report GPU utilization;
+    for those reporting ``gpu_utilization_pct`` below the configurable threshold,
+    calls :func:`~app.alert_dispatch._maybe_create_runner_idle_gpu_alert` to raise
+    (or dedup) a WARNING alert. Resolves alerts for runners whose GPU utilization
+    has recovered.
+
+    Called from :func:`_check_degraded_runners` so it shares the same 300s cadence
+    as the other health sweeps.
+    """
+    from app.alert_dispatch import (
+        _RUNNER_IDLE_GPU_EVENT_TYPE,
+        _RUNNER_IDLE_GPU_THRESHOLD_PCT_DEFAULT,
+        _maybe_create_runner_idle_gpu_alert,
+        _resolve_runner_idle_gpu_alert,
+    )
+    from app.models import Alert
+
+    threshold = int(
+        _runtime_config.get(
+            "runner_idle_gpu_threshold_pct", _RUNNER_IDLE_GPU_THRESHOLD_PCT_DEFAULT
+        )
+    )
+
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    active_rows = (
+        await session.execute(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.hostname,
+                LocalRunner.capabilities,
+            ).where(
+                LocalRunner.status == "active",
+                LocalRunner.last_seen_at.is_not(None),
+                LocalRunner.last_seen_at >= cutoff,
+            )
+        )
+    ).all()
+
+    idle_gpu_runner_ids: set[uuid.UUID] = set()
+    for runner_id, project_id, hostname, capabilities in active_rows:
+        gpu_pct = (capabilities or {}).get("gpu_utilization_pct")
+        if gpu_pct is None:
+            continue  # No GPU or no GPU monitoring
+        try:
+            gpu_pct_float = float(gpu_pct)
+        except (TypeError, ValueError):
+            continue
+        if gpu_pct_float < threshold:
+            idle_gpu_runner_ids.add(runner_id)
+            try:
+                await _maybe_create_runner_idle_gpu_alert(
+                    session,
+                    project_id=project_id,
+                    runner_id=runner_id,
+                    hostname=hostname,
+                    gpu_utilization_pct=gpu_pct_float,
+                    threshold_pct=threshold,
+                )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] Failed to create idle-GPU alert for runner %s",
+                    runner_id,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RUNNERS] rollback after idle-GPU alert create failed for %s",
+                        runner_id,
+                    )
+
+    # Resolve alerts for runners whose GPU utilization has recovered.
+    open_idle_gpu = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _RUNNER_IDLE_GPU_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+    for project_id_row, dedupe_key in open_idle_gpu:
+        if not dedupe_key:
+            continue
+        try:
+            runner_id = uuid.UUID(dedupe_key.split(":", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if runner_id in idle_gpu_runner_ids:
+            continue
+        try:
+            await _resolve_runner_idle_gpu_alert(
+                session, project_id_row, runner_id
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve idle-GPU alert for runner %s",
+                runner_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after idle-GPU alert resolve failed for %s",
+                    runner_id,
+                )
+
+
+async def _check_low_memory_runners(session: AsyncSession) -> None:
+    """Detect live runners whose free memory has fallen below the floor and alert/resolve.
+
+    Queries active runners with a recent heartbeat; for those reporting
+    ``memory_free_bytes`` below the configurable threshold, calls
+    :func:`~app.alert_dispatch._maybe_create_runner_low_memory_alert` to raise (or
+    dedup) a WARNING alert. Resolves alerts for runners whose memory has recovered.
+
+    Called from :func:`_check_degraded_runners` so it shares the same 300s cadence
+    as the other health sweeps.
+    """
+    from app.alert_dispatch import (
+        _RUNNER_LOW_MEMORY_EVENT_TYPE,
+        _maybe_create_runner_low_memory_alert,
+        _resolve_runner_low_memory_alert,
+    )
+    from app.models import Alert
+
+    threshold = int(
+        _runtime_config.get(
+            "runner_low_memory_threshold_bytes", _RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT
+        )
+    )
+
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    active_rows = (
+        await session.execute(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.hostname,
+                LocalRunner.capabilities,
+            ).where(
+                LocalRunner.status == "active",
+                LocalRunner.last_seen_at.is_not(None),
+                LocalRunner.last_seen_at >= cutoff,
+            )
+        )
+    ).all()
+
+    low_memory_runner_ids: set[uuid.UUID] = set()
+    for runner_id, project_id, hostname, capabilities in active_rows:
+        mem_free = (capabilities or {}).get("memory_free_bytes")
+        if mem_free is None:
+            continue
+        if int(mem_free) < threshold:
+            low_memory_runner_ids.add(runner_id)
+            try:
+                await _maybe_create_runner_low_memory_alert(
+                    session,
+                    project_id=project_id,
+                    runner_id=runner_id,
+                    hostname=hostname,
+                    memory_free_bytes=int(mem_free),
+                    threshold_bytes=threshold,
+                )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] Failed to create low-memory alert for runner %s", runner_id
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RUNNERS] rollback after low-memory alert create failed for %s",
+                        runner_id,
+                    )
+
+    # Resolve alerts for runners whose memory has recovered (or that stopped reporting).
+    open_low_memory = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _RUNNER_LOW_MEMORY_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+    for project_id_row, dedupe_key in open_low_memory:
+        if not dedupe_key:
+            continue
+        try:
+            runner_id = uuid.UUID(dedupe_key.split(":", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if runner_id in low_memory_runner_ids:
+            continue
+        try:
+            await _resolve_runner_low_memory_alert(session, project_id_row, runner_id)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve low-memory alert for runner %s", runner_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after low-memory alert resolve failed for %s",
                     runner_id,
                 )
 
@@ -435,3 +683,119 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
         await _check_low_disk_runners(session)
     except Exception:
         logger.exception("[RUNNERS] Failed to sweep low-disk runner alerts")
+
+    # 6. Proactive idle-GPU alert: GPU runners reporting utilization below threshold.
+    try:
+        await _check_idle_gpu_runners(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep idle-GPU runner alerts")
+
+    # 7. Proactive stale-token alert: runners whose token hasn't been rotated in 90+ days.
+    try:
+        await _check_stale_token_runners(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep stale-token runner alerts")
+
+    # 8. Proactive low-memory alert: runners reporting free memory below the floor.
+    try:
+        await _check_low_memory_runners(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep low-memory runner alerts")
+
+
+async def _check_stale_token_runners(session: AsyncSession) -> None:
+    """Detect runners whose token hasn't been rotated in 90+ days and alert/resolve.
+
+    Queries active runners with a ``token_created_at`` older than 90 days. For each
+    stale-token runner, calls :func:`~app.runner_health_alerts._maybe_create_runner_token_stale_alert`
+    to raise (or dedup) a WARNING alert. Then resolves alerts for runners whose token
+    was rotated (``token_created_at`` is now recent, or the runner was deactivated).
+
+    Called from :func:`_check_degraded_runners` so it shares the same 300s cadence
+    as the other health sweeps.
+    """
+    from app.runner_health_alerts import (
+        _RUNNER_TOKEN_STALE_EVENT_TYPE,
+        _maybe_create_runner_token_stale_alert,
+        _resolve_runner_token_stale_alert,
+    )
+    from app.models import Alert
+
+    stale_days = int(
+        _runtime_config.get("runner_token_stale_days", 90)
+    )
+
+    cutoff = _utcnow() - timedelta(days=stale_days)
+    active_rows = (
+        await session.execute(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.hostname,
+                LocalRunner.token_created_at,
+            ).where(
+                LocalRunner.status == "active",
+                LocalRunner.token_created_at.is_not(None),
+                LocalRunner.token_created_at < cutoff,
+            )
+        )
+    ).all()
+
+    stale_runner_ids: set[uuid.UUID] = set()
+    for runner_id, project_id, hostname, token_created_at in active_rows:
+        stale_runner_ids.add(runner_id)
+        token_age_days = max(0, int((_utcnow() - token_created_at).total_seconds() / 86400))
+        try:
+            await _maybe_create_runner_token_stale_alert(
+                session,
+                project_id=project_id,
+                runner_id=runner_id,
+                hostname=hostname,
+                token_age_days=token_age_days,
+                threshold_days=stale_days,
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create stale-token alert for runner %s", runner_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after stale-token alert create failed for %s",
+                    runner_id,
+                )
+
+    # Resolve alerts for runners whose token was rotated (or that stopped being active).
+    open_stale_token = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _RUNNER_TOKEN_STALE_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+    for project_id_row, dedupe_key in open_stale_token:
+        if not dedupe_key:
+            continue
+        try:
+            runner_id = uuid.UUID(dedupe_key.split(":", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if runner_id in stale_runner_ids:
+            continue
+        try:
+            await _resolve_runner_token_stale_alert(
+                session, project_id_row, runner_id
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve stale-token alert for runner %s", runner_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after stale-token alert resolve failed for %s",
+                    runner_id,
+                )

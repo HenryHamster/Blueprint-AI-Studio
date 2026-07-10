@@ -1,218 +1,274 @@
 [
-  {
-    "op": "set_problem_model",
-    "alias": "set-problem-model",
-    "description": "Replace/refresh the project's problem model (gaps, systems, priorities).",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "set_running_update",
-    "alias": "set-running-update",
-    "description": "Update the operator-facing running-update snapshot (markdown file input).",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "reflect",
-    "alias": "reflect",
-    "description": "Record a strategic self-reflection note for the cycle.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "pending_confirm",
-    "alias": "pending-confirm",
-    "description": "Queue a pending user-confirmation item on the problem model.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "set_vision",
-    "alias": "set-vision",
-    "description": "Update the project vision (purpose, systems, priorities, context).",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "create_direction",
-    "alias": "create-direction",
-    "description": "Open a new strategic direction (optionally staged for the next version).",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "update_direction",
-    "alias": "update-direction",
-    "description": "Update an existing direction's fields, status, or gap linkage.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "retire_direction",
-    "alias": "retire-direction",
-    "description": "Retire a direction (expired/superseded); gated by the challenge.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "stage_direction",
-    "alias": "stage-direction",
-    "description": "Stage an existing direction to begin after the current version promotes.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "approve_direction",
-    "alias": "approve-direction",
-    "description": "Approve a staged/proposed direction.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "reject_direction",
-    "alias": "reject-direction",
-    "description": "Reject a staged/proposed direction.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "activate_direction",
-    "alias": "activate-direction",
-    "description": "Reactivate a staged or paused direction back to active.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "create_message",
-    "alias": "create-message",
-    "description": "Post a message to the operator (available to all agent types).",
-    "cli": true,
-    "prompt": false,
-    "internal_reason": null
-  },
-  {
-    "op": "resolve_message",
-    "alias": "resolve-message",
-    "description": "Resolve an addressed operator message (available to all agent types).",
-    "cli": true,
-    "prompt": false,
-    "internal_reason": null
-  },
-  {
-    "op": "spawn_task",
-    "alias": "spawn-task",
-    "description": "Spawn an implementation/research/plan task for a direction.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "spawn_fix",
-    "alias": "spawn-fix",
-    "description": "Spawn a one-time fix task.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "cancel_task",
-    "alias": "cancel-task",
-    "description": "Cancel a previously spawned QUEUED/PROVISIONING task with a required reason.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "dispose_completion_debt",
-    "alias": "dispose-completion-debt",
-    "description": "Dispose of an open completion-debt ledger entry.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "set_retirement_critiques",
-    "alias": "set-retirement-critiques",
-    "description": "Record retirement critiques for the cycle.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "set_evidence_progress",
-    "alias": "set-evidence-progress",
-    "description": "Record evidence-progress verdicts (gated by the challenge).",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "set_acceptance_criteria",
-    "alias": "set-acceptance-criteria",
-    "description": "Author acceptance criteria for a direction/task.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "record_finding_resolution",
-    "alias": "record-finding-resolution",
-    "description": "Record a carried audit finding as resolved or code-verified stale in the re-qualification resolution ledger.",
-    "cli": true,
-    "prompt": true,
-    "internal_reason": null
-  },
-  {
-    "op": "decide_churn_retirement",
-    "alias": null,
-    "description": "Decide keep/retire for a direction the churn/zombie ladder paused pending review.",
-    "cli": false,
-    "prompt": false,
-    "internal_reason": "Autonomous keep/retire decision for a churn/zombie-flagged direction; mirrors the operator seam and is not surfaced as a standalone CLI verb."
-  },
-  {
-    "op": "declare_capability_adoption",
-    "alias": null,
-    "description": "Declare a capability-adoption verdict for a named capability.",
-    "cli": false,
-    "prompt": false,
-    "internal_reason": "Records a capability-adoption trial verdict; reserved/auto-invoked, not surfaced on the CLI."
-  },
-  {
-    "op": "cite_memos",
-    "alias": null,
-    "description": "Record the memo task_ids the thinker cited in its analysis.",
-    "cli": false,
-    "prompt": false,
-    "internal_reason": "Invoked programmatically by the one-shot cycle to record cited memo ids, not via the CLI."
-  },
-  {
-    "op": "cite_knowledge",
-    "alias": null,
-    "description": "Record the knowledge-document ids the strategist cited in its analysis.",
-    "cli": false,
-    "prompt": false,
-    "internal_reason": "Invoked programmatically by the one-shot cycle to record cited knowledge ids, not via the CLI."
-  },
-  {
-    "op": "set_strategic_challenge",
-    "alias": null,
-    "description": "Persist the independent adversarial second-opinion record over the strategist's self-judgments.",
-    "cli": false,
-    "prompt": false,
-    "internal_reason": "Persists the independent adversarial challenge record; invoked programmatically by the cycle, not via the CLI."
-  }
+    {
+        "op": "set_problem_model",
+        "alias": "set-problem-model",
+        "description": "Replace/refresh the project's problem model (gaps, systems, priorities).",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "set_running_update",
+        "alias": "set-running-update",
+        "description": "Update the operator-facing running-update snapshot (markdown file input).",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "reflect",
+        "alias": "reflect",
+        "description": "Record a strategic self-reflection note for the cycle.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "pending_confirm",
+        "alias": "pending-confirm",
+        "description": "Queue a pending user-confirmation item on the problem model.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "set_vision",
+        "alias": "set-vision",
+        "description": "Update the project vision (purpose, systems, priorities, context).",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "create_direction",
+        "alias": "create-direction",
+        "description": "Open a new strategic direction (optionally staged for the next version).",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "update_direction",
+        "alias": "update-direction",
+        "description": "Update an existing direction's fields, status, or gap linkage.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "retire_direction",
+        "alias": "retire-direction",
+        "description": "Retire a direction (expired/superseded); gated by the challenge.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "stage_direction",
+        "alias": "stage-direction",
+        "description": "Stage an existing direction to begin after the current version promotes.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "approve_direction",
+        "alias": "approve-direction",
+        "description": "Approve a staged/proposed direction.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "reject_direction",
+        "alias": "reject-direction",
+        "description": "Reject a staged/proposed direction.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "activate_direction",
+        "alias": "activate-direction",
+        "description": "Reactivate a staged or paused direction back to active.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "create_message",
+        "alias": "create-message",
+        "description": "Post a message to the operator (available to all agent types).",
+        "cli": true,
+        "prompt": false,
+        "internal_reason": null
+    },
+    {
+        "op": "resolve_message",
+        "alias": "resolve-message",
+        "description": "Resolve an addressed operator message (available to all agent types).",
+        "cli": true,
+        "prompt": false,
+        "internal_reason": null
+    },
+    {
+        "op": "spawn_task",
+        "alias": "spawn-task",
+        "description": "Spawn an implementation/research/plan task for a direction.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "spawn_fix",
+        "alias": "spawn-fix",
+        "description": "Spawn a one-time fix task.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "cancel_task",
+        "alias": "cancel-task",
+        "description": "Cancel a previously spawned QUEUED/PROVISIONING task with a required reason.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "dispose_completion_debt",
+        "alias": "dispose-completion-debt",
+        "description": "Dispose of an open completion-debt ledger entry.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "consume_knowledge_followup",
+        "alias": "consume-knowledge-followup",
+        "description": "Consume a pending knowledge follow-up (spawned direction, incorporated knowledge, etc.).",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "dismiss_knowledge_followup",
+        "alias": "dismiss-knowledge-followup",
+        "description": "Dismiss a pending knowledge follow-up as not currently actionable.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "set_retirement_critiques",
+        "alias": "set-retirement-critiques",
+        "description": "Record retirement critiques for the cycle.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "set_evidence_progress",
+        "alias": "set-evidence-progress",
+        "description": "Record evidence-progress verdicts (gated by the challenge).",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "set_acceptance_criteria",
+        "alias": "set-acceptance-criteria",
+        "description": "Author acceptance criteria for a direction/task.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "record_finding_resolution",
+        "alias": "record-finding-resolution",
+        "description": "Record a carried audit finding as resolved or code-verified stale in the re-qualification resolution ledger.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "set_memory",
+        "alias": "set-memory",
+        "description": "Persist a behavioral lesson or operator preference for future sessions.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "set_session_summary",
+        "alias": "set-session-summary",
+        "description": "Record a running summary of session context and progress for continuity across restarts.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "decide_churn_retirement",
+        "alias": null,
+        "description": "Decide keep/retire for a direction the churn/zombie ladder paused pending review.",
+        "cli": false,
+        "prompt": false,
+        "internal_reason": "Autonomous keep/retire decision for a churn/zombie-flagged direction; mirrors the operator seam and is not surfaced as a standalone CLI verb."
+    },
+    {
+        "op": "declare_capability_adoption",
+        "alias": null,
+        "description": "Declare a capability-adoption verdict for a named capability.",
+        "cli": false,
+        "prompt": false,
+        "internal_reason": "Records a capability-adoption trial verdict; reserved/auto-invoked, not surfaced on the CLI."
+    },
+    {
+        "op": "cite_memos",
+        "alias": null,
+        "description": "Record the memo task_ids the thinker cited in its analysis.",
+        "cli": false,
+        "prompt": false,
+        "internal_reason": "Invoked programmatically by the one-shot cycle to record cited memo ids, not via the CLI."
+    },
+    {
+        "op": "cite_knowledge",
+        "alias": null,
+        "description": "Record the knowledge-document ids the strategist cited in its analysis.",
+        "cli": false,
+        "prompt": false,
+        "internal_reason": "Invoked programmatically by the one-shot cycle to record cited knowledge ids, not via the CLI."
+    },
+    {
+        "op": "set_strategic_challenge",
+        "alias": null,
+        "description": "Persist the independent adversarial second-opinion record over the strategist's self-judgments.",
+        "cli": false,
+        "prompt": false,
+        "internal_reason": "Persists the independent adversarial challenge record; invoked programmatically by the cycle, not via the CLI."
+    },
+    {
+        "op": "consume_knowledge",
+        "alias": "consume-knowledge",
+        "description": "Mark a knowledge document as consumed — the strategist has read and acted on it.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "dismiss_knowledge",
+        "alias": "dismiss-knowledge",
+        "description": "Mark a knowledge document as dismissed — not actionable, with an optional reason.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    },
+    {
+        "op": "request_qualification",
+        "alias": "request-qualification",
+        "description": "Request a fresh release-qualification run directly, without going through set_problem_model.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null
+    }
 ]

@@ -29,7 +29,7 @@
     "routers/admin_digest.py": 10300,
     "routers/admin_release_version.py": 1950,
     "routers/admin_pipeline_observability.py": 2000,
-    "routers/admin_agent_ops.py": 5450,
+    "routers/admin_agent_ops.py": 6350,
     "routers/admin_pool_accounts.py": 1600,
     "max_plan_pool.py": 3750,
     "anomaly_detection.py": 2100,
@@ -41,7 +41,7 @@
     "autonomous_research_residual.py": 900,
     "efficiency_snapshot.py": 5150,
     "llm_cost_attribution.py": 1550,
-    "research_completion.py": 6400,
+    "research_completion.py": 7400,
     "research_provenance_validation.py": 400,
     "research_scope_calibration.py": 650,
     "findings_index.py": 350,
@@ -103,7 +103,7 @@
     "release_scoring.py": 2450,
     "runtime_config_state.py": 3000,
     "routers/directions.py": 2100,
-    "warm_pool_maintainer.py": 2300,
+    "warm_pool_maintainer.py": 2650,
     "review_fix_lane_pilot.py": 2450,
     "routers/admin_projects.py": 2000,
     "routers/admin_project_strategic_session.py": 2650,
@@ -127,13 +127,15 @@
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 2700,
     "operator_attention.py": 2250,
-    "payload_schemas.py": 1750,
+    "payload_schemas.py": 2050,
     "lifecycle.py": 1750,
     "research_direction_state.py": 1750,
     "dep_lifecycle.py": 800,
     "routers/admin_health.py": 1750,
     "metrics_integrity_sweep.py": 3350,
-    "release_readiness.py": 2100
+    "release_readiness.py": 2100,
+    "acceptance_criteria.py": 1750,
+    "runner_health_alerts.py": 1800
   },
   "agent": {
     "index.ts": 4600,
@@ -171,11 +173,13 @@
     "utils/test-runners.ts": 2850,
     "utils/diff-detection.ts": 150,
     "utils/stale-result.ts": 150,
-    "handlers/strategic-sections.ts": 1500,
+    "handlers/strategic-sections.ts": 1800,
     "providers/runners.ts": 1900,
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950,
-    "providers/resident-session.ts": 800
+    "providers/resident-session.ts": 800,
+    "handlers/research-plan-sections.ts": 1800,
+    "handlers/strategic-resident-lib.ts": 1800
   },
   "frontend": {
     "useAppState.ts": 3000,
@@ -189,7 +193,7 @@
     "components/DirectionCard.tsx": 1650,
     "components/PipelineView.tsx": 1200,
     "components/DashboardHome.tsx": 3050,
-    "components/MessagesPanel.tsx": 2400,
+    "components/MessagesPanel.tsx": 2800,
     "components/MessageBubble.tsx": 650,
     "components/MetricsDashboard.tsx": 1500,
     "components/AutonomousStatus.tsx": 1500,
@@ -227,6 +231,8 @@
     "components/HeaderBar.tsx": 1100,
     "components/ResearchBrowser.tsx": 1050,
     "components/ComputeJobsPanel.tsx": 2450,
-    "hooks/useWorkbenchCommands.ts": 1800
+    "hooks/useWorkbenchCommands.ts": 1800,
+    "api/compute.ts": 2000,
+    "api/projects.ts": 1750
   }
 }

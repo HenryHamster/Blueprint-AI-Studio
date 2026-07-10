@@ -2995,13 +2995,26 @@ async def _check_autonomous_research(owner: str, repo: str):
     if vm_consuming >= _runtime_config["max_concurrent_vms"]:
         return
 
-    # Phase 2 — spawn per project, each in its own isolated session.
+    # Phase 2 — pre-fetch all projects in one batch query, then spawn per project
+    # in its own isolated session. The batch query replaces N individual
+    # session.get(Project, project_id) calls with a single round-trip.
+    projects_by_id: dict[uuid.UUID, Project] = {}
+    if project_ids:
+        async with AsyncSessionLocal() as batch_session:
+            project_rows = (
+                (await batch_session.execute(
+                    select(Project).where(Project.id.in_(project_ids))
+                ))
+                .scalars()
+                .all()
+            )
+            projects_by_id = {p.id: p for p in project_rows}
     for project_id in project_ids:
+        project = projects_by_id.get(project_id)
+        if project is None:
+            continue
         try:
             async with AsyncSessionLocal() as session:
-                project = await session.get(Project, project_id)
-                if project is None:
-                    continue
                 await _spawn_research_task(project, session)
         except Exception as e:
             logger.error(
@@ -3161,13 +3174,26 @@ async def _check_idle_research():
         )
         return
 
-    # Phase 2 — spawn per project, each in its own isolated session.
+    # Phase 2 — pre-fetch all projects in one batch query, then spawn per project
+    # in its own isolated session. The batch query replaces N individual
+    # session.get(Project, project_id) calls with a single round-trip.
+    projects_by_id: dict[uuid.UUID, Project] = {}
+    if project_ids:
+        async with AsyncSessionLocal() as batch_session:
+            project_rows = (
+                (await batch_session.execute(
+                    select(Project).where(Project.id.in_(project_ids))
+                ))
+                .scalars()
+                .all()
+            )
+            projects_by_id = {p.id: p for p in project_rows}
     for project_id in project_ids:
+        project = projects_by_id.get(project_id)
+        if project is None:
+            continue
         try:
             async with AsyncSessionLocal() as session:
-                project = await session.get(Project, project_id)
-                if project is None:
-                    continue
                 await _run_idle_research_for_project(project, session, vm_consuming)
         except Exception as e:
             logger.error(

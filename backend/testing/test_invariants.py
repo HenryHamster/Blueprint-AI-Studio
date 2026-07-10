@@ -330,7 +330,12 @@ def test_all_admin_routes_require_auth():
     # Intentional exceptions — should stay empty. If a route is intentionally
     # public (for example, a monitored liveness probe), add its path here with
     # a short comment explaining why the public surface is deliberate.
-    public_allowlist: dict[str, str] = {}
+    public_allowlist: dict[str, str] = {
+        # POST /api/admin/token authenticates via direct ADMIN_API_KEY comparison
+        # (not Depends(get_current_user) / require_admin), because it is the
+        # token-issuance endpoint that exchanges the shared secret for a JWT.
+        "/api/admin/token": "exchanges ADMIN_API_KEY for short-lived JWT",
+    }
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
     # JWTs; it is a valid auth callable for metrics-only endpoints.
@@ -491,6 +496,73 @@ def test_get_metrics_reader_routes_are_get_only_and_allowlisted():
             for route in sorted(metrics_routes, key=lambda route: route.path)
         )
     )
+
+
+# ── Cross-cutting test file registry ────────────────────────────────────────
+
+
+def test_cross_cutting_test_files_registry_is_current():
+    """Verify ``_CROSS_CUTTING_TEST_FILES`` in acceptance_gate.py is current.
+
+    Every registered entry must:
+        1. Point to a real file on disk.
+        2. Be a ``backend/testing/test_*.py`` file.
+        3. Be genuinely cross-cutting (its stem does not match any production
+           module's basename in ``backend/app/`` — otherwise it would qualify
+           for the normal stem-match heuristic and does not belong in the
+           cross-cutting list).
+
+    Additionally, discover **unregistered** cross-cutting test files: any
+    ``backend/testing/test_*invariant*`` file whose stem does not match a
+    production module must be registered.  This catches the exact scenario
+    described in PR #13677: a new cross-cutting test file silently receiving
+    false-negative acceptance verdicts because it was never added to the
+    allowlist.
+    """
+    from app.acceptance_gate import get_cross_cutting_test_files
+
+    registered = set(get_cross_cutting_test_files())
+    testing_dir = BACKEND_ROOT / "testing"
+
+    # All production .py basenames in backend/app/ (recursive).
+    app_dir = BACKEND_ROOT / "app"
+    prod_basenames: set[str] = set()
+    for p in app_dir.rglob("*.py"):
+        prod_basenames.add(p.stem)
+
+    # 1–3. Validate every registered entry.
+    for entry in registered:
+        assert entry.startswith("backend/testing/"), (
+            f"Cross-cutting entry {entry!r} is not under backend/testing/"
+        )
+        full_path = testing_dir / Path(*Path(entry).parts[2:])
+        assert full_path.exists(), (
+            f"Cross-cutting entry {entry!r} does not exist on disk"
+        )
+        test_basename = Path(entry).stem
+        assert test_basename.startswith("test_"), (
+            f"Cross-cutting entry {entry!r} is not a test file"
+        )
+        stem = test_basename[len("test_"):]
+        assert stem not in prod_basenames, (
+            f"Cross-cutting entry {entry!r} has stem {stem!r} which matches "
+            f"a production module — it should use the regular stem-match "
+            "heuristic, not the cross-cutting allowlist"
+        )
+
+    # 4. Discover unregistered invariant-pattern test files.
+    for test_file in sorted(testing_dir.glob("test_*invariant*")):
+        rel = f"backend/testing/{test_file.name}"
+        if rel in registered:
+            continue
+        stem = test_file.stem[len("test_"):]
+        if stem in prod_basenames:
+            continue  # matches a production module — not cross-cutting
+        raise AssertionError(
+            f"Cross-cutting test file {rel!r} is not registered in "
+            "_CROSS_CUTTING_TEST_FILES in acceptance_gate.py — add it to "
+            "the frozenset to prevent false-negative acceptance verdicts"
+        )
 
 
 # ── Safety Constants ────────────────────────────────────────────────────────
@@ -1579,8 +1651,12 @@ class TestSchemaRevisionSync:
             ):
                 body = body[1:]
 
-            # Pure data-only migrations (upgrade body is only op.execute calls)
-            # are inherently one-way — accept any downgrade body for them.
+            # Pure data-only migrations (upgrade body is only op.execute or
+            # op.get_bind calls) are inherently one-way — accept any downgrade
+            # body for them.  op.get_bind() is the raw-SQL variant of
+            # op.execute(): both perform data transformation without schema
+            # changes; the downgrade reverse-transforms the same data.
+            _DATA_ONLY_OP_ATTRS = {"execute", "get_bind"}
             upgrade = next(
                 (
                     n
@@ -1598,7 +1674,9 @@ class TestSchemaRevisionSync:
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == "op"
                 ]
-                if up_calls and all(c.func.attr == "execute" for c in up_calls):
+                if up_calls and all(
+                    c.func.attr in _DATA_ONLY_OP_ATTRS for c in up_calls
+                ):
                     continue
 
             # Empty or only `pass`
@@ -2414,8 +2492,50 @@ class TestPreMergeDualHeadGuardCoverage:
         assert len(ci_calls) == 2
         ci_guard_assignments = _guard_assignments(ci_func)
         assert len(ci_guard_assignments) == 1
-        ci_guard_stmt, ci_verdict_vars = ci_guard_assignments[0]
-        assert ci_verdict_vars == {"_ok_to_merge", "_hold_reason"}
+        ci_guard_stmt, ci_intermediate_vars = ci_guard_assignments[0]
+
+        # The guard result may flow through a coerce helper (two-step shape) or
+        # be assigned directly to the effective verdict tuple (single-step shape).
+        # Detect a downstream coerce_migration_guard_result call that consumes the
+        # intermediate variable(s) and derive the effective ok/hold variables from
+        # whichever step actually produces them.
+        ci_coerce_assignments = []
+        for _node in ast.walk(ci_func):
+            if not isinstance(_node, ast.stmt):
+                continue
+            _coerce_vars = _ast_assign_targets_for_predicated_call(
+                _node,
+                call_predicate=lambda _call: (
+                    _ast_called_name(_call) == "coerce_migration_guard_result"
+                    and any(
+                        isinstance(_arg, ast.Name) and _arg.id in ci_intermediate_vars
+                        for _arg in _call.args
+                    )
+                ),
+            )
+            if _coerce_vars:
+                ci_coerce_assignments.append((_node, _coerce_vars))
+
+        if ci_coerce_assignments:
+            # Two-step flow: guard → intermediate var → coerce → verdict vars
+            assert len(ci_coerce_assignments) == 1
+            ci_coerce_stmt, _ = ci_coerce_assignments[0]
+            # _ok_to_merge is derived from the coerce targets; find its assignment
+            ci_ok_stmts = sorted(
+                [
+                    _n
+                    for _n in ast.walk(ci_func)
+                    if isinstance(_n, ast.stmt)
+                    and "_ok_to_merge" in _assigned_names(_n)
+                ],
+                key=lambda _n: getattr(_n, "lineno", 0),
+            )
+            assert len(ci_ok_stmts) >= 1, "_ok_to_merge must be assigned after coerce"
+            ci_effective_guard_stmt = ci_ok_stmts[0]
+        else:
+            # Single-step flow: guard call assigns directly to verdict tuple
+            assert ci_intermediate_vars == {"_guard_result"}
+            ci_effective_guard_stmt = ci_guard_stmt
         ci_fail_closed = next(
             stmt
             for stmt in ast.walk(ci_func)
@@ -2433,10 +2553,11 @@ class TestPreMergeDualHeadGuardCoverage:
         assert min(call.lineno for call in ci_calls) > getattr(
             ci_fail_closed, "end_lineno", ci_fail_closed.lineno
         )
+        # The raw guard result must not be reassigned after the guard call.
         assert not _name_assignments_after(
             ci_func,
             "_ok_to_merge",
-            getattr(ci_guard_stmt, "lineno", 0),
+            getattr(ci_effective_guard_stmt, "lineno", 0),
         )
 
         assert len(task_calls) == 1
@@ -10187,6 +10308,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "web_research": "forward-quality",
         "design": "forward-quality",
         "repo_bootstrap": "none",
+        "salvage_bundle": "code-ci-review",
     }
     assert EVALUATION_STRATEGY_BY_TASK_TYPE == expected_registry, (
         "TaskType evaluation registry has drifted from the locked spec. "
@@ -11839,4 +11961,55 @@ def test_retire_direction_op_gates_on_criterion_coverage():
         "_handle_strategic_completion does not call direction_owns_uncovered_criterion. "
         "The retire_direction op must gate on criterion coverage before retiring a "
         "direction."
+    )
+
+
+def test_record_task_merge_evidence_gates_on_acceptance_is_proven():
+    """record_task_merge_evidence must gate on acceptance_is_proven before writing CriterionEvidence rows.
+
+    Regression guard: the evidence-quality gate (``_reject_unproven_merge_evidence``
+    wrapping ``acceptance_is_proven``) must be called inside
+    ``record_task_merge_evidence`` before any ``record_evidence`` call. This
+    ensures that only machine-checked proven tasks can record CriterionEvidence.
+    """
+    import ast
+    from pathlib import Path
+
+    ac_path = Path(__file__).resolve().parents[1] / "app" / "acceptance_criteria.py"
+    source = ac_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(ac_path))
+
+    gate_func_name = "_reject_unproven_merge_evidence"
+
+    # Find the record_task_merge_evidence async function
+    func: ast.AsyncFunctionDef | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "record_task_merge_evidence":
+            func = node
+            break
+
+    assert func is not None, (
+        "record_task_merge_evidence is no longer defined in acceptance_criteria.py. "
+        "Restore this function or update the invariant."
+    )
+
+    # Walk the function body to find calls to _reject_unproven_merge_evidence
+    gate_called = False
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call):
+            name = _ast_called_name(node)
+            if name == gate_func_name:
+                gate_called = True
+                break
+        if isinstance(node, ast.Await) and isinstance(node.value, ast.Call):
+            name = _ast_called_name(node.value)
+            if name == gate_func_name:
+                gate_called = True
+                break
+
+    assert gate_called, (
+        f"'{gate_func_name}' is not called inside "
+        "record_task_merge_evidence in acceptance_criteria.py. "
+        "The acceptance_is_proven gate before recording CriterionEvidence rows "
+        "has been removed or renamed. Restore it."
     )

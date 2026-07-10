@@ -59,6 +59,7 @@ import { spawn } from 'child_process';
 import { startResidentClaudeSession } from './resident-session.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import { recordLlmTokens, recordNumTurns } from '../index.js';
+import { encodeUserTurnBlocks } from './resident-stream.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -154,6 +155,26 @@ describe('startResidentClaudeSession', () => {
     expect(r.interrupted).toBe(false);
     expect(events.filter((e) => e.kind === 'text').map((e) => e.text)).toEqual(['hi ', 'back']);
     expect(session.sessionId()).toBe('sess-1');
+    session.close();
+  });
+
+  it('sendTurn with content blocks invokes encodeUserTurnBlocks and writes multimodal NDJSON', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    const session = startResidentClaudeSession({});
+    const blocks: Array<Record<string, unknown>> = [
+      { type: 'text', text: 'check this image' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
+    ];
+
+    const turn = session.sendTurn(blocks);
+    // The first stdin write must match the expected NDJSON from encodeUserTurnBlocks.
+    expect(ctl.stdinWrites).toHaveLength(1);
+    expect(ctl.stdinWrites[0]).toBe(encodeUserTurnBlocks(blocks));
+
+    ctl.pushLine({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'got it' } } });
+    ctl.pushLine({ type: 'result', result: 'got it' });
+    await turn;
     session.close();
   });
 

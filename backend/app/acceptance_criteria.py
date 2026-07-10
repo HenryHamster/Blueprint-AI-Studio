@@ -563,6 +563,35 @@ async def direction_owns_uncovered_criterion(
         return True
 
 
+
+def _reject_unproven_merge_evidence(
+    verdict: Any,
+    task: Any,
+    project_id: Any,
+    criterion_ids: list[str],
+) -> bool:
+    """Return True when the acceptance gate rejects (verdict absent or not proven).
+
+    Extracted so the AST invariant test
+    (``test_record_task_merge_evidence_gates_on_acceptance_is_proven``)
+    can structurally verify that ``record_task_merge_evidence`` gates on
+    ``acceptance_is_proven`` before writing ``CriterionEvidence`` rows.
+    """
+    from app.acceptance_gate import acceptance_is_proven
+
+    if not acceptance_is_proven(verdict):
+        logger.info(
+            "record_task_merge_evidence: verdict absent or not proven — reason=%s "
+            "task_id=%s project_id=%s criterion_count=%d",
+            MergeEvidenceReason.verdict_not_proven,
+            getattr(task, "id", None),
+            project_id,
+            len(criterion_ids),
+        )
+        return True
+    return False
+
+
 async def record_task_merge_evidence(
     session: AsyncSession,
     task: Any,
@@ -637,18 +666,10 @@ async def record_task_merge_evidence(
             project_id,
         )
         return 0
-    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY, acceptance_is_proven
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
 
     verdict = task_context.get(CODE_ACCEPTANCE_VERDICT_KEY)
-    if not acceptance_is_proven(verdict):
-        logger.info(
-            "record_task_merge_evidence: verdict absent or not proven — reason=%s "
-            "task_id=%s project_id=%s criterion_count=%d",
-            MergeEvidenceReason.verdict_not_proven,
-            getattr(task, "id", None),
-            project_id,
-            len(criterion_ids),
-        )
+    if _reject_unproven_merge_evidence(verdict, task, project_id, criterion_ids):
         return 0
     # Extract provenance fields for the evidence detail dict so operators can
     # audit why a criterion counts as covered without resorting to SQL.

@@ -158,6 +158,7 @@ async def _get_project_github_token(project, session, *, integration=None):
     by ``_run_stale_branch_cleanup`` which batch-loads all integrations upfront).
     """
     from app.models import UserIntegration
+    from app.field_encryption import decrypt_field
     from app.github import (
         generate_installation_access_token,
         get_repo_installation_token,
@@ -203,7 +204,8 @@ async def _get_project_github_token(project, session, *, integration=None):
     elif integration and integration.github_pat:
         # PATs are long-lived — caching isn't necessary but is harmless and
         # keeps every code path symmetric.
-        token = await get_user_secret(integration.github_pat)
+        decrypted_pat_ref = decrypt_field(integration.github_pat)
+        token = await get_user_secret(decrypted_pat_ref)
     else:
         token = await get_repo_installation_token(
             project.github_owner, project.github_repo

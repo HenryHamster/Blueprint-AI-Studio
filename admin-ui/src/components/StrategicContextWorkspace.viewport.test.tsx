@@ -183,7 +183,12 @@ const STATE = {
     },
     cumulative_estimated_cost_usd: 0,
   },
-} as StrategicStateResponse;
+  strategic_memory_notes: [
+    { note: 'Do not assert timelines without supporting evidence — keep projections grounded in measured data.', set_at: '2026-07-08T14:30:00Z' },
+    { note: 'Verify claims from external sources before escalating them to strategic decisions.', set_at: '2026-07-08T15:00:00Z' },
+    { note: 'Prefer concrete action proposals over abstract discussion when blocking on operator input.', set_at: '2026-07-09T09:15:00Z' },
+  ],
+} as unknown as StrategicStateResponse;
 
 describe('StrategicContextWorkspace — viewport regression', () => {
   let root: Root | null = null;

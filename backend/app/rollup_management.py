@@ -491,6 +491,14 @@ async def _propagate_landed_to_staging_merged_descendants(
     queue: list = [parent_task_id]
     stamped: list[Task] = []
 
+    # Read test_coverage_result from the root parent so it can be propagated
+    # to descendants; coverage_delta acceptance evidence needs this key
+    # present on each child task's context at verdict time.
+    _parent = await session.get(Task, parent_task_id)
+    _parent_coverage: dict | None = (_parent.context or {}).get(
+        "test_coverage_result"
+    )
+
     while queue:
         rows = (
             (
@@ -514,6 +522,17 @@ async def _propagate_landed_to_staging_merged_descendants(
                 and has_merge_unblock_signal(row)
                 and not has_landed_signal(row)
             ):
+                # Propagate test_coverage_result from the root parent to this
+                # descendant so the coverage_delta acceptance gate
+                # (_evaluate_coverage_delta) can find measured coverage data
+                # instead of failing closed with "no result found".  Use
+                # setdefault so any existing per-descendant coverage data is
+                # never overwritten.
+                if _parent_coverage is not None:
+                    _desc_ctx = dict(row.context or {})
+                    _desc_ctx.setdefault("test_coverage_result", _parent_coverage)
+                    row.context = _desc_ctx
+
                 mark_landed_on_integration(row)
                 session.add(row)
                 stamped.append(row)
@@ -1198,8 +1217,14 @@ async def _record_completed_children_merge_evidence(
 
 async def _check_and_trigger_rollup(
     child_task: Task, session: AsyncSession, progress_cb=None
-) -> None:
+) -> bool:
     """Check if all siblings are done and trigger rollup PR for the parent.
+
+    Returns:
+        True if a silent internal session.rollback() was performed (e.g. the
+        ``_sess_poisoned`` recovery path). The caller should re-fetch ORM objects
+        before the next attribute access to avoid MissingGreenlet on expired
+        instances in async contexts. False (or None) otherwise — no re-batch needed.
 
     Called after a child task completes, fails, or is cancelled.
     Also called from admin PATCH when status/context changes.
@@ -1229,6 +1254,12 @@ async def _check_and_trigger_rollup(
         pr_is_not_behind_for,
         update_branch_with_sha_retry,
     )
+
+    # Track whether a silent internal rollback was performed (via the
+    # _sess_poisoned recovery path). The caller inspects this return value
+    # to decide whether to re-fetch ORM objects before the next attribute
+    # access, avoiding MissingGreenlet on expired instances in asyncpg.
+    _did_silent_rollback = False
 
     if not child_task.parent_task_id:
         return
@@ -1753,8 +1784,19 @@ async def _check_and_trigger_rollup(
             # (respawn-count bump) are persisted on this session and committed by
             # the Phase D relock commit.
             cap_exhausted_prs: list[int] = []
+            # Batch-fetch all respawn-candidate child tasks into both the identity
+            # map and a local lookup dict (N+1 guard: _spawn_pipeline_task commits
+            # internally, expiring the session, and the dict gives us O(1) access
+            # without re-fetching).
+            child_ids = [cand["child_id"] for cand in respawn_candidates]
+            children_rows = (
+                (await session.execute(select(Task).where(Task.id.in_(child_ids))))
+                .scalars()
+                .all()
+            )
+            children_by_id = {child.id: child for child in children_rows}
             for cand in respawn_candidates:
-                child = await session.get(Task, cand["child_id"])
+                child = children_by_id.get(cand["child_id"])
                 if child is None:
                     continue
                 review_task, was_spawned = await _spawn_pipeline_task(
@@ -4808,6 +4850,7 @@ async def _check_and_trigger_rollup(
                 with contextlib.suppress(Exception):
                     _sess_poisoned = not session.is_active
                 if _sess_poisoned:
+                    _did_silent_rollback = True
                     with contextlib.suppress(Exception):
                         await session.rollback()
                     if parent_id_local is not None:
@@ -4875,7 +4918,7 @@ async def _check_and_trigger_rollup(
                 # PR marker; the next sweep cycle re-enters with fresh parent
                 # state and resumes from the existing-PR branch.
                 if isinstance(e, _ParentMutatedDuringPRCreation):
-                    return
+                    return _did_silent_rollback
                 err_str = str(e).lower()
                 # Auth failures: invalidate the cached token so the next retry uses a fresh one
                 if (
@@ -5021,4 +5064,9 @@ async def _check_and_trigger_rollup(
         await broadcast_to_project(str(parent.project_id), "task_updated",
                                    {"task_id": str(parent.id), "status": TaskStatus.FAILED})
         logger.error(f"[ROLLUP] Parent {parent.id} failed — {failed_count} children failed")
+
+    # Every path above either returns explicitly or falls through to here.
+    # If a silent internal rollback occurred, signal it to the caller so it
+    # can re-fetch ORM objects before the next attribute access.
+    return _did_silent_rollback
 # fmt: on

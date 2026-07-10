@@ -367,6 +367,89 @@ class TestEnvAllowlist(unittest.TestCase):
         self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", env)
         self.assertEqual(env["AGENT_SECRET_TOKEN"], "jwt")
 
+    # ── per_task_creds (single credential code path) ────────────────────────
+
+    def test_build_agent_env_per_task_creds_replaces_source_creds(self):
+        """per_task_creds replaces matching credential keys from source_env."""
+        source = {
+            "ANTHROPIC_API_KEY": "sk-ant-host",
+            "AWS_SECRET_ACCESS_KEY": "aws-host",
+            "LANG": "en_US.UTF-8",
+            "PATH": "/usr/bin",
+        }
+        per_task = {
+            "ANTHROPIC_API_KEY": "sk-ant-per-task",
+            "AWS_SECRET_ACCESS_KEY": "aws-per-task",
+        }
+        env = iso.build_agent_env(
+            source,
+            {"AGENT_SECRET_TOKEN": "jwt"},
+            [],
+            per_task_creds=per_task,
+        )
+        # Credential keys REPLACED by per-task values (host value NOT used).
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-per-task")
+        self.assertEqual(env["AWS_SECRET_ACCESS_KEY"], "aws-per-task")
+        # Non-credential keys still flow from source_env.
+        self.assertEqual(env["LANG"], "en_US.UTF-8")
+        self.assertIn("/usr/bin", env["PATH"])
+        # Injected identity vars present.
+        self.assertEqual(env["AGENT_SECRET_TOKEN"], "jwt")
+
+    def test_build_agent_env_per_task_creds_single_code_path(self):
+        """When per_task_creds is provided, source_env credential keys for which
+        per_task_creds has a matching entry use the per-task value, not the host
+        value (single code path — no fallback to static host env)."""
+        source = {
+            "ANTHROPIC_API_KEY": "sk-ant-host",
+            "LANG": "en_US.UTF-8",
+        }
+        per_task = {
+            "ANTHROPIC_API_KEY": "sk-ant-per-task",
+        }
+        env = iso.build_agent_env(
+            source,
+            {"AGENT_SECRET_TOKEN": "jwt"},
+            [],
+            per_task_creds=per_task,
+        )
+        # ANTHROPIC_API_KEY comes from per_task_creds, NOT source_env.
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-per-task")
+        self.assertNotEqual(env.get("ANTHROPIC_API_KEY"), "sk-ant-host")
+        # Non-credential key still from source_env.
+        self.assertEqual(env["LANG"], "en_US.UTF-8")
+
+    def test_build_agent_env_per_task_creds_filtered_through_allowlist(self):
+        """per_task_creds keys NOT in AGENT_ENV_ALLOWLIST are dropped."""
+        source = {"LANG": "en_US.UTF-8"}
+        per_task = {
+            "ANTHROPIC_API_KEY": "sk-ant-valid",
+            "MALICIOUS_INJECTION": "danger",
+        }
+        env = iso.build_agent_env(
+            source,
+            {"AGENT_SECRET_TOKEN": "jwt"},
+            [],
+            per_task_creds=per_task,
+        )
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-valid")
+        self.assertNotIn("MALICIOUS_INJECTION", env)
+
+    def test_build_agent_env_empty_per_task_creds_is_noop(self):
+        """Empty/None per_task_creds does not change behavior (source creds pass)."""
+        source = {
+            "ANTHROPIC_API_KEY": "sk-ant-host",
+            "LANG": "en_US.UTF-8",
+        }
+        env = iso.build_agent_env(
+            source,
+            {"AGENT_SECRET_TOKEN": "jwt"},
+            [],
+            per_task_creds=None,
+        )
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-ant-host")
+        self.assertEqual(env["LANG"], "en_US.UTF-8")
+
 
 # ── bwrap argv builder ────────────────────────────────────────────────────────
 
@@ -709,6 +792,71 @@ class TestAgentPlan(unittest.TestCase):
         self.assertFalse(plan.declined)
         self.assertEqual(plan.backend, iso.BACKEND_BWRAP)
         self.assertIsNone(plan.container_name)
+
+    # ── per_task_creds (single credential code path) ────────────────────────
+
+    def test_agent_plan_bwrap_with_per_task_creds(self):
+        """plan_agent_execution forwards per_task_creds on bwrap path."""
+        plan = iso.plan_agent_execution(
+            caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+            agent_binary=["node", "/opt/agent/dist/index.js"],
+            workspace_host="/tmp/ws/t1",
+            injected_env={
+                "AGENT_SECRET_TOKEN": "jwt",
+                "ORCHESTRATOR_URL": "https://api.example.com",
+                "TASK_ID": "t1",
+                "VM_INSTANCE_ID": "runner:local",
+            },
+            source_env={
+                "PATH": "/usr/bin",
+                "ANTHROPIC_API_KEY": "sk-ant-host",
+                "LANG": "en_US.UTF-8",
+            },
+            per_task_creds={
+                "ANTHROPIC_API_KEY": "sk-ant-per-task",
+            },
+        )
+        self.assertFalse(plan.declined)
+        self.assertEqual(plan.backend, iso.BACKEND_BWRAP)
+        # per_task_creds value wins over source_env value.
+        self.assertEqual(plan.env["ANTHROPIC_API_KEY"], "sk-ant-per-task")
+        self.assertNotEqual(plan.env["ANTHROPIC_API_KEY"], "sk-ant-host")
+        # Non-cred key from source_env preserved.
+        self.assertEqual(plan.env["LANG"], "en_US.UTF-8")
+
+    def test_agent_plan_docker_with_per_task_creds(self):
+        """plan_agent_execution forwards per_task_creds on docker path."""
+        plan = iso.plan_agent_execution(
+            caps=_caps(docker_usable=True),
+            agent_binary=None,
+            workspace_host="/tmp/ws/t1",
+            injected_env={
+                "AGENT_SECRET_TOKEN": "SUPER-SECRET-JWT",
+                "ORCHESTRATOR_URL": "https://api.example.com",
+                "TASK_ID": "abcdef0123456789",
+                "VM_INSTANCE_ID": "runner:local",
+            },
+            source_env={
+                "PATH": "/usr/bin",
+                "ANTHROPIC_API_KEY": "sk-ant-host",
+                "BLUEPRINT_RUNNER_TOKEN": "SECRET",
+            },
+            task_type="research",
+            agent_image="reg/blueprint-agent-job:latest",
+            per_task_creds={
+                "ANTHROPIC_API_KEY": "sk-ant-per-task",
+            },
+        )
+        self.assertFalse(plan.declined)
+        self.assertEqual(plan.backend, iso.BACKEND_DOCKER)
+        # per_task_creds value overrides source_env value in docker client env.
+        self.assertEqual(plan.env["ANTHROPIC_API_KEY"], "sk-ant-per-task")
+        self.assertNotEqual(plan.env["ANTHROPIC_API_KEY"], "sk-ant-host")
+        # Host PATH is NOT forwarded into the container.
+        joined = " ".join(plan.argv)
+        self.assertNotIn("-e PATH", joined)
+        # Runner token still stripped.
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", plan.env)
 
 
 class TestComputePlan(unittest.TestCase):

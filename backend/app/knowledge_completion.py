@@ -873,6 +873,12 @@ async def _persist_document(
         )
         doc = existing
     else:
+        # Design and web_research docs participate in the follow-up lifecycle:
+        # they are created with lifecycle_status="pending" so the strategist
+        # knows they exist and haven't been consumed/dismissed yet.
+        # Omit lifecycle_status for non-participating kinds — the column is NOT
+        # NULL (server_default='pending'), and the query already filters by
+        # source_kind, so no sentinel value is needed.
         doc = KnowledgeDocument(
             project_id=task.project_id,
             source_task_id=task.id,
@@ -889,6 +895,8 @@ async def _persist_document(
             head_sha=normalized.get("head_sha"),
             **origin,
         )
+        if source_kind in {SourceKind.DESIGN.value, SourceKind.WEB_RESEARCH.value}:
+            doc.lifecycle_status = "pending"
         session.add(doc)
 
     # Mirror a compact copy into plan_output for debugging / admin visibility

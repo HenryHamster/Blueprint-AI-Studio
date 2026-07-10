@@ -358,6 +358,14 @@ function AccountRow({
             {tokenAge && <span className={`ml-2 ${isExpiring ? 'text-amber-400' : ''}`}>&middot; token {tokenAge}</span>}
             {account.provider_metadata?.project && typeof account.provider_metadata.project === 'string' && <span className="ml-2">&middot; {account.provider_metadata.project}</span>}
             {account.provider_metadata?.location && typeof account.provider_metadata.location === 'string' && <span className="ml-2">@ {account.provider_metadata.location}</span>}
+            {account.usage_snapshot?.known && (
+              <span className="ml-2" title={`5h: ${account.usage_snapshot.five_hour_utilization ?? '?'}% · 7d: ${account.usage_snapshot.seven_day_utilization ?? '?'}% headroom usage`}>
+                &middot; 5h&nbsp;
+                <span className={account.usage_snapshot.five_hour_utilization != null && account.usage_snapshot.five_hour_utilization >= 80 ? 'text-amber-400' : account.usage_snapshot.five_hour_utilization != null && account.usage_snapshot.five_hour_utilization >= 60 ? 'text-yellow-500' : 'text-emerald-500'}>
+                  {account.usage_snapshot.five_hour_utilization == null ? '?' : `${Math.round(account.usage_snapshot.five_hour_utilization)}%`}
+                </span>
+              </span>
+            )}
           </div>
           {accountSupportsAvailabilityCheck(account) && (
             <AccountAvailabilityLine

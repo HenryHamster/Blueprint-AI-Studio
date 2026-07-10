@@ -89,6 +89,7 @@ from app.routers.admin_scope_measurement import router as admin_scope_measuremen
 from app.routers.agent_status import router as agent_status_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.routers.admin_agent_ops import router as admin_agent_ops_router
+from app.routers.admin_auth import router as admin_auth_router
 from app.routers.admin_agent_ops import _bump_size_limit  # noqa: F401  re-exported for test patches (test_agent_annotate.py)
 from app.routers.admin_acceptance_criteria import router as admin_acceptance_criteria_router
 from app.routers.admin_direction_events import router as admin_direction_events_router
@@ -106,7 +107,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0423"
+EXPECTED_SCHEMA_REVISION = "0468"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -800,8 +801,13 @@ class RequestDurationMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         elapsed_ms = (time.monotonic() - start_time) * 1000
 
-        # Add Server-Timing header with backend duration
-        response.headers["Server-Timing"] = f"backend;dur={elapsed_ms:.1f}"
+        # Build Server-Timing header: backend total first, then per-step entries
+        timing_parts = [f"backend;dur={elapsed_ms:.1f}"]
+        per_step_entries = getattr(request.state, "_server_timing_entries", None)
+        if per_step_entries:
+            for name, ms in per_step_entries:
+                timing_parts.append(f"{name};dur={ms:.1f}")
+        response.headers["Server-Timing"] = ", ".join(timing_parts)
 
         # Log slow requests with route template and duration
         if elapsed_ms > self.SLOW_REQUEST_THRESHOLD_MS:
@@ -868,6 +874,7 @@ app.include_router(admin_compute_jobs_router)
 app.include_router(admin_direction_events_router)
 app.include_router(admin_onboard_router)
 app.include_router(admin_agent_ops_router)
+app.include_router(admin_auth_router)
 
 
 def _get_zone_health_summary() -> dict:

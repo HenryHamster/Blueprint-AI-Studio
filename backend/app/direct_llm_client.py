@@ -11,15 +11,164 @@ lets callers target Anthropic-compatible providers such as DeepSeek.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 # Shared model for all direct (non-provider-stack) Anthropic calls.
 # Do not drive this from runtime_config — that is the scope of in-flight task e61e6de8.
 DIRECT_LLM_MODEL = "claude-haiku-4-5-20251001"
 
+# Prefix for Anthropic rate-limit response headers.
+_RATE_LIMIT_HEADER_PREFIX = "anthropic-ratelimit-"
+_RATE_LIMIT_TOKENS_HEADER_PREFIX = f"{_RATE_LIMIT_HEADER_PREFIX}tokens-"
+
 
 def get_anthropic_api_key() -> str:
     """Return the stripped ANTHROPIC_API_KEY env value (empty string if not set)."""
     return os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+
+def extract_rate_limit_headers(
+    response: Any,
+) -> dict[str, str]:
+    """Extract Anthropic rate-limit/usage headers from a messages.create response.
+
+    Every Anthropic Messages API response carries rate-limit headers:
+      - anthropic-ratelimit-requests-remaining / -limit / -reset
+      - anthropic-ratelimit-tokens-remaining / -limit / -reset
+      - anthropic-ratelimit-unified-5h-status / -remaining / -reset (/-limit)
+
+    This is a best-effort extraction: header values are case-insensitive but the
+    prefix is matched lowercased. Returns a flat dict of ``{header_name: value}``
+    for every header starting with the rate-limit prefix; returns empty dict when
+    the response object has no ``headers`` attribute (e.g. test stubs).
+    """
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        # Some test stubs or mock responses may not have a headers attribute.
+        return {}
+    result: dict[str, str] = {}
+    try:
+        for key, value in headers.items():
+            if key.lower().startswith(_RATE_LIMIT_HEADER_PREFIX):
+                result[str(key)] = str(value)
+    except (AttributeError, TypeError, ValueError):
+        # Non-iterable or non-dict-like headers object.
+        pass
+    return result
+
+
+def parse_rate_limit_header_value(raw: str) -> str | int | None:
+    """Parse a rate-limit header value to int or return as-is.
+
+    The unified-5h-remaining and unified-5h-limit headers are numeric (tokens).
+    Other headers may be ISO timestamps (reset) or string status (status).
+    """
+    stripped = raw.strip()
+    try:
+        return int(stripped)
+    except (ValueError, TypeError):
+        if stripped:
+            return stripped
+        return None
+
+
+def normalize_rate_limit_data(
+    raw_headers: dict[str, str],
+) -> dict[str, Any]:
+    """Normalize raw rate-limit headers into a structured dict for persistence.
+
+    Returns a dict suitable for storing in MaxPlanAccount.rate_limit_usage:
+
+    .. code-block:: python
+
+        {
+            "unified_5h": {
+                "remaining_tokens": int,
+                "limit_tokens": int,
+                "status": str,           # "live" | "near_limit" | "exhausted"
+                "resets_at": str,        # ISO-8601
+            },
+            "requests": {
+                "remaining": int,
+                "limit": int,
+                "resets_at": str,
+            },
+            "tokens": {
+                "remaining": int,
+                "limit": int,
+                "resets_at": str,
+            },
+            "updated_at": str,           # ISO-8601
+            "source": "messages_api_header",
+        }
+    """
+    from datetime import datetime, timezone
+
+    normalized: dict[str, Any] = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "messages_api_header",
+    }
+
+    # Unified 5h window
+    unified_5h: dict[str, Any] = {}
+    for key, raw_val in raw_headers.items():
+        lk = key.lower()
+        if "unified-5h" not in lk:
+            continue
+        val = parse_rate_limit_header_value(raw_val)
+        if "remaining" in lk and isinstance(val, int):
+            unified_5h["remaining_tokens"] = val
+        elif "limit" in lk and isinstance(val, int):
+            unified_5h["limit_tokens"] = val
+        elif "status" in lk and isinstance(val, str):
+            unified_5h["status"] = val
+        elif "reset" in lk and isinstance(val, str):
+            unified_5h["resets_at"] = val
+    if unified_5h:
+        if (
+            "remaining_tokens" in unified_5h
+            and "limit_tokens" in unified_5h
+            and unified_5h["limit_tokens"] > 0
+        ):
+            utilization = (
+                1.0 - unified_5h["remaining_tokens"] / unified_5h["limit_tokens"]
+            ) * 100.0
+            unified_5h["utilization"] = round(utilization, 1)
+        normalized["unified_5h"] = unified_5h
+
+    # Per-request rate-limit
+    requests: dict[str, Any] = {}
+    for key, raw_val in raw_headers.items():
+        lk = key.lower()
+        if "requests-" not in lk:
+            continue
+        val = parse_rate_limit_header_value(raw_val)
+        if "remaining" in lk and isinstance(val, int):
+            requests["remaining"] = val
+        elif "limit" in lk and isinstance(val, int):
+            requests["limit"] = val
+        elif "reset" in lk and isinstance(val, str):
+            requests["resets_at"] = val
+    if requests:
+        normalized["requests"] = requests
+
+    # Per-token rate-limit
+    tokens: dict[str, Any] = {}
+    for key, raw_val in raw_headers.items():
+        lk = key.lower()
+        if not lk.startswith(_RATE_LIMIT_TOKENS_HEADER_PREFIX):
+            continue
+        val = parse_rate_limit_header_value(raw_val)
+        if "remaining" in lk and isinstance(val, int):
+            tokens["remaining"] = val
+        elif "limit" in lk and isinstance(val, int):
+            tokens["limit"] = val
+        elif "reset" in lk and isinstance(val, str):
+            tokens["resets_at"] = val
+    if tokens:
+        normalized["tokens"] = tokens
+
+    return normalized
 
 
 async def call_direct_llm(
@@ -31,25 +180,30 @@ async def call_direct_llm(
     model: str = DIRECT_LLM_MODEL,
     system: str | None = None,
     base_url: str | None = None,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     """Construct an AsyncAnthropic client and make one messages.create call.
 
-    Returns the raw text from the first content block. Raises on any error —
-    callers wrap this in their own retry loop so parse-error retries work exactly
-    as before.
+    Returns ``(text, rate_limit_data)`` where *text* is the trimmed concatenated
+    text from all content blocks and *rate_limit_data* is a structured dict from
+    :func:`normalize_rate_limit_data` containing the response-header rate-limit
+    information (unified-5h, request-level, token-level). Callers without an
+    account context can discard the second element with ``_``.
+
+    Raises on any error — callers wrap this in their own retry loop so
+    parse-error retries work exactly as before.
     """
-    import anthropic as _anthropic  # noqa: PLC0415 — lazy so module is importable without anthropic installed
+    import anthropic as _anthropic  # lazy so module is importable without anthropic installed
 
     client_kwargs = {"api_key": api_key}
     if base_url:
         client_kwargs["base_url"] = base_url
     client = _anthropic.AsyncAnthropic(**client_kwargs)
-    kwargs: dict = dict(
-        model=model,
-        max_tokens=max_tokens,
-        timeout=timeout,
-        messages=messages,
-    )
+    kwargs: dict = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "timeout": timeout,
+        "messages": messages,
+    }
     if system is not None:
         kwargs["system"] = system
     resp = await client.messages.create(**kwargs)
@@ -58,4 +212,9 @@ async def call_direct_llm(
         text = getattr(block, "text", None)
         if isinstance(text, str) and text:
             text_parts.append(text)
-    return "\n".join(text_parts).strip()
+    text = "\n".join(text_parts).strip()
+    raw_headers = extract_rate_limit_headers(resp)
+    rate_limit_data = normalize_rate_limit_data(raw_headers)
+    return text, rate_limit_data
+
+

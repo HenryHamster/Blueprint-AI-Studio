@@ -14,6 +14,7 @@ import { CopyableId, SectionHeader, DetailRow, DirectionsSection, DependencyItem
 import {
   TaskComputeJobsSection,
   ResearchOriginSection,
+  SalvageActivitySection,
   AdversarialGateDiagnosticSection,
   KnowledgeDocumentSection,
   EvaluationSummarySection,
@@ -91,6 +92,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         </DetailRow>
       )}
       <ResearchOriginSection task={task} tasks={tasks} onNavigateToTask={onNavigateToTask} />
+      <SalvageActivitySection task={task} onNavigateToTask={onNavigateToTask} />
       {task.context?.adversarial_gate_diagnostic && (
         <AdversarialGateDiagnosticSection diag={task.context.adversarial_gate_diagnostic as AdversarialGateDiagnostic} onNavigateToTask={onNavigateToTask} />
       )}

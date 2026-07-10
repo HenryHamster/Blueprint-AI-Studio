@@ -32,7 +32,7 @@ from app.direction_outcomes import (
     verified_merged_count,
 )
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
-from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups, fetch_direction_knowledge_index
+from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups, fetch_direction_knowledge_index, build_pending_followups
 from app.models import (
     Task,
     Project,
@@ -224,6 +224,7 @@ from app.strategic_payload_summaries import (  # noqa: F401 — re-exported for 
     _SELF_REFLECTION_KEEP,
     _SELF_REFLECTION_TEXT_CAP,
     _SELF_REFLECTION_TEXT_FIELDS,
+    _build_self_reflection_themes,
     _summarize_self_reflection_log,
 )
 
@@ -2055,6 +2056,49 @@ def _build_prune_candidates(
     }
 
 
+# Threshold for gap history + past_moves entry count that triggers a
+# compaction hint. Gaps whose combined entries reach this level are candidates
+# for ``_compactions`` watermark compaction — the strategist should review and
+# emit a compaction directive rather than letting the history grow unbounded.
+_COMPACTION_HISTORY_ENTRY_THRESHOLD = 15
+
+
+def _build_compaction_hints(problem_model: dict | None) -> list[dict] | None:
+    """Identify active gaps warranting ``_compactions`` watermark compaction.
+
+    Resident sessions accumulate problem-model gap history entries over time;
+    this returns a list of hints — one per active gap whose combined history
+    and past_moves entries exceed the threshold — so the strategist can apply
+    targeted compaction without exhaustive manual inspection.
+
+    Returns None when no gap qualifies (no field emitted on the payload).
+    Pure and side-effect free.
+    """
+    pm = problem_model if isinstance(problem_model, dict) else {}
+    hints: list[dict] = []
+    for g in pm.get("gaps") or []:
+        if not isinstance(g, dict) or g.get("status") != "active":
+            continue
+        history = g.get("history")
+        if not isinstance(history, list):
+            history = []
+        past_moves = g.get("past_moves")
+        if not isinstance(past_moves, list):
+            past_moves = []
+        total = len(history) + len(past_moves)
+        if total >= _COMPACTION_HISTORY_ENTRY_THRESHOLD:
+            hints.append(
+                {
+                    "gap_id": str(g.get("id") or ""),
+                    "name": str(g.get("name") or "")[:_RECON_LABEL_MAXLEN],
+                    "history_entry_count": len(history),
+                    "past_moves_count": len(past_moves),
+                    "total_entries": total,
+                }
+            )
+    return hints if hints else None
+
+
 _OPERATOR_STEERING_QUOTE_MAX_CHARS = 600
 _OPERATOR_STEERING_QUOTE_COUNT = 2
 
@@ -2274,6 +2318,14 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "summarize": _summarize_knowledge_index,
         "fetch_verb": "knowledge",
     },
+    # Pending knowledge follow-ups: design/web_research docs the strategist
+    # hasn't consumed/dismissed yet. Already bounded at build time (max 20
+    # entries, summaries truncated to ~200 chars), so exempt from the packer.
+    "pending_followups": {
+        "priority": "medium",
+        "exempt": True,
+        "fetch_verb": "knowledge",
+    },
     # Per-sweep comparative arm grouping — bounded at build time so the packer
     # drops it whole under budget rather than trimming. Same tier as
     # knowledge_index.
@@ -2301,6 +2353,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "self_reflection_log": {
         "priority": "low",
         "summarize": _summarize_self_reflection_log,
+    },
+    # Already compact (note + set_at per entry, capped by the handler at build
+    # time), so drop-whole is correct degradation under budget pressure.
+    "strategic_memory_notes": {
+        "priority": "low",
+        "exempt": True,
     },
     "previous_decision_outcomes": {
         "priority": "low",
@@ -2492,6 +2550,8 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
         "priority": "medium",
         "summarize": _summarize_knowledge_index,
     },
+    # Pending knowledge follow-ups (design/web_research) — exempt: bounded at build time.
+    "pending_followups": {"priority": "medium", "exempt": True},
     # Per-sweep comparative arm grouping — exempt: bounded at build time.
     "compute_experiment_sweeps": {"priority": "medium", "exempt": True},
     # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Exempt: small, bounded.
@@ -2731,8 +2791,16 @@ async def _build_recent_interventions(
         .options(
             load_only(Task.id, Task.status, Task.context, Task.payloads, raiseload=True)
         )
+        .order_by(Task.created_at.desc())
+        .limit(500)
     )
     active_tasks = list(active_tasks_result.scalars().all())
+    if len(active_tasks) >= 500:
+        logger.warning(
+            "[STRATEGIC] active_tasks truncated to 500 rows for project=%s "
+            "— active_by_direction/active_by_scope metrics may be incomplete",
+            project.id,
+        )
     held_tasks_result = await session.execute(
         select(Task)
         .where(
@@ -2740,8 +2808,16 @@ async def _build_recent_interventions(
             Task.status.in_((TaskStatus.BLOCKED, TaskStatus.PARKED)),
         )
         .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
+        .order_by(Task.created_at.desc())
+        .limit(500)
     )
     held_tasks = list(held_tasks_result.scalars().all())
+    if len(held_tasks) >= 500:
+        logger.warning(
+            "[STRATEGIC] held_tasks truncated to 500 rows for project=%s "
+            "— held_by_direction metrics may be incomplete",
+            project.id,
+        )
 
     # Build direction lookup for text enrichment
     directions_by_id: dict[str, str] = {
@@ -4058,12 +4134,14 @@ async def _spawn_design_doc_update(
     # can fetch full bodies on demand — included only when documents exist.
     _knowledge_index = await build_knowledge_index(session, project.id)
     _dd_compute_sweep_groups = await build_compute_sweep_groups(session, project.id)
+    _pending_followups = await build_pending_followups(session, project.id)
 
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
             "design_doc": _design_doc_index(reconciled_design_doc),
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
+            **({"pending_followups": _pending_followups} if _pending_followups else {}),
             **({"compute_experiment_sweeps": _dd_compute_sweep_groups} if _dd_compute_sweep_groups else {}),
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
@@ -4481,14 +4559,22 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
         TaskStatus.BLOCKED,
         TaskStatus.PARKED,
     }
-    rows = (
-        await session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.status.in_(active_statuses),
-            )
+    rows_result = await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.status.in_(active_statuses),
         )
-    ).scalars().all()
+        .order_by(Task.created_at.desc())
+        .limit(100)
+    )
+    rows = list(rows_result.scalars().all())
+    if len(rows) >= 100:
+        logger.warning(
+            "[COMPLIANCE_CAP_BUMP] dedup query truncated to 100 rows "
+            "for project=%s, head_sha=%s — dedup may miss existing tasks",
+            project.id,
+            head_sha,
+        )
     for task in rows:
         context = task.context or {}
         if (
@@ -5567,6 +5653,18 @@ async def _spawn_strategic_review(
                     **(
                         {"resident_exam_leads": _res_exam_leads}
                         if _res_exam_leads
+                        else {}
+                    ),
+                    # Compact, durable behavioral memory notes written by the
+                    # set_memory strategic op. Already capped at 100 entries by the
+                    # handler, so budget-footprint is bounded.
+                    "strategic_memory_notes": project.strategic_memory_notes or [],
+                    # Gaps whose history entries warrant compaction — surfaced
+                    # directly in the payload so the strategist sees an automatic
+                    # signal without manual inspection. Pure in-memory computation.
+                    **(
+                        {"compaction_hints": _rm_compaction_hints}
+                        if (_rm_compaction_hints := _build_compaction_hints(project.problem_model))
                         else {}
                     ),
                 },
@@ -7228,6 +7326,7 @@ async def _spawn_strategic_review(
     # can fetch full bodies on demand — included only when documents exist.
     _knowledge_index = await build_knowledge_index(session, project.id)
     _compute_sweep_groups = await build_compute_sweep_groups(session, project.id)
+    _pending_followups = await build_pending_followups(session, project.id)
     # Live self-hosted local-runner availability, so the strategist avoids
     # authoring GPU compute_experiment tasks (which silently fall back to
     # billable cloud GPU) while the operator's hardware is offline. Included in
@@ -7308,7 +7407,15 @@ async def _spawn_strategic_review(
             # Concrete prune candidates — present only when the model is
             # large/oversized AND something is actually prunable. Advisory list.
             **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
+            # Gaps whose history entries warrant compaction — surfaced so the
+            # strategist can apply targeted compaction without manual inspection.
+            **(
+                {"compaction_hints": _cadence_compaction_hints}
+                if (_cadence_compaction_hints := _build_compaction_hints(_verified_problem_model))
+                else {}
+            ),
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
+            **({"pending_followups": _pending_followups} if _pending_followups else {}),
             **({"compute_experiment_sweeps": _compute_sweep_groups} if _compute_sweep_groups else {}),
             # Live local-runner availability — surfaced when the operator has
             # ever registered self-hosted hardware OR the project declares the
@@ -7332,6 +7439,16 @@ async def _spawn_strategic_review(
             ),
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
+            **(
+                {"self_reflection_themes": _self_reflection_themes}
+                if (
+                    _self_reflection_themes := _build_self_reflection_themes(
+                        project.self_reflection_log
+                    )
+                )
+                else {}
+            ),
+            "strategic_memory_notes": project.strategic_memory_notes or [],
             # De-gated from the raw project.is_self_repo column to the deploy-repo
             # predicate: the strategist's self-improvement framing (modify your own
             # prompts/schemas/orchestration) keys off this field, so it must follow

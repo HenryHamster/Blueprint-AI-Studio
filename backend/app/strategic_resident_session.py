@@ -361,6 +361,8 @@ def resident_session_snapshot(vision: dict[str, Any] | None) -> dict[str, Any] |
         "ended_at": blob.get("ended_at"),
         "last_progress_at": blob.get("last_progress_at"),
         "last_operator_interaction_at": blob.get("last_operator_interaction_at"),
+        "compaction_count": blob.get("compaction_count"),
+        "last_compaction_at": blob.get("last_compaction_at"),
     }
 
 
@@ -667,6 +669,7 @@ async def _spawn_resident_strategic_task(
     session_id: str,
     exam_ledger: str | None = None,
     message_cursor: str | None = None,
+    session_summary: str | None = None,
 ) -> Task | None:
     """Spawn a fresh ``strategic_review`` task via the canonical spawn path.
 
@@ -712,7 +715,8 @@ async def _spawn_resident_strategic_task(
         # this stays None and the task is born QUEUED (degraded cloud fallback).
         runner_pin_id=str(runner_id) if runner_id else None,
         extra_context=_resident_born_context(
-            session_id, runner_id, exam_ledger=exam_ledger, message_cursor=message_cursor
+            session_id, runner_id, exam_ledger=exam_ledger, message_cursor=message_cursor,
+            session_summary=session_summary,
         ),
         # Spawn MINIMALLY: skip the ~2-minute synchronous strategic-context build
         # (design-doc grounding + capability backing-path verification GitHub
@@ -887,6 +891,7 @@ def _resident_born_context(
     *,
     exam_ledger: str | None = None,
     message_cursor: str | None = None,
+    session_summary: str | None = None,
 ) -> dict[str, Any]:
     """Build the resident-session context flags a SPAWNED task is BORN with.
 
@@ -925,6 +930,10 @@ def _resident_born_context(
     # messages). Absent on first-ever start — no cursor has been established yet.
     if message_cursor:
         context["message_cursor"] = message_cursor
+    # Carry the session summary forward so the new session's bootstrap includes
+    # "Prior session context" from the previous session's set-session-summary op.
+    if session_summary:
+        context["_session_summary"] = session_summary
     return context
 
 
@@ -935,6 +944,7 @@ def _stamp_resident_context(
     runner_id: str | None,
     exam_ledger: str | None = None,
     message_cursor: str | None = None,
+    session_summary: str | None = None,
 ) -> None:
     """Stamp the shared resident-session flags + AUTHORITATIVE runner pin onto *task*.
 
@@ -978,6 +988,10 @@ def _stamp_resident_context(
     # Carry the message cursor forward so the poll window survives a restart.
     if message_cursor:
         context["message_cursor"] = message_cursor
+    # Carry the session summary forward so the bootstrap includes "Prior session
+    # context" from the previous session's set-session-summary output.
+    if session_summary:
+        context["_session_summary"] = session_summary
     if runner_id:
         context["preferred_runner_target_id"] = str(runner_id)
         # Hard local-runner intent so dispatch pins the warm session to the
@@ -1133,6 +1147,7 @@ async def start_resident_session(
     # dropped (best-effort — a lost ledger only costs one rotation reset).
     carried_exam_ledger: str | None = None
     carried_message_cursor: str | None = None
+    carried_session_summary: str | None = None
     if isinstance(existing, dict):
         _raw_ledger = existing.get("_exam_ledger")
         if isinstance(_raw_ledger, str) and 0 < len(
@@ -1144,6 +1159,11 @@ async def start_resident_session(
         _raw_cursor = existing.get("_message_cursor")
         if isinstance(_raw_cursor, str) and _raw_cursor:
             carried_message_cursor = _raw_cursor
+        # Carry the session summary forward so the new session's bootstrap includes
+        # context from the prior session (set-session-summary op).
+        _raw_summary = existing.get("_session_summary")
+        if isinstance(_raw_summary, str) and _raw_summary.strip():
+            carried_session_summary = _raw_summary
     if resident_session_is_active(existing):
         task_id = existing.get("task_id")
         live = None
@@ -1262,6 +1282,10 @@ async def start_resident_session(
         # the first heartbeat still restores the high-water mark correctly.
         if carried_message_cursor:
             vision[RESIDENT_SESSION_KEY]["_message_cursor"] = carried_message_cursor
+        # Preserve the session summary on the new blob so a restart BEFORE the
+        # first heartbeat still carries it into the agent's bootstrap prompt.
+        if carried_session_summary:
+            vision[RESIDENT_SESSION_KEY]["_session_summary"] = carried_session_summary
         decision["mode"] = "adopt" if adopt_task is not None else "spawn"
 
     await with_vision_locked(session, project.id, _claim, skip_locked=False)
@@ -1333,6 +1357,7 @@ async def start_resident_session(
                             runner_id=effective_runner_id,
                             exam_ledger=carried_exam_ledger,
                             message_cursor=carried_message_cursor,
+                            session_summary=carried_session_summary,
                         )
                         session.add(task)
                         workbench_state = (
@@ -1384,6 +1409,7 @@ async def start_resident_session(
                 session_id=session_id,
                 exam_ledger=carried_exam_ledger,
                 message_cursor=carried_message_cursor,
+                session_summary=carried_session_summary,
             )
             if task is None:
                 raise HTTPException(
@@ -1934,6 +1960,8 @@ async def renew_resident_session_lease(
     message_cursor: str | None = None,
     handled_message_ids: list[str] | None = None,
     turn_latency_summary: dict | None = None,
+    compaction_count: int | None = None,
+    last_compaction_at: str | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
@@ -2205,6 +2233,12 @@ async def renew_resident_session_lease(
         # observability. Bounded to a simple dict; ignored when absent/None.
         if isinstance(turn_latency_summary, dict):
             updated["_turn_latency_summary"] = turn_latency_summary
+        # Persist compaction metadata reported by the agent. These are
+        # opaque agent-reported values — the backend never derives them.
+        if isinstance(compaction_count, int) and compaction_count > 0:
+            updated["compaction_count"] = compaction_count
+        if isinstance(last_compaction_at, str) and last_compaction_at:
+            updated["last_compaction_at"] = last_compaction_at
         vision[RESIDENT_SESSION_KEY] = updated
 
     await with_vision_locked(session, project.id, _renew, skip_locked=False)
@@ -2368,6 +2402,8 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     message_cursor: str | None = None
     handled_message_ids: list[str] | None = None
     turn_latency_summary: dict | None = None
+    compaction_count: int | None = None
+    last_compaction_at: str | None = None
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -2399,4 +2435,6 @@ async def resident_session_heartbeat(
         message_cursor=payload.message_cursor,
         handled_message_ids=payload.handled_message_ids,
         turn_latency_summary=payload.turn_latency_summary,
+        compaction_count=payload.compaction_count,
+        last_compaction_at=payload.last_compaction_at,
     )

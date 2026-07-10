@@ -27,6 +27,7 @@ from app.models import (
     ReleaseVersion,
     Task,
     TaskStatus,
+    UiLoadTimingSample,
 )
 from app.auth import create_agent_token
 
@@ -5955,3 +5956,202 @@ async def test_get_task_children_scoped_to_project(client: AsyncClient, db_sessi
     )
     assert res.status_code == 200, res.text
     assert res.json()["data"]["children"] == []
+
+
+# ---------------------------------------------------------------------------
+# Spend ceiling fetch endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_spend_ceiling_reached(
+    client: AsyncClient, db_session, mocker
+):
+    """When spend exceeds the ceiling, the endpoint reports
+    spend_ceiling_reached=True with the correct amounts."""
+    project = Project(
+        name="Spend Ceiling Reached",
+        user_id="test-user-scr",
+        build_config={"resource_envelope": {"spend_ceiling_usd": 10.0}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-scr")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Mock get_project_recent_spend_usd to return $12 total (past the $10 ceiling).
+    # Patched at the source module because the endpoint imports it lazily.
+    mock_spend = mocker.patch(
+        "app.resource_envelope.get_project_recent_spend_usd",
+    )
+    mock_spend.return_value = {
+        "total": 12.0,
+        "compute": 10.0,
+        "agent_vm": 2.0,
+        "idle": 0.0,
+    }
+
+    token = create_agent_token(str(task.id), "agent-vm-scr")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/spend-ceiling",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["spend_ceiling_usd"] == 10.0
+    assert data["spend_recent_usd"] == 12.0
+    assert data["spend_ceiling_reached"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_spend_ceiling_not_reached(
+    client: AsyncClient, db_session, mocker
+):
+    """When spend is below the ceiling, spend_ceiling_reached is False."""
+    project = Project(
+        name="Spend Ceiling Not Reached",
+        user_id="test-user-scnr",
+        build_config={"resource_envelope": {"spend_ceiling_usd": 50.0}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-scnr"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mock_spend = mocker.patch(
+        "app.resource_envelope.get_project_recent_spend_usd",
+    )
+    mock_spend.return_value = {
+        "total": 8.0,
+        "compute": 5.0,
+        "agent_vm": 3.0,
+        "idle": 0.0,
+    }
+
+    token = create_agent_token(str(task.id), "agent-vm-scnr")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/spend-ceiling",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["spend_ceiling_usd"] == 50.0
+    assert data["spend_recent_usd"] == 8.0
+    assert data["spend_ceiling_reached"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_spend_ceiling_no_ceiling(
+    client: AsyncClient, db_session
+):
+    """When no spend ceiling is configured, all ceiling fields are null."""
+    project = Project(
+        name="No Ceiling",
+        user_id="test-user-scnc",
+        build_config={"resource_envelope": {}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-scnc")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-scnc")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/spend-ceiling",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["spend_ceiling_usd"] is None
+    assert data["spend_recent_usd"] is None
+    assert data["spend_ceiling_reached"] is None
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_ui_load_timing_returns_surface_data(
+    client: AsyncClient, db_session
+):
+    """Agent ./fetch ui-load-timing returns surfaces dict with {ts, page_ready_ms,
+    sample_type} entries grouped by surface, oldest-first."""
+    from datetime import timezone
+
+    project = Project(name="UiTiming Test", user_id="test-user-ult")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-ult",
+    )
+    db_session.add(token_task)
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    db_session.add(UiLoadTimingSample(surface="chat", page_ready_ms=1200, sample_type="first_commit", recorded_at=now))
+    db_session.add(UiLoadTimingSample(surface="chat", page_ready_ms=800, sample_type="chat_data_ready", recorded_at=now))
+    db_session.add(UiLoadTimingSample(surface="board", page_ready_ms=950, sample_type="first_commit", recorded_at=now))
+
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-ult")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/ui-load-timing",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    surfaces = body["data"]["surfaces"]
+    assert "chat" in surfaces
+    assert "board" in surfaces
+    assert len(surfaces["chat"]) == 2
+    assert len(surfaces["board"]) == 1
+    chat_entry = surfaces["chat"][0]
+    assert "ts" in chat_entry
+    assert chat_entry["page_ready_ms"] == 1200
+    assert chat_entry["sample_type"] == "first_commit"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_ui_load_timing_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch ui-load-timing for project B (404)."""
+    project_a = Project(name="UiTiming A", user_id="test-user-ulta")
+    project_b = Project(name="UiTiming B", user_id="test-user-ultb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-ulta",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-ulta")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/ui-load-timing",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404

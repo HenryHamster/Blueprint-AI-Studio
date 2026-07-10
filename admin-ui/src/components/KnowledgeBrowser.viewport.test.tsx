@@ -215,6 +215,24 @@ describe('KnowledgeBrowser — viewport regression', () => {
     );
   });
 
+  test('selecting a lifecycle-status filter forwards lifecycle_status to fetchKnowledgeDocuments', async () => {
+    const mock = vi.mocked(fetchKnowledgeDocuments);
+    await renderList();
+    mock.mockClear();
+    const buttons = (host as HTMLDivElement).querySelectorAll('button');
+    const pendingFilter = Array.from(buttons).find(
+      b => b.textContent?.trim() === 'Pending' && b.hasAttribute('data-viewport-allow-small-target'),
+    );
+    expect(pendingFilter).toBeTruthy();
+    if (!pendingFilter) throw new Error('expected Pending filter button');
+    await act(async () => { pendingFilter.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    expect(mock).toHaveBeenCalledWith(
+      'project-test',
+      expect.objectContaining({ lifecycle_status: 'pending' }),
+    );
+  });
+
   test('detail view with finding-origin provenance renders without overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       await renderList();

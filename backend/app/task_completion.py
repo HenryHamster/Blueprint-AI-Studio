@@ -69,6 +69,7 @@ from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
 )
 from app.task_evaluators import (
+    BLIND_REVIEW_SOURCE_KEY,
     REVIEW_SECOND_OPINION_AWAITING_KEY,
     REVIEW_SECOND_OPINION_PARKED_KEY,
     REVIEW_SECOND_OPINION_SOURCE_KEY,
@@ -112,6 +113,7 @@ from app.json_extract import (  # noqa: F401  (re-exported; callers import from 
     _extract_json_array,
     _extract_last_json_array,
     _extract_json_object,
+    async_json_loads,
 )
 
 logger = logging.getLogger(__name__)
@@ -1900,7 +1902,7 @@ async def _handle_security_audit_completion(
     try:
         json_str = _extract_json_array(logs, "severity")
         if json_str:
-            parsed = json.loads(json_str)
+            parsed = await async_json_loads(json_str)
             findings = _normalize_findings_array(parsed)
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -2190,7 +2192,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     try:
         json_str = _extract_json_array(logs, "severity")
         if json_str:
-            parsed = json.loads(json_str)
+            parsed = await async_json_loads(json_str)
             findings = _normalize_findings_array(parsed)
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -3978,6 +3980,7 @@ REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS = (
     REVIEW_SECOND_OPINION_AWAITING_KEY,
     REVIEW_SECOND_OPINION_PARKED_KEY,
     REVIEW_SECOND_OPINION_SOURCE_KEY,
+    BLIND_REVIEW_SOURCE_KEY,
 )
 
 
@@ -5313,7 +5316,7 @@ async def _handle_repo_bootstrap_completion(
         source_revision = _extract_revision(ctx_overview)
     elif logs:
         try:
-            parsed = json.loads(logs)
+            parsed = await async_json_loads(logs)
             if isinstance(parsed, dict) and _is_overview_complete(parsed):
                 overview = _build_overview(parsed)
                 source_revision = _extract_revision(parsed)

@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { AlertTriangle, CheckCircle } from 'lucide-react';
-import { Skeleton } from './DashboardMetricCards';
+import { Skeleton } from './DashboardMetricCardsPrimitives';
 import { snapshotFreshness } from '../utils/time';
 import type { Task } from '../types/task';
 

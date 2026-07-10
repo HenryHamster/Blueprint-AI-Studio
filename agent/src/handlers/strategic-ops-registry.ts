@@ -85,6 +85,10 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Cancel a previously spawned QUEUED/PROVISIONING task with a required reason.' },
   { op: 'dispose_completion_debt', alias: 'dispose-completion-debt', cli: true, prompt: true, internalReason: null,
     description: 'Dispose of an open completion-debt ledger entry.' },
+  { op: 'consume_knowledge_followup', alias: 'consume-knowledge-followup', cli: true, prompt: true, internalReason: null,
+    description: 'Consume a pending knowledge follow-up (spawned direction, incorporated knowledge, etc.).' },
+  { op: 'dismiss_knowledge_followup', alias: 'dismiss-knowledge-followup', cli: true, prompt: true, internalReason: null,
+    description: 'Dismiss a pending knowledge follow-up as not currently actionable.' },
   { op: 'set_retirement_critiques', alias: 'set-retirement-critiques', cli: true, prompt: true, internalReason: null,
     description: 'Record retirement critiques for the cycle.' },
   { op: 'set_evidence_progress', alias: 'set-evidence-progress', cli: true, prompt: true, internalReason: null,
@@ -93,6 +97,11 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Author acceptance criteria for a direction/task.' },
   { op: 'record_finding_resolution', alias: 'record-finding-resolution', cli: true, prompt: true, internalReason: null,
     description: 'Record a carried audit finding as resolved or code-verified stale in the re-qualification resolution ledger.' },
+  { op: 'set_memory', alias: 'set-memory', cli: true, prompt: true, internalReason: null,
+    description: 'Persist a behavioral lesson or operator preference for future sessions.' },
+  { op: 'set_session_summary', alias: 'set-session-summary', cli: true, prompt: true, internalReason: null,
+    description: 'Record a running summary of session context and progress for continuity across restarts.' },
+
   // ── Internal-only / auto-invoked backend ops (deliberately NOT on the CLI or
   //    resident prompt). They are accepted by the dispatch chain but are invoked
   //    programmatically by the one-shot cycle / operator seams, never as a
@@ -113,6 +122,12 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'set_strategic_challenge', alias: null, cli: false, prompt: false,
     internalReason: 'Persists the independent adversarial challenge record; invoked programmatically by the cycle, not via the CLI.',
     description: "Persist the independent adversarial second-opinion record over the strategist's self-judgments." },
+  { op: 'consume_knowledge', alias: 'consume-knowledge', cli: true, prompt: true, internalReason: null,
+    description: 'Mark a knowledge document as consumed — the strategist has read and acted on it.' },
+  { op: 'dismiss_knowledge', alias: 'dismiss-knowledge', cli: true, prompt: true, internalReason: null,
+    description: 'Mark a knowledge document as dismissed — not actionable, with an optional reason.' },
+  { op: 'request_qualification', alias: 'request-qualification', cli: true, prompt: true, internalReason: null,
+    description: 'Request a fresh release-qualification run directly, without going through set_problem_model.' },
 ];
 
 /** Registry entries surfaced on the `./strategic` CLI, in canonical order. */

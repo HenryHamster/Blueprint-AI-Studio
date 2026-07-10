@@ -22,6 +22,8 @@ from sqlalchemy import select, update
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
 from app.models import (
+    Artifact,
+    ArtifactType,
     LocalRunner,
     Project,
     Task,
@@ -1266,6 +1268,7 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "origin_provenance",
         "sweep_id",
         "arm_label",
+        "lifecycle_status",
     }
 
 
@@ -6307,25 +6310,32 @@ async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(
         )
     await db_session.commit()
 
-    # Create 5 completed claim-tasks with no PR artifacts → stalled_despite_churn
+    # Create 5 completed claim-tasks with unmerged PR artifacts.
     for i in range(5):
+        task = Task(
+            project_id=project.id,
+            title=f"trend claim {i}",
+            description="",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[
+                {
+                    "type": "create",
+                    "prompt": "x",
+                    "current_direction_id": "d-trend01",
+                }
+            ],
+            context={"direction_id": "d-trend01"},
+            plan_output={"summary": "shipped"},
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(task)
+        await db_session.flush()
         db_session.add(
-            Task(
-                project_id=project.id,
-                title=f"trend claim {i}",
-                description="",
-                status=TaskStatus.COMPLETED,
-                created_by="ORCHESTRATOR",
-                payloads=[
-                    {
-                        "type": "create",
-                        "prompt": "x",
-                        "current_direction_id": "d-trend01",
-                    }
-                ],
-                context={"direction_id": "d-trend01"},
-                plan_output={"summary": "shipped"},
-                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.PULL_REQUEST,
+                pr_url=f"https://github.com/test/repo/pull/{task.id.hex[:8]}",
             )
         )
     await db_session.commit()
@@ -13053,6 +13063,43 @@ class TestAnnotateCapabilityProofStatus:
 
         assert _annotate_capability_proof_status is annotate_capability_proof_status
 
+    def test_capability_proof_badge_reflects_reverified_evidence_status(self):
+        """evidence_refs_map overrides proof_records for the badge.
+
+        A capability that has durable proof_records (historically proven) but
+        whose evidence_refs have been re-verified and show no proven=True ref
+        must NOT show 'proven' — the re-verified status takes precedence over
+        the write-once record-existence check.
+        """
+        from app.strategic_spawning import _annotate_capability_proof_status
+
+        vocab = [
+            {"name": "ci-pipeline", "status": "working"},
+            {"name": "repo-map", "status": "working"},
+            {"name": "untracked", "status": "planned"},
+        ]
+        # proof_records says both ci-pipeline and repo-map are "proven" (old logic)
+        proof_records = {
+            "ci-pipeline": [{"task_id": "t1", "proof_kind": "named_test", "proof_ref": "test_ci.py::test_merge", "commit_sha": "abc"}],
+            "repo-map": [{"task_id": "t2", "proof_kind": "named_test", "proof_ref": "test_map.py::test_map", "commit_sha": "def"}],
+        }
+        # evidence_refs_map: ci-pipeline re-verified — backing code removed, proven=False
+        #                    repo-map re-verified — still present, proven=True
+        evidence_refs_map = {
+            "ci-pipeline": [{"kind": "named_test", "ref": "test_ci.py::test_merge", "proven": False}],
+            "repo-map": [{"kind": "named_test", "ref": "test_map.py::test_map", "proven": True}],
+        }
+        out = _annotate_capability_proof_status(vocab, proof_records, evidence_refs_map)
+
+        # repo-map: evidence_refs has proven=True → "proven" (consistent with old logic)
+        assert out[1]["proof_status"] == "proven"
+        # ci-pipeline: evidence_refs has proven=False only → classify_evidence → "partial"
+        # (refs exist but none is proven=True), overriding the stale proof_record
+        assert out[0]["proof_status"] == "partial"
+        assert out[0]["proof_status"] != "proven"
+        # untracked: no entry in evidence_refs_map → falls back to proof_records → "unproven"
+        assert out[2]["proof_status"] == "unproven"
+
 
 # ── _verify_capability_backing_paths: advisory capability verification ────────
 
@@ -19230,6 +19277,103 @@ def test_summarize_self_reflection_log_malformed_never_raises():
     assert _summarize_self_reflection_log("x") == "x"
     assert _summarize_self_reflection_log([]) == []
     assert _summarize_self_reflection_log(["str", 1]) == ["str", 1]
+
+
+def test_build_self_reflection_themes_finds_common_theme():
+    """Themes are extracted when >5 entries share a recurring word in what_was_hard."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    log = [
+        {"what_was_hard": "Missing context on async patterns"},
+        {"what_was_hard": "Needed more context for the change"},
+        {"what_was_hard": "Hard to follow without broader context"},
+        {"what_was_hard": "Confused by missing context in schema"},
+        {"what_was_hard": "Struggled with test context setup"},
+        {"what_was_hard": "Ran out of context for large refactor"},
+    ]
+    result = _build_self_reflection_themes(log)
+    assert isinstance(result, list)
+    assert len(result) >= 1
+    context_themes = [t for t in result if t["theme"] == "context"]
+    assert len(context_themes) == 1
+    assert context_themes[0]["occurrences"] >= 5
+
+
+def test_build_self_reflection_themes_empty_under_six():
+    """Empty result when log has 5 or fewer entries."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    assert _build_self_reflection_themes([]) == []
+    assert _build_self_reflection_themes([{"what_was_hard": "x"}]) == []
+    assert _build_self_reflection_themes([{"what_was_hard": str(i)} for i in range(5)]) == []
+
+
+def test_build_self_reflection_themes_no_commonality():
+    """Empty result when >5 entries have no overlapping significant words."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    log = [
+        {"what_was_hard": "Struggled with python packaging"},
+        {"what_was_hard": "Hard to debug kubernetes networking"},
+        {"what_was_hard": "Confused by react rendering lifecycle"},
+        {"what_was_hard": "Missing documentation for build steps"},
+        {"what_was_hard": "Unexpected behavior in database migrations"},
+        {"what_was_hard": "Could not reproduce flaky integration test"},
+    ]
+    result = _build_self_reflection_themes(log)
+    assert isinstance(result, list)
+    assert result == []
+
+
+def test_build_self_reflection_themes_malformed():
+    """Malformed or None input returns empty list."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    assert _build_self_reflection_themes(None) == []
+    assert _build_self_reflection_themes("x") == []
+    assert _build_self_reflection_themes(42) == []
+    assert _build_self_reflection_themes([123]) == []
+
+
+def test_build_self_reflection_themes_non_dict_entries_in_long_log():
+    """Non-dict entries in a >5-entry log are skipped without raising AttributeError."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    log = [
+        {"what_was_hard": "Missing context for the async change"},
+        {"what_was_hard": "Hard to follow without broader context"},
+        "not a dict",
+        {"what_was_hard": "Confused by missing context in schema"},
+        42,
+        {"what_was_hard": "Struggled with test context setup"},
+        None,
+        {"what_was_hard": "Ran out of context for large refactor"},
+    ]
+    result = _build_self_reflection_themes(log)
+    assert isinstance(result, list)
+    context_themes = [t for t in result if t["theme"] == "context"]
+    assert len(context_themes) == 1
+    assert context_themes[0]["occurrences"] >= 5
+
+
+def test_build_self_reflection_themes_sorts_by_frequency():
+    """Themes are sorted descending by occurrence count, at most 5 returned."""
+    from app.strategic_spawning import _build_self_reflection_themes
+
+    log = [
+        {"what_was_hard": "Something about schema design testing"},
+        {"what_was_hard": "Schema migration was painful testing"},
+        {"what_was_hard": "Could not validate schema testing"},
+        {"what_was_hard": "Schema changes broke everything testing"},
+        {"what_was_hard": "Schema testing took too long"},
+        {"what_was_hard": "Schema and testing both frustrating"},
+    ]
+    result = _build_self_reflection_themes(log)
+    assert len(result) <= 5
+    # Should have schema (6) first, then testing (6)
+    assert result[0]["theme"] == "schema"
+    occurrences = [t["occurrences"] for t in result]
+    assert occurrences == sorted(occurrences, reverse=True)
 
 
 def _oversized_section_fixtures() -> dict:

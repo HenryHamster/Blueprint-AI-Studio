@@ -24,12 +24,16 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 # Baked-in production orchestrator base URL. Keep in sync with the admin-UI
 # constant DEFAULT_ORCHESTRATOR_URL in admin-ui/src/components/FleetRunnersPanel.utils.ts
@@ -62,6 +66,53 @@ _USER_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner.service")
 _SYSTEM_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner-system.service")
 _SYSTEM_WANTED_BY = "multi-user.target"
 
+# Resource-limit env vars: (cli-flag, env-var, argparse-dest, help-text).
+# Used by the install flags and by `status` to show effective config.
+_RESOURCE_LIMIT_VARS: list[tuple[str, str, str, str]] = [
+    (
+        "--max-concurrent",
+        "BLUEPRINT_RUNNER_MAX_CONCURRENT",
+        "max_concurrent",
+        "Max simultaneous agent subprocesses (default: 2).",
+    ),
+    (
+        "--max-concurrent-compute-jobs",
+        "BLUEPRINT_RUNNER_MAX_CONCURRENT_COMPUTE_JOBS",
+        "max_concurrent_compute_jobs",
+        "Max simultaneous compute jobs (default: 2).",
+    ),
+    (
+        "--gpu-indices",
+        "BLUEPRINT_RUNNER_GPU_INDICES",
+        "gpu_indices",
+        "Comma-separated GPU-index allowlist (default: all GPUs).",
+    ),
+    (
+        "--gpus-per-job",
+        "BLUEPRINT_RUNNER_GPUS_PER_JOB",
+        "gpus_per_job",
+        "GPUs assigned per compute job (default: 1).",
+    ),
+    (
+        "--cpu-limit",
+        "BLUEPRINT_RUNNER_CPU_LIMIT",
+        "cpu_limit",
+        "Best-effort CPU cap (cores) per task.",
+    ),
+    (
+        "--mem-limit",
+        "BLUEPRINT_RUNNER_MEM_LIMIT",
+        "mem_limit",
+        "Best-effort memory cap per task (e.g. 8g).",
+    ),
+    (
+        "--min-disk-bytes",
+        "BLUEPRINT_RUNNER_MIN_DISK_BYTES",
+        "min_disk_bytes",
+        "Stop claiming work when free disk space is below this many bytes (default: 0 = disabled).",
+    ),
+]
+
 
 @dataclass(frozen=True)
 class Prereq:
@@ -85,6 +136,26 @@ def _node_major() -> int | None:
         return None
     match = re.match(r"v?(\d+)\.", result.stdout.strip())
     return int(match.group(1)) if match else None
+
+
+def _check_provider_credentials() -> bool:
+    """Return True iff at least one LLM provider credential is set in the environment.
+
+    The agent subprocess needs at least one of these to authenticate with an LLM
+    backend.  A runner CAN start without them (compute-only jobs do not need LLM
+    access), but ``--check`` should warn the operator so they are not surprised when
+    every agent task fails at PRE_CLAIM_FAILED.
+
+    The checked env-variable names are the primary credential keys from
+    ``runner_isolation.AGENT_ENV_ALLOWLIST``.
+    """
+    _CREDENTIAL_KEYS = (
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ZAI_API_KEY",
+        "OPENAI_API_KEY",
+    )
+    return any(os.environ.get(k, "").strip() for k in _CREDENTIAL_KEYS)
 
 
 def check_prerequisites() -> list[Prereq]:
@@ -566,7 +637,30 @@ def _print_no_systemd_guidance(*, system: bool) -> None:
     )
 
 
-def _write_env_file(path: str, *, url: str, token: str | None) -> None:
+def _read_env_file(path: str) -> dict[str, str]:
+    """Parse key=value pairs from a runner.env file, skipping blank lines and comments."""
+    result: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, val = line.partition("=")
+                    result[key.strip()] = val.strip()
+    except OSError:
+        pass
+    return result
+
+
+def _write_env_file(
+    path: str,
+    *,
+    url: str,
+    token: str | None,
+    resource_limits: dict[str, str] | None = None,
+) -> None:
     """Seed the 0600 EnvironmentFile so the service has its config on first start.
 
     The orchestrator URL is required (local_runner._require_env). The token is
@@ -574,6 +668,9 @@ def _write_env_file(path: str, *, url: str, token: str | None) -> None:
     persists it to ``runner_token`` and the service reads it from there, so we
     prefer not to keep it here indefinitely, but seeding it makes a fresh install
     connect on its very first boot with no manual step.
+
+    ``resource_limits`` maps env-var name to value string for any resource-limit
+    knobs the operator supplied at install time (all optional).
     """
     cred_dir = os.path.dirname(path)
     os.makedirs(cred_dir, exist_ok=True)
@@ -587,6 +684,9 @@ def _write_env_file(path: str, *, url: str, token: str | None) -> None:
     ]
     if token:
         lines.append(f"BLUEPRINT_RUNNER_TOKEN={token}\n")
+    if resource_limits:
+        for env_var, value in resource_limits.items():
+            lines.append(f"{env_var}={value}\n")
     with open(path, "w", encoding="utf-8") as fh:
         fh.writelines(lines)
     try:
@@ -601,6 +701,7 @@ def do_install(
     token: str | None = None,
     url: str,
     dry_run: bool = False,
+    resource_limits: dict[str, str] | None = None,
     _run=subprocess.run,
 ) -> int:
     """Render, install, enable, and persist the runner service. Returns rc."""
@@ -640,7 +741,7 @@ def do_install(
         print("\n" + unit_text, flush=True)
         return 0
 
-    _write_env_file(env_file, url=url, token=token)
+    _write_env_file(env_file, url=url, token=token, resource_limits=resource_limits)
 
     try:
         os.makedirs(os.path.dirname(unit_path), exist_ok=True)
@@ -756,6 +857,35 @@ def do_uninstall(*, system: bool = False, dry_run: bool = False, _run=subprocess
         flush=True,
     )
     return 0
+
+
+def _restart_runner_service(*, _run=subprocess.run) -> bool:
+    """Restart the runner systemd service if it is installed and active.
+
+    Checks both user and system scopes, restarting the first active unit
+    found. User scope is checked first (the common case for a local runner
+    installed by a non-root operator).
+
+    Returns True if a restart was performed, False otherwise.
+    """
+    if shutil.which("systemctl") is None:
+        return False
+
+    for system in (False, True):
+        unit_path = _system_unit_path() if system else _user_unit_path()
+        if not os.path.isfile(unit_path):
+            continue
+        result = _systemctl(["is-active", SERVICE_UNIT_NAME], system=system, _run=_run)
+        if getattr(result, "returncode", 1) == 0:
+            scope_label = "system" if system else "user"
+            print(
+                f"[blueprint-runner] restarting {SERVICE_UNIT_NAME} "
+                f"({scope_label} scope)...",
+                flush=True,
+            )
+            _systemctl(["restart", SERVICE_UNIT_NAME], system=system, _run=_run)
+            return True
+    return False
 
 
 # ── update (efficient self-update via git) ─────────────────────────────────────
@@ -890,8 +1020,153 @@ def do_update(
                         file=sys.stderr, flush=True,
                     )
 
+    _restart_runner_service(_run=_run)
+
     print("[blueprint-runner] update complete.", flush=True)
     return 0
+
+
+def do_status() -> int:
+    """Read and print ``~/.blueprint/status.json`` in a human-readable summary.
+
+    The status file is written by the runner on every heartbeat (see
+    ``local_runner._write_status_json``).  It contains no secrets — only the
+    runner identity, last heartbeat timestamp, active work, and detected
+    isolation capabilities.
+
+    Returns 0 on success, 1 when the file is missing or unreadable.
+    """
+    path = os.path.join(_credential_dir(), "status.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(
+            f"ERROR: status file not found at {path}",
+            file=sys.stderr,
+        )
+        print(
+            "  The runner may not have started yet, or ~/.blueprint is empty.",
+            file=sys.stderr,
+        )
+        return 1
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: could not parse {path}: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"ERROR: could not read {path}: {exc}", file=sys.stderr)
+        return 1
+
+    # ── Compute how long ago the last heartbeat was ──
+    last_hb = str(data.get("last_heartbeat_at", "") or "")
+    time_ago_str = ""
+    hb_seconds_ago: int | None = None
+    if last_hb:
+        try:
+            hb_dt = datetime.fromisoformat(last_hb)
+            if hb_dt.tzinfo is None:
+                hb_dt = hb_dt.replace(tzinfo=timezone.utc)
+            delta = datetime.now(timezone.utc) - hb_dt
+            seconds = int(delta.total_seconds())
+            hb_seconds_ago = seconds
+            if seconds < 0:
+                time_ago_str = " (in the future — clock skew?)"
+            elif seconds < 60:
+                time_ago_str = f" ({seconds}s ago)"
+            elif seconds < 3600:
+                time_ago_str = f" ({seconds // 60}m {seconds % 60}s ago)"
+            else:
+                hrs = seconds // 3600
+                mins = (seconds % 3600) // 60
+                time_ago_str = f" ({hrs}h {mins}m ago)" if hrs < 24 else f" ({hrs // 24}d {hrs % 24}h ago)"
+        except (ValueError, TypeError):
+            time_ago_str = " (unparseable timestamp)"
+
+    active_tasks = data.get("active_task_ids") or []
+    active_compute = data.get("active_compute_job_ids") or []
+    bwrap = data.get("bwrap_ok")
+    docker = data.get("docker_usable")
+
+    print("blueprint-runner status", flush=True)
+    print(f"  runner_id              : {data.get('runner_id', 'N/A')}", flush=True)
+    print(f"  last_heartbeat_at      : {last_hb}{time_ago_str}", flush=True)
+    print(f"  last_heartbeat_status  : {data.get('last_heartbeat_status', 'N/A')}", flush=True)
+    print(f"  active_task_ids        : {', '.join(str(t) for t in active_tasks) if active_tasks else 'none'}", flush=True)
+    print(f"  active_compute_job_ids : {', '.join(str(j) for j in active_compute) if active_compute else 'none'}", flush=True)
+    if bwrap is not None:
+        print(f"  bwrap_ok               : {bwrap}", flush=True)
+    if docker is not None:
+        print(f"  docker_usable          : {docker}", flush=True)
+    agent = data.get("agent_backend")
+    compute = data.get("compute_backend")
+    if agent:
+        print(f"  agent_backend          : {agent}", flush=True)
+    if compute:
+        print(f"  compute_backend        : {compute}", flush=True)
+
+    # Health assessment
+    if hb_seconds_ago is not None:
+        if hb_seconds_ago > 120:
+            print(f"  health                 : STALE (no heartbeat in {hb_seconds_ago}s)", flush=True)
+        else:
+            print("  health                 : OK", flush=True)
+
+    # ── Resource-limit config (from runner.env) ──
+    env_file = _env_file_path()
+    env_vars = _read_env_file(env_file)
+    env_file_found = bool(env_vars) or os.path.exists(env_file)
+    print("", flush=True)
+    print("resource limits (from runner.env):", flush=True)
+    if not env_file_found:
+        print(f"  (env file not found at {env_file} — runner may not be installed as a service)", flush=True)
+    for _flag, env_var, _dest, _help in _RESOURCE_LIMIT_VARS:
+        value = env_vars.get(env_var)
+        display = value if value is not None else "not set (using default)"
+        label = env_var.lower().replace("blueprint_runner_", "").replace("_", "-")
+        print(f"  {label:<34}: {display}", flush=True)
+
+    return 0
+
+
+def _post_update_result(
+    url: str,
+    token: str,
+    *,
+    status: str,
+    old_version: str | None = None,
+    new_version: str | None = None,
+) -> None:
+    """POST the update outcome to the orchestrator. Best-effort, never raises.
+
+    ``status`` must be ``"success"`` or ``"failure"``.  Uses Python stdlib
+    ``urllib`` so there is no extra dependency.  Any HTTP / network / timeout
+    error is silently swallowed — the update CLI must never block on this.
+
+    Called from ``main()`` after ``do_update()`` returns.
+    """
+    endpoint = f"{url}/api/runner/update-report"
+    body = json.dumps(
+        {
+            "status": status,
+            "old_version": old_version,
+            "new_version": new_version,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        pass  # Best-effort — never fail the update CLI over a notification
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -903,7 +1178,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(
-        dest="command", metavar="{start,check,install,uninstall,update}"
+        dest="command", metavar="{start,check,install,uninstall,update,status}"
     )
     for name, help_text in (
         ("start", "Run the runner (blocks; Ctrl-C for graceful shutdown)."),
@@ -991,6 +1266,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Print the rendered unit and the commands that would run, without touching the host.",
     )
+    for _flag, _env_var, _dest, _help_text in _RESOURCE_LIMIT_VARS:
+        install_parser.add_argument(_flag, dest=_dest, default=None, help=_help_text)
 
     uninstall_parser = sub.add_parser(
         "uninstall",
@@ -1014,7 +1291,47 @@ def build_parser() -> argparse.ArgumentParser:
         "update",
         help="Update the local checkout and reinstall dependencies only when needed.",
     )
+    sub.add_parser(
+        "status",
+        help="Show runner process status from ~/.blueprint/status.json.",
+    )
     return parser
+
+
+def _run_update_and_report() -> int:
+    """Run ``do_update()``, capture version before/after, and report to orchestrator.
+
+    Best-effort POST to ``/api/runner/update-report`` so the operator console
+    surfaces the outcome.  A reporting failure is silently swallowed — the CLI
+    returns ``do_update()``'s exit code regardless.
+    """
+    # Capture version before update.
+    old_version: str | None = None
+    head_result = _git(["rev-parse", "HEAD"], cwd=_REPO_ROOT)
+    if head_result and head_result.returncode == 0:
+        old_version = head_result.stdout.strip()
+
+    rc = do_update()
+
+    # Capture version after update.
+    new_version: str | None = None
+    head_result = _git(["rev-parse", "HEAD"], cwd=_REPO_ROOT)
+    if head_result and head_result.returncode == 0:
+        new_version = head_result.stdout.strip()
+
+    # Report to orchestrator (best-effort).
+    try:
+        _post_update_result(
+            url=resolve_url(None),
+            token=resolve_token(None),
+            status="success" if rc == 0 else "failure",
+            old_version=old_version,
+            new_version=new_version,
+        )
+    except Exception:
+        pass
+
+    return rc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1026,7 +1343,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.command == "update":
-        return do_update()
+        return _run_update_and_report()
 
     if args.command == "uninstall":
         return do_uninstall(
@@ -1034,14 +1351,23 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=getattr(args, "dry_run", False),
         )
 
+    if args.command == "status":
+        return do_status()
+
     if args.command == "install":
         # The token is OPTIONAL for install: if omitted, the service reads the
         # persisted ~/.blueprint/runner_token written on the runner's first start.
+        resource_limits: dict[str, str] = {}
+        for _flag, env_var, dest, _help in _RESOURCE_LIMIT_VARS:
+            val = getattr(args, dest, None)
+            if val is not None:
+                resource_limits[env_var] = str(val)
         return do_install(
             system=getattr(args, "system", False),
             token=resolve_token(getattr(args, "token", None)),
             url=resolve_url(getattr(args, "url", None)),
             dry_run=getattr(args, "dry_run", False),
+            resource_limits=resource_limits or None,
         )
 
     token = resolve_token(getattr(args, "token", None))
@@ -1061,6 +1387,15 @@ def main(argv: list[str] | None = None) -> int:
     prereqs = check_prerequisites()
     _print_prereqs(prereqs, url)
     missing = [p for p in prereqs if not p.ok]
+
+    if not _check_provider_credentials():
+        print(
+            "  [WARNING] No LLM provider credential found (ANTHROPIC_API_KEY, "
+            "CLAUDE_CODE_OAUTH_TOKEN, ZAI_API_KEY, or OPENAI_API_KEY) — agent "
+            "tasks that require LLM access will fail at PRE_CLAIM_FAILED. "
+            "Compute-only runners are unaffected.",
+            flush=True,
+        )
 
     # Docker-agent opt-in: explicit --docker-agent flag, BLUEPRINT_AGENT_BACKEND=docker,
     # or --pull (pulling a registry image is inherently a docker operation). Without an

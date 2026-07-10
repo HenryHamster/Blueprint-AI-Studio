@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { memo, useMemo, type ReactNode } from 'react';
 import { Activity, ArrowUpRight, CircleAlert, Cpu, CreditCard, GitBranch, Network, Radio, X } from 'lucide-react';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
@@ -22,9 +22,12 @@ import {
   removeStrategicSelectedRef,
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
+import type { StrategicLiveActivity } from '../utils/strategicSessionLive';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
+import { StrategicActivityStrip } from './StrategicLiveTurn';
 import type { StrategicAccountSpendStatus } from './StrategicSessionControl';
 import { WorkbenchPanel } from './WorkbenchLayout';
+import { RailMiniCanvas } from './RailMiniCanvas';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
 type TaskFocusBucketKey = 'needs_judgment' | 'active' | 'friction' | 'queued' | 'recent_completed';
@@ -40,6 +43,7 @@ interface StrategicContextRailProps {
   strategistActive?: boolean;
   cycleProgress?: StrategicCycleProgress | null;
   lastCycleCompletion?: StrategicCycleCompletion | null;
+  liveActivity?: StrategicLiveActivity;
   onOpenProjectSection: (section: ProjectTarget) => void;
   onOpenPipeline: () => void;
   onOpenRuntimeHealth: () => void;
@@ -627,12 +631,21 @@ function TaskFocusRow({
   onOpenTask?: (taskId: string) => void;
 }) {
   const detail = taskFocusDetail(item);
+  const stepLabel =
+    item.bucket === 'active' && item.task_type
+      ? item.task_type.replace(/_/g, ' ')
+      : null;
   const content = (
     <>
       <div className="flex min-w-0 items-center justify-between gap-2">
         <span className="truncate text-xs font-semibold text-neutral-200">{item.title || item.id}</span>
         <span className="shrink-0 font-mono text-ui-sm text-neutral-600">{shortId(item.id)}</span>
       </div>
+      {stepLabel && (
+        <p className="mt-0.5 text-xs font-medium text-cyan-400/70 uppercase tracking-wider">
+          {stepLabel}
+        </p>
+      )}
       <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-neutral-500">{detail}</p>
     </>
   );
@@ -751,13 +764,27 @@ function ContextPackageBlock({
   );
 }
 
-export function StrategicContextRail({
+/** Ephemeral live-activity section at the top of the rail. Self-hides when
+ *  the activity strip has nothing to show (idle or turn finished). */
+function RailLiveActivitySection({ liveActivity }: { liveActivity?: StrategicLiveActivity }) {
+  if (!liveActivity) return null;
+  const { items, latestLifecycle } = liveActivity;
+  if (!items.length || latestLifecycle === 'done') return null;
+  return (
+    <div className="border-b border-neutral-800 pb-3" data-testid="rail-live-activity">
+      <StrategicActivityStrip items={items.slice(-3)} latestLifecycle={latestLifecycle} />
+    </div>
+  );
+}
+
+export const StrategicContextRail = memo(function StrategicContextRail({
   state,
   loading = false,
   error = null,
   strategistActive = false,
   cycleProgress = null,
   lastCycleCompletion = null,
+  liveActivity,
   onOpenProjectSection,
   onOpenPipeline,
   onOpenRuntimeHealth,
@@ -781,7 +808,7 @@ export function StrategicContextRail({
   const pendingSteer = state?.strategic.refresh.pending ?? null;
   const latestCycle = state?.strategic.latest_cycle ?? null;
   const attention = state?.attention ?? null;
-  const attentionItems = attention?.items.slice(0, 2) ?? [];
+  const attentionItems = useMemo(() => attention?.items.slice(0, 2) ?? [], [attention?.items]);
   const staleCycle = Boolean(activeCycle?.stale);
   const shaFreshness = state?.sha_freshness ?? null;
   const operatorSteerQueued = Boolean(
@@ -857,15 +884,29 @@ export function StrategicContextRail({
   const accountActionLabel = onOpenAccounts ? 'accounts' : 'spend';
   const workSessionActions = state?.work_session?.actions ?? [];
   const workSessionEvents = state?.work_session?.events?.items ?? [];
-  const visibleWorkSessionActions = workSessionActions.filter(action => action.enabled).slice(0, 4);
-  const visibleWorkSessionActionIds = new Set(visibleWorkSessionActions.map(action => action.id));
-  const visibleAttentionItems = attentionItems.filter(item => !visibleWorkSessionActionIds.has(`attention.${item.id}`));
-  const actionableWorkSessionEvents = workSessionEvents.filter(workSessionEventHasActionableSignal).slice(0, 2);
+  const visibleWorkSessionActions = useMemo(
+    () => workSessionActions.filter(action => action.enabled).slice(0, 4),
+    [workSessionActions],
+  );
+  const visibleWorkSessionActionIds = useMemo(
+    () => new Set(visibleWorkSessionActions.map(action => action.id)),
+    [visibleWorkSessionActions],
+  );
+  const visibleAttentionItems = useMemo(
+    () => attentionItems.filter(item => !visibleWorkSessionActionIds.has(`attention.${item.id}`)),
+    [attentionItems, visibleWorkSessionActionIds],
+  );
+  const actionableWorkSessionEvents = useMemo(
+    () => workSessionEvents.filter(workSessionEventHasActionableSignal).slice(0, 2),
+    [workSessionEvents],
+  );
   const showActionableSessionActivity = visibleWorkSessionActions.length === 0 && actionableWorkSessionEvents.length > 0;
   const selectedRefs = workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [];
   const workSessionDescriptors = state?.work_session?.selected_ref_descriptors ?? [];
-  const descriptorByRef = new Map(workSessionDescriptors.map(descriptor => [sessionRefKey(descriptor), descriptor]));
-  const selectedRefDescriptors = selectedRefs.map(ref => descriptorByRef.get(sessionRefKey(ref)) ?? fallbackRefDescriptor(ref));
+  const selectedRefDescriptors = useMemo(() => {
+    const descriptorByRef = new Map(workSessionDescriptors.map(descriptor => [sessionRefKey(descriptor), descriptor]));
+    return selectedRefs.map(ref => descriptorByRef.get(sessionRefKey(ref)) ?? fallbackRefDescriptor(ref));
+  }, [workSessionDescriptors, selectedRefs]);
 
   function attentionItemAction(item: StrategicStateAttentionItem): (() => void) | undefined {
     if (item.target?.surface === 'task') {
@@ -963,6 +1004,7 @@ export function StrategicContextRail({
 
   return (
     <div className="space-y-3" data-testid="strategic-context-rail">
+      <RailLiveActivitySection liveActivity={liveActivity} />
       <WorkbenchPanel title="Strategic" meta={loading ? 'loading' : error ? 'stale' : 'live'}>
         <div className="flex min-w-0 items-start gap-3">
           <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${statusTone}`} aria-hidden="true" />
@@ -1179,6 +1221,12 @@ export function StrategicContextRail({
               </div>
             </div>
           </div>
+          <RailMiniCanvas
+            canvas={state?.context_package?.canvas}
+            strategistActive={isWorking}
+            activeTaskLabel={state?.strategic.active_task?.title ?? null}
+            activeDirectionLabel={state?.directions.primary?.text ?? null}
+          />
           <ContextPackageBlock
             contextPackage={state?.context_package}
             sessionRefs={selectedRefDescriptors}
@@ -1204,4 +1252,4 @@ export function StrategicContextRail({
       </WorkbenchPanel>
     </div>
   );
-}
+});

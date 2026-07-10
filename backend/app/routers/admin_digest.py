@@ -148,7 +148,11 @@ from app.routers.admin_release_version import (  # noqa: E402, F401
 from app.anomaly_detection import (  # noqa: E402, F401
     get_anomaly_tracker_snapshot,
 )
+from app.cost_telemetry_reconciliation import (  # noqa: E402, F401
+    reconcile_llm_cost,
+)
 from app.efficiency_snapshot import (  # noqa: E402, F401
+    compute_provider_routing_share,
     compute_provider_routing_verdict,
     get_efficiency_axes,
     get_llm_cost_breakdown,
@@ -343,6 +347,8 @@ DIGEST_PAYLOAD_METRIC_MANIFEST: dict[str, dict] = {
     "cost_per_merge_by_type": {"consumer": "CatchUpCostDiagnosticsSection"},
     "median_cost_per_merge_by_type": {"consumer": "CatchUpCostDiagnosticsSection"},
     "effort_model_efficiency": {"consumer": "DashboardHome"},
+    "provider_routing_share": {"consumer": "EffortEfficiencyPanel"},
+    "cost_telemetry_reconciliation": {"consumer": "EffortEfficiencyPanel"},
     "overall_type_distribution": {"consumer": "CatchUpStatsRow"},
     "total_estimated_cost_usd": {"consumer": "CatchUpStatsRow"},
     "spot_cost_usd": {"consumer": "CatchUpStatsRow"},
@@ -1325,6 +1331,21 @@ async def _compute_digest(
     effort_model_efficiency["provider_routing_verdict"] = (
         compute_provider_routing_verdict(effort_model_efficiency["by_model"])
     )
+    # Per-provider routing share derived from the same by-model rows — shows
+    # task count and verified merge rate by provider at a glance.
+    effort_model_efficiency["provider_routing_share"] = (
+        compute_provider_routing_share(effort_model_efficiency["by_model"])
+    )
+    # Cost-telemetry reconciliation: recompute LLM cost and cache-hit rate via a
+    # structurally independent path to surface whether the primary cost telemetry
+    # is trustworthy within declared tolerance. Injected into the efficiency dict
+    # and surfaced as a top-level key for the EffortEfficiencyPanel trust indicator.
+    _reconciliation_window = completed_tasks + failed_tasks + cancelled_tasks
+    effort_model_efficiency["cost_telemetry_reconciliation"] = (
+        reconcile_llm_cost(_reconciliation_window).asdict()
+        if _reconciliation_window
+        else None
+    )
 
     # --- Scope mismatch diagnostics ---
     # Aggregate calibration data across terminal tasks in the window to surface
@@ -2103,6 +2124,12 @@ async def _compute_digest(
         "cost_per_merge_by_type": cost_per_merge_by_type,
         "median_cost_per_merge_by_type": _median_cpm_by_type,
         "effort_model_efficiency": effort_model_efficiency,
+        "provider_routing_share": effort_model_efficiency.get(
+            "provider_routing_share"
+        ),
+        "cost_telemetry_reconciliation": effort_model_efficiency.get(
+            "cost_telemetry_reconciliation"
+        ),
         "overall_type_distribution": overall_type_distribution or None,
         "total_estimated_cost_usd": total_estimated_cost_usd,
         "spot_cost_usd": total_spot_cost_usd,

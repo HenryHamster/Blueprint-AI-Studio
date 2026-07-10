@@ -1954,11 +1954,13 @@ async def test_add_max_plan_account_secret_manager_failure_returns_503(
         "Orphaned MaxPlanAccount row must not persist after SM failure"
     )
 
-    # None of the surviving rows may carry a plaintext secret.
+    # None of the surviving rows may carry a plaintext secret (decrypt to check SM path).
+    from app.field_encryption import decrypt_field as _df
     all_accounts = (await db_session.execute(select(MaxPlanAccount))).scalars().all()
     for acct in all_accounts:
+        ref = _df(acct.secret_blob_ref)
         assert not (
-            acct.secret_blob_ref and not acct.secret_blob_ref.startswith("projects/")
+            ref and not ref.startswith("projects/")
         ), (
             f"Account {acct.id} has a plaintext secret_blob_ref: {acct.secret_blob_ref!r}"
         )
@@ -2231,4 +2233,164 @@ async def test_reset_rate_limits_clears_disabled_at_column(client, db_session):
     assert acct.disabled_at is None
     assert acct.enabled is True
     assert acct.disabled_reason is None
+
+
+@pytest.mark.anyio
+async def test_claude_config_json_encrypted_at_rest_on_create(
+    client, db_session, mocker
+):
+    """claude_config_json is encrypted in DB and omitted from the API response."""
+    from cryptography.fernet import Fernet
+    from app.field_encryption import decrypt_field
+
+    key = Fernet.generate_key().decode()
+    mocker.patch.dict("os.environ", {"GITHUB_PAT_ENCRYPTION_KEY": key})
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/acct/versions/1"),
+    )
+
+    plaintext_config = '{"onboardingAccepted":true}'
+    res = await client.post(
+        "/api/admin/max-plan-accounts",
+        json={
+            "name": "Anthropic OAuth Encrypted",
+            "provider": "anthropic",
+            "auth_mode": "oauth",
+            "secret": "sk-ant-oat01-valid",
+            "claude_config_json": plaintext_config,
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # Credential material must not be echoed back by the create endpoint.
+    assert "claude_config_json" not in body
+    assert plaintext_config not in res.text
+
+    # DB row stores the encrypted value (not the original plaintext)
+    from app.models import MaxPlanAccount
+    from sqlmodel import select
+
+    acct = await db_session.scalar(select(MaxPlanAccount))
+    assert acct is not None
+    assert acct.claude_config_json != plaintext_config
+    assert decrypt_field(acct.claude_config_json) == plaintext_config
+
+
+@pytest.mark.anyio
+async def test_claude_config_json_encrypted_at_rest_on_update(
+    client, db_session, mocker
+):
+    """Updating claude_config_json via PATCH stores the value encrypted in DB."""
+    from cryptography.fernet import Fernet
+    from app.field_encryption import decrypt_field
+
+    key = Fernet.generate_key().decode()
+    mocker.patch.dict("os.environ", {"GITHUB_PAT_ENCRYPTION_KEY": key})
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/acct/versions/1"),
+    )
+
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="Anthropic OAuth Update Test",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/acct/versions/1",
+        secret_blob_ref="projects/test/secrets/acct/versions/1",
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    new_config = '{"sessionToken":"secret-session-abc"}'
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}",
+        json={"claude_config_json": new_config},
+    )
+    assert res.status_code == 200, res.text
+
+    await db_session.refresh(acct)
+    # DB value is encrypted
+    assert acct.claude_config_json != new_config
+    assert decrypt_field(acct.claude_config_json) == new_config
     assert acct.rate_limit_state is None
+
+
+@pytest.mark.anyio
+async def test_secret_blob_ref_encrypted_at_rest_on_create(
+    client, db_session, mocker
+):
+    """secret_blob_ref is stored encrypted in DB on create."""
+    from cryptography.fernet import Fernet
+    from app.field_encryption import decrypt_field
+
+    key = Fernet.generate_key().decode()
+    mocker.patch.dict("os.environ", {"GITHUB_PAT_ENCRYPTION_KEY": key})
+    sm_ref = "projects/test/secrets/acct-enc/versions/1"
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value=sm_ref),
+    )
+
+    res = await client.post(
+        "/api/admin/max-plan-accounts",
+        json={"name": "Encrypted SBR Create", "oauth_token": "sk-ant-oat01-enc"},
+    )
+    assert res.status_code == 200, res.text
+
+    acct = (
+        (
+            await db_session.execute(
+                select(MaxPlanAccount).where(
+                    MaxPlanAccount.name == "Encrypted SBR Create"
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    # Raw DB value must be encrypted (not equal to the SM path).
+    assert acct.secret_blob_ref != sm_ref
+    # Decrypted value must equal the original SM path.
+    assert decrypt_field(acct.secret_blob_ref) == sm_ref
+
+
+@pytest.mark.anyio
+async def test_secret_blob_ref_encrypted_at_rest_on_update(
+    client, db_session, mocker
+):
+    """Updating the secret via PATCH stores secret_blob_ref encrypted in DB."""
+    from cryptography.fernet import Fernet
+    from app.field_encryption import decrypt_field
+
+    key = Fernet.generate_key().decode()
+    mocker.patch.dict("os.environ", {"GITHUB_PAT_ENCRYPTION_KEY": key})
+    sm_ref = "projects/test/secrets/acct-enc-patch/versions/1"
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value=sm_ref),
+    )
+
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="SBR Patch Enc Test",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/old/versions/1",
+        secret_blob_ref="projects/test/secrets/old/versions/1",
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}",
+        json={"secret": "sk-ant-oat01-new_secret"},
+    )
+    assert res.status_code == 200, res.text
+
+    await db_session.refresh(acct)
+    # Raw DB value must be encrypted.
+    assert acct.secret_blob_ref != sm_ref
+    # Decrypted value must equal the new SM path.
+    assert decrypt_field(acct.secret_blob_ref) == sm_ref

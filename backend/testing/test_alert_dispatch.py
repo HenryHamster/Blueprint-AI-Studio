@@ -1430,3 +1430,542 @@ async def test_local_runner_hold_alert_handles_notification_failure(
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
     assert alerts[0].task_id == task.id
+
+
+# ── Runner idle-GPU alert ────────────────────────────────────────────────────
+
+from app.alert_dispatch import (  # noqa: E402
+    _RUNNER_IDLE_GPU_EVENT_TYPE,
+    _maybe_create_runner_idle_gpu_alert,
+    _resolve_runner_idle_gpu_alert,
+)
+
+
+async def _idle_gpu_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _RUNNER_IDLE_GPU_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_runner_idle_gpu_alert_creates_and_broadcasts(db_session, mocker):
+    """A GPU runner below the utilization floor raises one WARNING alert and broadcasts it."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    threshold_pct = 10
+    gpu_utilization_pct = 2.0  # 2% — well below idle threshold
+
+    created = await _maybe_create_runner_idle_gpu_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="gpu-runner-01",
+        gpu_utilization_pct=gpu_utilization_pct,
+        threshold_pct=threshold_pct,
+    )
+
+    assert created is True
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "idle" in alert.title.lower()
+    assert "2%" in alert.message  # 2% utilization
+    assert "10%" in alert.message  # 10% threshold
+    bcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_runner_idle_gpu_alert_deduped(db_session, mocker):
+    """Repeated sweep passes create exactly one alert row."""
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    for _ in range(3):
+        await _maybe_create_runner_idle_gpu_alert(
+            db_session,
+            project_id=project.id,
+            runner_id=runner_id,
+            hostname="gpu-runner-01",
+            gpu_utilization_pct=2.0,
+            threshold_pct=10,
+        )
+
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1, "repeated sweep passes must dedup to one alert"
+
+
+@pytest.mark.asyncio
+async def test_runner_idle_gpu_alert_auto_resolves_on_recovery(db_session, mocker):
+    """Alert fires when GPU is idle and auto-resolves when GPU utilization recovers."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    threshold_pct = 10
+
+    # Runner reports idle GPU → alert fires.
+    created = await _maybe_create_runner_idle_gpu_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="gpu-runner-01",
+        gpu_utilization_pct=2.0,
+        threshold_pct=threshold_pct,
+    )
+    assert created is True
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].dismissed_at is None
+
+    # GPU utilization recovers → alert resolves.
+    resolved = await _resolve_runner_idle_gpu_alert(db_session, project.id, runner_id)
+    assert resolved == 1
+
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "alert must dismiss once GPU utilization recovers"
+
+    # Broadcast: once for create, once for dismiss.
+    assert bcast.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_idle_gpu_runner_check_integration(db_session, mocker):
+    """_check_degraded_runners raises an idle-GPU alert and auto-resolves on recovery."""
+    from app.models import LocalRunner
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+    from app.time_utils import _utcnow
+
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Active GPU runner reporting idle utilization (2% — well below the 10% default threshold).
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="hash-idle-gpu",
+        status="active",
+        last_seen_at=_utcnow(),
+        consecutive_job_failures=0,
+        capabilities={"gpu_utilization_pct": 2},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep → idle-GPU alert must fire.
+    await _check_degraded_runners(db_session)
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].dismissed_at is None
+
+    # Second sweep → deduplication (no second alert).
+    await _check_degraded_runners(db_session)
+    alerts = await _idle_gpu_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+    # Runner GPU utilization recovers (80% — above the 10% threshold).
+    await db_session.refresh(runner)
+    caps = dict(runner.capabilities or {})
+    caps["gpu_utilization_pct"] = 80
+    runner.capabilities = caps
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep again → alert must be dismissed.
+    await _check_degraded_runners(db_session)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "idle-GPU alert must auto-resolve on recovery"
+
+
+# ── Runner token-stale alert ──────────────────────────────────────────────────
+
+from app.alert_dispatch import (  # noqa: E402
+    _RUNNER_TOKEN_STALE_EVENT_TYPE,
+    _maybe_create_runner_token_stale_alert,
+)
+
+
+async def _stale_token_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _RUNNER_TOKEN_STALE_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+# ── Low-memory runner alert ────────────────────────────────────────────────────
+
+from app.alert_dispatch import (  # noqa: E402
+    _RUNNER_LOW_MEMORY_EVENT_TYPE,
+    _maybe_create_runner_low_memory_alert,
+    _resolve_runner_low_memory_alert,
+)
+
+
+async def _low_memory_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _RUNNER_LOW_MEMORY_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_runner_stale_token_alert_creates_and_resolves_via_sweep(db_session, mocker):
+    """_check_degraded_runners raises a token-stale WARNING alert and auto-resolves on rotation."""
+    from app.models import LocalRunner
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+    from app.time_utils import _utcnow
+
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Active runner with a stale token (>90 days).
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="hash-stale-token",
+        status="active",
+        last_seen_at=_utcnow(),
+        consecutive_job_failures=0,
+        token_created_at=_utcnow() - _timedelta(days=100),
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep → token-stale alert must fire.
+    await _check_degraded_runners(db_session)
+    alerts = await _stale_token_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].dismissed_at is None
+
+    # Second sweep → deduplication (no second alert).
+    await _check_degraded_runners(db_session)
+    alerts = await _stale_token_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+    # Runner rotates token (token_created_at updated to now).
+    await db_session.refresh(runner)
+    runner.token_created_at = _utcnow() - _timedelta(days=1)  # 1 day old — well within threshold
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep again → alert must be dismissed.
+    await _check_degraded_runners(db_session)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "stale-token alert must auto-resolve on token rotation"
+
+
+@pytest.mark.asyncio
+async def test_runner_stale_token_alert_creates_and_broadcasts(db_session, mocker):
+    """A runner with an old token raises one WARNING alert and broadcasts it."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    token_age_days = 100
+    threshold_days = 90
+
+    created = await _maybe_create_runner_token_stale_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="old-token-runner",
+        token_age_days=token_age_days,
+        threshold_days=threshold_days,
+    )
+
+    assert created is True
+    alerts = await _stale_token_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "stale" in alert.title.lower()
+    assert "100" in alert.message
+    bcast.assert_awaited_once()
+
+
+# ── Low-memory runner alert tests ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_runner_low_memory_alert_creates_and_broadcasts(db_session, mocker):
+    """A runner below the memory floor raises one WARNING alert and broadcasts it."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    threshold = 1_073_741_824  # 1 GiB
+    mem_free = 100_000_000     # ~95 MB — below threshold
+
+    created = await _maybe_create_runner_low_memory_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="runner-mem-01",
+        memory_free_bytes=mem_free,
+        threshold_bytes=threshold,
+    )
+
+    assert created is True
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "low memory" in alert.title.lower()
+    assert "95" in alert.message  # ~95 MB free
+    assert "1024" in alert.message  # 1.0 GiB = 1024 MB threshold
+    bcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_runner_low_memory_alert_deduped(db_session, mocker):
+    """Repeated sweep passes create exactly one alert row."""
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    for _ in range(3):
+        await _maybe_create_runner_low_memory_alert(
+            db_session,
+            project_id=project.id,
+            runner_id=runner_id,
+            hostname="runner-mem-01",
+            memory_free_bytes=100_000_000,
+            threshold_bytes=1_073_741_824,
+        )
+
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1, "repeated sweep passes must dedup to one alert"
+
+
+@pytest.mark.asyncio
+async def test_runner_low_memory_alert_auto_resolves_on_recovery(db_session, mocker):
+    """Alert fires when memory is low and auto-resolves when memory recovers."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    threshold = 1_073_741_824  # 1 GiB
+
+    # Runner reports low memory → alert fires.
+    created = await _maybe_create_runner_low_memory_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="runner-mem-01",
+        memory_free_bytes=100_000_000,
+        threshold_bytes=threshold,
+    )
+    assert created is True
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].dismissed_at is None
+
+    # Memory recovers → alert resolves.
+    resolved = await _resolve_runner_low_memory_alert(db_session, project.id, runner_id)
+    assert resolved == 1
+
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "alert must dismiss once memory recovers"
+
+    # Broadcast: once for create, once for dismiss.
+    assert bcast.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_low_memory_runner_check_integration(db_session, mocker):
+    """_check_degraded_runners raises a low-memory alert and auto-resolves on recovery."""
+    from app.models import LocalRunner
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+    from app.time_utils import _utcnow
+
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Active runner reporting low memory (50 MB — well below the 512 MiB default threshold).
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="hash-low-mem",
+        status="active",
+        last_seen_at=_utcnow(),
+        consecutive_job_failures=0,
+        capabilities={"memory_free_bytes": 50_000_000},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep → low-memory alert must fire.
+    await _check_degraded_runners(db_session)
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].dismissed_at is None
+
+    # Second sweep → deduplication (no second alert).
+    await _check_degraded_runners(db_session)
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+    # Runner frees memory (2 GiB — above the 512 MiB threshold).
+    await db_session.refresh(runner)
+    caps = dict(runner.capabilities or {})
+    caps["memory_free_bytes"] = 2_147_483_648  # 2 GiB
+    runner.capabilities = caps
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep again → alert must be dismissed.
+    await _check_degraded_runners(db_session)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "low-memory alert must auto-resolve on recovery"
+
+
+# ---------------------------------------------------------------------------
+# Cross-project runner mismatch alert
+# ---------------------------------------------------------------------------
+
+from app.alert_dispatch import (  # noqa: E402
+    _RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
+    _maybe_create_runner_cross_project_mismatch_alert,
+)
+
+
+async def _cross_project_mismatch_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_runner_cross_project_mismatch_raises_dedup_alert(db_session, mocker):
+    """A runner attempting to report on a foreign project's job raises a WARNING alert.
+
+    - First call creates one alert and broadcasts it.
+    - Repeated calls with the same (runner_id, job_id) dedup to the same row.
+    - A distinct job_id from the same runner creates a second alert (separate dedupe key).
+    """
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    other_project = make_project()
+    db_session.add(project)
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other_project)
+
+    runner_id = _uuid_module.uuid4()
+    job_id = _uuid_module.uuid4()
+
+    # First call → alert created, broadcast fired.
+    created = await _maybe_create_runner_cross_project_mismatch_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        job_id=job_id,
+        job_project_id=other_project.id,
+        hostname="runner-alpha",
+    )
+    assert created is True
+    alerts = await _cross_project_mismatch_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "cross-project" in alert.title.lower()
+    assert "runner-alpha" in alert.title
+    assert str(runner_id)[:8] in alert.message
+    assert str(job_id)[:8] in alert.message
+    assert str(other_project.id)[:8] in alert.message
+    bcast.assert_awaited_once()
+
+    # Second call with same (runner_id, job_id) → dedup, no new alert.
+    bcast.reset_mock()
+    created2 = await _maybe_create_runner_cross_project_mismatch_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        job_id=job_id,
+        job_project_id=other_project.id,
+        hostname="runner-alpha",
+    )
+    assert created2 is False
+    alerts = await _cross_project_mismatch_alerts(db_session, project.id)
+    assert len(alerts) == 1, "repeated call must dedup to one alert row"
+    bcast.assert_not_awaited()
+
+    # Different job_id → distinct dedupe key → second alert.
+    job_id_2 = _uuid_module.uuid4()
+    created3 = await _maybe_create_runner_cross_project_mismatch_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        job_id=job_id_2,
+        job_project_id=other_project.id,
+        hostname="runner-alpha",
+    )
+    assert created3 is True
+    alerts = await _cross_project_mismatch_alerts(db_session, project.id)
+    assert len(alerts) == 2

@@ -80,6 +80,7 @@ export function ProjectResourceEnvelopeSection({
   // When true, compute experiments only run on registered self-hosted runners
   // and never fall back to billable cloud compute.
   const [requireLocalRunner, setRequireLocalRunner] = useState(false);
+  const [pauseOnCeilingExceeded, setPauseOnCeilingExceeded] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -95,6 +96,7 @@ export function ProjectResourceEnvelopeSection({
     setBlockAllGpu(Array.isArray(accel) && accel.length === 0);
     setAcceleratorTypes(accel != null ? [...accel] : []);
     setRequireLocalRunner(data?.require_local_runner ?? false);
+    setPauseOnCeilingExceeded(data?.pause_on_ceiling_exceeded ?? false);
   }, [data]);
 
   const parsedMaxConcurrent = useMemo(() => {
@@ -136,6 +138,7 @@ export function ProjectResourceEnvelopeSection({
     allowed_machine_types: null,
     allowed_accelerator_types: null,
     require_local_runner: false,
+    pause_on_ceiling_exceeded: false,
     active_vm_count: 0,
     recent_spend_usd: 0,
     recent_spend_compute_usd: 0,
@@ -185,6 +188,7 @@ export function ProjectResourceEnvelopeSection({
     const machineTypesChanged = !policyEquals(current.allowed_machine_types ?? null, machineTypesToSave);
     const acceleratorTypesChanged = !policyEquals(current.allowed_accelerator_types ?? null, acceleratorTypesToSave);
     const requireLocalRunnerChanged = (current.require_local_runner ?? false) !== requireLocalRunner;
+    const pauseOnCeilingExceededChanged = (current.pause_on_ceiling_exceeded ?? false) !== pauseOnCeilingExceeded;
     return (
       maxChanged ||
       spendChanged ||
@@ -193,7 +197,8 @@ export function ProjectResourceEnvelopeSection({
       computeJobsChanged ||
       machineTypesChanged ||
       acceleratorTypesChanged ||
-      requireLocalRunnerChanged
+      requireLocalRunnerChanged ||
+      pauseOnCeilingExceededChanged
     );
   }, [
     current.max_concurrent_vms,
@@ -204,6 +209,7 @@ export function ProjectResourceEnvelopeSection({
     current.allowed_machine_types,
     current.allowed_accelerator_types,
     current.require_local_runner,
+    current.pause_on_ceiling_exceeded,
     maxConcurrentVmsInput,
     spendCeilingUsdInput,
     spendWindowDaysInput,
@@ -212,6 +218,7 @@ export function ProjectResourceEnvelopeSection({
     machineTypesToSave,
     acceleratorTypesToSave,
     requireLocalRunner,
+    pauseOnCeilingExceeded,
   ]);
 
   const handleSave = async () => {
@@ -229,6 +236,7 @@ export function ProjectResourceEnvelopeSection({
         allowed_machine_types: machineTypesToSave,
         allowed_accelerator_types: acceleratorTypesToSave,
         require_local_runner: requireLocalRunner,
+        pause_on_ceiling_exceeded: pauseOnCeilingExceeded,
       });
     } finally {
       setSaving(false);
@@ -519,6 +527,28 @@ export function ProjectResourceEnvelopeSection({
               runners and never fall back to billable cloud compute. With no live runner,
               experiments are held until one comes online (and time out after a few hours
               rather than wedging).
+            </span>
+          </span>
+        </label>
+      </div>
+
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Spend Ceiling Action</h3>
+        <label className="flex items-start gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={pauseOnCeilingExceeded}
+            disabled={inputDisabled}
+            onChange={() => setPauseOnCeilingExceeded(prev => !prev)}
+            className="h-4 w-4 mt-0.5 rounded border-neutral-700 bg-neutral-950 disabled:opacity-60"
+          />
+          <span className="text-xs text-neutral-200">
+            Pause project when spend ceiling is exceeded
+            <span className="block text-ui-md text-neutral-600 mt-1">
+              When on, exceeding the spend ceiling automatically pauses the project until
+              an operator manually unpauses it. No new task will dispatch while paused.
+              When off (the default), tasks are soft-deferred with a status message but
+              the project stays running.
             </span>
           </span>
         </label>

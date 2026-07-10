@@ -6,6 +6,8 @@ import type {
   EffortEfficiencyRow,
   ModelEfficiencyRow,
   ProviderRoutingVerdict,
+  ProviderRoutingShare,
+  CostTelemetryReconciliation,
 } from '../types/digest';
 
 function fmtTokens(n: number): string {
@@ -260,6 +262,136 @@ function ProviderRoutingVerdictCallout({ verdict }: { verdict: ProviderRoutingVe
 }
 
 /**
+ * Compact distribution block showing per-provider run count, verified landed
+ * rate, and cost-per-merge from the provider_routing_share data. Renders
+ * nothing when the share data is absent or empty.
+ */
+function ProviderRoutingShareBlock({ share }: { share: ProviderRoutingShare }) {
+  const { by_provider, total_run_count, total_pr_eligible_run_count } = share;
+  if (!by_provider || by_provider.length === 0) return null;
+
+  return (
+    <div className="mb-2 rounded border border-neutral-700/50 bg-neutral-900/30 px-2.5 py-1.5 text-ui-sm">
+      <h3 className="text-ui-xs font-semibold text-neutral-500 uppercase tracking-wider mb-1">
+        Provider Routing Distribution
+      </h3>
+      <table className="w-full text-ui-xs">
+        <thead>
+          <tr className="text-neutral-500 border-b border-neutral-800/50">
+            <th className="text-left px-1 py-1 font-medium">Provider</th>
+            <th className="text-right px-1 py-1 font-medium">Runs</th>
+            <th className="text-right px-1 py-1 font-medium">PR-eligible</th>
+            <th className="text-right px-1 py-1 font-medium">Verified Rate</th>
+            <th className="text-right px-1 py-1 font-medium">$/Merge</th>
+            <th className="text-right px-1 py-1 font-medium">Cost</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-neutral-800/30">
+          {by_provider.map((p) => (
+            <tr key={p.provider}>
+              <td className="px-1 py-1 font-medium text-neutral-200 capitalize">{p.provider}</td>
+              <td className="text-right px-1 py-1 text-neutral-300 tabular-nums">{p.run_count}</td>
+              <td className="text-right px-1 py-1 text-neutral-300 tabular-nums">{p.pr_eligible_run_count}</td>
+              <td className={`text-right px-1 py-1 tabular-nums ${rateColor(p.verified_landed_rate)}`}>
+                {fmtRate(p.verified_landed_rate)}
+              </td>
+              <td className={`text-right px-1 py-1 font-mono tabular-nums ${cpmColor(p.cost_per_merge)}`}>
+                {fmtCpm(p.cost_per_merge)}
+              </td>
+              <td className="text-right px-1 py-1 text-neutral-300 font-mono tabular-nums">
+                ${p.total_cost_usd.toFixed(2)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr className="border-t border-neutral-800/50 text-neutral-400">
+            <td className="px-1 py-1 font-medium">Total</td>
+            <td className="text-right px-1 py-1 tabular-nums">{total_run_count}</td>
+            <td className="text-right px-1 py-1 tabular-nums">{total_pr_eligible_run_count}</td>
+            <td colSpan={3} />
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  );
+}
+
+/**
+ * Compact trust indicator for cost-telemetry reconciliation: shows whether the
+ * primary cost-telemetry path agrees with a structurally independent direct-path
+ * recomputation within declared tolerance. Green when within_tolerance is true,
+ * amber with the absolute delta value when the paths diverge beyond tolerance.
+ * Follows the same badge-and-detail idiom as ProviderRoutingVerdictCallout.
+ */
+function CostTelemetryReconciliationCallout({
+  reconciliation,
+}: {
+  reconciliation: CostTelemetryReconciliation;
+}) {
+  const { within_tolerance, absolute_delta, cache_hit_rate_within_tolerance, task_count, tolerance } = reconciliation;
+
+  if (within_tolerance && cache_hit_rate_within_tolerance) {
+    return (
+      <div className="mb-2 rounded border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 text-ui-sm">
+        <div className="flex items-center gap-2">
+          <span className="inline-block px-1.5 py-px rounded text-ui-xs font-semibold border bg-emerald-500/20 text-emerald-300 border-emerald-500/40">
+            ✓ Reconciled
+          </span>
+          <span className="text-neutral-300 font-medium">Cost Telemetry</span>
+        </div>
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-500 mt-1">
+          <span>
+            Delta: <span className="text-emerald-300 tabular-nums">${absolute_delta.toFixed(7)}</span>
+          </span>
+          <span>
+            Tolerance: <span className="text-neutral-300 tabular-nums">${tolerance}</span>
+          </span>
+          <span>
+            Tasks: <span className="text-neutral-300 tabular-nums">{task_count}</span>
+          </span>
+        </div>
+        <div className="text-ui-xs text-emerald-600/70 mt-0.5">
+          Cache-hit rate and cost agree within tolerance — telemetry is trustworthy.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-ui-sm">
+      <div className="flex items-center gap-2">
+        <span className="inline-block px-1.5 py-px rounded text-ui-xs font-semibold border bg-amber-500/20 text-amber-300 border-amber-500/40">
+          ⚠ Mismatch
+        </span>
+        <span className="text-neutral-300 font-medium">Cost Telemetry</span>
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-neutral-500 mt-1">
+        <span>
+          Delta: <span className="text-amber-300 tabular-nums">${absolute_delta.toFixed(7)}</span>
+        </span>
+        {!within_tolerance && (
+          <span>
+            Cost tolerance: <span className="text-amber-300 tabular-nums">±${tolerance}</span>
+          </span>
+        )}
+        {!cache_hit_rate_within_tolerance && (
+          <span>
+            Cache-hit rate: <span className="text-amber-300 tabular-nums">diverged</span>
+          </span>
+        )}
+        <span>
+          Tasks: <span className="text-neutral-300 tabular-nums">{task_count}</span>
+        </span>
+      </div>
+      <div className="text-ui-xs text-amber-600/70 mt-0.5">
+        Cost telemetry paths diverge — investigate pricing or aggregation discrepancies.
+      </div>
+    </div>
+  );
+}
+
+/**
  * Operator view of cost & landed/merge-rate attributable by EFFORT tier and by
  * ACTUAL resolved model. Purely presentational — the rollup rides the digest
  * payload already fetched by DashboardHome (no extra fetch). Renders nothing
@@ -272,7 +404,7 @@ function ProviderRoutingVerdictCallout({ verdict }: { verdict: ProviderRoutingVe
  */
 export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | null | undefined }) {
   if (!data) return null;
-  const { by_effort, by_model, totals, unpriced_combos, fallbacks, provider_routing_verdict } = data;
+  const { by_effort, by_model, totals, unpriced_combos, fallbacks, provider_routing_verdict, provider_routing_share, cost_telemetry_reconciliation } = data;
   if ((by_effort?.length ?? 0) === 0 && (by_model?.length ?? 0) === 0) return null;
   if (totals.run_count === 0) return null;
 
@@ -315,6 +447,8 @@ export function EffortEfficiencyPanel({ data }: { data: EffortModelEfficiency | 
       )}
 
       {provider_routing_verdict && <ProviderRoutingVerdictCallout verdict={provider_routing_verdict} />}
+      {provider_routing_share && <ProviderRoutingShareBlock share={provider_routing_share} />}
+      {cost_telemetry_reconciliation && <CostTelemetryReconciliationCallout reconciliation={cost_telemetry_reconciliation} />}
 
       <EfficiencySubTable
         title="By Effective Effort Tier"

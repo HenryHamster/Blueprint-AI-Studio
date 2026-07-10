@@ -76,12 +76,10 @@ describe('computeStrategicPromptFingerprint', () => {
     previousDecisionOutcomes: '',
     pastRetirementCritiquesSection: '',
     retiredDirectionsSummarySection: '',
-    dirSummaryText: 'No active directions.',
-    dirHealthSummary: 'Active: 0/10 slots.',
+    directionPortfolioSection: '## Direction Portfolio\nActive: 0/10 slots.\nNo critical gaps detected.\n\nNo directions exist yet.\n\nNo active directions — portfolio is empty.',
     userPausedSection: '',
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
-    portfolioCompositionText: 'No active directions — portfolio is empty.',
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
@@ -133,12 +131,10 @@ describe('buildThinkerPrompt', () => {
     previousDecisionOutcomes: '',
     pastRetirementCritiquesSection: '',
     retiredDirectionsSummarySection: '',
-    dirSummaryText: 'No active directions.',
-    dirHealthSummary: 'Active: 0/10 slots.',
+    directionPortfolioSection: '## Direction Portfolio\nActive: 0/10 slots.\nNo critical gaps detected.\n\nNo directions exist yet.\n\nNo active directions — portfolio is empty.',
     userPausedSection: '',
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
-    portfolioCompositionText: 'No active directions — portfolio is empty.',
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
@@ -158,9 +154,7 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('## What you previously said was hard');
     expect(prompt).toContain('## Running update');
     expect(prompt).toContain('## Architecture');
-    expect(prompt).toContain('## Current research directions');
-    expect(prompt).toContain('## Direction Health');
-    expect(prompt).toContain('## Portfolio Composition');
+    expect(prompt).toContain('## Direction Portfolio');
   });
 
   it('includes all required output section headers', () => {
@@ -201,10 +195,8 @@ describe('buildThinkerPrompt', () => {
     const prompt = buildThinkerPrompt(base);
     const idx = (s: string) => prompt.indexOf(s);
     // Context sections appear before instructions
-    expect(idx('## Architecture')).toBeLessThan(idx('## Current research directions'));
-    expect(idx('## Current research directions')).toBeLessThan(idx('## Direction Health'));
-    expect(idx('## Direction Health')).toBeLessThan(idx('## Portfolio Composition'));
-    expect(idx('## Portfolio Composition')).toBeLessThan(idx('# Your job'));
+    expect(idx('## Architecture')).toBeLessThan(idx('## Direction Portfolio'));
+    expect(idx('## Direction Portfolio')).toBeLessThan(idx('# Your job'));
     // Output sections appear at the end
     expect(idx('# Your job')).toBeLessThan(idx('## 1. State assessment'));
     expect(idx('## 1. State assessment')).toBeLessThan(idx('## 6. Problem model'));
@@ -539,13 +531,13 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).not.toContain('set_vision');
   });
 
-  it('dirSummaryText contribution stays under 50,000 chars', () => {
-    const hugeDirSummary = 'x'.repeat(49_000);
-    const prompt = buildThinkerPrompt({ ...base, dirSummaryText: hugeDirSummary });
-    const idx = prompt.indexOf(hugeDirSummary);
+  it('directionPortfolioSection contribution stays under 50,000 chars', () => {
+    const hugePortfolioSection = 'x'.repeat(49_000);
+    const prompt = buildThinkerPrompt({ ...base, directionPortfolioSection: hugePortfolioSection });
+    const idx = prompt.indexOf(hugePortfolioSection);
     expect(idx).toBeGreaterThan(-1);
     // The prompt should not balloon — the section itself is bounded by its input
-    expect(hugeDirSummary.length).toBeLessThan(50_000);
+    expect(hugePortfolioSection.length).toBeLessThan(50_000);
   });
 
   it('outcomeSection contribution stays under 30,000 chars', () => {
@@ -1336,12 +1328,10 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     previousDecisionOutcomes: '',
     pastRetirementCritiquesSection: '',
     retiredDirectionsSummarySection: '',
-    dirSummaryText: 'No active directions.',
-    dirHealthSummary: 'Active: 0/10 slots.',
+    directionPortfolioSection: '## Direction Portfolio\nActive: 0/10 slots.\nNo critical gaps detected.\n\nNo directions exist yet.\n\nNo active directions — portfolio is empty.',
     userPausedSection: '',
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
-    portfolioCompositionText: 'No active directions — portfolio is empty.',
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
@@ -1395,12 +1385,10 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     previousDecisionOutcomes: '',
     pastRetirementCritiquesSection: '',
     retiredDirectionsSummarySection: '',
-    dirSummaryText: 'No active directions.',
-    dirHealthSummary: 'Active: 0/10 slots.',
+    directionPortfolioSection: '## Direction Portfolio\nActive: 0/10 slots.\nNo critical gaps detected.\n\nNo directions exist yet.\n\nNo active directions — portfolio is empty.',
     userPausedSection: '',
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
-    portfolioCompositionText: 'No active directions — portfolio is empty.',
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
@@ -1500,12 +1488,10 @@ describe('spawn-fix allowlist sync', () => {
     previousDecisionOutcomes: '',
     pastRetirementCritiquesSection: '',
     retiredDirectionsSummarySection: '',
-    dirSummaryText: '',
-    dirHealthSummary: '',
+    directionPortfolioSection: '',
     userPausedSection: '',
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
-    portfolioCompositionText: '',
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
@@ -1548,12 +1534,10 @@ describe('buildThinkerPrompt stabilize-hardening guidance', () => {
     previousDecisionOutcomes: '',
     pastRetirementCritiquesSection: '',
     retiredDirectionsSummarySection: '',
-    dirSummaryText: '',
-    dirHealthSummary: '',
+    directionPortfolioSection: '',
     userPausedSection: '',
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
-    portfolioCompositionText: '',
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',

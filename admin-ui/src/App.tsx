@@ -1,6 +1,7 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { useMemo, useRef, useEffect, useState, useCallback, lazy, Suspense } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { Skeleton } from './components/DashboardMetricCardsPrimitives';
 import { Activity, AlertCircle, CheckSquare, LayoutList, PanelRightOpen } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
@@ -8,22 +9,25 @@ import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { matchesTaskTypeFilter, resolveTaskCapabilities, TaskCapabilitiesProvider } from './taskCapabilities';
 import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
-import { ResearchBrowser } from './components/ResearchBrowser';
-import { KnowledgeBrowser } from './components/KnowledgeBrowser';
+const ResearchBrowser = lazy(() => import('./components/ResearchBrowser').then(m => ({ default: m.ResearchBrowser })));
+const KnowledgeBrowser = lazy(() => import('./components/KnowledgeBrowser').then(m => ({ default: m.KnowledgeBrowser })));
+const NewTaskModal = lazy(() => import('./components/NewTaskModal').then(m => ({ default: m.NewTaskModal })));
+const NewProjectModal = lazy(() => import('./components/NewProjectModal').then(m => ({ default: m.NewProjectModal })));
 import { auth, signInWithGoogle, signOut } from './firebase';
-import { fetchTask, apiFetch, API_BASE_URL } from './api';
+import { fetchTask } from './api/tasks';
+import { apiFetch, API_BASE_URL } from './api/core';
 import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
 import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { AlertsPopover } from './components/AlertsPopover';
 import { FleetDetailDrawer } from './components/FleetDetailDrawer';
-import { NewTaskModal } from './components/NewTaskModal';
-import { NewProjectModal } from './components/NewProjectModal';
+import { WelcomeScreen } from './components/WelcomeScreen';
 import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
-import type { SettingsSectionRouterProps } from './components/SettingsSectionRouter';
+import { useStrategicSession } from './hooks/useStrategicSession';
+import { useSettingsRouterProps } from './hooks/useSettingsRouterProps';
 import { normalizePrimaryTab, resolvePrimaryTabTarget, type PrimaryTab } from './hooks/useUIState';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import { BulkActionBar } from './components/BulkActionBar';
@@ -32,14 +36,13 @@ import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERM
 import { Pagination } from './components/Pagination';
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
-import ActivityFeed from './components/ActivityFeed';
-import { MessagesPanel } from './components/MessagesPanel';
+const MessagesPanel = lazy(() => import('./components/MessagesPanel').then(m => ({ default: m.MessagesPanel })));
+const ActivityFeed = lazy(() => import('./components/ActivityFeed'));
+const StrategicContextWorkspace = lazy(() => import('./components/StrategicContextWorkspace').then(m => ({ default: m.StrategicContextWorkspace })));
 import { StrategicContextRail } from './components/StrategicContextRail';
-import { StrategicContextWorkspace } from './components/StrategicContextWorkspace';
 import { StrategicSessionControl, type StrategicAccountSpendStatus, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
 import { KeyboardShortcutsOverlay } from './components/KeyboardShortcutsOverlay';
-import { parseArmingOutcome, workbenchArmingToastCopy } from './components/messageArming';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
@@ -56,15 +59,14 @@ import { useCommandPaletteState } from './hooks/useCommandPaletteState';
 import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
 import { useVersionLifecycle, hasVersionLifecycleData } from './hooks/useVersionLifecycle';
-import { checkInStrategicSession, startStrategicSession, stopStrategicSession, updateStrategicWorkbenchState, type StrategicResidentRunnerOption, type StrategicResidentSessionSnapshot, type StrategicStateAttentionItem, type StrategicWorkbenchState } from './strategicStateApi';
+import { type StrategicStateAttentionItem } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
-import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
+import { normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
-import { buildStrategicContextDescriptor } from './utils/strategicContextDescriptor';
+import { computeStrategicSessionActivity } from './utils/strategicSessionLive';
 import { STATUS_OPTIONS } from './constants';
 
-type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 type PipelineDirectionOption = { id: string; text: string };
 const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];
 const PROJECT_SECTION_ORDER: readonly ProjectSection[] = ['running-update', 'directions', 'problem-model', 'design-doc', 'manage'];
@@ -83,6 +85,22 @@ function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
   const values = new Set(b);
   return a.every(value => values.has(value));
 }
+
+function WorkspaceSkeleton() {
+  return (
+    <div className="flex-1 p-6 space-y-4">
+      <Skeleton className="h-7 w-1/4" />
+      <Skeleton className="h-4 w-1/2" />
+      <Skeleton className="h-48 w-full rounded-lg" />
+      <div className="space-y-3">
+        <Skeleton className="h-4 w-full" />
+        <Skeleton className="h-4 w-5/6" />
+        <Skeleton className="h-4 w-2/3" />
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
   const refreshMessagesRef = useRef<() => void>(() => {});
@@ -164,8 +182,6 @@ export default function App() {
     }
   }, [openMessageCount]);
   const selectedProjectId = s.selectedProjectId;
-  const selectedProjectIdRef = useRef(selectedProjectId);
-  selectedProjectIdRef.current = selectedProjectId;
   const rawActiveTab = s.activeTab;
   const activeTab: PrimaryTab = normalizePrimaryTab(rawActiveTab);
   const messagesPanelOpen = activeTab === 'chat';
@@ -310,7 +326,7 @@ export default function App() {
     const pid = selectedProjectId;
     let cancelled = false;
     apiFetch(
-      `${API_BASE_URL}/api/admin/tasks?archived=false&limit=500&project_id=${encodeURIComponent(pid)}`,
+      `${API_BASE_URL}/api/admin/tasks?task_type=research&archived=false&limit=500&project_id=${encodeURIComponent(pid)}`,
     )
       .then(async res => {
         if (!res.ok || cancelled) return;
@@ -416,215 +432,29 @@ export default function App() {
       refreshStrategicReadModelRef.current = () => {};
     };
   }, [strategicReadModel.refresh]);
-  const [optimisticStrategicWorkbench, setOptimisticStrategicWorkbench] = useState<StrategicWorkbenchState | null>(null);
-  const [savingStrategicWorkbench, setSavingStrategicWorkbench] = useState(false);
-  const [checkingInStrategicSession, setCheckingInStrategicSession] = useState(false);
-  const [strategicSessionBusy, setStrategicSessionBusy] = useState(false);
-  const strategicWorkbenchStateRef = useRef<StrategicWorkbenchState | null>(null);
-  const strategicWorkbenchSaveSeqRef = useRef(0);
-  const strategicWorkbenchSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const strategicCheckInIdempotencyKeyRef = useRef<string | null>(null);
-  const strategicWorkbenchOperatorSurfaceTouchedRef = useRef(false);
-  const strategicWorkbenchRestoreProjectRef = useRef<string | null>(null);
-  useEffect(() => {
-    strategicWorkbenchStateRef.current = null;
-    setOptimisticStrategicWorkbench(null);
-    setSavingStrategicWorkbench(false);
-    strategicWorkbenchSaveSeqRef.current += 1;
-    strategicWorkbenchSaveQueueRef.current = Promise.resolve();
-    strategicWorkbenchOperatorSurfaceTouchedRef.current = false;
-    strategicWorkbenchRestoreProjectRef.current = null;
-    strategicCheckInIdempotencyKeyRef.current = null;
-    setCheckingInStrategicSession(false);
-    setStrategicSessionBusy(false);
-  }, [selectedProjectId]);
-  const strategicReadModelWorkbench = strategicReadModel.data?.project_id === selectedProjectId
-    ? strategicReadModel.data?.workbench ?? null
-    : null;
-  const selectedStrategicReadModel = strategicReadModel.data?.project_id === selectedProjectId
-    ? strategicReadModel.data
-    : null;
-  // Resident Strategic session state is surfaced on the strategic read model as
-  // `resident_session` (mirrors `resident_session_snapshot`). The cast keeps
-  // this forward-compatible whether or not the read-model type already declares
-  // the field. `sessionActive` intentionally excludes a session whose stop was
-  // requested so the control flips back to Start immediately on stop.
-  const residentStrategicSession =
-    (selectedStrategicReadModel as { resident_session?: StrategicResidentSessionSnapshot | null } | null)?.resident_session
-    ?? null;
-  const strategicSessionActive = residentStrategicSession?.status === 'active' && !residentStrategicSession?.stop_requested;
-  const strategicSessionStatus = residentStrategicSession?.status ?? null;
-  // The Start affordance is gated on the resident-session feature flag, surfaced
-  // as `resident_session_available` on the read model. When the flag is off we
-  // withhold `onStartSession` so StrategicSessionControl (which self-gates on
-  // callback presence) hides Start, rather than letting a click 403 at the start
-  // endpoint. Stop stays wired unconditionally so an operator can always reclaim.
-  const residentStrategicSessionAvailable =
-    (selectedStrategicReadModel as { resident_session_available?: boolean } | null)?.resident_session_available === true;
-  // Legible Workday session state + reason (from `resident_session_availability`):
-  // drives the status chip (off / ready / starting / active / blocked / error) so
-  // entering Workday is enough to go live. Falls back to a flag-derived state for
-  // older payloads.
-  const residentStrategicSessionAvailability =
-    (selectedStrategicReadModel as {
-      resident_session_availability?: { available?: boolean; state?: string | null; reason?: string | null } | null;
-    } | null)?.resident_session_availability ?? null;
-  const strategicSessionState = residentStrategicSessionAvailability?.state
-    ?? (strategicSessionActive ? 'active' : residentStrategicSessionAvailable ? 'ready' : 'off');
-  const strategicSessionReason = residentStrategicSessionAvailability?.reason ?? null;
-  const strategicWorkbenchState = optimisticStrategicWorkbench ?? strategicReadModelWorkbench;
-  // Multi-device picker options for the resident session (auto-pick + override
-  // dropdown). The selected device is the operator's stored preference, falling
-  // back to the device the live session is pinned to so an active session shows
-  // its actual runner.
-  const residentStrategicSessionRunners =
-    (selectedStrategicReadModel as { resident_session_runners?: StrategicResidentRunnerOption[] | null } | null)
-      ?.resident_session_runners ?? null;
-  const strategicSessionSelectedRunnerId =
-    strategicWorkbenchState?.preferred_runner_id
-    ?? residentStrategicSession?.runner_id
-    ?? null;
-  const chatComposerContextDescriptor = useMemo(
-    () => buildStrategicContextDescriptor(selectedStrategicReadModel, strategicWorkbenchState),
-    [selectedStrategicReadModel, strategicWorkbenchState],
-  );
-  useEffect(() => {
-    strategicWorkbenchStateRef.current = strategicWorkbenchState;
-  }, [strategicWorkbenchState]);
-  // The optimistic workbench shadow is only meant to cover the in-flight save
-  // window. Once no save is pending, let the polled server read model reclaim
-  // the display as soon as it is at least as fresh as the optimistic value.
-  // Without this the shadow would outlive its mutation forever (cleared only on
-  // project switch), so workbench/session changes arriving via the 30s poll —
-  // e.g. from another device or session — never surfaced.
-  useEffect(() => {
-    if (savingStrategicWorkbench) return;
-    if (!optimisticStrategicWorkbench || !strategicReadModelWorkbench) return;
-    const optimisticTs = parseTimestamp(optimisticStrategicWorkbench.last_interaction_at).getTime();
-    const serverTs = parseTimestamp(strategicReadModelWorkbench.last_interaction_at).getTime();
-    if (serverTs >= optimisticTs) {
-      setOptimisticStrategicWorkbench(null);
-    }
-  }, [savingStrategicWorkbench, optimisticStrategicWorkbench, strategicReadModelWorkbench]);
-  const persistStrategicWorkbench = useCallback((patch: Partial<StrategicWorkbenchState>) => {
-    const projectId = s.selectedProjectId;
-    if (!projectId) return;
-    const saveSeq = strategicWorkbenchSaveSeqRef.current + 1;
-    strategicWorkbenchSaveSeqRef.current = saveSeq;
-    const base = strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench;
-    const optimistic = buildOptimisticStrategicWorkbench(base, patch);
-    strategicWorkbenchStateRef.current = optimistic;
-    setOptimisticStrategicWorkbench(optimistic);
-    setSavingStrategicWorkbench(true);
-    const save = strategicWorkbenchSaveQueueRef.current
-      .catch(() => undefined)
-      .then(async () => {
-        try {
-          const result = await updateStrategicWorkbenchState(projectId, patch);
-          const armingOutcome = selectedProjectIdRef.current === projectId ? parseArmingOutcome(result.arming) : null;
-          const armingToast = workbenchArmingToastCopy(armingOutcome);
-          if (armingToast) s.addToast(armingToast, armingOutcome === 'not_armed' ? 'info' : 'success');
-          if (selectedProjectIdRef.current !== projectId || strategicWorkbenchSaveSeqRef.current !== saveSeq) return;
-          const saved = result.workbench;
-          strategicWorkbenchStateRef.current = saved;
-          setOptimisticStrategicWorkbench(saved);
-          void strategicReadModel.refresh();
-        } catch {
-          if (selectedProjectIdRef.current === projectId && strategicWorkbenchSaveSeqRef.current === saveSeq) {
-            strategicWorkbenchStateRef.current = base;
-            setOptimisticStrategicWorkbench(base);
-            s.addToast('Could not save Strategic session', 'error');
-          }
-        } finally {
-          if (selectedProjectIdRef.current === projectId && strategicWorkbenchSaveSeqRef.current === saveSeq) setSavingStrategicWorkbench(false);
-        }
-      });
-    strategicWorkbenchSaveQueueRef.current = save.then(
-      () => undefined,
-      () => undefined,
-    );
-  }, [s, strategicReadModel, strategicReadModelWorkbench]);
-  const updateStrategicSessionRefs = useCallback((updateRefs: (refs: StrategicSessionRefs) => StrategicSessionRefs) => {
-    const baseRefs = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.selected_refs ?? [];
-    persistStrategicWorkbench({ selected_refs: updateRefs(baseRefs) });
-  }, [persistStrategicWorkbench, strategicReadModelWorkbench]);
-  // Multi-device override: pick which enrolled runner the resident session pins
-  // to. Persisted as the workbench `preferred_runner_id` — the source the Start
-  // handler already reads — so the next start (or restart after a device goes
-  // offline) uses the chosen device. `null` selects auto-pick.
-  const handleSelectStrategicRunner = useCallback((runnerId: string | null) => {
-    persistStrategicWorkbench({ preferred_runner_id: runnerId });
-  }, [persistStrategicWorkbench]);
-  const handleStrategicCheckIn = useCallback(async () => {
-    const projectId = s.selectedProjectId;
-    if (!projectId || checkingInStrategicSession) return;
-    setCheckingInStrategicSession(true);
-    try {
-      const workbenchContext = strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench;
-      if (!strategicCheckInIdempotencyKeyRef.current) {
-        strategicCheckInIdempotencyKeyRef.current = `strategic-check-in:${projectId}:${Date.now()}`;
-      }
-      const checkInResponse = await checkInStrategicSession(projectId, {
-        kind: 'manual',
-        workbench_context: workbenchContext ? { ...workbenchContext } : undefined,
-        idempotency_key: strategicCheckInIdempotencyKeyRef.current,
-      });
-      if (selectedProjectIdRef.current !== projectId) return;
-      strategicCheckInIdempotencyKeyRef.current = null;
-      s.addToast('Strategic check-in recorded', 'success');
-      if (strategicReadModel.data) {
-        strategicReadModel.applySessionResponse(checkInResponse);
-      } else {
-        void strategicReadModel.refresh();
-      }
-    } catch {
-      if (selectedProjectIdRef.current === projectId) {
-        s.addToast('Could not record Strategic check-in', 'error');
-      }
-    } finally {
-      if (selectedProjectIdRef.current === projectId) setCheckingInStrategicSession(false);
-    }
-  }, [checkingInStrategicSession, s, strategicReadModel, strategicReadModelWorkbench]);
-  const handleStartStrategicSession = useCallback(async () => {
-    const projectId = s.selectedProjectId;
-    if (!projectId || strategicSessionBusy) return;
-    setStrategicSessionBusy(true);
-    try {
-      const preferredRunnerId = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.preferred_runner_id ?? null;
-      await startStrategicSession(projectId, preferredRunnerId ? { runner_id: preferredRunnerId } : {});
-      if (selectedProjectIdRef.current !== projectId) return;
-      s.addToast('Strategic session starting', 'success');
-      void strategicReadModel.refresh();
-    } catch (err) {
-      if (selectedProjectIdRef.current === projectId) {
-        s.addToast(err instanceof Error ? err.message : 'Could not start Strategic session', 'error');
-      }
-    } finally {
-      if (selectedProjectIdRef.current === projectId) setStrategicSessionBusy(false);
-    }
-  }, [strategicSessionBusy, s, strategicReadModel, strategicReadModelWorkbench]);
-  const handleStopStrategicSession = useCallback(async () => {
-    const projectId = s.selectedProjectId;
-    if (!projectId || strategicSessionBusy) return;
-    setStrategicSessionBusy(true);
-    try {
-      await stopStrategicSession(projectId);
-      if (selectedProjectIdRef.current !== projectId) return;
-      s.addToast('Strategic session stopping', 'success');
-      void strategicReadModel.refresh();
-    } catch (err) {
-      if (selectedProjectIdRef.current === projectId) {
-        s.addToast(err instanceof Error ? err.message : 'Could not stop Strategic session', 'error');
-      }
-    } finally {
-      if (selectedProjectIdRef.current === projectId) setStrategicSessionBusy(false);
-    }
-  }, [strategicSessionBusy, s, strategicReadModel]);
-  const taskContextSessionProps = useMemo(() => ({
-    sessionRefs: strategicWorkbenchState?.selected_refs,
-    savingSessionRefs: savingStrategicWorkbench,
-    onUpdateSessionRefs: updateStrategicSessionRefs,
-  }), [strategicWorkbenchState?.selected_refs, savingStrategicWorkbench, updateStrategicSessionRefs]);
+  const {
+    strategicWorkbenchState,
+    strategicSessionActive,
+    strategicSessionStatus,
+    residentStrategicSessionAvailable,
+    strategicSessionState,
+    strategicSessionReason,
+    residentStrategicSessionRunners,
+    strategicSessionSelectedRunnerId,
+    savingStrategicWorkbench,
+    checkingInStrategicSession,
+    strategicSessionBusy,
+    chatComposerContextDescriptor,
+    taskContextSessionProps,
+    persistStrategicWorkbench,
+    updateStrategicSessionRefs,
+    handleSelectStrategicRunner,
+    handleStrategicCheckIn,
+    handleStartStrategicSession,
+    handleStopStrategicSession,
+    strategicWorkbenchOperatorSurfaceTouchedRef,
+    strategicWorkbenchRestoreProjectRef,
+  } = useStrategicSession({ selectedProjectId, addToast: s.addToast, strategicReadModel });
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -901,251 +731,18 @@ export default function App() {
     const pid = s.selectedProjectId;
     return pid ? () => s.handleClearWaveDeps(pid) : undefined;
   }, [s.selectedProjectId, s.handleClearWaveDeps]);
-  const settingsRouterProps: Omit<SettingsSectionRouterProps, 'activeSection'> = useMemo(() => ({
-    isAdmin: s.userRole === 'admin',
-    onNavigateToSection: (section: string) => {
-      if (section === 'notifications') {
-        setRuntimeSection('settings');
-        setRuntimeConfigSection('notifications');
-      }
-    },
-    hostKind: 'workspace',
-    closeOnExternalPanelOpen: false,
-    onToggleSettings: ignoreEmbeddedSettingsClose,
+  const settingsRouterProps = useSettingsRouterProps({
+    s,
     allModelOptions,
     healthCheckUrlsInput,
     onHealthCheckUrlsInputChange: setHealthCheckUrlsInput,
-    onUpdateHealthCheckUrls: s.updateHealthCheckUrls,
-    defaultTaskType: s.defaultTaskType,
-    onUpdateDefaultTaskType: s.setDefaultTaskType,
-    viewMode: s.viewMode,
-    onSetViewMode: s.setViewMode,
-    refreshInterval: s.refreshInterval,
-    onUpdateRefreshInterval: s.setRefreshInterval,
-    pageSize: s.limit,
-    onUpdatePageSize: s.setLimit,
-    apiHealthy: s.apiHealthy,
-    wsConnected: s.wsConnected,
-    lastFetchTime: s.lastFetchTime,
-    notifyOnComplete: s.notifyOnComplete,
-    onUpdateNotifyOnComplete: s.setNotifyOnComplete,
-    notifyOnFail: s.notifyOnFail,
-    onUpdateNotifyOnFail: s.setNotifyOnFail,
-    notifyOnApprovalNeeded: s.notifyOnApprovalNeeded,
-    onUpdateNotifyOnApprovalNeeded: s.setNotifyOnApprovalNeeded,
-    soundOnComplete: s.soundOnComplete,
-    onUpdateSoundOnComplete: s.setSoundOnComplete,
-    notifyOnHighSignalMessage: s.notifyOnHighSignalMessage,
-    onUpdateNotifyOnHighSignalMessage: s.setNotifyOnHighSignalMessage,
-    maxConcurrentVMs: s.maxConcurrentVMs,
-    onUpdateMaxVMs: s.updateMaxVMs,
-    maxRetries: s.maxRetries,
-    onUpdateMaxRetries: s.updateMaxRetries,
-    requireApprovalGates: s.requireApprovalGates,
-    onUpdateRequireApprovalGates: s.updateRequireApprovalGates,
-    autoArchiveEnabled: s.autoArchiveEnabled,
-    onUpdateAutoArchiveEnabled: s.updateAutoArchiveEnabled,
-    autoArchiveTerminalAfterDays: s.autoArchiveTerminalAfterDays,
-    onUpdateAutoArchiveTerminalAfterDays: s.updateAutoArchiveTerminalAfterDays,
-    autoArchiveMaxTerminalTasksPerProject: s.autoArchiveMaxTerminalTasksPerProject,
-    onUpdateAutoArchiveMaxTerminalTasksPerProject: s.updateAutoArchiveMaxTerminalTasksPerProject,
-    autoArchiveIntervalMinutes: s.autoArchiveIntervalMinutes,
-    onUpdateAutoArchiveIntervalMinutes: s.updateAutoArchiveIntervalMinutes,
-    maxAutonomousTasksPerHour: s.maxAutonomousTasksPerHour,
-    onUpdateMaxAutonomousRate: s.handleUpdateMaxAutonomousRate,
-    maxGlobalAutonomousTasksPerHour: s.maxGlobalAutonomousTasksPerHour,
-    onUpdateMaxGlobalAutonomousRate: s.updateMaxGlobalAutonomousRate,
-    maxPipelineSlots: s.maxPipelineSlots,
-    onUpdateMaxPipelineSlots: s.updateMaxPipelineSlots,
-    reservedSlotsForTypes: s.reservedSlotsForTypes,
-    onUpdateReservedSlotsForTypes: s.updateReservedSlotsForTypes,
-    evaluatingPipelineTimeoutMinutes: s.evaluatingPipelineTimeoutMinutes,
-    onUpdateEvaluatingPipelineTimeout: s.updateEvaluatingPipelineTimeout,
-    evaluatingFailHours: s.evaluatingFailHours,
-    onUpdateEvaluatingFailHours: s.updateEvaluatingFailHours,
-    ciBackstopTimeoutMinutes: s.ciBackstopTimeoutMinutes,
-    onUpdateCiBackstopTimeout: s.updateCiBackstopTimeout,
-    autonomousResearchIntervalMinutes: s.autonomousResearchIntervalMinutes,
-    onUpdateAutonomousResearchInterval: s.handleUpdateAutonomousResearchInterval,
-    directionCooldownMinutes: s.directionCooldownMinutes,
-    onUpdateDirectionCooldownMinutes: s.handleUpdateDirectionCooldownMinutes,
-    strategicResearchFrequency: s.strategicResearchFrequency,
-    onUpdateStrategicResearchFrequency: s.handleUpdateStrategicResearchFrequency,
-    anyAutonomousEnabled: s.projects.some(p => p.autonomous_enabled),
-    onPauseAllAutonomous: s.handlePauseAllAutonomous,
-    onRestartOrchestrator: s.handleRestartOrchestrator,
-    directionChurnWindowCycles: s.directionChurnWindowCycles,
-    onUpdateDirectionChurnWindowCycles: s.updateDirectionChurnWindowCycles,
-    directionChurnNonMergeThreshold: s.directionChurnNonMergeThreshold,
-    onUpdateDirectionChurnNonMergeThreshold: s.updateDirectionChurnNonMergeThreshold,
-    directionChurnMinMergeRate: s.directionChurnMinMergeRate,
-    onUpdateDirectionChurnMinMergeRate: s.updateDirectionChurnMinMergeRate,
-    directionLifetimeNonMergeThreshold: s.directionLifetimeNonMergeThreshold,
-    onUpdateDirectionLifetimeNonMergeThreshold: s.updateDirectionLifetimeNonMergeThreshold,
-    directionLifetimeMinMergeRate: s.directionLifetimeMinMergeRate,
-    onUpdateDirectionLifetimeMinMergeRate: s.updateDirectionLifetimeMinMergeRate,
-    directionReviewRecommendationThreshold: s.directionReviewRecommendationThreshold,
-    onUpdateDirectionReviewRecommendationThreshold: s.updateDirectionReviewRecommendationThreshold,
-    githubAccount: s.githubAccount,
-    onConnectGitHub: s.connectGitHub,
-    maxPlanAccounts: s.maxPlanAccounts,
-    onToggleAccount: s.toggleMaxPlanAccount,
-    onRemoveAccount: s.removeMaxPlanAccount,
-    onResetRateLimits: s.resetAccountRateLimits,
-    onRefreshAccountModels: s.refreshAccountModels,
-    onUpdateAccount: s.updateMaxPlanAccount,
-    onUpdateAccountCaps: s.updateAccountCaps,
-    showUserManagement: s.showUserManagement,
-    onToggleUserManagement: () => s.setShowUserManagement(prev => !prev),
+    setRuntimeSection,
+    setRuntimeConfigSection,
+    onToggleSettings: ignoreEmbeddedSettingsClose,
     showProjectMembers,
-    onToggleProjectMembers: () => setShowProjectMembers(prev => !prev),
-    selectedProjectMyRole: selectedProject?.my_role ?? null,
-    newAccountName: s.newAccountName,
-    setNewAccountName: s.setNewAccountName,
-    newAccountProvider: s.newAccountProvider,
-    setNewAccountProvider: s.setNewAccountProvider,
-    newAccountAuthMode: s.newAccountAuthMode,
-    setNewAccountAuthMode: s.setNewAccountAuthMode,
-    newAccountToken: s.newAccountToken,
-    setNewAccountToken: s.setNewAccountToken,
-    newAccountProviderMetadata: s.newAccountProviderMetadata,
-    setNewAccountProviderMetadata: s.setNewAccountProviderMetadata,
-    newAccountClaudeConfigJson: s.newAccountClaudeConfigJson,
-    setNewAccountClaudeConfigJson: s.setNewAccountClaudeConfigJson,
-    newAccountDailyTaskCap: s.newAccountDailyTaskCap,
-    setNewAccountDailyTaskCap: s.setNewAccountDailyTaskCap,
-    newAccountMaxConcurrentTasks: s.newAccountMaxConcurrentTasks,
-    setNewAccountMaxConcurrentTasks: s.setNewAccountMaxConcurrentTasks,
-    newAccountAutoDisableAfterRateLimits: s.newAccountAutoDisableAfterRateLimits,
-    setNewAccountAutoDisableAfterRateLimits: s.setNewAccountAutoDisableAfterRateLimits,
-    onAddAccount: s.addMaxPlanAccount,
-    providers: s.providers,
-    providerSettingsDefaults: s.providerSettingsDefaults,
-    taskTypeProviderOverrides: s.taskTypeProviderOverrides,
-    providerSettingsByEffort: s.providerSettingsByEffort,
-    onUpdateProviderSettingsDefaults: s.updateProviderSettingsDefaults,
-    onUpdateTaskTypeProviderOverrides: s.updateTaskTypeProviderOverrides,
-    onUpdateProviderSettingsByEffort: s.updateProviderSettingsByEffort,
-    providerSelectionMode: s.providerSelectionMode,
-    onUpdateProviderSelectionMode: s.updateProviderSelectionMode,
-    taskTypeCategories: s.taskTypeCategories,
-    onUpdateTaskTypeCategories: s.updateTaskTypeCategories,
-    categoryRouting: s.categoryRouting,
-    onUpdateCategoryRouting: s.updateCategoryRouting,
-    taskTypeRouting: s.taskTypeRouting,
-    onUpdateTaskTypeRouting: s.updateTaskTypeRouting,
-    deployState: s.deployState,
-    onPausePipeline: s.handlePausePipeline,
-    onResumePipeline: s.handleResumePipeline,
-    onResetHealth: s.handleResetHealth,
-    onRollback: s.handleRollback,
-    onMarkStable: s.handleMarkStable,
-    onRepairState: s.handleRepairState,
-    failedRollback: s.failedRollback,
-    zoneHealth: s.zoneHealth,
-    notificationConfig: s.notificationConfig,
-    onUpdateNotificationConfig: s.updateNotificationConfig,
-    dailyCostCeilingUsd: s.dailyCostCeilingUsd,
-    onUpdateDailyCostCeiling: s.updateDailyCostCeiling,
-    selectedProjectId: s.selectedProjectId,
-    selectedProjectOwner: selectedProject?.github_owner ?? null,
-    selectedProjectRepo: selectedProject?.github_repo ?? null,
-    selectedProjectIsSelfRepo: selectedProject?.is_self_repo ?? false,
-    selectedProjectRole: selectedProject?.my_role ?? null,
-    buildConfig: s.buildConfig,
-    onUpdateBuildConfig: s.handleUpdateBuildConfig,
-    onDetectBuildConfig: s.handleDetectBuildConfig,
-    autoRemediationConfig: s.autoRemediationConfig,
-    autoRemediationStats: s.autoRemediationStats,
-    onUpdateAutoRemediationConfig: s.handleUpdateAutoRemediationConfig,
-    issueImplementationConfig: s.issueImplementationConfig,
-    onUpdateIssueImplementationConfig: s.handleUpdateIssueImplementationConfig,
-    autoReviewConfig: s.autoReviewConfig,
-    onUpdateAutoReviewConfig: s.handleUpdateAutoReviewConfig,
-    resourceEnvelopeData: s.resourceEnvelopeData,
-    resourceEnvelopeLoading: s.resourceEnvelopeLoading,
-    resourceEnvelopeError: s.resourceEnvelopeError,
-    onUpdateResourceEnvelope: s.handleUpdateResourceEnvelope,
-    integrationBranchData: s.integrationBranchData,
-    onUpdateIntegrationBranch: s.handleUpdateIntegrationBranch,
-    promotionTargetData: s.promotionTargetData,
-    onUpdatePromotionTarget: s.handleUpdatePromotionTarget,
-    selectedProjectOnboardingProof: selectedProject?.onboarding_proof ?? null,
-  }), [
-    s.userRole, setRuntimeSection, setRuntimeConfigSection,
-    ignoreEmbeddedSettingsClose, allModelOptions, healthCheckUrlsInput, setHealthCheckUrlsInput,
-    s.updateHealthCheckUrls, s.defaultTaskType, s.setDefaultTaskType,
-    s.viewMode, s.setViewMode, s.refreshInterval, s.setRefreshInterval,
-    s.limit, s.setLimit, s.apiHealthy, s.wsConnected, s.lastFetchTime,
-    s.notifyOnComplete, s.setNotifyOnComplete, s.notifyOnFail, s.setNotifyOnFail,
-    s.notifyOnApprovalNeeded, s.setNotifyOnApprovalNeeded,
-    s.soundOnComplete, s.setSoundOnComplete,
-    s.notifyOnHighSignalMessage, s.setNotifyOnHighSignalMessage,
-    s.maxConcurrentVMs, s.updateMaxVMs, s.maxRetries, s.updateMaxRetries,
-    s.requireApprovalGates, s.updateRequireApprovalGates,
-    s.autoArchiveEnabled, s.updateAutoArchiveEnabled,
-    s.autoArchiveTerminalAfterDays, s.updateAutoArchiveTerminalAfterDays,
-    s.autoArchiveMaxTerminalTasksPerProject, s.updateAutoArchiveMaxTerminalTasksPerProject,
-    s.autoArchiveIntervalMinutes, s.updateAutoArchiveIntervalMinutes,
-    s.maxAutonomousTasksPerHour, s.handleUpdateMaxAutonomousRate,
-    s.maxGlobalAutonomousTasksPerHour, s.updateMaxGlobalAutonomousRate,
-    s.maxPipelineSlots, s.updateMaxPipelineSlots,
-    s.reservedSlotsForTypes, s.updateReservedSlotsForTypes,
-    s.evaluatingPipelineTimeoutMinutes, s.updateEvaluatingPipelineTimeout,
-    s.evaluatingFailHours, s.updateEvaluatingFailHours,
-    s.ciBackstopTimeoutMinutes, s.updateCiBackstopTimeout,
-    s.autonomousResearchIntervalMinutes, s.handleUpdateAutonomousResearchInterval,
-    s.directionCooldownMinutes, s.handleUpdateDirectionCooldownMinutes,
-    s.strategicResearchFrequency, s.handleUpdateStrategicResearchFrequency,
-    s.projects, s.handlePauseAllAutonomous, s.handleRestartOrchestrator,
-    s.directionChurnWindowCycles, s.updateDirectionChurnWindowCycles,
-    s.directionChurnNonMergeThreshold, s.updateDirectionChurnNonMergeThreshold,
-    s.directionChurnMinMergeRate, s.updateDirectionChurnMinMergeRate,
-    s.directionLifetimeNonMergeThreshold, s.updateDirectionLifetimeNonMergeThreshold,
-    s.directionLifetimeMinMergeRate, s.updateDirectionLifetimeMinMergeRate,
-    s.directionReviewRecommendationThreshold, s.updateDirectionReviewRecommendationThreshold,
-    s.githubAccount, s.connectGitHub, s.maxPlanAccounts,
-    s.toggleMaxPlanAccount, s.removeMaxPlanAccount,
-    s.resetAccountRateLimits, s.refreshAccountModels,
-    s.updateMaxPlanAccount, s.updateAccountCaps,
-    s.showUserManagement, s.setShowUserManagement,
-    showProjectMembers, setShowProjectMembers,
-    selectedProject?.my_role,
-    s.newAccountName, s.setNewAccountName,
-    s.newAccountProvider, s.setNewAccountProvider,
-    s.newAccountAuthMode, s.setNewAccountAuthMode,
-    s.newAccountToken, s.setNewAccountToken,
-    s.newAccountProviderMetadata, s.setNewAccountProviderMetadata,
-    s.newAccountClaudeConfigJson, s.setNewAccountClaudeConfigJson,
-    s.newAccountDailyTaskCap, s.setNewAccountDailyTaskCap,
-    s.newAccountMaxConcurrentTasks, s.setNewAccountMaxConcurrentTasks,
-    s.newAccountAutoDisableAfterRateLimits, s.setNewAccountAutoDisableAfterRateLimits,
-    s.addMaxPlanAccount, s.providers,
-    s.providerSettingsDefaults, s.taskTypeProviderOverrides, s.providerSettingsByEffort,
-    s.updateProviderSettingsDefaults, s.updateTaskTypeProviderOverrides,
-    s.updateProviderSettingsByEffort,
-    s.providerSelectionMode, s.updateProviderSelectionMode,
-    s.taskTypeCategories, s.updateTaskTypeCategories,
-    s.categoryRouting, s.updateCategoryRouting,
-    s.taskTypeRouting, s.updateTaskTypeRouting,
-    s.deployState, s.handlePausePipeline, s.handleResumePipeline,
-    s.handleResetHealth, s.handleRollback, s.handleMarkStable, s.handleRepairState,
-    s.failedRollback, s.zoneHealth,
-    s.notificationConfig, s.updateNotificationConfig,
-    s.dailyCostCeilingUsd, s.updateDailyCostCeiling,
-    s.selectedProjectId,
-    selectedProject?.github_owner, selectedProject?.github_repo,
-    selectedProject?.is_self_repo,
-    s.buildConfig, s.handleUpdateBuildConfig, s.handleDetectBuildConfig,
-    s.autoRemediationConfig, s.autoRemediationStats, s.handleUpdateAutoRemediationConfig,
-    s.issueImplementationConfig, s.handleUpdateIssueImplementationConfig,
-    s.autoReviewConfig, s.handleUpdateAutoReviewConfig,
-    s.resourceEnvelopeData, s.resourceEnvelopeLoading, s.resourceEnvelopeError,
-    s.handleUpdateResourceEnvelope,
-    s.integrationBranchData, s.handleUpdateIntegrationBranch,
-    s.promotionTargetData, s.handleUpdatePromotionTarget,
-    selectedProject?.onboarding_proof,
-  ]);
+    setShowProjectMembers,
+    selectedProject,
+  });
 
   // activeTab drives the four operator modes: Strategic, Pipeline, Project, Runtime.
   const handleTabChange = useCallback((tab: PrimaryTab) => {
@@ -1258,6 +855,10 @@ export default function App() {
       dailyCostCeilingUsd: s.dailyCostCeilingUsd,
     };
   }, [s.cumulativeCost, s.dailyCostCeilingUsd, s.maxPlanAccounts]);
+  const railLiveActivity = useMemo(
+    () => computeStrategicSessionActivity(s.strategicSessionTranscript, []),
+    [s.strategicSessionTranscript],
+  );
   const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
     void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
   }, [persistStrategicWorkbench]);
@@ -1507,6 +1108,8 @@ export default function App() {
     );
   }
 
+  const showWelcomeScreen = s.projectsLoaded && s.projects.length === 0 && !s.projectsFetchError;
+
   return (
     <ErrorBoundary>
     <TaskCapabilitiesProvider contract={s.taskCapabilityContract}>
@@ -1551,11 +1154,13 @@ export default function App() {
         health={s.orchestratorHealth}
         detailedHealth={s.detailedHealth}
         pipelineThrottle={s.pipelineThrottle}
+        ceilingDeferredProjectIds={s.ceilingDeferredProjectIds}
         gatedTaskTypes={s.gatedTaskTypes}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
       />
       <CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} />
       <KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} />
+      <Suspense fallback={null}>
       <StrategicContextWorkspace
         open={strategicContextWorkspaceOpen}
         state={strategicReadModel.data ?? null}
@@ -1581,6 +1186,7 @@ export default function App() {
         onOpenSpend={openRuntimeAnalytics}
         onUpdateSessionRefs={updateStrategicSessionRefs}
       />
+      </Suspense>
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
         return (
@@ -1610,7 +1216,13 @@ export default function App() {
         </div>
       )}
 
-      <WorkbenchFrame>
+      {showWelcomeScreen ? (
+        <WelcomeScreen
+          onCreateProject={() => setShowNewProjectModal(true)}
+          onSignOut={() => signOut(auth)}
+        />
+      ) : (
+        <WorkbenchFrame>
       {s.showUserManagement && s.userRole === 'admin' ? (
         <UserManagement
           users={s.allowedUsers}
@@ -1676,6 +1288,7 @@ export default function App() {
         >
           <WorkbenchSplit
             main={(
+              <Suspense fallback={<WorkspaceSkeleton />}>
               <MessagesPanel
                 selectedProjectId={s.selectedProjectId}
                 githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
@@ -1700,6 +1313,7 @@ export default function App() {
                 onOpenCommandPalette={openCommandPalette}
                 onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
               />
+              </Suspense>
             )}
             rail={(
               <StrategicContextRail
@@ -1709,6 +1323,7 @@ export default function App() {
                 strategistActive={s.strategistActive}
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
+                liveActivity={railLiveActivity}
                 onOpenProjectSection={(section) => openStrategicContextTarget({ surface: 'project', section })}
                 onOpenPipeline={() => openStrategicContextTarget({ surface: 'pipeline', section: 'flow' })}
                 onOpenRuntimeHealth={() => openStrategicContextTarget({ surface: 'runtime', section: 'health' })}
@@ -1731,7 +1346,7 @@ export default function App() {
         </WorkbenchSurface>
       ) : activeTab === 'project' ? (
         <ErrorBoundary level="panel">
-          <Suspense fallback={null}>
+          <Suspense fallback={<WorkspaceSkeleton />}>
           <ProjectWorkspace
             projectSection={projectSection}
             onProjectSectionChange={setProjectSection}
@@ -1757,7 +1372,7 @@ export default function App() {
         </ErrorBoundary>
       ) : activeTab === 'runtime' ? (
         <ErrorBoundary level="panel">
-          <Suspense fallback={null}>
+          <Suspense fallback={<WorkspaceSkeleton />}>
           <RuntimeWorkspace
             runtimeSection={runtimeSection}
             onRuntimeSectionChange={setRuntimeSection}
@@ -1810,7 +1425,7 @@ export default function App() {
           </Suspense>
         </ErrorBoundary>
       ) : (
-        <Suspense fallback={null}>
+        <Suspense fallback={<WorkspaceSkeleton />}>
         <PipelineWorkspace
           surface={{
             pipelineSection,
@@ -1924,6 +1539,7 @@ export default function App() {
         </Suspense>
       )}
       </WorkbenchFrame>
+      )}
 
       <PrimaryTabNav
         activeTab={activeTab}
@@ -1970,6 +1586,7 @@ export default function App() {
       />
 
       {s.showNewTaskModal && (
+        <Suspense fallback={null}>
         <NewTaskModal
           newTaskRepo={s.newTaskRepo}
           newTaskBranch={s.newTaskBranch}
@@ -2021,9 +1638,11 @@ export default function App() {
           onSubmit={s.handleCreateTask}
           onClose={() => s.setShowNewTaskModal(false)}
         />
+        </Suspense>
       )}
 
       {(showNewProjectModal || setupProjectId) && (
+        <Suspense fallback={null}>
         <NewProjectModal
           onClose={() => { setShowNewProjectModal(false); setSetupProjectId(null); }}
           onSuccess={() => {
@@ -2032,6 +1651,7 @@ export default function App() {
           }}
           setupProject={setupProject}
         />
+        </Suspense>
       )}
 
       {showProjectManagement && (
@@ -2046,32 +1666,36 @@ export default function App() {
       )}
 
       {s.showResearchBrowser && (
-        <ResearchBrowser
-          tasks={s.tasks}
-          researchFeed={researchFeed.length > 0 ? researchFeed : undefined}
-          selectedProjectId={s.selectedProjectId}
-          initialDirectionId={researchBrowserDirectionId ?? undefined}
-          onClose={() => { s.setShowResearchBrowser(false); setResearchBrowserDirectionId(null); }}
-          onNavigateToTask={(taskId) => {
-            s.setShowResearchBrowser(false);
-            setResearchBrowserDirectionId(null);
-            handleViewTaskById(taskId);
-          }}
-        />
+        <Suspense fallback={<WorkspaceSkeleton />}>
+          <ResearchBrowser
+            tasks={s.tasks}
+            researchFeed={researchFeed.length > 0 ? researchFeed : undefined}
+            selectedProjectId={s.selectedProjectId}
+            initialDirectionId={researchBrowserDirectionId ?? undefined}
+            onClose={() => { s.setShowResearchBrowser(false); setResearchBrowserDirectionId(null); }}
+            onNavigateToTask={(taskId) => {
+              s.setShowResearchBrowser(false);
+              setResearchBrowserDirectionId(null);
+              handleViewTaskById(taskId);
+            }}
+          />
+        </Suspense>
       )}
 
       {s.showKnowledgeBrowser && (
-        <KnowledgeBrowser
-          selectedProjectId={s.selectedProjectId}
-          onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); setKnowledgeBrowserInitialDocId(null); }}
-          onLaunchWebResearchTask={s.openWebResearchTaskModal}
-          initialDirectionId={knowledgeBrowserDirectionId ?? undefined}
-          initialDocumentId={knowledgeBrowserInitialDocId ?? undefined}
-          onNavigateToTask={(taskId) => {
-            s.setShowKnowledgeBrowser(false);
-            handleViewTaskById(taskId);
-          }}
-        />
+        <Suspense fallback={<WorkspaceSkeleton />}>
+          <KnowledgeBrowser
+            selectedProjectId={s.selectedProjectId}
+            onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); setKnowledgeBrowserInitialDocId(null); }}
+            onLaunchWebResearchTask={s.openWebResearchTaskModal}
+            initialDirectionId={knowledgeBrowserDirectionId ?? undefined}
+            initialDocumentId={knowledgeBrowserInitialDocId ?? undefined}
+            onNavigateToTask={(taskId) => {
+              s.setShowKnowledgeBrowser(false);
+              handleViewTaskById(taskId);
+            }}
+          />
+        </Suspense>
       )}
 
       {s.logTask && (
@@ -2130,6 +1754,7 @@ export default function App() {
       )}
 
       {showActivityFeed && (
+        <Suspense fallback={null}>
         <ActivityFeed
           selectedProjectId={s.selectedProjectId}
           refreshInterval={s.refreshInterval}
@@ -2140,6 +1765,7 @@ export default function App() {
           onClose={() => setShowActivityFeed(false)}
           lastVisitTimestamp={s.lastVisitTimestamp}
         />
+        </Suspense>
       )}
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />

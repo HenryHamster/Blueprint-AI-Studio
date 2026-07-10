@@ -3,6 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act, createRef } from 'react';
 import { MessagesComposer } from './MessagesComposer';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
+import type { PendingAttachment } from './MessagesComposer';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 import { MESSAGE_CONTENT_MAX } from '../api';
 
@@ -15,6 +16,9 @@ async function renderComposer(
   strategicContext: StrategicContextDescriptorModel | null = null,
   onOpenCommandPalette?: () => void,
   newContent = '',
+  pendingAttachments: PendingAttachment[] = [],
+  onAddAttachment?: (file: File) => void,
+  onRemoveAttachment?: (id: string) => void,
 ) {
   const ref = createRef<HTMLTextAreaElement>();
   await act(async () => {
@@ -35,6 +39,9 @@ async function renderComposer(
         strategicContext={strategicContext}
         onOpenStrategicContext={() => {}}
         onOpenCommandPalette={onOpenCommandPalette}
+        pendingAttachments={pendingAttachments}
+        onAddAttachment={onAddAttachment}
+        onRemoveAttachment={onRemoveAttachment}
       />,
     );
   });
@@ -307,5 +314,221 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     expect(descriptor).not.toBeNull();
     expect(descriptor!.getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
     await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('minimal chat composer with pending attachment preview fits 1280px without overflow', async () => {
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
+        { id: '1', file: new File([], 'screenshot.png', { type: 'image/png' }), previewUrl: null, mime_type: 'image/png', name: 'screenshot.png', size_bytes: 123456 },
+        { id: '2', file: new File([], 'report.pdf', { type: 'application/pdf' }), previewUrl: null, mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 789012 },
+      ]);
+    });
+    await expectMinTouchTargetAt(1280, async () => {});
+  });
+
+  test('minimal chat composer with pending attachment preview fits 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
+        { id: 'a', file: new File([], 'screenshot.png', { type: 'image/png' }), previewUrl: null, mime_type: 'image/png', name: 'screenshot.png', size_bytes: 123456 },
+        { id: 'b', file: new File([], 'report.pdf', { type: 'application/pdf' }), previewUrl: null, mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 789012 },
+        { id: 'c', file: new File([], 'notes.txt', { type: 'text/plain' }), previewUrl: null, mime_type: 'text/plain', name: 'notes.txt', size_bytes: 1024 },
+      ]);
+    });
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+});
+
+describe('MessagesComposer — attachment interaction', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) {
+      host.remove();
+      host = null;
+    }
+  });
+
+  test('remove attachment button calls onRemoveAttachment with the correct attachment id', async () => {
+    const onRemoveAttachment = vi.fn();
+    host = document.createElement('div');
+    host.style.width = '375px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
+      { id: 'first-id', file: new File([], 'first.png', { type: 'image/png' }), previewUrl: null, mime_type: 'image/png', name: 'first.png', size_bytes: 1000 },
+      { id: 'second-id', file: new File([], 'second.pdf', { type: 'application/pdf' }), previewUrl: null, mime_type: 'application/pdf', name: 'second.pdf', size_bytes: 2000 },
+    ], undefined, onRemoveAttachment);
+
+    // Find and click the remove button on the second attachment
+    const removeButtons = host.querySelectorAll<HTMLButtonElement>('button[aria-label^="Remove"]');
+    expect(removeButtons.length).toBe(2);
+
+    await act(async () => {
+      removeButtons[1].click();
+    });
+
+    expect(onRemoveAttachment).toHaveBeenCalledOnce();
+    expect(onRemoveAttachment).toHaveBeenCalledWith('second-id');
+  });
+
+  test('remove button aria-label reflects the file name', async () => {
+    host = document.createElement('div');
+    host.style.width = '375px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
+      { id: '3', file: new File([], 'my-notes.txt', { type: 'text/plain' }), previewUrl: null, mime_type: 'text/plain', name: 'my-notes.txt', size_bytes: 500 },
+    ]);
+
+    const removeBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Remove my-notes.txt"]');
+    expect(removeBtn).toBeTruthy();
+  });
+
+  test('handlePaste calls onAddAttachment when files are pasted and prevents default', async () => {
+    const onAddAttachment = vi.fn();
+    host = document.createElement('div');
+    host.style.width = '375px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
+
+    const textarea = host?.querySelector('textarea');
+    expect(textarea).toBeTruthy();
+
+    const file = new File(['pasted content'], 'pasted.txt', { type: 'text/plain' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    const pasteEvent = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+
+    await act(async () => {
+      textarea!.dispatchEvent(pasteEvent);
+    });
+
+    expect(onAddAttachment).toHaveBeenCalledOnce();
+    expect(onAddAttachment).toHaveBeenCalledWith(file);
+    expect(pasteEvent.defaultPrevented).toBe(true);
+  });
+
+  test('handlePaste does not prevent default or call onAddAttachment when no files are pasted', async () => {
+    const onAddAttachment = vi.fn();
+    host = document.createElement('div');
+    host.style.width = '375px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
+
+    const textarea = host?.querySelector('textarea');
+    expect(textarea).toBeTruthy();
+
+    // Paste with no clipboardData (no files) — handler should return early.
+    const pasteEvent = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+
+    await act(async () => {
+      textarea!.dispatchEvent(pasteEvent);
+    });
+
+    expect(onAddAttachment).not.toHaveBeenCalled();
+    expect(pasteEvent.defaultPrevented).toBe(false);
+  });
+
+  test('handleDrop calls onAddAttachment with dropped files', async () => {
+    const onAddAttachment = vi.fn();
+    host = document.createElement('div');
+    host.style.width = '375px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
+
+    const composerBox = host?.querySelector('[data-testid="strategic-composer-box"]');
+    expect(composerBox).toBeTruthy();
+
+    const file = new File(['dropped content'], 'dropped.txt', { type: 'text/plain' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    const dropEvent = new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true });
+
+    await act(async () => {
+      composerBox!.dispatchEvent(dropEvent);
+    });
+
+    expect(onAddAttachment).toHaveBeenCalledOnce();
+    expect(onAddAttachment).toHaveBeenCalledWith(file);
+  });
+
+  test('dragOver and dragLeave toggle the drag-over border class', async () => {
+    host = document.createElement('div');
+    host.style.width = '375px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal');
+
+    const composerBox = host!.querySelector('[data-testid="strategic-composer-box"]')!;
+    expect(composerBox).toBeTruthy();
+
+    // Initially no drag-over style
+    expect(composerBox.className).not.toContain('border-emerald-500/60');
+
+    // Dispatch dragover
+    await act(async () => {
+      composerBox.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true }));
+    });
+    expect(composerBox.className).toContain('border-emerald-500/60');
+
+    // Dispatch dragleave
+    await act(async () => {
+      composerBox.dispatchEvent(new DragEvent('dragleave', { bubbles: true, cancelable: true }));
+    });
+    expect(composerBox.className).not.toContain('border-emerald-500/60');
+  });
+
+  test('handleDrop clears drag-over state', async () => {
+    const onAddAttachment = vi.fn();
+    host = document.createElement('div');
+    host.style.width = '375px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
+
+    const composerBox = host!.querySelector('[data-testid="strategic-composer-box"]')!;
+
+    // First enter drag-over state
+    await act(async () => {
+      composerBox.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true }));
+    });
+    expect(composerBox.className).toContain('border-emerald-500/60');
+
+    // Drop with files
+    const file = new File(['content'], 'file.txt', { type: 'text/plain' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    await act(async () => {
+      composerBox.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+    });
+
+    // State cleared after drop
+    expect(composerBox.className).not.toContain('border-emerald-500/60');
   });
 });

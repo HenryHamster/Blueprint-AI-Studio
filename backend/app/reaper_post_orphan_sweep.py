@@ -118,13 +118,21 @@ async def run_post_orphan_sweep(
         await _ensure_vm_deleted(old_vm, reason="reaper")
 
     # Trigger rollup checks for failed tasks with parents (after commit)
+    # Batch-fetch ALL tasks once before the loop to avoid N+1 session.get calls.
+    # The rollback inside the exception handler expires all ORM objects; after
+    # a rollback we re-batch in a single query instead of falling back to per-
+    # iteration gets.
+    _rollup_task_batch: dict = {}
+    if post_reap_task_ids:
+        _rows = await session.execute(
+            select(Task).where(Task.id.in_(post_reap_task_ids))
+        )
+        _rollup_task_batch = {t.id: t for t in _rows.scalars().all()}
+
     for _post_reap_task_id in post_reap_task_ids:
         # Heartbeat: _check_and_trigger_rollup hits GitHub per task.
         progress_cb()
-        # Re-fetch fresh each iteration: the deferred-requeue rollback (97) and a
-        # prior iteration's rollup-check rollback (142) both expire the batch, so
-        # reading task.status/.parent_task_id on a stale object would MissingGreenlet.
-        task = await session.get(Task, _post_reap_task_id, populate_existing=True)
+        task = _rollup_task_batch.get(_post_reap_task_id)
         if task is None:
             continue
         if task.status == TaskStatus.FAILED and task.parent_task_id:
@@ -135,7 +143,21 @@ async def run_post_orphan_sweep(
                 # round-trips cannot silently exhaust
                 # REAPER_HANG_SECONDS on this loop either (mirrors
                 # the stale-EVALUATING sweep at reaper.py:2789).
-                await _check_and_trigger_rollup(task, session, progress_cb=progress_cb)
+                # C4: _check_and_trigger_rollup may perform a silent internal
+                # rollback (e.g. `_sess_poisoned` recovery) WITHOUT re-raising.
+                # When that happens, all ORM objects in the shared session are
+                # expired — the next iteration's `task.status` would trigger a
+                # sync lazy-refresh inside the AsyncSession and raise
+                # MissingGreenlet on asyncpg. Re-batch immediately if the
+                # return value signals a silent rollback.
+                _rolled_back = await _check_and_trigger_rollup(
+                    task, session, progress_cb=progress_cb
+                )
+                if _rolled_back:
+                    _rows = await session.execute(
+                        select(Task).where(Task.id.in_(post_reap_task_ids))
+                    )
+                    _rollup_task_batch = {t.id: t for t in _rows.scalars().all()}
                 # Completion-side warm-reuse: if that landing
                 # completed the parent rollup, stamp the
                 # _deps_satisfied marker on the dependents it just
@@ -154,14 +176,28 @@ async def run_post_orphan_sweep(
                 # not inherit a PendingRollback session.
                 with contextlib.suppress(Exception):
                     await session.rollback()
+                # Re-batch after rollback: the rollback expired every
+                # ORM object. A single batch query replaces up to N
+                # individual session.get() calls for remaining tasks.
+                _rows = await session.execute(
+                    select(Task).where(Task.id.in_(post_reap_task_ids))
+                )
+                _rollup_task_batch = {t.id: t for t in _rows.scalars().all()}
 
     # Immediately unblock dependents of terminally failed tasks
+    # Batch-fetch ALL tasks once before the loop so we read from a local
+    # dict instead of issuing N individual session.get() queries.
+    _unblock_task_batch: dict = {}
+    if post_reap_task_ids:
+        _rows = await session.execute(
+            select(Task).where(Task.id.in_(post_reap_task_ids))
+        )
+        _unblock_task_batch = {t.id: t for t in _rows.scalars().all()}
+
     for _post_reap_task_id in post_reap_task_ids:
         # Heartbeat: per-task dependent-unblock opens its own session.
         progress_cb()
-        # Re-fetch fresh: loop-1's rollup-check rollback (142) expired the batch;
-        # a raw task.status read here would otherwise MissingGreenlet.
-        task = await session.get(Task, _post_reap_task_id, populate_existing=True)
+        task = _unblock_task_batch.get(_post_reap_task_id)
         if task is None:
             continue
         if task.status == TaskStatus.FAILED:
@@ -232,6 +268,23 @@ async def run_post_orphan_sweep(
     # sibling tasks whose rollup waits on open PRs targeting the
     # same research branch block forever. Closing the dead PR
     # removes it from the sibling rollup-wait gate.
+    # Batch-fetch unique projects referenced by FAILED fix tasks
+    # so each _proj lookup below uses a dict instead of a
+    # per-iteration session.get(Project, ...).
+    _dead_pr_project_cache: dict = {}
+    _failed_fix_pids = {
+        t.project_id
+        for t in post_reap_tasks
+        if t.status == TaskStatus.FAILED
+        and (t.first_payload or {}).get("type") == "fix"
+        and t.project_id is not None
+    }
+    if _failed_fix_pids:
+        _rows = await session.execute(
+            select(Project).where(Project.id.in_(list(_failed_fix_pids)))
+        )
+        _dead_pr_project_cache = {p.id: p for p in _rows.scalars().all()}
+
     for task in post_reap_tasks:
         # Heartbeat: closing a dead PR is a GitHub API call per task.
         progress_cb()
@@ -253,7 +306,7 @@ async def run_post_orphan_sweep(
         # single fix task that exhausted retries. Match the FULL
         # set of per-project staging prefixes, not just research/.
         branch = payload.get("branch", "")
-        _proj = await session.get(Project, task.project_id)
+        _proj = _dead_pr_project_cache.get(task.project_id) if task.project_id else None
         if _proj is not None and _proj.is_staging_branch(branch):
             logger.warning(
                 f"[REAPER] Skip closing rollup PR #{pr_number} "

@@ -1780,6 +1780,10 @@ async def list_knowledge_documents(
     challenge_state: str | None = Query(
         default=None, description="Exact origin challenge state filter"
     ),
+    lifecycle_status: str | None = Query(
+        default=None,
+        description="Exact lifecycle-status filter (pending / consumed / dismissed)",
+    ),
     finding_hash: str | None = Query(
         default=None, description="Exact originating research finding hash filter"
     ),
@@ -1813,6 +1817,7 @@ async def list_knowledge_documents(
         source_kind=source_kind,
         origin_state=origin_state,
         challenge_state=challenge_state,
+        lifecycle_status=lifecycle_status,
         finding_hash=finding_hash,
         sweep_id=sweep_id,
         limit=limit,

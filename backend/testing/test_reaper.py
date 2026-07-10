@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -6252,21 +6252,27 @@ async def test_orphan_crash_sibling_reaped_when_poison_throws(
     await reaper_db.commit()
     poison_id = poison.id
 
-    # Inject a crash on the first session.get(Task, poison_id) call only.
-    # Subsequent calls (e.g. from the quarantine path's _qsession) succeed normally.
-    call_count: dict = {}
-    real_get = AsyncSession.get
-
-    async def patched_get(self, model, pk, **kwargs):
-        key = (model, pk)
-        call_count[key] = call_count.get(key, 0) + 1
-        if pk == poison_id and call_count[key] == 1:
-            raise RuntimeError("injected-poison-pill")
-        return await real_get(self, model, pk, **kwargs)
-
-    mocker.patch.object(AsyncSession, "get", patched_get)
-
+    # Inject a crash inside _run_orphan_io for the poison task.  This function
+    # is called at line 1136 during orphan processing, which is inside the
+    # per-orphan try/except block.  The crash triggers the except-block's
+    # session.rollback() (line 2265), expiring ALL cached objects including
+    # _projects_batch entries.  _run_orphan_io was chosen because (a) it is
+    # guaranteed to be called for every orphan, (b) it runs AFTER the fresh_task
+    # guard (so the task instance is valid), and (c) it runs BEFORE the three
+    # _projects_batch call sites.
     import app.reaper as _reaper_mod
+
+    _real_run_orphan_io = _reaper_mod._run_orphan_io
+
+    async def patched_run_orphan_io(*args, **kwargs):
+        task = kwargs.get("task")
+        if task is not None and task.id == poison_id:
+            raise RuntimeError("injected-poison-pill")
+        return await _real_run_orphan_io(*args, **kwargs)
+
+    mocker.patch.object(
+        _reaper_mod, "_run_orphan_io", side_effect=patched_run_orphan_io
+    )
 
     _cycles_before = _reaper_mod._reaper_cycles_completed_count
     await _run_reaper_once()
@@ -6297,6 +6303,141 @@ async def test_orphan_crash_sibling_reaped_when_poison_throws(
 
 
 @pytest.mark.asyncio
+async def test_orphan_projects_batch_expired_after_rollback_guard_re_fetches(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """After a per-row session.rollback() expires the batch-cached Project
+    objects in _projects_batch, a later orphan in the same batch that reads
+    _projects_batch must receive a FRESH Project via the expiry guard — not an
+    expired instance whose attribute access would raise MissingGreenlet.
+
+    Regression: the _orphan_task_map already has this guard (inspect+re-fetch at
+    lines 888-890), but the three _projects_batch.get() call sites (lines 1589,
+    1728, 2090) did not. After a prior orphan iteration's except-block
+    session.rollback(), the cached Project instances became expired, and the
+    guard-less sites would crash-quarantine an otherwise-healthy orphan task.
+
+    This test targets the call site at the research retry path (line 2090):
+    ``_res_proj = _projects_batch.get(task.project_id)`` inside
+    ``if task_type == "research"``. Two research-type orphans share a project;
+    the first triggers the rollback by crashing in _run_orphan_io, and the
+    second reaches the research retry path where the guard must re-fetch the
+    expired Project.
+    """
+    project = await _make_project(reaper_db)
+
+    # Two research-type orphans sharing the same project.
+    poison = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        vm_instance_id="vm-poison-research",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+    )
+    healthy = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        vm_instance_id="vm-healthy-research",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(poison)
+    reaper_db.add(healthy)
+    await reaper_db.commit()
+    poison_id = poison.id
+
+    # Inject a crash inside _run_orphan_io for the poison task.  This function
+    # is called at line 1136 during orphan processing, which is inside the
+    # per-orphan try/except block.  The crash triggers the except-block's
+    # session.rollback() (line 2265), expiring ALL cached objects including
+    # _projects_batch entries.  _run_orphan_io was chosen because (a) it is
+    # guaranteed to be called for every orphan, (b) it runs AFTER the fresh_task
+    # guard (so the task instance is valid), and (c) it runs BEFORE the three
+    # _projects_batch call sites.
+    import app.reaper as _reaper_mod
+
+    _real_run_orphan_io = _reaper_mod._run_orphan_io
+
+    async def patched_run_orphan_io(*args, **kwargs):
+        task = kwargs.get("task")
+        if task is not None and task.id == poison_id:
+            raise RuntimeError("injected-poison-pill")
+        return await _real_run_orphan_io(*args, **kwargs)
+
+    mocker.patch.object(
+        _reaper_mod, "_run_orphan_io", side_effect=patched_run_orphan_io
+    )
+
+    # Spy on refresh_research_task_verification to record whether the Project
+    # instance passed in was expired.  If the guard works, the Project will be
+    # fresh (re-fetched via session.get).  If the guard is missing, the Project
+    # will be expired — accessing its attributes inside the real function would
+    # raise MissingGreenlet.
+    refresh_calls: list = []
+
+    async def spy_refresh(task, proj, session):
+        refresh_calls.append(
+            {
+                "project_expired": inspect(proj).expired,
+                "task_id": task.id,
+            }
+        )
+
+    mocker.patch(
+        "app.autonomous_research.refresh_research_task_verification",
+        side_effect=spy_refresh,
+    )
+
+    _cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+    await reaper_db.refresh(poison)
+    await reaper_db.refresh(healthy)
+
+    # The reaper cycle must complete cleanly — no MissingGreenlet from an
+    # expired Project cascading through the per-orphan except block.
+    assert _reaper_mod._reaper_cycles_completed_count == _cycles_before + 1, (
+        "reaper cycle must complete cleanly despite expired _projects_batch"
+    )
+
+    # Poison task skipped this cycle (crash was caught, rolled back, skipped).
+    assert poison.status == TaskStatus.IN_PROGRESS, (
+        "poison task must not be reaped — crash caught and skipped"
+    )
+
+    # Healthy sibling MUST be reaped normally.  It reaches the research retry
+    # path (line 2084+), hits _projects_batch.get(...) at line 2094, and the
+    # expiry guard must have re-fetched the expired Project so the task is
+    # retried without error.
+    assert healthy.status == TaskStatus.QUEUED, (
+        "healthy research task must be retried after sibling's rollback "
+        "expired _projects_batch entries"
+    )
+    assert healthy.attempt_count == 1
+
+    # refresh_research_task_verification must have been called for the healthy
+    # task (it's a research type and the retry path reached line 2084-2096).
+    assert len(refresh_calls) >= 1, (
+        "refresh_research_task_verification must be called for the "
+        "healthy research task's retry"
+    )
+
+    # CRITICAL: the Project passed to the verification function must NOT be
+    # expired — this proves the expiry guard at line 2097 re-fetched it.
+    expired = [c for c in refresh_calls if c["project_expired"]]
+    assert not expired, (
+        "refresh_research_task_verification received an expired Project — "
+        "the _projects_batch expiry guard did not re-fetch"
+    )
+
+    # Crash streak must be incremented for the poison task (one crash).
+    assert clean_crash_streaks.get(str(poison_id)) == 1, (
+        "crash streak must be incremented for the poison task"
+    )
+
+
+@pytest.mark.asyncio
 async def test_orphan_crash_quarantines_task_after_streak_threshold(
     reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
 ):
@@ -6319,21 +6460,25 @@ async def test_orphan_crash_quarantines_task_after_streak_threshold(
     # Pre-seed streak to one below the threshold so this cycle triggers quarantine.
     clean_crash_streaks[str(poison_id)] = _ORPHAN_REAP_CRASH_STREAK_LIMIT - 1
 
-    # Raise on the first session.get call per task id (main loop body); subsequent
-    # calls from the quarantine path's _qsession succeed so the FAILED write lands.
-    call_count: dict = {}
-    real_get = AsyncSession.get
-
-    async def patched_get(self, model, pk, **kwargs):
-        key = (model, pk)
-        call_count[key] = call_count.get(key, 0) + 1
-        if pk == poison_id and call_count[key] == 1:
-            raise RuntimeError("injected-poison-quarantine")
-        return await real_get(self, model, pk, **kwargs)
-
-    mocker.patch.object(AsyncSession, "get", patched_get)
-
+    # Inject a crash inside _run_orphan_io for the poison task.  This function
+    # is called at line 1136 during orphan processing, which is inside the
+    # per-orphan try/except block.  The crash triggers the except-block's
+    # session.rollback() (line 2265), expiring ALL cached objects and
+    # incrementing the crash streak.  The streak then reaches the threshold,
+    # triggering the quarantine path (which uses its own fresh _qsession).
     import app.reaper as _reaper_mod
+
+    _real_run_orphan_io = _reaper_mod._run_orphan_io
+
+    async def patched_run_orphan_io(*args, **kwargs):
+        task = kwargs.get("task")
+        if task is not None and task.id == poison_id:
+            raise RuntimeError("injected-poison-quarantine")
+        return await _real_run_orphan_io(*args, **kwargs)
+
+    mocker.patch.object(
+        _reaper_mod, "_run_orphan_io", side_effect=patched_run_orphan_io
+    )
 
     _cycles_before = _reaper_mod._reaper_cycles_completed_count
     await _run_reaper_once()
@@ -15683,3 +15828,254 @@ async def test_metrics_integrity_sweep_flags_counter_drift_without_mutating_sour
             else:
                 _rc[k] = v
         mis._reset_observability_for_tests()
+
+
+# ── _projects_batch expiry-guard regression tests ────────────────────────────
+#
+# Regression: the orphan loop batch-loads Project objects BEFORE the per-row
+# processing loop (reaper.py ~line 757).  A per-row exception on one orphan
+# triggers session.rollback(), which expires ALL session-tracked ORM objects —
+# including the _projects_batch items.  A subsequent iteration that reads
+# attributes on the cached-but-expired Project raises MissingGreenlet
+# (synchronous lazy-load in async context), crash-quarantining a healthy task
+# as a side effect of an unrelated per-row failure.
+#
+# The fix (applied at the three _projects_batch.get() call sites) mirrors the
+# existing Task-object guard: ``if _proj is None or inspect(_proj).expired:
+# _proj = await session.get(Project, task.project_id)``.
+#
+# These tests exercise two of the three guarded call sites:
+#   Site 1 (~line 1589): merged-PR landing classification
+#   Site 2 (~line 1730): open-PR review-spawn branch derivation
+
+
+@pytest.mark.asyncio
+async def test_orphan_project_batch_expired_before_merged_pr_classification(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """Regression for Site 1: _projects_batch Project expired by a prior-row
+    rollback must be re-fetched before _apply_rollup_merge_classification.
+
+    Task A (PROVISIONING, processed first) crashes on session.get — triggering
+    session.rollback() which expires all ORM objects including _projects_batch.
+    Task B (IN_PROGRESS, merged PR) is processed second.  Without the expiry
+    guard at the merged-PR classification site, ``get_project_integration_branch``
+    accesses an expired Project attribute, raising MissingGreenlet and
+    crash-quarantining a healthy task.  With the guard, a fresh Project is
+    re-fetched and Task B completes normally.
+    """
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged": True, "base": {"ref": "main"}},
+    )
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = await _make_project(reaper_db)
+
+    # Task A: PROVISIONING (priority bucket 2) — processed first.
+    # started_at > 15 min ago satisfies the absolute PROVISIONING catch-all.
+    # Crashes immediately via patched_get, expiring all session objects.
+    task_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-expiry-crash-merged-pr-site1",
+        status=TaskStatus.PROVISIONING,
+        started_at=_utcnow() - timedelta(minutes=20),
+    )
+    # Task B: IN_PROGRESS (priority bucket 3) — processed second.
+    # Has a merged-PR artifact; should still complete after the batch expiry.
+    task_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "base_branch": "main"}],
+        vm_instance_id="vm-merged-pr-after-batch-expiry",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(task_a)
+    reaper_db.add(task_b)
+    await reaper_db.commit()
+    await reaper_db.refresh(task_a)
+    await reaper_db.refresh(task_b)
+    task_a_id = task_a.id
+    task_b_id = task_b.id
+
+    reaper_db.add(
+        Artifact(
+            task_id=task_b_id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/7701",
+        )
+    )
+    await reaper_db.commit()
+
+    # Crash Task A inside _run_orphan_io.  This function is called at line 1136
+    # for every orphan including PROVISIONING tasks, inside the per-orphan
+    # try/except block.  The crash triggers the except-block's
+    # session.rollback() (line 2265), expiring ALL cached objects including
+    # _projects_batch entries.  _run_orphan_io was chosen because (a) it is
+    # guaranteed to be called for every orphan, (b) it runs AFTER the fresh_task
+    # guard (so the task instance is valid), and (c) it runs BEFORE the three
+    # _projects_batch call sites.
+    import app.reaper as _reaper_mod
+
+    _real_run_orphan_io = _reaper_mod._run_orphan_io
+
+    async def patched_run_orphan_io(*args, **kwargs):
+        task = kwargs.get("task")
+        if task is not None and task.id == task_a_id:
+            raise RuntimeError("injected-expiry-crash-projects-batch-site1")
+        return await _real_run_orphan_io(*args, **kwargs)
+
+    mocker.patch.object(
+        _reaper_mod, "_run_orphan_io", side_effect=patched_run_orphan_io
+    )
+
+    _cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+    await reaper_db.refresh(task_b)
+
+    # Cycle completes cleanly despite Task A's crash.
+    assert _reaper_mod._reaper_cycles_completed_count == _cycles_before + 1, (
+        "reaper cycle must complete cleanly despite Task A crashing and expiring "
+        "_projects_batch"
+    )
+    # Task B must be COMPLETED: the expiry guard re-fetched a fresh Project and
+    # _apply_rollup_merge_classification classified the landing correctly.
+    # Without the guard, MissingGreenlet would crash-quarantine Task B to
+    # IN_PROGRESS (mutations rolled back by the per-row exception handler).
+    assert task_b.status == TaskStatus.COMPLETED, (
+        "Task B (merged-PR) must be COMPLETED — the _projects_batch expiry guard "
+        "must re-fetch a fresh Project before _apply_rollup_merge_classification "
+        "(reaper.py Site 1: merged-PR classification)"
+    )
+    assert (task_b.context or {}).get("pr_merged") is True, (
+        "Task B context must carry pr_merged=True after expiry-guarded merge classification"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_project_batch_expired_before_open_pr_review_spawn(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """Regression for Site 2: _projects_batch Project expired by a prior-row
+    rollback must be re-fetched before _get_project_task_branch_namespace at
+    the open-PR review-spawn site.
+
+    Same expiry mechanic as Site 1: Task A crashes → rollback → all session
+    objects expire.  Task B (open PR) then derives its review-spawn branch via
+    ``_get_project_task_branch_namespace(_proj)``, which reads
+    ``_proj.build_config``.  Without the guard, that attribute access raises
+    MissingGreenlet; the inner spawn-failure except catches it, sets
+    ``_pr_state_check_pending = True``, and never calls _spawn_pipeline_task.
+    With the guard, a fresh Project is re-fetched and the review task spawns
+    normally.
+
+    Note: no explicit GitHub token mock is needed — when get_github_token_for_task
+    has no credentials in the test DB, reaper_orphan_io.py falls back to
+    gh_pr_state="open", triggering the open-PR review-spawn path automatically.
+    """
+    mock_spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = await _make_project(reaper_db)
+
+    # Task A: PROVISIONING (priority 2, processed first) — crashes, expiring
+    # all session objects including _projects_batch.
+    task_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-expiry-crash-open-pr-site2",
+        status=TaskStatus.PROVISIONING,
+        started_at=_utcnow() - timedelta(minutes=20),
+    )
+    # Task B: IN_PROGRESS (priority 3, processed second) — has a PR artifact.
+    # The GitHub fallback sets gh_pr_state="open", routing to the review-spawn
+    # path that reads _proj.build_config via _get_project_task_branch_namespace.
+    task_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-open-pr-after-batch-expiry",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(task_a)
+    reaper_db.add(task_b)
+    await reaper_db.commit()
+    await reaper_db.refresh(task_a)
+    await reaper_db.refresh(task_b)
+    task_a_id = task_a.id
+    task_b_id = task_b.id
+
+    reaper_db.add(
+        Artifact(
+            task_id=task_b_id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/8802",
+        )
+    )
+    await reaper_db.commit()
+
+    # Crash Task A inside _run_orphan_io.  This function is called at line 1136
+    # for every orphan including PROVISIONING tasks, inside the per-orphan
+    # try/except block.  The crash triggers the except-block's
+    # session.rollback() (line 2265), expiring ALL cached objects including
+    # _projects_batch entries.  _run_orphan_io was chosen because (a) it is
+    # guaranteed to be called for every orphan, (b) it runs AFTER the fresh_task
+    # guard (so the task instance is valid), and (c) it runs BEFORE the three
+    # _projects_batch call sites.
+    import app.reaper as _reaper_mod
+
+    _real_run_orphan_io = _reaper_mod._run_orphan_io
+
+    async def patched_run_orphan_io(*args, **kwargs):
+        task = kwargs.get("task")
+        if task is not None and task.id == task_a_id:
+            raise RuntimeError("injected-expiry-crash-projects-batch-site2")
+        return await _real_run_orphan_io(*args, **kwargs)
+
+    mocker.patch.object(
+        _reaper_mod, "_run_orphan_io", side_effect=patched_run_orphan_io
+    )
+
+    _cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+    await reaper_db.refresh(task_b)
+
+    # Cycle completes cleanly.
+    assert _reaper_mod._reaper_cycles_completed_count == _cycles_before + 1, (
+        "reaper cycle must complete cleanly despite Task A crashing and expiring "
+        "_projects_batch"
+    )
+    # Task B must be EVALUATING (handed off to review pipeline).
+    assert task_b.status == TaskStatus.EVALUATING, (
+        "Task B (open-PR) must be EVALUATING — the _projects_batch expiry guard "
+        "must re-fetch a fresh Project before _get_project_task_branch_namespace "
+        "(reaper.py Site 2: open-PR review-spawn branch derivation)"
+    )
+    # The spawn must have been called: without the expiry guard,
+    # _get_project_task_branch_namespace raises MissingGreenlet on the expired
+    # project, the inner spawn-failure except catches it, and _spawn_pipeline_task
+    # is never invoked (leaving _pr_state_check_pending=True and no review child).
+    mock_spawn.assert_called_once()
+    # With the guard and a successful spawn, the write-ahead recovery marker is
+    # cleared from context (not needed since the review task was spawned).
+    assert not (task_b.context or {}).get("_pr_state_check_pending"), (
+        "_pr_state_check_pending must be cleared after successful review spawn"
+    )

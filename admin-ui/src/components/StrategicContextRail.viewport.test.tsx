@@ -364,6 +364,10 @@ describe('StrategicContextRail — viewport regression', () => {
     await expectNoTextTruncationAt(375, async () => { await mount(375); });
   });
 
+  test('renders without horizontal overflow at 1440px — acceptance evidence', async () => {
+    await expectNoOverflowAt(1440, async () => { await mount(1440); });
+  });
+
   async function mountStrategicChatSideboard(onOpenContext = vi.fn()) {
     host = document.createElement('div');
     host.style.height = '800px';

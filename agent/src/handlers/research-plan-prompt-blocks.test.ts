@@ -21,8 +21,8 @@ describe('CAPABILITY_DECLARATION_DOC', () => {
 });
 
 describe('ACCEPTANCE_EVIDENCE_RUBRIC', () => {
-  it('documents exactly the four payload/merge-gate kinds', () => {
-    for (const kind of ['named_test', 'observable_behavior', 'downstream_artifact', 'visual']) {
+  it('documents exactly the five payload/merge-gate kinds', () => {
+    for (const kind of ['named_test', 'observable_behavior', 'downstream_artifact', 'visual', 'coverage_delta']) {
       expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain(`"kind": "${kind}"`);
     }
   });
@@ -33,6 +33,17 @@ describe('ACCEPTANCE_EVIDENCE_RUBRIC', () => {
     expect(ACCEPTANCE_EVIDENCE_RUBRIC).not.toContain('"kind": "test"');
     expect(ACCEPTANCE_EVIDENCE_RUBRIC).not.toContain('"descriptor"');
     expect(ACCEPTANCE_EVIDENCE_RUBRIC).not.toContain('"selector"');
+  });
+
+  it('coverage_delta_rubric_describes_total_coverage: describes codebase-wide line coverage, not changed-line-differential', () => {
+    // The actual backend implementation (acceptance_gate.py:_evaluate_coverage_delta
+    // / orchestrator_ci_monitor.py) measures either total codebase line coverage
+    // via pytest-cov/c8 or test pass rate as a fallback — NOT changed-line coverage.
+    // The rubric must accurately reflect what the gate checks so agents don't
+    // calibrate thresholds against differential coverage they think they declared.
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('total codebase line coverage');
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('not changed-line-differential');
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('test pass rate');
   });
 
   it('names the payload fields the backend AcceptanceEvidence parser honors', () => {

@@ -6,8 +6,24 @@ task_completion, task_completion_self_audit, research_completion, and
 task_evaluators can all share the same implementations without circular imports.
 """
 
+import asyncio
 import json
-from typing import Optional
+from typing import Any, Optional
+
+
+_ASYNC_JSON_THRESHOLD = 8192
+
+
+async def async_json_loads(text: str) -> Any:
+    """Parse JSON, offloading large payloads to a thread to avoid blocking the event loop.
+
+    Uses a heuristic threshold (``_ASYNC_JSON_THRESHOLD`` bytes) — small strings parse
+    synchronously (negligible blocking), large strings parse via ``asyncio.to_thread``
+    so CPU-bound :func:`json.loads` doesn't stall the async reactor.
+    """
+    if len(text) > _ASYNC_JSON_THRESHOLD:
+        return await asyncio.to_thread(json.loads, text)
+    return json.loads(text)
 
 
 def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:

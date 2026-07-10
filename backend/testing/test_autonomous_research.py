@@ -3772,12 +3772,16 @@ async def test_word_overlap_deduplication_skips_similar_title(db_session, mocker
             Task.project_id == project.id, Task.parent_task_id == task.id
         )
     )
-    assert len(result.scalars().all()) == 0, (
-        "Word-overlap duplicate must not create a task"
+    child_tasks = result.scalars().all()
+    assert len(child_tasks) == 1, (
+        "Word-overlap duplicate must be consolidated into one salvage task"
     )
+    salvage = child_tasks[0]
+    assert salvage.first_payload.get("type") == "salvage_bundle"
+    assert salvage.context.get("salvage_source_task_id") == str(task.id)
     await db_session.refresh(task)
-    assert task.status == TaskStatus.COMPLETED, (
-        "Research task must be auto-completed when all findings are duplicates"
+    assert task.status == TaskStatus.EVALUATING, (
+        "Research task must await its salvage child when all direct findings are duplicates"
     )
 
 

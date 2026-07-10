@@ -32,7 +32,7 @@
   "vision": {
     "direction_metrics.py": 1,
     "research_completion.py": 1,
-    "routers/admin_agent_ops.py": 1,
+    "routers/admin_agent_ops.py": 2,
     "routers/admin_debug.py": 1,
     "routers/admin_projects.py": 1,
     "strategic_completion.py": 9,

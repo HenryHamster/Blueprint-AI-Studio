@@ -20,10 +20,12 @@ from sqlmodel import select
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     CRITERION_OPS,
+    TEST_COVERAGE_RESULT_KEY,
     acceptance_blocks_success,
     acceptance_is_proven,
     acceptance_counts_as_verified_context,
     acceptance_was_declared,
+    backfill_acceptance_verdicts,
     classify_merged_acceptance,
     classify_merged_acceptance_context,
     classify_undeclared_reason,
@@ -33,10 +35,21 @@ from app.acceptance_gate import (
     record_artifact_consumptions_for_task,
     record_code_acceptance_verdict,
     summarize_version_acceptance_aggregate,
+    _evaluate_coverage_delta,
 )
 from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
-from app.models import Artifact, ArtifactConsumption, ArtifactType, Task, TaskStatus
+from app.models import (
+    Artifact,
+    ArtifactConsumption,
+    ArtifactType,
+    CriterionEvidence,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+    VersionAcceptanceCriterion,
+)
+from app.payload_schemas import AcceptanceEvidence
 from testing.factories import make_project
 
 
@@ -250,6 +263,28 @@ def test_named_test_several_seams_one_matches_passes():
             "backend/app/unrelated_module.py",
             "backend/app/widget.py",
             "backend/testing/test_widget.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "semantically grounded" in verdict.reason
+
+
+def test_named_test_cross_cutting_invariants_passes_semantic_grounding():
+    """A named_test declaring test_invariants.py — a cross-cutting test whose
+    stem 'invariants' does not match any single production module — passes
+    semantic grounding because the test validates invariants spanning multiple
+    modules and is intrinsically grounded when the PR ships a non-test change."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_invariants.py",
+        },
+        changed_files=[
+            "backend/app/research_direction_state.py",
+            "backend/testing/test_invariants.py",
         ],
         unverified_reason=None,
     )
@@ -1052,6 +1087,240 @@ def test_failed_named_test_is_declared_but_not_proven():
     assert acceptance_blocks_success(stamped) is True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# coverage_delta — test-coverage based acceptance gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_coverage_delta_meets_threshold_passes_and_is_proven():
+    """coverage_delta passes when the coverage result meets or exceeds threshold."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": 85.0}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "achieved" in verdict.reason
+
+
+def test_coverage_delta_below_threshold_fails_closed():
+    """coverage_delta fails when coverage is below the declared threshold."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": 45.0}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "coverage <" in verdict.reason or "below" in verdict.reason
+
+
+def test_coverage_delta_missing_result_fails_closed():
+    """coverage_delta fails when no coverage result is stored in context."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py"],
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "no result" in verdict.reason.lower()
+
+
+def test_coverage_delta_missing_threshold_fails_closed():
+    """coverage_delta fails when no threshold is provided in the declaration.
+
+    The schema-layer validator on AcceptanceEvidence rejects missing threshold
+    before ``evaluate_code_acceptance`` is reached, so this test validates the
+    gate-level ``_evaluate_coverage_delta`` function directly (bypassing the
+    schema validator via ``model_construct``) to confirm the fail-closed guard
+    still fires if a malformed declaration ever reached it.
+    """
+    evidence = AcceptanceEvidence.model_construct(kind="coverage_delta")
+    verdict = _evaluate_coverage_delta(evidence, context={})
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+
+
+def test_coverage_delta_non_numeric_coverage_fails_closed():
+    """coverage_delta fails when coverage_pct is not a number."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py"],
+    )
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": "high"}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+
+
+def test_coverage_delta_populated_from_verify_tests_artifact():
+    """coverage_delta acceptance evidence consumes coverage data that was
+    extracted from a MERGE_TEST_RESULT verdict and bridged into task context,
+    simulating what the orchestrator CI monitor + ci_completion do in production.
+
+    The MERGE_TEST_RESULT artifact carries a ``coverage`` block
+    (``{passed, skipped, total}``) from the verify-tests handler. This test
+    simulates the bridge: computing ``coverage_pct`` from those counts and
+    storing it under ``test_coverage_result``, then verifying the acceptance
+    gate evaluates it correctly.
+    """
+    # Simulate the coverage block a real MERGE_TEST_RESULT artifact would carry.
+    verdict_coverage = {"passed": 42, "skipped": 3, "total": 50}
+    total = verdict_coverage["total"]
+    passed = verdict_coverage["passed"]
+    coverage_pct = round((passed / total) * 100.0, 2)
+    assert coverage_pct == 84.0  # 42/50 = 84%
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": coverage_pct}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "achieved" in verdict.reason
+
+
+def test_coverage_delta_uses_line_coverage_not_test_pass_rate():
+    """coverage_pct reflects the fraction of changed lines hit by the test
+    (line coverage), not the test pass rate.
+
+    The orchestrator stores line_coverage_pct (from pytest-cov) as
+    coverage_pct in test_coverage_result. When line coverage differs from
+    the test pass rate (passed/total), the acceptance gate evaluates against
+    the line coverage value — NOT the pass rate.
+
+    This verifies the coverage_delta acceptance evidence kind fixes the
+    semantic bug where coverage_pct was computed as (passed/total)*100,
+    which is test pass rate, not changed-line coverage.
+    """
+    # Simulate a MERGE_TEST_RESULT coverage block where line coverage (90%)
+    # differs from test pass rate (passed=8, total=10 → 80%).
+    # The orchestrator reads line_coverage_pct and stores it as coverage_pct.
+    line_cov = 90.0
+    pass_rate = round((8 / 10) * 100.0, 2)  # 80.0
+    assert line_cov != pass_rate  # 90 != 80 — coverage differs from pass rate
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 85,  # threshold between pass_rate and line_cov
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    # The coverage_pct is the line coverage value, NOT the test pass rate.
+    task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": line_cov}
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True  # 90 >= 85 passes
+    assert verdict.proven is True
+
+    # Prove it's NOT pass rate: with the same test counts (8/10 = 80%),
+    # using pass rate as coverage_pct would give coverage_pct=80, which
+    # is below the threshold of 85 and would fail.
+    task2 = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 85,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task2.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": pass_rate}
+    pass_verdict = evaluate_code_acceptance(task2)
+    assert pass_verdict.satisfied is False  # 80 < 85 fails
+    assert pass_verdict.proven is False
+
+
+def test_coverage_delta_pass_rate_not_proven():
+    """coverage_delta with a pass-rate proxy (source="pass_rate") is satisfied
+    but NOT proven — test pass rate is semantically distinct from changed-line
+    coverage.
+
+    When no pytest-cov/c8 instrumentation is active, the orchestrator stores
+    coverage_pct computed from (passed/total)*100 with source="pass_rate". The
+    acceptance gate must distinguish this from instrumented line coverage:
+    the result is satisfied (a real test run happened and the threshold was met)
+    but NOT machine-checked proven (pass-rate is a weaker claim than line
+    coverage). This prevents coverage_delta declared on uninstrumented repos
+    from silently proving stronger claims than the data supports.
+
+    Exercises the production logic in _evaluate_coverage_delta's source check.
+    """
+    # Threshold of 80%, pass-rate proxy of 85% — meets threshold but is pass rate.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task.context[TEST_COVERAGE_RESULT_KEY] = {
+        "coverage_pct": 85.0,
+        "source": "pass_rate",
+    }
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is False  # pass-rate proxy is NOT proven
+    assert "pass-rate proxy" in verdict.reason or "pass rate" in verdict.reason
+
+    # Recorded verdict reflects the same: satisfied but not proven.
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert recorded.satisfied is True
+    assert recorded.proven is False
+    stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stamped["satisfied"] is True
+    assert stamped["proven"] is False
+    assert acceptance_blocks_success(stamped) is False  # satisfied does not block
+    assert acceptance_is_proven(stamped) is False  # but is NOT machine-proven
+
+    # Compare with the instrumented (line coverage) path: same threshold, same
+    # coverage_pct value but no pass-rate source — IS proven.
+    task_instrumented = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80,
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task_instrumented.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": 85.0}
+    inst_verdict = evaluate_code_acceptance(task_instrumented)
+    assert inst_verdict.proven is True  # instrumented coverage IS proven
+
+
 def test_acceptance_was_declared_and_is_proven_contract():
     # Undeclared / legacy / garbage rows are never declared and never proven.
     for bad in (None, "garbage", 123, []):
@@ -1143,6 +1412,23 @@ _VERDICT_MIX = [
         True,
     ),
     (
+        "coverage_delta_proven",
+        {
+            "acceptance_evidence": {
+                "kind": "coverage_delta",
+                "threshold": 80,
+            },
+            "changed_files": [
+                "backend/app/widget.py",
+                "backend/testing/test_widget.py",
+            ],
+            "unverified_reason": None,
+        },
+        True,
+        True,
+        True,
+    ),
+    (
         "declared_unsatisfied_named_test_missing",
         {
             "acceptance_evidence": {
@@ -1211,6 +1497,8 @@ def test_verdict_axis_implication_invariant_over_mix():
                 "gs://bucket/viewport-failures/"
                 f"{task.project_id}/MetricsDashboard-1280.png"
             )
+        if label == "coverage_delta_proven":
+            task.context[TEST_COVERAGE_RESULT_KEY] = {"coverage_pct": 85.0}
         verdict = evaluate_code_acceptance(task)
 
         # The verdict matches the expected per-axis outcome for this kind.
@@ -1227,9 +1515,11 @@ def test_verdict_axis_implication_invariant_over_mix():
             # NEVER proven.
             assert not verdict.proven, label
 
-        # Only a satisfied named_test or visual is ever proven at evaluation time.
+        # Only a satisfied named_test, visual, or coverage_delta (from
+        # line-coverage instrumentation, not pass-rate proxy) is ever proven
+        # at evaluation time.
         if verdict.proven:
-            assert verdict.kind in {"named_test", "visual"}, label
+            assert verdict.kind in {"named_test", "visual", "coverage_delta"}, label
 
         # Now exercise the recorded-verdict predicates the aggregates consume.
         recorded = record_code_acceptance_verdict(task)
@@ -1457,7 +1747,7 @@ def test_invariant_all_valid_kinds_covered():
     assert vis.kind == "visual"
 
     # Verify the four kinds are the closed set by checking the schema.
-    # (This documents that if AcceptanceEvidence.kind ever adds a fourth kind,
+    # (This documents that if AcceptanceEvidence.kind ever adds a new kind,
     # this test's assertion will need updating, triggering a review of whether
     # the evaluation logic covers the new kind.)
     import typing
@@ -1471,6 +1761,7 @@ def test_invariant_all_valid_kinds_covered():
             "observable_behavior",
             "downstream_artifact",
             "visual",
+            "coverage_delta",
         }
 
 
@@ -1734,3 +2025,377 @@ def test_missing_review_loop_not_scored_as_proven():
     assert acceptance_blocks_success(task_no_context.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
     assert acceptance_blocks_success(task_malformed.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
     assert acceptance_blocks_success(task_explicit_unverified.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_empty_db(db_session):
+    """The backfill returns 0 on an empty or unpopulated database."""
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_upgrades_false_negative(db_session):
+    """A pre-fix task with the false-negative verdict pattern is upgraded by
+    the backfill sweep, and its verdict is updated to proven=True.
+    """
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_invariants.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_invariants.py",
+        ],
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    # Stamp a false-negative verdict exactly as the pre-fix gate would have:
+    # satisfied=True (test was present, verified, and shipped a production seam)
+    # but proven=False because _test_semantically_grounded failed for the
+    # cross-cutting test_invariants.py before the _CROSS_CUTTING_TEST_FILES fix.
+    ctx = dict(task.context or {})
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": True,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_invariants.py' exercises "
+            "a production seam that does not semantically correspond to the "
+            "declared test module"
+        ),
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result >= 1, "backfill should upgrade the pre-fix false-negative verdict"
+
+    # Re-read the task and verify the verdict was upgraded
+    await db_session.refresh(task)
+    updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("proven") is True, "verdict should be upgraded to proven"
+    assert updated.get("backfilled") is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_verdicts_no_starvation(db_session):
+    """ORDER BY + NOT EXISTS ensures repeated backfill calls cover all
+    >200 false-negative tasks (no starvation), and already-proven tasks
+    with CriterionEvidence rows are excluded from the query.
+    """
+    from datetime import datetime, timezone
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    # Create an open release version so record_task_merge_evidence
+    # persists CriterionEvidence rows for upgraded tasks — this is
+    # required by the NOT EXISTS filter to advance the LIMIT window.
+    version = ReleaseVersion(project_id=project.id)
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-backfill-starvation-test",
+        text="Backfill starvation test criterion",
+    )
+    db_session.add(criterion)
+    await db_session.flush()
+    criterion_key = criterion.criterion_key
+
+    FIX_TS = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+
+    def _make_candidate(*, proven: bool) -> Task:
+        task = _make_code_task(
+            acceptance_evidence={
+                "kind": "named_test",
+                "test_path": "backend/testing/test_invariants.py",
+            },
+            changed_files=[
+                "backend/app/acceptance_gate.py",
+                "backend/testing/test_invariants.py",
+            ],
+        )
+        task.project_id = project.id
+        task.completed_at = FIX_TS
+        task.criterion_ids = [criterion_key]
+        ctx = dict(task.context or {})
+        ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+            "satisfied": True,
+            "proven": proven,
+            "kind": "named_test",
+            "reason": "simulated for starvation test",
+        }
+        task.context = ctx
+        return task
+
+    # ── Already-proven tasks (have CriterionEvidence rows) ──────────────
+    ALREADY_PROVEN = 10
+    for _ in range(ALREADY_PROVEN):
+        task = _make_candidate(proven=True)
+        db_session.add(task)
+        await db_session.flush()
+        ev = CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind="task_merge",
+            source_id=str(task.id),
+            detail={"proven": True},
+        )
+        db_session.add(ev)
+    await db_session.flush()
+
+    # ── False-negative tasks (satisfied=True, proven=False, no evidence) ─
+    FALSE_NEGATIVE = 205
+    for _ in range(FALSE_NEGATIVE):
+        task = _make_candidate(proven=False)
+        db_session.add(task)
+    await db_session.flush()
+
+    # ── Run backfill until all false-negatives are consumed ─────────────
+    total_upgraded = 0
+    for iteration in range(5):
+        upgraded = await backfill_acceptance_verdicts(db_session)
+        total_upgraded += upgraded
+        if upgraded == 0:
+            break
+
+    assert total_upgraded == FALSE_NEGATIVE, (
+        f"Expected {FALSE_NEGATIVE} upgrades (all false-negative tasks), "
+        f"got {total_upgraded}; {ALREADY_PROVEN} already-proven tasks "
+        f"should have been excluded via NOT EXISTS"
+    )
+
+    # Confirm idempotent: a final pass returns 0
+    final = await backfill_acceptance_verdicts(db_session)
+    assert final == 0, "No false negatives should remain after full sweep"
+
+
+@pytest.mark.asyncio
+async def test_backfill_verdicts_resilient_to_mid_loop_rollback(db_session):
+    """A rollback inside record_task_merge_evidence (e.g. IntegrityError on
+    CriterionEvidence unique constraint) must not abort the whole backfill
+    cycle.  Specifically, subsequent loop iterations must not raise
+    MissingGreenlet when accessing task attributes after the rollback
+    unconditionally expired all session objects.
+
+    Regression test for the gap where expire_on_commit=False only covered
+    the COMMIT path, leaving the ROLLBACK path unprotected.  The fix
+    collects task IDs upfront and re-fetches each task fresh at the start
+    of every iteration via session.get(), making each iteration independent
+    of prior commits or rollbacks.
+    """
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    FIX_TS = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+
+    # Three tasks eligible for upgrade (false-negative named_test verdicts).
+    for _ in range(3):
+        task = _make_code_task(
+            acceptance_evidence={
+                "kind": "named_test",
+                "test_path": "backend/testing/test_invariants.py",
+            },
+            changed_files=[
+                "backend/app/acceptance_gate.py",
+                "backend/testing/test_invariants.py",
+            ],
+        )
+        task.project_id = project.id
+        task.completed_at = FIX_TS
+        ctx = dict(task.context or {})
+        ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+            "satisfied": True,
+            "proven": False,
+            "kind": "named_test",
+            "reason": "simulated false-negative for rollback resilience test",
+        }
+        task.context = ctx
+        db_session.add(task)
+    await db_session.flush()
+
+    # Patch record_task_merge_evidence to simulate a session rollback on the
+    # first call (as would happen when record_evidence hits an IntegrityError
+    # on a duplicate CriterionEvidence row).  After the rollback all session
+    # objects are expired; the fix must re-fetch each task so the 2nd and 3rd
+    # iterations do not raise MissingGreenlet on task attribute access.
+    call_count = [0]
+
+    async def _mock_rtme_with_rollback(session, task, project_id):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            await session.rollback()
+        return 0
+
+    with patch(
+        "app.acceptance_criteria.record_task_merge_evidence",
+        _mock_rtme_with_rollback,
+    ):
+        upgraded = await backfill_acceptance_verdicts(db_session)
+
+    assert upgraded == 3, (
+        f"Expected all 3 tasks upgraded (verdict set to proven); got {upgraded}. "
+        "A MissingGreenlet or premature abort would have reduced this count."
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_verdicts_advances_past_unprovable(db_session):
+    """The backfill query advances past tasks that can never be proven (wrong
+    verdict kind, not satisfied, or re-evaluation still unprovable), instead of
+    getting stuck on them permanently and starving newer tasks behind them.
+
+    Regression test for the starvation bug where the LIMIT-200 window never
+    advanced because non-upgradeable tasks received no marker and blocked all
+    later-ordered tasks from ever being examined.
+    """
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    # Create an open release version so record_task_merge_evidence persists
+    # CriterionEvidence rows for upgraded tasks — this is required by the
+    # NOT EXISTS filter that handles already-proven rows.
+    version = ReleaseVersion(project_id=project.id)
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-backfill-advance-test",
+        text="Backfill advance test criterion",
+    )
+    db_session.add(criterion)
+    await db_session.flush()
+    criterion_key = criterion.criterion_key
+
+    OLD_TS = datetime(2026, 7, 9, 7, 0, 0, tzinfo=timezone.utc)  # Pre-fix
+    NEW_TS = datetime(2026, 7, 9, 9, 0, 0, tzinfo=timezone.utc)  # Also pre-fix, newer
+
+    def _make_candidate(
+        *,
+        verdict_kind: str = "named_test",
+        satisfied: bool = True,
+        proven: bool = False,
+        completed_at: datetime = OLD_TS,
+        test_path: str | None = None,
+        changed_files: list[str] | None = None,
+    ) -> Task:
+        task = _make_code_task(
+            acceptance_evidence=(
+                {"kind": "named_test", "test_path": test_path or "backend/testing/test_invariants.py"}
+                if verdict_kind == "named_test"
+                else {"kind": "observable_behavior"}
+            ),
+            changed_files=changed_files or [
+                "backend/app/acceptance_gate.py",
+                "backend/testing/test_invariants.py",
+            ],
+        )
+        task.project_id = project.id
+        task.completed_at = completed_at
+        task.criterion_ids = [criterion_key]
+        ctx = dict(task.context or {})
+        ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+            "satisfied": satisfied,
+            "proven": proven,
+            "kind": verdict_kind,
+            "reason": "simulated for advance test",
+        }
+        task.context = ctx
+        return task
+
+    # ── Old non-upgradeable tasks (occupy the front of the LIMIT window) ──
+    # We create >= 200 tasks that the backfill examines and marks but can
+    # never upgrade. These fill the entire LIMIT-200 window on every call,
+    # so WITHOUT the _backfill_checked_at marker the window never advances
+    # past them and the upgradeable tasks behind them are starved.
+    # Three categories are cycled:
+    #   - Wrong verdict kind (not named_test)
+    #   - Not satisfied
+    #   - Re-evaluation still unprovable
+    BLOCKER_COUNT = 215  # > LIMIT-200 to saturate the window
+    for i in range(BLOCKER_COUNT):
+        category = i % 3
+        if category == 0:
+            # Wrong verdict kind — skipped at the kind guard
+            task = _make_candidate(verdict_kind="observable_behavior")
+        elif category == 1:
+            # Not satisfied — skipped at the satisfied guard
+            task = _make_candidate(satisfied=False)
+        else:
+            # Re-evaluation still unprovable — test_path not in changed_files
+            task = _make_candidate(
+                test_path="backend/testing/test_reaper.py",
+                changed_files=["backend/app/reaper.py"],
+            )
+        db_session.add(task)
+    await db_session.flush()
+
+    # ── Newer upgradeable tasks behind the stuck ones ─────────────────────
+    # These are only reachable across successive backfill calls if the
+    # _backfill_checked_at marker excludes the blocker tasks from the query.
+    FALSE_NEGATIVE = 205
+    for _ in range(FALSE_NEGATIVE):
+        task = _make_candidate(
+            completed_at=NEW_TS,
+            test_path="backend/testing/test_invariants.py",
+            changed_files=[
+                "backend/app/acceptance_gate.py",
+                "backend/testing/test_invariants.py",
+            ],
+        )
+        db_session.add(task)
+    await db_session.flush()
+
+    # ── Run backfill repeatedly until exhausted ──────────────────────────
+    # The loop does NOT break on upgraded==0 because the first 1-2 calls
+    # may return 0 upgrades while filling the LIMIT-200 window with blocker
+    # tasks that the marker stamps. Only when all blockers are marked (and
+    # thus excluded via _backfill_checked) does the query advance to the
+    # upgradeable false-negative tasks.
+    # Without the marker fix, the window stays stuck on the 215 blockers
+    # permanently and total_upgraded stays 0 → assertion catches it.
+    total_upgraded = 0
+    for iteration in range(6):
+        upgraded = await backfill_acceptance_verdicts(db_session)
+        total_upgraded += upgraded
+
+    # All 205 false negatives must be upgraded. WITHOUT the marker fix the
+    # window stays stuck on the 215 blocker tasks (all in the LIMIT-200 query
+    # result on every call since none get marked) and the upgradeable tasks
+    # are never reached.
+    assert total_upgraded == FALSE_NEGATIVE, (
+        f"Expected {FALSE_NEGATIVE} upgrades (all false-negative tasks), "
+        f"got {total_upgraded} — the backfill window is stuck on "
+        f"non-upgradeable tasks"
+    )
+
+    # Confirm idempotent: a final pass returns 0
+    final = await backfill_acceptance_verdicts(db_session)
+    assert final == 0, "No false negatives should remain after full sweep"

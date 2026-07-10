@@ -30,7 +30,7 @@ from app.capability_trial_verdict import (
 )
 from app.direction_referential_guard import build_retired_direction_grounding
 from app.database import get_session
-from app.knowledge_query import fetch_retirement_memo
+from app.knowledge_query import fetch_retirement_memo, get_knowledge_document
 from app.strategic_events import (
     STRATEGIC_KIND_DIRECTIONS,
     STRATEGIC_KIND_PROBLEM_MODEL,
@@ -44,7 +44,7 @@ from app.direction_lifecycle import (
     direction_has_churn_retirement_recommendation,
     reactivate_paused_direction,
 )
-from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
+from app.models import KnowledgeDocument, MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
     validate_internal_payload as _validate_internal_payload,
@@ -85,6 +85,11 @@ from app.strategic_completion import (
     spawn_title_is_redundant,
     strategic_retirement_challenge_gate_mode,
 )
+from app.strategic_resident_session import (
+    RESIDENT_SESSION_KEY as _RESIDENT_SESSION_KEY,
+    read_resident_session as _read_resident_session,
+    resident_session_is_active as _resident_session_is_active,
+)
 from app.strategic_constants import (
     MIN_HEALTHY_ACTIVE_DIRECTIONS,
     STRATEGIC_DIRECTION_TEXT_MAX,
@@ -104,6 +109,7 @@ from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
     lock_project_or_429 as _lock_project_or_429,
     task_lock,
+    with_design_doc_locked as _with_design_doc_locked,
     with_directions_locked as _with_directions_locked,
     with_vision_locked as _with_vision_locked,
 )
@@ -144,6 +150,8 @@ STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES = 50_000
 STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "set_problem_model",
     "set_running_update",
+    "set_memory",
+    "set_session_summary",
     "reflect",
     "pending_confirm",
     "set_vision",
@@ -163,6 +171,9 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "set_evidence_progress",
     "set_acceptance_criteria",
     "record_finding_resolution",
+    "consume_knowledge",
+    "dismiss_knowledge",
+    "request_qualification",
 })
 
 
@@ -289,6 +300,74 @@ class DesignDocUpdate(BaseModel):
     value: Any | None = None
 
 
+def _get_file_list_from_system_page(doc_val: dict) -> list[str]:
+    """Extract the file path list from a ``systems/*`` design-doc page.
+
+    Systems pages were authored with different field-name conventions for
+    listing their covered files: ``key_paths`` (majority convention),
+    ``key_files`` (a few pages), or ``modules`` (earliest pages).  This helper
+    checks each in preference order and returns entries from the first one that
+    is a non-empty list of strings, so the caller (the ``_file_to_system``
+    reverse-index builder) never depends on a single unenforced field name.
+    """
+    for field in ("key_paths", "key_files", "modules"):
+        files = doc_val.get(field)
+        if isinstance(files, list):
+            return [f for f in files if isinstance(f, str)]
+    return []
+
+
+async def backfill_file_to_system_index(session: AsyncSession) -> int:
+    """One-time startup backfill: recompute ``_file_to_system`` for every
+    project that has a non-empty ``design_doc``.
+
+    Uses :func:`_with_design_doc_locked` for each project so the canonical
+    locking helper is used for all ``project.design_doc`` writes.
+
+    The reverse-index was originally built only from the ``modules`` field
+    name, but most ``systems/*`` pages use ``key_paths`` (or ``key_files``).
+    This sweep applies the corrected field-reading logic (via
+    :func:`_get_file_list_from_system_page`) to every existing systems page,
+    bringing the index in sync without waiting for each page to be re-set.
+
+    Returns the number of projects whose index was actually updated.
+    """
+    project_ids = (
+        (
+            await session.execute(
+                select(Project.id).where(
+                    Project.design_doc.isnot(None),
+                    Project.design_doc != {},
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    updated_count = 0
+    for project_id in project_ids:
+        _was_updated = False
+
+        def _mutate(doc: dict) -> None:
+            nonlocal _was_updated
+            rebuilt: dict[str, str] = {}
+            for doc_key, doc_val in doc.items():
+                if doc_key.startswith("systems/") and isinstance(doc_val, dict):
+                    sys_id = doc_key[len("systems/") :]
+                    for fpath in _get_file_list_from_system_page(doc_val):
+                        rebuilt[fpath] = sys_id
+            current = doc.get("_file_to_system")
+            if isinstance(current, dict) and current == rebuilt:
+                return  # already correct
+            doc["_file_to_system"] = rebuilt
+            _was_updated = True
+
+        await _with_design_doc_locked(session, project_id, _mutate)
+        if _was_updated:
+            updated_count += 1
+    return updated_count
+
+
 @router.post("/api/agent/design-doc")
 @limiter.limit("60/minute")
 async def update_design_doc(
@@ -383,9 +462,20 @@ async def update_design_doc(
             raise HTTPException(
                 status_code=400, detail=f"Value too large ({val_size} bytes, max 50KB)"
             )
+        # Measure only agent-facing keys: reserved keys have their own internal
+        # retention caps and must not consume the agent-write budget.
+        old_agent_keys_doc = {
+            k: v for k, v in doc.items() if k not in _RESERVED_DESIGN_DOC_KEYS
+        }
+        old_size = len(_json.dumps(old_agent_keys_doc))
         doc[key] = payload.value
-        total_size = len(_json.dumps(doc))
-        if total_size > DESIGN_DOC_MAX_BYTES:
+        new_agent_keys_doc = {
+            k: v for k, v in doc.items() if k not in _RESERVED_DESIGN_DOC_KEYS
+        }
+        total_size = len(_json.dumps(new_agent_keys_doc))
+        # Allow writes that shrink or don't grow the corpus even when already over cap
+        # (matches the canonical with_design_doc_locked logic in task_locking.py).
+        if total_size > DESIGN_DOC_MAX_BYTES and total_size > old_size:
             del doc[key]  # rollback
             raise HTTPException(
                 status_code=400,
@@ -397,9 +487,8 @@ async def update_design_doc(
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
                     sys_id = doc_key[len("systems/") :]
-                    for fpath in doc_val.get("modules", []):
-                        if isinstance(fpath, str):
-                            file_to_system_map[fpath] = sys_id
+                    for fpath in _get_file_list_from_system_page(doc_val):
+                        file_to_system_map[fpath] = sys_id
             doc["_file_to_system"] = file_to_system_map
     elif payload.op == "delete":
         doc.pop(key, None)
@@ -409,9 +498,8 @@ async def update_design_doc(
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
                     sys_id = doc_key[len("systems/") :]
-                    for fpath in doc_val.get("modules", []):
-                        if isinstance(fpath, str):
-                            file_to_system_deleted_map[fpath] = sys_id
+                    for fpath in _get_file_list_from_system_page(doc_val):
+                        file_to_system_deleted_map[fpath] = sys_id
             doc["_file_to_system"] = file_to_system_deleted_map
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
@@ -492,8 +580,33 @@ async def update_playbook(
     if op == "get":
         project = await session.get(Project, task.project_id)
         doc = project.design_doc or {} if project else {}
-        entries = {}
         my_id = str(task.id)
+
+        # Single-key scoped retrieval
+        if payload.key and payload.key.strip():
+            full_key = f"playbook/{payload.key.strip()}"
+            v = doc.get(full_key) if doc else None
+            if isinstance(v, dict):
+                pending_source = v.get("pending_source")
+                if pending_source and pending_source != my_id:
+                    return {"status": "ok", "op": op, "entries": {}}
+                return {
+                    "status": "ok",
+                    "op": op,
+                    "entries": {
+                        payload.key.strip(): {
+                            "content": v.get("content", ""),
+                            "updated_at": v.get("updated_at", ""),
+                            "source_task_id": v.get("source_task_id", ""),
+                            "branch": v.get("branch", ""),
+                            "head_sha": v.get("head_sha", ""),
+                        }
+                    },
+                }
+            return {"status": "ok", "op": op, "entries": {}}
+
+        # No specific key — return all entries (existing behavior)
+        entries = {}
         for k, v in doc.items():
             if k.startswith("playbook/") and isinstance(v, dict):
                 # Hide pending entries written by OTHER non-completed tasks —
@@ -3990,6 +4103,47 @@ async def strategic_operation(
             }
         )
 
+    elif payload.op == "set_memory":
+        # Append a durable behavioral-memory note to project.strategic_memory_notes.
+        # The resident strategist uses this to persist lessons and operator
+        # preferences across sessions. No challenge gate — personal memory op.
+        if not isinstance(data, dict) or not isinstance(data.get("note"), str) or not data["note"].strip():
+            raise HTTPException(
+                status_code=400,
+                detail="set_memory requires data.note as a non-empty string",
+            )
+        note = data["note"].strip()
+        # Per-note length cap (10 KB UTF-8) to keep JSONB columns lean,
+        # consistent with set_session_summary's 10 KB limit.
+        _MAX_MEMORY_NOTE_BYTES = 10_000
+        note_bytes = note.encode("utf-8")
+        if len(note_bytes) > _MAX_MEMORY_NOTE_BYTES:
+            note = note_bytes[:_MAX_MEMORY_NOTE_BYTES].decode("utf-8", errors="replace")
+        entry = {"note": note, "set_at": _utcnow().isoformat()}
+        if project.strategic_memory_notes is None:
+            project.strategic_memory_notes = []
+        project.strategic_memory_notes.append(entry)
+        # Keep last 100 entries for defense-in-depth against JSONB column bloat
+        project.strategic_memory_notes = project.strategic_memory_notes[-100:]
+        flag_modified(project, "strategic_memory_notes")
+        session.add(project)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Appended strategic_memory note for project {project.id} "
+            f"(entry count: {len(project.strategic_memory_notes)})"
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_memory",
+                "entry_count": len(project.strategic_memory_notes),
+            }
+        )
+
     elif payload.op == "pending_confirm":
         # Add a pending_user_confirmation item to the problem_model.
         # Scoped to external blockers only: credentials, access, major
@@ -4381,7 +4535,7 @@ async def strategic_operation(
         # (project_id, release_version_id) scope so repeated calls are safe.
         from app.acceptance_criteria import (
             count_active_criteria_for_version as _count_active_criteria,
-            get_criterion_by_key as _get_criterion_by_key,
+            get_criteria_by_keys as _get_criteria_by_keys,
             get_criterion_by_text as _get_criterion_by_text,
             generate_criterion_key as _gen_criterion_key,
             is_operator_authored_criterion as _is_operator_authored_criterion,
@@ -4470,12 +4624,27 @@ async def strategic_operation(
         # retraction commits so a partial batch cannot leave some retracted.
         # Also snapshot each target's pre-retraction status so the notification
         # step only fires when a previously-active criterion actually changes.
+        # Batch-fetch ALL retraction targets (and supersession target keys) in
+        # a single query instead of N individual _get_criterion_by_key() calls
+        # across three separate loops (finding 1: 3N → 1 + N).
+        _retract_keys: list[str] = [item["criterion_key"].strip() for item in retract_input]
+        _supersession_keys: list[str] = [
+            item["superseded_by_key"].strip()
+            for item in retract_input
+            if isinstance(item.get("superseded_by_key"), str) and item["superseded_by_key"].strip()
+        ]
+        _all_crit_keys = list(set(_retract_keys + _supersession_keys))
+        _criteria_by_key: dict[str, _VAC] = {}
+        if _all_crit_keys:
+            _rows = await _get_criteria_by_keys(
+                session, project.id, _all_crit_keys, release_version_id=open_version.id
+            )
+            _criteria_by_key = {r.criterion_key: r for r in _rows}
+
         pre_status_by_key: dict[str, str | None] = {}
         for item in retract_input:
             criterion_key = item["criterion_key"].strip()
-            existing = await _get_criterion_by_key(
-                session, open_version.id, criterion_key
-            )
+            existing = _criteria_by_key.get(criterion_key)
             pre_status_by_key[criterion_key] = (
                 existing.status if existing is not None else None
             )
@@ -4507,7 +4676,7 @@ async def strategic_operation(
                     status_code=400,
                     detail=f"set_acceptance_criteria: criterion '{criterion_key}' cannot supersede itself",
                 )
-            target = await _get_criterion_by_key(session, open_version.id, superseded_by_key)
+            target = _criteria_by_key.get(superseded_by_key)
             if target is None or target.status != "active":
                 raise HTTPException(
                     status_code=400,
@@ -4612,6 +4781,25 @@ async def strategic_operation(
         new_added_count = 0
         skipped_over_cap = 0
         processed: list[dict] = []
+
+        # Batch-fetch ALL direction rows referenced across criteria_input in a
+        # single query instead of per-item N+1 _get_direction_row() calls
+        # (finding 2: M*D → 1 query).
+        _all_direction_keys: list[str] = []
+        for item in criteria_input:
+            _all_direction_keys.extend(item.get("direction_keys") or [])
+        _direction_rows: dict[str, Any] = {}
+        if _all_direction_keys:
+            _unique_dir_keys = list(set(_all_direction_keys))
+            from app.models import Direction as _DirectionModel
+            _dir_result = await session.execute(
+                select(_DirectionModel).where(
+                    _DirectionModel.project_id == project.id,
+                    _DirectionModel.direction_key.in_(_unique_dir_keys),
+                )
+            )
+            _direction_rows = {r.direction_key: r for r in _dir_result.scalars().all()}
+
         for item in criteria_input:
             text = item["text"].strip()
             direction_keys_input: list[str] = list(item.get("direction_keys") or [])
@@ -4644,7 +4832,7 @@ async def strategic_operation(
 
             mapped_keys: list[str] = []
             for dk in direction_keys_input:
-                dir_row = await _get_direction_row(session, project.id, dk)
+                dir_row = _direction_rows.get(dk)
                 if dir_row is None:
                     warnings.append(f"Unknown direction_key: {dk}")
                     continue
@@ -4792,6 +4980,119 @@ async def strategic_operation(
             }
         )
 
+    elif payload.op == "consume_knowledge_followup":
+        # Strategist marks a pending knowledge follow-up (design/web_research
+        # doc) as consumed — meaning the strategist has acted on it (spawned a
+        # direction, incorporated the knowledge, etc.).
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400, detail="consume_knowledge_followup data must be an object"
+            )
+        document_id = data.get("document_id")
+        if not document_id:
+            raise HTTPException(
+                status_code=400, detail="document_id is required"
+            )
+        try:
+            doc_id_uuid = uuid.UUID(str(document_id))
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="document_id must be a valid UUID"
+            ) from None
+        doc = (
+            (await session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.id == doc_id_uuid,
+                    KnowledgeDocument.project_id == project.id,
+                )
+            ))
+            .scalars()
+            .first()
+        )
+        if doc is None:
+            raise HTTPException(
+                status_code=404, detail="Knowledge document not found"
+            )
+        if doc.lifecycle_status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot consume: lifecycle_status is '{doc.lifecycle_status}' (must be 'pending')",
+            )
+        doc.lifecycle_status = "consumed"
+        doc.consumed_at = _utcnow()
+        session.add(doc)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await session.refresh(doc)
+        return _resp({
+            "status": "ok",
+            "op": "consume_knowledge_followup",
+            "document_id": str(doc.id),
+            "lifecycle_status": doc.lifecycle_status,
+        })
+
+    elif payload.op == "dismiss_knowledge_followup":
+        # Strategist marks a pending knowledge follow-up as dismissed — meaning
+        # it's not actionable right now.
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400, detail="dismiss_knowledge_followup data must be an object"
+            )
+        document_id = data.get("document_id")
+        if not document_id:
+            raise HTTPException(
+                status_code=400, detail="document_id is required"
+            )
+        reason = str(data.get("reason") or "").strip()
+        if not reason:
+            raise HTTPException(
+                status_code=400, detail="reason is required (why not actionable)"
+            )
+        try:
+            doc_id_uuid = uuid.UUID(str(document_id))
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="document_id must be a valid UUID"
+            ) from None
+        doc = (
+            (await session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.id == doc_id_uuid,
+                    KnowledgeDocument.project_id == project.id,
+                )
+            ))
+            .scalars()
+            .first()
+        )
+        if doc is None:
+            raise HTTPException(
+                status_code=404, detail="Knowledge document not found"
+            )
+        if doc.lifecycle_status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot dismiss: lifecycle_status is '{doc.lifecycle_status}' (must be 'pending')",
+            )
+        doc.lifecycle_status = "dismissed"
+        doc.dismissed_at = _utcnow()
+        doc.dismissed_reason = reason
+        session.add(doc)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await session.refresh(doc)
+        return _resp({
+            "status": "ok",
+            "op": "dismiss_knowledge_followup",
+            "document_id": str(doc.id),
+            "lifecycle_status": doc.lifecycle_status,
+        })
+
     elif payload.op == "record_finding_resolution":
         if not isinstance(data, dict):
             raise HTTPException(
@@ -4842,6 +5143,50 @@ async def strategic_operation(
                 "release_version_id": str(resolution_version_id),
             }
         )
+
+    elif payload.op == "set_session_summary":
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="set_session_summary data must be an object with a 'summary' field",
+            )
+        summary = str(data.get("summary", "")).strip()
+        if not summary:
+            raise HTTPException(
+                status_code=400,
+                detail="summary text is required",
+            )
+        # Bounded to 10 KB to keep JSONB columns lean
+        _MAX_SUMMARY_BYTES = 10_000
+        summary_bytes = summary.encode("utf-8")
+        if len(summary_bytes) > _MAX_SUMMARY_BYTES:
+            summary = summary_bytes[:_MAX_SUMMARY_BYTES].decode("utf-8", errors="replace")
+
+        # Write to task context so the running agent reads it on bootstrap
+        ctx = dict(task.context or {})
+        ctx["_session_summary"] = summary
+        task.context = ctx
+        flag_modified(task, "context")
+        session.add(task)
+
+        # Also persist into the resident session blob so it survives a restart
+        # (a new task picks it up via start_resident_session's carry-forward).
+        # Uses with_vision_locked so the invariant test counts it as a locked
+        # write, consistent with the rest of the session-blob code.
+        _existing = _read_resident_session(project.vision)
+        if _existing is not None and _resident_session_is_active(_existing):
+
+            def _update_session_summary(vision: dict) -> None:
+                current = _read_resident_session(vision)
+                if current is not None and _resident_session_is_active(current):
+                    updated = dict(current)
+                    updated["_session_summary"] = summary
+                    vision[_RESIDENT_SESSION_KEY] = updated
+
+            await _with_vision_locked(session, project.id, _update_session_summary)
+
+        await session.commit()
+        return _resp({"status": "ok", "op": "set_session_summary"})
 
     elif payload.op == "cancel_task":
         if not isinstance(data, dict):
@@ -4937,6 +5282,152 @@ async def strategic_operation(
                 "op": "cancel_task",
                 "target_task_id": str(target_task.id),
                 "previous_status": previous_status,
+            }
+        )
+
+    elif payload.op == "consume_knowledge":
+        # Mark a knowledge document as consumed — the strategist has read and
+        # acted on it. Once consumed, it is excluded from the pending-follow-up
+        # surface in the strategic context package evidence section.
+        if not isinstance(data, dict) or not isinstance(
+            data.get("knowledge_document_id"), str
+        ) or not data["knowledge_document_id"].strip():
+            raise HTTPException(
+                status_code=400,
+                detail='consume_knowledge: data must be {"knowledge_document_id": "<uuid>"}',
+            )
+        raw_id = data["knowledge_document_id"].strip()
+        try:
+            doc_id = uuid.UUID(raw_id)
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"consume_knowledge: invalid knowledge_document_id: {raw_id}",
+            )
+        doc = await get_knowledge_document(session, project.id, doc_id)
+        if doc is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Knowledge document {doc_id} not found in this project",
+            )
+        doc.lifecycle_status = "consumed"
+        doc.consumed_at = _utcnow()
+        session.add(doc)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] Consumed knowledge document %s for project %s",
+            doc_id,
+            project.id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "consume_knowledge",
+                "document_id": str(doc_id),
+            }
+        )
+
+    elif payload.op == "dismiss_knowledge":
+        # Mark a knowledge document as dismissed — the strategist has reviewed
+        # it and determined it is not actionable. An optional reason can be
+        # recorded for auditability.
+        if not isinstance(data, dict) or not isinstance(
+            data.get("knowledge_document_id"), str
+        ) or not data["knowledge_document_id"].strip():
+            raise HTTPException(
+                status_code=400,
+                detail='dismiss_knowledge: data must be {"knowledge_document_id": "<uuid>", "reason": "<optional string>"}',
+            )
+        raw_id = data["knowledge_document_id"].strip()
+        try:
+            doc_id = uuid.UUID(raw_id)
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"dismiss_knowledge: invalid knowledge_document_id: {raw_id}",
+            )
+        doc = await get_knowledge_document(session, project.id, doc_id)
+        if doc is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Knowledge document {doc_id} not found in this project",
+            )
+        reason = str(data.get("reason") or "").strip() or None
+        doc.lifecycle_status = "dismissed"
+        doc.dismissed_at = _utcnow()
+        doc.dismissed_reason = (
+            reason[:500] if reason else None
+        )
+        session.add(doc)
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] Dismissed knowledge document %s for project %s (reason=%s)",
+            doc_id,
+            project.id,
+            reason,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "dismiss_knowledge",
+                "document_id": str(doc_id),
+            }
+        )
+
+    elif payload.op == "request_qualification":
+        # Dedicated one-off qualification trigger. Does NOT touch ProblemModel at
+        # all — it calls the same underlying qualify logic that set_problem_model
+        # uses via its qualify_request rider, but reached directly so the agent
+        # (or operator) can request a fresh qualification run without having to
+        # construct a set_problem_model payload.
+        #
+        # Data shape: {"reason": "<string>"}. reason is optional — an absent or
+        # empty reason is treated as "". Wrong-phase is a no-op (same behavior as
+        # qualify_request via set_problem_model). The qualification runs
+        # post-commit on its own fresh session for the same structural reason as
+        # the set_problem_model path: avoid holding any DB lock during slow GitHub
+        # I/O (CI-compliance scan + run_qualification).
+        from app.strategic_completion import (
+            _apply_qualify_request_post_commit,
+            extract_qualify_request,
+        )
+
+        qualify_request = extract_qualify_request(
+            data if isinstance(data, dict) else {}
+        )
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        _rq_task_id = task.id
+        _rq_project_id = project.id
+        await session.commit()
+        await _apply_qualify_request_post_commit(
+            qualify_request,
+            task_id=_rq_task_id,
+            project_id=_rq_project_id,
+            path="api_inline_request_qualification",
+        )
+        logger.info(
+            "[STRATEGIC API] request_qualification applied for task %s project %s "
+            "(reason=%r) — release qualifier ran if open version is in stabilize",
+            _rq_task_id,
+            _rq_project_id,
+            (qualify_request or {}).get("reason"),
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "request_qualification",
+                "reason_received": (qualify_request or {}).get("reason") or None,
             }
         )
 

@@ -1430,6 +1430,35 @@ async def _commit_or_handle_duplicate_spawn(
     return True
 
 
+def _build_salvage_payload(
+    salvage_candidates: list[dict],
+    source_task_id: uuid.UUID | str,
+) -> dict:
+    """Build the salvage bundle payload dict from decayed/discarded findings.
+
+    Each finding entry carries rich context (prompt, description, related_files,
+    claims, sources) so the consuming agent can address all findings in one PR.
+    """
+    return {
+        "type": "salvage_bundle",
+        "source_task_id": str(source_task_id),
+        "salvaged_findings": [
+            {
+                "title": f.get("title") or (f.get("description") or "")[:80],
+                "discard_reason": f.get("deferred_reason") or "unknown",
+                "direction_id": f.get("direction_id"),
+                "prompt": f.get("prompt"),
+                "description": (f.get("description") or "")[:500] if f.get("description") else None,
+                "related_files": f.get("related_files"),
+                "claims": f.get("claims"),
+                "sources": f.get("sources"),
+            }
+            for f in salvage_candidates
+        ],
+        "total_discarded": len(salvage_candidates),
+    }
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them.
 
@@ -2082,6 +2111,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             ):
                 _finding_give_up["adversarial_gate_cause"] = _give_up_cause
             _salvage_candidates.extend(_decayed)
+        # Include TTL-expired deferred findings in the salvage bundle so they
+        # are durably captured instead of only logged and silently dropped.
+        # This runs unconditionally: stale discarded findings exist independently
+        # of whether any repeatedly deferred findings decayed this cycle.
+        _salvage_candidates.extend(_stale_discarded)
         prior_actionable = _kept
         # Stale-targeting: a deferred finding carries the integration HEAD it was
         # generated against. On re-dispatch, ask whether any cited file changed
@@ -3299,6 +3333,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     file_overlap_count = _dedup_outcome.file_overlap_count
     evidence_overlap_count = _dedup_outcome.evidence_overlap_count
     filtered_findings = _dedup_outcome.filtered
+    # Capture dedup-filtered PERF findings into the salvage buffer so they
+    # are durably captured as a consolidated task instead of silently vanishing
+    # through the dedup pipeline (hash-match, region-identity, file-overlap,
+    # evidence-overlap, retired-approach, archived-diagnosis gates). Per-finding
+    # actionability thresholds are NOT relaxed — bundling filtered findings via
+    # salvage avoids flooding the pipeline with individual tasks.
+    # Track finding object ids added here so the reason-based loop below
+    # does not add the same finding a second time.
+    _perf_salvaged_finding_ids: set[int] = set()
+    for _filtered_entry in _dedup_outcome.filtered:
+        if _filtered_entry.get("terminal_history"):
+            continue
+        _inner_finding = _filtered_entry.get("finding")
+        if _inner_finding and _inner_finding.get("type") == "perf":
+            _inner_finding["deferred_reason"] = (
+                _filtered_entry.get("reason", "dedup_filtered")[:80]
+            )
+            _salvage_candidates.append(_inner_finding)
+            _perf_salvaged_finding_ids.add(id(_inner_finding))
+
     type_filtered_count = 0
     type_filtered_by_dir: dict[str, int] = {}
     empty_prompt_count = 0
@@ -3315,6 +3369,74 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _deduped_dropped_hashes = {
         h for h in _title_to_fhash.values() if h not in _survivor_finding_hashes
     }
+
+    # Feed dedup-filtered findings into the salvage pipeline so they are
+    # durably captured instead of silently dropped. The full finding payload
+    # is carried in each filtered entry's ``finding`` key (set by all
+    # dedup_gates in finding_deduplication.py), so we read it directly —
+    # no need for a fragile title-based lookup.
+    # Exclude findings that were suppressed for reasons indicating the work
+    # is already genuinely resolved or known-unproductive:
+    #   - cross-cycle hash suppression (previously_filtered_hashes)
+    #   - recent terminal region overlap (already resolved/shipped)
+    #   - retired approach (known failed direction)
+    #   - archived diagnosis (known stale diagnosis)
+    # Only salvage findings filtered by reasons that indicate the finding is
+    # still relevant but was suppressed by in-flight work:
+    #   - region overlap with an existing task (blocked, not resolved)
+    #   - all files covered by open PR (blocked until PR merges)
+    #   - evidence overlap with existing finding (Jaccard dedup — blocked
+    #     by another finding in the same batch, not resolved)
+    # Exclude findings filtered by terminal/retired/archived/hash reasons
+    # — those represent work already resolved, attempted, duplicated,
+    # or captured by another surviving finding in the same batch.
+    _SALVAGEABLE_DEDUP_REASONS = (
+        "region overlap with:",
+        "all files covered by open PR",
+        "evidence overlap with:",
+    )
+    # Build a fallback lookup dict for filtered entries that lack the
+    # ``finding`` key (legacy pattern; all current append sites set it).
+    _findings_by_key: dict[tuple[str, object], dict] = {}
+    for _orig in findings:
+        _key = (_orig.get("title", "")[:120], _orig.get("direction_id"))
+        if _key not in _findings_by_key:
+            _findings_by_key[_key] = _orig
+
+    _dedup_filtered_salvage: list[dict] = []
+    for _filt in _dedup_outcome.filtered:
+        if _filt.get("terminal_history"):
+            continue
+        _filt_reason = _filt.get("reason", "dedup filtered")
+        if not any(_filt_reason.startswith(_sr) for _sr in _SALVAGEABLE_DEDUP_REASONS):
+            continue
+        # Read full finding payload directly from the filtered entry.
+        _candidate_info = _filt.get("finding")
+        if _candidate_info is None:
+            # Fall back to key-based lookup for backward compat.
+            _key = (_filt.get("title", ""), _filt.get("direction_id"))
+            _candidate_info = _findings_by_key.get(_key)
+        if _candidate_info is None:
+            continue
+        # Skip findings already added by the perf-type loop above to avoid
+        # double-counting a finding that is both type=="perf" and filtered
+        # for a salvageable reason.
+        if id(_candidate_info) in _perf_salvaged_finding_ids:
+            continue
+        # Skip cross-cycle hash suppression.
+        _candidate_hash = _title_to_fhash.get(_candidate_info.get("title", ""))
+        if _candidate_hash and _candidate_hash in _previously_filtered_hashes:
+            continue
+        _candidate = dict(_candidate_info)
+        _candidate["deferred_reason"] = f"dedup: {_filt_reason}"
+        _dedup_filtered_salvage.append(_candidate)
+    if _dedup_filtered_salvage:
+        _salvage_candidates.extend(_dedup_filtered_salvage)
+        logger.info(
+            "[RESEARCH] Added %d dedup-filtered finding(s) to salvage candidates (task %s)",
+            len(_dedup_filtered_salvage),
+            task.id,
+        )
 
     # Assess pipeline health once before spawning implementation tasks.
     # Metadata findings (design_doc_observation, direction_update) are processed
@@ -5174,28 +5296,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     # Spawn a consolidated salvage-bundle task if any findings were discarded
     # via decay (ultra_low_confidence >=4, low_actionability >=3, degradation_gate >=3,
-    # adversarial_gate >=3, prereq_deferred >=3). This aggregates them into one
+    # adversarial_gate >=3, prereq_deferred >=3) or dedup filtering (hash match,
+    # region overlap, file overlap, evidence overlap, retired approach, archived
+    # diagnosis). This aggregates them into one
     # actionable task rather than only individual memo tasks or silent drops.
     if _salvage_candidates:
-        _salvage_payload = {
-            "type": "salvage_bundle",
-            "source_task_id": str(task.id),
-            "salvaged_findings": [
-                {
-                    "title": f.get("title") or (f.get("description") or "")[:80],
-                    "discard_reason": f.get("deferred_reason") or "unknown",
-                    "direction_id": f.get("direction_id"),
-                }
-                for f in _salvage_candidates
-            ],
-            "total_discarded": len(_salvage_candidates),
-        }
+        _salvage_payload = _build_salvage_payload(_salvage_candidates, task.id)
         _salvage_task = Task(
             project_id=task.project_id,
-            title=f"Salvage bundle: {len(_salvage_candidates)} decayed finding(s)",
+            title=f"Salvage bundle: {len(_salvage_candidates)} discarded finding(s)",
             description=(
                 f"Consolidated fix batch for {len(_salvage_candidates)} research finding(s) "
-                "discarded via repeated deferral decay."
+                "discarded via deduplication or deferral decay."
             ),
             parent_task_id=task.id,
             payloads=[_salvage_payload],
@@ -5223,7 +5335,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         flag_modified(task, "context")
         session.add(task)
         logger.info(
-            "[RESEARCH] Spawned consolidated salvage-bundle task for %d decayed finding(s) (task %s)",
+            "[RESEARCH] Spawned consolidated salvage-bundle task for %d discarded finding(s) (task %s)",
             len(_salvage_candidates),
             task.id,
         )
@@ -5451,8 +5563,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         session, task, stage="child-task spawn"
     ):
         return
-    for ct in child_tasks:
-        await session.refresh(ct)
+    # Batch-reload all child tasks (N+1 guard: commit above expired the
+    # session; one batch SELECT + identity-map lookups replaces N individual
+    # session.refresh calls). Build a fresh map so the downstream code that
+    # accesses attributes on child_tasks entries gets non-expired instances.
+    if child_tasks:
+        _ct_ids = [ct.id for ct in child_tasks]
+        _ct_result = await session.execute(
+            select(Task).where(Task.id.in_(_ct_ids))
+        )
+        _ct_fresh = {str(t.id): t for t in _ct_result.scalars().all()}
+        for _i, _ct in enumerate(child_tasks):
+            _fresh = _ct_fresh.get(str(_ct.id))
+            if _fresh is not None:
+                child_tasks[_i] = _fresh
 
     # Resolve explicit depends_on_indices to actual UUIDs (agent-specified inter-finding deps only)
     finding_to_child = {fi: ci for ci, fi in enumerate(finding_indices)}
@@ -6101,6 +6225,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         research_depth=research_depth,
         parent_research_task_id=parent_research_task_id,
         filtered_findings=filtered_findings,
+        salvage_count=len(_salvage_candidates),
     )
 
     # Persist per-cycle deferred-finding counts on the direction's latest

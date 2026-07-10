@@ -61,6 +61,7 @@ Flags:
 
 import io
 import json
+import typing
 import os
 import shutil
 import signal
@@ -79,6 +80,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 import runner_isolation as iso
+import blueprint_runner as br
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -481,6 +483,38 @@ def _gpu_utilization_pct() -> int | None:
     return max(0, min(100, max(vals)))
 
 
+def _cpu_load_avg() -> float | None:
+    """One-minute CPU load average, or None on any error."""
+    try:
+        load1, _5min, _15min = os.getloadavg()
+        return round(load1, 2)
+    except (OSError, AttributeError):
+        return None
+
+
+def _memory_free_bytes() -> int | None:
+    """Free (available) memory in bytes, or None on any error.
+
+    Reads ``/proc/meminfo`` for ``MemAvailable`` (preferred) or falls
+    back to ``MemFree``.  Returns None when neither can be read.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            fallback: int | None = None
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+                if line.startswith("MemFree:"):
+                    fallback = int(line.split()[1]) * 1024
+                    # MemAvailable is preferred but may not exist on all kernels;
+                    # MemFree is the fallback when we didn't see MemAvailable first.
+                    # Guard: MemAvailable *follows* MemFree in /proc/meminfo, so we
+                    # cannot return early — keep scanning for MemAvailable.
+            return fallback
+    except (OSError, ValueError, FileNotFoundError, IndexError):
+        return None
+
+
 class _TelemetryState:
     """Thread-safe runner health counters emitted on each heartbeat.
 
@@ -494,11 +528,13 @@ class _TelemetryState:
         self._lock = threading.Lock()
         self.last_successful_job_at: str | None = None
         self.consecutive_job_failures: int = 0
+        self._pause_start_at: float | None = None
 
     def record_success(self) -> None:
         with self._lock:
             self.last_successful_job_at = _utc_now_iso()
             self.consecutive_job_failures = 0
+            self._pause_start_at = None
 
     def record_failure(self) -> None:
         with self._lock:
@@ -507,6 +543,32 @@ class _TelemetryState:
     def snapshot(self) -> tuple[str | None, int]:
         with self._lock:
             return self.last_successful_job_at, self.consecutive_job_failures
+
+    def pause_remaining(self, threshold: int, pause_seconds: float) -> float | None:
+        """Check and update the circuit-breaker pause state.
+
+        Returns None if no pause should apply (threshold disabled or
+        consecutive failures below threshold). Returns the remaining
+        pause duration in seconds (> 0) when the circuit-breaker is active,
+        meaning the caller should NOT claim new agent work.
+
+        The caller must sleep for at least ``min(remaining, poll_interval)``
+        before re-checking; when the pause expires this method returns None,
+        allowing claiming to resume. A successful task (``record_success()``)
+        clears both the failure count and the pause state.
+        """
+        with self._lock:
+            if threshold <= 0 or self.consecutive_job_failures < threshold:
+                self._pause_start_at = None
+                return None
+            if self._pause_start_at is None:
+                self._pause_start_at = time.monotonic()
+                return pause_seconds
+            elapsed = time.monotonic() - self._pause_start_at
+            if elapsed >= pause_seconds:
+                self._pause_start_at = None
+                return None
+            return pause_seconds - elapsed
 
 
 def _supervise_threads(threads: dict) -> None:
@@ -745,6 +807,11 @@ _RUNNER_MAX_COMMAND_LOG_BYTES = 65536
 # downstream verdict needs.
 _RUNNER_COMMAND_LOG_HEAD_BYTES = 8192
 _RUNNER_HEARTBEAT_INTERVAL = 30.0
+# Minimum pause duration for the task-claiming circuit-breaker.
+# When BLUEPRINT_RUNNER_FAILURE_PAUSE_THRESHOLD consecutive job failures are
+# reached, the runner pauses claiming new agent tasks for this many seconds.
+# A successful task clears the failure count and resumes normal claiming.
+_FAILURE_PAUSE_SECONDS = 60.0
 # v1 cap on durable artifact uploads. The runner skips (does not fail) any run
 # whose artifact dir exceeds this; the backend mirrors the cap and 413s.
 _RUNNER_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB
@@ -927,6 +994,9 @@ def _detect_gpu() -> dict:
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
 
 _shutdown_event = threading.Event()
+# Separate from _shutdown_event — used during auto-update so background
+# threads (reaper, compute poller, main loop) are NOT signaled to exit.
+_update_in_progress = threading.Event()
 
 
 def _handle_signal(signum, frame):  # noqa: ARG001
@@ -935,11 +1005,88 @@ def _handle_signal(signum, frame):  # noqa: ARG001
         _shutdown_event.set()
 
 
+def _wait_for_compute_jobs(
+    active_compute_jobs: set[str],
+    compute_lock: threading.Lock,
+    orchestrator_url: str,
+    token: str,
+    timeout: float = 120,
+) -> None:
+    """Wait for active compute jobs to finish during graceful shutdown.
+
+    Compute job worker threads are daemon threads (they would be killed on
+    process exit).  This wait gives them a chance to finish their current
+    command and report a final status to the orchestrator.  Any jobs still
+    active after the deadline are reported as failed so they do not remain
+    in ``running`` status indefinitely — there is no server-side sweep for
+    stale ComputeJob rows.
+    """
+    with compute_lock:
+        remaining = set(active_compute_jobs)
+
+    if not remaining:
+        return
+
+    print(
+        f"[runner] Shutdown requested — waiting for {len(remaining)} "
+        "active compute jobs...",
+        flush=True,
+    )
+    deadline = time.monotonic() + timeout
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.5)
+        with compute_lock:
+            remaining = set(active_compute_jobs)
+
+    if remaining:
+        print(
+            f"[runner] timeout waiting for {len(remaining)} compute jobs "
+            "— reporting as failed",
+            flush=True,
+        )
+        for job_id in remaining:
+            try:
+                _report_compute_job(
+                    orchestrator_url,
+                    token,
+                    job_id,
+                    exec_status="failed",
+                    exit_code=1,
+                    command_log={
+                        "text": "Runner shut down (SIGTERM) before job completed",
+                        "truncated": False,
+                    },
+                )
+            except Exception:
+                print(
+                    f"[runner] failed to report stranded compute job {job_id} "
+                    "— continuing shutdown",
+                    flush=True,
+                )
+
+
 # ── Active task tracking (background thread) ──────────────────────────────────
 
 def _release_capacity(capacity: threading.Semaphore | None) -> None:
     if capacity is not None:
         capacity.release()
+
+
+def _notify_decline(orchestrator_url: str, token: str, task_id: str) -> None:
+    """Best-effort: tell the orchestrator this runner declined a claimed task.
+
+    When the runner claims a task from /next-task but then declines it at the
+    isolation-backend level (no bwrap, no docker, capability mismatch), the
+    orchestrator still has it pinned in PROVISIONING.  Without this notification
+    the task strands until the stale-runner sweep fires when THIS runner goes
+    offline — which may be hours or never.  This call releases the pin so the
+    dispatch loop can re-pin it next cycle.
+    """
+    try:
+        url = f"{orchestrator_url}/api/runner/decline-task"
+        _post(url, token, {"task_id": task_id})
+    except Exception:
+        pass  # best-effort — the stale-runner sweep is the safety net
 
 
 def _try_acquire_capacity(capacity: threading.Semaphore | None) -> bool:
@@ -1041,6 +1188,11 @@ def _reap_loop(
                 removed = _cleanup_stale_workspaces(active_ids)
                 if removed:
                     print(f"[runner] cleaned up {removed} stale workspace(s)", flush=True)
+            # Periodic stale task log cleanup (every ~5 min) — 150 ticks × 2 s.
+            if _cleanup_tick % 150 == 0:
+                log_removed = _cleanup_stale_task_logs()
+                if log_removed:
+                    print(f"[runner] cleaned up {log_removed} stale task log(s)", flush=True)
         except Exception as exc:  # noqa: BLE001 — never let the reaper thread die silently
             print(f"[runner] reap loop error (continuing): {exc}", flush=True)
         time.sleep(2)
@@ -1158,10 +1310,13 @@ def _heartbeat_loop(
                 "agent_backend": agent_backend,
                 "compute_backend": compute_backend,
                 # Health telemetry consumed by the orchestrator to spot a runner
-                # that is failing every job / running low on disk / idle-GPU.
+                # that is failing every job / running low on disk / low on memory /
+                # pegged CPU.
                 "last_successful_job_at": last_success_at,
                 "consecutive_job_failures": consecutive_failures,
                 "disk_free_bytes": _disk_free_bytes(workspace_root),
+                "cpu_load_avg": _cpu_load_avg(),
+                "memory_free_bytes": _memory_free_bytes(),
                 "gpu_utilization_pct": _gpu_utilization_pct() if has_gpu else None,
                 **gpu_capabilities,
             }
@@ -1179,12 +1334,58 @@ def _heartbeat_loop(
                         else:
                             stale = version_hint not in version
                         if stale:
-                            print(
-                                f"[runner] WARNING: runner version {version!r} does not match "
-                                f"orchestrator version hint {version_hint!r} — consider running "
-                                "`blueprint-runner update` to update the agent.",
-                                flush=True,
-                            )
+                            # Check if runner is completely idle before attempting
+                            # auto-update (no active tasks and no compute jobs).
+                            with lock:
+                                has_tasks = bool(active_tasks)
+                            if active_compute_jobs is not None and compute_lock is not None:
+                                with compute_lock:
+                                    has_compute = bool(active_compute_jobs)
+                            else:
+                                has_compute = False
+
+                            if not has_tasks and not has_compute:
+                                print(
+                                    f"[runner] version mismatch ({version!r} vs "
+                                    f"{version_hint!r}) and runner is idle — "
+                                    "auto-updating...",
+                                    flush=True,
+                                )
+                                _update_in_progress.set()
+                                try:
+                                    result = br.do_update()
+                                except Exception:
+                                    _update_in_progress.clear()
+                                    raise
+                                if result == 0:
+                                    # Update succeeded. _restart_runner_service
+                                    # (called inside do_update) will kill this
+                                    # process via systemctl restart if a service
+                                    # unit is installed. If still alive (no
+                                    # systemd), exit cleanly so any process
+                                    # supervisor restarts the updated runner.
+                                    print(
+                                        "[runner] auto-update complete — "
+                                        "exiting for restart.",
+                                        flush=True,
+                                    )
+                                    os._exit(0)
+                                else:
+                                    print(
+                                        f"[runner] auto-update failed "
+                                        f"(exit={result}) — continuing with "
+                                        "current version.",
+                                        flush=True,
+                                    )
+                                    _update_in_progress.clear()
+                            else:
+                                print(
+                                    f"[runner] WARNING: runner version {version!r} "
+                                    f"does not match orchestrator version hint "
+                                    f"{version_hint!r} — not auto-updating because "
+                                    "tasks are still executing.",
+                                    flush=True,
+                                )
                 _write_status_json(
                     runner_id=hostname,
                     last_heartbeat_status="ok",
@@ -2239,6 +2440,101 @@ def _cleanup_stale_workspaces(active_task_ids: set, max_age_seconds: float = 300
     return removed
 
 
+# ── Per-task log file persistence ─────────────────────────────────────────────
+
+# Default max age for task log files before cleanup (7 days).
+_MAX_TASK_LOG_AGE_SECONDS = 7 * 24 * 3600  # 7 days
+# Max number of task log files to retain (safety cap).
+_MAX_TASK_LOG_FILES = 200
+
+
+def _task_log_dir() -> str:
+    """Directory for per-task log files.
+
+    Defaults to ``<credential_dir>/task-logs/`` so logs live alongside the
+    runner's credential/status files. Override via ``BLUEPRINT_RUNNER_LOG_DIR``
+    for testing or non-standard installs.
+    """
+    override = os.environ.get("BLUEPRINT_RUNNER_LOG_DIR", "").strip()
+    if override:
+        return os.path.abspath(override)
+    return os.path.join(_credential_dir(), "task-logs")
+
+
+def _task_log_path(task_id: str) -> str:
+    """Return the per-task log file path for *task_id*.
+
+    The filename is the sanitized task ID with a ``.log`` extension, stored
+    inside the task log directory (``_task_log_dir()``).
+    """
+    safe_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in task_id)
+    if not safe_id:
+        safe_id = "unknown"
+    return os.path.join(_task_log_dir(), f"{safe_id}.log")
+
+
+def _cleanup_stale_task_logs(
+    max_age_seconds: float = _MAX_TASK_LOG_AGE_SECONDS,
+    max_files: int = _MAX_TASK_LOG_FILES,
+) -> int:
+    """Remove stale task log files to prevent unbounded disk growth.
+
+    Two-phase cleanup:
+      1. Remove all ``.log`` files in the task log directory whose mtime is
+         older than *max_age_seconds*.
+      2. After age-based removal, if the file count still exceeds *max_files*,
+         remove the oldest files until within the limit.
+
+    Returns the number of files removed. Best-effort — never raises.
+    """
+    log_dir = _task_log_dir()
+    if not os.path.isdir(log_dir):
+        return 0
+    now = time.time()
+    removed = 0
+    # Collect all .log files with their mtime (oldest first).
+    entries: list[tuple[float, str]] = []
+    try:
+        for name in os.listdir(log_dir):
+            if not name.endswith(".log"):
+                continue
+            path = os.path.join(log_dir, name)
+            try:
+                st = os.stat(path)
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                entries.append((st.st_mtime, path))
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    if not entries:
+        return 0
+    entries.sort(key=lambda x: x[0])
+
+    # Phase 1: remove files older than max_age_seconds.
+    surviving: list[tuple[float, str]] = []
+    for mtime, path in entries:
+        if (now - mtime) >= max_age_seconds:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                surviving.append((mtime, path))
+        else:
+            surviving.append((mtime, path))
+
+    # Phase 2: if still over the file cap, remove oldest.
+    while len(surviving) > max_files:
+        _mtime, path = surviving.pop(0)
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def _compute_backend_summary(caps: "iso.Capabilities") -> str:
     """Human summary of which compute backends this host can build."""
     parts: list[str] = []
@@ -2440,16 +2736,25 @@ def _preflight(
     for note in caps.notes:
         print(f"    note         : {note}", flush=True)
 
-    # Provider credential check (non-blocking warning).
+    # Provider credential check. When agent work is claimable this is a HARD
+    # requirement: --check exits non-zero (setup_ok=False) so the operator
+    # catches the misconfiguration at enrollment time instead of discovering
+    # every agent task fails at PRE_CLAIM_FAILED at runtime.
     provider_creds = _check_provider_credentials()
+    agent_claimable = claimable[iso.CLASS_AGENT]
     if provider_creds:
         _fmt("provider creds", f"present ({len(provider_creds)} key(s))")
+    elif agent_claimable:
+        print(
+            "  provider creds  : FAIL — no LLM provider credential found.\n"
+            "                    Set ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,\n"
+            "                    OPENAI_API_KEY, GEMINI_API_KEY, or similar in\n"
+            "                    the environment before claiming agent work.",
+            flush=True,
+        )
     else:
         print(
-            "  provider creds  : NONE — agent tasks WILL fail at claim unless a\n"
-            "                    provider credential (ANTHROPIC_API_KEY,\n"
-            "                    OPENAI_API_KEY, GEMINI_API_KEY, etc.) is set\n"
-            "                    in the environment.",
+            "  provider creds  : NONE (compute-only runner — not required)",
             flush=True,
         )
 
@@ -2481,6 +2786,7 @@ def _preflight(
         (token_valid or token_401)
         and ws_writable
         and (claimable[iso.CLASS_AGENT] or claimable[iso.CLASS_COMPUTE])
+        and (bool(provider_creds) or not agent_claimable)
     )
     return {
         "orchestrator_ok": orchestrator_ok,
@@ -2493,6 +2799,47 @@ def _preflight(
         "setup_ok": setup_ok,
         "enrolled_max_concurrent": enrolled_max_concurrent,
     }
+
+
+def _safe_credential_path(fpath: str, workspace_root: str) -> str:
+    """Validate and resolve a credential file path, rejecting directory traversal.
+
+    The backend supplies ``fpath`` as a sandbox-absolute path (e.g.
+    ``/root/.config/claude/settings.json``). Leading ``/`` is stripped
+    so the path is relative to *workspace_root* (which is bind-mounted at
+    the sandbox root for both bwrap and docker backends).
+
+    Raises ``ValueError`` on any path containing ``..`` segments or whose
+    resolved absolute path falls outside *workspace_root* — so a compromised
+    or buggy orchestrator cannot write credential files to arbitrary host
+    locations via e.g. ``../../.ssh/authorized_keys``.
+    """
+    # Defense-in-depth: reject '..' path segments before any processing.
+    stripped = fpath.lstrip("/")
+    for component in stripped.split("/"):
+        if component == "..":
+            raise ValueError(
+                f"credential path contains '..' (directory traversal): {fpath!r}"
+            )
+
+    # Resolve relative to workspace root and verify containment.
+    full_path = os.path.abspath(os.path.join(workspace_root, stripped))
+    ws_abs = os.path.abspath(workspace_root)
+
+    try:
+        rel = os.path.relpath(full_path, ws_abs)
+    except ValueError:
+        raise ValueError(
+            f"credential path {fpath!r} resolves outside workspace "
+            f"{ws_abs!r} (os.path.relpath failed)"
+        )
+    if rel.startswith("..") or os.path.isabs(rel):
+        raise ValueError(
+            f"credential path {fpath!r} resolves to {full_path}, "
+            f"which is outside workspace {ws_abs}"
+        )
+
+    return full_path
 
 
 def _spawn_agent_task(
@@ -2554,14 +2901,16 @@ def _spawn_agent_task(
     # bwrap-eligible task on a docker+image box still takes the bwrap path.
     plan_image = agent_image if backend == iso.BACKEND_DOCKER else None
 
-    # Write backend-supplied credential files into the agent's home / sandbox.
-    # The LLM provider CLI (Claude, Codex, Gemini) reads config files from
-    # well-known paths (e.g. ~/.claude.json); the runner materializes them here
-    # per-task so the agent finds exactly the credential the pool assigned.
+    # Write backend-supplied credential files into the agent's workspace
+    # (bind-mounted as / inside the bwrap sandbox; mounted at /agent-workdir
+    #  inside the docker sandbox). The LLM provider CLI (Claude, Codex,
+    # Gemini) reads config files from well-known paths;
+    # the runner materializes them per-task so the agent finds exactly the
+    # credential the pool assigned.
     if llm_files:
         for f in llm_files:
             try:
-                fpath = f["path"]
+                fpath = _safe_credential_path(f["path"], workspace)
                 fcontent = f["content"]
                 fmode = f.get("mode", "0600")
                 parent = os.path.dirname(fpath)
@@ -2580,6 +2929,7 @@ def _spawn_agent_task(
                     f"{f.get('path', '?')} for task {task_id}: {exc}",
                     flush=True,
                 )
+
 
     # Build the FAIL-CLOSED sandbox plan. The env is assembled from an explicit
     # allowlist (never os.environ.copy) and NEVER carries BLUEPRINT_RUNNER_TOKEN /
@@ -2610,14 +2960,61 @@ def _spawn_agent_task(
         )
         return False
 
-    popen_kwargs: dict = {"env": plan.env, "stdout": sys.stdout, "stderr": sys.stderr}
+    # Open a per-task log file to persist the agent's stdout/stderr output
+    # on disk (best-effort - a write failure must never prevent the task from
+    # running).  The reader thread below tees output to both this log file and
+    # the runner's stdout (terminal/journal).
+    _log_file_handle: "typing.BinaryIO | None" = None
+    try:
+        _log_path = _task_log_path(task_id)
+        os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+        _log_file_handle = open(_log_path, "ab")
+    except Exception as exc:
+        print(
+            f"[runner] warning: could not open log file for task {task_id}: {exc}",
+            flush=True,
+        )
+
+    popen_kwargs: dict = {"env": plan.env, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT}
     if hasattr(os, "setsid"):
         popen_kwargs["start_new_session"] = True
     try:
         proc = subprocess.Popen(plan.argv, **popen_kwargs)
     except Exception as exc:
+        if _log_file_handle is not None:
+            try:
+                _log_file_handle.close()
+            except Exception:
+                pass
         print(f"[runner] failed to spawn agent for task {task_id}: {exc}", flush=True)
         return False
+
+    # Reader thread: tee the agent's stdout to both the per-task log file and
+    # the runner's stdout (so output still appears in the terminal / systemd
+    # journal, just as it did before with stdout=sys.stdout).
+    def _tee_agent_output() -> None:
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(8192)
+                if not chunk:
+                    break
+                if _log_file_handle is not None:
+                    _log_file_handle.write(chunk)
+                    _log_file_handle.flush()
+                sys.stdout.write(chunk.decode("utf-8", "replace"))
+                sys.stdout.flush()
+        except (ValueError, OSError):
+            return  # stdout closed underneath us (normal on teardown)
+        finally:
+            if _log_file_handle is not None:
+                try:
+                    _log_file_handle.close()
+                except Exception:
+                    pass
+
+    _log_reader = threading.Thread(target=_tee_agent_output, daemon=True)
+    _log_reader.start()
 
     with lock:
         active_tasks[task_id] = proc
@@ -2686,6 +3083,7 @@ def main() -> None:
     )
     max_auth_failures = _env_int("BLUEPRINT_RUNNER_MAX_AUTH_FAILURES", 20, minimum=0)
     max_network_failures = _env_int("BLUEPRINT_RUNNER_MAX_NETWORK_FAILURES", 20, minimum=0)
+    failure_pause_threshold = _env_int("BLUEPRINT_RUNNER_FAILURE_PAUSE_THRESHOLD", 0, minimum=0)
 
     # Prod agent container image (agent/Dockerfile). The default agent backend is bwrap
     # (host toolchain); the docker backend is used only on an explicit opt-in:
@@ -2930,6 +3328,14 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
+            # During an auto-update, don't claim new work — the update may restart
+            # the process on success. Unlike _shutdown_event, this event is scoped
+            # only to work claiming: reaper, compute poller, and supervise continue
+            # running, so a transient update failure never kills healthy threads.
+            if _update_in_progress.is_set():
+                time.sleep(poll_interval)
+                continue
+
             with lock:
                 active_count = len(active_tasks)
 
@@ -2953,6 +3359,24 @@ def main() -> None:
                 )
                 time.sleep(poll_interval)
                 continue
+
+            # Circuit-breaker: pause claiming after N consecutive task failures.
+            if failure_pause_threshold > 0:
+                pause_rem = telemetry.pause_remaining(failure_pause_threshold, _FAILURE_PAUSE_SECONDS)
+                if pause_rem is not None and pause_rem > 0:
+                    _release_capacity(agent_capacity)
+                    # Log on the first iteration of each pause cycle (when
+                    # pause_rem is close to the full pause_seconds duration).
+                    if pause_rem >= _FAILURE_PAUSE_SECONDS - 1.0:
+                        print(
+                            f"[runner] CIRCUIT BREAKER: consecutive task failures "
+                            f"(threshold={failure_pause_threshold}) — "
+                            f"pausing task claiming for {_FAILURE_PAUSE_SECONDS:.0f}s. "
+                            "A successful task will clear the circuit.",
+                            flush=True,
+                        )
+                    time.sleep(min(pause_rem, poll_interval, 10.0))
+                    continue
 
             try:
                 resp = _post(next_task_url, token, {}, return_headers=True)
@@ -2986,6 +3410,17 @@ def main() -> None:
                 time.sleep(poll_interval)
                 continue
 
+            if status == 503 and isinstance(body, dict) and body.get("pool_exhausted"):
+                _release_capacity(agent_capacity)
+                print(
+                    "[runner] POOL EXHAUSTED — no LLM account available; "
+                    "task stays claimable for a future poll cycle",
+                    flush=True,
+                )
+                poll_interval = min(poll_interval * 2, 30.0)
+                time.sleep(poll_interval)
+                continue
+
             if status == 204 or body is None:
                 _release_capacity(agent_capacity)
                 poll_interval = min(poll_interval * 2, 30.0)
@@ -3004,8 +3439,40 @@ def main() -> None:
             agent_token = body.get("agent_token", "")
             task_type = body.get("task_type", "unknown")
             vm_instance_id = body.get("vm_instance_id") or "runner:local"
-            llm_env = body.get("llm_env") or {}
-            llm_files = body.get("llm_files") or []
+            # Per-task server-vended LLM credentials from the nested
+            # {"credentials": {"env": {...}, "files": [...]}} response shape.
+            # The env dict (PROVIDER, AUTH_MODE, API keys) is used both as
+            # llm_env (injected into the agent subprocess) and as credential_env
+            # (passed to the isolation layer's per_task_creds).  The files list
+            # is used as credential_files (written to the workspace bind-mount
+            # before spawn) and as llm_files (written inside the sandbox).
+            _creds = body.get("credentials") or {}
+            credential_env: dict[str, str] = _creds.get("env", {})
+            credential_files: list[dict[str, typing.Any]] = _creds.get("files", [])
+            llm_env = credential_env
+            llm_files = credential_files
+            if credential_env:
+                # Provider and model are read from the credential_env dict,
+                # not from top-level response fields (the runner response nests
+                # them inside credentials.env). Account ID/name are not currently
+                # returned by the next-task endpoint.
+                provider = credential_env.get("PROVIDER", "")
+                model = credential_env.get("LLM_MODEL", "")
+                print(
+                    f"[runner] task {task_id}: server-vended credentials "
+                    f"provider={provider} model={model} "
+                    f"env_keys={sorted(credential_env.keys())}",
+                    flush=True,
+                )
+            elif not any(
+                os.environ.get(k, "").strip() for k in _PROVIDER_CREDENTIAL_KEYS
+            ):
+                print(
+                    f"[runner] task {task_id}: NO credentials — server returned no "
+                    f"credential_env and no static host provider credentials are set. "
+                    f"The agent WILL fail at LLM call.",
+                    flush=True,
+                )
 
             with lock:
                 already_active = task_id in active_tasks
@@ -3051,19 +3518,27 @@ def main() -> None:
                 # DECLINE / spawn failure — the reaper never sees this task, so the
                 # permit must be released here.
                 _release_capacity(agent_capacity)
+                # Notify the orchestrator so the task returns to QUEUED instead of
+                # stranding in PROVISIONING until the runner goes offline.
+                _notify_decline(orchestrator_url, token, task_id)
                 time.sleep(poll_interval)
                 continue
         except Exception as exc:  # noqa: BLE001 — a transient error must not crash the runner
             print(f"[runner] agent poll loop error (continuing): {exc}", flush=True)
             time.sleep(5)
 
+    # Drain active compute jobs first — daemon threads would be killed on
+    # process exit, so give them a chance to report their final status.
+    _wait_for_compute_jobs(active_compute_jobs, compute_lock, orchestrator_url, token)
+
     # Graceful shutdown (monotonic clock so a wall-clock jump can't skew the wait).
+    deadline = time.monotonic() + 120
+
     with lock:
         remaining = dict(active_tasks)
 
     if remaining:
         print(f"[runner] Shutdown requested — waiting for {len(remaining)} active agents...", flush=True)
-        deadline = time.monotonic() + 120
         for tid, proc in remaining.items():
             timeout = max(0.0, deadline - time.monotonic())
             try:
@@ -3076,6 +3551,49 @@ def main() -> None:
                 iso.terminate_process_tree(
                     proc, backend=backend, container_name=container_name
                 )
+
+    # Drain compute job threads. These are daemon threads: when the process exits
+    # they are killed mid-flight, before _run_compute_job can send a terminal
+    # status report to the server. Wait for them to finish (they check
+    # _shutdown_event and self-terminate with a "failed" report); if any are still
+    # alive after the deadline, report failure on their behalf.
+    with compute_lock:
+        remaining_compute = set(active_compute_jobs)
+    if remaining_compute:
+        print(
+            f"[runner] Shutdown requested — waiting for {len(remaining_compute)} active compute jobs...",
+            flush=True,
+        )
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            with compute_lock:
+                if not active_compute_jobs:
+                    break
+        # After the deadline: any compute job still alive was stranded by a daemon
+        # thread that couldn't finish. Report it as failed so it doesn't remain
+        # stuck in RUNNING on the server.
+        with compute_lock:
+            stranded = set(active_compute_jobs)
+        if stranded:
+            for job_id in stranded:
+                print(
+                    f"[runner] compute job {job_id} did not finish within shutdown "
+                    "deadline — reporting as failed",
+                    flush=True,
+                )
+                try:
+                    _report_compute_job(
+                        orchestrator_url, token, job_id,
+                        exec_status="failed", exit_code=1,
+                        command_log={
+                            "text": "Runner shut down (SIGTERM) before job completed",
+                            "truncated": False,
+                        },
+                    )
+                except Exception:
+                    pass
+            with compute_lock:
+                active_compute_jobs.difference_update(stranded)
 
     print("[runner] Exiting.", flush=True)
 

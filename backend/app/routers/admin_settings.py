@@ -179,6 +179,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "residual_remediation_cooldown_hours",
         "rollup_merge_queue_enabled",
         "review_second_opinion_gate_enabled",
+        "blind_multi_reviewer_gate_enabled",
         "review_second_opinion_sample_rate",
         "smoketest_enabled",
         "spend_approval_timeout_hours",
@@ -601,6 +602,9 @@ async def get_settings(
         ),
         "review_second_opinion_gate_enabled": bool(
             _runtime_config.get("review_second_opinion_gate_enabled", True)
+        ),
+        "blind_multi_reviewer_gate_enabled": bool(
+            _runtime_config.get("blind_multi_reviewer_gate_enabled", True)
         ),
         "review_second_opinion_sample_rate": float(
             _runtime_config.get("review_second_opinion_sample_rate", 1.0)
@@ -1522,6 +1526,14 @@ async def _apply_settings(
                 detail="review_second_opinion_gate_enabled must be a boolean",
             )
         _runtime_config["review_second_opinion_gate_enabled"] = val
+    if "blind_multi_reviewer_gate_enabled" in payload:
+        val = payload["blind_multi_reviewer_gate_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="blind_multi_reviewer_gate_enabled must be a boolean",
+            )
+        _runtime_config["blind_multi_reviewer_gate_enabled"] = val
     if "review_second_opinion_sample_rate" in payload:
         try:
             fval = float(payload["review_second_opinion_sample_rate"])

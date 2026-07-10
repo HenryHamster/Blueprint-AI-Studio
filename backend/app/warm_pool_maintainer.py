@@ -30,6 +30,7 @@ from typing import Awaitable, Callable
 
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.orm.exc import ObjectDeletedError
 
 from app.database import AsyncSessionLocal
 from app.models import (
@@ -594,11 +595,18 @@ async def drain_global_warm_pool(*, session_factory=AsyncSessionLocal) -> int:
             .scalars()
             .all()
         )
-        member_ids = [m.id for m in members]
-        for member_id in member_ids:
-            member = await session.get(PoolVm, member_id)
-            if member is None:
-                continue
+        # Iterate directly over the batch-loaded members. Only refresh after a
+        # commit has expired the instances (avoiding the unconditional-SELECT-per-
+        # member regression that iteration 1 introduced with an unconditional
+        # refresh). retire_and_delete_pool_vm always commits, expiring everything.
+        needs_refresh = False
+        for member in members:
+            member_id = member.id
+            if needs_refresh:
+                try:
+                    await session.refresh(member)
+                except ObjectDeletedError:
+                    continue  # deleted by a peer since the batch load
             try:
                 if await retire_and_delete_pool_vm(
                     session, member, reason="pool_global_disable", force=True
@@ -610,6 +618,7 @@ async def drain_global_warm_pool(*, session_factory=AsyncSessionLocal) -> int:
                     member_id,
                     exc_info=True,
                 )
+            needs_refresh = True
     if retired:
         logger.info("[WARM-POOL] global-disable drain retired %d members", retired)
     return retired
@@ -1452,8 +1461,26 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
     # would abort the whole stranded-lane sweep uncaught. populate_existing
     # forces the reload inside the async greenlet and reflects committed state.
     active_lane_ids = [lane.id for lane in active_lanes]
+    # Batch-fetch all lanes in one query instead of N individual session.get() calls.
+    # ``populate_existing`` via execution_options provides the same MissingGreenlet
+    # safety as the prior per-lane session.get(…, populate_existing=True) by forcing
+    # the reload inside the async greenlet and reflecting committed state.
+    lanes_by_id: dict[int, ImprovementLane] = {}
+    if active_lane_ids:
+        lanes_batch = (
+            (
+                await session.execute(
+                    select(ImprovementLane)
+                    .where(ImprovementLane.id.in_(active_lane_ids))
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        lanes_by_id = {lane.id: lane for lane in lanes_batch}
     for lane_id in active_lane_ids:
-        lane = await session.get(ImprovementLane, lane_id, populate_existing=True)
+        lane = lanes_by_id.get(lane_id)
         if lane is None or lane.status != ImprovementLaneStatus.ACTIVE.value:
             continue
         task = None
@@ -2081,20 +2108,21 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     )
 
     retired = 0
-    # Iterate by id and re-fetch each member fresh. retire_and_delete_pool_vm
-    # commits per member, and a failed teardown below issues session.rollback() —
-    # both expire the batch-loaded ``candidates`` instances. Reading a later
-    # candidate's attributes (or the failed member's vm_instance_id in the except)
-    # off an expired instance triggers a sync lazy-load under async ->
-    # MissingGreenlet, which masks the real error AND aborts the rest of the
-    # sweep (leaving idle/zombie members unswept). session.get re-loads a fresh
-    # instance (identity-map hit until a rollback expires it). Stale-ORM-after-
-    # rollback pattern; observed via the 2026-06-04 lock-contention incident.
-    candidate_ids = [member.id for member in candidates]
-    for member_id in candidate_ids:
-        member = await session.get(PoolVm, member_id)
-        if member is None:
-            continue  # retired/deleted by a peer since the lock-free scan
+    needs_refresh = False  # candidates freshly loaded; no refresh until a commit expires them
+    for member in candidates:
+        if needs_refresh:
+            # retire_and_delete_pool_vm commits per member, and a failed
+            # teardown below issues session.rollback() — both expire the previously
+            # loaded instances. Reading an expired instance's attributes triggers a sync
+            # lazy-load under async -> MissingGreenlet, which masks the real error AND
+            # aborts the rest of the sweep (leaving idle/zombie members unswept).
+            # session.refresh re-populates the instance from the DB (identity-map hit
+            # until the next commit/rollback expires it). Stale-ORM-after-rollback pattern;
+            # observed via the 2026-06-04 lock-contention incident.
+            try:
+                await session.refresh(member)
+            except ObjectDeletedError:
+                continue  # deleted by a peer since the lock-free scan
         reason: str | None = None
         # Captures the id of a QUEUED task whose warm-pool pin must be cleared
         # after the owning member is reclaimed (so the orchestrator can cold-
@@ -2269,6 +2297,7 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                 vm_id,
                 exc_info=True,
             )
+        needs_refresh = True  # teardown path committed or rolled back, expiring instances
 
     # Periodic defense-in-depth: reclaim lanes whose backing VM was removed
     # outside retire_and_delete_pool_vm (e.g. GCP console, API, or a crash

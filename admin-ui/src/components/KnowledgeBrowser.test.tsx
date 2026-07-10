@@ -974,6 +974,142 @@ describe('KnowledgeBrowser — finding-challenge origin provenance', () => {
   });
 });
 
+describe('KnowledgeBrowser — lifecycle status badge', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  function findBadge(scope: ParentNode, label: string): Element | undefined {
+    return Array.from(scope.querySelectorAll('span')).find(
+      s => s.textContent?.trim() === label,
+    );
+  }
+
+  async function renderList(documents: unknown[]) {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
+      documents: documents as never,
+      total: documents.length,
+      limit: 50,
+      offset: 0,
+    });
+    vi.mocked(fetchKnowledgeDocument).mockImplementation((_pid, id) =>
+      Promise.resolve({
+        ...(documents.find(d => (d as { id: string }).id === id) as object),
+        body: '# Body\n\nMarkdown body.',
+      } as never),
+    );
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+  }
+
+  function cardFor(title: string): Element | undefined {
+    return Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes(title),
+    );
+  }
+
+  test('renders consumed badge when lifecycle_status is consumed', async () => {
+    const consumedDoc = { ...computeDoc, id: 'doc-lifecycle-consumed', title: 'Consumed lifecycle doc', lifecycle_status: 'consumed' };
+    await renderList([consumedDoc]);
+    const card = cardFor('Consumed lifecycle doc');
+    expect(card && findBadge(card, 'Consumed')).toBeTruthy();
+  });
+
+  test('renders dismissed badge when lifecycle_status is dismissed', async () => {
+    const dismissedDoc = { ...computeDoc, id: 'doc-lifecycle-dismissed', title: 'Dismissed lifecycle doc', lifecycle_status: 'dismissed' };
+    await renderList([dismissedDoc]);
+    const card = cardFor('Dismissed lifecycle doc');
+    expect(card && findBadge(card, 'Dismissed')).toBeTruthy();
+  });
+
+  test('no badge when lifecycle_status is pending', async () => {
+    const pendingDoc = { ...computeDoc, id: 'doc-lifecycle-pending', title: 'Pending lifecycle doc', lifecycle_status: 'pending' };
+    await renderList([pendingDoc]);
+    const card = cardFor('Pending lifecycle doc');
+    expect(card && findBadge(card, 'Consumed')).toBeFalsy();
+    expect(card && findBadge(card, 'Dismissed')).toBeFalsy();
+  });
+
+  test('no badge when lifecycle_status is null', async () => {
+    const nullDoc: Record<string, unknown> = { ...computeDoc, id: 'doc-lifecycle-null', title: 'Null lifecycle doc' };
+    nullDoc.lifecycle_status = null;
+    await renderList([nullDoc]);
+    const card = cardFor('Null lifecycle doc');
+    expect(card && findBadge(card, 'Consumed')).toBeFalsy();
+    expect(card && findBadge(card, 'Dismissed')).toBeFalsy();
+  });
+
+  test('no badge when lifecycle_status is undefined (absent field)', async () => {
+    const undefinedDoc = { ...computeDoc, id: 'doc-lifecycle-undef', title: 'Undefined lifecycle doc' };
+    await renderList([undefinedDoc]);
+    const card = cardFor('Undefined lifecycle doc');
+    expect(card && findBadge(card, 'Consumed')).toBeFalsy();
+    expect(card && findBadge(card, 'Dismissed')).toBeFalsy();
+  });
+
+  test('consumed badge appears in detail view', async () => {
+    const consumedDoc = { ...computeDoc, id: 'doc-lifecycle-consumed-detail', title: 'Consumed lifecycle detail', lifecycle_status: 'consumed' };
+    await renderList([consumedDoc]);
+    const card = cardFor('Consumed lifecycle detail');
+    expect(card).toBeTruthy();
+    if (!card) throw new Error('expected document card');
+    await act(async () => { (card as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    expect((host as HTMLDivElement).textContent).toContain('Consumed');
+  });
+
+  test('dismissed badge appears in detail view', async () => {
+    const dismissedDoc = { ...computeDoc, id: 'doc-lifecycle-dismissed-detail', title: 'Dismissed lifecycle detail', lifecycle_status: 'dismissed' };
+    await renderList([dismissedDoc]);
+    const card = cardFor('Dismissed lifecycle detail');
+    expect(card).toBeTruthy();
+    if (!card) throw new Error('expected document card');
+    await act(async () => { (card as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    expect((host as HTMLDivElement).textContent).toContain('Dismissed');
+  });
+
+  test('lifecycle filter forwards lifecycle_status to fetchKnowledgeDocuments', async () => {
+    await renderList([computeDoc]);
+    const { fetchKnowledgeDocuments } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockClear();
+    const pendingFilter = Array.from((host as HTMLDivElement).querySelectorAll('button')).find(
+      b => b.textContent?.trim() === 'Pending',
+    );
+    expect(pendingFilter).toBeTruthy();
+    if (!pendingFilter) throw new Error('expected Pending filter button');
+    await act(async () => { pendingFilter.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    const calls = vi.mocked(fetchKnowledgeDocuments).mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[1]?.offset).toBe(0);
+    expect(lastCall[1]?.lifecycle_status).toBe('pending');
+  });
+});
+
 describe('KnowledgeBrowser — document body load failure', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;

@@ -248,4 +248,28 @@ describe('TaskDetailDrawer — viewport regression', () => {
       });
     });
   });
+
+  test('renders without horizontal overflow at 1280px (desktop width)', async () => {
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskDetailDrawer
+            task={makeTask()}
+            logLines={[]}
+            onClose={() => {}}
+            onApprove={() => {}}
+            onRequestChanges={() => {}}
+            onCancel={() => {}}
+            onRetry={() => {}}
+            onEditPrompt={() => {}}
+            onDismiss={() => {}}
+          />,
+        );
+      });
+    });
+  });
 });

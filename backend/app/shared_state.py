@@ -205,6 +205,21 @@ from app.pipeline_health_state import (  # noqa: F401
 # autonomous research spawn) check this before starting new work.
 monthly_budget_gate_engaged: bool = False
 
+# --- Per-project spend-ceiling deferred state ---
+# Set of project IDs (as strings) whose per-project spend ceiling has been
+# exceeded. Updated every orchestrator cycle in
+# _filter_project_resource_dispatch_eligible. Checked by broadcast events
+# and the admin-ui to show ceiling-deferred indicators on projects.
+project_ceiling_deferred_ids: set[str] = set()
+
+# --- Per-project monthly-budget deferred state ---
+# Set of project IDs (as strings) whose tasks are deferred because the
+# fleet-wide monthly budget has been reached or exceeded. Updated every
+# orchestrator cycle in _filter_project_resource_dispatch_eligible.
+# Checked by broadcast events and the admin-ui to show budget-deferred
+# indicators on projects.
+monthly_budget_deferred_project_ids: set[str] = set()
+
 # --- Autonomous loop / anomaly timing ---
 last_idle_check: datetime | None = None
 # Throttle anchor for the orchestrator's _check_evergreen_fill() sibling

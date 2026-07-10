@@ -1,6 +1,7 @@
 import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
+import { waitFor } from '@testing-library/react';
 import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
 import type { ProjectMessage } from './MessageBubble';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
@@ -514,12 +515,16 @@ describe('MessagesPanel — viewport regression', () => {
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
 
-    const bubbles = host.querySelectorAll('[data-testid="message-bubble"]');
-    const visibleContent = Array.from(bubbles)
-      .map(el => el.textContent || '')
-      .join(' ');
-    expect(visibleContent).toContain('migration schema error');
-    expect(visibleContent).not.toContain('pr merged successfully');
+    if (!host) throw new Error('Expected messages panel test host to remain mounted');
+    const panelHost = host;
+    await waitFor(() => {
+      const bubbles = panelHost.querySelectorAll('[data-testid="message-bubble"]');
+      const visibleContent = Array.from(bubbles)
+        .map(el => el.textContent || '')
+        .join(' ');
+      expect(visibleContent).toContain('migration schema error');
+      expect(visibleContent).not.toContain('pr merged successfully');
+    });
   });
 
   test('clearing search query restores all matching messages', async () => {

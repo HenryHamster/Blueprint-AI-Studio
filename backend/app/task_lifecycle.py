@@ -53,7 +53,7 @@ from app.json_extract import scan_balanced_json_objects
 from app.task_blocked import reset_task_for_fresh_attempt
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project, _sanitize_log
-from app.payload_schemas import validate_internal_payload
+from app.payload_schemas import read_acceptance_evidence, validate_internal_payload
 from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
     _genuine_blocking_issue_exists,
@@ -958,6 +958,7 @@ async def _resolve_review_second_opinion(
     unparseable, do NOT merge or spawn.
     """
     from app.task_evaluators import (
+        BLIND_REVIEW_SOURCE_KEY,
         REVIEW_SECOND_OPINION_SOURCE_KEY,
         REVIEW_SECOND_OPINION_AWAITING_KEY,
         REVIEW_SECOND_OPINION_PARKED_KEY,
@@ -1177,6 +1178,11 @@ async def _resolve_review_second_opinion(
         record = reconcile_review_second_opinion(primary_verdict, primary_issues, panel)
         record["challenger_task_id"] = str(challenger.id)
         record["review_task_id"] = str(review.id)
+        # Distinguish blind multi-reviewer from single second-opinion challenger
+        # so the reconciliation record is self-describing for telemetry.
+        record["is_blind"] = bool(
+            (challenger.context or {}).get(BLIND_REVIEW_SOURCE_KEY)
+        )
 
         ctx = dict(review.context or {})
         ctx[REVIEW_SECOND_OPINION_RECONCILIATION_KEY] = record
@@ -1215,8 +1221,10 @@ async def _resolve_review_second_opinion(
             }
         ),
     )
+    _blind = " blind" if record.get("is_blind") else ""
     logger.info(
-        "[REVIEW SECOND-OPINION] Challenge %s for review %s reconciled as %s (%s → %s); re-dispatching review",
+        "[REVIEW SECOND-OPINION]%s Challenge %s for review %s reconciled as %s (%s → %s); re-dispatching review",
+        _blind,
         challenger.id,
         review.id,
         record["state"],
@@ -2218,11 +2226,13 @@ async def _process_post_commit(
                             from app.rollup_migration_validation import (
                                 enforce_premerge_migration_guard,
                             )
+                            from app.migration_guard_recovery import (
+                                coerce_migration_guard_result,
+                                mark_migration_guard_deferred,
+                                spawn_migration_guard_fix_task,
+                            )
 
-                            (
-                                _dh_ok,
-                                _dh_reason,
-                            ) = await enforce_premerge_migration_guard(
+                            _dh_result = await enforce_premerge_migration_guard(
                                 gh_token,
                                 owner,
                                 repo,
@@ -2234,12 +2244,36 @@ async def _process_post_commit(
                                     else None
                                 ),
                             )
-                            if not _dh_ok:
+                            (
+                                _dh_verdict,
+                                _dh_reason,
+                            ) = coerce_migration_guard_result(_dh_result)
+                            if _dh_verdict != "ok":
                                 logger.warning(
                                     f"[PIPELINE] Auto-approve merge held for PR "
                                     f"#{pr_number} — Alembic combined-chain guard: "
                                     f"{_dh_reason}"
                                 )
+                                _dh_loop = {
+                                    **((task.context or {}).get("review_loop") or {}),
+                                    "ci_waiting": True,
+                                    "review_approved": True,
+                                    "ci_passed": True,
+                                    "pr_number": pr_number,
+                                    "branch": branch,
+                                    "base_branch": base_branch,
+                                }
+                                if _dh_verdict == "defer":
+                                    task.status = TaskStatus.EVALUATING
+                                    mark_migration_guard_deferred(
+                                        task,
+                                        review_loop=_dh_loop,
+                                        reason=_dh_reason,
+                                        context_snapshot=dict(task.context or {}),
+                                    )
+                                    session.add(task)
+                                    await session.commit()
+                                    return {"status": "accepted"}
                                 reservation = await get_migration_reservation_for_task(
                                     session, task_id=task.id
                                 )
@@ -2304,25 +2338,17 @@ async def _process_post_commit(
                                         session.add(task)
                                         await session.commit()
                                         return {"status": "accepted"}
-                                task.status = TaskStatus.EVALUATING
-                                task.latest_status_message = (
-                                    f"Merge held — Alembic dual-head guard: {_dh_reason}"
-                                )[:500]
-                                task.context = {
-                                    **(task.context or {}),
-                                    "review_loop": {
-                                        **(
-                                            (task.context or {}).get("review_loop")
-                                            or {}
-                                        ),
-                                        "ci_waiting": True,
-                                        "review_approved": True,
-                                        "ci_passed": True,
-                                        "pr_number": pr_number,
-                                        "branch": branch,
-                                        "base_branch": base_branch,
-                                    },
-                                }
+                                await spawn_migration_guard_fix_task(
+                                    task,
+                                    session,
+                                    pr_number=pr_number,
+                                    branch=branch,
+                                    base_branch=base_branch,
+                                    guard_reason=_dh_reason,
+                                    review_loop=_dh_loop,
+                                    context_snapshot=dict(task.context or {}),
+                                    complete_source_on_fix_spawn=False,
+                                )
                                 session.add(task)
                                 await session.commit()
                                 return {"status": "accepted"}
@@ -3094,6 +3120,7 @@ async def _process_post_commit(
                 )
                 from app.task_evaluators import (
                     review_is_high_stakes,
+                    spawn_blind_multi_reviewer,
                     spawn_review_second_opinion,
                 )
                 from app.review_heuristics import (
@@ -3154,6 +3181,7 @@ async def _process_post_commit(
                     # when original_task_id is unavailable (fail-open: challenge).
                     _so_diff_lines: int | None = None
                     _so_file_count: int | None = None
+                    _is_observable_behavior: bool = False
                     if original_task_id:
                         try:
                             _so_source = await session.get(
@@ -3171,6 +3199,23 @@ async def _process_post_commit(
                                     for f in _so_files
                                     if not _is_test_file(f)
                                 )
+                                # Check whether the source task declared
+                                # observable_behavior acceptance evidence.
+                                # These tasks always get a second opinion
+                                # regardless of diff size — their proof is
+                                # entirely self-reported with no
+                                # machine-checkable assertion.
+                                try:
+                                    _evidence = read_acceptance_evidence(
+                                        _so_source.first_payload
+                                    )
+                                    if (
+                                        _evidence is not None
+                                        and _evidence.kind == "observable_behavior"
+                                    ):
+                                        _is_observable_behavior = True
+                                except Exception:
+                                    pass
                         except Exception:
                             logger.debug(
                                 "[REVIEW PIPELINE] PR #%s: could not load source task "
@@ -3192,6 +3237,7 @@ async def _process_post_commit(
                         ),
                         diff_non_test_lines=_so_diff_lines,
                         diff_non_test_file_count=_so_file_count,
+                        is_observable_behavior=_is_observable_behavior,
                     ):
                         _sample_rate = float(
                             _runtime_config.get(
@@ -3220,19 +3266,39 @@ async def _process_post_commit(
                             }
                             session.add(task)
                         else:
-                            _challenger = await spawn_review_second_opinion(
-                                task,
-                                session,
-                                verdict=verdict,
-                                issues=issues,
-                                feedback=feedback,
-                                pr_number=pr_number,
-                                branch=branch,
-                                base_branch=base_branch,
-                                original_task_id=original_task_id,
-                                original_prompt=original_prompt,
-                                investigated_files=investigated_files,
+                            _use_blind = bool(
+                                _runtime_config.get(
+                                    "blind_multi_reviewer_gate_enabled", False
+                                )
                             )
+                            if _use_blind:
+                                _challenger = await spawn_blind_multi_reviewer(
+                                    task,
+                                    session,
+                                    verdict=verdict,
+                                    issues=issues,
+                                    feedback=feedback,
+                                    pr_number=pr_number,
+                                    branch=branch,
+                                    base_branch=base_branch,
+                                    original_task_id=original_task_id,
+                                    original_prompt=original_prompt,
+                                    investigated_files=investigated_files,
+                                )
+                            else:
+                                _challenger = await spawn_review_second_opinion(
+                                    task,
+                                    session,
+                                    verdict=verdict,
+                                    issues=issues,
+                                    feedback=feedback,
+                                    pr_number=pr_number,
+                                    branch=branch,
+                                    base_branch=base_branch,
+                                    original_task_id=original_task_id,
+                                    original_prompt=original_prompt,
+                                    investigated_files=investigated_files,
+                                )
                             if _challenger is not None:
                                 logger.info(
                                     "[REVIEW PIPELINE] PR #%s: parked review %s "
@@ -3494,9 +3560,7 @@ async def _process_post_commit(
                                 _pre_rollup_gh: str | None = None
                                 _pre_rollup_own: str | None = None
                                 _pre_rollup_rep: str | None = None
-                                _pre_rollup_mig_guard: (
-                                    tuple[bool, str | None] | None
-                                ) = None
+                                _pre_rollup_mig_guard: object | None = None
                                 _pre_rollup_size_cap: (
                                     tuple[str, str | None] | None
                                 ) = None
@@ -3974,11 +4038,13 @@ async def _process_post_commit(
                             from app.rollup_migration_validation import (
                                 enforce_premerge_migration_guard,
                             )
+                            from app.migration_guard_recovery import (
+                                coerce_migration_guard_result,
+                                mark_migration_guard_deferred,
+                                spawn_migration_guard_fix_task,
+                            )
 
-                            (
-                                _dh_ok,
-                                _dh_reason,
-                            ) = await enforce_premerge_migration_guard(
+                            _dh_result = await enforce_premerge_migration_guard(
                                 gh_token,
                                 owner,
                                 repo,
@@ -3986,11 +4052,38 @@ async def _process_post_commit(
                                 base_branch,
                                 promotion_target=_promotion_target,
                             )
-                            if not _dh_ok:
+                            (
+                                _dh_verdict,
+                                _dh_reason,
+                            ) = coerce_migration_guard_result(_dh_result)
+                            if _dh_verdict != "ok":
                                 logger.warning(
                                     f"[CI] Inline merge held for PR #{pr_number} — "
                                     f"Alembic combined-chain guard: {_dh_reason}"
                                 )
+                                _dh_loop = {
+                                    **review_loop,
+                                    "ci_waiting": True,
+                                    "review_approved": True,
+                                    "ci_passed": True,
+                                    "head_sha": head_sha,
+                                    "pr_number": pr_number,
+                                    "branch": branch,
+                                    "base_branch": base_branch,
+                                    "original_task_id": original_task_id,
+                                }
+                                if _dh_verdict == "defer":
+                                    task.status = TaskStatus.EVALUATING
+                                    mark_migration_guard_deferred(
+                                        task,
+                                        review_loop=_dh_loop,
+                                        reason=_dh_reason,
+                                        context_snapshot=dict(task.context or {}),
+                                    )
+                                    session.add(task)
+                                    await session.commit()
+                                    action_taken = True
+                                    return {"status": "accepted"}
                                 reservation_task_id = (
                                     uuid.UUID(original_task_id)
                                     if original_task_id
@@ -4056,24 +4149,18 @@ async def _process_post_commit(
                                         await session.commit()
                                         action_taken = True
                                         return {"status": "accepted"}
-                                task.status = TaskStatus.EVALUATING
-                                task.latest_status_message = (
-                                    f"Merge held — Alembic dual-head guard: {_dh_reason}"
-                                )[:500]
-                                task.context = {
-                                    **(task.context or {}),
-                                    "review_loop": {
-                                        **review_loop,
-                                        "ci_waiting": True,
-                                        "review_approved": True,
-                                        "ci_passed": True,
-                                        "head_sha": head_sha,
-                                        "pr_number": pr_number,
-                                        "branch": branch,
-                                        "base_branch": base_branch,
-                                        "original_task_id": original_task_id,
-                                    },
-                                }
+                                await spawn_migration_guard_fix_task(
+                                    task,
+                                    session,
+                                    pr_number=pr_number,
+                                    branch=branch,
+                                    base_branch=base_branch,
+                                    original_task_id=original_task_id,
+                                    guard_reason=_dh_reason,
+                                    review_loop=_dh_loop,
+                                    context_snapshot=dict(task.context or {}),
+                                    complete_source_on_fix_spawn=True,
+                                )
                                 session.add(task)
                                 await session.commit()
                                 action_taken = True
@@ -5618,11 +5705,14 @@ async def _process_post_commit(
                 #                   intermediate); rebase output is mechanical;
                 #                   re-reviewing would be inconsistent with the
                 #                   no-conflict happy path. Wait for CI then merge.
+                #   - migration_guard → mechanical Alembic renumber/rechain after
+                #                   the pre-merge guard blocked an approved PR.
+                #                   Wait for CI then merge.
                 #   - minor-only first-pass verdict → the fix only addressed
                 #                   minor nits; a re-review would near-certainly
                 #                   approve, so spend CI as the only gate.
                 skip_rereview = (
-                    fix_reason in ("ci_failure", "merge_conflict")
+                    fix_reason in ("ci_failure", "merge_conflict", "migration_guard")
                     or skip_rereview_minor_only
                 )
                 if not scan_blocked and skip_rereview:
@@ -5642,11 +5732,14 @@ async def _process_post_commit(
                         label = "CI-only fix"
                     elif fix_reason == "merge_conflict":
                         label = "merge-conflict fix"
+                    elif fix_reason == "migration_guard":
+                        label = "migration-guard fix"
                     else:
                         label = "minor-nit fix"
                     skip_detail = (
                         fix_reason
-                        if fix_reason in ("ci_failure", "merge_conflict")
+                        if fix_reason
+                        in ("ci_failure", "merge_conflict", "migration_guard")
                         else "minor_only"
                     )
                     task.latest_status_message = f"{label} applied for PR #{pr_number} — waiting for CI (review skipped: {skip_detail})"

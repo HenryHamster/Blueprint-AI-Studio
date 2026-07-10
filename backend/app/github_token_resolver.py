@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 import app.shared_state as _shared_state
+from app.field_encryption import decrypt_field
 from app.github import generate_installation_access_token
 from app.models import Project, Task, UserIntegration, _utcnow
 from app.secrets_manager import get_user_secret
@@ -111,7 +112,8 @@ async def get_github_token_for_task(
             )
 
     if not token and integration and integration.github_pat:
-        token = await get_user_secret(integration.github_pat)
+        decrypted_pat_ref = decrypt_field(integration.github_pat)
+        token = await get_user_secret(decrypted_pat_ref)
 
     if not token:
         raise HTTPException(

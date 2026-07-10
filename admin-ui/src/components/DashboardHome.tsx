@@ -37,6 +37,7 @@ import {
 import { RecurringPatternsSection } from './RecurringPatternsSection';
 import { TAXONOMY_ORDER } from './dashboardConstants';
 import { ViewportDebtPanel } from './ViewportDebtPanel';
+import { UILoadTimingPanel } from './UILoadTimingPanel';
 import { SystemStatusCard } from './SystemStatusCard';
 import { PipelineEfficiencyPanel } from './PipelineEfficiencyPanel';
 import { WarmReuseVsCostTrend } from './WarmReuseVsCostTrend';
@@ -309,6 +310,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
 
       {/* Warm-reuse vs cost-per-merged-PR trend (baseline reference line) */}
       <WarmReuseVsCostTrend projectId={selectedProjectId} />
+
+      {/* UI Load Timing — p50/p90 per surface */}
+      <UILoadTimingPanel />
 
       {/* Challenge Gate Health — adversarial quality panel */}
       <AdversarialQualityPanel projectId={selectedProjectId} />

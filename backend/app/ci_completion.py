@@ -49,6 +49,14 @@ from app.models import Task, TaskStatus, _utcnow
 
 logger = logging.getLogger(__name__)
 
+# ── CI rerun budget (general flake-tolerant gate) ──
+# Number of times to re-run failed CI jobs (via GitHub's rerun-failed-jobs API)
+# before spawning a full agent fix task. A value of 1 means one recheck attempt
+# per task; after that the CI must genuinely pass or a fix task is spawned.
+# Configured as a module constant so it's trivially overridable for testing;
+# set to 0 to disable the general rerun gate entirely.
+_CI_RERUN_BUDGET = 1
+
 
 async def _auto_resolve_audit_findings_on_merge(
     project_id,
@@ -146,7 +154,7 @@ async def _attempt_merge_with_retry_and_escalation(
     session: AsyncSession,
     *,
     source: str,
-    precomputed_migration_guard: tuple[bool, str | None] | None = None,
+    precomputed_migration_guard: object | None = None,
     precomputed_size_cap: tuple[str, str | None] | None = None,
 ) -> bool:
     """Both gates are open — try to merge. Mutates ``task`` in place; caller commits.
@@ -266,10 +274,16 @@ async def _attempt_merge_with_retry_and_escalation(
         # the row lock).  Fall back to running the guard inline for all other
         # callers (CI-completion, promotion, hotfix back-merge) where the guard
         # already runs outside the critical lock window.
+        from app.migration_guard_recovery import (
+            coerce_migration_guard_result,
+            mark_migration_guard_deferred,
+            spawn_migration_guard_fix_task,
+        )
+
         if precomputed_migration_guard is not None:
-            _ok_to_merge, _hold_reason = precomputed_migration_guard
+            _guard_result = precomputed_migration_guard
         else:
-            _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
+            _guard_result = await enforce_premerge_migration_guard(
                 gh_token,
                 owner,
                 repo,
@@ -281,7 +295,18 @@ async def _attempt_merge_with_retry_and_escalation(
                     else None
                 ),
             )
+        _guard_verdict, _hold_reason = coerce_migration_guard_result(_guard_result)
+        _ok_to_merge = _guard_verdict == "ok"
         if not _ok_to_merge:
+            if _guard_verdict == "defer":
+                mark_migration_guard_deferred(
+                    task,
+                    review_loop=ci_loop,
+                    reason=_hold_reason,
+                    context_snapshot=dict(task.context or {}),
+                )
+                session.add(task)
+                return False
             reservation_task_id = uuid.UUID(ci_orig_id) if ci_orig_id else task.id
             reservation = await get_migration_reservation_for_task(
                 session, task_id=reservation_task_id
@@ -344,6 +369,18 @@ async def _attempt_merge_with_retry_and_escalation(
             task.latest_status_message = (
                 f"Merge held — Alembic dual-head guard: {_hold_reason}"
             )[:500]
+            await spawn_migration_guard_fix_task(
+                task,
+                session,
+                pr_number=ci_pr_number,
+                branch=ci_branch,
+                base_branch=ci_base,
+                original_task_id=ci_orig_id,
+                guard_reason=_hold_reason,
+                review_loop=ci_loop,
+                context_snapshot=dict(task.context or {}),
+                complete_source_on_fix_spawn=True,
+            )
             session.add(task)
             return False
 
@@ -737,6 +774,15 @@ async def _attempt_merge_with_retry_and_escalation(
                         # MissingGreenlet lazy-load.
                         _orig_dir_reps: dict = {}
                         if record_pr_merged:
+                            # Bridge test coverage data from the CI loop into the
+                            # original task's context so the coverage_delta acceptance
+                            # gate can consume it during record_code_acceptance_verdict
+                            # (called inside apply_merged_landed_signal).
+                            _tcov = ci_loop.get("test_coverage_result")
+                            if _tcov is not None:
+                                _orig_ctx = dict(orig.context or {})
+                                _orig_ctx["test_coverage_result"] = _tcov
+                                orig.context = _orig_ctx
                             _orig_landed_on_integration = apply_merged_landed_signal(
                                 orig,
                                 orig_project,
@@ -2126,6 +2172,42 @@ async def handle_ci_completion(
                 logger.info(
                     f"[CI] PR #{ci_pr_number} CI failure is setup-phase infra — "
                     f"re-ran failed jobs, deferring fix spawn to next poll ({source})"
+                )
+                return False
+
+        # ── General CI rerun gate (flake-tolerant) ──
+        # If the CI failure involves user/test steps (not just GitHub built-in
+        # setup infra), re-run failed jobs once before burning a full fix cycle.
+        # A test flake (intermittent pass/fail) would otherwise trigger an
+        # expensive agent fix task unnecessarily. Mirrors the bounded retry-budget
+        # pattern used for behind-base in orchestrator_ci_monitor.py
+        # (ci_behind_update_retries). Capped at one rerun per task via a context
+        # counter; a genuinely broken test fails the rerun too and falls through
+        # to the normal fix path on the next sweep.
+        _rerun_consumed = (task.context or {}).get("ci_rerun_consumed", 0)
+        if _rerun_consumed < _CI_RERUN_BUDGET:
+            from app.github_checks import rerun_failed_jobs
+
+            _reran_any = False
+            for _run_id in ci_result.get("failed_run_ids") or []:
+                if await rerun_failed_jobs(gh_token, owner, repo, _run_id):
+                    _reran_any = True
+            if _reran_any:
+                _ctx = dict(task.context or {})
+                _ctx["ci_rerun_consumed"] = _rerun_consumed + 1
+                task.context = _ctx
+                flag_modified(task, "context")
+                task.latest_status_message = (
+                    f"CI failed on PR #{ci_pr_number} — re-ran failed jobs "
+                    f"({_rerun_consumed + 1}/{_CI_RERUN_BUDGET}), "
+                    f"deferring fix spawn to next sweep"
+                )
+                session.add(task)
+                await session.commit()
+                logger.info(
+                    f"[CI] PR #{ci_pr_number} CI failure — general rerun "
+                    f"({_rerun_consumed + 1}/{_CI_RERUN_BUDGET}), "
+                    f"deferring fix spawn to next sweep ({source})"
                 )
                 return False
 

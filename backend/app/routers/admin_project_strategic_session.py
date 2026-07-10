@@ -7,7 +7,11 @@ admin_projects_router under the same /api/admin prefix.
 """
 
 import asyncio
+import datetime as _dt
+import hashlib
+import json
 import logging
+import re
 import time
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -104,7 +108,15 @@ from app.work_session_check_in import (
     _message_is_operator_check_in,
     _persist_strategic_check_in_marker,
 )
+from app.server_timing import async_timed
 from app.shared_state import runtime_config
+from app.storage import (
+    ARTIFACT_BUCKET_NAME,
+    GCP_PROJECT_ID,
+    _generate_v4_signed_url,
+    generate_download_signed_url,
+    storage as gcs_storage,
+)
 from app.strategic_resident_session import (
     STRATEGIC_SESSION_ENABLED_SETTING,
     build_resident_runner_options,
@@ -460,6 +472,48 @@ class StrategicSessionCommandExecute(BaseModel):
 
 class StrategicResidentSessionStart(BaseModel):
     runner_id: str | None = None
+
+
+_ATTACHMENT_DEFAULT_CONTENT_TYPE = "application/octet-stream"
+_ATTACHMENT_DEFAULT_FILENAME = "attachment"
+_ATTACHMENT_FILENAME_MAX_CHARS = 200
+_ATTACHMENT_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_ATTACHMENT_CONTENT_TYPE_RE = re.compile(
+    r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+/[A-Za-z0-9!#$%&'*+.^_`|~-]+$"
+)
+
+
+def _sanitize_message_attachment_filename(filename: str) -> str:
+    """Return a single safe GCS object-name segment for an uploaded attachment."""
+    raw = (filename or "").strip().replace("\\", "/")
+    name = raw.rsplit("/", 1)[-1].strip()
+    name = _ATTACHMENT_SAFE_FILENAME_RE.sub("_", name).strip("._")
+    if not name:
+        return _ATTACHMENT_DEFAULT_FILENAME
+    if len(name) <= _ATTACHMENT_FILENAME_MAX_CHARS:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if dot and 1 <= len(ext) <= 32:
+        keep = max(1, _ATTACHMENT_FILENAME_MAX_CHARS - len(dot) - len(ext))
+        return f"{stem[:keep]}{dot}{ext}"
+    return name[:_ATTACHMENT_FILENAME_MAX_CHARS]
+
+
+def _attachment_content_type(content_type: str | None) -> str:
+    """Validate the Content-Type header that will be bound into the signed PUT."""
+    value = (content_type or "").strip()
+    if not value:
+        return _ATTACHMENT_DEFAULT_CONTENT_TYPE
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise HTTPException(status_code=400, detail="Invalid content_type")
+    if not _ATTACHMENT_CONTENT_TYPE_RE.fullmatch(value):
+        raise HTTPException(status_code=400, detail="Invalid content_type")
+    return value
+
+
+def _message_context_has_attachments(context: Dict[str, Any] | None) -> bool:
+    raw = context.get("attachments") if isinstance(context, dict) else None
+    return isinstance(raw, list) and any(isinstance(item, dict) for item in raw)
 
 
 def _work_session_command_by_id(
@@ -953,11 +1007,68 @@ async def _persist_message_preview_strategic_session_descriptors(
     await session.refresh(message)
 
 
+def _compute_strategic_state_revision(
+    project: Project,
+    *,
+    active_cycle_summary: Dict[str, Any] | None,
+    active_task: Task | None,
+    latest_cycle_summary: Dict[str, Any] | None,
+    running_update_summary: Dict[str, Any],
+    problem_model_summary: Dict[str, Any],
+    directions_summary: Dict[str, Any],
+    message_counts: Dict[str, int],
+    task_counts: Dict[str, int],
+    attention: Dict[str, Any] | None,
+) -> str:
+    """Compute a lightweight revision token for the context package inputs.
+
+    Only includes fields that the context package build reads directly.
+    Called AFTER cheap inputs are resolved and BEFORE the expensive
+    load_strategic_context_evidence + build_strategic_context_package_summary
+    steps, so a matching client token allows those steps to be skipped.
+    """
+    seed = json.dumps(
+        {
+            "project_id": str(project.id),
+            "project_name": project.name,
+            "vision": project.vision or {},
+            "problem_model": project.problem_model or {},
+            "directions": project.directions or [],
+            "design_doc": bool(project.design_doc),
+            "has_running_update": bool(project.running_update),
+            "running_update_acknowledged_at": (
+                str(project.running_update_acknowledged_at)
+                if project.running_update_acknowledged_at
+                else None
+            ),
+            "active_cycle": active_cycle_summary or {},
+            "active_task_id": str(active_task.id) if active_task else None,
+            "active_task_updated_at": (
+                str(active_task.updated_at)
+                if active_task and active_task.updated_at
+                else None
+            ),
+            "latest_cycle": latest_cycle_summary or {},
+            "running_update_summary": running_update_summary,
+            "problem_model_summary": problem_model_summary,
+            "directions_summary": directions_summary,
+            "message_counts": message_counts,
+            "task_counts": task_counts,
+            "attention_level": (attention or {}).get("level"),
+            "attention_counts": (attention or {}).get("counts", {}),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
 @router.get("/projects/{project_id}/strategic-state")
 @limiter.limit("30/minute")
 async def get_project_strategic_state(
     request: Request,
     project_id: uuid.UUID,
+    state_revision: str | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1105,30 +1216,55 @@ async def get_project_strategic_state(
         if status in message_counts:
             message_counts[status] = int(count or 0)
 
-    attention = await build_operator_attention(
-        session,
-        project,
-        current_user["user_id"],
-    )
+    async with async_timed(request, "attention"):
+        attention = await build_operator_attention(
+            session,
+            project,
+            current_user["user_id"],
+        )
     active_cycle_summary = _cycle_summary(active_cycle, active_task=active_task)
     latest_cycle_summary = _cycle_summary(latest_cycle)
     running_update_summary = _running_update_summary(project)
     problem_model_summary = _problem_model_summary(project.problem_model or {})
     directions_summary = _direction_summary(project.directions or [])
-    context_evidence = await load_strategic_context_evidence(session, project.id)
-    context_package = build_strategic_context_package_summary(
+    # State-revision skip: if the client already has a matching revision token,
+    # the context package inputs haven't changed since their last poll.
+    # Skip the expensive evidence load + package build and log the bypass.
+    _revision = _compute_strategic_state_revision(
         project,
-        active_cycle=active_cycle_summary,
+        active_cycle_summary=active_cycle_summary,
         active_task=active_task,
-        latest_cycle=latest_cycle,
-        running_update=running_update_summary,
-        problem_model=problem_model_summary,
-        directions=directions_summary,
+        latest_cycle_summary=latest_cycle_summary,
+        running_update_summary=running_update_summary,
+        problem_model_summary=problem_model_summary,
+        directions_summary=directions_summary,
         message_counts=message_counts,
         task_counts=task_counts,
         attention=attention,
-        evidence=context_evidence,
     )
+    if state_revision is not None and state_revision == _revision:
+        context_evidence: dict = {}
+        context_package: dict | None = None
+        logger.info(
+            "[STRATEGIC_STATE] skipped context package build for project %s "
+            "(state_revision unchanged)",
+            project.id,
+        )
+    else:
+        context_evidence = await load_strategic_context_evidence(session, project.id)
+        context_package = build_strategic_context_package_summary(
+            project,
+            active_cycle=active_cycle_summary,
+            active_task=active_task,
+            latest_cycle=latest_cycle,
+            running_update=running_update_summary,
+            problem_model=problem_model_summary,
+            directions=directions_summary,
+            message_counts=message_counts,
+            task_counts=task_counts,
+            attention=attention,
+            evidence=context_evidence,
+        )
     runtime_summary = await build_strategic_runtime_summary(
         session,
         project.id,
@@ -1140,21 +1276,24 @@ async def get_project_strategic_state(
     # online / agent-ready / eligible flags (for the auto-pick + override
     # dropdown) and, via ``_resident_session_availability``, the block-on-offline
     # verdict for a session pinned to a now-offline device.
-    resident_runner_options = await build_resident_runner_options(session, project.id)
-    workbench_state = await get_strategic_workbench_state(
-        session,
-        current_user["user_id"],
-        project.id,
-    )
-    resolved_selected_ref_descriptors = await resolve_selected_ref_descriptors(
-        session,
-        project.id,
-        _collect_selected_refs_for_resolution(
-            workbench_state.get("selected_refs"),
-            *message_rows,
-        ),
-        limit=48,
-    )
+    async with async_timed(request, "runners"):
+        resident_runner_options = await build_resident_runner_options(session, project.id)
+    async with async_timed(request, "workbench"):
+        workbench_state = await get_strategic_workbench_state(
+            session,
+            current_user["user_id"],
+            project.id,
+        )
+    async with async_timed(request, "refs"):
+        resolved_selected_ref_descriptors = await resolve_selected_ref_descriptors(
+            session,
+            project.id,
+            _collect_selected_refs_for_resolution(
+                workbench_state.get("selected_refs"),
+                *message_rows,
+            ),
+            limit=48,
+        )
     work_session = _build_work_session_summary(
         project,
         workbench_state=workbench_state,
@@ -1377,10 +1516,11 @@ async def get_project_strategic_state(
             else None,
         },
         "sha_freshness": sha_freshness,
+        "state_revision": _revision,
         "model_integrity": model_integrity,
         "integrity_conflict_trend": integrity_trend,
+        "strategic_memory_notes": project.strategic_memory_notes or [],
     }
-
 
 @router.get("/projects/{project_id}/strategic-session")
 @limiter.limit("30/minute")
@@ -1810,7 +1950,12 @@ async def create_project_strategic_session_message(
         project=project,
         user_id=current_user["user_id"],
         message_type=parse_operator_message_type(payload.message_type),
-        content=payload.content,
+        content=(
+            payload.content
+            if payload.content.strip()
+            or not _message_context_has_attachments(payload.context)
+            else "Sent attachment."
+        ),
         context=payload.context,
         workbench_context=payload.workbench_context,
         idempotency_key=payload.idempotency_key,
@@ -1865,6 +2010,72 @@ async def create_project_strategic_session_message(
             result.message_event,
         )
     return response
+
+
+class MessageAttachmentUploadUrlRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=512)
+    content_type: str | None = Field(default=None, max_length=128)
+
+
+@router.post("/projects/{project_id}/messages/attachment-upload-url")
+@limiter.limit("60/minute")
+async def get_message_attachment_upload_url(
+    request: Request,
+    project_id: uuid.UUID,
+    req: MessageAttachmentUploadUrlRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Generate a signed upload URL for a message attachment."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member",
+    )
+    safe_filename = _sanitize_message_attachment_filename(req.filename)
+    content_type = _attachment_content_type(req.content_type)
+    attachment_id = str(uuid.uuid4())
+    object_name = f"message-attachments/{project_id}/{attachment_id}/{safe_filename}"
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    def _generate() -> str:
+        blob = (
+            gcs_storage.Client(project=GCP_PROJECT_ID)
+            .bucket(ARTIFACT_BUCKET_NAME)
+            .blob(object_name)
+        )
+        return _generate_v4_signed_url(
+            blob,
+            version="v4",
+            expiration=_dt.timedelta(minutes=15),
+            method="PUT",
+            content_type=content_type,
+        )
+
+    try:
+        upload_url = await asyncio.to_thread(_generate)
+    except Exception as exc:
+        logger.warning(
+            "[ATTACHMENT] signed upload URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(status_code=503, detail="Storage unavailable") from exc
+
+    try:
+        download_url = await generate_download_signed_url(
+            storage_uri,
+            expiration_minutes=60,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[ATTACHMENT] signed download URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(status_code=503, detail="Storage unavailable") from exc
+
+    return {
+        "upload_url": upload_url,
+        "download_url": download_url,
+        "storage_uri": storage_uri,
+        "attachment_id": attachment_id,
+        "content_type": content_type,
+    }
 
 
 @router.post("/projects/{project_id}/strategic-session/start")

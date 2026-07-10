@@ -33,6 +33,7 @@ from app.github import (
     get_file_text_at_ref,
     get_pr_files,
 )
+from app.json_extract import async_json_loads
 from app.size_limit_policy import classify_breach
 
 logger = logging.getLogger(__name__)
@@ -154,7 +155,7 @@ async def preflight_rollup_size_caps(
         )
 
     try:
-        caps_data: dict = json.loads(caps_text)
+        caps_data: dict = await async_json_loads(caps_text)
     except Exception as exc:
         return ("defer", f"could not parse module_size_limits.json: {exc}")
 

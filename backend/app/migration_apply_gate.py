@@ -431,6 +431,16 @@ def _apply_lock() -> asyncio.Lock:
     return entry[1]
 
 
+def _write_candidate_files(tmp: str, candidate_sources: dict[str, str]) -> str:
+    """Write candidate migration files to a temporary directory (sync helper)."""
+    versions_dir = os.path.join(tmp, "versions")
+    os.makedirs(versions_dir)
+    for filename, text in candidate_sources.items():
+        with open(os.path.join(versions_dir, filename), "w") as handle:
+            handle.write(text)
+    return tmp
+
+
 async def _apply_candidate_migrations(
     scratch_engine: AsyncEngine, candidate_sources: dict[str, str]
 ) -> None:
@@ -443,11 +453,7 @@ async def _apply_candidate_migrations(
     outside the lock; only the EnvironmentContext-driven apply is serialized."""
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            versions_dir = os.path.join(tmp, "versions")
-            os.makedirs(versions_dir)
-            for filename, text in candidate_sources.items():
-                with open(os.path.join(versions_dir, filename), "w") as handle:
-                    handle.write(text)
+            await asyncio.to_thread(_write_candidate_files, tmp, candidate_sources)
             async with _apply_lock(), scratch_engine.connect() as conn:
                 await conn.run_sync(
                     lambda sync_conn: _reconcile_then_upgrade(sync_conn, tmp)
@@ -535,6 +541,24 @@ async def _download_candidate_repo_archive(
     return response.content
 
 
+def _extract_snapshot_repo_root(
+    tmp_dir: str, archive_bytes: bytes
+) -> str:
+    """Extract a candidate repo archive and return the repo root path (blocking I/O)."""
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as tar:
+        _safe_tar_extractall(tar, tmp_dir)
+    extracted_roots = [
+        os.path.join(tmp_dir, name)
+        for name in os.listdir(tmp_dir)
+        if os.path.isdir(os.path.join(tmp_dir, name))
+    ]
+    if not extracted_roots:
+        raise _MigrationApplyError(
+            "candidate code snapshot unpacked to no repo root"
+        )
+    return extracted_roots[0]
+
+
 async def _build_candidate_required_metadata_from_snapshot(
     gh_token: str,
     owner: str,
@@ -557,25 +581,9 @@ async def _build_candidate_required_metadata_from_snapshot(
         )
 
     with tempfile.TemporaryDirectory() as tmp:
-        try:
-            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
-                _safe_tar_extractall(tar, tmp)
-        except Exception as exc:
-            raise _MigrationApplyError(
-                f"could not unpack the candidate code snapshot at "
-                f"{candidate_ref!r}: {type(exc).__name__}: {exc}"
-            ) from exc
-
-        extracted_roots = [
-            os.path.join(tmp, name)
-            for name in os.listdir(tmp)
-            if os.path.isdir(os.path.join(tmp, name))
-        ]
-        if not extracted_roots:
-            raise _MigrationApplyError(
-                f"candidate code snapshot at {candidate_ref!r} unpacked to no repo root"
-            )
-        repo_root = extracted_roots[0]
+        repo_root = await asyncio.to_thread(
+            _extract_snapshot_repo_root, tmp, archive
+        )
 
         env = os.environ.copy()
         env["CANDIDATE_REPO_ROOT"] = repo_root
@@ -717,6 +725,37 @@ def _check_structural_defects(candidate_sources: dict[str, str]) -> Verdict | No
     return None
 
 
+def _extract_and_read_sources(archive: bytes) -> dict[str, str] | None:
+    """Extract tar archive and read migration sources (sync helper)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
+            _safe_tar_extractall(tar, tmp)
+        # GitHub archives always unpack to a single top-level repo dir.
+        extracted_roots = [
+            os.path.join(tmp, name)
+            for name in os.listdir(tmp)
+            if os.path.isdir(os.path.join(tmp, name))
+        ]
+        if not extracted_roots:
+            return None
+        versions_dir = os.path.join(extracted_roots[0], _ALEMBIC_VERSIONS_DIR)
+        if not os.path.isdir(versions_dir):
+            return None
+        sources: dict[str, str] = {}
+        for filename in sorted(os.listdir(versions_dir)):
+            if not _is_migration_source(filename):
+                continue
+            full_path = os.path.join(versions_dir, filename)
+            if not os.path.isfile(full_path):
+                continue
+            with open(full_path, encoding="utf-8") as fh:
+                text = fh.read()
+            if not text:
+                return None
+            sources[filename] = text
+        return sources or None
+
+
 async def _fetch_candidate_sources(
     gh_token: str,
     owner: str,
@@ -743,33 +782,7 @@ async def _fetch_candidate_sources(
     if not archive:
         return None
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
-                _safe_tar_extractall(tar, tmp)
-            # GitHub archives always unpack to a single top-level repo dir.
-            extracted_roots = [
-                os.path.join(tmp, name)
-                for name in os.listdir(tmp)
-                if os.path.isdir(os.path.join(tmp, name))
-            ]
-            if not extracted_roots:
-                return None
-            versions_dir = os.path.join(extracted_roots[0], _ALEMBIC_VERSIONS_DIR)
-            if not os.path.isdir(versions_dir):
-                return None
-            sources: dict[str, str] = {}
-            for filename in sorted(os.listdir(versions_dir)):
-                if not _is_migration_source(filename):
-                    continue
-                full_path = os.path.join(versions_dir, filename)
-                if not os.path.isfile(full_path):
-                    continue
-                with open(full_path, encoding="utf-8") as fh:
-                    text = fh.read()
-                if not text:
-                    return None
-                sources[filename] = text
-            return sources or None
+        return await asyncio.to_thread(_extract_and_read_sources, archive)
     except Exception:  # noqa: BLE001 — unpack/read failure HOLDS (=> defer)
         return None
 

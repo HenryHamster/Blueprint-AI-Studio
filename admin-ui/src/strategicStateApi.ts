@@ -256,7 +256,10 @@ export interface StrategicContextPackageDescriptor {
   } | null;
   resources?: StrategicContextResourceRef[];
   evidence?: {
-    knowledge?: StrategicContextEvidenceCollection<StrategicContextKnowledgeEvidence>;
+    knowledge?: StrategicContextEvidenceCollection<StrategicContextKnowledgeEvidence> & {
+      pending_count?: number;
+      oldest_pending_age_hours?: number | null;
+    };
     artifacts?: StrategicContextEvidenceCollection<StrategicContextArtifactEvidence>;
   } | null;
   descriptors?: StrategicContextRenderableDescriptor[];
@@ -757,6 +760,11 @@ export interface StrategicResidentSessionAvailability {
  * `eligible` = online + agent-ready + can handle strategic work (the full
  * auto-pick gate). The pinned device rides on `resident_session.runner_id`.
  */
+export interface StrategicMemoryNote {
+  note: string;
+  set_at: string;
+}
+
 export interface StrategicResidentRunnerOption {
   id: string;
   name: string;
@@ -972,6 +980,10 @@ export interface StrategicStateResponse {
     stale?: boolean | null;
     stale_reason?: string | null;
   } | null;
+  /** Opaque revision token for the strategic-state payload. Send it back as
+   *  ?state_revision= on the next poll so the server can skip the expensive
+   *  context-package build if inputs haven't changed. */
+  state_revision?: string | null;
   model_integrity?: {
     orphaned_gaps: Array<{ id: string; name: string; status: string; recovery_hint?: string }>;
     ungrounded_directions: Array<{
@@ -1002,6 +1014,10 @@ export interface StrategicStateResponse {
       total: number;
     };
   } | null;
+  /** Durable behavioral lessons and operator preferences accumulated by the
+   *  resident Strategic session. Each entry is a {note, set_at} pair.
+   *  Written by the set_memory strategic op. */
+  strategic_memory_notes?: StrategicMemoryNote[];
 }
 
 export async function fetchStrategicState(
@@ -1017,6 +1033,26 @@ export async function fetchStrategicState(
     // Bypass apiFetch's in-flight GET dedup: a post-mutation refresh must never
     // coalesce onto an older, in-flight pre-mutation request (which would
     // resolve with stale data). useStrategicReadModel sequences the results.
+    false,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch strategic state: ${res.status}`);
+  return res.json() as Promise<StrategicStateResponse>;
+}
+
+/** Fetch strategic state with an optional state_revision for server-side
+ *  context-package skip (returns cached response when inputs unchanged). */
+export async function fetchStrategicStateWithRevision(
+  projectId: string,
+  stateRevision: string | null,
+  signal?: AbortSignal,
+): Promise<StrategicStateResponse> {
+  const params = stateRevision ? `?state_revision=${encodeURIComponent(stateRevision)}` : '';
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-state${params}`,
+    undefined,
+    2,
+    30000,
+    signal,
     false,
   );
   if (!res.ok) throw new Error(`Failed to fetch strategic state: ${res.status}`);
@@ -1204,4 +1240,31 @@ export async function stopStrategicSession(
     throw new Error(detail);
   }
   return res.json() as Promise<StrategicSessionStopResponse>;
+}
+
+export interface MessageAttachmentUploadUrlResponse {
+  upload_url: string;
+  download_url: string;
+  storage_uri: string;
+  attachment_id: string;
+}
+
+export async function getMessageAttachmentUploadUrl(
+  projectId: string,
+  filename: string,
+  contentType?: string,
+): Promise<MessageAttachmentUploadUrlResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/messages/attachment-upload-url`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, content_type: contentType }),
+    },
+  );
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error((detail as { detail?: string }).detail || `Failed to get upload URL: ${res.status}`);
+  }
+  return res.json() as Promise<MessageAttachmentUploadUrlResponse>;
 }

@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
-  BoundedSeenSet, dedupNewMessages, extractMessageContent,
-  combineOperatorMessages, buildBootstrapPrompt, buildAutonomousPrompt,
+  BoundedSeenSet, dedupNewMessages, extractMessageTurn, combineOperatorMessages,
+  materializeContentBlocks, isAllowedAttachmentDownloadUrl,
+  buildBootstrapPrompt, buildAutonomousPrompt,
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
   buildRetiredContextText,
@@ -13,7 +14,11 @@ import {
   AUTONOMOUS_FLOOR_TICK_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
-  type ExamSurface, type ExamRecord,
+  MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN, MAX_TEXT_ATTACHMENT_BYTES,
+  modelContextLimit, compactionThreshold, buildCompactionCheckpoint,
+  DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
+  type ExamSurface, type ExamRecord, type ContentBlock,
+  type CompactionCheckpointContext,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -27,6 +32,8 @@ describe('residentConfig', () => {
     expect(c.minTickMs).toBe(600_000);
     expect(c.autonomousTurnTimeoutMs).toBe(300_000);
     expect(c.maxOpsPerTurn).toBe(3);
+    expect(c.compactionThresholdTokens).toBeUndefined(); // model-derived by default
+    expect(c.compactionCooldownMs).toBe(300_000); // 5 min default
   });
 
   it('reads the payload knobs (seconds → ms)', () => {
@@ -200,26 +207,420 @@ describe('MESSAGE_POLL_LIMIT', () => {
   });
 });
 
-describe('extractMessageContent / combineOperatorMessages', () => {
-  it('extracts and trims content', () => {
-    expect(extractMessageContent({ content: '  hello  ' })).toBe('hello');
-    expect(extractMessageContent({})).toBe('');
+describe('extractMessageTurn / combineOperatorMessages', () => {
+  it('extracts and trims content as a text block', () => {
+    const r1 = extractMessageTurn({ content: '  hello  ' });
+    expect(r1).toHaveLength(1);
+    expect(r1[0]).toEqual({ type: 'text', text: 'hello' });
+
+    const r2 = extractMessageTurn({});
+    expect(r2).toHaveLength(0);
+  });
+
+  it('extracts inline base64 image attachments from context', () => {
+    const r = extractMessageTurn({
+      content: 'see this',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=' },
+        ],
+      },
+    });
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'see this' });
+    expect(r[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } });
   });
 
   it('returns a single message verbatim', () => {
-    expect(combineOperatorMessages([{ content: 'just one' }])).toBe('just one');
+    const out = combineOperatorMessages([{ content: 'just one' }]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toEqual({ type: 'text', text: 'just one' });
   });
 
   it('batches multiple messages with headers', () => {
     const out = combineOperatorMessages([{ content: 'first' }, { content: 'second' }]);
-    expect(out).toContain('[operator message 1/2]');
-    expect(out).toContain('first');
-    expect(out).toContain('[operator message 2/2]');
-    expect(out).toContain('second');
+    expect(out.length).toBeGreaterThanOrEqual(2);
+    const texts = out.filter((b: ContentBlock): b is { type: 'text'; text: string } => b.type === 'text').map(b => b.text);
+    expect(texts.some(t => t.includes('first'))).toBe(true);
+    expect(texts.some(t => t.includes('second'))).toBe(true);
   });
 
   it('skips empty messages', () => {
-    expect(combineOperatorMessages([{ content: '' }, { content: '   ' }])).toBe('');
+    expect(combineOperatorMessages([{ content: '' }, { content: '   ' }])).toHaveLength(0);
+  });
+
+  it('preserves image blocks through combine', () => {
+    const out = combineOperatorMessages([
+      { content: 'check', context: { attachments: [{ type: 'image', mime_type: 'image/jpeg', data: '/9j/4AAQ=' }] } },
+    ]);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toEqual({ type: 'text', text: 'check' });
+    expect(out[1]).toHaveProperty('type', 'image');
+    expect((out[1] as unknown as { source: Record<string, unknown> }).source).toEqual({ type: 'base64', media_type: 'image/jpeg', data: '/9j/4AAQ=' });
+  });
+
+  it('preserves image blocks through combine batch path (2+ messages)', () => {
+    const out = combineOperatorMessages([
+      { content: 'first', context: { attachments: [{ type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=' }] } },
+      { content: 'second with attachment', context: { attachments: [{ type: 'image', mime_type: 'image/jpeg', data: '/9j/4AAQ=' }] } },
+    ]);
+    // First message: header + text + image (3 blocks).
+    // Separator + second header + second text + second image (4 more blocks).
+    expect(out.length).toBeGreaterThanOrEqual(6);
+    const texts = out.filter((b: ContentBlock) => b.type === 'text').map(b => b.text);
+    expect(texts.some(t => t.includes('first'))).toBe(true);
+    expect(texts.some(t => t.includes('second with attachment'))).toBe(true);
+    const images = out.filter((b: ContentBlock) => b.type === 'image');
+    expect(images).toHaveLength(2);
+    expect(images[0]).toHaveProperty('source.data', 'iVBORw0KGgo=');
+    expect(images[1]).toHaveProperty('source.data', '/9j/4AAQ=');
+  });
+
+  it('rejects non-image and unsupported image mime_types in extractMessageTurn', () => {
+    const r = extractMessageTurn({
+      content: 'file attached',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'application/pdf', data: 'JVBERi0=' },
+          { type: 'image', mime_type: 'image/svg+xml', data: 'PHN2Zz4=' },
+          { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=' },
+        ],
+      },
+    });
+    // Only the valid image/png block should be included.
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'file attached' });
+    expect(r[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } });
+  });
+
+  it('drops oversized image base64 data in extractMessageTurn', () => {
+    const oversized = 'x'.repeat(MAX_IMAGE_BASE64_LENGTH + 1);
+    const r = extractMessageTurn({
+      content: 'big image',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'image/png', data: oversized },
+          { type: 'image', mime_type: 'image/jpeg', data: '/9j/4AAQ=' },
+        ],
+      },
+    });
+    // Only the second (valid-size) image should be extracted alongside the text.
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'big image' });
+    expect(r[1]).toHaveProperty('type', 'image');
+    expect(r[1]).toHaveProperty('source.data', '/9j/4AAQ=');
+  });
+
+  it('extractMessageTurn delivers an operator image produced by the real frontend attachment shape as an image block', () => {
+    // The frontend's fileToMessageAttachment sets type:'image' for image/* mime types.
+    // This test verifies that extractMessageTurn accepts that shape and emits an image block.
+    const r = extractMessageTurn({
+      content: 'see screenshot',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=', name: 'screenshot.png', size_bytes: 9 },
+        ],
+      },
+    });
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'see screenshot' });
+    expect(r[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } });
+  });
+
+  it('extractMessageTurn emits decoded text for a text/markdown attachment and a reference block for a PDF', () => {
+    const markdownContent = '# Hello\n\nThis is a markdown file.';
+    const markdownBase64 = Buffer.from(markdownContent).toString('base64');
+    const r = extractMessageTurn({
+      content: 'check these files',
+      context: {
+        attachments: [
+          { type: 'file', mime_type: 'text/markdown', data: markdownBase64, name: 'README.md', size_bytes: markdownContent.length },
+          { type: 'file', mime_type: 'application/pdf', data: 'JVBERi0=', name: 'document.pdf', size_bytes: 6 },
+        ],
+      },
+    });
+    // text block + decoded markdown + PDF reference
+    expect(r).toHaveLength(3);
+    expect(r[0]).toEqual({ type: 'text', text: 'check these files' });
+    // Decoded text/markdown attachment
+    expect(r[1].type).toBe('text');
+    const markdownBlock = r[1] as { type: 'text'; text: string };
+    expect(markdownBlock.text).toContain('README.md');
+    expect(markdownBlock.text).toContain(markdownContent);
+    // PDF reference block (no decoding — opaque binary)
+    expect(r[2].type).toBe('text');
+    const pdfBlock = r[2] as { type: 'text'; text: string };
+    expect(pdfBlock.text).toContain('document.pdf');
+    expect(pdfBlock.text).toContain('application/pdf');
+    expect(pdfBlock.text).toContain('6 bytes');
+  });
+
+  it('caps the number of image attachments per turn', () => {
+    const attachments: Array<Record<string, string>> = Array.from({ length: MAX_IMAGES_PER_TURN + 3 }, (_, i) => ({
+      type: 'image',
+      mime_type: 'image/png',
+      data: `data${i}`,
+    }));
+    const r = extractMessageTurn({
+      content: 'many images',
+      context: { attachments },
+    });
+    // One text block + MAX_IMAGES_PER_TURN image blocks.
+    expect(r).toHaveLength(1 + MAX_IMAGES_PER_TURN);
+    expect(r[0]).toEqual({ type: 'text', text: 'many images' });
+    // All extracted image blocks should have distinct data values.
+    expect(r.filter(b => b.type === 'image')).toHaveLength(MAX_IMAGES_PER_TURN);
+    for (let i = 0; i < MAX_IMAGES_PER_TURN; i++) {
+      expect(r[i + 1]).toHaveProperty('source.data', `data${i}`);
+    }
+  });
+
+  it('extracts GCS URL-sourced image attachment from context', () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/screenshot.png?X-Goog-Signature=abc123';
+    const r = extractMessageTurn({
+      content: 'see the screenshot',
+      context: {
+        attachments: [
+          {
+            type: 'image',
+            mime_type: 'image/png',
+            url: signedUrl,
+            name: 'screenshot.png',
+          },
+        ],
+      },
+    });
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'see the screenshot' });
+    expect(r[1]).toEqual({
+      type: 'image',
+      source: {
+        type: 'url',
+        url: signedUrl,
+        media_type: 'image/png',
+        name: 'screenshot.png',
+      },
+    });
+  });
+
+  it('rejects unsigned or non-GCS image attachment URLs before fetch', () => {
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com/bucket/a.png?X-Goog-Signature=abc123')).toBe(true);
+    expect(isAllowedAttachmentDownloadUrl('https://bucket.storage.googleapis.com/a.png?X-Goog-Signature=abc123')).toBe(true);
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com/bucket/a.png')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('http://storage.googleapis.com/bucket/a.png?X-Goog-Signature=abc123')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('https://example.com/a.png?X-Goog-Signature=abc123')).toBe(false);
+
+    const r = extractMessageTurn({
+      content: 'bad url',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'image/png', url: 'https://example.com/a.png?X-Goog-Signature=abc123', name: 'a.png' },
+        ],
+      },
+    });
+    expect(r).toEqual([
+      { type: 'text', text: 'bad url' },
+      { type: 'text', text: '[Attached image "a.png" could not be loaded: unsupported download URL.]' },
+    ]);
+  });
+
+  it('prefers base64 data over GCS URL when both are present', () => {
+    const r = extractMessageTurn({
+      content: 'inline data',
+      context: {
+        attachments: [
+          {
+            type: 'image',
+            mime_type: 'image/jpeg',
+            data: '/9j/4AAQ=',
+            url: 'https://storage.googleapis.com/bucket/photo.jpg?signed=...',
+          },
+        ],
+      },
+    });
+    // Should use the base64 data, not the URL.
+    expect(r).toHaveLength(2);
+    expect(r[1]).toHaveProperty('type', 'image');
+    expect(r[1]).toHaveProperty('source.type', 'base64');
+    expect(r[1]).toHaveProperty('source.data', '/9j/4AAQ=');
+  });
+
+  it('materializes signed GCS image URLs as base64 model blocks', async () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/photo.png?X-Goog-Signature=abc123';
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const fetchCalls: string[] = [];
+    const out = await materializeContentBlocks([
+      { type: 'text', text: 'look' },
+      { type: 'image', source: { type: 'url', url: signedUrl, media_type: 'image/png', name: 'photo.png' } },
+    ], (url) => {
+      fetchCalls.push(url);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: {
+          get(name: string) {
+            if (name.toLowerCase() === 'content-length') return String(bytes.byteLength);
+            if (name.toLowerCase() === 'content-type') return 'image/png';
+            return null;
+          },
+        },
+        arrayBuffer: () => Promise.resolve(bytes.buffer),
+      });
+    });
+
+    expect(fetchCalls).toEqual([signedUrl]);
+    expect(out).toEqual([
+      { type: 'text', text: 'look' },
+      {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/png',
+          data: Buffer.from(bytes).toString('base64'),
+        },
+      },
+    ]);
+  });
+
+  it('materializes URL fetch failures as text notices without throwing', async () => {
+    const out = await materializeContentBlocks([
+      {
+        type: 'image',
+        source: {
+          type: 'url',
+          url: 'https://storage.googleapis.com/bucket/missing.png?X-Goog-Signature=abc123',
+          media_type: 'image/png',
+          name: 'missing.png',
+        },
+      },
+    ], () => Promise.resolve({
+      ok: false,
+      status: 403,
+      headers: { get: () => null },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+    }));
+
+    expect(out).toEqual([
+      { type: 'text', text: '[Attached image "missing.png" could not be loaded: download failed (403).]' },
+    ]);
+  });
+
+  it('does not download images declared larger than the model input cap', async () => {
+    let readBody = false;
+    const out = await materializeContentBlocks([
+      {
+        type: 'image',
+        source: {
+          type: 'url',
+          url: 'https://storage.googleapis.com/bucket/huge.png?X-Goog-Signature=abc123',
+          media_type: 'image/png',
+          name: 'huge.png',
+        },
+      },
+    ], () => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: {
+        get(name: string) {
+          return name.toLowerCase() === 'content-length'
+            ? String(MAX_IMAGE_DOWNLOAD_BYTES + 1)
+            : null;
+        },
+      },
+      arrayBuffer: () => {
+        readBody = true;
+        return Promise.resolve(new ArrayBuffer(0));
+      },
+    }));
+
+    expect(readBody).toBe(false);
+    expect(out).toEqual([
+      { type: 'text', text: '[Attached image "huge.png" could not be loaded: image is too large.]' },
+    ]);
+  });
+
+  it('text attachment content reaches the model via GCS URL fetch', async () => {
+    // Operator uploads a Python file; backend stores only {type, url, mime_type, name} — no inline data.
+    const signedUrl = 'https://storage.googleapis.com/bucket/script.py?X-Goog-Signature=abc123';
+    const fileContent = 'def hello():\n    print("Hello, world!")\n';
+    const fetchCalls: string[] = [];
+
+    // Step 1: extractMessageTurn emits a text_url block for the URL-only text file.
+    const blocks = extractMessageTurn({
+      content: 'review this file',
+      context: {
+        attachments: [
+          { type: 'file', mime_type: 'text/x-python', url: signedUrl, name: 'script.py', size_bytes: fileContent.length },
+        ],
+      },
+    });
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toEqual({ type: 'text', text: 'review this file' });
+    expect(blocks[1]).toEqual({ type: 'text_url', url: signedUrl, name: 'script.py', mime_type: 'text/x-python' });
+
+    // Step 2: materializeContentBlocks fetches the URL and inlines the content as a text block.
+    const out = await materializeContentBlocks(blocks, (url) => {
+      fetchCalls.push(url);
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(fileContent);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        arrayBuffer: () => Promise.resolve(bytes.buffer),
+      });
+    });
+
+    expect(fetchCalls).toEqual([signedUrl]);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toEqual({ type: 'text', text: 'review this file' });
+    expect(out[1]).toEqual({ type: 'text', text: `[Attachment: script.py]\n${fileContent}` });
+    // Verify the file body is present — this is the seam: content reaches the model input.
+    expect(out[1].type === 'text' && out[1].text).toContain('def hello()');
+  });
+
+  it('text attachment URL fetch failure degrades to a notice without throwing', async () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/notes.txt?X-Goog-Signature=abc123';
+    const blocks = extractMessageTurn({
+      content: 'here',
+      context: {
+        attachments: [{ type: 'file', mime_type: 'text/plain', url: signedUrl, name: 'notes.txt', size_bytes: 100 }],
+      },
+    });
+    const out = await materializeContentBlocks(blocks, () => Promise.resolve({
+      ok: false,
+      status: 403,
+      headers: { get: () => null },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+    }));
+    expect(out).toEqual([
+      { type: 'text', text: 'here' },
+      { type: 'text', text: '[Attachment "notes.txt" could not be loaded: download failed (403).]' },
+    ]);
+  });
+
+  it('text attachment content is truncated when it exceeds MAX_TEXT_ATTACHMENT_BYTES', async () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/big.txt?X-Goog-Signature=abc123';
+    const blocks = extractMessageTurn({
+      content: 'check this',
+      context: {
+        attachments: [{ type: 'file', mime_type: 'text/plain', url: signedUrl, name: 'big.txt', size_bytes: MAX_TEXT_ATTACHMENT_BYTES + 10 }],
+      },
+    });
+    const bigContent = 'A'.repeat(MAX_TEXT_ATTACHMENT_BYTES + 10);
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(bigContent);
+    const out = await materializeContentBlocks(blocks, () => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      arrayBuffer: () => Promise.resolve(bytes.buffer),
+    }));
+    expect(out).toHaveLength(2);
+    const textOut = out[1].type === 'text' ? out[1].text : '';
+    expect(textOut).toContain('[... truncated]');
+    // Output should not contain the full original content (only the sliced prefix).
+    expect(textOut).not.toContain(bigContent);
   });
 });
 
@@ -303,6 +704,49 @@ describe('buildBootstrapPrompt', () => {
     expect(p).not.toContain('Recently retired / completed directions');
     expect(p).not.toContain('Prior-cycle decision outcomes');
     expect(p).not.toContain('Already-staged (next-version) directions');
+  });
+
+  it('includes standing behavioral lessons when memory notes are provided', () => {
+    const p = buildBootstrapPrompt({
+      ...base,
+      strategicMemoryNotesText: '- [2026-07-01] Prefer concrete action over abstract discussion\n- [2026-07-02] Verify claims before escalating',
+    });
+    expect(p).toContain('## Standing behavioral lessons');
+    expect(p).toContain('Accumulated across sessions');
+    expect(p).toContain('./strategic set-memory');
+    expect(p).toContain('- [2026-07-01] Prefer concrete action over abstract discussion');
+    expect(p).toContain('- [2026-07-02] Verify claims before escalating');
+  });
+
+  it('omits standing behavioral lessons when memory notes is empty', () => {
+    const p = buildBootstrapPrompt({ ...base, strategicMemoryNotesText: '' });
+    expect(p).not.toContain('## Standing behavioral lessons');
+    expect(p).not.toContain('Accumulated across sessions');
+  });
+
+  it('omits standing behavioral lessons when memory notes is undefined', () => {
+    const p = buildBootstrapPrompt(base); // strategicMemoryNotesText not set
+    expect(p).not.toContain('## Standing behavioral lessons');
+    expect(p).not.toContain('Accumulated across sessions');
+  });
+
+  it('includes prior session context when priorSessionContextText is provided', () => {
+    const p = buildBootstrapPrompt({
+      ...base,
+      priorSessionContextText: 'Previous session explored authentication flows.',
+    });
+    expect(p).toContain('## Prior session context');
+    expect(p).toContain('Previous session explored authentication flows.');
+  });
+
+  it('omits prior session context when priorSessionContextText is empty', () => {
+    const p = buildBootstrapPrompt({ ...base, priorSessionContextText: '' });
+    expect(p).not.toContain('## Prior session context');
+  });
+
+  it('omits prior session context when priorSessionContextText is undefined', () => {
+    const p = buildBootstrapPrompt(base); // priorSessionContextText not set
+    expect(p).not.toContain('## Prior session context');
   });
 });
 
@@ -1084,5 +1528,147 @@ describe('refreshSurfaceCatalog', () => {
     const catalog = [makeDir('d-1')];
     const result = refreshSurfaceCatalog(catalog, ['d-1', 'd-2'], {});
     expect(result.map(s => s.key)).toEqual(['direction:d-1', 'direction:d-2']);
+  });
+});
+
+// ── Compaction helpers ─────────────────────────────────────────────────────
+
+describe('modelContextLimit', () => {
+  it('returns 200K for opus models', () => {
+    expect(modelContextLimit('claude-opus-4-8')).toBe(200_000);
+    expect(modelContextLimit('claude-opus-4-7')).toBe(200_000);
+    expect(modelContextLimit('claude-opus-4')).toBe(200_000);
+  });
+
+  it('returns 200K for sonnet models', () => {
+    expect(modelContextLimit('claude-sonnet-5')).toBe(200_000);
+    expect(modelContextLimit('claude-sonnet-4-5')).toBe(200_000);
+    expect(modelContextLimit('sonnet')).toBe(200_000);
+  });
+
+  it('returns 128K for older haiku models', () => {
+    expect(modelContextLimit('claude-haiku-3-5')).toBe(128_000);
+    expect(modelContextLimit('haiku')).toBe(128_000);
+  });
+
+  it('returns 200K for haiku-4-5', () => {
+    expect(modelContextLimit('claude-haiku-4-5')).toBe(200_000);
+    expect(modelContextLimit('haiku-4-5')).toBe(200_000);
+  });
+
+  it('returns 200K for fable models', () => {
+    expect(modelContextLimit('claude-fable-5')).toBe(200_000);
+    expect(modelContextLimit('fable')).toBe(200_000);
+  });
+
+  it('returns DEFAULT_CONTEXT_LIMIT for unrecognized models', () => {
+    expect(modelContextLimit('unknown-model')).toBe(DEFAULT_CONTEXT_LIMIT);
+    expect(modelContextLimit('')).toBe(DEFAULT_CONTEXT_LIMIT);
+    expect(modelContextLimit()).toBe(DEFAULT_CONTEXT_LIMIT);
+  });
+
+  it('matches case-insensitively', () => {
+    expect(modelContextLimit('CLAUDE-OPUS-4-8')).toBe(200_000);
+    expect(modelContextLimit('Claude-Sonnet-5')).toBe(200_000);
+  });
+});
+
+describe('compactionThreshold', () => {
+  it('returns 80% of model limit by default', () => {
+    // 80% of 200K = 160K
+    expect(compactionThreshold('claude-opus-4-8')).toBe(160_000);
+    // 80% of 128K = 102400
+    expect(compactionThreshold('claude-haiku-3-5')).toBe(Math.floor(128_000 * COMPACTION_THRESHOLD_RATIO));
+  });
+
+  it('uses explicit override when provided', () => {
+    expect(compactionThreshold('claude-opus-4-8', 50_000)).toBe(50_000);
+  });
+
+  it('returns Infinity when explicit threshold is 0 (disabled)', () => {
+    expect(compactionThreshold('claude-opus-4-8', 0)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it('falls back to DEFAULT_CONTEXT_LIMIT for unknown models', () => {
+    expect(compactionThreshold('unknown')).toBe(Math.floor(DEFAULT_CONTEXT_LIMIT * COMPACTION_THRESHOLD_RATIO));
+  });
+});
+
+describe('buildCompactionCheckpoint', () => {
+  const fullCtx: CompactionCheckpointContext = {
+    roleIdentity: 'You are the resident strategist for TestProject.',
+    examLedgerJson: JSON.stringify({ records: [{ surfaceKey: 'direction:d-1', atTick: 5, at: '2026-01-01T00:00:00Z', verdict: 'found', note: 'needs follow-up' }], tick: 5, corrective: false }),
+    recentInteractions: 'Recent: examined direction:d-1 — found actionable lead.',
+    autonomousState: 'Examination tick: 5\nFocus rotation: direction:d-1, qualification',
+  };
+
+  it('includes all sections in the checkpoint', () => {
+    const result = buildCompactionCheckpoint(fullCtx);
+    expect(result).toContain('Session checkpoint');
+    expect(result).toContain('compaction restart');
+    expect(result).toContain('You are the resident strategist for TestProject');
+    expect(result).toContain('Examination ledger (carried forward)');
+    expect(result).toContain('direction:d-1');
+    expect(result).toContain('Recent context (carried forward)');
+    expect(result).toContain('examined direction:d-1');
+    expect(result).toContain('Current state');
+    expect(result).toContain('Examination tick: 5');
+  });
+
+  it('omits sections with empty content', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role only',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    });
+    expect(result).toContain('role only');
+    expect(result).not.toContain('Examination ledger');
+    expect(result).not.toContain('Recent context');
+    expect(result).not.toContain('Current state');
+  });
+
+  it('produces a non-empty string for minimal context', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'minimal role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    });
+    expect(result.length).toBeGreaterThan(0);
+    expect(result).toContain('minimal role');
+    expect(result).toContain('Session checkpoint');
+  });
+
+  it('includes a resume instruction at the end', () => {
+    const result = buildCompactionCheckpoint(fullCtx);
+    expect(result).toContain('Resume from this checkpoint');
+  });
+});
+
+describe('residentConfig compaction knobs', () => {
+  it('reads explicit compaction threshold from payload', () => {
+    const c = residentConfig({ strategic_session_compaction_threshold_tokens: 50_000 });
+    expect(c.compactionThresholdTokens).toBe(50_000);
+  });
+
+  it('treats zero explicit threshold as disabled (0)', () => {
+    const c = residentConfig({ strategic_session_compaction_threshold_tokens: 0 });
+    expect(c.compactionThresholdTokens).toBe(0);
+  });
+
+  it('leaves threshold undefined when payload omits it', () => {
+    const c = residentConfig({});
+    expect(c.compactionThresholdTokens).toBeUndefined();
+  });
+
+  it('reads compaction cooldown from payload', () => {
+    const c = residentConfig({ strategic_session_compaction_cooldown_seconds: 120 });
+    expect(c.compactionCooldownMs).toBe(120_000);
+  });
+
+  it('clamps compaction cooldown to minimum 60s', () => {
+    const c = residentConfig({ strategic_session_compaction_cooldown_seconds: 10 });
+    expect(c.compactionCooldownMs).toBe(60_000);
   });
 });

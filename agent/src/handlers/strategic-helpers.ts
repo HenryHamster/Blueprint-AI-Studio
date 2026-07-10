@@ -134,13 +134,13 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'capability-trials' | 'sections' | 'task' | 'tasks' | 'completion-debt';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'capability-trials' | 'sections' | 'task' | 'tasks' | 'completion-debt' | 'ui-load-timing';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
 // distinct from the single-id project-path verbs that precede it.
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'capability-trials', 'sections', 'task', 'tasks', 'completion-debt',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'capability-trials', 'sections', 'task', 'tasks', 'completion-debt', 'ui-load-timing',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -175,6 +175,7 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'task':                'task)                 PATH_SUFFIX="tasks/$ID"',
   'tasks':               'tasks)                PATH_SUFFIX="tasks"',
   'completion-debt':     'completion-debt)      PATH_SUFFIX="completion-debt"',
+  'ui-load-timing':      'ui-load-timing)       PATH_SUFFIX="ui-load-timing"',
 };
 
 // Self-contained case arm for the SEARCH-shaped `knowledge` verb. Unlike the
@@ -200,7 +201,9 @@ const KNOWLEDGE_FETCH_CASE = `  knowledge)
           --sweep-id)    QARGS+=(--data-urlencode "sweep_id=\${2:-}"); shift 2 ;;
           --q)           QARGS+=(--data-urlencode "q=\${2:-}"); shift 2 ;;
           --tag)         QARGS+=(--data-urlencode "tag=\${2:-}"); shift 2 ;;
-          *) echo "[ERROR] fetch knowledge: unknown flag '$1' (use --topic/--direction/--q/--source-kind/--sweep-id/--tag or a document id)" >&2; exit 1 ;;
+          --lifecycle-status) QARGS+=(--data-urlencode "lifecycle_status=\${2:-}"); shift 2 ;;
+          --followups)  QARGS+=(--data-urlencode "lifecycle_status=pending"); shift ;;
+          *) echo "[ERROR] fetch knowledge: unknown flag '$1' (use --topic/--direction/--q/--source-kind/--sweep-id/--tag/--lifecycle-status/--followups or a document id)" >&2; exit 1 ;;
         esac
       done
       kresp=$(curl -sS --max-time 20 --connect-timeout 10 --get \\
@@ -223,7 +226,7 @@ export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'gap':           '`./fetch gap <id>` — a full gap record',
   'message':       '`./fetch message [ref]` — compact listing of open messages (no id), or full detail for one message by short ref or UUID',
   'section':       '`./fetch section <key>` — a full design-doc section',
-  'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--sweep-id S] [--tag T]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body',
+  'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--sweep-id S] [--tag T] [--lifecycle-status S] [--followups]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body; `--followups` is shorthand for `--lifecycle-status pending`',
   'compute-sweeps': '`./fetch compute-sweeps [sweep_id]` — list completed compute experiment sweeps, or fetch one sweep by id',
   'qualification': '`./fetch qualification` — latest qualification verdict for the open version: candidate SHA, confidence, sub_scores, and full audit findings list (no id)',
   'version-phase': '`./fetch version-phase` — compact current version phase/lifecycle context, qualification state, serving/deploy status, and recent closed versions (no id)',
@@ -235,6 +238,7 @@ export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'task':                '`./fetch task <task_id>` — status and outcome for a single task by id; visible for any STRATEGIC_AGENT-spawned task or its transitive descendants (fields: id, parent_task_id, status, created_at, progress message, pr_url/failure_reason for terminal tasks); includes a `children` list of direct pipeline-spawned subtasks with their own status/task_type/title/pr_url',
   'tasks':               '`./fetch tasks` — list of recent tasks for this project (most recent first, default limit 20); includes STRATEGIC_AGENT-spawned tasks AND their transitive descendants; each item carries parent_task_id (null for strategist roots) to map failing descendants back to the spawned task, plus a `children` list of direct pipeline-spawned subtasks',
   'completion-debt':     '`./fetch completion-debt` — open completion-debt entries for the project (kind, description, created_at, age_days); recovery path when open_completion_debt was dropped from the strategic payload under budget pressure (no id)',
+  'ui-load-timing':      '`./fetch ui-load-timing` — admin-UI initial-load timing samples grouped by surface: list of {ts, page_ready_ms, sample_type} ordered oldest-first; use to verify the >50% page-ready improvement retirement threshold (no id)',
 };
 
 function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
@@ -279,7 +283,7 @@ case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ "$KIND" != "completion-debt" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ "$KIND" != "completion-debt" ] && [ "$KIND" != "ui-load-timing" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi

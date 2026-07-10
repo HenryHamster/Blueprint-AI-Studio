@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type React from 'react';
 import { AlertTriangle, Check, ChevronDown, ChevronRight, ChevronUp, Loader2, Pencil, Trash2, X, Zap } from 'lucide-react';
 import { BarChart, Bar, Cell, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts';
@@ -260,6 +260,141 @@ function DirectionCardImpl({
     };
   }, [d.research_history, d.history_aggregate]);
 
+  // Stable callback references for action prop handlers — avoids re-creating
+  // inline arrow functions on every render (finding 5: 36 inline callbacks
+  // prevented React.memo from short-circuiting re-renders).
+  const handleApprove = useCallback(() => approveProposal(d.id), [approveProposal, d.id]);
+  const handleReject = useCallback(() => rejectProposal(d.id), [rejectProposal, d.id]);
+  const handleEdit = useCallback(() => startEdit(d), [startEdit, d]);
+  const handleDelete = useCallback(() => deleteDirection(d.id), [deleteDirection, d.id]);
+  const handleTriggerResearch = useCallback(() => triggerResearch(d.id), [triggerResearch, d.id]);
+  const handleForceResearch = useCallback(() => triggerResearch(d.id, true), [triggerResearch, d.id]);
+  const handleUnhold = useCallback((e: React.MouseEvent) => { e.stopPropagation(); void unholdDirection(d.id); }, [unholdDirection, d.id]);
+  const handleMarkComplete = useCallback(() => markDirectionComplete(d.id), [markDirectionComplete, d.id]);
+  const handleRevive = useCallback(() => reviveProposal(d.id), [reviveProposal, d.id]);
+  const handleActivateStaged = useCallback(() => activateStagedDirection?.(d.id), [activateStagedDirection, d.id]);
+  const handleCancelStaged = useCallback(() => cancelStagedDirection?.(d.id), [cancelStagedDirection, d.id]);
+  const handleForceConfirmToggle = useCallback(() => setForceConfirmId(forceConfirmId === d.id ? null : d.id), [forceConfirmId, d.id, setForceConfirmId]);
+  const handleDismissForceConfirm = useCallback(() => setForceConfirmId(null), [setForceConfirmId]);
+  const handleKeepDirection = useCallback(() => decideChurnRetirement?.(d.id, 'KEEP'), [decideChurnRetirement, d.id]);
+  const handleRetireDirection = useCallback(() => { setRetireConfirmOpen(false); decideChurnRetirement?.(d.id, 'RETIRE'); }, [decideChurnRetirement, d.id]);
+
+  // Memoize the budget utilization badge (was IIFE at ~1051) so it does
+  // not recompute cost rankings and color classes on every render.
+  const budgetUtilizationBadge = useMemo<React.ReactNode>(() => {
+    const spend = d.estimated_cost_usd;
+    const budget = d.cost_budget_usd;
+    if (spend == null && (budget == null || budget === 0)) return null;
+    const utilPct = d.budget_utilization_pct != null
+      ? d.budget_utilization_pct
+      : (budget != null && budget > 0 && spend != null ? (spend / budget) * 100 : null);
+    const exceeded = d.budget_exceeded ?? (utilPct != null && utilPct > 100);
+    if (budget == null || budget === 0) {
+      return (
+        <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+          ${(spend ?? 0).toFixed(2)} spent
+        </span>
+      );
+    }
+    if (spend == null) {
+      return (
+        <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
+          Budget ${budget.toFixed(2)}
+        </span>
+      );
+    }
+    const color = exceeded ? 'red' : utilPct != null && utilPct > 80 ? 'amber' : 'emerald';
+    const label = exceeded
+      ? `$${spend.toFixed(2)} · over budget`
+      : utilPct != null
+        ? `$${spend.toFixed(2)} / $${budget.toFixed(2)} · ${Math.round(utilPct)}%`
+        : `$${spend.toFixed(2)} / $${budget.toFixed(2)}`;
+    return (
+      <span
+        title={`$${spend.toFixed(2)} spent of $${budget.toFixed(2)} budget`}
+        className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
+      >
+        {label}
+      </span>
+    );
+  }, [d.estimated_cost_usd, d.cost_budget_usd, d.budget_utilization_pct, d.budget_exceeded]);
+
+  // Memoize the cost-per-merge warning badges (was IIFE at ~1089) so it
+  // does not recompute provider/model cost rankings each render.
+  const costPerMergeWarning = useMemo<React.ReactNode>(() => {
+    if (!d.cost_per_merge_exceeds_threshold) return null;
+    const evidenceSplit = d.retirement_consideration_evidence?.cost_by_provider_model;
+    const ranked: Array<{ key: string; cost: number; share: number | null }> = [];
+    if (evidenceSplit && Object.keys(evidenceSplit).length > 0) {
+      for (const [k, v] of Object.entries(evidenceSplit)) {
+        ranked.push({ key: k, cost: v.cost_usd, share: v.share_pct });
+      }
+    } else if (d.cost_by_provider_model && Object.keys(d.cost_by_provider_model).length > 0) {
+      const total = Object.values(d.cost_by_provider_model).reduce((a, b) => a + b, 0);
+      for (const [k, v] of Object.entries(d.cost_by_provider_model)) {
+        ranked.push({ key: k, cost: v, share: total > 0 ? v / total : null });
+      }
+    }
+    ranked.sort((a, b) => (b.share ?? 0) - (a.share ?? 0) || b.cost - a.cost);
+    const top = ranked.slice(0, 3);
+    const tooltip = top.length > 0
+      ? `Cost per autonomous merge: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — autonomous merges only; operator-assisted merges are excluded from the denominator.\n` +
+        top.map(r => `${r.key}: $${r.cost.toFixed(2)}${r.share != null ? ` (${Math.round(r.share * 100)}%)` : ''}`).join('\n')
+      : `Cost per autonomous merge: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — autonomous merges only; operator-assisted merges are excluded from the denominator.`;
+    return (
+      <>
+        <span
+          title={tooltip}
+          className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 border-amber-900/50 text-amber-400"
+        >
+          High cost / autonomous merge
+        </span>
+        {top.length > 0 && (
+          <span
+            title={tooltip}
+            className="text-ui-sm text-amber-400/80 font-mono"
+          >
+            {top.map(r => {
+              const label = r.key.split('|').pop() || r.key;
+              return r.share != null
+                ? `${label} ${Math.round(r.share * 100)}%`
+                : `${label} $${r.cost.toFixed(2)}`;
+            }).join(' · ')}
+          </span>
+        )}
+      </>
+    );
+  }, [d.cost_per_merge_exceeds_threshold, d.retirement_consideration_evidence, d.cost_by_provider_model, d.cost_per_merged_pr]);
+
+  // Memoize active-task badges (was IIFE at ~1196) so the status-color map and
+  // task badge list are not rebuilt each render.
+  const activeTasksBadges = useMemo<React.ReactNode>(() => {
+    const tasks = activeTasks?.[d.id] ?? [];
+    if (tasks.length === 0) return null;
+    const statusColor = (s: string) => {
+      if (s === 'IN_PROGRESS') return 'bg-yellow-950/40 border-yellow-900/50 text-yellow-400';
+      if (s === 'PROVISIONING') return 'bg-sky-950/40 border-sky-900/60 text-sky-400';
+      if (s === 'EVALUATING') return 'bg-indigo-950/40 border-indigo-900/60 text-indigo-400';
+      return 'bg-neutral-800/60 border-neutral-700/60 text-neutral-400';
+    };
+    return (
+      <div className="flex flex-wrap gap-1">
+        {tasks.map(t => (
+          <button
+            data-viewport-allow-small-target
+            key={t.id}
+            type="button"
+            onClick={() => onNavigateToTask?.(t.id)}
+            title={t.title || t.latest_status_message || t.status}
+            className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium transition-opacity hover:opacity-80 ${statusColor(t.status)}`}
+          >
+            {t.status.toLowerCase()} · {t.id.slice(0, 8)}
+          </button>
+        ))}
+      </div>
+    );
+  }, [activeTasks, d.id, onNavigateToTask]);
+
   // Close force-confirm popover on outside click
   useEffect(() => {
     if (forceConfirmId !== d.id) return;
@@ -295,7 +430,7 @@ function DirectionCardImpl({
               {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
-                onClick={() => approveProposal(d.id)}
+                onClick={handleApprove}
                 title="Approve — activate this direction"
                 className="text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
               >
@@ -304,7 +439,7 @@ function DirectionCardImpl({
               {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
-                onClick={() => rejectProposal(d.id)}
+                onClick={handleReject}
                 title="Reject — remove this proposal"
                 className="text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors bg-red-950/60 border-red-900/50 text-red-400 hover:bg-red-900/50"
               >
@@ -346,7 +481,7 @@ function DirectionCardImpl({
               {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
-                onClick={() => reviveProposal(d.id)}
+                onClick={handleRevive}
                 title="Revive — move back to proposed"
                 className="text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors bg-purple-950/60 border-purple-900/50 text-purple-400 hover:bg-purple-900/50"
               >
@@ -355,7 +490,7 @@ function DirectionCardImpl({
               {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
-                onClick={() => approveProposal(d.id)}
+                onClick={handleApprove}
                 title="Approve — activate this direction"
                 className="text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
               >
@@ -397,7 +532,7 @@ function DirectionCardImpl({
               {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
-                onClick={() => activateStagedDirection(d.id)}
+                onClick={handleActivateStaged}
                 title="Activate now — start this direction immediately instead of waiting for the next version"
                 className="text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
               >
@@ -406,7 +541,7 @@ function DirectionCardImpl({
               {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
-                onClick={() => cancelStagedDirection(d.id)}
+                onClick={handleCancelStaged}
                 title="Cancel — remove this staged direction so it will not auto-activate"
                 className="text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors bg-red-950/60 border-red-900/50 text-red-400 hover:bg-red-900/50"
               >
@@ -669,7 +804,7 @@ function DirectionCardImpl({
                     {/* reason: inline research trigger chip in dense direction row; text-ui-sm py-0.5 */}
                     <button
                       data-viewport-allow-small-target
-                      onClick={() => !inCooldown && triggerResearch(d.id)}
+                      onClick={handleTriggerResearch}
                       disabled={researchingIds[d.id] || inCooldown}
                       title={inCooldown ? 'Direction is in cooldown — use force to bypass' : 'Trigger research for this direction'}
                       className="text-ui-sm px-1.5 py-0.5 rounded border font-medium transition-colors disabled:opacity-40 bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:enabled:text-neutral-200 hover:enabled:bg-neutral-700/60"
@@ -681,7 +816,7 @@ function DirectionCardImpl({
                         {/* reason: inline force-research icon chip in dense direction row; text-ui-sm py-0.5 */}
                         <button
                           data-viewport-allow-small-target
-                          onClick={() => setForceConfirmId(forceConfirmId === d.id ? null : d.id)}
+                          onClick={handleForceConfirmToggle}
                           disabled={researchingIds[d.id]}
                           title="Force research (bypass cooldown)"
                           className="text-ui-sm px-1 py-0.5 rounded border font-medium transition-colors disabled:opacity-40 bg-amber-950/40 border-amber-900/50 text-amber-400 hover:bg-amber-900/40"
@@ -697,13 +832,13 @@ function DirectionCardImpl({
                             <p className="text-ui-sm text-neutral-400 mb-2 leading-relaxed">Bypasses the cooldown and queues a research task immediately.</p>
                             <div className="flex gap-2">
                               <button
-                                onClick={() => triggerResearch(d.id, true)}
+                                onClick={handleForceResearch}
                                 className="flex-1 text-ui-sm px-2 py-1 min-h-[44px] rounded border bg-amber-950/60 border-amber-900/50 text-amber-300 hover:bg-amber-900/50 font-medium transition-colors"
                               >
                                 Force
                               </button>
                               <button
-                                onClick={() => setForceConfirmId(null)}
+                                onClick={handleDismissForceConfirm}
                                 className="flex-1 text-ui-sm px-2 py-1 min-h-[44px] rounded border bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
                               >
                                 Cancel
@@ -717,11 +852,11 @@ function DirectionCardImpl({
                 );
               })()}
               {/* reason: inline icon-only edit button in dense direction row; p-0.5 w-3 h-3 icon */}
-              <button data-viewport-allow-small-target onClick={() => startEdit(d)} className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5">
+              <button data-viewport-allow-small-target onClick={handleEdit} className="text-neutral-400 hover:text-neutral-300 transition-colors p-0.5">
                 <Pencil className="w-3 h-3" />
               </button>
               {/* reason: inline icon-only delete button in dense direction row; p-0.5 w-3 h-3 icon */}
-              <button data-viewport-allow-small-target onClick={() => deleteDirection(d.id)} className="text-neutral-400 hover:text-red-400 transition-colors p-0.5">
+              <button data-viewport-allow-small-target onClick={handleDelete} className="text-neutral-400 hover:text-red-400 transition-colors p-0.5">
                 <Trash2 className="w-3 h-3" />
               </button>
             </div>
@@ -777,7 +912,7 @@ function DirectionCardImpl({
               {/* reason: inline unhold action button in dense hold-banner; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
-                onClick={(e) => { e.stopPropagation(); void unholdDirection(d.id); }}
+                onClick={handleUnhold}
                 className="text-ui-sm px-2 py-0.5 rounded border border-red-700 text-red-200 hover:bg-red-900/40 shrink-0"
                 title="Clear the hold so this direction can spawn autonomous tasks again"
               >
@@ -807,7 +942,7 @@ function DirectionCardImpl({
                 {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
                 <button
                   data-viewport-allow-small-target
-                  onClick={() => decideChurnRetirement?.(d.id, 'KEEP')}
+                  onClick={handleKeepDirection}
                   title="Keep — clear the retirement recommendation and keep this direction active"
                   className="text-ui-sm px-2 py-0.5 rounded border font-medium transition-colors bg-emerald-950/60 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/50"
                 >
@@ -832,7 +967,7 @@ function DirectionCardImpl({
                       <p className="text-ui-sm text-neutral-400 mb-2 leading-relaxed">This will permanently retire the direction. This action cannot be undone.</p>
                       <div className="flex gap-2">
                         <button
-                          onClick={() => { setRetireConfirmOpen(false); decideChurnRetirement?.(d.id, 'RETIRE'); }}
+                          onClick={handleRetireDirection}
                           className="flex-1 text-ui-sm px-2 py-1 min-h-[44px] rounded border bg-red-950/60 border-red-900/50 text-red-300 hover:bg-red-900/50 font-medium transition-colors"
                         >
                           Retire
@@ -1041,97 +1176,15 @@ function DirectionCardImpl({
               // reason: inline mark-complete action chip; text-ui-sm py-0.5 matches card density
               <button
                 data-viewport-allow-small-target
-                onClick={() => markDirectionComplete(d.id)}
+                onClick={handleMarkComplete}
                 className="text-ui-sm px-1.5 py-0.5 rounded border font-medium transition-colors bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40"
               >
                 Mark Complete
               </button>
             )}
             {/* Budget utilization indicator */}
-            {(() => {
-              const spend = d.estimated_cost_usd;
-              const budget = d.cost_budget_usd;
-              if (spend == null && (budget == null || budget === 0)) return null;
-              const utilPct = d.budget_utilization_pct != null
-                ? d.budget_utilization_pct
-                : (budget != null && budget > 0 && spend != null ? (spend / budget) * 100 : null);
-              const exceeded = d.budget_exceeded ?? (utilPct != null && utilPct > 100);
-              if (budget == null || budget === 0) {
-                return (
-                  <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
-                    ${(spend ?? 0).toFixed(2)} spent
-                  </span>
-                );
-              }
-              if (spend == null) {
-                return (
-                  <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
-                    Budget ${budget.toFixed(2)}
-                  </span>
-                );
-              }
-              const color = exceeded ? 'red' : utilPct != null && utilPct > 80 ? 'amber' : 'emerald';
-              const label = exceeded
-                ? `$${spend.toFixed(2)} · over budget`
-                : utilPct != null
-                  ? `$${spend.toFixed(2)} / $${budget.toFixed(2)} · ${Math.round(utilPct)}%`
-                  : `$${spend.toFixed(2)} / $${budget.toFixed(2)}`;
-              return (
-                <span
-                  title={`$${spend.toFixed(2)} spent of $${budget.toFixed(2)} budget`}
-                  className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
-                >
-                  {label}
-                </span>
-              );
-            })()}
-            {/* Cost-per-merge retirement warning */}
-            {d.cost_per_merge_exceeds_threshold && (() => {
-              // Prefer the rolling-window split from retirement_consideration_evidence (per-(provider,model)
-              // cost summed across the same window the threshold uses); fall back to the digest's
-              // window-level cost_by_provider_model so the badge still shows context for legacy entries.
-              const evidenceSplit = d.retirement_consideration_evidence?.cost_by_provider_model;
-              const ranked: Array<{ key: string; cost: number; share: number | null }> = [];
-              if (evidenceSplit && Object.keys(evidenceSplit).length > 0) {
-                for (const [k, v] of Object.entries(evidenceSplit)) {
-                  ranked.push({ key: k, cost: v.cost_usd, share: v.share_pct });
-                }
-              } else if (d.cost_by_provider_model && Object.keys(d.cost_by_provider_model).length > 0) {
-                const total = Object.values(d.cost_by_provider_model).reduce((a, b) => a + b, 0);
-                for (const [k, v] of Object.entries(d.cost_by_provider_model)) {
-                  ranked.push({ key: k, cost: v, share: total > 0 ? v / total : null });
-                }
-              }
-              ranked.sort((a, b) => (b.share ?? 0) - (a.share ?? 0) || b.cost - a.cost);
-              const top = ranked.slice(0, 3);
-              const tooltip = top.length > 0
-                ? `Cost per autonomous merge: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — autonomous merges only; operator-assisted merges are excluded from the denominator.\n` +
-                  top.map(r => `${r.key}: $${r.cost.toFixed(2)}${r.share != null ? ` (${Math.round(r.share * 100)}%)` : ''}`).join('\n')
-                : `Cost per autonomous merge: $${(d.cost_per_merged_pr ?? 0).toFixed(2)} — autonomous merges only; operator-assisted merges are excluded from the denominator.`;
-              return (
-                <>
-                  <span
-                    title={tooltip}
-                    className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 border-amber-900/50 text-amber-400"
-                  >
-                    High cost / autonomous merge
-                  </span>
-                  {top.length > 0 && (
-                    <span
-                      title={tooltip}
-                      className="text-ui-sm text-amber-400/80 font-mono"
-                    >
-                      {top.map(r => {
-                        const label = r.key.split('|').pop() || r.key;
-                        return r.share != null
-                          ? `${label} ${Math.round(r.share * 100)}%`
-                          : `${label} $${r.cost.toFixed(2)}`;
-                      }).join(' · ')}
-                    </span>
-                  )}
-                </>
-              );
-            })()}
+            {budgetUtilizationBadge}
+            {costPerMergeWarning}
             {/* Cooldown badge — suppressed when direction is held */}
             {key === 'active' && !d.held && (() => {
               if (d.refractory_remaining_minutes != null) {
@@ -1193,33 +1246,7 @@ function DirectionCardImpl({
             </span>
             {/* Active research tasks for this direction — clickable badges when we
                 have the per-task list, otherwise fall back to a plain count. */}
-            {(() => {
-              const tasks = activeTasks?.[d.id] ?? [];
-              if (tasks.length === 0) return null;
-              const statusColor = (s: string) => {
-                if (s === 'IN_PROGRESS') return 'bg-yellow-950/40 border-yellow-900/50 text-yellow-400';
-                if (s === 'PROVISIONING') return 'bg-sky-950/40 border-sky-900/60 text-sky-400';
-                if (s === 'EVALUATING') return 'bg-indigo-950/40 border-indigo-900/60 text-indigo-400';
-                return 'bg-neutral-800/60 border-neutral-700/60 text-neutral-400';
-              };
-              return (
-                <div className="flex flex-wrap gap-1">
-                  {tasks.map(t => (
-                    // reason: inline active-task badge in dense direction row; text-ui-sm py-0.5
-                    <button
-                      data-viewport-allow-small-target
-                      key={t.id}
-                      type="button"
-                      onClick={() => onNavigateToTask?.(t.id)}
-                      title={t.title || t.latest_status_message || t.status}
-                      className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium transition-opacity hover:opacity-80 ${statusColor(t.status)}`}
-                    >
-                      {t.status.toLowerCase()} · {t.id.slice(0, 8)}
-                    </button>
-                  ))}
-                </div>
-              );
-            })()}
+            {activeTasksBadges}
             {(!activeTasks?.[d.id]) && (taskCounts[d.id] ?? 0) > 0 && (
               <span className="text-ui-sm text-neutral-500">
                 {taskCounts[d.id]} {taskCounts[d.id] === 1 ? 'task' : 'tasks'}

@@ -967,7 +967,161 @@ describe('buildContextPrefix — domain overview', () => {
   });
 });
 
-// ── REVIEW_GATED_TASK_TYPES contract ─────────────────────────────────────────
+// ── Direction context condensed rendering ─────────────────────────────────
+describe('condensed direction context', () => {
+  const sampleDirCtx = {
+    title: 'Fix agent prompt overhead',
+    priority: 'high',
+    implementation_constraints: 'Do not modify prompt.ts exports',
+    contract: {
+      completion_criteria: 'Direction context section < 200 bytes smaller in batch mode',
+      success_evidence: 'Measured in prompt_section_sizes telemetry',
+      retirement_condition: 'All three findings produce observable reductions',
+    },
+    narrative: {
+      established_findings: ['Finding A: prompt overhead confirmed', 'Finding B: duplicate rendering'],
+      open_questions: ['Question 1: Which sections are redundant?'],
+      last_cycle: {
+        tasks_created: 5,
+        prs_merged: 2,
+        prs_rejected: 1,
+      },
+    },
+    failed_approaches: [
+      { text: 'Patch rendering inline', failure_type: 'regression' },
+      { text: 'Extract to separate file', failure_type: 'circular_import' },
+    ],
+    recent_outcomes: [
+      { tasks_created: 2, prs_merged: 1 },
+      { tasks_created: 3, prs_merged: 0 },
+    ],
+    failure_stage_pattern: { message: 'Fails at review stage', rate: 0.6 },
+    scope_success_rates: {
+      small: { created: 5, merged: 4, failed: 0 },
+      medium: { created: 3, merged: 1, failed: 1 },
+    },
+    review_iteration_rolling_median: 2.5,
+    top_first_review_issues: [
+      { description: 'Missing test coverage', count: 4, category: 'test-coverage' },
+      { description: 'Error handling gaps', count: 2, category: 'error-handling' },
+    ],
+    // Fields that should NOT appear in condensed output:
+    recent_findings_evidence: [
+      { title: 'A finding', claims: ['claim 1'], source_refs: [] },
+    ],
+    direction_prior_analysis: [
+      { title: 'Prior fail', failure_category: 'other' },
+    ],
+    direction_successful_analysis: [
+      { title: 'Success', scope: 'small' },
+    ],
+    review_effectiveness: { categories: { 'test-coverage': { trend: 'stable' } } },
+    review_quality_feedback: { note: 'Missing calibration data' },
+    prompt_quality_patterns: ['Pattern 1', 'Pattern 2'],
+  };
+
+  it('renders full direction context when co_batch_sibling_count is absent', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix', scope: 'small' }],
+      direction_context: { ...sampleDirCtx },
+    });
+    expect(prefix).toContain('## Direction Context');
+    expect(prefix).toContain('**Goal:** Fix agent prompt overhead');
+    // Full rendering includes verbose sections
+    expect(prefix).toContain('Established findings (what we know)');
+    expect(prefix).toContain('Prior analysis from failed attempts');
+    expect(prefix).toContain('Approaches that worked');
+    expect(prefix).not.toContain('(condensed — batch sibling)');
+  });
+
+  it('renders condensed direction context when co_batch_sibling_count >= 3', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix', scope: 'small' }],
+      direction_context: { ...sampleDirCtx, co_batch_sibling_count: 3 },
+    });
+    expect(prefix).toContain('## Direction Context (condensed — batch sibling)');
+    expect(prefix).toContain('**Goal:** Fix agent prompt overhead');
+    // Condensed still includes structural metadata
+    expect(prefix).toContain('**Priority:** high');
+    expect(prefix).toContain('**Completion criteria:** Direction context section < 200 bytes smaller');
+    expect(prefix).toContain('Scope merge rates: small 4/5 (80%), medium 1/3 (33%, 1 failed)');
+    expect(prefix).toContain('Recent PRs on this direction averaged 2.5 review iterations');
+    expect(prefix).toContain('Missing test coverage');
+    // Condensed omits verbose sections
+    expect(prefix).not.toContain('Established findings (what we know)');
+    expect(prefix).not.toContain('Prior analysis from failed attempts');
+    expect(prefix).not.toContain('Approaches that worked');
+    expect(prefix).not.toContain('Recent findings evidence');
+  });
+
+  it('renders full direction context when co_batch_sibling_count < 3', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix', scope: 'small' }],
+      direction_context: { ...sampleDirCtx, co_batch_sibling_count: 2 },
+    });
+    expect(prefix).toContain('## Direction Context');
+    expect(prefix).not.toContain('(condensed — batch sibling)');
+    // Full rendering includes verbose sections
+    expect(prefix).toContain('Established findings (what we know)');
+  });
+
+  it('condensed context omits recent_findings_evidence entries', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix', scope: 'small' }],
+      direction_context: { ...sampleDirCtx, co_batch_sibling_count: 3 },
+    });
+    // Should not contain the verbose claims+sources block
+    expect(prefix).not.toContain('Recent findings evidence');
+    expect(prefix).not.toContain('A finding');
+    expect(prefix).not.toContain('claim 1');
+  });
+
+  it('condensed context shows only top 1 review issue and hints at more', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix', scope: 'small' }],
+      direction_context: { ...sampleDirCtx, co_batch_sibling_count: 3 },
+    });
+    expect(prefix).toContain('Missing test coverage');
+    expect(prefix).not.toContain('Error handling gaps');
+    expect(prefix).toContain('check full context via');
+  });
+
+  it('condensed context omits review_effectiveness and self-review calibration', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix', scope: 'small' }],
+      direction_context: { ...sampleDirCtx, co_batch_sibling_count: 3 },
+    });
+    expect(prefix).not.toContain('Review effectiveness');
+    expect(prefix).not.toContain('Self-review calibration');
+    expect(prefix).not.toContain('Missing calibration data');
+  });
+
+  it('condensed context omits prompt_quality_patterns', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix', scope: 'small' }],
+      direction_context: { ...sampleDirCtx, co_batch_sibling_count: 3 },
+    });
+    expect(prefix).not.toContain('Prompt quality patterns');
+    expect(prefix).not.toContain('Pattern 1');
+  });
+
+  it('condensed context includes failure_hotspots when present', () => {
+    const dirCtxWithHotspots = {
+      ...sampleDirCtx,
+      co_batch_sibling_count: 3,
+      direction_prior_analysis: [
+        { title: 'Fail A', pr_changed_files: ['src/core.py', 'src/utils.py'] },
+        { title: 'Fail B', pr_changed_files: ['src/core.py', 'src/helpers.py'] },
+      ],
+    };
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'fix', scope: 'small' }],
+      direction_context: dirCtxWithHotspots,
+    });
+    expect(prefix).toContain('Files appearing in multiple recent failures');
+    expect(prefix).toContain('src/core.py');
+  });
+});
 describe('REVIEW_GATED_TASK_TYPES contract', () => {
   it('matches the backend CODE_REVIEW_GATED_TASK_TYPES derived from the registry', () => {
     // REVIEW_GATED_TASK_TYPES is a hand-maintained TS array mirroring the

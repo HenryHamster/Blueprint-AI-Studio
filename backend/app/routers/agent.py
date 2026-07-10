@@ -1989,11 +1989,13 @@ async def claim_task(
                     await session.rollback()
 
         direction_concurrent_files: list[str] = []
+        co_batch_sibling_count = 0
         if current_direction_id:
             _seen_files: set[str] = set()
             for _at in active_tasks:
                 if _at.get("direction_id") != current_direction_id:
                     continue
+                co_batch_sibling_count += 1
                 for _f in _at.get("related_files") or []:
                     if isinstance(_f, str) and _f and _f not in _seen_files:
                         _seen_files.add(_f)
@@ -2002,6 +2004,7 @@ async def claim_task(
         response["project_context"] = {
             "active_tasks": active_tasks,
             "direction_concurrent_files": direction_concurrent_files,
+            "co_batch_sibling_count": co_batch_sibling_count,
             "queued_tasks": queued_tasks,
             "recently_completed_tasks": recently_completed_tasks,
             "direction_recent_tasks": direction_recent_tasks
@@ -3006,6 +3009,10 @@ async def claim_task(
                     "top_first_review_issues": direction_top_first_review_issues,
                     "first_attempt_feedback": direction_first_attempt_feedback,
                 }
+                if co_batch_sibling_count >= 3:
+                    response["direction_context"]["co_batch_sibling_count"] = (
+                        co_batch_sibling_count
+                    )
                 if direction_implementation_constraints:
                     response["direction_context"]["implementation_constraints"] = (
                         direction_implementation_constraints
@@ -3222,6 +3229,10 @@ async def claim_task(
                     "success_patterns": success_summary,
                     "review_effectiveness": research_review_effectiveness,
                 }
+                if co_batch_sibling_count >= 3:
+                    response["direction_context"]["co_batch_sibling_count"] = (
+                        co_batch_sibling_count
+                    )
                 if prompt_quality_patterns:
                     response["direction_context"]["prompt_quality_patterns"] = (
                         prompt_quality_patterns
@@ -4946,6 +4957,14 @@ async def agent_heartbeat(
             ]
         task.api_call_summary = summary
 
+    # Provider-reported token usage (Component B of cost-telemetry
+    # reconciliation). Posted by the agent as a nested object alongside the
+    # flat-spread api_call_summary fields. Persisted as-is so the
+    # reconciliation can cross-check against api_call_summary. Backwards-
+    # compatible: older agents that don't emit this leave the column NULL.
+    if req.provider_reported_usage is not None:
+        task.provider_reported_usage = req.provider_reported_usage
+
     # Per-task structured-output format-compliance telemetry (equipping
     # direction d-46468a41), sibling to api_call_summary. Cumulative counters
     # posted on every heartbeat — last write wins. Backwards-compatible: older
@@ -5213,14 +5232,21 @@ async def spawn_subtask(
     await session.commit()
 
     # Log history for each new task
+    # Batch-reload all new tasks (N+1 guard: commit expired the session;
+    # one batch SELECT + identity-map lookups replaces N individual
+    # session.refresh calls).
+    if new_tasks:
+        await session.execute(
+            select(Task).where(Task.id.in_([t.id for t in new_tasks]))
+        )
     for task in new_tasks:
-        await session.refresh(task)
+        fresh_task = await session.get(Task, task.id)
         history = TaskHistory(
-            task_id=task.id,
+            task_id=fresh_task.id if fresh_task else task.id,
             action="SPAWNED",
             details={
                 "spawned_by": f"AGENT_{parent_task.id}",
-                "requires_approval": task.requires_approval,
+                "requires_approval": fresh_task.requires_approval if fresh_task else task.requires_approval,
                 "context": req.context,
             },
         )
@@ -5421,6 +5447,9 @@ async def agent_list_knowledge_documents(
     sweep_id: str | None = Query(
         default=None, description="Exact sweep_id filter (compute experiment sweeps)"
     ),
+    lifecycle_status: str | None = Query(
+        default=None, description="Filter by lifecycle status: pending, consumed, dismissed"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -5450,6 +5479,7 @@ async def agent_list_knowledge_documents(
         challenge_state=challenge_state,
         finding_hash=finding_hash,
         sweep_id=sweep_id,
+        lifecycle_status=lifecycle_status,
         limit=limit,
         offset=offset,
     )

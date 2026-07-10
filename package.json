@@ -11,22 +11,11 @@
     "@protobufjs/utf8": "^1.1.1"
   },
   "scripts": {
-    "dev": "concurrently --raw \"vite --port=3000 --host=localhost\" \"npm run dev --prefix admin-ui\"",
-    "dev:root": "vite --port=3000 --host=localhost",
+    "dev": "npm run dev --prefix admin-ui",
     "dev:admin": "npm run dev --prefix admin-ui",
-    "build": "vite build && npm run build --prefix admin-ui",
-    "preview": "vite preview",
     "clean": "rm -rf dist && rm -rf admin-ui/dist",
+    "build": "npm run build --prefix admin-ui",
     "lint": "npm run lint --prefix admin-ui"
-  },
-  "dependencies": {
-    "@tailwindcss/vite": "^4.1.14",
-    "@vitejs/plugin-react": "^5.0.4",
-    "lucide-react": "^0.546.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "tldraw": "^4.4.1",
-    "vite": "^6.4.2"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

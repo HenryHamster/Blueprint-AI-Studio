@@ -9,6 +9,34 @@
 
 import { promptOps } from './strategic-ops-registry.js';
 
+/**
+ * Maximum base64-encoded image data length accepted in a message turn
+ * (~10 MB encoded corresponds to ~7.5 MB raw). Longer payloads are silently
+ * dropped to prevent excessive token usage and agent stalls.
+ */
+export const MAX_IMAGE_BASE64_LENGTH = 13_000_000;
+
+/**
+ * Maximum number of image attachment blocks extracted per message turn.
+ * Beyond this cap, additional images are silently dropped.
+ */
+export const MAX_IMAGES_PER_TURN = 8;
+
+/**
+ * Maximum downloaded image bytes for URL-sourced attachments. This is aligned
+ * with MAX_IMAGE_BASE64_LENGTH so a downloaded image cannot expand past the
+ * model input cap after base64 encoding.
+ */
+export const MAX_IMAGE_DOWNLOAD_BYTES = Math.floor(MAX_IMAGE_BASE64_LENGTH * 3 / 4);
+
+/**
+ * Maximum bytes to fetch for a URL-sourced text/code file attachment.
+ * Larger files are truncated to this limit before being inlined as text.
+ */
+export const MAX_TEXT_ATTACHMENT_BYTES = 512 * 1024; // 512 KB
+
+const MODEL_IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
 export interface ResidentInboundMessage {
   id?: string;
   created_at?: string;
@@ -97,6 +125,13 @@ export interface ResidentConfig {
   /** Max ops to batch in one autonomous turn — surfaced in the self-prompt as a hint.
    *  Default: 3. */
   maxOpsPerTurn: number;
+  /** Explicit compaction threshold in input tokens. When set (>0) this overrides the
+   *  model-derived threshold. When zero compaction is disabled. When absent (undefined)
+   *  the threshold is derived from the model's context-window limit. */
+  compactionThresholdTokens?: number;
+  /** Minimum wall-clock cooldown between compactions (ms). Prevents double-compacting
+   *  when consecutive turns both land above the threshold. Default: 5 min. */
+  compactionCooldownMs: number;
 }
 
 function num(v: unknown, fallback: number): number {
@@ -231,6 +266,12 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
   const autonomousEnabled =
     payload.strategic_session_autonomous === false ? false : mode !== 'monitor';
   const idleTickMs = Math.max(1000, Math.round(idleTickSec * 1000));
+  // Compaction threshold: explicit payload override (0 = disabled), else derived
+  // from the model's context-window limit below.
+  const compactionThresholdTokens = payload.strategic_session_compaction_threshold_tokens !== undefined
+    ? num(payload.strategic_session_compaction_threshold_tokens, 0)
+    : undefined;
+  const compactionCooldownSec = num(payload.strategic_session_compaction_cooldown_seconds, 300);
   return {
     idleTickMs,
     // Poll operator messages faster than the heartbeat tick so a turn starts
@@ -243,7 +284,127 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     minTickMs: Math.max(idleTickMs, Math.round(minTickSec * 1000)),
     autonomousTurnTimeoutMs: Math.max(15_000, Math.round(autonomousTurnTimeoutSec * 1000)),
     maxOpsPerTurn,
+    compactionThresholdTokens,
+    compactionCooldownMs: Math.max(60_000, Math.round(compactionCooldownSec * 1000)),
   };
+}
+
+// ── Compaction: context-window pressure detection ─────────────────────────
+
+/** Per-model context-window limits (tokens). The resident session tracks
+ *  cumulative input tokens and triggers compaction at 80% of the model's
+ *  limit, restarting the Claude subprocess with a condensed checkpoint.
+ *  Model IDs are matched by substring (case-insensitive) so short aliases
+ *  like "sonnet" match "claude-sonnet-5-20251001". */
+const MODEL_CONTEXT_LIMITS: ReadonlyArray<{ pattern: string; limit: number }> = [
+  // Claude Opus family: 200K context window
+  { pattern: 'opus', limit: 200_000 },
+  // Claude Sonnet family: 200K context window
+  { pattern: 'sonnet', limit: 200_000 },
+  // Claude Haiku family: 128K (older), 200K (haiku-4-5+)
+  { pattern: 'haiku-4-5', limit: 200_000 },
+  { pattern: 'haiku', limit: 128_000 },
+  // Claude Fable family: 200K
+  { pattern: 'fable', limit: 200_000 },
+];
+
+/** Default context-window limit when the model is unrecognized (tokens). */
+export const DEFAULT_CONTEXT_LIMIT = 200_000;
+
+/** Fraction of the context-window limit at which compaction triggers. */
+export const COMPACTION_THRESHOLD_RATIO = 0.80;
+
+/**
+ * Resolve the context-window limit for a model id string. Matches by
+ * case-insensitive substring against the known patterns; falls back to
+ * {@link DEFAULT_CONTEXT_LIMIT} when no pattern matches.
+ */
+export function modelContextLimit(model?: string): number {
+  if (!model) return DEFAULT_CONTEXT_LIMIT;
+  const lower = model.toLowerCase();
+  for (const entry of MODEL_CONTEXT_LIMITS) {
+    if (lower.includes(entry.pattern)) return entry.limit;
+  }
+  return DEFAULT_CONTEXT_LIMIT;
+}
+
+/**
+ * Compute the compaction threshold for a model + explicit override.
+ * When `explicitThreshold` is a positive number, it is used directly.
+ * When it is zero, compaction is disabled (returns Infinity). When undefined,
+ * the threshold is derived as {@link COMPACTION_THRESHOLD_RATIO} of the
+ * model's context-window limit.
+ */
+export function compactionThreshold(
+  model?: string,
+  explicitThreshold?: number,
+): number {
+  if (explicitThreshold !== undefined) {
+    return explicitThreshold > 0 ? explicitThreshold : Number.POSITIVE_INFINITY;
+  }
+  return Math.floor(modelContextLimit(model) * COMPACTION_THRESHOLD_RATIO);
+}
+
+export interface CompactionCheckpointContext {
+  /** Condensed role identity section (from the original bootstrap). */
+  roleIdentity: string;
+  /** Current exam ledger serialized as JSON. */
+  examLedgerJson: string;
+  /** Human-readable summary of recent operator interactions and key decisions. */
+  recentInteractions: string;
+  /** Current autonomous state snapshot (agenda, focus rotation, open leads). */
+  autonomousState: string;
+}
+
+/**
+ * Build the compaction checkpoint prompt — a condensed context package
+ * delivered to a FRESH subprocess so the session continues coherently
+ * after a context-window compaction restart.
+ *
+ * This is NOT the full bootstrap prompt. It preserves high-signal content:
+ * (i) resident role identity and tool descriptions, (ii) the current exam
+ * ledger state, (iii) a brief summary of recent operator interactions and
+ * key decisions made, (iv) the current autonomous state.
+ *
+ * Pure and unit-testable — no imports from index.js.
+ */
+export function buildCompactionCheckpoint(ctx: CompactionCheckpointContext): string {
+  const sections: string[] = [];
+
+  // (i) Condensed role identity — the session is resuming, not starting fresh.
+  sections.push(`# Session checkpoint — compaction restart
+
+The resident session's Claude subprocess was restarted because the context
+window approached its limit. This is a CHECKPOINT restore, not a fresh start.
+Your previous session was compacted; you retain your role, tools, and all
+durable state. Continue operating exactly where you left off.
+
+${ctx.roleIdentity}`);
+
+  // (ii) Exam ledger state.
+  if (ctx.examLedgerJson.trim()) {
+    sections.push(`## Examination ledger (carried forward)
+\`\`\`json
+${ctx.examLedgerJson.trim()}
+\`\`\``);
+  }
+
+  // (iii) Recent operator interactions and decisions.
+  if (ctx.recentInteractions.trim()) {
+    sections.push(`## Recent context (carried forward)
+${ctx.recentInteractions.trim()}`);
+  }
+
+  // (iv) Autonomous state.
+  if (ctx.autonomousState.trim()) {
+    sections.push(`## Current state
+${ctx.autonomousState.trim()}`);
+  }
+
+  sections.push(`Resume from this checkpoint. Your next turn will arrive as a
+normal operator or autonomous prompt — this checkpoint is informational only.`);
+
+  return sections.join('\n\n');
 }
 
 /**
@@ -356,22 +517,265 @@ export function dedupNewMessages(
   return out;
 }
 
-/** Extract the human text of an inbound operator message. */
-export function extractMessageContent(msg: ResidentInboundMessage): string {
-  const content = str(msg.content).trim();
-  return content;
+/** Content block types for multimodal message delivery. */
+export interface TextBlock { type: 'text'; text: string; }
+export interface ImageBlockBase64Source { type: 'base64'; media_type: string; data: string; }
+export interface ImageBlockUrlSource { type: 'url'; url: string; media_type: string; name?: string; }
+export type ImageBlockSource = ImageBlockBase64Source | ImageBlockUrlSource;
+export interface ImageBlock { type: 'image'; source: ImageBlockSource; }
+/** Internal transport block: a text/code file to be fetched from a signed GCS URL by materializeContentBlocks. */
+export interface TextUrlBlock { type: 'text_url'; url: string; name: string; mime_type: string; }
+export type ContentBlock = TextBlock | ImageBlock | TextUrlBlock;
+
+const TEXT_LIKE_APP_MIMES = new Set([
+  'application/json', 'application/javascript', 'application/xml',
+  'application/yaml', 'application/x-yaml', 'application/toml',
+  'application/sql', 'application/x-sh', 'application/x-shellscript',
+]);
+
+/**
+ * Whether a MIME type represents human-readable text that can be decoded and presented inline.
+ */
+function isTextLikeMime(mimeType: string): boolean {
+  if (typeof mimeType !== 'string') return false;
+  if (mimeType.startsWith('text/')) return true;
+  return TEXT_LIKE_APP_MIMES.has(mimeType.split(';')[0].trim().toLowerCase());
 }
 
 /**
- * Combine one or more pending operator messages into a single turn payload. When
- * several arrive between polls they are concatenated in order with a short header
- * so the agent sees them as a batch rather than losing all but the last.
+ * Build a one-line reference block for an opaque (non-text, non-image) file attachment.
  */
-export function combineOperatorMessages(msgs: ResidentInboundMessage[]): string {
-  const texts = msgs.map(extractMessageContent).filter(Boolean);
-  if (texts.length === 0) return '';
-  if (texts.length === 1) return texts[0];
-  return texts.map((t, i) => `[operator message ${i + 1}/${texts.length}]\n${t}`).join('\n\n');
+function buildFileReference(att: Record<string, unknown>): string {
+  const name = str(att.name, 'file');
+  const mimeType = str(att.mime_type, 'application/octet-stream');
+  const sizeBytes = typeof att.size_bytes === 'number' ? att.size_bytes : null;
+  const sizeStr = sizeBytes !== null ? `, ${sizeBytes} bytes` : '';
+  return `[File attachment: ${name} (${mimeType}${sizeStr})]`;
+}
+
+export interface AttachmentFetchResponse {
+  ok: boolean;
+  status: number;
+  headers: { get(name: string): string | null };
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export type AttachmentFetch = (url: string) => Promise<AttachmentFetchResponse>;
+
+function normalizeImageMediaType(value: unknown): string {
+  const mediaType = str(value).split(';', 1)[0].trim().toLowerCase();
+  return MODEL_IMAGE_MEDIA_TYPES.has(mediaType) ? mediaType : '';
+}
+
+function attachmentName(value: unknown): string {
+  return str(value).trim().slice(0, 200);
+}
+
+export function isAllowedAttachmentDownloadUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    const gcsHost = host === 'storage.googleapis.com' || host.endsWith('.storage.googleapis.com');
+    if (!gcsHost) return false;
+    return url.searchParams.has('X-Goog-Signature');
+  } catch {
+    return false;
+  }
+}
+
+function attachmentUnavailableBlock(source: ImageBlockUrlSource, reason: string): TextBlock {
+  const label = source.name ? ` "${source.name}"` : '';
+  return { type: 'text', text: `[Attached image${label} could not be loaded: ${reason}.]` };
+}
+
+/**
+ * Extract message content as content blocks (text + image attachments from
+ * context.attachments). Images can arrive as inline base64 data or as GCS
+ * signed URLs (the scalable path for operator-uploaded files). Non-image
+ * attachments with text/* MIME types are decoded and emitted as text blocks;
+ * opaque files (PDF, binary, URL-only) are emitted as a one-line reference
+ * block. Text-only messages produce a single text block.
+ */
+export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] {
+  const blocks: ContentBlock[] = [];
+  const text = str(msg.content).trim();
+  if (text) {
+    blocks.push({ type: 'text', text });
+  }
+  if (msg.context) {
+    const raw = msg.context.attachments;
+    if (Array.isArray(raw)) {
+      let imageCount = 0;
+      for (const att of raw as Array<Record<string, unknown>>) {
+        if (imageCount >= MAX_IMAGES_PER_TURN) break;
+        if (str(att.type) === 'image') {
+          const mediaType = normalizeImageMediaType(att.mime_type);
+          if (!mediaType) continue;
+          // Inline base64 data — preferred when available.
+          if (typeof att.data === 'string' && att.data && att.data.length <= MAX_IMAGE_BASE64_LENGTH) {
+            blocks.push({
+              type: 'image',
+              source: { type: 'base64', media_type: mediaType, data: att.data },
+            });
+            imageCount++;
+          } else if (typeof att.url === 'string' && att.url) {
+            const url = att.url.trim();
+            // GCS signed URL — fallback when data is absent or oversized. The URL
+            // is an internal transport detail; materializeContentBlocks fetches it
+            // and converts it to base64 before the model sees the turn.
+            if (isAllowedAttachmentDownloadUrl(url)) {
+              blocks.push({
+                type: 'image',
+                source: {
+                  type: 'url',
+                  url,
+                  media_type: mediaType,
+                  name: attachmentName(att.name) || undefined,
+                },
+              });
+            } else {
+              blocks.push(attachmentUnavailableBlock(
+                { type: 'url', url: '', media_type: mediaType, name: attachmentName(att.name) || undefined },
+                'unsupported download URL',
+              ));
+            }
+            imageCount++;
+          }
+        } else {
+          // Non-image attachment: decode text-like content or emit a reference block.
+          const attData = typeof att.data === 'string' ? att.data : '';
+          const mimeType = str(att.mime_type);
+          if (attData && isTextLikeMime(mimeType)) {
+            try {
+              const decoded = Buffer.from(attData, 'base64').toString('utf-8');
+              const name = str(att.name, 'file');
+              blocks.push({ type: 'text', text: `[Attachment: ${name}]\n${decoded}` });
+            } catch {
+              blocks.push({ type: 'text', text: buildFileReference(att) });
+            }
+          } else if (!attData && typeof att.url === 'string' && att.url && isTextLikeMime(mimeType)) {
+            // URL-only text/code file (uploaded to GCS) — defer fetch to materializeContentBlocks.
+            const url = att.url.trim();
+            if (isAllowedAttachmentDownloadUrl(url)) {
+              blocks.push({ type: 'text_url', url, name: str(att.name, 'file'), mime_type: mimeType });
+            } else {
+              blocks.push({ type: 'text', text: buildFileReference(att) });
+            }
+          } else {
+            blocks.push({ type: 'text', text: buildFileReference(att) });
+          }
+        }
+      }
+    }
+  }
+  return blocks;
+}
+
+/**
+ * Convert internal URL-sourced image blocks into model-ready base64 image
+ * blocks. Signed URLs are never forwarded into the resident model input.
+ * Download failures degrade to a text notice so the operator turn still runs.
+ */
+export async function materializeContentBlocks(
+  blocks: ContentBlock[],
+  fetchImpl: AttachmentFetch = async (url: string) => {
+    if (typeof globalThis.fetch !== 'function') throw new Error('fetch unavailable');
+    return globalThis.fetch(url);
+  },
+): Promise<ContentBlock[]> {
+  const result: ContentBlock[] = [];
+  for (const block of blocks) {
+    if (block.type === 'text_url') {
+      if (!isAllowedAttachmentDownloadUrl(block.url)) {
+        result.push({ type: 'text', text: `[Attachment "${block.name}" could not be loaded: unsupported download URL.]` });
+        continue;
+      }
+      try {
+        const resp = await fetchImpl(block.url);
+        if (!resp.ok) {
+          result.push({ type: 'text', text: `[Attachment "${block.name}" could not be loaded: download failed (${resp.status}).]` });
+          continue;
+        }
+        const bytes = Buffer.from(await resp.arrayBuffer());
+        const sliced = bytes.length > MAX_TEXT_ATTACHMENT_BYTES ? bytes.subarray(0, MAX_TEXT_ATTACHMENT_BYTES) : bytes;
+        const text = sliced.toString('utf-8');
+        const truncNote = bytes.length > MAX_TEXT_ATTACHMENT_BYTES ? '\n[... truncated]' : '';
+        result.push({ type: 'text', text: `[Attachment: ${block.name}]\n${text}${truncNote}` });
+      } catch {
+        result.push({ type: 'text', text: `[Attachment "${block.name}" could not be loaded: download failed.]` });
+      }
+      continue;
+    }
+    if (block.type !== 'image' || block.source.type !== 'url') {
+      result.push(block);
+      continue;
+    }
+
+    const source = block.source;
+    if (!isAllowedAttachmentDownloadUrl(source.url)) {
+      result.push(attachmentUnavailableBlock(source, 'unsupported download URL'));
+      continue;
+    }
+    try {
+      const resp = await fetchImpl(source.url);
+      if (!resp.ok) {
+        result.push(attachmentUnavailableBlock(source, `download failed (${resp.status})`));
+        continue;
+      }
+      const lengthHeader = resp.headers.get('content-length');
+      const contentLength = lengthHeader ? Number.parseInt(lengthHeader, 10) : 0;
+      if (Number.isFinite(contentLength) && contentLength > MAX_IMAGE_DOWNLOAD_BYTES) {
+        result.push(attachmentUnavailableBlock(source, 'image is too large'));
+        continue;
+      }
+      const bytes = Buffer.from(await resp.arrayBuffer());
+      if (bytes.length > MAX_IMAGE_DOWNLOAD_BYTES) {
+        result.push(attachmentUnavailableBlock(source, 'image is too large'));
+        continue;
+      }
+      const data = bytes.toString('base64');
+      if (data.length > MAX_IMAGE_BASE64_LENGTH) {
+        result.push(attachmentUnavailableBlock(source, 'image is too large'));
+        continue;
+      }
+      const headerMediaType = normalizeImageMediaType(resp.headers.get('content-type'));
+      result.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: headerMediaType || source.media_type,
+          data,
+        },
+      });
+    } catch {
+      result.push(attachmentUnavailableBlock(source, 'download failed'));
+    }
+  }
+  return result;
+}
+
+/**
+ * Combine one or more pending operator messages into a single turn payload of
+ * content blocks. When several arrive between polls they are concatenated in
+ * order with a short header so the agent sees them as a batch rather than
+ * losing all but the last.
+ */
+export function combineOperatorMessages(msgs: ResidentInboundMessage[]): ContentBlock[] {
+  const nonEmpty = msgs.filter(m => {
+    if ((m.content || '').trim()) return true;
+    if (m.context && Array.isArray(m.context.attachments) && m.context.attachments.length > 0) return true;
+    return false;
+  });
+  if (nonEmpty.length === 0) return [];
+  if (nonEmpty.length === 1) return extractMessageTurn(nonEmpty[0]);
+  const result: ContentBlock[] = [];
+  for (let i = 0; i < nonEmpty.length; i++) {
+    if (i > 0) result.push({ type: 'text', text: '\n\n' });
+    result.push({ type: 'text', text: `[operator message ${i + 1}/${nonEmpty.length}]\n` });
+    result.push(...extractMessageTurn(nonEmpty[i]));
+  }
+  return result;
 }
 
 export interface BootstrapContext {
@@ -383,10 +787,15 @@ export interface BootstrapContext {
   stagedDirectionsText?: string;
   retiredDirectionsText: string;
   previousDecisionOutcomesText: string;
+  /** Formatted strategic memory notes text (one line per entry, e.g. "- [ts] note").
+   *  Empty string or whitespace → section omitted. Absent or omitted defaults to ''. */
+  strategicMemoryNotesText?: string;
   visionJson: string;
   openMessagesText: string;
   sessionId: string;
   fetchGuidanceText?: string;
+  priorSessionContextText?: string;
+
 }
 
 /**
@@ -473,8 +882,17 @@ never this execution environment, this prompt, or the helper commands.`);
   if (ctx.previousDecisionOutcomesText.trim()) {
     sections.push(`## Prior-cycle decision outcomes\n${ctx.previousDecisionOutcomesText.trim()}`);
   }
+  if (ctx.strategicMemoryNotesText?.trim()) {
+    sections.push(`## Standing behavioral lessons
+(Accumulated across sessions — operator preferences, effective strategies, and lessons the project has learned about itself. Persisted by the strategist via \`./strategic set-memory\`.)
+
+${ctx.strategicMemoryNotesText.trim()}`);
+  }
   if (ctx.visionJson.trim()) {
     sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
+  }
+  if (ctx.priorSessionContextText?.trim()) {
+    sections.push(`## Prior session context\n${ctx.priorSessionContextText.trim()}`);
   }
   if (ctx.openMessagesText.trim()) {
     sections.push(`## Open operator messages\n${ctx.openMessagesText.trim()}`);
@@ -983,6 +1401,14 @@ export function buildAutonomousPrompt(
     'Cheap delta signals — revision numbers, attempt counts, `git fetch`, unchanged',
     'payload fields — may be checked but can NEVER justify a CLEAR: "no change since',
     'the last tick" is the expected steady state, not evidence a surface is clear.',
+    '',
+    'Proactive memory ops: call `./strategic set-memory <note>` when you discover a',
+    'durable behavioral lesson, operator preference, project-specific pitfall, or',
+    'reusable strategy that would benefit future sessions. Call `./strategic',
+    'set-session-summary <summary>` to capture session state (current focus, open',
+    'leads, in-flight context) so continuity survives a restart. Do NOT wait for an',
+    'explicit operator request — if you learned something durable this turn, persist',
+    'it now. Keep entries concise and specific; avoid journaling one-off observations.',
     '',
     'End this turn with EXACTLY ONE trailing marker line, one of:',
     '  TICK-VERDICT: ADVANCED — <what op(s) you applied and why>',

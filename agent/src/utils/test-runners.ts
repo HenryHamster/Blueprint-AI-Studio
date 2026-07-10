@@ -290,7 +290,7 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
     // backend's `n.endswith('.sln') or n.endswith('.csproj')`).
     let dotnetEntries: string[] = [];
     try {
-      const entries = _readdir(absDir) as unknown as string[];
+      const entries = _readdir(absDir);
       if (Array.isArray(entries)) dotnetEntries = entries;
     } catch { /* unreadable — skip */ }
     if (dotnetEntries.some(n => typeof n === 'string' && (n.endsWith('.sln') || n.endsWith('.csproj')))) {
@@ -592,7 +592,7 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
 
       let topLevelEntries: string[];
       try {
-        topLevelEntries = readdirSync(WORKSPACE) as unknown as string[];
+        topLevelEntries = readdirSync(WORKSPACE);
       } catch { topLevelEntries = []; /* unreadable workspace — skip nested scan */ }
       if (Array.isArray(topLevelEntries)) {
         for (const entry of topLevelEntries) {
@@ -604,7 +604,7 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
           // top-level file (not a dir) makes readdirSync throw → caught → skip.
           let children: string[];
           try {
-            children = readdirSync(`${WORKSPACE}/${entry}`) as unknown as string[];
+            children = readdirSync(`${WORKSPACE}/${entry}`);
           } catch { continue; /* not a directory / unreadable — skip */ }
           if (!Array.isArray(children)) continue;
           for (const child of children) {
@@ -644,7 +644,7 @@ export function detectAutoTestRunners(): TestRunner[] {
 // checking a fixed manifest. Defensive against fs errors (treated as "absent").
 function hasDotnetProject(absDir: string): boolean {
   try {
-    const entries = fs.readdirSync(absDir) as unknown as string[];
+    const entries = fs.readdirSync(absDir);
     return Array.isArray(entries) && entries.some(
       n => typeof n === 'string' && (n.endsWith('.sln') || n.endsWith('.csproj')),
     );
@@ -1233,7 +1233,7 @@ export function detectAcceptanceProbes(buildConfig?: BuildConfig): AcceptancePro
   const SKIP_DIRS = new Set(['node_modules', 'vendor', '.venv', 'venv', 'target', 'dist', 'build']);
   const skip = (name: string): boolean => name.startsWith('.') || SKIP_DIRS.has(name);
   let entries: string[] = [];
-  try { entries = readdirSync(WORKSPACE) as unknown as string[]; } catch { entries = []; }
+  try { entries = readdirSync(WORKSPACE); } catch { entries = []; }
   if (Array.isArray(entries)) {
     let inspected = 0;
     for (const entry of entries) {
@@ -1864,6 +1864,98 @@ export function extractTestCoverage(
   const total = passed + skipped + failed;
   if (total <= 0) return null;
   return { passed, skipped, total };
+}
+
+/**
+ * Extract TOTAL line/statement coverage percentage from pytest-cov terminal output.
+ *
+ * Parses the final coverage summary line emitted by ``--cov-report=term-missing``:
+ * ``TOTAL    350    30    91%``.  Returns the percentage (91) as a number, or null
+ * when no coverage summary line is found (no coverage instrumentation active).
+ *
+ * The returned percentage is a FIRST-PASS TOTAL over all instrumented modules, not
+ * a diff-aware "coverage of changed lines" metric.  A per-file union with the PR
+ * diff is a future refinement.
+ */
+export function extractLineCoverage(output: string): number | null {
+  if (!output) return null;
+  // Match "TOTAL" summary line from pytest-cov. Captures the coverage %.
+  const match = output.match(/^\s*TOTAL\s+\d+\s+\d+\s+(\d+(?:\.\d+)?)%/im);
+  if (!match) return null;
+  const pct = parseFloat(match[1]);
+  return isFinite(pct) ? pct : null;
+}
+
+/**
+ * Extract a diff-aware changed-line coverage percentage from pytest-cov terminal output.
+ *
+ * Parses the per-file coverage table from ``--cov-report=term-missing`` and computes a
+ * weighted average: for each file touched by the PR diff, its coverage percentage is
+ * weighted by the number of changed lines in that file.
+ *
+ * This is an approximation that prefers simplicity over line-level precision — it
+ * assumes coverage within a file is uniformly distributed.  A line-level intersection
+ * with the diff (via ``--cov-report=json``) is a further refinement.
+ *
+ * @param output Raw pytest-cov terminal output containing the per-file table.
+ * @param changedLineCounts Map of repo-relative file path → count of changed/added lines.
+ *   Paths are first tried as-is, then with the first directory component stripped (to
+ *   handle the common case where tests run from a subdirectory like ``backend/``).
+ * @returns The weighted changed-line coverage percentage, or null when no per-file
+ *   coverage data is found or ``changedLineCounts`` is empty.
+ */
+export function extractChangedLineCoverage(
+  output: string,
+  changedLineCounts: Record<string, number>,
+): number | null {
+  if (!output) return null;
+  const changedFiles = Object.keys(changedLineCounts).filter(f => changedLineCounts[f] > 0);
+  if (changedFiles.length === 0) return null;
+
+  // Parse per-file coverage from pytest-cov terminal output.  Format per data line:
+  //   backend/app/foo.py   100    10    90%
+  // Skip the header row (Name), the dashed separator, and the TOTAL summary.
+  const fileCoverage: Record<string, number> = {};
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed === 'Name' || /^(?:-+|TOTAL)/.test(trimmed)) continue;
+    const m = trimmed.match(/^(\S+(?:\/\S+)*)\s+(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)%/);
+    if (m) {
+      const pct = parseFloat(m[4]);
+      if (isFinite(pct)) fileCoverage[m[1]] = pct;
+    }
+  }
+
+  const fileCoverageKeys = Object.keys(fileCoverage);
+  if (fileCoverageKeys.length === 0) return null;
+
+  // Compute weighted average: weight each changed file's coverage by its
+  // changed-line count.  Try the diff path as-is first, then strip the first
+  // directory component (handles tests run from a project subdirectory).
+  let weightedSum = 0;
+  let totalChangedLines = 0;
+  for (const filePath of changedFiles) {
+    const changedCount = changedLineCounts[filePath];
+    // Try the full repo-relative path (e.g. ``backend/app/foo.py``).
+    let covPct: number | null = null;
+    if (filePath in fileCoverage) {
+      covPct = fileCoverage[filePath];
+    } else {
+      // Fallback: strip the first directory (``backend/app/foo.py`` → ``app/foo.py``).
+      const slashIdx = filePath.indexOf('/');
+      const stripped = slashIdx !== -1 ? filePath.slice(slashIdx + 1) : null;
+      if (stripped !== null && stripped in fileCoverage) {
+        covPct = fileCoverage[stripped];
+      }
+    }
+    if (covPct !== null) {
+      weightedSum += covPct * changedCount;
+      totalChangedLines += changedCount;
+    }
+  }
+
+  if (totalChangedLines === 0) return null;
+  return Math.round((weightedSum / totalChangedLines) * 100) / 100;
 }
 
 /**

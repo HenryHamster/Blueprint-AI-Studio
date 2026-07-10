@@ -144,6 +144,7 @@ const {
     'recordInitialOAuthAuthHash',
     'recordLlmCallStart',
     'recordLlmTokens',
+    'recordProviderReportedUsage',
     'recordNumTurns',
     'recordResidentTurnLatency',
     'recordToolUse',
@@ -261,6 +262,7 @@ const {
     'buildClockAndRecentWorkSection',
     'buildConversationThreadSection',
     'buildCycleStartReconciliationSection',
+    'buildDirectionPortfolioSection',
     'buildDirHealthSummary',
     'buildDirSummaryText',
     'buildDriftSection',
@@ -269,6 +271,7 @@ const {
     'buildModelHealthSection',
     'buildOpenMessagesText',
     'buildOutcomeSection',
+    'buildPendingFollowupsSection',
     'buildPayloadStalenessSection',
     'buildPruneCandidatesSection',
     'buildQuestionSection',
@@ -294,6 +297,7 @@ const {
     'getResidentTurnLatencyTelemetry',
     'recordLlmCallStart',
     'recordLlmTokens',
+    'recordProviderReportedUsage',
     'recordNumTurns',
     'recordResidentTurnLatency',
     'recordToolResultBytes',
@@ -514,6 +518,16 @@ vi.mock('./strategic-sections.js', () => ({
     maxActiveDirections: number,
     authoritative?: { active: number; paused: number },
   ) => `DIRHEALTH(max=${maxActiveDirections},auth=${authoritative ? authoritative.active : undefined})`,
+  // Echo key args so wiring tests can assert the handler threads
+  // payload.direction_counts through to the consolidated section builder.
+  buildDirectionPortfolioSection: (
+    _d: unknown,
+    maxActiveDirections: number,
+    _sys: unknown,
+    _scope: unknown,
+    authoritativeActiveCount?: number,
+    authoritativePausedCount?: number,
+  ) => `DIRPORTFOLIO(max=${maxActiveDirections},authActive=${authoritativeActiveCount},authPaused=${authoritativePausedCount})`,
   buildSweepComparisonSection: () => '',
   buildCiComplianceSection: () => '',
   buildPayloadStalenessSection: (staleness: Record<string, unknown> | undefined) =>
@@ -542,6 +556,7 @@ vi.mock('../telemetry.js', () => ({
   recordFormatRepairMiss: vi.fn(),
   recordLlmCallStart: vi.fn(),
   recordLlmTokens: vi.fn(),
+  recordProviderReportedUsage: vi.fn(),
   recordNumTurns: vi.fn(),
   recordViewportScreenshotDownload: vi.fn(),
   resetFormatComplianceTelemetry: vi.fn(),
@@ -737,12 +752,10 @@ describe('strategic prompt fingerprinting', () => {
     previousDecisionOutcomes: '',
     pastRetirementCritiquesSection: '',
     retiredDirectionsSummarySection: '',
-    dirSummaryText: 'No active directions.',
-    dirHealthSummary: 'Active: 0/10 slots.',
+    directionPortfolioSection: '## Direction Portfolio\nActive: 0/10 slots.\nNo critical gaps detected.\n\nNo directions exist yet.\n\nNo active directions — portfolio is empty.',
     userPausedSection: '',
     rejectedProposalsSection: '',
     operatorOverridesSection: '',
-    portfolioCompositionText: 'No active directions — portfolio is empty.',
     modelHealthSection: '',
     systemMaturitySection: '',
     driftSection: '',
@@ -1425,11 +1438,9 @@ describe('handleStrategic authoritative direction_counts wiring', () => {
     await handleStrategic('task-dc', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
 
     const p = capturedThinkerParams;
-    // The handler threads the authoritative active count (12) and the real
-    // ceiling (15) into all three direction builders.
-    expect(String(p?.dirHealthSummary)).toBe('DIRHEALTH(max=15,auth=12)');
-    expect(String(p?.portfolioCompositionText)).toBe('PORTFOLIO(auth=12)');
-    expect(String(p?.dirSummaryText)).toBe('DIRSUMMARY(auth=12)');
+    // The handler threads the authoritative active count (12) and pauses (1)
+    // into the consolidated portfolio section builder.
+    expect(String(p?.directionPortfolioSection)).toBe('DIRPORTFOLIO(max=15,authActive=12,authPaused=1)');
   });
 
   it('falls back to undefined authoritative count + default ceiling when direction_counts absent', async () => {
@@ -1441,9 +1452,7 @@ describe('handleStrategic authoritative direction_counts wiring', () => {
     await handleStrategic('task-dc-absent', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
 
     const p = capturedThinkerParams;
-    expect(String(p?.dirHealthSummary)).toBe('DIRHEALTH(max=10,auth=undefined)');
-    expect(String(p?.portfolioCompositionText)).toBe('PORTFOLIO(auth=undefined)');
-    expect(String(p?.dirSummaryText)).toBe('DIRSUMMARY(auth=undefined)');
+    expect(String(p?.directionPortfolioSection)).toBe('DIRPORTFOLIO(max=10,authActive=undefined,authPaused=undefined)');
   });
 });
 
@@ -1734,7 +1743,7 @@ describe('handleStrategic prompt section telemetry', () => {
     expect(sectionNames.has('running_update')).toBe(true);
     expect(sectionNames.has('context_prefix')).toBe(true);
     expect(sectionNames.has('design_doc')).toBe(true);
-    expect(sectionNames.has('portfolio_composition')).toBe(true);
+    expect(sectionNames.has('direction_portfolio')).toBe(true);
 
     // setPromptSizeTelemetry must have been called with the telemetry result.
     expect(setPromptSizeTelemetry).toHaveBeenCalledTimes(1);

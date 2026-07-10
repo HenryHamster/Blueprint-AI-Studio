@@ -3549,8 +3549,8 @@ _DUAL_HEAD_DIFF = (
 
 
 @pytest.mark.asyncio
-async def test_merge_held_on_dual_head_migration(db_session, mocker):
-    """A PR adding a colliding revision id is HELD: merge not called, returns False."""
+async def test_merge_dual_head_migration_spawns_guard_fix(db_session, mocker):
+    """A deterministic dual-head block spawns a migration fix and exits CI wait."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
     mocker.patch("app.github.create_pr_comment", return_value=None)
@@ -3580,6 +3580,11 @@ async def test_merge_held_on_dual_head_migration(db_session, mocker):
         "app.github.merge_pull_request",
         AsyncMock(return_value={"merged": True}),
     )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(return_value=(fake_fix, True)),
+    )
 
     project = Project(name="dual-head hold", user_id="test-user")
     db_session.add(project)
@@ -3596,9 +3601,89 @@ async def test_merge_held_on_dual_head_migration(db_session, mocker):
 
     assert result is False, "Guard must hold the merge on a dual-head collision"
     merge_mock.assert_not_called()
-    assert task.status == TaskStatus.EVALUATING, "Held merge leaves task EVALUATING"
-    assert "dual-head" in (task.latest_status_message or "").lower()
-    assert "0002" in (task.latest_status_message or "")
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.kwargs.get("fix_reason") == "migration_guard"
+    assert spawn_mock.await_args.kwargs.get("suppress_warm_handoff") is True
+    assert "0002" in (spawn_mock.await_args.kwargs.get("fix_prompt") or "")
+    assert task.status == TaskStatus.COMPLETED
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_waiting") is False
+    assert review_loop.get("ci_passed") is False
+    assert review_loop.get("migration_guard_state") == "fix_spawned"
+    assert review_loop.get("migration_guard_fix_spawned") == str(fake_fix.id)
+    assert review_loop.get("ci_fix_spawned") == str(fake_fix.id)
+    assert "_migration_finalization" not in (task.context or {})
+    assert "spawned migration fix" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_merge_dual_head_fix_spawn_defer_retries_ci_wait(db_session, mocker):
+    """A transient migration-fix spawn deferral remains retryable."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.review_pipeline import SPAWN_REASON_DEFERRED, SPAWN_REASON_KEY
+
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(
+            return_value=[
+                {
+                    "filename": "backend/alembic/versions/0002_dup.py",
+                    "status": "added",
+                    "patch": '+"""dup migration"""\n+revision = "0002"\n+down_revision = "0001"',
+                }
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        AsyncMock(return_value=_DUAL_HEAD_DIFF),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        AsyncMock(return_value=["0001_init.py", "0002_existing.py"]),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+
+    async def _defer_spawn(source_task, *_args, **_kwargs):
+        source_task.context = {
+            **(source_task.context or {}),
+            SPAWN_REASON_KEY: SPAWN_REASON_DEFERRED,
+        }
+        return None, False
+
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(side_effect=_defer_spawn),
+    )
+
+    project = Project(name="dual-head deferred fix spawn", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False
+    merge_mock.assert_not_called()
+    spawn_mock.assert_awaited_once()
+    assert task.status == TaskStatus.EVALUATING
+    assert task.requires_approval is not True
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_waiting") is True
+    assert review_loop.get("ci_passed") is True
+    assert review_loop.get("migration_guard_state") == "fix_deferred"
+    assert review_loop.get("migration_guard_fix_spawned") is None
+    assert "spawn was deferred" in (task.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio
@@ -3691,13 +3776,21 @@ async def test_merge_held_on_migration_fetch_failure(db_session, mocker):
         "app.github.merge_pull_request",
         AsyncMock(return_value={"merged": True}),
     )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(return_value=(None, False)),
+    )
 
     project = Project(name="guard defer", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = _make_task(db_session, project)
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"ci_waiting": True, "ci_passed": True},
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -3707,7 +3800,12 @@ async def test_merge_held_on_migration_fetch_failure(db_session, mocker):
 
     assert result is False, "A failed safety fetch must hold the merge (defer)"
     merge_mock.assert_not_called()
+    spawn_mock.assert_not_called()
     assert task.status == TaskStatus.EVALUATING
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("migration_guard_state") == "deferred"
+    assert review_loop.get("ci_waiting") is True
+    assert review_loop.get("ci_passed") is True
 
 
 @pytest.mark.asyncio
@@ -3738,13 +3836,21 @@ async def test_migration_guard_hold_reason_includes_http_exception_detail(
         "app.github.merge_pull_request",
         AsyncMock(return_value={"merged": True}),
     )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(return_value=(None, False)),
+    )
 
     project = Project(name="guard http exc", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    task = _make_task(db_session, project)
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"ci_waiting": True, "ci_passed": True},
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -3754,6 +3860,7 @@ async def test_migration_guard_hold_reason_includes_http_exception_detail(
 
     assert result is False, "HTTPException from guard must hold the merge"
     merge_mock.assert_not_called()
+    spawn_mock.assert_not_called()
     status_msg = task.latest_status_message or ""
     assert "upstream error" in status_msg, (
         f"HTTPException detail must appear in status message, got: {status_msg!r}"
@@ -5653,3 +5760,230 @@ async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
         .all()
     )
     assert len(rows) == 0, "No AuditFindingResolution rows expected for task without keys"
+
+
+# ─── General CI rerun gate (flake-tolerant) tests ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_general_rerun_fires(db_session, mocker):
+    """CI failure with rerun budget remaining calls rerun_failed_jobs,
+    increments ci_rerun_consumed in task context, updates latest_status_message,
+    and returns False (defers fix spawn to next sweep)."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        return_value=True,
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(type("FT", (), {"id": uuid.uuid4()})(), True),
+    )
+
+    project = Project(name="General rerun test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "FAILED test_x",
+        "failed_run_ids": [12345],
+        "setup_phase_failure": False,
+    }
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    # Must return False — no fix spawned, deferring to next sweep
+    assert result is False, "Expected False (rerun defers fix spawn to next sweep)"
+
+    # rerun_failed_jobs must have been called with the failed run ID
+    rerun_mock.assert_called_once_with("fake-token", "owner", "repo", 12345)
+
+    # spawn_pipeline_task must NOT have been called
+    spawn_mock.assert_not_called()
+
+    # Task context must track the consumed rerun
+    await db_session.refresh(task)
+    assert task.context.get("ci_rerun_consumed") == 1, (
+        f"Expected ci_rerun_consumed=1, got {task.context.get('ci_rerun_consumed')}"
+    )
+    # latest_status_message must reflect the rerun
+    assert "re-ran failed jobs" in (task.latest_status_message or ""), (
+        f"Expected status message to mention rerun, got {task.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_general_rerun_already_consumed(db_session, mocker):
+    """CI failure with ci_rerun_consumed already at budget does NOT call
+    rerun_failed_jobs and falls through to spawn a fix task."""
+    from app.ci_completion import _CI_RERUN_BUDGET, handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        return_value=True,
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+    mocker.patch(
+        "app.review_pipeline.build_ci_failure_fix_prompt",
+        return_value="fix prompt",
+    )
+
+    project = Project(name="Rerun exhausted", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create task with ci_rerun_consumed already at budget
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={},
+    )
+    task.context = {
+        **(task.context or {}),
+        "ci_rerun_consumed": _CI_RERUN_BUDGET,
+    }
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "FAILED test_x",
+        "failed_run_ids": [12345],
+        "setup_phase_failure": False,
+    }
+    await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    # rerun_failed_jobs must NOT have been called
+    rerun_mock.assert_not_called()
+
+    # A fix task must have been spawned
+    spawn_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_general_rerun_no_failed_run_ids(db_session, mocker):
+    """CI failure with empty failed_run_ids (API failure or quota active) does
+    NOT call rerun_failed_jobs and falls through to spawn a fix task."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        return_value=True,
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+    mocker.patch(
+        "app.review_pipeline.build_ci_failure_fix_prompt",
+        return_value="fix prompt",
+    )
+
+    project = Project(name="No failed run IDs", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "FAILED test_x",
+        "failed_run_ids": [],
+        "setup_phase_failure": False,
+    }
+    await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    # rerun_failed_jobs must NOT have been called (no run IDs to re-run)
+    rerun_mock.assert_not_called()
+
+    # A fix task must have been spawned
+    spawn_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_general_rerun_infra_takes_priority(db_session, mocker):
+    """When setup_phase_failure is True, the infra rerun gate fires instead
+    of the general rerun gate. The general rerun budget is not consumed."""
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        return_value=True,
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(type("FT", (), {"id": uuid.uuid4()})(), True),
+    )
+
+    project = Project(name="Infra rerun priority", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "FAILED test_x",
+        "failed_run_ids": [12345],
+        "setup_phase_failure": True,
+    }
+    await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    # rerun_failed_jobs must have been called (infra rerun path)
+    rerun_mock.assert_called_once_with("fake-token", "owner", "repo", 12345)
+
+    # No fix spawned
+    spawn_mock.assert_not_called()
+
+    # ci_rerun_consumed must NOT have been incremented (general rerun did not fire)
+    await db_session.refresh(task)
+    assert task.context.get("ci_rerun_consumed", 0) == 0, (
+        "General rerun gate must NOT consume its budget when infra rerun fires"
+    )

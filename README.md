@@ -4,18 +4,16 @@ Blueprint is a platform for launching, monitoring, and scaling autonomous Claude
 
 Blueprint also supports autonomous research mode: the orchestrator can generate and dispatch tasks from configurable strategic directions without manual intervention.
 
-The runtime is split across three main surfaces:
+The runtime is split across two main surfaces:
 
 - `backend/` - FastAPI orchestrator and background workers
-- `admin-ui/` - React admin dashboard on port `3001`
-- root `src/` - launcher UI on port `3000`
+- `admin-ui/` - React admin dashboard
 
 ## Architecture
 
 ```
-Launcher UI (React, root Vite app)   Admin UI (React workspace)
-        \                  /
-         \                /
+Admin UI (React workspace)
+        |
     Orchestrator (FastAPI / Cloud Run)
               |
     +---------+---------+
@@ -37,15 +35,13 @@ Agent VMs          Background workers
 
 - **Admin UI** (`admin-ui/`) — React dashboard for monitoring agents, reviewing directions, configuring settings, and viewing analytics. It also consumes the project WebSocket log stream.
 
-- **Launcher UI** (root `src/`) — Root Vite app for creating new tasks and viewing progress. Runs on port 3000 in local dev.
-
 - **Agent** (`agent/`) — TypeScript process that runs inside each VM. Claims its task, clones the repo, runs Claude Code with streaming output, handles the review-fix cycle, and creates a PR.
 
 - **Infrastructure** (`infra/`) — Terraform for VPC, Cloud NAT, Cloud Run, AlloyDB, and IAM. Packer builds the pre-baked agent VM image.
 
 ## Quick Start (Local Mode)
 
-Local mode runs agents as subprocesses instead of GCP VMs. You still need PostgreSQL, the backend API, and both frontend apps running locally.
+Local mode runs agents as subprocesses instead of GCP VMs. You still need PostgreSQL, the backend API, and the admin UI running locally.
 
 ```bash
 # 1. Copy and fill in environment variables
@@ -73,11 +69,11 @@ export WS_TICKET_SECRET=dev-ws-ticket-secret
 export LOCAL_MODE=true
 uvicorn app.main:app --reload --port 8080
 
-# 5. In another terminal, start the UIs (launcher on :3000, admin on :3001)
+# 5. In another terminal, start the UI
 npm install
 npm run dev
 
-# 6. Open http://localhost:3000 to launch tasks, or http://localhost:3001 for the admin dashboard
+# 6. Open http://localhost:3001 for the admin dashboard
 ```
 
 ## Production Setup (GCP)
@@ -131,7 +127,7 @@ See `.env.example` for the complete template with all variables.
 
 ## How It Works
 
-1. Open the launcher UI and click Launch Task
+1. Open the admin UI and create a new task
 2. Enter a GitHub repo (`owner/repo`), base branch, and a prompt
 3. The orchestrator creates a project and task, then assigns a VM name
 4. The orchestrator worker picks up the queued task and provisions a GCP VM, or a local subprocess in `LOCAL_MODE=true`
@@ -276,7 +272,7 @@ cp .env.example .env
 docker compose up -d db        # PostgreSQL
 cd backend && bash run_migrations.sh
 cd .. && npm install
-npm run dev                    # Starts launcher UI (3000) and admin UI (3001)
+npm run dev                    # Starts admin UI (3001)
 
 # In another terminal, start backend
 cd backend

@@ -55,6 +55,7 @@ from app.models import (
     get_task_total_llm_totals,
     get_task_total_vm_cost_usd,
 )
+from app.cost_telemetry_reconciliation import reconcile_llm_cost
 from app.llm_cost_attribution import (
     CACHE_CREATION_INPUT_RATE_MULTIPLIER,  # noqa: F401 — re-exported for callers
     LLM_CACHE_READ_INPUT_PRICING,  # noqa: F401 — re-exported for callers
@@ -131,6 +132,10 @@ AXIS_TOTAL_COST_PER_VERIFIED_TASK = "total_cost_per_verified_task"
 VERIFIED_TASK_DRIFT_MIN_COUNT = 20
 
 AXIS_REWORK_COST_SHARE = "rework_cost_share"
+AXIS_SALVAGE_COUNT = "salvage_count"
+AXIS_SALVAGE_MERGE_RATE = "salvage_merge_rate"
+AXIS_ACCEPTANCE_PROVEN_RATE = "acceptance_proven_rate"
+AXIS_ACCEPTANCE_SATISFIED_RATE = "acceptance_satisfied_rate"
 
 # Guard threshold for prompt_static_bytes: alert when static prompt size exceeds
 # this many source characters. Set well above the current measured value (~31k chars)
@@ -166,6 +171,10 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_LLM_CACHE_HIT_RATE,
     AXIS_TOTAL_COST_PER_VERIFIED_TASK,
     AXIS_REWORK_COST_SHARE,
+    AXIS_SALVAGE_COUNT,
+    AXIS_SALVAGE_MERGE_RATE,
+    AXIS_ACCEPTANCE_PROVEN_RATE,
+    AXIS_ACCEPTANCE_SATISFIED_RATE,
 )
 
 # ---------------------------------------------------------------------------
@@ -228,6 +237,18 @@ AXIS_CONSUMERS: dict[str, dict] = {
     AXIS_REWORK_COST_SHARE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
     },
+    AXIS_SALVAGE_COUNT: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_SALVAGE_MERGE_RATE: {
+        "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_ACCEPTANCE_PROVEN_RATE: {
+        "pending": "acceptance quality trend axis — awaiting UI consumer"
+    },
+    AXIS_ACCEPTANCE_SATISFIED_RATE: {
+        "pending": "acceptance quality trend axis — awaiting UI consumer"
+    },
 }
 
 NESTED_METRIC_CONSUMERS: dict[str, dict] = {
@@ -246,6 +267,10 @@ NESTED_METRIC_CONSUMERS: dict[str, dict] = {
     "panel_review_effectiveness": {
         "ground_truth": "Task.context.review_second_opinion.state (challenged_confirmed / challenged_revised / challenged_rejected)",
         "consumer": "efficiency_snapshot.write_snapshot (durable gate ROI signal in daily snapshot)",
+    },
+    "effort_model_efficiency": {
+        "ground_truth": "Task.first_payload[effort] + Task.provider + Task.model + Task.context.pr_merged + api_call_summary tokens priced via LLM_TOKEN_PRICING",
+        "consumer": "efficiency_snapshot.write_snapshot → read_baseline_with_drift (persisted by_model efficiency breakdown for DeepSeek vs Anthropic A/B)",
     },
 }
 
@@ -272,6 +297,13 @@ LAST_ALERTED_UNPRICED_KEY = "last_alerted_unpriced_coverage"
 # rather than every tick, and re-arms on recovery.
 LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY = "last_alerted_self_repair_burn_share"
 
+# Sub-key under the efficiency_baseline container recording whether the last
+# provider-routing verdict transition check alerted on ADOPT or REJECT. The
+# per-project transition check (:func:`maybe_alert_provider_routing_transition`)
+# compares the current verdict against this marker so it fires once per
+# decision-boundary crossing rather than every hourly tick.
+LAST_ALERTED_ROUTING_KEY = "last_alerted_routing_verdict"
+
 # Fire the unpriced-models alert when at least this share of attributed
 # (provider+model+token-bearing) tasks ran on combos absent from the pricing
 # table, and at least this many such tasks exist (so a single stray task on a
@@ -283,8 +315,10 @@ UNPRICED_ALERT_MIN_TASKS = 3
 # Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
 
-# Cap snapshot history length (~1 year of daily snapshots).
-_SNAPSHOT_HISTORY_MAX = 365
+# Cap snapshot history length (2 weeks of daily snapshots).
+# Each snapshot is ~17–21 KB; 14 entries keeps efficiency_baseline bounded at
+# roughly 300 KB while still covering a meaningful trend window.
+_SNAPSHOT_HISTORY_MAX = 14
 
 # Metric-definition version stamp applied to every new snapshot.  Increment
 # this whenever a metric's computation changes in a way that produces a
@@ -311,7 +345,11 @@ _SNAPSHOT_HISTORY_MAX = 365
 #      drift floor of ≥20 verified merges.
 # v12: rework_cost_share axis added — fraction of total LLM spend consumed by fix/
 #      re-attempt tasks, computed from the existing per-PR chain breakdown.
-METRIC_DEF_VERSION = "v12"
+# v13: effort_model_efficiency block added — per-(provider,model) by_model efficiency
+#      breakdown (verified_landed_rate, cost_per_merge, run counts) persisted from
+#      compute_effort_model_efficiency for retroactive A/B verification of DeepSeek
+#      vs Anthropic routing across daily snapshots.
+METRIC_DEF_VERSION = "v13"
 
 
 async def _load_recent_tasks(
@@ -1117,6 +1155,81 @@ def compute_provider_routing_verdict(
         "Adopt DeepSeek routing for low/medium-effort tasks — cost is lower with "
         "no quality regression.",
     )
+
+
+def compute_provider_routing_share(
+    by_model_rows: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Aggregate by-model efficiency rows into a per-provider routing share block.
+
+    Takes the same ``by_model`` rows from :func:`compute_effort_model_efficiency`
+    as :func:`compute_provider_routing_verdict` and returns a compact summary of
+    task count and verified merge rate by provider, plus overall totals — so
+    operators can confirm at a glance which provider handled what fraction of
+    tasks and at what verified-landing rate.
+
+    Returns::
+
+        {
+            "by_provider": [
+                {"provider": "deepseek", "run_count": 30,
+                 "pr_eligible_run_count": 28, "verified_landed_count": 20,
+                 "verified_landed_rate": 0.714, "total_cost_usd": 12.50,
+                 "cost_per_merge": 0.625},
+                ...
+            ],
+            "total_run_count": 40,
+            "total_pr_eligible_run_count": 36,
+        }
+    """
+    from collections import defaultdict
+
+    # Aggregate by lowercased provider.
+    accum: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "run_count": 0,
+            "pr_eligible_run_count": 0,
+            "verified_landed_count": 0,
+            "total_cost_usd": 0.0,
+        }
+    )
+    for row in by_model_rows:
+        provider = str(row.get("provider") or "other").lower()
+        b = accum[provider]
+        b["run_count"] += int(row.get("run_count", 0))
+        b["pr_eligible_run_count"] += int(row.get("pr_eligible_run_count", 0))
+        b["verified_landed_count"] += int(row.get("verified_landed_count", 0))
+        b["total_cost_usd"] += float(row.get("total_cost_usd", 0))
+
+    by_provider = []
+    total_run_count = 0
+    total_pr_eligible_run_count = 0
+
+    for provider in sorted(accum.keys()):
+        b = accum[provider]
+        total_run_count += b["run_count"]
+        total_pr_eligible_run_count += b["pr_eligible_run_count"]
+        pe = b["pr_eligible_run_count"]
+        vc = b["verified_landed_count"]
+        by_provider.append(
+            {
+                "provider": provider,
+                "run_count": b["run_count"],
+                "pr_eligible_run_count": pe,
+                "verified_landed_count": vc,
+                "verified_landed_rate": round(vc / pe, 4) if pe else None,
+                "total_cost_usd": round(b["total_cost_usd"], 6),
+                "cost_per_merge": (
+                    round(b["total_cost_usd"] / vc, 6) if vc else None
+                ),
+            }
+        )
+
+    return {
+        "by_provider": by_provider,
+        "total_run_count": total_run_count,
+        "total_pr_eligible_run_count": total_pr_eligible_run_count,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2486,6 +2599,41 @@ def _compute_rework_cost_share(tasks: list[Task]) -> float | None:
     return breakdown.get("rework_share_of_total_llm_cost")
 
 
+def _compute_cost_telemetry_reconciliation(tasks: list[Task]) -> dict | None:
+    """Self-check: reconcile LLM cost telemetry against an independent
+    recomputation and log if the two paths disagree beyond the declared
+    tolerance.
+
+    Returns the reconciliation dict when tasks is non-empty and at least one
+    task contributes priced LLM attempts; returns None when there are no tasks
+    (the check would be vacuous) or when no tasks have a priced provider/model
+    (zero-cost input with no pricing coverage is not a telemetry defect).
+    """
+    if not tasks:
+        return None
+    result = reconcile_llm_cost(tasks)
+    # Only flag divergence when there is actual cost to reconcile — tasks with
+    # zero-cost unpriced combos produce 0.0 from both paths and trivially agree.
+    if result.total_cost_snapshot_path > 0 and not result.within_tolerance:
+        logger.warning(
+            "cost_telemetry_reconciliation FAILED — snapshot %.8f vs direct %.8f "
+            "(delta=%.2e, tolerance=%.2e) over %d task(s)",
+            result.total_cost_snapshot_path,
+            result.total_cost_direct_path,
+            result.absolute_delta,
+            result.tolerance,
+            result.task_count,
+        )
+    if not result.cache_hit_rate_within_tolerance and result.total_input_tokens_snapshot_path > 0:
+        logger.warning(
+            "cost_telemetry_reconciliation cache-hit-rate FAILED — snapshot %.10f vs direct %.10f "
+            "(delta=%.2e) over %d task(s)",
+            result.cache_hit_rate_snapshot_path,
+            result.cache_hit_rate_direct_path,
+            result.cache_hit_rate_delta,
+            result.task_count,
+        )
+    return result.asdict()
 
 
 def _compute_prompt_static_bytes() -> int | None:
@@ -2539,6 +2687,58 @@ def _compute_prompt_static_bytes() -> int | None:
             return None
         total += length
     return total
+
+
+async def _compute_salvage_axes(
+    session: AsyncSession, project_id: uuid.UUID
+) -> dict[str, int | float | None]:
+    """Query salvage-bundle tasks created in the axis window.
+
+    Returns a dict with ``salvage_count`` (total salvage_bundle tasks created
+    in the window) and ``salvage_merge_rate`` (fraction of COMPLETED salvage
+    bundles that have ``pr_merged == true``).  Both are ``None`` when there
+    are no salvage bundles in the window.
+    """
+    cutoff = _utcnow() - timedelta(days=_AXIS_WINDOW_DAYS)
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.updated_at >= cutoff,
+            Task.payloads[0]["type"].as_string() == "salvage_bundle",
+        )
+        .options(load_only(Task.id, Task.status, Task.context, raiseload=True))
+    )
+    salvage_tasks = list((await session.execute(stmt)).scalars().all())
+
+    if not salvage_tasks:
+        return {"salvage_count": None, "salvage_merge_rate": None}
+
+    total = len(salvage_tasks)
+    completed_merged = sum(
+        1
+        for t in salvage_tasks
+        if t.status == TaskStatus.COMPLETED
+        and (t.context or {}).get("pr_merged")
+    )
+
+    return {
+        "salvage_count": total,
+        "salvage_merge_rate": (
+            round(completed_merged / total, 4) if total > 0 else None
+        ),
+    }
+
+
+def _acceptance_quality_axes(tasks: list[Task]) -> dict[str, float | None]:
+    """Return proven_rate and satisfied_rate snapshot axes from recent tasks."""
+    from app.acceptance_gate import summarize_version_acceptance_aggregate
+
+    agg = summarize_version_acceptance_aggregate(tasks)
+    return {
+        AXIS_ACCEPTANCE_PROVEN_RATE: agg["proven_rate"],
+        AXIS_ACCEPTANCE_SATISFIED_RATE: agg["satisfied_rate"],
+    }
 
 
 async def compute_current_axes(
@@ -2613,6 +2813,10 @@ async def compute_current_axes(
     if _peff_post_deploy is not None:
         _peff_post_deploy["gate_health"] = compute_gate_health_verdict(_peff_post_deploy)
 
+    # Salvage-bundle effectiveness: count of salvage tasks spawned in the
+    # window and the fraction that reached a merged state.
+    _salvage = await _compute_salvage_axes(session, project_id)
+
     return {
         AXIS_COST_PER_MERGED_PR: _compute_cost_per_merged_pr(tasks),
         AXIS_VM_COLD_START_P50_MS: _compute_vm_cold_start_p50_ms(tasks),
@@ -2635,6 +2839,8 @@ async def compute_current_axes(
         AXIS_TOTAL_COST_PER_VERIFIED_TASK: _compute_total_cost_per_verified_task(tasks),
         "total_cost_per_verified_task_denominator": _compute_verified_merge_count(tasks),
         AXIS_REWORK_COST_SHARE: _compute_rework_cost_share(tasks),
+        AXIS_SALVAGE_COUNT: _salvage["salvage_count"],
+        AXIS_SALVAGE_MERGE_RATE: _salvage["salvage_merge_rate"],
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
@@ -2720,6 +2926,31 @@ async def compute_current_axes(
         # Anthropic cost ratio + verified-merge-rate delta, persisted in the
         # daily snapshot so the A/B is machine-checkable on the deployed instance.
         "provider_routing_verdict": provider_routing_verdict,
+        # Per-(provider,model) efficiency breakdown from compute_effort_model_efficiency:
+        # by_model rows with verified_landed_rate, cost_per_merge, run counts, and token
+        # volumes, plus aggregate totals. Persisted in the daily snapshot so the DeepSeek
+        # vs Anthropic A/B (direction d-cf39cb40) can be verified retroactively from
+        # persisted history rather than only from the live digest endpoint.
+        "effort_model_efficiency": {
+            "by_model": _effort_model["by_model"],
+            "totals": _effort_model["totals"],
+        },
+        # Per-provider routing share (direction d-cf39cb40): aggregates by_model into
+        # a compact by_provider block so operators can confirm at a glance which
+        # provider handled what fraction of tasks, at what cost and verified-landing
+        # rate. Persisted alongside the verdict for retroactive decomposition.
+        "provider_routing_share": compute_provider_routing_share(_effort_model["by_model"]),
+        # Self-check: reconcile LLM cost telemetry against an independent
+        # recomputation path so operators are alerted if the two diverge beyond
+        # the declared tolerance. Non-zero tasks with at least one priced attempt
+        # are required for a meaningful check.
+        "cost_telemetry_reconciliation": _compute_cost_telemetry_reconciliation(tasks),
+        # Acceptance evidence quality trend (direction d-99daddbd): proven_rate
+        # (machine-checked proofs / total merges) and satisfied_rate
+        # (proven + satisfied_unproven / total merges) persisted as snapshot axes
+        # so operators can observe whether evidence quality improves or degrades
+        # as acceptance-gate changes land. None when no completed tasks in window.
+        **_acceptance_quality_axes(tasks),
     }
 
 
@@ -2775,6 +3006,7 @@ async def write_snapshot(
                 FORMAT_COMPLIANCE_KEY,
                 "llm_cost_attribution",
                 "panel_review_effectiveness",
+                "effort_model_efficiency",
             ):
                 if snapshot.get(_key) is not None:
                     _prov[_key] = {
@@ -2803,6 +3035,7 @@ async def write_snapshot(
                     FORMAT_COMPLIANCE_KEY,
                     "llm_cost_attribution",
                     "panel_review_effectiveness",
+                    "effort_model_efficiency",
                 ]:
                     _bval = baseline.get(_member)
                     if _bval is None:
@@ -2911,6 +3144,15 @@ async def write_snapshot(
                     "seeded_at": captured_at,
                     "snapshot_captured_at": captured_at,
                 }
+            if (
+                baseline.get("effort_model_efficiency") is None
+                and snapshot.get("effort_model_efficiency") is not None
+            ):
+                baseline["effort_model_efficiency"] = snapshot["effort_model_efficiency"]
+                provenance["effort_model_efficiency"] = {
+                    "seeded_at": captured_at,
+                    "snapshot_captured_at": captured_at,
+                }
             baseline["_member_provenance"] = provenance
             container["baseline"] = baseline
 
@@ -2932,6 +3174,26 @@ async def write_snapshot(
         captured_at,
         {k: axes[k] for k in ALL_AXES},
     )
+
+    # Trigger alert if cost telemetry reconciliation failed tolerance.
+    reconciliation: dict | None = axes.get("cost_telemetry_reconciliation")
+    if (
+        reconciliation
+        and reconciliation.get("within_tolerance") is False
+        and (reconciliation.get("total_cost_snapshot_path") or 0) > 0
+    ):
+        from app.alert_dispatch import (
+            _maybe_create_cost_telemetry_reconciliation_alert,
+        )
+
+        await _maybe_create_cost_telemetry_reconciliation_alert(
+            project_id,
+            session,
+            absolute_delta=reconciliation.get("absolute_delta", 0.0),
+            tolerance=reconciliation.get("tolerance", 1e-6),
+            task_count=reconciliation.get("task_count", 0),
+        )
+
     return snapshot
 
 
@@ -3320,6 +3582,7 @@ async def read_baseline_with_drift(
             FORMAT_COMPLIANCE_KEY,
             "llm_cost_attribution",
             "panel_review_effectiveness",
+            "effort_model_efficiency",
         ]:
             _bval = baseline.get(_member)
             if _bval is None:
@@ -3642,6 +3905,16 @@ async def read_baseline_with_drift(
         # cost ratio + verified-merge-rate delta, persisted in the daily snapshot and
         # surfaced here from the latest snapshot so the A/B is machine-checkable.
         "provider_routing_verdict": latest.get("provider_routing_verdict"),
+        # Per-provider routing share from the latest snapshot: by_provider block
+        # with run counts, cost, and verified landing rate per provider, plus
+        # aggregate totals. Persisted alongside the verdict in the daily snapshot
+        # for retroactive decomposition of model routing efficiency.
+        "provider_routing_share": latest.get("provider_routing_share"),
+        # Per-(provider,model) efficiency breakdown from the latest snapshot:
+        # by_model rows with verified_landed_rate, cost_per_merge, run counts, and
+        # aggregate totals. Persisted in the daily snapshot for retroactive A/B
+        # verification of DeepSeek vs Anthropic routing across daily snapshots.
+        "effort_model_efficiency": latest.get("effort_model_efficiency"),
         # Recommended sample_rate for the challenger gate, computed on-the-fly from
         # the latest snapshot's panel_review_effectiveness so operators always see a
         # fresh recommendation without waiting for the next daily snapshot write.
@@ -3961,9 +4234,21 @@ async def maybe_alert_self_repair_burn_share(
     from app.models import AlertSeverity
     from app.task_locking import with_design_doc_locked
 
+    from app.digest_metrics import _accumulate_format_compliance
+
     tasks = await _load_recent_tasks(session, project_id)
     llm_attribution = _compact_llm_cost_attribution(tasks)
     burn_share = llm_attribution.get(SELF_REPAIR_BURN_SHARE_KEY)
+
+    # Extract top offending schemas by repair_attempt count for actionable alert context.
+    fc_block = _accumulate_format_compliance(tasks)
+    by_schema = fc_block.get("by_schema") or {}
+    top_schemas: list[tuple[str, int]] = sorted(
+        ((name, entry.get("repair_attempts", 0)) for name, entry in by_schema.items()
+         if entry.get("repair_attempts", 0) > 0),
+        key=lambda x: x[1],
+        reverse=True,
+    )[:3]
 
     # Elevated when burn_share exists and exceeds the threshold.
     elevated = (
@@ -3998,6 +4283,7 @@ async def maybe_alert_self_repair_burn_share(
         burn_share=burn_share,
         threshold=SELF_REPAIR_BURN_SHARE_THRESHOLD,
         severity=AlertSeverity.WARNING,
+        top_schemas=top_schemas or None,
     )
     logger.info(
         "[SELF_REPAIR_BURN_SHARE_ALERT] project=%s burn_share=%.4f threshold=%.4f",
@@ -4006,6 +4292,110 @@ async def maybe_alert_self_repair_burn_share(
         SELF_REPAIR_BURN_SHARE_THRESHOLD,
     )
     return True
+
+
+async def maybe_alert_provider_routing_transition(
+    session: AsyncSession, project_id: uuid.UUID
+) -> str | None:
+    """Raise an operator Alert when the provider routing A/B verdict transitions
+    to ADOPT or REJECT, deduplicated per project + verdict.
+
+    The DeepSeek-vs-Anthropic routing A/B produces a verdict from the per-model
+    efficiency breakdown once enough PR-eligible tasks have landed on each side.
+    ADOPT (DeepSeek is cheaper with no quality regression) and REJECT (cost not
+    meaningfully lower or quality regressed) are decision boundaries — operators
+    should act on them, not poll the efficiency panel to discover them.
+
+    Edge-triggered against ``last_alerted_routing_verdict`` in the efficiency-
+    baseline container (locked read-modify-write, mirroring
+    :func:`maybe_alert_pool_payoff_transition`): fires once per verdict state,
+    does not re-fire while the same verdict persists. Returns the verdict state
+    when an alert fired, else ``None``.
+    """
+    from app.alert_dispatch import _maybe_create_provider_routing_alert
+    from app.alert_policy import alert_policy_allows
+    from app.models import AlertSeverity
+    from app.task_locking import project_lock, with_design_doc_locked
+
+    drift = await read_baseline_with_drift(session, project_id)
+    verdict = drift.get("provider_routing_verdict") or {}
+    state = verdict.get("state")
+
+    # Only ADOPT and REJECT are alert-worthy; INSUFFICIENT_DATA is the
+    # default "keep measuring" state and should not page operators.
+    if state not in (PROVIDER_ROUTING_ADOPT, PROVIDER_ROUTING_REJECT):
+        return None
+
+    supporting = dict(verdict.get("supporting") or {})
+    recommended_action = verdict.get("recommended_action") or ""
+
+    decision = await alert_policy_allows(
+        session,
+        project_id,
+        "efficiency.provider_routing_verdict",
+        severity=AlertSeverity.WARNING,
+    )
+    if not decision.emit:
+        logger.info(
+            "[ROUTING_ALERT] project=%s verdict=%s suppressed=%s",
+            project_id,
+            state,
+            decision.reason,
+        )
+        return None
+
+    # Transition edge: only fire when the alert-worthy state differs from the
+    # last state we have a durable alert for.
+    should_fire = False
+    async with project_lock(session, project_id, skip_locked=False) as project:
+        if project is None:
+            return None
+        doc = dict(project.design_doc or {})
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        should_fire = container.get(LAST_ALERTED_ROUTING_KEY) != state
+    await session.rollback()
+
+    if not should_fire:
+        return None
+
+    alert, created = await _maybe_create_provider_routing_alert(
+        project_id,
+        session,
+        verdict_state=state,
+        supporting=supporting,
+        recommended_action=recommended_action,
+        severity=AlertSeverity.WARNING,
+    )
+    if alert is None:
+        return None
+
+    # Advance the marker inside a design-doc locked block so a concurrent
+    # snapshot writer cannot clobber it.
+    changed = {"fire": False}
+
+    def _advance_marker(doc: Dict[str, Any]) -> None:
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        if container.get(LAST_ALERTED_ROUTING_KEY) == state:
+            return
+        container[LAST_ALERTED_ROUTING_KEY] = state
+        doc[DESIGN_DOC_KEY] = container
+        changed["fire"] = True
+
+    wrote_marker = await with_design_doc_locked(
+        session, project_id, _advance_marker, skip_locked=False
+    )
+    if wrote_marker and changed["fire"]:
+        await session.commit()
+    else:
+        await session.rollback()
+    if not created:
+        return None
+    logger.info(
+        "[ROUTING_ALERT] project=%s verdict=%s",
+        project_id,
+        state,
+    )
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -4097,6 +4487,44 @@ def _format_rework_attribution(rework_breakdown: Dict[str, Any]) -> Dict[str, An
     }
 
 
+def _compute_llm_cost_by_account(tasks: list[Task]) -> list[Dict[str, Any]]:
+    """Per-account LLM token/cost rollup — groups tasks by llm_account_id, sorted by cost descending."""
+    from collections import defaultdict
+    from app.max_plan_pool import get_task_llm_account_id
+
+    buckets: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"input_tokens": 0, "output_tokens": 0, "llm_call_count": 0,
+                 "task_count": 0, "cost_usd": 0.0}
+    )
+    for t in tasks:
+        account_id = get_task_llm_account_id(t) or "unknown"
+        b = buckets[account_id]
+        seen_this_task = False
+        for (provider, model, it, ot, cc, cache_cr, cache_rd) in _task_llm_attempts(t):
+            if it <= 0 and ot <= 0:
+                continue
+            key = (provider.lower(), model.lower()) if provider and model else None
+            pricing = LLM_TOKEN_PRICING.get(key) if key else None
+            if pricing:
+                cost = _price_llm_attempt(it, ot, cache_cr, cache_rd, *pricing,
+                                           provider=provider, model=model)
+            else:
+                cost = 0.0
+            b["input_tokens"] += int(it)
+            b["output_tokens"] += int(ot)
+            b["llm_call_count"] += cc
+            b["cost_usd"] += cost
+            seen_this_task = True
+        if seen_this_task:
+            b["task_count"] += 1
+    for v in buckets.values():
+        v["cost_usd"] = round(v["cost_usd"], 6)
+    return [
+        {"account_id": aid, **data}
+        for aid, data in sorted(buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True)
+    ]
+
+
 @router.get("/projects/{project_id}/llm-cost-breakdown")
 async def get_llm_cost_breakdown(
     project_id: uuid.UUID,
@@ -4177,6 +4605,7 @@ async def get_llm_cost_breakdown(
         "generated_at": _utcnow().isoformat(),
         **breakdown,
         "by_task_type": compute_llm_cost_by_task_type(tasks),
+        "by_account": _compute_llm_cost_by_account(tasks),
         "rework_attribution": _format_rework_attribution(rework_breakdown),
     }
 

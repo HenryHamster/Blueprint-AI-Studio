@@ -49,6 +49,10 @@ export interface ResourceEnvelopeConfig {
    *  a few hours rather than wedging). `false`/undefined means cloud fallback is
    *  allowed (the default). */
   require_local_runner?: boolean;
+  /** When true, exceeding the spend ceiling automatically pauses the project
+   *  (project.paused = True) until an operator manually unpauses it. `false`/
+   *  undefined means soft-defer tasks but don't pause the project (the default). */
+  pause_on_ceiling_exceeded?: boolean;
 }
 
 export interface BuildConfig {

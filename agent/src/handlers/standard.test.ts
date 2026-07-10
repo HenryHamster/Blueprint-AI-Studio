@@ -211,7 +211,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, handleSalvageBundle, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata, assignCapabilityHoldbackArm, resolveVisualAcceptance } from './standard.js';
 import { setupWorkspace, runClaudeCode, sendHeartbeatSync, getProviderRunner } from '../index.js';
 import { resetLlmTelemetry, getLlmTelemetry, buildPromptSizeTelemetry, setPromptSizeTelemetry } from '../telemetry.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
@@ -5026,5 +5026,76 @@ describe('prompt size telemetry', () => {
     expect(telemetry.prompt_size_bytes).toBeNull();
     expect(telemetry.prompt_section_count).toBeNull();
     expect(telemetry.prompt_section_sizes).toBeNull();
+  });
+});
+
+// ── Salvage bundle handler ──────────────────────────────────────────────
+describe('handleSalvageBundle', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('includes finding prompt content in the built prompt string', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    const payload = {
+      salvaged_findings: [
+        {
+          title: 'Fix flaky test',
+          discard_reason: 'decayed',
+          prompt: 'Investigate the flaky websocket reconnect test — add proper async wait logic and ensure the test does not race against the server heartbeat.',
+          description: 'short description',
+          related_files: ['tests/test_ws.py'],
+        },
+      ],
+    };
+    await handleSalvageBundle(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('Fix flaky test');
+    expect(prompt).toContain('Investigate the flaky websocket reconnect test');
+    expect(prompt).toContain('tests/test_ws.py');
+  });
+
+  it('falls back to description when prompt is empty', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    const payload = {
+      salvaged_findings: [
+        {
+          title: 'Refactor helper',
+          discard_reason: 'decayed',
+          prompt: '',
+          description: 'This is a long description that should appear in the prompt when prompt is empty.',
+          related_files: ['src/helper.ts'],
+        },
+      ],
+    };
+    await handleSalvageBundle(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('Refactor helper');
+    expect(prompt).toContain('This is a long description that should appear');
+    expect(prompt).not.toContain('Prompt:');
+  });
+
+  it('includes claims as a bulleted list when present', async () => {
+    const task = { title: 'Task', description: '', context: {}, project_context: {} };
+    const payload = {
+      salvaged_findings: [
+        {
+          title: 'Memory leak in cache',
+          discard_reason: 'decayed',
+          prompt: 'Fix the unbounded cache growth in the metrics aggregator.',
+          claims: [
+            'Cache entries are never evicted after TTL expiry',
+            'Aggregator retains references to all metric keys',
+            'Heap grows linearly with unique metric count over uptime',
+          ],
+          related_files: ['src/cache.ts'],
+        },
+      ],
+    };
+    await handleSalvageBundle(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = capturedPrompt();
+    expect(prompt).toContain('Cache entries are never evicted after TTL expiry');
+    expect(prompt).toContain('Aggregator retains references to all metric keys');
+    expect(prompt).toContain('Heap grows linearly');
   });
 });

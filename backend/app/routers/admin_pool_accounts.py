@@ -21,6 +21,7 @@ from sqlmodel import select
 from app.admin_helpers import _get_user_project
 from app.auth import get_current_user, require_admin
 from app.database import get_session, resolve_dialect_name
+from app.field_encryption import decrypt_field, encrypt_field
 from app.digest_cache import DigestCache, get_digest_cache
 from app.digest_precompute import annotate_precompute_metadata
 from app.models import (
@@ -201,7 +202,7 @@ def _stored_oauth_token_ref(
 
 
 def _account_secret_ref(db_account: MaxPlanAccount) -> str | None:
-    return db_account.secret_blob_ref or db_account.oauth_token
+    return decrypt_field(db_account.secret_blob_ref) or decrypt_field(db_account.oauth_token)
 
 
 _CAP_FIELDS = (
@@ -513,6 +514,10 @@ def _serialize_max_plan_account_row(
         "status_reasons": status_reasons,
         "usage": usage,
         "usage_snapshot": usage_snapshot,
+        # Persisted rate-limit/usage headroom snapshot (survives restarts).
+        # In-memory usage_snapshot above is the live probe; this is the last
+        # known-good value from the DB, available even when the pool is cold.
+        "rate_limit_usage": db_account.rate_limit_usage,
     }
 
 
@@ -868,7 +873,7 @@ async def add_max_plan_account(
         provider=provider,
         auth_mode=auth_mode,
         oauth_token=None,
-        claude_config_json=claude_config_json,
+        claude_config_json=encrypt_field(claude_config_json),
         secret_blob_ref=None,
         provider_metadata=normalized_metadata or None,
         token_created_at=now,
@@ -887,9 +892,9 @@ async def add_max_plan_account(
         stored_secret_ref = await store_user_secret(
             "system", secret_name, normalized_secret
         )
-        db_account.secret_blob_ref = stored_secret_ref
-        db_account.oauth_token = _stored_oauth_token_ref(
-            provider, auth_mode, stored_secret_ref
+        db_account.secret_blob_ref = encrypt_field(stored_secret_ref)
+        db_account.oauth_token = encrypt_field(
+            _stored_oauth_token_ref(provider, auth_mode, stored_secret_ref)
         )
         session.add(db_account)
         await session.commit()
@@ -910,12 +915,12 @@ async def add_max_plan_account(
         "name": db_account.name,
         "provider": db_account.provider.value,
         "auth_mode": db_account.auth_mode.value,
-        "secret_blob_ref": db_account.secret_blob_ref,
+        "secret_blob_ref": decrypt_field(db_account.secret_blob_ref),
         "provider_metadata": db_account.provider_metadata or {},
         "runtime_secret": normalized_secret,
         "runtime_ready": bool(normalized_secret),
         "oauth_token": _runtime_pool_secret(provider, auth_mode, normalized_secret),
-        "claude_config_json": db_account.claude_config_json,
+        "claude_config_json": decrypt_field(db_account.claude_config_json),
         "enabled": db_account.enabled,
         "active_tasks": 0,
         "total_tasks": db_account.total_tasks,
@@ -1196,8 +1201,8 @@ async def update_max_plan_account(
         db_account.provider_metadata = normalized_metadata or None
 
     if "claude_config_json" in payload:
-        db_account.claude_config_json = _validate_claude_config_json(
-            payload.get("claude_config_json")
+        db_account.claude_config_json = encrypt_field(
+            _validate_claude_config_json(payload.get("claude_config_json"))
         )
     if (
         target_provider != LLMProviderName.ANTHROPIC
@@ -1234,17 +1239,19 @@ async def update_max_plan_account(
                 status_code=503,
                 detail="Secret storage temporarily unavailable, please retry",
             ) from exc
-        db_account.secret_blob_ref = stored_secret_ref
-        db_account.oauth_token = _stored_oauth_token_ref(
-            target_provider, target_auth_mode, stored_secret_ref
+        db_account.secret_blob_ref = encrypt_field(stored_secret_ref)
+        db_account.oauth_token = encrypt_field(
+            _stored_oauth_token_ref(target_provider, target_auth_mode, stored_secret_ref)
         )
         db_account.token_created_at = _utcnow()
 
     if "provider" in payload or "auth_mode" in payload:
-        db_account.oauth_token = _stored_oauth_token_ref(
-            db_account.provider,
-            db_account.auth_mode,
-            db_account.secret_blob_ref,
+        db_account.oauth_token = encrypt_field(
+            _stored_oauth_token_ref(
+                db_account.provider,
+                db_account.auth_mode,
+                decrypt_field(db_account.secret_blob_ref),
+            )
         )
 
     db_account.updated_at = _utcnow()
@@ -1258,9 +1265,9 @@ async def update_max_plan_account(
             mem_account["name"] = db_account.name
             mem_account["provider"] = db_account.provider.value
             mem_account["auth_mode"] = db_account.auth_mode.value
-            mem_account["secret_blob_ref"] = db_account.secret_blob_ref
+            mem_account["secret_blob_ref"] = decrypt_field(db_account.secret_blob_ref)
             mem_account["provider_metadata"] = db_account.provider_metadata or {}
-            mem_account["claude_config_json"] = db_account.claude_config_json
+            mem_account["claude_config_json"] = decrypt_field(db_account.claude_config_json)
             mem_account["daily_task_cap"] = db_account.daily_task_cap
             mem_account["max_concurrent_tasks"] = db_account.max_concurrent_tasks
             mem_account["auto_disable_after_rate_limits"] = (

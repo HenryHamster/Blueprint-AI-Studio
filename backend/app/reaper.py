@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 from typing import Dict
 
+from sqlalchemy import inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -297,6 +298,7 @@ from app.reaper_sweeps import (
     sweep_closed_handmerge_prs,
     _sweep_strategic_cycle_starvation,
 )
+from app.acceptance_gate import backfill_acceptance_verdicts
 
 
 async def _mark_landed_parent_dependents(parent_id, session) -> None:
@@ -739,10 +741,28 @@ async def reaper_service():
                 # orphan loop crashes mid-iteration on the very first task.
                 # Iterate by id instead so no expired-attribute access happens.
                 _orphaned_task_ids: list[str] = []
+                _orphaned_project_ids: list[uuid.UUID] = []
                 if orphaned_tasks:
                     _orphaned_task_ids = [t.id for t in orphaned_tasks]
+                    _orphaned_project_ids = list(
+                        {t.project_id for t in orphaned_tasks}
+                    )
                     await session.commit()
                     session.expire_all()
+
+                # Batch-load all projects referenced by orphaned tasks to
+                # avoid N+1 SELECTs in the orphan-processing loop below (each
+                # of the 3 sites that read task.project_id previously issued a
+                # separate await session.get(Project, ...) query).
+                _projects_batch: dict[uuid.UUID, Project] = {}
+                if _orphaned_project_ids:
+                    _proj_stmt = select(Project).where(
+                        Project.id.in_(_orphaned_project_ids)
+                    )
+                    _proj_result = await session.execute(_proj_stmt)
+                    _projects_batch = {
+                        _p.id: _p for _p in _proj_result.scalars().all()
+                    }
 
                 # Collect old VM IDs for deletion after commit (can't set attrs on SQLModel)
                 _reaper_old_vms: Dict[str, str] = {}
@@ -804,6 +824,23 @@ async def reaper_service():
                     for _child in _all_children:
                         _children_by_parent[_child.parent_task_id].append(_child)
 
+                # Batch-fetch all orphan tasks before the loop to
+                # avoid N+1 session.get calls.  After a per-row commit
+                # (line ~2209) all cached instances are expired — fall
+                # back to session.get for the affected row.
+                _orphan_task_map: dict[uuid.UUID, Task] = {}
+                if _orphaned_task_ids:
+                    _orphan_rows = (
+                        (
+                            await session.execute(
+                                select(Task).where(Task.id.in_(_orphaned_task_ids))
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    _orphan_task_map = {t.id: t for t in _orphan_rows}
+
                 for _orphan_loop_idx, task_id in enumerate(_orphaned_task_ids):
                     # Stop taking NEW orphans once the wall-time budget is spent.
                     # The remainder re-qualify next cycle via the Step-1 scan, so no
@@ -845,8 +882,12 @@ async def reaper_service():
                     _orphan_merge_refresh_needed = False
                     try:
                         # Re-validate status before acting — task may have completed/been cancelled
-                        # between the initial query and now
-                        fresh_task = await session.get(Task, task_id)
+                        # between the initial query and now.
+                        # Use batch-cached task; re-fetch only when the cached
+                        # instance was expired by a prior iteration's commit/rollback.
+                        fresh_task = _orphan_task_map.get(task_id)
+                        if fresh_task is None or inspect(fresh_task).expired:
+                            fresh_task = await session.get(Task, task_id)
                         if fresh_task is None or fresh_task.status not in (
                             TaskStatus.PROVISIONING,
                             TaskStatus.IN_PROGRESS,
@@ -1545,7 +1586,9 @@ async def reaper_service():
                                 f"[REAPER] Task {task.id} reaped mid-run; PR #{_pr_num} already merged — "
                                 f"classifying landing"
                             )
-                            _proj = await session.get(Project, task.project_id)
+                            _proj = _projects_batch.get(task.project_id)
+                            if _proj is None or inspect(_proj).expired:
+                                _proj = await session.get(Project, task.project_id)
                             from app.recovery_evaluating_helpers import (
                                 _apply_rollup_merge_classification,
                             )
@@ -1684,7 +1727,9 @@ async def reaper_service():
                                 # branch is recorded — without this, reaped fix tasks
                                 # spawn review tasks pointing at non-existent branches
                                 # and the review fails on `git clone --branch`.
-                                _proj = await session.get(Project, task.project_id)
+                                _proj = _projects_batch.get(task.project_id)
+                                if _proj is None or inspect(_proj).expired:
+                                    _proj = await session.get(Project, task.project_id)
                                 _branch = (task.first_payload or {}).get(
                                     "branch"
                                 ) or _derive_task_branch(
@@ -2046,9 +2091,11 @@ async def reaper_service():
                                             refresh_research_task_verification,
                                         )
 
-                                        _res_proj = await session.get(
-                                            Project, task.project_id
+                                        _res_proj = _projects_batch.get(
+                                            task.project_id
                                         )
+                                        if _res_proj is not None and inspect(_res_proj).expired:
+                                            _res_proj = await session.get(Project, task.project_id)
                                         if _res_proj is not None:
                                             await refresh_research_task_verification(
                                                 task, _res_proj, session
@@ -2228,6 +2275,26 @@ async def reaper_service():
                         # post-rollback-expired ORM attribute.
                         _reaper_old_vms.pop(str(task_id), None)
                         del _deferred_parent_requeues[_dq_len_at_row_start:]
+                        # Re-batch-fetch remaining orphan tasks after rollback to
+                        # avoid N+1 per-row session.get() on the next iterations.
+                        # The rollback expires all cached ORM objects; a single
+                        # IN-query here is faster than one SELECT per remaining row.
+                        _remaining_ids = _orphaned_task_ids[_orphan_loop_idx + 1:]
+                        if _remaining_ids:
+                            try:
+                                _refreshed = (
+                                    (
+                                        await session.execute(
+                                            select(Task).where(Task.id.in_(_remaining_ids))
+                                        )
+                                    )
+                                    .scalars()
+                                    .all()
+                                )
+                                for _rt in _refreshed:
+                                    _orphan_task_map[_rt.id] = _rt
+                            except Exception:  # noqa: BLE001
+                                pass  # fallback: per-row session.get() handles misses
 
                         # Benign per-row idempotency collision: the requeue→QUEUED /
                         # →EVALUATING mutation tried to enter
@@ -2822,6 +2889,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Orphaned cross-base children sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 21: Backfill acceptance verdicts for pre-fix false-negative
+                # named_test evaluations — re-evaluate with the current fixed logic
+                # and record CriterionEvidence when the new verdict is proven=True.
+                # One-time bounded sweep (200 tasks/cycle); idempotent after all
+                # candidates are processed (each upgraded task carries proven=True).
+                _mark_reaper_progress()
+                try:
+                    await backfill_acceptance_verdicts(session)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Backfill-acceptance-verdicts sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

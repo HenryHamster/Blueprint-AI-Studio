@@ -3,7 +3,8 @@ import { AlertTriangle, BarChart2, CheckCircle2, Clock, ExternalLink, Layers, Pl
 import { useDashboardDigest } from '../hooks/useDashboardDigest';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { fetchFleetUtilization, fetchTask, triggerSelfAudit } from '../api';
-import { MetricCard, SuccessRateCard, CostCard, Skeleton, FAILURE_CLASS_COLORS } from './DashboardMetricCards';
+import { MetricCard, SuccessRateCard, CostCard } from './DashboardMetricCards';
+import { Skeleton, FAILURE_CLASS_COLORS } from './DashboardMetricCardsPrimitives';
 import { FleetCapacityCard, type FleetUtilizationResponse } from './FleetCapacityCard';
 import { SystemStatusCard } from './SystemStatusCard';
 import { timeAgo } from '../utils/time';

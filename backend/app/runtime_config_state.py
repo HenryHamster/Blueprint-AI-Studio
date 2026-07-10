@@ -75,6 +75,13 @@ runtime_config: Dict = {
     # the panel_review task type (it stays available as a user-launchable
     # advisory workflow); reconciliation records then read ``unchallenged``.
     "review_second_opinion_gate_enabled": True,
+    # Default-on blind multi-reviewer gate for judgment-shaped acceptance
+    # decisions (pillar 2 of independent acceptance verification). When True
+    # (default), eligible high-stakes decisions spawn N independent blind
+    # reviewers (panel_review with is_blind=True and majority voting) instead
+    # of a single second-opinion review. Operator can disable via
+    # PATCH /api/admin/settings.
+    "blind_multi_reviewer_gate_enabled": True,
     # Fraction of high-stakes trunk-targeting APPROVEs that spawn a panel_review
     # challenger (0.0 = none, 1.0 = all). Default 1.0 preserves existing behavior.
     # Uses deterministic task-ID-based sampling so operators can safely dial down
@@ -1986,6 +1993,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "review_second_opinion_gate_enabled",
                         bool(config_json["review_second_opinion_gate_enabled"]),
+                    )
+                if "blind_multi_reviewer_gate_enabled" in config_json:
+                    _set(
+                        "blind_multi_reviewer_gate_enabled",
+                        bool(config_json["blind_multi_reviewer_gate_enabled"]),
                     )
                 if "review_second_opinion_sample_rate" in config_json:
                     try:

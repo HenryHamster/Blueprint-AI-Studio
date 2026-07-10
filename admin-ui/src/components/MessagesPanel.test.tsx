@@ -5007,6 +5007,43 @@ describe('MessagesPanel send arming receipt', () => {
     expect(onStrategicInteraction).toHaveBeenCalledTimes(1);
   });
 
+  test('answering a question with attachments is blocked without dropping the attachment', async () => {
+    const question = makeMsg({
+      id: 'q-attachment',
+      message_type: 'QUESTION',
+      from_type: 'agent',
+      content: 'Can you inspect the screenshot?',
+      status: 'open',
+    });
+    const patchBodies: unknown[] = [];
+    _setupQuestionAnswerMock(question, patchBodies);
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+
+    const replyBtn = [...el.querySelectorAll('button')].find(button => button.title === 'Reply');
+    expect(replyBtn).toBeTruthy();
+    await act(async () => { (replyBtn as HTMLButtonElement).click(); });
+
+    const fileInput = el.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(fileInput).toBeTruthy();
+    await act(async () => {
+      Object.defineProperty(fileInput, 'files', {
+        value: [new File(['fake-png'], 'question-screenshot.png', { type: 'image/png' })],
+        configurable: true,
+      });
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    await typeAndSend(el, 'see attached');
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith('Remove attachments before answering a question', 'error');
+    });
+    expect(patchBodies).toHaveLength(0);
+    expect(el.textContent).toContain('question-screenshot.png');
+  });
+
   test('passive_note send shows a success "won’t wake" toast', async () => {
     _setupSendMock({ arming: 'passive_note' });
     const addToast = vi.fn();
@@ -5223,6 +5260,229 @@ describe('MessagesPanel send arming receipt', () => {
     expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
   });
 
+  test('attachment upload flow: type=image + signed download URL in context', async () => {
+    const uploadUrlCalls: Array<{ body: unknown }> = [];
+    const messagePostCalls: Array<{ body: unknown }> = [];
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      const body = (init as RequestInit | undefined)?.body;
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        uploadUrlCalls.push({ body: body ? JSON.parse(String(body)) : null });
+        return new Response(JSON.stringify({
+          upload_url: 'https://storage.googleapis.com/signed-upload',
+          download_url: 'https://storage.googleapis.com/signed-download',
+          storage_uri: 'gs://bucket/message-attachments/proj-1/att-123/test.png',
+          attachment_id: 'att-123',
+        }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages$/.test(urlStr) && method === 'POST') {
+        messagePostCalls.push({ body: body ? JSON.parse(String(body)) : null });
+        return new Response(JSON.stringify({ id: 'm1', status: 'created', arming: 'steering' }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url) === 'https://storage.googleapis.com/signed-upload') {
+        return new Response(null, { status: 200 });
+      }
+      return origFetch(url);
+    });
+
+    const addToast = vi.fn();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    // Select an image file via the file input.
+    const fileInput = el.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(fileInput).toBeTruthy();
+    const testFile = new File(['fake-png'], 'test-screenshot.png', { type: 'image/png' });
+    await act(async () => {
+      Object.defineProperty(fileInput, 'files', {
+        value: [testFile],
+        configurable: true,
+      });
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    // Attachment preview renders with file name.
+    expect(el.textContent).toContain('test-screenshot.png');
+
+    // Remove the attachment and verify it disappears.
+    const removeBtn = el.querySelector('button[aria-label="Remove test-screenshot.png"]') as HTMLButtonElement;
+    expect(removeBtn).toBeTruthy();
+    await act(async () => { removeBtn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+    expect(el.textContent).not.toContain('test-screenshot.png');
+
+    // Re-add by redefining files (configurable: true allows re-definition).
+    await act(async () => {
+      Object.defineProperty(fileInput, 'files', {
+        value: [new File(['fake-png'], 'test-screenshot.png', { type: 'image/png' })],
+        configurable: true,
+      });
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    // Verify re-add rendered the attachment.
+    expect(el.textContent).toContain('test-screenshot.png');
+
+    // Add text and send.
+    const textarea = el.querySelector('textarea[placeholder="Type a message..."]') as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype, 'value',
+    )!.set!;
+    await act(async () => {
+      nativeSetter.call(textarea, 'check this screenshot');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const sendBtn = el.querySelector('button[class*="bg-blue-600"]') as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    await act(async () => { sendBtn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    // Assert upload-URL endpoint was called.
+    await waitFor(() => expect(uploadUrlCalls.length).toBe(1), { timeout: 3000 });
+    expect(uploadUrlCalls[0].body).toMatchObject({ filename: 'test-screenshot.png', content_type: 'image/png' });
+
+    // Assert GCS PUT upload was performed.
+    await waitFor(() => {
+      expect(globalThis.fetch).toHaveBeenCalledWith('https://storage.googleapis.com/signed-upload', expect.anything());
+    }, { timeout: 3000 });
+
+    // Assert message POST carries the attachment with corrected type and signed download URL.
+    await waitFor(() => expect(messagePostCalls.length).toBe(1), { timeout: 3000 });
+    const sentPayload = messagePostCalls[0].body as Record<string, unknown>;
+    const ctx = sentPayload.context;
+    expect(ctx).toBeTruthy();
+    const attachments = (ctx as Record<string, unknown>).attachments as Array<Record<string, unknown>>;
+    expect(attachments).toBeTruthy();
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0].type).toBe('image');
+    expect(attachments[0].url).toBe('https://storage.googleapis.com/signed-download');
+    expect(attachments[0].mime_type).toBe('image/png');
+    expect(attachments[0].name).toBe('test-screenshot.png');
+
+    globalThis.fetch = origFetch;
+  });
+
+  test('attachment upload flow: upload failure does not send message without attachment', async () => {
+    const messagePostCalls: Array<{ body: unknown }> = [];
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      const body = (init as RequestInit | undefined)?.body;
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        return new Response(JSON.stringify({
+          upload_url: 'https://storage.googleapis.com/signed-upload-fails',
+          download_url: 'https://storage.googleapis.com/signed-download',
+          storage_uri: 'gs://bucket/message-attachments/proj-1/att-123/test.png',
+          attachment_id: 'att-123',
+        }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages$/.test(urlStr) && method === 'POST') {
+        messagePostCalls.push({ body: body ? JSON.parse(String(body)) : null });
+        return new Response(JSON.stringify({ id: 'm1', status: 'created', arming: 'steering' }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url) === 'https://storage.googleapis.com/signed-upload-fails') {
+        return new Response(null, { status: 500 });
+      }
+      return origFetch(url);
+    });
+
+    try {
+      const addToast = vi.fn();
+      _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <MessagesPanel
+            selectedProjectId="proj-1"
+            onClose={() => {}}
+            addToast={addToast as never}
+            onMessageCountChange={() => {}}
+          />,
+        );
+      });
+      await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+      const el = host as HTMLDivElement;
+
+      const fileInput = el.querySelector('input[type="file"]') as HTMLInputElement;
+      expect(fileInput).toBeTruthy();
+      await act(async () => {
+        Object.defineProperty(fileInput, 'files', {
+          value: [new File(['fake-png'], 'test-screenshot.png', { type: 'image/png' })],
+          configurable: true,
+        });
+        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+      const textarea = el.querySelector('textarea[placeholder="Type a message..."]') as HTMLTextAreaElement;
+      expect(textarea).toBeTruthy();
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype, 'value',
+      )!.set!;
+      await act(async () => {
+        nativeSetter.call(textarea, 'check this screenshot');
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      const sendBtn = el.querySelector('button[class*="bg-blue-600"]') as HTMLButtonElement;
+      expect(sendBtn.disabled).toBe(false);
+      await act(async () => { sendBtn.click(); });
+
+      await waitFor(() => {
+        expect(addToast).toHaveBeenCalledWith('Failed to upload test-screenshot.png', 'error');
+      }, { timeout: 3000 });
+      expect(addToast).not.toHaveBeenCalledWith('Failed to send message', 'error');
+      expect(messagePostCalls).toHaveLength(0);
+      expect(el.textContent).toContain('test-screenshot.png');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   test('refreshes strategic state once after duplicate steering replay', async () => {
     _setupSendMock({ arming: 'duplicate' });
     const addToast = vi.fn();
@@ -5251,6 +5511,358 @@ describe('MessagesPanel send arming receipt', () => {
     expect(addToast).toHaveBeenCalledWith(armingToastCopy('duplicate'), 'success');
     expect(hintText(el)).toBe(armingHintCopy('duplicate'));
     expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Attachment integration ─────────────────────────────────────────────────────
+// Verifies that handleAttachFiles populates pendingAttachments (visible as
+// preview chips), handleRemoveAttachment removes by index, and that submitted
+// messages include context.attachments in the POST body.
+
+describe('MessagesPanel attachment integration', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  let originalFetch: typeof globalThis.fetch | undefined;
+
+  beforeEach(async () => {
+    localStorage.clear();
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url) === 'https://storage.googleapis.com/signed-upload') {
+        return new Response(null, { status: 200 });
+      }
+      return originalFetch
+        ? originalFetch(url)
+        : new Response('', { status: 404 });
+    });
+  });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    if (originalFetch) globalThis.fetch = originalFetch;
+    vi.clearAllMocks();
+  });
+
+  function _setupAttachmentMock(capturedBodies: Record<string, unknown>[]): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        return new Response(JSON.stringify({
+          upload_url: 'https://storage.googleapis.com/signed-upload',
+          download_url: 'https://storage.googleapis.com/signed-download',
+          storage_uri: 'gs://bucket/message-attachments/proj-1/att-123/report.txt',
+          attachment_id: 'att-123',
+        }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'POST') {
+        capturedBodies.push(JSON.parse(String((init as RequestInit).body)));
+        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  }
+
+  async function renderPanel(
+    addToast: (msg: string, level: string) => void,
+    props: Partial<MessagesPanelProps> = {},
+  ) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          {...props}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  async function attachFile(el: HTMLElement, name: string, content: string, mimeType: string): Promise<void> {
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    const file = new File([content], name, { type: mimeType });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    // Use a writable data-property descriptor so the same input can be reused
+    // across multiple calls in one test (re-defining is allowed when configurable).
+    Object.defineProperty(fileInput, 'files', {
+      value: dt.files,
+      writable: true,
+      configurable: true,
+    });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+
+  test('handleAttachFiles renders attachment preview chips with file name', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    await attachFile(el, 'test.txt', 'Hello, world!', 'text/plain');
+
+    await waitFor(() => {
+      expect(el.textContent).toContain('test.txt');
+    });
+  });
+
+  test('handleRemoveAttachment removes attachment chip by index', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    // Attach two files
+    await attachFile(el, 'first.txt', 'first', 'text/plain');
+    await attachFile(el, 'second.txt', 'second', 'text/plain');
+
+    await waitFor(() => {
+      expect(el.textContent).toContain('first.txt');
+      expect(el.textContent).toContain('second.txt');
+    });
+
+    // Remove the first attachment (index 0)
+    const removeButtons = el.querySelectorAll<HTMLButtonElement>('button[aria-label^="Remove"]');
+    expect(removeButtons.length).toBe(2);
+    await act(async () => {
+      removeButtons[0].click();
+    });
+
+    // The first file's name should be gone while second remains
+    await waitFor(() => {
+      expect(el.textContent).not.toContain('first.txt');
+    });
+    expect(el.textContent).toContain('second.txt');
+  });
+
+  test('sending with pendingAttachments uploads and includes signed download URL in POST body', async () => {
+    const addToast = vi.fn();
+    const capturedBodies: Record<string, unknown>[] = [];
+    _setupAttachmentMock(capturedBodies);
+    const el = await renderPanel(addToast);
+
+    // Attach a file so pendingAttachments is non-empty
+    await attachFile(el, 'report.txt', 'report content', 'text/plain');
+
+    await waitFor(() => {
+      expect(el.textContent).toContain('report.txt');
+    });
+
+    // Type and send a message (full chrome path: POST /api/admin/messages)
+    const textarea = el.querySelector('textarea[placeholder="Type a message..."]') as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype, 'value',
+    )!.set!;
+    await act(async () => {
+      nativeSetter.call(textarea, 'Here is the file');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const sendBtn = el.querySelector('button[class*="bg-blue-600"]') as HTMLButtonElement;
+    expect(sendBtn).toBeTruthy();
+    await act(async () => { sendBtn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    // The POST body must include the uploaded attachment metadata and signed
+    // download URL, not inline base64 data.
+    expect(capturedBodies.length).toBeGreaterThanOrEqual(1);
+    const postBody = capturedBodies[capturedBodies.length - 1];
+    expect(postBody).toMatchObject({
+      content: 'Here is the file',
+      context: expect.objectContaining({
+        attachments: expect.arrayContaining([
+          expect.objectContaining({
+            type: 'attachment',
+            name: 'report.txt',
+            mime_type: 'text/plain',
+            size_bytes: 14,
+            url: 'https://storage.googleapis.com/signed-download',
+          }),
+        ]),
+      }),
+    });
+    const attachments = ((postBody.context as { attachments?: unknown[] }).attachments ?? []) as Array<Record<string, unknown>>;
+    expect(attachments[0]).not.toHaveProperty('data');
+  });
+
+  test('oversized files (>50MB) are rejected with a toast and no chips', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    // Create a file that looks small but reports >50MB via size override
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    const file = new File(['tiny'], 'huge.mp4', { type: 'video/mp4' });
+    Object.defineProperty(file, 'size', { value: 55 * 1024 * 1024 });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    Object.defineProperty(fileInput, 'files', {
+      value: dt.files,
+      writable: true,
+      configurable: true,
+    });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
+
+    // The size-limit toast must fire
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('50 MB size limit'),
+      'error',
+    );
+    // No attachment chips should appear (the file was rejected)
+    expect(el.querySelector('[aria-label^="Remove"]')).toBeNull();
+  });
+
+  test('all files oversized triggers early return with no chips', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    // Two oversized files — both must be rejected
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    const file1 = new File(['x'], 'big1.bin', { type: 'application/octet-stream' });
+    Object.defineProperty(file1, 'size', { value: 60 * 1024 * 1024 });
+    const file2 = new File(['y'], 'big2.bin', { type: 'application/octet-stream' });
+    Object.defineProperty(file2, 'size', { value: 70 * 1024 * 1024 });
+    const dt = new DataTransfer();
+    dt.items.add(file1);
+    dt.items.add(file2);
+    Object.defineProperty(fileInput, 'files', {
+      value: dt.files,
+      writable: true,
+      configurable: true,
+    });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
+
+    // One toast per rejected file; no file is retained for upload.
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('50 MB size limit'),
+      'error',
+    );
+    expect(addToast).toHaveBeenCalledTimes(2);
+    // No chips — early return before any file reading
+    expect(el.querySelector('[aria-label^="Remove"]')).toBeNull();
+  });
+
+  test('image over ~9.75MB triggers a warning toast but is still accepted', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    // 10 MB image — above the agent cap (~9.75 MB) but below the 50 MB hard limit
+    const file = new File(['x'], 'large.png', { type: 'image/png' });
+    Object.defineProperty(file, 'size', { value: 10 * 1024 * 1024 });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    Object.defineProperty(fileInput, 'files', { value: dt.files, writable: true, configurable: true });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
+
+    // Warning toast must fire (not an error — file is accepted)
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('may not be visible to the strategist'),
+      'info',
+    );
+    // File must still be accepted as an attachment chip
+    await waitFor(() => {
+      expect(el.querySelector('[aria-label^="Remove"]')).not.toBeNull();
+    });
+  });
+
+  test('non-image file over ~9.75MB does NOT trigger the image warning toast', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    // 10 MB PDF — above the agent image cap but not an image
+    const file = new File(['x'], 'report.pdf', { type: 'application/pdf' });
+    Object.defineProperty(file, 'size', { value: 10 * 1024 * 1024 });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    Object.defineProperty(fileInput, 'files', { value: dt.files, writable: true, configurable: true });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
+
+    // No warning toast for non-image files
+    expect(addToast).not.toHaveBeenCalledWith(
+      expect.stringContaining('may not be visible to the strategist'),
+      'info',
+    );
+    // File must still be accepted as an attachment chip
+    await waitFor(() => {
+      expect(el.querySelector('[aria-label^="Remove"]')).not.toBeNull();
+    });
+  });
+
+  test('object URL preview failure still renders attachment chip', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    const originalCreateObjectURL = URL.createObjectURL;
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => { throw new Error('mock preview error'); }),
+    });
+    try {
+      await attachFile(el, 'broken.png', 'content', 'image/png');
+
+      await waitFor(() => {
+        expect(el.textContent).toContain('broken.png');
+      });
+      expect(addToast).not.toHaveBeenCalledWith(
+        expect.stringContaining('failed to read'),
+        'error',
+      );
+    } finally {
+      Object.defineProperty(URL, 'createObjectURL', {
+        configurable: true,
+        value: originalCreateObjectURL,
+      });
+    }
   });
 });
 

@@ -19,7 +19,7 @@ vi.mock('../api', async () => {
     // when called.  Explicitly override them with controlled stubs so the
     // DeadLetterPanel tests can exercise the component without leaking real
     // HTTP calls through the closure.
-    fetchDeadLetters: vi.fn().mockResolvedValue([]),
+    fetchDeadLetters: vi.fn().mockResolvedValue({ items: [], total: 0, limit: 100, offset: 0 }),
     redriveDeadLetters: vi.fn().mockResolvedValue({ redriven: 0, errors: [] }),
   };
 });
@@ -193,7 +193,7 @@ describe('SettingsNotificationsSection', () => {
         last_failure_reason: '', last_failure_at: null, retry_queue_depth: 0,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
     );
-    vi.mocked(fetchDeadLetters).mockResolvedValueOnce([
+    vi.mocked(fetchDeadLetters).mockResolvedValueOnce({ items: [
       {
         id: 'dl-1',
         project_id: 'project-123',
@@ -218,7 +218,7 @@ describe('SettingsNotificationsSection', () => {
         body: {},
         created_at: '2026-07-02T00:00:00',
       },
-    ]);
+    ], total: 2, limit: 100, offset: 0 });
 
     render(<SettingsNotificationsSection {...baseProps} webhookUrl="https://hooks.example.com/health" selectedProjectId="project-123" />);
 
@@ -279,7 +279,7 @@ describe('SettingsNotificationsSection', () => {
         last_failure_reason: '', last_failure_at: null, retry_queue_depth: 0,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
     );
-    vi.mocked(fetchDeadLetters).mockResolvedValueOnce([]);
+    vi.mocked(fetchDeadLetters).mockResolvedValueOnce({ items: [], total: 0, limit: 100, offset: 0 });
 
     render(<SettingsNotificationsSection {...baseProps} webhookUrl="https://hooks.example.com/health" selectedProjectId="project-123" />);
 
@@ -303,7 +303,7 @@ describe('SettingsNotificationsSection', () => {
         last_failure_reason: '', last_failure_at: null, retry_queue_depth: 0,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
     );
-    vi.mocked(fetchDeadLetters).mockResolvedValueOnce([
+    vi.mocked(fetchDeadLetters).mockResolvedValueOnce({ items: [
       {
         id: 'dl-redrive',
         project_id: 'project-123',
@@ -316,7 +316,7 @@ describe('SettingsNotificationsSection', () => {
         body: {},
         created_at: '2026-07-01T00:00:00',
       },
-    ]);
+    ], total: 1, limit: 100, offset: 0 });
 
     render(<SettingsNotificationsSection {...baseProps} webhookUrl="https://hooks.example.com/health" selectedProjectId="project-123" />);
 
@@ -326,7 +326,7 @@ describe('SettingsNotificationsSection', () => {
     // Mock the redrive API response
     vi.mocked(redriveDeadLetters).mockResolvedValueOnce({ redriven: 1, errors: [] });
     // Mock the subsequent reload of dead letters (empty after redrive)
-    vi.mocked(fetchDeadLetters).mockResolvedValueOnce([]);
+    vi.mocked(fetchDeadLetters).mockResolvedValueOnce({ items: [], total: 0, limit: 100, offset: 0 });
 
     fireEvent.click(reDriveBtn);
 
@@ -352,7 +352,7 @@ describe('SettingsNotificationsSection', () => {
         last_failure_reason: '', last_failure_at: null, retry_queue_depth: 0,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
     );
-    vi.mocked(fetchDeadLetters).mockResolvedValueOnce([
+    vi.mocked(fetchDeadLetters).mockResolvedValueOnce({ items: [
       {
         id: 'dl-fail',
         project_id: 'project-123',
@@ -365,7 +365,7 @@ describe('SettingsNotificationsSection', () => {
         body: {},
         created_at: '2026-07-01T00:00:00',
       },
-    ]);
+    ], total: 1, limit: 100, offset: 0 });
 
     render(<SettingsNotificationsSection {...baseProps} webhookUrl="https://hooks.example.com/health" selectedProjectId="project-123" />);
 

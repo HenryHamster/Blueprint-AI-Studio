@@ -441,37 +441,43 @@ function RootGroup({
   blockingMap: Record<string, number>;
 }) {
   const isSynthetic = root.isSyntheticParent;
-  const totalInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countNodes(c), 0)
-    : countNodes(root);
-  const completedInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'COMPLETED'), 0)
-    : countByStatus(root, 'COMPLETED');
-  const inProgressInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'IN_PROGRESS'), 0)
-    : countByStatus(root, 'IN_PROGRESS');
-  const provisioningInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'PROVISIONING'), 0)
-    : countByStatus(root, 'PROVISIONING');
-  const evaluatingInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'EVALUATING'), 0)
-    : countByStatus(root, 'EVALUATING');
+
+  // Single tree traversal returns all status counts at once instead of
+  // 10 separate walks (finding 4: 10x traversal → 1x traversal).
+  const statusCounts: StatusCounts = isSynthetic
+    ? root.children.reduce<StatusCounts>(
+        (acc, c) => {
+          const childCounts = countAllStatuses(c);
+          return {
+            total: acc.total + childCounts.total,
+            COMPLETED: acc.COMPLETED + childCounts.COMPLETED,
+            IN_PROGRESS: acc.IN_PROGRESS + childCounts.IN_PROGRESS,
+            PROVISIONING: acc.PROVISIONING + childCounts.PROVISIONING,
+            EVALUATING: acc.EVALUATING + childCounts.EVALUATING,
+            FAILED: acc.FAILED + childCounts.FAILED,
+            CANCELLED: acc.CANCELLED + childCounts.CANCELLED,
+            BLOCKED: acc.BLOCKED + childCounts.BLOCKED,
+            PARKED: acc.PARKED + childCounts.PARKED,
+            QUEUED: acc.QUEUED + childCounts.QUEUED,
+          };
+        },
+        { total: 0, COMPLETED: 0, IN_PROGRESS: 0, PROVISIONING: 0, EVALUATING: 0, FAILED: 0, CANCELLED: 0, BLOCKED: 0, PARKED: 0, QUEUED: 0 }
+      )
+    : countAllStatuses(root);
+
+  const {
+    total: totalInGroup,
+    COMPLETED: completedInGroup,
+    IN_PROGRESS: inProgressInGroup,
+    PROVISIONING: provisioningInGroup,
+    EVALUATING: evaluatingInGroup,
+    FAILED: failedInGroup,
+    CANCELLED: cancelledInGroup,
+    BLOCKED: blockedInGroup,
+    PARKED: parkedInGroup,
+    QUEUED: queuedInGroup,
+  } = statusCounts;
   const runningInGroup = inProgressInGroup + provisioningInGroup + evaluatingInGroup;
-  const failedInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'FAILED'), 0)
-    : countByStatus(root, 'FAILED');
-  const cancelledInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'CANCELLED'), 0)
-    : countByStatus(root, 'CANCELLED');
-  const blockedInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'BLOCKED'), 0)
-    : countByStatus(root, 'BLOCKED');
-  const parkedInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'PARKED'), 0)
-    : countByStatus(root, 'PARKED');
-  const queuedInGroup = isSynthetic
-    ? root.children.reduce((sum, c) => sum + countByStatus(c, 'QUEUED'), 0)
-    : countByStatus(root, 'QUEUED');
 
   return (
     <div
@@ -777,24 +783,41 @@ export function PipelineView({ tasks, loading, onViewLogs, hasActiveFilters, onN
   );
 }
 
-function countNodes(node: TreeNode): number {
-  return 1
-    + node.children.reduce((sum, c) => sum + countNodes(c), 0)
-    + node.sidecars.reduce((sum, c) => sum + countNodes(c), 0);
-}
-
-function countByStatus(node: TreeNode, status: string): number {
-  const self = node.task.status === status ? 1 : 0;
-  return self
-    + node.children.reduce((sum, c) => sum + countByStatus(c, status), 0)
-    + node.sidecars.reduce((sum, c) => sum + countByStatus(c, status), 0);
-}
-
 function countByStatuses(node: TreeNode, statuses: string[]): number {
   const self = statuses.includes(node.task.status) ? 1 : 0;
   return self
     + node.children.reduce((sum, c) => sum + countByStatuses(c, statuses), 0)
     + node.sidecars.reduce((sum, c) => sum + countByStatuses(c, statuses), 0);
+}
+
+type StatusCounts = {
+  total: number;
+  COMPLETED: number;
+  IN_PROGRESS: number;
+  PROVISIONING: number;
+  EVALUATING: number;
+  FAILED: number;
+  CANCELLED: number;
+  BLOCKED: number;
+  PARKED: number;
+  QUEUED: number;
+};
+
+function countAllStatuses(root: TreeNode): StatusCounts {
+  const counts: StatusCounts = {
+    total: 0, COMPLETED: 0, IN_PROGRESS: 0, PROVISIONING: 0,
+    EVALUATING: 0, FAILED: 0, CANCELLED: 0, BLOCKED: 0,
+    PARKED: 0, QUEUED: 0,
+  };
+  function walk(node: TreeNode) {
+    counts.total++;
+    const status = node.task.status as keyof StatusCounts;
+    if (status in counts) { counts[status]++; }
+    for (const child of node.children) walk(child);
+    for (const sidecar of node.sidecars) walk(sidecar);
+  }
+  walk(root);
+  return counts;
 }
 
 function countQueuedBehindDependencies(node: TreeNode): number {

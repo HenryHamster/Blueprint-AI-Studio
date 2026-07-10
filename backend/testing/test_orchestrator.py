@@ -13,7 +13,7 @@ import pytest
 import json
 import uuid
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from app.time_utils import _utcnow
 import app.main as _main_module
@@ -296,6 +296,106 @@ def reset_max_plan_pool():
     _account_by_id.clear()
     _max_plan_pools.update(orig_pools)
     _account_by_id.update(orig_by_id)
+
+
+# ── Per-project spend ceiling dispatch gate ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dispatch_gate_ceiling_exceeded_defers_tasks(db_session, mocker):
+    """Per-project spend ceiling in resource_envelope prevents dispatch when
+    recent spend exceeds the configured ceiling.
+
+    _project_resource_dispatch_defer_message reads spend_ceiling_usd from the
+    project's build_config and compares it against get_project_recent_spend_usd.
+    When total spend >= ceiling, a human-readable deferral reason is returned.
+    When spend < ceiling (or no ceiling is set), None is returned and the task
+    remains eligible.
+    """
+    from app.orchestrator import _project_resource_dispatch_defer_message
+
+    project = make_project(
+        name="ceiling-test",
+        user_id=_TEST_USER,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Case 1: spend exceeds ceiling → deferral message returned
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 150.0, "compute": 100.0, "agent_vm": 50.0, "idle": 0.0}),
+    )
+    msg = await _project_resource_dispatch_defer_message(
+        db_session, task, {},
+        project_cache={},
+        spend_cache={},
+    )
+    assert msg is not None, (
+        "expected deferral message when spend ($150) exceeds ceiling ($100)"
+    )
+    assert "spend budget" in msg.lower(), (
+        f"defer message should mention spend budget; got: {msg}"
+    )
+    assert "150.00" in msg and "100.00" in msg, (
+        f"defer message should include spend/ceiling values; got: {msg}"
+    )
+
+    # Case 2: spend well under ceiling → no deferral
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(return_value={"total": 30.0, "compute": 20.0, "agent_vm": 10.0, "idle": 0.0}),
+    )
+    msg2 = await _project_resource_dispatch_defer_message(
+        db_session, task, {},
+        project_cache={},
+        spend_cache={},
+    )
+    assert msg2 is None, (
+        "expected no deferral when spend ($30) is under ceiling ($100)"
+    )
+
+    # Case 3: no spend ceiling set → no deferral
+    project_no_ceiling = make_project(
+        name="no-ceiling",
+        user_id=_TEST_USER,
+        build_config={},
+    )
+    db_session.add(project_no_ceiling)
+    await db_session.commit()
+    await db_session.refresh(project_no_ceiling)
+
+    task2 = make_task(
+        project_id=project_no_ceiling.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "test"}],
+    )
+    db_session.add(task2)
+    await db_session.commit()
+
+    msg3 = await _project_resource_dispatch_defer_message(
+        db_session, task2, {},
+        project_cache={},
+        spend_cache={},
+    )
+    assert msg3 is None, (
+        "expected no deferral when no spend ceiling is configured"
+    )
 
 
 # ── Degraded-runner dispatch deprioritization ─────────────────────────────────
@@ -724,6 +824,11 @@ class TestReaperService:
 
         db_session.get = _intercepted_get
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        # The reaper batch-fetches orphan tasks and only falls back to session.get()
+        # when the cached instance is expired.  Force expired=True so _intercepted_get
+        # is reached and can return the already-COMPLETED stub that simulates a
+        # concurrent reaper instance having already processed the task.
+        mocker.patch("app.reaper.inspect", return_value=MagicMock(expired=True))
 
         try:
             await reaper_service()
@@ -1763,12 +1868,25 @@ class TestResearchCompletion:
             .all()
         )
 
-        assert len(children) == 1, (
-            "Only the non-duplicate finding should produce a child task"
+        implementation_children = [
+            child
+            for child in children
+            if (child.first_payload or {}).get("type") != "salvage_bundle"
+        ]
+        salvage_children = [
+            child
+            for child in children
+            if (child.first_payload or {}).get("type") == "salvage_bundle"
+        ]
+        assert len(implementation_children) == 1, (
+            "Only the non-duplicate finding should produce an implementation task"
+        )
+        assert len(salvage_children) == 1, (
+            "The in-flight duplicate should be retained in one consolidated salvage bundle"
         )
         assert (
-            "tracing" in children[0].title.lower()
-            or "middleware" in children[0].title.lower()
+            "tracing" in implementation_children[0].title.lower()
+            or "middleware" in implementation_children[0].title.lower()
         )
 
     # ── Burst-1 regression: duplicate active claim during post-spawn apply ───
@@ -2273,22 +2391,32 @@ class TestResearchCompletion:
         await _handle_research_completion(research_task, logs, db_session)
 
         await db_session.refresh(research_task)
-        assert research_task.status == TaskStatus.COMPLETED, (
-            f"Research task with 0 children should be COMPLETED, got {research_task.status}"
-        )
-        assert "auto-completed" in (research_task.latest_status_message or "").lower()
+        from sqlmodel import select as sql_select
 
-        # Verify direction note was written
-        await db_session.refresh(project)
-        d = next(
-            (d for d in (project.directions or []) if d.get("id") == direction_id), None
+        children = (
+            (
+                await db_session.execute(
+                    sql_select(Task).where(Task.parent_task_id == research_task.id)
+                )
+            )
+            .scalars()
+            .all()
         )
-        assert d is not None
-        notes = d.get("notes", [])
-        assert len(notes) >= 1, (
-            "A direction note should be appended for zero-child completion"
+        salvage_children = [
+            child
+            for child in children
+            if (child.first_payload or {}).get("type") == "salvage_bundle"
+        ]
+        assert len(children) == 1
+        assert len(salvage_children) == 1, (
+            "The deduplicated in-flight finding should be retained in a salvage bundle"
         )
-        assert "0 tasks" in notes[-1].get("msg", "")
+        assert research_task.status == TaskStatus.EVALUATING, (
+            "A research task that owns a salvage child must remain EVALUATING for rollup"
+        )
+        assert (research_task.context or {}).get("salvage_activity", {}).get(
+            "salvage_task_id"
+        ) == str(salvage_children[0].id)
 
 
 # ── Tests: classify_failure ──────────────────────────────────────────────────
@@ -3062,6 +3190,18 @@ class TestProjectConcurrencyCap:
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
             _orch_module._last_deadlock_check = now
+            _orch_module._last_anomaly_state_persist = now
+            _orch_module._last_anomaly_sweep = now
+            _orch_module._last_post_commit_sweep = now
+            _orch_module._last_sidecar_sweep = now
+            _orch_module._last_bootstrap_recovery_sweep = now
+            _orch_module._last_lane_baseline_backfill = now
+            _orch_module._last_merge_credit_backfill = now
+            _orch_module._last_v22_finding_backfill = now
+            _orch_module._last_runner_deactivation_sweep = now
+            _orch_module._last_runner_degraded_sweep = now
+            _orch_module._last_runner_escalation_sweep = now
+            _orch_module._last_local_runner_hold_sweep = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
@@ -4718,6 +4858,18 @@ class TestWarmVMSkipProvision:
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
             _orch_module._last_deadlock_check = now
+            _orch_module._last_anomaly_state_persist = now
+            _orch_module._last_anomaly_sweep = now
+            _orch_module._last_post_commit_sweep = now
+            _orch_module._last_sidecar_sweep = now
+            _orch_module._last_bootstrap_recovery_sweep = now
+            _orch_module._last_lane_baseline_backfill = now
+            _orch_module._last_merge_credit_backfill = now
+            _orch_module._last_v22_finding_backfill = now
+            _orch_module._last_runner_deactivation_sweep = now
+            _orch_module._last_runner_degraded_sweep = now
+            _orch_module._last_runner_escalation_sweep = now
+            _orch_module._last_local_runner_hold_sweep = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
@@ -6390,6 +6542,81 @@ class TestWarmVMSkipProvision:
             )
             assert row.status == TaskStatus.QUEUED
             assert "project spend budget" in (row.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_monthly_budget_defers_dispatch(self, orch_warm_db, mocker):
+        """When the monthly budget is exhausted, queued tasks are deferred with a
+        per-project message via _project_resource_dispatch_defer_message."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+        # Mock the monthly budget check to report exhaustion (150% of target).
+        budget_mock = mocker.patch(
+            "app.orchestrator.check_monthly_budget",
+            new_callable=AsyncMock,
+            return_value=(True, 1.5),
+        )
+
+        previous_max = _orch_module._runtime_config["max_concurrent_vms"]
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Budget Capped",
+                    user_id=_TEST_USER,
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                queued = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "wait"}],
+                    context={},
+                )
+                session.add(queued)
+                await session.commit()
+                await session.refresh(queued)
+                queued_id = queued.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config["max_concurrent_vms"] = previous_max
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        prov_mock.assert_not_called()
+        budget_mock.assert_awaited_once()
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == queued_id)))
+                .scalars()
+                .one()
+            )
+            assert row.status == TaskStatus.QUEUED
+            assert "monthly budget" in (row.latest_status_message or "")
 
     @pytest.mark.asyncio
     async def test_no_resource_envelope_dispatches_under_global_gate(
@@ -8678,6 +8905,18 @@ class TestDispatchCrashContainment:
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
             _orch_module._last_deadlock_check = now
+            _orch_module._last_anomaly_state_persist = now
+            _orch_module._last_anomaly_sweep = now
+            _orch_module._last_post_commit_sweep = now
+            _orch_module._last_sidecar_sweep = now
+            _orch_module._last_bootstrap_recovery_sweep = now
+            _orch_module._last_lane_baseline_backfill = now
+            _orch_module._last_merge_credit_backfill = now
+            _orch_module._last_v22_finding_backfill = now
+            _orch_module._last_runner_deactivation_sweep = now
+            _orch_module._last_runner_degraded_sweep = now
+            _orch_module._last_runner_escalation_sweep = now
+            _orch_module._last_local_runner_hold_sweep = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 

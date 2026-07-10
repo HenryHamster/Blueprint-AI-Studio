@@ -273,6 +273,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'release_audit_challenge', // Uses audit-challenge.ts bespoke prompt assembly (advisory second opinion)
   'release_merge_grade', // Uses merge-grade.ts bespoke prompt assembly (blind goal-coverage grader)
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
+  'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
@@ -708,9 +709,17 @@ _load_agent_token || exit 1
 TASK="${taskId}"
 ${retryPostShellFn()}
 if [ "$OP" = "get" ]; then
-  printf '{"task_id":"%s","op":"get"}' "$TASK" | \\
-    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+  if [ -n "$KEY" ]; then
+    PAYLOAD=$(printf '{"task_id":%s,"op":"get","key":%s}' \\
+      "$(_json_str "$TASK")" "$(_json_str "$KEY")")
+    printf '%s' "$PAYLOAD" | \\
+      curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
+        -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+  else
+    printf '{"task_id":"%s","op":"get"}' "$TASK" | \\
+      curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
+        -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+  fi
 elif [ "$OP" = "set" ]; then
   [ -z "$KEY" ] || [ -z "$VALUE" ] && { echo "Error: set requires <key> and <content>" >&2; exit 1; }
   # Capture branch/HEAD provenance at write time so the backend can stamp it on

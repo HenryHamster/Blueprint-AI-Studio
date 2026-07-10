@@ -1065,6 +1065,87 @@ async def _maybe_create_pool_payoff_alert(
     return alert, True
 
 
+# Title prefix for the per-project provider-routing-verdict transition alert.
+# The verdict state is appended to the prefix, so the dedup key
+# ``(project_id, dedupe_key)`` is effectively per project + verdict — exactly
+# one alert per distinct verdict transition. Keep the prefix stable.
+_PROVIDER_ROUTING_ALERT_TITLE_PREFIX = "Provider routing verdict"
+
+
+async def _maybe_create_provider_routing_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    verdict_state: str,
+    supporting: "dict",
+    recommended_action: str,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> tuple[Alert | None, bool]:
+    """Create a deduplicated operator Alert when the provider routing A/B verdict
+    crosses a decision boundary.
+
+    Closes the loop on the DeepSeek-vs-Anthropic routing A/B: when the verdict
+    transitions to ADOPT or REJECT, the operator is alerted so the keep / revert
+    decision is made without polling the efficiency panel. INSUFFICIENT_DATA is
+    not a decision boundary and never reaches this helper.
+
+    The message carries the supporting numbers (cost ratio, verified-rate delta,
+    per-provider counts) plus the recommended action so the operator can act from
+    the alert alone.
+
+    Deduplicated by ``efficiency.provider_routing_verdict:{project_id}:{verdict_state}``
+    — so a verdict that persists across many ticks raises exactly ONE alert, and
+    a genuinely different verdict gets its own.
+    """
+    title = f"{_PROVIDER_ROUTING_ALERT_TITLE_PREFIX}: {verdict_state} on project {str(project_id)[:8]}"
+    cost_ratio = supporting.get("cost_ratio")
+    rate_delta = supporting.get("verified_rate_delta_pct")
+    ds_run = int(supporting.get("deepseek_run_count") or 0)
+    an_run = int(supporting.get("anthropic_run_count") or 0)
+    msg_parts = [
+        f"Provider routing verdict for project {project_id} is now {verdict_state}.",
+    ]
+    if cost_ratio is not None:
+        msg_parts.append(f"DeepSeek cost ratio vs Anthropic: {cost_ratio:.4f}")
+    if rate_delta is not None:
+        msg_parts.append(
+            f"Verified-merge rate delta: {rate_delta:+.2f} percentage points"
+        )
+    msg_parts.append(
+        f"DeepSeek runs: {ds_run}, Anthropic runs: {an_run}. {recommended_action}"
+    )
+    message = " ".join(msg_parts)[:1000]
+
+    dedupe_key = f"efficiency.provider_routing_verdict:{project_id}:{verdict_state}"
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type="efficiency.provider_routing_verdict",
+        severity=severity,
+        title=title,
+        message=message,
+        source="alert_dispatch",
+        dedupe_key=dedupe_key,
+        broadcast=False,
+    )
+    if alert is None:
+        return None, False
+    if not created:
+        await session.commit()
+        return alert, False
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+    return alert, True
+
+
 # Stable per-project title for the unpriced-LLM-models coverage alert. The
 # drifting numbers (unpriced share, affected combos) live in the MESSAGE so a
 # degradation that persists across snapshot ticks dedups to exactly ONE alert
@@ -1150,6 +1231,7 @@ async def _maybe_create_self_repair_burn_share_alert(
     burn_share: float,
     threshold: float,
     severity: AlertSeverity = AlertSeverity.WARNING,
+    top_schemas: list[tuple[str, int]] | None = None,
 ) -> None:
     """Create a deduplicated operator Alert when a project's self-repair burn-share
     exceeds the efficiency ceiling.
@@ -1180,12 +1262,18 @@ async def _maybe_create_self_repair_burn_share_alert(
         return
     burn_share_pct = (burn_share * 100) if burn_share is not None else 0.0
     threshold_pct = threshold * 100
+    schema_suffix = ""
+    if top_schemas:
+        schema_lines = ", ".join(
+            f"{name} ({attempts} attempts)" for name, attempts in top_schemas
+        )
+        schema_suffix = f" Top offending schemas: {schema_lines}."
     message = (
         f"Self-repair tokens consumed {burn_share_pct:.1f}% of total LLM tokens, "
         f"exceeding the efficiency ceiling of {threshold_pct:.1f}%. High repair "
         f"overhead indicates multiple format-recovery attempts are required; "
         f"investigate whether recent prompt or schema changes have degraded "
-        f"structured-output success rates."
+        f"structured-output success rates.{schema_suffix}"
     )[:1000]
     alert = Alert(
         project_id=project_id,
@@ -1699,13 +1787,17 @@ from app.runner_health_alerts import (  # noqa: F401
     _RUNNER_ESCALATION_AGE_SECONDS_DEFAULT,
     _RUNNER_ESCALATION_FIRST_SECONDS,
     _RUNNER_ESCALATION_REPEAT_SECONDS,
+    _RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
     _RUNNER_LOW_DISK_EVENT_TYPE,
+    _RUNNER_LOW_MEMORY_EVENT_TYPE,
     _fleet_no_healthy_runner_dedupe_key,
     _maybe_create_fleet_no_healthy_runner_alert,
     _maybe_create_local_runner_hold_alert,
     _maybe_create_runner_deactivated_alert,
     _maybe_create_runner_degraded_alert,
+    _maybe_create_runner_cross_project_mismatch_alert,
     _maybe_create_runner_low_disk_alert,
+    _maybe_create_runner_low_memory_alert,
     _maybe_escalate_runner_deactivated_alert,
     _maybe_escalate_runner_deactivated_alerts,
     _maybe_escalate_runner_degraded_alerts,
@@ -1714,12 +1806,96 @@ from app.runner_health_alerts import (  # noqa: F401
     _resolve_runner_deactivated_alert,
     _resolve_runner_degraded_alert,
     _resolve_runner_low_disk_alert,
+    _resolve_runner_low_memory_alert,
     _runner_deactivated_dedupe_key,
     _runner_degraded_dedupe_key,
     _runner_escalation_last_notified,
+    _runner_cross_project_mismatch_dedupe_key,
     _runner_low_disk_dedupe_key,
+    _runner_low_memory_dedupe_key,
     _runner_outage_escalated_keys,
+    # Idle-GPU alert: runner GPU utilization below threshold
+    _RUNNER_IDLE_GPU_EVENT_TYPE,
+    _RUNNER_IDLE_GPU_THRESHOLD_PCT_DEFAULT,
+    _maybe_create_runner_idle_gpu_alert,
+    _resolve_runner_idle_gpu_alert,
+    _runner_idle_gpu_dedupe_key,
+    # Token-stale alert: runner credential not rotated within recommended window
+    _RUNNER_TOKEN_STALE_EVENT_TYPE,
+    _maybe_create_runner_token_stale_alert,
+    _resolve_runner_token_stale_alert,
+    _runner_token_stale_dedupe_key,
 )
+
+# Stable title prefix for the per-project cost-telemetry-reconciliation-failure alert.
+# The project id suffix ensures dedup is per-project: one undismissed alert per
+# project while the mismatch persists. Keep the prefix stable.
+_COST_TELEMETRY_RECONCILIATION_ALERT_TITLE_PREFIX = (
+    "Cost telemetry reconciliation failed tolerance"
+)
+
+
+async def _maybe_create_cost_telemetry_reconciliation_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    absolute_delta: float,
+    tolerance: float,
+    task_count: int,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert when the daily efficiency snapshot's
+    cost telemetry reconciliation exceeds the declared tolerance.
+
+    LLM cost telemetry is computed via two structurally independent paths
+    (snapshot aggregation and flat per-attempt iteration) and must agree within
+    COST_TELEMETRY_TOLERANCE (1e-6 USD). A mismatch indicates that the per-task
+    cost numbers the snapshot reports are suspect — operators should investigate
+    before relying on cost-per-merged-PR or cost-per-verified-task metrics.
+
+    Deduplicated on a STABLE title so a mismatch that persists across snapshot
+    ticks raises exactly ONE alert per project. The drifting delta and task count
+    live in the message so a moving metric never defeats dedup. Caller owns the
+    commit.
+    """
+    title = (
+        f"{_COST_TELEMETRY_RECONCILIATION_ALERT_TITLE_PREFIX}"
+        f" on project {str(project_id)[:8]}"
+    )[:200]
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    message = (
+        f"LLM cost telemetry reconciliation failed: snapshot vs direct-path "
+        f"cost delta ${absolute_delta:.6f} exceeds tolerance ${tolerance:.6f} "
+        f"over {task_count} task(s). The efficiency snapshot's LLM cost "
+        f"data may be unreliable."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+
 
 async def _create_strategic_alert(
     project_id: "uuid.UUID",

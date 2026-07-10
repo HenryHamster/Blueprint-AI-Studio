@@ -2,7 +2,7 @@
 import { useState, useEffect, useMemo, useRef, type MutableRefObject } from 'react';
 import type { Task } from './types/task';
 import type { Project } from './types/project';
-import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
+import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api/core';
 import { useToasts } from './components/Toasts';
 import { usePersistedState } from './hooks/usePersistedState';
 import { usePoller } from './hooks/usePoller';
@@ -88,6 +88,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     handleViewLogs, closeLogViewer,
     wsRef, wsConnected,
     pipelineThrottle,
+    ceilingDeferredProjectIds,
     gatedTaskTypes,
     strategistActive,
     cycleProgress,
@@ -222,7 +223,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
 
   // ── Projects domain ──────────────────────────────────────────────────────
   const {
-    projects, setProjects, projectsFetchError,
+    projects, setProjects, projectsFetchError, projectsLoaded,
     fetchProjects, handlePauseAllAutonomous, handleClearWaveDeps,
   } = useProjectsState(addToast, fetchTasksRef);
 
@@ -570,7 +571,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     // Search/filter
     searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter, directionFilter, setDirectionFilter,
     // Projects
-    projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects,
+    projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects, projectsLoaded,
     // Log viewer
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer,
     // Research browser
@@ -695,6 +696,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     // Diagnostics
     diagnostics,
     pipelineThrottle,
+    ceilingDeferredProjectIds,
     gatedTaskTypes,
     // User management
     allowedUsers, showUserManagement, setShowUserManagement,

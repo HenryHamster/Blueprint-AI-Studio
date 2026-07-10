@@ -450,3 +450,342 @@ class TestValidateJwtSecret:
 
         with pytest.raises(ValueError, match="WS_TICKET_SECRET"):
             _validate_jwt_secret("tooshort", "WS_TICKET_SECRET")
+
+
+class TestAdminJwt:
+    """create_admin_token / verify_admin_token for the short-lived admin JWT."""
+
+    def test_requires_admin_jwt_secret(self, monkeypatch):
+        """create_admin_token raises ValueError when ADMIN_JWT_SECRET is not configured."""
+        monkeypatch.delenv("ADMIN_JWT_SECRET", raising=False)
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+        with pytest.raises(ValueError, match="ADMIN_JWT_SECRET"):
+            auth_mod.create_admin_token(user_id="any")
+
+    def test_create_and_verify_token(self, monkeypatch):
+        """Round-trip: a token minted by create_admin_token is accepted by verify_admin_token."""
+        monkeypatch.setenv("ADMIN_JWT_SECRET", "a" * 32)
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+
+        token = auth_mod.create_admin_token(user_id="admin-uid-001")
+        payload = auth_mod.verify_admin_token(token)
+        assert payload is not None
+        assert payload["sub"] == "admin-uid-001"
+        assert payload["role"] == "admin"
+        assert payload["token_type"] == "admin_api_exchange"
+
+    def test_verify_admin_token_none_when_secret_not_set(self):
+        """verify_admin_token returns None when ADMIN_JWT_SECRET is not configured."""
+        from app.auth import verify_admin_token
+
+        assert verify_admin_token("some-token") is None
+
+    def test_verify_admin_token_rejects_expired(self, monkeypatch):
+        """An expired admin JWT returns None."""
+        monkeypatch.setenv("ADMIN_JWT_SECRET", "b" * 32)
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+        import jwt as pyjwt
+        from datetime import datetime, timezone, timedelta
+
+        expired = pyjwt.encode(
+            {
+                "sub": "old",
+                "role": "admin",
+                "token_type": "admin_api_exchange",
+                "exp": datetime.now(timezone.utc) - timedelta(hours=1),
+                "iat": datetime.now(timezone.utc) - timedelta(hours=2),
+            },
+            auth_mod.ADMIN_JWT_SECRET,
+            algorithm=auth_mod.ADMIN_JWT_ALGORITHM,
+        )
+        assert auth_mod.verify_admin_token(expired) is None
+
+    def test_verify_admin_token_rejects_wrong_token_type(self, monkeypatch):
+        """A JWT with token_type != admin_api_exchange is rejected."""
+        monkeypatch.setenv("ADMIN_JWT_SECRET", "c" * 32)
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+        import jwt as pyjwt
+        from datetime import datetime, timezone, timedelta
+
+        not_admin = pyjwt.encode(
+            {
+                "sub": "user-1",
+                "role": "admin",
+                "token_type": "agent",
+                "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+                "iat": datetime.now(timezone.utc),
+            },
+            auth_mod.ADMIN_JWT_SECRET,
+            algorithm=auth_mod.ADMIN_JWT_ALGORITHM,
+        )
+        assert auth_mod.verify_admin_token(not_admin) is None
+
+    def test_verify_admin_token_rejects_wrong_role(self, monkeypatch):
+        """A JWT with role != admin is rejected."""
+        monkeypatch.setenv("ADMIN_JWT_SECRET", "d" * 32)
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+        import jwt as pyjwt
+        from datetime import datetime, timezone, timedelta
+
+        non_admin = pyjwt.encode(
+            {
+                "sub": "user-1",
+                "role": "user",
+                "token_type": "admin_api_exchange",
+                "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+                "iat": datetime.now(timezone.utc),
+            },
+            auth_mod.ADMIN_JWT_SECRET,
+            algorithm=auth_mod.ADMIN_JWT_ALGORITHM,
+        )
+        assert auth_mod.verify_admin_token(non_admin) is None
+
+    @pytest.mark.asyncio
+    async def test_admin_jwt_works_in_get_current_user(self, override_get_session, db_session, monkeypatch):
+        """An admin JWT is accepted by get_current_user the same as ADMIN_API_KEY."""
+        monkeypatch.setenv("ADMIN_JWT_SECRET", "e" * 32)
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+        from app.auth import get_current_user
+
+        token = auth_mod.create_admin_token(user_id="admin-uid-002")
+        creds = _creds(token)
+        result = await get_current_user(credentials=creds, session=db_session)
+        assert result["role"] == "admin"
+        assert result["user_id"] == "admin-uid-002"
+
+    @pytest.mark.asyncio
+    async def test_admin_jwt_works_in_get_metrics_reader(self, db_session, monkeypatch):
+        """An admin JWT is accepted by get_metrics_reader."""
+        monkeypatch.setenv("ADMIN_JWT_SECRET", "f" * 32)
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+        from app.auth import get_metrics_reader
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        token = auth_mod.create_admin_token(user_id="admin-metrics-001")
+        creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        result = await get_metrics_reader(credentials=creds)
+        assert result["role"] == "admin"
+
+
+class TestAdminApiKeyIpAllowlist:
+    """Source IP allowlist for ADMIN_API_KEY."""
+
+    def test_parse_empty_returns_empty_list(self, monkeypatch):
+        """_parse_admin_ip_allowlist returns [] when env var is unset."""
+        monkeypatch.delenv("ADMIN_API_KEY_ALLOWED_IPS", raising=False)
+        from app.auth import _parse_admin_ip_allowlist
+
+        assert _parse_admin_ip_allowlist() == []
+
+    def test_parse_single_cidr(self, monkeypatch):
+        """A single CIDR entry is parsed correctly."""
+        monkeypatch.setenv("ADMIN_API_KEY_ALLOWED_IPS", "10.0.0.0/8")
+        from app.auth import _parse_admin_ip_allowlist
+
+        nets = _parse_admin_ip_allowlist()
+        assert len(nets) == 1
+        assert nets[0].compressed == "10.0.0.0/8"
+
+    def test_parse_multiple_cidrs(self, monkeypatch):
+        """Multiple comma-separated CIDRs are all parsed."""
+        monkeypatch.setenv("ADMIN_API_KEY_ALLOWED_IPS", "192.168.0.0/16,10.0.0.0/8")
+        from app.auth import _parse_admin_ip_allowlist
+
+        nets = _parse_admin_ip_allowlist()
+        assert len(nets) == 2
+
+    def test_check_source_ip_no_allowlist_returns_true(self):
+        """_check_admin_api_key_source_ip returns True when no allowlist configured."""
+        from app.auth import _check_admin_api_key_source_ip
+
+        assert _check_admin_api_key_source_ip(request=None) is True
+
+    def test_check_source_ip_allowed(self, monkeypatch):
+        """An IP within the allowlist passes."""
+        monkeypatch.setenv("ADMIN_API_KEY_ALLOWED_IPS", "10.0.0.0/8")
+        from app.auth import _check_admin_api_key_source_ip
+
+        mock_request = MagicMock()
+        mock_request.client.host = "10.1.2.3"
+        assert _check_admin_api_key_source_ip(mock_request) is True
+
+    def test_check_source_ip_blocked(self, monkeypatch):
+        """An IP outside the allowlist is blocked."""
+        monkeypatch.setenv("ADMIN_API_KEY_ALLOWED_IPS", "10.0.0.0/8")
+        from app.auth import _check_admin_api_key_source_ip
+
+        mock_request = MagicMock()
+        mock_request.client.host = "192.168.1.1"
+        assert _check_admin_api_key_source_ip(mock_request) is False
+
+    def test_check_source_ip_none_request_returns_false_when_allowlist_set(self, monkeypatch):
+        """When allowlist is configured but request is None, access is denied."""
+        monkeypatch.setenv("ADMIN_API_KEY_ALLOWED_IPS", "10.0.0.0/8")
+        from app.auth import _check_admin_api_key_source_ip
+
+        assert _check_admin_api_key_source_ip(request=None) is False
+
+
+class TestAdminApiKeyAuditLogging:
+    """Structured audit logging for ADMIN_API_KEY usage."""
+
+    def test_audit_log_emits_warning(self):
+        """_audit_log_admin_api_key emits a WARNING-level log with audit_event field."""
+        from app.auth import _audit_log_admin_api_key
+        from unittest.mock import MagicMock, patch
+
+        mock_request = MagicMock()
+        mock_request.client.host = "10.0.0.1"
+        mock_request.headers.get.return_value = "test-agent"
+
+        with patch("app.auth.logger.warning") as mock_warning:
+            _audit_log_admin_api_key(mock_request, action="direct_use")
+
+        mock_warning.assert_called_once()
+        args, kwargs = mock_warning.call_args
+        assert "ADMIN_API_KEY" in args[0]
+        extra = kwargs.get("extra", {})
+        assert extra.get("audit_event") == "admin_api_key_usage"
+        assert extra.get("action") == "direct_use"
+        assert extra.get("source_ip") == "10.0.0.1"
+
+    def test_audit_log_without_request(self):
+        """_audit_log_admin_api_key handles missing request gracefully."""
+        from app.auth import _audit_log_admin_api_key
+        from unittest.mock import patch
+
+        with patch("app.auth.logger.warning") as mock_warning:
+            _audit_log_admin_api_key(None, action="token_exchange")
+
+        mock_warning.assert_called_once()
+        args, kwargs = mock_warning.call_args
+        extra = kwargs.get("extra", {})
+        assert extra.get("source_ip") == "unknown"
+
+
+class TestAdminTokenExchangeEndpoint:
+    """Integration-style tests for POST /api/admin/token."""
+
+    @pytest.mark.asyncio
+    async def test_returns_501_when_jwt_secret_not_set(self, override_get_session, monkeypatch):
+        """Without ADMIN_JWT_SECRET, the endpoint returns 501."""
+        monkeypatch.delenv("ADMIN_JWT_SECRET", raising=False)
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+        from app.main import app
+        from httpx import AsyncClient, ASGITransport
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/api/admin/token",
+                headers={"Authorization": "Bearer any-key"},
+            )
+        assert resp.status_code == 501
+
+    @pytest.mark.asyncio
+    async def test_returns_401_for_wrong_key(self, override_get_session, monkeypatch):
+        """A wrong ADMIN_API_KEY returns 401."""
+        monkeypatch.setenv("ADMIN_JWT_SECRET", "g" * 32)
+        monkeypatch.setenv("ADMIN_API_KEY", "real-key-12345")
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+
+        from app.main import app
+        from httpx import AsyncClient, ASGITransport
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/api/admin/token",
+                headers={"Authorization": "Bearer wrong-key"},
+            )
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_returns_200_with_valid_key(self, override_get_session, db_session, monkeypatch):
+        """A valid ADMIN_API_KEY + ADMIN_JWT_SECRET returns a JWT."""
+        monkeypatch.setenv("ADMIN_JWT_SECRET", "h" * 32)
+        monkeypatch.setenv("ADMIN_API_KEY", "valid-key-999")
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+        from app.main import app
+        from httpx import AsyncClient, ASGITransport
+
+        # Seed an admin user so the UID resolution succeeds
+        admin_user = AllowedUser(
+            email="admin@test.local", role="admin", firebase_uid="firebase-admin-001"
+        )
+        db_session.add(admin_user)
+        await db_session.commit()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/api/admin/token",
+                headers={"Authorization": "Bearer valid-key-999"},
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "access_token" in body
+        assert body["token_type"] == "bearer"
+        assert body["expires_in"] == 3600  # default
+        # Verify the returned JWT works for subsequent auth
+        jwt_token = body["access_token"]
+        creds = _creds(jwt_token)
+        result = await auth_mod.get_current_user(credentials=creds, session=db_session)
+        assert result["role"] == "admin"
+        assert result["user_id"] == "firebase-admin-001"
+
+    @pytest.mark.asyncio
+    async def test_returns_403_from_disallowed_ip(self, override_get_session, monkeypatch):
+        """When ADMIN_API_KEY_ALLOWED_IPS is set and request IP is outside, returns 403."""
+        monkeypatch.setenv("ADMIN_JWT_SECRET", "i" * 32)
+        monkeypatch.setenv("ADMIN_API_KEY", "ip-restricted-key")
+        monkeypatch.setenv("ADMIN_API_KEY_ALLOWED_IPS", "10.0.0.0/8")
+        import importlib
+        from app import auth as auth_mod
+
+        importlib.reload(auth_mod)
+        from app.main import app
+        from httpx import AsyncClient, ASGITransport
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/api/admin/token",
+                headers={"Authorization": "Bearer ip-restricted-key"},
+            )
+        # The test client runs on 127.0.0.1 by default, which is outside 10.0.0.0/8
+        assert resp.status_code == 403

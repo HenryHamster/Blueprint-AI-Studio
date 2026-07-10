@@ -288,7 +288,7 @@ export function DirectionsPanel({
   );
 
   return (
-      <div className="flex-1 overflow-hidden flex flex-col bg-neutral-950">
+      <div className="flex-1 min-h-0 overflow-hidden flex flex-col bg-neutral-950">
         <DirectionsPanelHeader
           selectedProjectId={selectedProjectId}
           projects={projects}
@@ -341,7 +341,7 @@ export function DirectionsPanel({
             </span>
           </div>
         )}
-        <div className="flex-1 overflow-hidden flex flex-col">
+        <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
           {activeTab === 'directions' && (<>
           <div className="px-5 py-3 border-b border-neutral-800 space-y-3 shrink-0">
             {selectedProjectId && (
@@ -480,7 +480,7 @@ export function DirectionsPanel({
           </div>
           </>)}
           {activeTab === 'problem-model' && selectedProjectId && (
-            <div className="flex-1 overflow-hidden">
+            <div className="flex-1 min-h-0 overflow-hidden">
               <ProblemModelViewer
                 projectId={selectedProjectId}
                 problemModel={data.problemModel}
@@ -497,7 +497,7 @@ export function DirectionsPanel({
             </div>
           )}
           {activeTab === 'running-update' && selectedProjectId && (
-            <div className="flex-1 overflow-hidden">
+            <div className="flex-1 min-h-0 overflow-hidden">
               <RunningUpdatePanel
                 projectId={selectedProjectId}
                 document={data.runningUpdate}
@@ -510,7 +510,7 @@ export function DirectionsPanel({
             </div>
           )}
           {activeTab === 'design-doc' && (
-            <div className="flex-1 overflow-hidden">
+            <div className="flex-1 min-h-0 overflow-hidden">
               <DesignDocViewer designDoc={data.designDoc} />
             </div>
           )}

@@ -33,6 +33,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    # When imported as a package member (e.g. via pytest), absolute import works.
+    from golden_tasks.agent_runner import AgentBinaryNotFound, run_single_task
+    _AGENT_RUNNER_AVAILABLE = True
+except ImportError:
+    try:
+        # When run as a script (python3 golden_tasks/runner.py), the script
+        # directory is on sys.path[0] and the package prefix won't resolve.
+        from agent_runner import AgentBinaryNotFound, run_single_task  # type: ignore[no-redef]
+        _AGENT_RUNNER_AVAILABLE = True
+    except ImportError:
+        _AGENT_RUNNER_AVAILABLE = False
+        AgentBinaryNotFound = Exception  # type: ignore[assignment,misc]
+
+        def run_single_task(*args: Any, **kwargs: Any) -> dict[str, Any]:  # type: ignore[misc,no-redef]
+            """Stub — agent_runner module is not importable."""
+            raise AgentBinaryNotFound("agent_runner module not available")
+
 # ---------------------------------------------------------------------------
 # Valid task types — keep in sync with backend/app/task_capabilities.py
 # ---------------------------------------------------------------------------
@@ -65,6 +83,7 @@ VALID_TASK_TYPES: set[str] = {
     "web_research",
     "design",
     "repo_bootstrap",
+    "salvage_bundle",
 }
 
 VALID_EFFORTS: set[str] = {"low", "medium", "high", "max"}
@@ -291,6 +310,11 @@ class RunMetrics:
         self.error: str | None = None
         self.llm_provider: str | None = None
         self.model_id: str | None = None
+        # Extended telemetry (populated by real agent execution)
+        self.cache_read_input_tokens: int = 0
+        self.cache_creation_input_tokens: int = 0
+        self.llm_call_count: int = 0
+        self.num_turns: int = 0
 
     @property
     def wall_time_s(self) -> float | None:
@@ -298,12 +322,19 @@ class RunMetrics:
             return self.end_time - self.start_time
         return None
 
+    @property
+    def cache_hit_rate(self) -> float | None:
+        """Cache read as a fraction of total input tokens (0.0–1.0)."""
+        if self.prompt_tokens > 0:
+            return self.cache_read_input_tokens / self.prompt_tokens
+        return None
+
     def stop(self, success: bool = True) -> None:
         self.end_time = time.monotonic()
         self.success = success
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "wall_time_s": self.wall_time_s,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
@@ -314,11 +345,21 @@ class RunMetrics:
             "llm_provider": self.llm_provider,
             "model_id": self.model_id,
         }
+        if self.cache_read_input_tokens or self.cache_creation_input_tokens:
+            d["cache_read_input_tokens"] = self.cache_read_input_tokens
+            d["cache_creation_input_tokens"] = self.cache_creation_input_tokens
+        if self.llm_call_count:
+            d["llm_call_count"] = self.llm_call_count
+        if self.num_turns:
+            d["num_turns"] = self.num_turns
+        if self.cache_hit_rate is not None:
+            d["cache_hit_rate"] = round(self.cache_hit_rate, 4)
+        return d
 
     @staticmethod
     def aggregate(metrics_list: list[RunMetrics]) -> dict[str, Any]:
         """Aggregate multiple RunMetrics into summary statistics."""
-        totals = {
+        totals: dict[str, Any] = {
             "count": len(metrics_list),
             "total_wall_time_s": 0.0,
             "total_prompt_tokens": 0,
@@ -327,7 +368,15 @@ class RunMetrics:
             "total_cost_usd": 0.0,
             "success_count": 0,
             "fail_count": 0,
+            "total_cache_read_input_tokens": 0,
+            "total_cache_creation_input_tokens": 0,
+            "total_llm_call_count": 0,
+            "total_num_turns": 0,
         }
+        providers: dict[str, int] = {}
+        models: dict[str, int] = {}
+        failure_categories: dict[str, int] = {}
+
         for m in metrics_list:
             if m.wall_time_s is not None:
                 totals["total_wall_time_s"] += m.wall_time_s
@@ -335,15 +384,41 @@ class RunMetrics:
             totals["total_completion_tokens"] += m.completion_tokens
             totals["total_tokens"] += m.total_tokens
             totals["total_cost_usd"] += m.cost_usd
+            totals["total_cache_read_input_tokens"] += m.cache_read_input_tokens
+            totals["total_cache_creation_input_tokens"] += m.cache_creation_input_tokens
+            totals["total_llm_call_count"] += m.llm_call_count
+            totals["total_num_turns"] += m.num_turns
             if m.success is True:
                 totals["success_count"] += 1
             elif m.success is False:
                 totals["fail_count"] += 1
+                # Extract failure category from error string
+                if m.error and "failure_category=" in m.error:
+                    cat = m.error.split("failure_category=")[1].split(" ")[0].split(")")[0]
+                    failure_categories[cat] = failure_categories.get(cat, 0) + 1
+            if m.llm_provider:
+                providers[m.llm_provider] = providers.get(m.llm_provider, 0) + 1
+            if m.model_id:
+                models[m.model_id] = models.get(m.model_id, 0) + 1
+
         if totals["count"] > 0:
             totals["avg_wall_time_s"] = totals["total_wall_time_s"] / totals["count"]
             totals["avg_tokens"] = totals["total_tokens"] / totals["count"]
             totals["avg_cost_usd"] = totals["total_cost_usd"] / totals["count"]
             totals["success_rate"] = totals["success_count"] / totals["count"]
+            # Cache hit rate: cache_read / total_input across all specs
+            total_input = totals["total_prompt_tokens"]
+            if total_input > 0:
+                totals["cache_hit_rate"] = round(
+                    totals["total_cache_read_input_tokens"] / total_input, 4
+                )
+        if providers:
+            totals["providers"] = providers
+        if models:
+            totals["models"] = models
+        if failure_categories:
+            totals["failure_categories"] = failure_categories
+
         return totals
 
 
@@ -402,6 +477,29 @@ def _setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override model ID for --run",
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=600,
+        metavar="SECONDS",
+        help="Per-spec timeout in seconds (default: 600)",
+    )
+    parser.add_argument(
+        "--agent-path",
+        default=None,
+        metavar="PATH",
+        help="Override agent binary path (sets BLUEPRINT_AGENT_BINARY)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Skip real execution, use simulated metrics (preserves existing behavior)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Stream agent stdout/stderr to the terminal",
+    )
     return parser
 
 
@@ -441,10 +539,15 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    """Run one or all specs (future — dispatches to orchestrator)."""
-    # TODO: implement actual dispatch to orchestrator or local agent runner.
-    # For the skeleton phase, --run simulates a successful run with placeholder
-    # metrics so the infrastructure can be tested end-to-end.
+    """Run one or all specs against the configured agent.
+
+    In ``--run`` mode (the default without ``--dry-run``), dispatches each spec
+    through the real agent via ``golden_tasks.agent_runner.run_single_task()``.
+    When the agent binary or LLM credentials are unavailable, falls back
+    gracefully to simulated metrics with a warning.
+
+    ``--dry-run`` preserves the existing simulated behavior explicitly.
+    """
     spec_dir = Path(args.spec_dir)
     all_metrics: list[RunMetrics] = []
 
@@ -478,27 +581,27 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if args.model:
             payload["model"] = args.model
 
-        # ── Skeleton: simulate metrics instead of dispatching ──
-        # In the future, this section would:
-        #   1. Submit the task via the orchestrator API
-        #   2. Poll for completion
-        #   3. Collect real token/cost/wall-time data
-        #   4. Check outcome against spec.expected
-        time.sleep(0.05)  # simulate brief work
-        metrics.prompt_tokens = 150
-        metrics.completion_tokens = 450
-        metrics.total_tokens = 600
-        metrics.cost_usd = 0.015
-        metrics.llm_provider = "anthropic"
-        metrics.model_id = args.model or "claude-sonnet-4-20250514"
+        # ── Dispatch: real agent execution or simulated fallback ──
+        if args.dry_run:
+            _run_simulated(metrics, args)
+        else:
+            _run_real(metrics, payload, args)
 
-        metrics.stop(success=True)
         all_metrics.append(metrics)
-        print(
-            f"  DONE: {metrics.total_tokens} tokens, "
-            f"${metrics.cost_usd:.4f}, "
-            f"{metrics.wall_time_s:.2f}s"
-        )
+        if metrics.success is True:
+            cache_str = ""
+            if metrics.cache_hit_rate is not None:
+                cache_str = f", cache_hit={metrics.cache_hit_rate:.1%}"
+            print(
+                f"  DONE: {metrics.total_tokens} tokens, "
+                f"${metrics.cost_usd:.4f}, "
+                f"{metrics.wall_time_s:.2f}s"
+                f"{cache_str}"
+            )
+        elif metrics.success is False:
+            print(f"  FAIL: {metrics.error or 'unknown error'}")
+        else:
+            print(f"  DONE (status unknown)")
 
     # Report
     summary = RunMetrics.aggregate(all_metrics)
@@ -507,6 +610,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"  Total tokens: {summary['total_tokens']}")
     print(f"  Total cost: ${summary['total_cost_usd']:.4f}")
     print(f"  Avg wall time: {summary['avg_wall_time_s']:.2f}s")
+    if summary.get("cache_hit_rate") is not None:
+        print(f"  Cache hit rate: {summary['cache_hit_rate']:.1%}")
+    if summary.get("providers"):
+        print(f"  Providers: {summary['providers']}")
+    if summary.get("models"):
+        print(f"  Models: {summary['models']}")
+    if summary.get("failure_categories"):
+        print(f"  Failure categories: {summary['failure_categories']}")
 
     if args.report:
         report = {
@@ -520,6 +631,92 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"  Report written to {report_path}")
 
     return 0
+
+
+def _run_simulated(metrics: RunMetrics, args: argparse.Namespace) -> None:
+    """Populate *metrics* with placeholder values (existing ``--dry-run`` behavior)."""
+    time.sleep(0.05)  # simulate brief work
+    metrics.prompt_tokens = 150
+    metrics.completion_tokens = 450
+    metrics.total_tokens = 600
+    metrics.cost_usd = 0.015
+    metrics.llm_provider = "anthropic"
+    metrics.model_id = args.model or "claude-sonnet-4-20250514"
+    metrics.cache_read_input_tokens = 0
+    metrics.cache_creation_input_tokens = 0
+    metrics.llm_call_count = 1
+    metrics.num_turns = 1
+    metrics.stop(success=True)
+
+
+def _run_real(
+    metrics: RunMetrics,
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    """Dispatch *payload* through the real agent and populate *metrics*.
+
+    Falls back to simulated metrics when the agent binary or LLM credentials
+    are unavailable (prints a clear warning).
+    """
+    if not _AGENT_RUNNER_AVAILABLE:
+        print(
+            "  WARNING: agent_runner module not importable — "
+            "falling back to simulated metrics. "
+            "Ensure golden_tasks/agent_runner.py exists and is importable.",
+        )
+        _run_simulated(metrics, args)
+        return
+
+    try:
+        result = run_single_task(
+            payload,
+            timeout_seconds=args.timeout,
+            agent_path=args.agent_path,
+            verbose=args.verbose,
+        )
+    except AgentBinaryNotFound as exc:
+        msg = str(exc)
+        if "LLM credentials" in msg:
+            print(f"  WARNING: {msg}")
+        else:
+            print(
+                f"  WARNING: Agent binary not found — falling back to simulated metrics.\n"
+                f"    {msg}\n"
+                f"    Install agent deps: cd agent && npm install\n"
+                f"    Or set: export BLUEPRINT_AGENT_BINARY=/path/to/agent/entry"
+            )
+        _run_simulated(metrics, args)
+        return
+    except Exception as exc:
+        print(f"  WARNING: Agent execution failed: {exc} — falling back to simulated metrics.")
+        _run_simulated(metrics, args)
+        return
+
+    # Populate metrics from the result dict
+    metrics.prompt_tokens = result.get("prompt_tokens", 0)
+    metrics.completion_tokens = result.get("completion_tokens", 0)
+    metrics.total_tokens = result.get("total_tokens", 0)
+    metrics.cost_usd = result.get("cost_usd", 0.0)
+    metrics.llm_provider = result.get("llm_provider")
+    metrics.model_id = result.get("model_id")
+    metrics.cache_read_input_tokens = result.get("cache_read_input_tokens", 0)
+    metrics.cache_creation_input_tokens = result.get("cache_creation_input_tokens", 0)
+    metrics.llm_call_count = result.get("llm_call_count", 0)
+    metrics.num_turns = result.get("num_turns", 0)
+
+    success = result.get("success", False)
+    error = result.get("error")
+    metrics.stop(success=bool(success))
+    if error:
+        metrics.error = str(error)
+    if metrics.wall_time_s is not None:
+        # Override with the real wall time from agent_runner if it differs
+        reported_wall = result.get("wall_time_s")
+        if reported_wall is not None and isinstance(reported_wall, (int, float)):
+            # run_single_task returns wall_time_s; RunMetrics also computes it.
+            # Use the reported value as canonical.
+            metrics.end_time = metrics.start_time + float(reported_wall)
 
 
 def main(argv: list[str] | None = None) -> int:

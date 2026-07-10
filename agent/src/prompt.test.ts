@@ -5513,12 +5513,10 @@ describe('thinker prompt contains criterion-coverage retirement warning', () => 
       previousDecisionOutcomes: '',
       pastRetirementCritiquesSection: '',
       retiredDirectionsSummarySection: '',
-      dirSummaryText: 'No active directions.',
-      dirHealthSummary: 'Active: 0/10 slots.',
+      directionPortfolioSection: '## Direction Portfolio\nActive: 0/10 slots.\nNo critical gaps detected.\n\nNo directions exist yet.\n\nNo active directions — portfolio is empty.',
       userPausedSection: '',
       rejectedProposalsSection: '',
       operatorOverridesSection: '',
-      portfolioCompositionText: 'No active directions — portfolio is empty.',
       modelHealthSection: '',
       systemMaturitySection: '',
       driftSection: '',
@@ -5532,9 +5530,9 @@ describe('thinker prompt contains criterion-coverage retirement warning', () => 
       efficiencySnapshotSection: '',
     };
     const prompt = buildThinkerPrompt(params);
-    expect(prompt).toContain('Criterion-coverage check before retirement');
+    expect(prompt).toContain('Criterion-coverage before retirement');
     expect(prompt).toContain('direction_owns_uncovered_criterion');
-    expect(prompt).toContain('retract the orphaned criterion via Section 8');
-    expect(prompt).toContain('Do NOT retire a criterion-carrying direction without first addressing its criterion');
+    expect(prompt).toContain('retract via Section 8');
+    expect(prompt).toContain('Do NOT retire criterion-carrying without addressing the criterion first');
   });
 });

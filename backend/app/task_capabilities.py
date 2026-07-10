@@ -42,6 +42,7 @@ class TaskType(str, Enum):
     web_research = "web_research"
     design = "design"
     repo_bootstrap = "repo_bootstrap"
+    salvage_bundle = "salvage_bundle"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -698,6 +699,21 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         filter_visible=False,
         evaluation="none",
     ),
+    TaskCapability(
+        TaskType.salvage_bundle,
+        "Salvage Bundle",
+        "write",
+        description=(
+            "Consolidated fix batch for research findings discarded via "
+            "repeated deferral decay. Produces a single PR addressing "
+            "all salvaged findings as one consolidated batch."
+        ),
+        run_shape="workflow",
+        output_kind="pr",
+        evaluation_strategy="ci_and_review",
+        cost_ceiling_usd=8.0,
+        evaluation="code-ci-review",
+    ),
 )
 
 TASK_CAPABILITY_BY_TYPE: dict[TaskType, TaskCapability] = {
@@ -949,6 +965,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.release_audit_challenge.value,
         TaskType.release_merge_grade.value,
         TaskType.self_audit.value,
+        TaskType.salvage_bundle.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering

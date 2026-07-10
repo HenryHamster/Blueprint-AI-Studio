@@ -25,6 +25,7 @@ vi.mock('../workspacePrep.js', () => ({ prepareWorkspaceForRole: vi.fn() }));
 vi.mock('../prompt.js', () => ({
   buildContextPrefix: vi.fn(() => ''),
   configureAgentPermissions: vi.fn(() => []),
+  configureResidentAgentPermissions: vi.fn(() => []),
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
   SHARED_LIFECYCLE_REMAINDER: '',
@@ -39,6 +40,8 @@ vi.mock('../providers/resident-session.js', () => ({
 vi.mock('./strategic-sections.js', () => ({
   buildDirSummaryText: vi.fn(() => ''),
   buildOpenMessagesText: vi.fn(() => ''),
+  buildDirectionPortfolioSection: vi.fn(() => ''),
+  buildPendingFollowupsSection: vi.fn(() => ''),
 }));
 
 // ── Import after mocks ────────────────────────────────────────────────────────

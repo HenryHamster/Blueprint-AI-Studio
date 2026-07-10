@@ -26,6 +26,7 @@ from app.knowledge_completion import (
     _parse_web_research_document,
 )
 from app.models import KnowledgeDocument, Task, TaskStatus
+from app.time_utils import _utcnow as _utcnow_func
 from app.schemas import AgentStatusPayload
 from app.task_evaluators import (
     QUALITY_GRADER_SOURCE_KEY,
@@ -2437,6 +2438,7 @@ async def test_knowledge_index_entry_shape(db_session):
         "origin_provenance",
         "sweep_id",
         "arm_label",
+        "lifecycle_status",
     }
     assert "body" not in entry
     assert entry["knowledge_acceptance_evidence"] is True
@@ -4185,3 +4187,1136 @@ class TestBuildResearchAuditDocument:
 
         task = self._make_task_with_topic("topic")
         assert _build_research_audit_document(task, [], [], None) is None
+
+
+# ── Knowledge document follow-up lifecycle ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pending_followup_auto_set_on_design_completion(
+    db_session, _quiet_broadcast
+):
+    """A design completion persists followup_status='pending' automatically."""
+    project, task = await _make_design_task(db_session)
+
+    document = {
+        "title": "Design for follow-up lifecycle",
+        "summary": "Tracking consumption of knowledge docs.",
+        "body": "# Follow-up\n\nDetailed design body.",
+        "citations": ["file:docs/design.md"],
+        "tags": ["design", "followup"],
+        "topic": "follow-up-lifecycle",
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert doc.source_kind == "design"
+    assert doc.lifecycle_status == "pending"
+    assert doc.consumed_at is None
+    assert doc.dismissed_reason is None
+
+
+@pytest.mark.asyncio
+async def test_pending_followup_auto_set_on_web_research_completion(
+    db_session, _quiet_broadcast
+):
+    """A web_research completion persists followup_status='pending' automatically."""
+    project, task = await _make_web_research_task(db_session)
+
+    document = {
+        "title": "State of X on the web",
+        "summary": "A concise survey of X with citations.",
+        "body": "# X\n\nDetailed markdown body.",
+        "citations": ["https://example.com/x"],
+        "tags": ["survey"],
+        "topic": "X",
+    }
+    await _handle_web_research_completion(task, json.dumps(document), db_session)
+
+    doc = (
+        (
+            await db_session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.source_task_id == task.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert doc.source_kind == "web_research"
+    assert doc.lifecycle_status == "pending"
+    assert doc.consumed_at is None
+    assert doc.dismissed_reason is None
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_completion_leaves_followup_null(
+    db_session, _quiet_broadcast
+):
+    """A compute_experiment completion leaves followup_status as None."""
+    from app.knowledge_completion import persist_compute_experiment_knowledge
+    from app.models import SourceKind
+
+    project = make_project(name="CEfollowup")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="compute_experiment: bench Y",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {"type": "compute_experiment", "experiment": "Y→Z", "base_branch": "main"}
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = await persist_compute_experiment_knowledge(
+        task,
+        outcome="SUCCESS",
+        cost=0.42,
+        criterion={
+            "metric": "runtime_ms",
+            "operator": "<",
+            "threshold": 100,
+            "value": 80,
+            "met": True,
+            "measurable": True,
+        },
+        result_reference="https://storage.example.com/jobs/xyz/result.json",
+        session=db_session,
+    )
+    assert doc is not None
+    assert doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
+    # compute_experiment docs do not participate in the follow-up lifecycle.
+    # lifecycle_status inherits the column default ('pending'), but the
+    # build_pending_followups query filters by source_kind so they are excluded.
+    assert doc.lifecycle_status == "pending"
+    assert doc.consumed_at is None
+    assert doc.dismissed_at is None
+    assert doc.dismissed_reason is None
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_returns_only_pending_design_web_research(
+    db_session,
+):
+    """build_pending_followups returns only pending design/web_research docs,
+    excluding consumed, dismissed, and other source kinds."""
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project = make_project(name="PFproject")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create real tasks for FK integrity.
+    def _make_doc_task(project_id, title, status=TaskStatus.COMPLETED):
+        t = make_task(project_id=project_id, title=title, status=status)
+        db_session.add(t)
+        return t
+
+    t1 = _make_doc_task(project.id, "Source task A")
+    t2 = _make_doc_task(project.id, "Source task B")
+    t3 = _make_doc_task(project.id, "Source task C")
+    t4 = _make_doc_task(project.id, "Source task D")
+    t5 = _make_doc_task(project.id, "Source task E")
+    t6 = _make_doc_task(project.id, "Source task F")
+    await db_session.commit()
+    for t in [t1, t2, t3, t4, t5, t6]:
+        await db_session.refresh(t)
+
+    # d1: pending design doc — should appear
+    d1 = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t1.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Design A",
+        summary="First design document.",
+        body="# A",
+        topic="topic-a",
+        tags=["design"],
+        lifecycle_status="pending",
+    )
+    # d2: consumed design doc — should NOT appear
+    d2 = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t2.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Design B",
+        summary="Already consumed design.",
+        body="# B",
+        topic="topic-b",
+        tags=["design"],
+        lifecycle_status="consumed",
+        consumed_at=_utcnow_func(),
+    )
+    # d3: pending web_research doc — should appear
+    d3 = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t3.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Research on Z",
+        summary="Web research findings.",
+        body="# Z",
+        topic="z",
+        tags=["research"],
+        lifecycle_status="pending",
+    )
+    # d4: dismissed web_research doc — should NOT appear
+    d4 = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t4.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Dismissed research",
+        summary="Not actionable.",
+        body="# D",
+        topic="d",
+        tags=["dismissed"],
+        lifecycle_status="dismissed",
+        dismissed_at=_utcnow_func(),
+        dismissed_reason="Out of scope",
+    )
+    # d5: pending compute_experiment doc — should NOT appear (wrong source kind)
+    d5 = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t5.id,
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        title="Benchmark results",
+        summary="Compute experiment output.",
+        body="# B",
+        topic="perf",
+        tags=["compute"],
+        lifecycle_status="pending",
+    )
+    # d6: consumed design doc — should NOT appear
+    # (lifecycle_status is NOT NULL with default='pending', so the old
+    # followup_status=None case is impossible in the new model.)
+    d6 = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t6.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Legacy design",
+        summary="Consumed design.",
+        body="# L",
+        topic="legacy",
+        tags=["legacy"],
+        lifecycle_status="consumed",
+        consumed_at=_utcnow_func(),
+    )
+
+    for d in [d1, d2, d3, d4, d5, d6]:
+        db_session.add(d)
+    await db_session.commit()
+
+    entries = await build_pending_followups(db_session, project.id)
+    ids = {e["id"] for e in entries}
+    assert str(d1.id) in ids
+    assert str(d3.id) in ids
+    assert str(d2.id) not in ids  # consumed
+    assert str(d4.id) not in ids  # dismissed
+    assert str(d5.id) not in ids  # compute_experiment
+    assert str(d6.id) not in ids  # consumed
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_followup_op(client: AsyncClient, db_session):
+    """The consume_knowledge_followup strategic op transitions status to 'consumed'."""
+    from app.auth import create_agent_token
+    from app.models import SourceKind
+
+    project = make_project(name="consumeop")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Source task for consume op",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=src_task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Consumable design",
+        summary="Ready to consume.",
+        body="# C",
+        topic="test",
+        tags=["test"],
+        lifecycle_status="pending",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-consume",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-consume", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge_followup",
+            "data": {
+                "document_id": str(doc.id),
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "consume_knowledge_followup"
+    assert body["lifecycle_status"] == "consumed"
+    assert body["document_id"] == str(doc.id)
+
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "consumed"
+    assert doc.consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_followup_op(client: AsyncClient, db_session):
+    """The dismiss_knowledge_followup strategic op transitions status to 'dismissed'."""
+    from app.auth import create_agent_token
+    from app.models import SourceKind
+
+    project = make_project(name="dismissop")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Source task for dismiss op",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=src_task.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Dismissible research",
+        summary="Not actionable right now.",
+        body="# D",
+        topic="test",
+        tags=["test"],
+        lifecycle_status="pending",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-dismiss",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dismiss", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge_followup",
+            "data": {
+                "document_id": str(doc.id),
+                "reason": "Out of scope for current cycle",
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "dismiss_knowledge_followup"
+    assert body["lifecycle_status"] == "dismissed"
+    assert body["document_id"] == str(doc.id)
+
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "dismissed"
+    assert doc.dismissed_at is not None
+    assert "Out of scope" in doc.dismissed_reason
+
+
+@pytest.mark.asyncio
+async def test_consume_already_consumed_returns_409(client: AsyncClient, db_session):
+    """Consuming a document that is already consumed returns 409."""
+    from app.auth import create_agent_token
+    from app.models import SourceKind
+
+    project = make_project(name="consume409")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Source task for consume 409",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=src_task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Already consumed",
+        summary="Was consumed earlier.",
+        body="# A",
+        topic="test",
+        tags=["test"],
+        lifecycle_status="consumed",
+        consumed_at=_utcnow_func(),
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-consume409",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-consume409", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge_followup",
+            "data": {
+                "document_id": str(doc.id),
+                "reason": "Trying to consume again",
+            },
+        },
+    )
+    assert resp.status_code == 409, resp.text
+
+
+@pytest.mark.asyncio
+async def test_dismiss_already_dismissed_returns_409(client: AsyncClient, db_session):
+    """Dismissing a document that is already dismissed returns 409."""
+    from app.auth import create_agent_token
+    from app.models import SourceKind
+
+    project = make_project(name="dismiss409")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src_task = make_task(
+        project_id=project.id,
+        title="Source task for dismiss 409",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=src_task.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Already dismissed",
+        summary="Was dismissed earlier.",
+        body="# A",
+        topic="test",
+        tags=["test"],
+        lifecycle_status="dismissed",
+        dismissed_at=_utcnow_func(),
+        dismissed_reason="Not relevant",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-dismiss409",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dismiss409", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge_followup",
+            "data": {
+                "document_id": str(doc.id),
+                "reason": "Trying to dismiss again",
+            },
+        },
+    )
+    assert resp.status_code == 409, resp.text
+
+
+# ── lifecycle ops: consume_knowledge / dismiss_knowledge ──────────────────────
+
+
+@pytest.fixture
+async def _lifecycle_setup(db_session):
+    """Create project + strategic review task + pending knowledge doc for lifecycle tests."""
+    from app.auth import create_agent_token
+
+    project = make_project(name="Lifecycle Test")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Strategic review for lifecycle",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="vm-lifecycle-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = KnowledgeDocument(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind="design",
+        title="Test Design Document",
+        summary="A test design doc awaiting consumption",
+        body="# Test Design\n\nThis is a test.",
+        topic="testing",
+        forward_quality_verdict={},
+        lifecycle_status="pending",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+
+    token = create_agent_token(str(task.id), "vm-lifecycle-test", task_type="strategic_review")
+    return project, task, doc, token
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_transitions_pending_to_consumed(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """consume_knowledge sets lifecycle_status=consumed and consumed_at timestamp."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": str(doc.id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "consume_knowledge"
+    assert body["document_id"] == str(doc.id)
+
+    # Verify durable DB state
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "consumed"
+    assert doc.consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_404_on_wrong_project(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """consume_knowledge returns 404 when the document belongs to a different project."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    # Use a random UUID that doesn't exist in this project
+    unknown_id = uuid.uuid4()
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": str(unknown_id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_transitions_pending_to_dismissed(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge sets lifecycle_status=dismissed with timestamp and reason."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {
+                "knowledge_document_id": str(doc.id),
+                "reason": "Design is already covered by direction d-abc123",
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "dismiss_knowledge"
+    assert body["document_id"] == str(doc.id)
+
+    # Verify durable DB state
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "dismissed"
+    assert doc.dismissed_at is not None
+    assert doc.dismissed_reason == "Design is already covered by direction d-abc123"
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_without_reason(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge works without an optional reason."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {"knowledge_document_id": str(doc.id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+
+    await db_session.refresh(doc)
+    assert doc.lifecycle_status == "dismissed"
+    assert doc.dismissed_at is not None
+    assert doc.dismissed_reason is None
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_404_on_missing_doc(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge returns 404 when the document does not exist."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    unknown_id = uuid.uuid4()
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {"knowledge_document_id": str(unknown_id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_consume_knowledge_rejects_malformed_payload(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """consume_knowledge returns 400 when data is not a dict with knowledge_document_id."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    # Missing knowledge_document_id entirely
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+    # Invalid UUID
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": "not-a-uuid"},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_dismiss_knowledge_rejects_malformed_payload(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """dismiss_knowledge returns 400 when data is not a dict with knowledge_document_id."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    # Missing knowledge_document_id entirely
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+    # Invalid UUID
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "dismiss_knowledge",
+            "data": {"knowledge_document_id": "not-a-uuid"},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_ops_set_strategic_api_called_on_task_context(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """Both consume_knowledge and dismiss_knowledge set _strategic_api_called on task context."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": str(doc.id)},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_api_called") is True
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_status_query_filter_works(
+    client: AsyncClient, db_session, _lifecycle_setup
+):
+    """The lifecycle_status query param filters the list endpoint correctly."""
+    project, task, doc, token = _lifecycle_setup
+    headers = {"x-agent-token": token}
+
+    # Doc starts as "pending" — it should appear when filtering for pending
+    pending_resp = await client.get(
+        "/api/agent/knowledge-documents?lifecycle_status=pending",
+        headers=headers,
+    )
+    assert pending_resp.status_code == 200, pending_resp.text
+    pending_ids = [d["id"] for d in pending_resp.json()["documents"]]
+    assert str(doc.id) in pending_ids
+
+    # It should NOT appear when filtering for "consumed"
+    consumed_resp = await client.get(
+        "/api/agent/knowledge-documents?lifecycle_status=consumed",
+        headers=headers,
+    )
+    assert consumed_resp.status_code == 200, consumed_resp.text
+    consumed_ids = [d["id"] for d in consumed_resp.json()["documents"]]
+    assert str(doc.id) not in consumed_ids
+
+    # After consuming the doc, it should appear in the "consumed" filter
+    await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "consume_knowledge",
+            "data": {"knowledge_document_id": str(doc.id)},
+        },
+        headers=headers,
+    )
+    consumed_after = await client.get(
+        "/api/agent/knowledge-documents?lifecycle_status=consumed",
+        headers=headers,
+    )
+    assert consumed_after.status_code == 200
+    consumed_after_ids = [d["id"] for d in consumed_after.json()["documents"]]
+    assert str(doc.id) in consumed_after_ids
+
+
+# ── build_pending_followups: additional edge-case coverage ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_cross_project_isolation(db_session):
+    """Pending docs from a different project must NOT appear in another project's followups."""
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project_a = make_project(name="BPF-cross-A")
+    project_b = make_project(name="BPF-cross-B")
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = make_task(
+        project_id=project_a.id,
+        title="task in project A",
+        status=TaskStatus.COMPLETED,
+    )
+    task_b = make_task(
+        project_id=project_b.id,
+        title="task in project B",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task_a)
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+    await db_session.refresh(task_b)
+
+    # A pending design doc owned by project B
+    doc_b = KnowledgeDocument(
+        project_id=project_b.id,
+        source_task_id=task_b.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Project B Design",
+        summary="Belongs to project B.",
+        body="# B",
+        lifecycle_status="pending",
+    )
+    # A pending web_research doc owned by project A
+    doc_a = KnowledgeDocument(
+        project_id=project_a.id,
+        source_task_id=task_a.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Project A Research",
+        summary="Belongs to project A.",
+        body="# A",
+        lifecycle_status="pending",
+    )
+    db_session.add(doc_a)
+    db_session.add(doc_b)
+    await db_session.commit()
+
+    entries_a = await build_pending_followups(db_session, project_a.id)
+    ids_a = {e["id"] for e in entries_a}
+    assert str(doc_a.id) in ids_a
+    assert str(doc_b.id) not in ids_a, "doc from project B must NOT appear in project A's followups"
+
+    entries_b = await build_pending_followups(db_session, project_b.id)
+    ids_b = {e["id"] for e in entries_b}
+    assert str(doc_b.id) in ids_b
+    assert str(doc_a.id) not in ids_b, "doc from project A must NOT appear in project B's followups"
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_newest_first_ordering(db_session):
+    """Pending followups are returned newest-first by created_at."""
+    from datetime import datetime, timedelta
+
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-order")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t1 = make_task(project_id=project.id, title="task 1", status=TaskStatus.COMPLETED)
+    t2 = make_task(project_id=project.id, title="task 2", status=TaskStatus.COMPLETED)
+    t3 = make_task(project_id=project.id, title="task 3", status=TaskStatus.COMPLETED)
+    db_session.add(t1)
+    db_session.add(t2)
+    db_session.add(t3)
+    await db_session.commit()
+    await db_session.refresh(t1)
+    await db_session.refresh(t2)
+    await db_session.refresh(t3)
+
+    base = datetime(2026, 3, 1, 10, 0, 0)
+    d_old = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t1.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Oldest doc",
+        summary="Oldest",
+        body="# old",
+        lifecycle_status="pending",
+        created_at=base,
+    )
+    d_mid = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t2.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Middle doc",
+        summary="Middle",
+        body="# mid",
+        lifecycle_status="pending",
+        created_at=base + timedelta(hours=1),
+    )
+    d_new = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t3.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Newest doc",
+        summary="Newest",
+        body="# new",
+        lifecycle_status="pending",
+        created_at=base + timedelta(hours=2),
+    )
+    db_session.add(d_old)
+    db_session.add(d_mid)
+    db_session.add(d_new)
+    await db_session.commit()
+
+    entries = await build_pending_followups(db_session, project.id)
+    titles = [e["title"] for e in entries]
+    assert titles == ["Newest doc", "Middle doc", "Oldest doc"]
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_summary_truncation(db_session):
+    """Summaries longer than the cap are collapsed (whitespace) and truncated with '…'."""
+    from app.knowledge_query import (
+        _PENDING_LIFECYCLE_ITEMS_SUMMARY_CHARS,
+        build_pending_followups,
+    )
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-trunc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id, title="trunc task", status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Build a summary longer than the cap; pad with spaces so whitespace collapse doesn't help
+    long_summary = "word " * 200  # ~1000 chars when collapsed
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Design with long summary",
+        summary=long_summary,
+        body="# Body",
+        lifecycle_status="pending",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    entries = await build_pending_followups(db_session, project.id)
+    assert len(entries) == 1
+    summary = entries[0]["summary"]
+    # Must end with the ellipsis sentinel
+    assert summary.endswith("…"), f"Expected truncated summary ending with '…', got: {summary!r}"
+    # Must not exceed the cap
+    assert len(summary) <= _PENDING_LIFECYCLE_ITEMS_SUMMARY_CHARS, (
+        f"Truncated summary length {len(summary)} exceeds cap {_PENDING_LIFECYCLE_ITEMS_SUMMARY_CHARS}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_respects_limit_cap(db_session):
+    """build_pending_followups returns at most `limit` entries."""
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-limit")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create 5 tasks + docs
+    tasks = []
+    for i in range(5):
+        t = make_task(project_id=project.id, title=f"limit task {i}", status=TaskStatus.COMPLETED)
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.commit()
+    for t in tasks:
+        await db_session.refresh(t)
+
+    for i, t in enumerate(tasks):
+        d = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=t.id,
+            source_kind=SourceKind.DESIGN.value,
+            title=f"Doc {i}",
+            summary=f"Summary {i}",
+            body=f"# {i}",
+            lifecycle_status="pending",
+        )
+        db_session.add(d)
+    await db_session.commit()
+
+    # Default limit (20) returns all 5
+    entries_all = await build_pending_followups(db_session, project.id)
+    assert len(entries_all) == 5
+
+    # Custom limit of 2 returns at most 2
+    entries_limited = await build_pending_followups(db_session, project.id, limit=2)
+    assert len(entries_limited) == 2
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_entry_fields_shape(db_session):
+    """Each entry carries id, title, summary, topic, source_kind, direction_id, created_at, and tags."""
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-shape")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id, title="shape task", status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        source_kind=SourceKind.WEB_RESEARCH.value,
+        title="Field-shape check",
+        summary="Summary for shape check.",
+        body="# Body",
+        topic="shape-topic",
+        direction_id="d-aabbccdd",
+        tags=["tag1", "tag2"],
+        lifecycle_status="pending",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    entries = await build_pending_followups(db_session, project.id)
+    assert len(entries) == 1
+    e = entries[0]
+
+    assert e["id"] == str(doc.id)
+    assert e["title"] == "Field-shape check"
+    assert e["summary"] == "Summary for shape check."
+    assert e["topic"] == "shape-topic"
+    assert e["source_kind"] == SourceKind.WEB_RESEARCH.value
+    assert e["direction_id"] == "d-aabbccdd"
+    assert e["tags"] == ["tag1", "tag2"]
+    assert e["created_at"] is not None  # ISO timestamp string
+
+
+@pytest.mark.asyncio
+async def test_build_pending_followups_excludes_research_audit(db_session):
+    """research_audit docs are excluded from the follow-up lifecycle (only design + web_research appear)."""
+    from app.knowledge_query import build_pending_followups
+    from app.models import SourceKind
+
+    project = make_project(name="BPF-audit")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    t_audit = make_task(project_id=project.id, title="audit task", status=TaskStatus.COMPLETED)
+    t_design = make_task(project_id=project.id, title="design task", status=TaskStatus.COMPLETED)
+    db_session.add(t_audit)
+    db_session.add(t_design)
+    await db_session.commit()
+    await db_session.refresh(t_audit)
+    await db_session.refresh(t_design)
+
+    doc_audit = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t_audit.id,
+        source_kind=SourceKind.RESEARCH_AUDIT.value,
+        title="Research audit doc",
+        summary="Audit output.",
+        body="# Audit",
+        lifecycle_status="pending",
+    )
+    doc_design = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=t_design.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Regular design doc",
+        summary="Design output.",
+        body="# Design",
+        lifecycle_status="pending",
+    )
+    db_session.add(doc_audit)
+    db_session.add(doc_design)
+    await db_session.commit()
+
+    entries = await build_pending_followups(db_session, project.id)
+    ids = {e["id"] for e in entries}
+    assert str(doc_design.id) in ids, "design doc should appear"
+    assert str(doc_audit.id) not in ids, "research_audit doc must NOT appear in lifecycle followups"

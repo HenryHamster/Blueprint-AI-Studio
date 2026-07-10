@@ -883,9 +883,12 @@ class DedupOutcome:
     evidence_overlap_count: int = 0
     retired_approach_count: int = 0
     archived_diagnoses_count: int = 0
-    # Per-skip reason records: {title, direction_id, reason} for each filtered
-    # finding, so the research agent can be told exactly what was rejected and
-    # why on its next cycle. Reasons are short literals (≤80 chars).
+    # Per-skip reason records: {title, direction_id, reason, finding} for each
+    # filtered finding. ``finding`` carries the full original payload (description,
+    # evidence, file citations, severity, sources, claims, etc.) so downstream
+    # salvage consumers can inspect type, severity, and context of skipped findings
+    # without a separate lookup. ``reason`` is a short literal (≤80 chars) and
+    # ``title`` is truncated to 120 chars for the research-agent feedback loop.
     filtered: list[dict] = field(default_factory=list)
 
 
@@ -925,6 +928,7 @@ def deduplicate_findings(
         (f.get("title", ""), f.get("sources", []), f.get("claims", []))
         for f in recent_terminal_findings
     ]
+    terminal_evidence_count = len(evidence_list)
 
     for orig_i, finding in indexed_findings:
         title = finding.get("title", f"Research finding #{orig_i + 1}")
@@ -950,6 +954,7 @@ def deduplicate_findings(
                     "title": title[:120],
                     "direction_id": finding_dir_id,
                     "reason": "hash match with prior task"[:80],
+                    "finding": finding,
                 }
             )
             continue
@@ -973,6 +978,7 @@ def deduplicate_findings(
                     "title": title[:120],
                     "direction_id": finding_dir_id,
                     "reason": reason[:80],
+                    "finding": finding,
                 }
             )
             continue
@@ -993,6 +999,7 @@ def deduplicate_findings(
                         "title": title[:120],
                         "direction_id": finding_dir_id,
                         "reason": reason[:80],
+                        "finding": finding,
                     }
                 )
                 continue
@@ -1017,6 +1024,7 @@ def deduplicate_findings(
                         "title": title[:120],
                         "direction_id": finding_dir_id,
                         "reason": reason[:80],
+                        "finding": finding,
                     }
                 )
                 continue
@@ -1036,6 +1044,7 @@ def deduplicate_findings(
                         "title": title[:120],
                         "direction_id": finding_dir_id,
                         "reason": reason[:80],
+                        "finding": finding,
                     }
                 )
                 continue
@@ -1051,11 +1060,17 @@ def deduplicate_findings(
                     "title": title[:120],
                     "direction_id": finding_dir_id,
                     "reason": "all files covered by open PR"[:80],
+                    "finding": finding,
                 }
             )
             continue
 
         # Evidence-overlap check: compare sources and claims against already-deduped findings
+        terminal_evidence_dup, _ = _check_evidence_overlap(
+            finding.get("sources", []),
+            finding.get("claims", []),
+            evidence_list[:terminal_evidence_count],
+        )
         is_evidence_dup, matched_evidence_title = _check_evidence_overlap(
             finding.get("sources", []),
             finding.get("claims", []),
@@ -1072,6 +1087,8 @@ def deduplicate_findings(
                     "title": title[:120],
                     "direction_id": finding_dir_id,
                     "reason": reason[:80],
+                    "finding": finding,
+                    "terminal_history": terminal_evidence_dup,
                 }
             )
             continue

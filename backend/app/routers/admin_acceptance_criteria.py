@@ -436,12 +436,26 @@ async def reconcile_backfill(
     from sqlmodel import select as _select
     from app.models import Direction as _Direction
 
-    dir_result = await session.execute(
-        _select(_Direction.direction_key).where(
-            _Direction.project_id == project_id,
+    # Keyset-paginated query over direction keys to avoid loading thousands of
+    # rows into memory at once. Batch size follows the same batching pattern
+    # used elsewhere in the codebase for large table scans.
+    _BATCH_SIZE = 500
+    direction_keys = []
+    last_key: str | None = None
+    while True:
+        q = (
+            _select(_Direction.direction_key)
+            .where(_Direction.project_id == project_id)
+            .order_by(_Direction.direction_key)
+            .limit(_BATCH_SIZE)
         )
-    )
-    direction_keys = list(dir_result.scalars().all())
+        if last_key is not None:
+            q = q.where(_Direction.direction_key > last_key)
+        batch = list((await session.execute(q)).scalars().all())
+        if not batch:
+            break
+        direction_keys.extend(batch)
+        last_key = batch[-1]
 
     results = []
     total = 0

@@ -4710,6 +4710,7 @@ async def test_second_opinion_state_not_propagated_to_spawned_tasks(db_session, 
         "awaiting_review_second_opinion": str(uuid.uuid4()),
         "review_second_opinion_parked": {"verdict": "REQUEST_CHANGES", "issues": []},
         "review_second_opinion_for_task_id": str(uuid.uuid4()),
+        "blind_review_for_task_id": str(uuid.uuid4()),
     }
     # The literal keys above must stay in lockstep with the canonical family —
     # if a key is renamed or added, this test must be updated alongside it.
@@ -7385,12 +7386,24 @@ async def test_noop_fix_churn_increments_counter(db_session, mocker):
     )
     await db_session.commit()
 
-    # Churn limit not yet reached (1 + 1 = 2 < 3) — review should spawn.
-    assert created is True
-    assert result is not None
+    # Churn limit not yet reached (1 + 1 = 2 < 3), but the no-op fix
+    # short-circuit must intercept and close the chain — no review spawns.
+    assert result is None
+    assert created is False
     await db_session.refresh(original_task)
     # Counter must have been INCREMENTED from 1 to 2, not reset to 0.
     assert (original_task.context or {}).get("_review_supersede_churn_count") == 2
+    # Terminal outcome must indicate no-op fix convergence.
+    assert (
+        (original_task.context or {})
+        .get("review_loop_terminal_outcome", {})
+        .get("kind")
+    ) == "converged"
+    assert (
+        (original_task.context or {})
+        .get("review_loop_terminal_outcome", {})
+        .get("reason")
+    ) == "noop_fix_already_satisfied"
 
 
 @pytest.mark.asyncio
@@ -7539,18 +7552,23 @@ async def test_real_fix_resets_churn_noop_fix_does_not(db_session, mocker):
     )
     await db_session.commit()
 
-    # Churn was 3; no-op fix increments to 4 (still < 5) — review spawns.
-    assert noop_created is True and noop_result is not None
+    # No-op fix short-circuit intercepts — no review spawns, churn is 4.
+    assert noop_created is False and noop_result is None
     await db_session.refresh(original_task)
     assert (original_task.context or {}).get("_review_supersede_churn_count") == 4
-
-    # Complete the spawned review so part 2 doesn't hit the dedup guard.
-    assert noop_result is not None
-    noop_result.status = TaskStatus.COMPLETED
-    db_session.add(noop_result)
-    await db_session.commit()
+    assert (
+        (original_task.context or {})
+        .get("review_loop_terminal_outcome", {})
+        .get("kind")
+    ) == "converged"
+    assert (
+        (original_task.context or {})
+        .get("review_loop_terminal_outcome", {})
+        .get("reason")
+    ) == "noop_fix_already_satisfied"
 
     # --- Part 2: real fix (no no_op_reason) MUST reset ---
+    # No spawned review to complete from Part 1 (short-circuit prevented it).
     real_fix = make_task(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
@@ -7591,7 +7609,8 @@ async def test_real_fix_resets_churn_noop_fix_does_not(db_session, mocker):
     await db_session.refresh(original_task)
     # Real fix must RESET churn to 0.
     assert (original_task.context or {}).get("_review_supersede_churn_count") == 0
-    assert (original_task.context or {}).get("review_loop_terminal_outcome") is None
+    # Terminal outcome from Part 1's no-op fix remains in place (historical
+    # breadcrumb) — a real fix resets the churn counter, not the outcome.
 
 
 @pytest.mark.asyncio
@@ -7696,28 +7715,22 @@ async def test_noop_fix_halt_cancels_inflight_children(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_noop_fix_churn_halt_fires_interleaved_review_fix_loop(
+async def test_real_fix_and_review_dont_interfere_with_noop_short_circuit(
     db_session, mocker
 ):
-    """Realistic review→fix→review→fix loop: the halt must fire when two no-op
-    fixes occur even with interleaved review completions between them.
+    """After a real fix spawns a review and the review completes, the churn
+    counter must NOT be reset by the review-type source task.  When the
+    subsequent fix completes as a no-op, the short-circuit must close the
+    chain as converged (not spin forever).
 
-    Before the fix, _spawn_pipeline_task's else-branch fired for REVIEW source
-    tasks too, resetting _review_supersede_churn_count to 0 after every review
-    completion — meaning the +1 from each no-op fix was immediately wiped by the
-    next review that spawned a new fix.  The halt never accumulated.
-
-    This test exercises the full interleaved path that the pre-fix code could not
-    halt:
-      1. noop_fix_1 completes → spawns review (churn 0→1)
-      2. review_1 completes REQUEST_CHANGES → spawns fix (must NOT reset churn)
-      3. noop_fix_2 completes → spawns review (churn 1→2, limit=2 → halt fires)
+    Steps:
+      1. Pre-set churn counter to 1 (simulating a prior stale-cycle).
+      2. REAL fix (no no_op_reason, resets churn to 0) → review spawns.
+      3. Review completes REQUEST_CHANGES → spawns a new fix (churn stays 0;
+         review source must NOT reset/modify the counter).
+      4. The fix completes as no-op → short-circuit closes chain as converged.
     """
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch(
-        "app.notification_dispatch.dispatch_external_notification",
-        new_callable=AsyncMock,
-    )
     mocker.patch("app.review_pipeline._REVIEW_SUPERSEDE_CHURN_LIMIT", 2)
 
     project = await _make_db_project(db_session)
@@ -7725,19 +7738,19 @@ async def test_noop_fix_churn_halt_fires_interleaved_review_fix_loop(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
-        context={"scope": "small"},
+        context={"scope": "small", "_review_supersede_churn_count": 1},
     )
     db_session.add(original_task)
     await db_session.commit()
     await db_session.refresh(original_task)
 
     pr_number = 720
-    branch = "feat/interleaved-noop"
+    branch = "feat/noop-interleave"
     base_branch = "main"
     orig_id = str(original_task.id)
 
-    # ── Step 1: first no-op fix completes → spawns a review (churn 0→1) ──────
-    noop_fix_1 = make_task(
+    # ── Step 1: real fix (no no_op_reason) resets churn to 0 → review spawns ──
+    real_fix = make_task(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         payloads=[
@@ -7751,16 +7764,16 @@ async def test_noop_fix_churn_halt_fires_interleaved_review_fix_loop(
         ],
         context={
             "scope": "small",
-            "no_op_reason": "deliverable already present on main — no new commits",
+            # No no_op_reason — real commits were pushed, resets churn.
             "review_loop": {"iteration": 2, "original_task_id": orig_id},
         },
     )
-    db_session.add(noop_fix_1)
+    db_session.add(real_fix)
     await db_session.commit()
-    await db_session.refresh(noop_fix_1)
+    await db_session.refresh(real_fix)
 
     review_1, review_1_created = await _spawn_pipeline_task(
-        noop_fix_1,
+        real_fix,
         "review",
         db_session,
         pr_number=pr_number,
@@ -7770,23 +7783,20 @@ async def test_noop_fix_churn_halt_fires_interleaved_review_fix_loop(
     )
     await db_session.commit()
 
-    # Churn not yet at limit (0→1 < 2) — review must spawn.
-    assert review_1_created is True, "First no-op fix must spawn a review (churn 0→1)"
+    # Real fix must spawn a review (no short-circuit applies).
+    assert review_1_created is True, "Real fix must spawn a review"
     assert review_1 is not None
     await db_session.refresh(original_task)
-    assert (original_task.context or {}).get("_review_supersede_churn_count") == 1, (
-        "Churn counter must be 1 after first no-op fix"
+    assert (original_task.context or {}).get("_review_supersede_churn_count") == 0, (
+        "Real fix must RESET churn counter to 0"
     )
 
-    # ── Step 2: that review completes REQUEST_CHANGES → spawns fix ────────────
-    # Mark the spawned review COMPLETED so it doesn't block the fix-spawn dedup.
+    # ── Step 2: review completes REQUEST_CHANGES → spawns fix ─────────────────
     assert review_1 is not None
     review_1.status = TaskStatus.COMPLETED
     db_session.add(review_1)
     await db_session.commit()
 
-    # The review task is the source for spawning a new fix — this is the
-    # path that formerly reset churn to 0 (the else-branch bug).
     review_task_source = make_task(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
@@ -7803,7 +7813,7 @@ async def test_noop_fix_churn_halt_fires_interleaved_review_fix_loop(
             "scope": "small",
             "review_loop": {"iteration": 3, "original_task_id": orig_id},
             "verdict": "REQUEST_CHANGES",
-            "issues": [{"severity": "major", "description": "Redundant with main"}],
+            "issues": [{"severity": "major", "description": "Needs cleanup"}],
         },
     )
     db_session.add(review_task_source)
@@ -7818,27 +7828,26 @@ async def test_noop_fix_churn_halt_fires_interleaved_review_fix_loop(
         branch=branch,
         base_branch=base_branch,
         original_task_id=orig_id,
-        fix_prompt="Address review feedback: redundant with main",
-        current_feedback="Redundant with main",
-        current_issues=[{"severity": "major", "description": "Redundant with main"}],
+        fix_prompt="Address review feedback",
+        current_feedback="Needs cleanup",
+        current_issues=[{"severity": "major", "description": "Needs cleanup"}],
     )
     await db_session.commit()
 
-    # The fix may or may not spawn depending on dedup; what's critical is that
-    # the churn counter was NOT reset by the review-source spawn.
+    # Review-type source must NOT modify the churn counter — it stays at 0.
     await db_session.refresh(original_task)
-    assert (original_task.context or {}).get("_review_supersede_churn_count") == 1, (
-        "Review completion must NOT reset the churn counter — it was 1, must still be 1"
+    assert (original_task.context or {}).get("_review_supersede_churn_count") == 0, (
+        "Review source must NOT modify churn counter"
     )
 
-    # Mark any spawned fix COMPLETED so the next review-spawn dedup does not block.
+    # Mark the spawned fix COMPLETED so the next review-spawn dedup does not block.
     if fix_from_review is not None:
         fix_from_review.status = TaskStatus.COMPLETED
         db_session.add(fix_from_review)
         await db_session.commit()
 
-    # ── Step 3: second no-op fix → churn 1→2 = limit → halt fires ────────────
-    noop_fix_2 = make_task(
+    # ── Step 3: the fix completes as no-op → short-circuit closes chain ───────
+    noop_fix = make_task(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         payloads=[
@@ -7856,12 +7865,12 @@ async def test_noop_fix_churn_halt_fires_interleaved_review_fix_loop(
             "review_loop": {"iteration": 4, "original_task_id": orig_id},
         },
     )
-    db_session.add(noop_fix_2)
+    db_session.add(noop_fix)
     await db_session.commit()
-    await db_session.refresh(noop_fix_2)
+    await db_session.refresh(noop_fix)
 
     result, created = await _spawn_pipeline_task(
-        noop_fix_2,
+        noop_fix,
         "review",
         db_session,
         pr_number=pr_number,
@@ -7871,22 +7880,20 @@ async def test_noop_fix_churn_halt_fires_interleaved_review_fix_loop(
     )
     await db_session.commit()
 
-    # Churn limit reached (1→2 >= 2): halt must fire, no task spawned.
-    assert result is None, "Halt must fire on second no-op fix in interleaved loop"
+    # No-op fix short-circuit must close the chain as converged (0+1=1 < 2).
+    assert result is None, "No-op fix must short-circuit, no review spawned"
     assert created is False
     await db_session.refresh(original_task)
-    assert (original_task.context or {}).get("_review_supersede_churn_count") == 2
-    assert (
-        (original_task.context or {})
-        .get("review_loop_terminal_outcome", {})
-        .get("kind")
-    ) == "supersession_churn_halt"
-    assert (
-        (original_task.context or {})
-        .get("review_loop_terminal_outcome", {})
-        .get("reason")
-    ) == "noop_fix_already_satisfied"
-    assert original_task.requires_approval is True
+    assert (original_task.context or {}).get("_review_supersede_churn_count") == 1, (
+        "No-op fix must increment churn counter to 1"
+    )
+    term = (original_task.context or {}).get("review_loop_terminal_outcome", {})
+    assert term.get("kind") == "converged", (
+        f"Expected converged terminal outcome, got {term.get('kind')}"
+    )
+    assert term.get("reason") == "noop_fix_already_satisfied", (
+        f"Expected noop_fix_already_satisfied reason, got {term.get('reason')}"
+    )
 
 
 def _utcnow_for_test():
@@ -18424,3 +18431,174 @@ async def test_spawn_review_second_opinion_forwards_viewport_shots(db_session):
         "challenger payload must carry viewport_shot_entries forwarded from the review task"
     )
     assert cp.get("viewport_source_task_id") == "src-task-abc"
+
+
+async def test_spawn_blind_multi_reviewer_creates_panel_review_task(db_session):
+    """spawn_blind_multi_reviewer creates a panel_review challenger with
+    is_blind: True, default reviewer count, forwarded viewport shots,
+    and both REVIEW_SECOND_OPINION_SOURCE_KEY + BLIND_REVIEW_SOURCE_KEY
+    in context. The source review task is parked EVALUATING."""
+    from app.task_evaluators import (
+        BLIND_REVIEW_SOURCE_KEY,
+        REVIEW_SECOND_OPINION_SOURCE_KEY,
+        spawn_blind_multi_reviewer,
+    )
+    from app.task_completion import REVIEW_SECOND_OPINION_AWAITING_KEY
+
+    project = Project(name="blind-test", user_id="user-1", github_repo="o/r")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    shot_entries = [
+        {"name": "before/comp/blind-375px"},
+    ]
+    source_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9002,
+                "branch": "feat/blind",
+                "base_branch": "main",
+                "original_task_id": str(uuid.uuid4()),
+                "viewport_shot_entries": shot_entries,
+                "viewport_source_task_id": "src-blind-abc",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    challenger = await spawn_blind_multi_reviewer(
+        source_task,
+        db_session,
+        verdict="APPROVE",
+        issues=[],
+        feedback="lgtm",
+        pr_number=9002,
+        branch="feat/blind",
+        base_branch="main",
+        original_task_id=str(uuid.uuid4()),
+        original_prompt="do the thing",
+        investigated_files=["app/x.py"],
+    )
+
+    assert challenger is not None
+    cp = challenger.first_payload
+    assert cp.get("type") == "panel_review"
+    assert cp.get("is_blind") is True, "blind multi-reviewer: is_blind must be True"
+    assert cp.get("blind_reviewer_count") == 3, (
+        "default blind_reviewer_count must be 3"
+    )
+    assert cp.get("viewport_shot_entries") == shot_entries, (
+        "challenger payload must carry viewport_shot_entries forwarded from the source task"
+    )
+    assert cp.get("viewport_source_task_id") == "src-blind-abc"
+
+    # Context must carry both source keys for routing and identification.
+    ctx = challenger.context or {}
+    assert REVIEW_SECOND_OPINION_SOURCE_KEY in ctx, (
+        "blind challenger context must have REVIEW_SECOND_OPINION_SOURCE_KEY for reconciliation routing"
+    )
+    assert BLIND_REVIEW_SOURCE_KEY in ctx, (
+        "blind challenger context must have BLIND_REVIEW_SOURCE_KEY for identification"
+    )
+    assert ctx[REVIEW_SECOND_OPINION_SOURCE_KEY] == str(source_task.id)
+    assert ctx[BLIND_REVIEW_SOURCE_KEY] == str(source_task.id)
+
+    # Source task must be parked EVALUATING with the awaiting marker.
+    assert source_task.status == TaskStatus.EVALUATING, (
+        "source task must be parked EVALUATING pending blind review"
+    )
+    assert (source_task.context or {}).get(REVIEW_SECOND_OPINION_AWAITING_KEY) is not False, (  # truthy (True or task id str)
+        "source task must have REVIEW_SECOND_OPINION_AWAITING_KEY set"
+    )
+
+    # Cleanup: can't leave a parked task in the session without committing
+    # the parking state. The test already committed through the spawn; just
+    # verify the DB state is consistent.
+    await db_session.refresh(source_task)
+    assert source_task.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_noop_fix_skips_review_spawn_below_churn_limit(db_session, mocker):
+    """A completed fix task with no_op_reason set must NOT spawn a new review
+    even when the supersession-churn limit has not been reached.  The no-op fix
+    short-circuit must close the chain as converged (deliverable already present
+    via another path) instead of spawning a fresh review that would loop."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.review_pipeline._REVIEW_SUPERSEDE_CHURN_LIMIT", 5)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Source task: COMPLETED fix with no_op_reason (zero net diff after rebase).
+    noop_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 800,
+                "branch": "feat/noop-spawn",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "no_op_reason": "deliverable already present on main — no new commits",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(noop_fix)
+    await db_session.commit()
+    await db_session.refresh(noop_fix)
+
+    result, created = await _spawn_pipeline_task(
+        noop_fix,
+        "review",
+        db_session,
+        pr_number=800,
+        branch="feat/noop-spawn",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    await db_session.commit()
+
+    # No review should be spawned — short-circuit closed the chain.
+    assert result is None, "Expected no review task (no-op fix short-circuit)"
+    assert created is False, "Expected no new task (no-op fix short-circuit)"
+
+    # Original task must carry the convergence terminal outcome.
+    await db_session.refresh(original_task)
+    term = (original_task.context or {}).get("review_loop_terminal_outcome", {})
+    assert term.get("kind") == "converged", (
+        f"Expected converged terminal outcome, got {term.get('kind')}"
+    )
+    assert term.get("reason") == "noop_fix_already_satisfied", (
+        f"Expected noop_fix_already_satisfied reason, got {term.get('reason')}"
+    )
+
+    # Source task should have a descriptive status message.
+    await db_session.refresh(noop_fix)
+    assert "No-op fix" in (noop_fix.latest_status_message or ""), (
+        "Source task status message should indicate no-op fix closure"
+    )

@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, cleanup } from '@testing-library/react';
 import { useStrategicReadModel } from './useStrategicReadModel';
-import { fetchStrategicState } from '../strategicStateApi';
+import { fetchStrategicStateWithRevision } from '../strategicStateApi';
 import type { StrategicSessionResponse, StrategicStateResponse } from '../strategicStateApi';
 
 vi.mock('../strategicStateApi', () => ({
-  fetchStrategicState: vi.fn(),
+  fetchStrategicStateWithRevision: vi.fn(),
   fetchStrategicWorkbenchState: vi.fn(),
   updateStrategicWorkbenchState: vi.fn(),
   fetchStrategicSession: vi.fn(),
@@ -15,6 +15,8 @@ vi.mock('../strategicStateApi', () => ({
   executeStrategicWorkSessionCommand: vi.fn(),
   startStrategicSession: vi.fn(),
   stopStrategicSession: vi.fn(),
+  getMessageAttachmentUploadUrl: vi.fn(),
+  fetchStrategicState: vi.fn(),
 }));
 
 // Disable the poller so tests drive fetches via result.current.refresh().
@@ -25,7 +27,7 @@ vi.mock('./usePoller', () => ({
   __pollerInternals: { reset: vi.fn(), hasActiveTimers: vi.fn(), subscriberCount: vi.fn() },
 }));
 
-const mockFetch = vi.mocked(fetchStrategicState);
+const mockFetch = vi.mocked(fetchStrategicStateWithRevision);
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -300,5 +302,67 @@ describe('useStrategicReadModel', () => {
     expect(mockFetch).not.toHaveBeenCalled();
     // State stays as set by the initial loading effect — not errored
     expect(result.current.error).toBeNull();
+  });
+
+  it('stores state_revision from response and passes it on the next poll', async () => {
+    const state1 = { ...makeState('proj-1'), state_revision: 'abc123' };
+    const state2 = { ...makeState('proj-1'), state_revision: 'def456' };
+
+    mockFetch.mockResolvedValueOnce(state1);
+    mockFetch.mockResolvedValueOnce(state2);
+
+    const { result } = renderHook(() => useStrategicReadModel('proj-1'));
+
+    // First call: no stored revision yet → passes null
+    await act(async () => { await result.current.refresh(); });
+    expect(mockFetch.mock.calls[0][1]).toBeNull();
+
+    // Second call: should pass the revision from the first response
+    await act(async () => { await result.current.refresh(); });
+    expect(mockFetch.mock.calls[1][1]).toBe('abc123');
+  });
+
+  it('resets state_revision ref on project change', async () => {
+    const state1 = { ...makeState('proj-1'), state_revision: 'abc123' };
+    const state2 = { ...makeState('proj-2'), state_revision: 'ghi789' };
+
+    mockFetch.mockResolvedValueOnce(state1);
+    mockFetch.mockResolvedValueOnce(state2);
+
+    const { result, rerender } = renderHook(
+      ({ projectId }: { projectId: string | null }) => useStrategicReadModel(projectId),
+      { initialProps: { projectId: 'proj-1' as string | null } },
+    );
+
+    // First refresh stores revision
+    await act(async () => { await result.current.refresh(); });
+    expect(mockFetch.mock.calls[0][1]).toBeNull();
+
+    // Change project — the revision ref must reset
+    mockFetch.mockResolvedValueOnce(state2);
+    act(() => { rerender({ projectId: 'proj-2' }); });
+    await act(async () => { await result.current.refresh(); });
+
+    // The fetch for the new project should pass null (revision reset)
+    expect(mockFetch.mock.calls[1][1]).toBeNull();
+  });
+
+  it('sets state_revision ref to null when response lacks state_revision', async () => {
+    const state1 = { ...makeState('proj-1') };
+    // state_revision deliberately absent from the response
+    const state2 = { ...makeState('proj-1'), state_revision: 'abc123' };
+
+    mockFetch.mockResolvedValueOnce(state1);
+    mockFetch.mockResolvedValueOnce(state2);
+
+    const { result } = renderHook(() => useStrategicReadModel('proj-1'));
+
+    // First call: no stored revision → passes null
+    await act(async () => { await result.current.refresh(); });
+    expect(mockFetch.mock.calls[0][1]).toBeNull();
+
+    // Second call: revision ref is null because response lacked state_revision
+    await act(async () => { await result.current.refresh(); });
+    expect(mockFetch.mock.calls[1][1]).toBeNull();
   });
 });

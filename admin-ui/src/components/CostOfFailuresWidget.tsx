@@ -1,4 +1,4 @@
-import { FAILURE_CLASS_COLORS } from './DashboardMetricCards';
+import { FAILURE_CLASS_COLORS } from './DashboardMetricCardsPrimitives';
 import type { DigestData } from './DashboardHome';
 
 export function CostOfFailuresWidget({ digest }: { digest: DigestData | null }) {

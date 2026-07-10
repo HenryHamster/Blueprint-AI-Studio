@@ -219,6 +219,9 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
         route=ROUTE_HEALTH,
         action_required=False,
     ),
+    "efficiency.provider_routing_verdict": AlertEventPolicy(
+        "efficiency.provider_routing_verdict",
+    ),
 }
 
 

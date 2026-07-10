@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { FAILURE_CLASS_COLORS } from './DashboardMetricCards';
+import { FAILURE_CLASS_COLORS } from './DashboardMetricCardsPrimitives';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS } from './dashboardConstants';
 import type { FailureGroup } from '../types/digest';
 import { Badge } from './ui/Badge';

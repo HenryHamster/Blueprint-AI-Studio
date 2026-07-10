@@ -6,7 +6,7 @@ import {
 import { writeAgentTokenFile } from '../token-file.js';
 import { PROCESS_KILL_GRACE_MS } from '../constants.js';
 import {
-  parseResidentLine, splitStreamChunk, encodeUserTurn, encodeInterrupt,
+  parseResidentLine, splitStreamChunk, encodeUserTurn, encodeUserTurnBlocks, encodeInterrupt,
   isStrategicMutation, isMessageSend, type ResidentStreamEvent,
 } from './resident-stream.js';
 import { getProviderRunner } from './runners.js';
@@ -72,6 +72,11 @@ export interface ResidentTurnResult {
   turnMs: number;
   /** number of tool_use calls that fired during this turn. */
   toolCallCount: number;
+  /** inclusive input token count reported by this turn's top-level `result` event;
+   *  zero when no usage block was reported (interrupted / pre-result child exit).
+   *  The handler uses this to detect context-window pressure and trigger compaction
+   *  before the model's context limit is reached. */
+  inputTokens: number;
 }
 
 export interface ResidentSessionEvent {
@@ -86,10 +91,12 @@ export interface ResidentSessionEvent {
 
 export interface ResidentSession {
   /** Write one user turn; resolves on the turn's top-level `result` (or interrupt/close).
-   *  `opts.stallTimeoutMs` overrides the per-active-turn stall budget for THIS turn
-   *  only (autonomous turns get a deeper budget so a long read/verify step isn't
-   *  killed mid-thought); the absolute hard ceiling and interrupt ladder are unchanged. */
-  sendTurn(text: string, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult>;
+   *  Accepts a plain text string or an array of content blocks (text + image) for
+   *  multimodal operator messages. `opts.stallTimeoutMs` overrides the per-active-turn
+   *  stall budget for THIS turn only (autonomous turns get a deeper budget so a long
+   *  read/verify step isn't killed mid-thought); the absolute hard ceiling and interrupt
+   *  ladder are unchanged. */
+  sendTurn(textOrBlocks: string | Array<Record<string, unknown>>, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult>;
   /** Cooperatively pre-empt the in-flight turn (control_request, SIGINT fallback). */
   interrupt(): void;
   /** Subscribe to parsed stream events (text deltas, tool_use, errors). */
@@ -154,6 +161,9 @@ interface ActiveTurn {
   firstTokenAtMs: number | null;
   /** count of tool_use calls observed so far this turn. */
   toolCallCount: number;
+  /** inclusive input token count reported by the turn's top-level `result` event;
+   *  zero when no usage block was reported (interrupted / pre-result child exit). */
+  inputTokens: number;
 }
 
 /**
@@ -271,6 +281,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       ttftMs,
       turnMs,
       toolCallCount: t.toolCallCount,
+      inputTokens: t.inputTokens,
     });
     resolveIdleWaiters();
   };
@@ -423,6 +434,9 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
             ev.usage.inputTokens, ev.usage.outputTokens,
             ev.usage.cacheCreationTokens, ev.usage.cacheReadTokens,
           );
+          // Capture the inclusive input token count on the active turn so the
+          // handler can detect context-window pressure and trigger compaction.
+          if (activeTurn) activeTurn.inputTokens = ev.usage.inputTokens;
         }
         if (ev.numTurns !== undefined) {
           recordNumTurns(ev.numTurns);
@@ -524,12 +538,12 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     resolveIdleWaiters();
   }
 
-  function sendTurn(text: string, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult> {
+  function sendTurn(textOrBlocks: string | Array<Record<string, unknown>>, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult> {
     if (!alive || closed) {
       return Promise.resolve({
         resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
         appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
-        processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0,
+        processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0, inputTokens: 0,
       });
     }
     if (activeTurn) {
@@ -552,12 +566,16 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         interrupted: false, timedOut: false, hardTimedOut: false, sawDeltaThisMessage: false,
         stallTimeoutMs,
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,
-        startedAtMs, firstTokenAtMs: null, toolCallCount: 0,
+        startedAtMs, firstTokenAtMs: null, toolCallCount: 0, inputTokens: 0,
       };
       activeTurn = turn;
       try {
         if (child.stdin.destroyed) throw new Error('stdin closed');
-        child.stdin.write(encodeUserTurn(text));
+        if (typeof textOrBlocks === 'string') {
+          child.stdin.write(encodeUserTurn(textOrBlocks));
+        } else {
+          child.stdin.write(encodeUserTurnBlocks(textOrBlocks));
+        }
       } catch (e) {
         activeTurn = null;
         emit({ kind: 'error', text: `failed to write turn: ${String(e)}` });
@@ -565,6 +583,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
           appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
           processGone: !alive, ttftMs: null, turnMs: Date.now() - startedAtMs, toolCallCount: 0,
+          inputTokens: 0,
         });
         return;
       }

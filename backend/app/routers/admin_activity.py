@@ -38,6 +38,8 @@ router = APIRouter(
 async def get_activity(
     project_id: uuid.UUID | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    artifact_limit: int = Query(200, ge=1, le=1000),
     event_types: List[str] | None = Query(None),
     since: datetime | None = Query(None),
     session: AsyncSession = Depends(get_session),
@@ -83,6 +85,7 @@ async def get_activity(
             raiseload=True,)
         )
         .order_by(terminal_activity_at.desc())
+        .offset(offset)
         .limit(limit * 3)
     )
     recent_tasks = tasks_result.scalars().all()
@@ -111,7 +114,7 @@ async def get_activity(
                     ]
                 ),
             )
-            .limit(1000)
+            .limit(artifact_limit)
             .order_by(Artifact.created_at.asc())
         )
         for a in artifacts_result.scalars().all():
@@ -273,6 +276,7 @@ async def get_activity(
         )
         .where(*inprogress_filters)
         .order_by(Task.created_at.desc())
+        .offset(offset)
         .limit(limit * 3)
     )
     inprogress_tasks = inprogress_result.scalars().all()

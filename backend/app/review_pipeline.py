@@ -1289,6 +1289,37 @@ def build_merge_conflict_fix_prompt(
     return prompt
 
 
+def build_migration_guard_fix_prompt(
+    *,
+    pr_number: int | str,
+    base_branch: str,
+    guard_reason: str,
+) -> str:
+    """Prompt for a deterministic Alembic pre-merge guard recovery task."""
+    return (
+        f"PR #{pr_number} cannot merge into `{base_branch}` because Blueprint's "
+        "pre-merge Alembic combined-chain guard found a deterministic migration "
+        "chain conflict.\n\n"
+        f"Guard reason: {guard_reason[:1000]}\n\n"
+        "Your task is only to repair the PR's Alembic migration chain so it is "
+        f"valid against the current `{base_branch}` branch.\n\n"
+        "  1. Inspect the PR's added/modified files under "
+        "`backend/alembic/versions` and the current migration heads on the base "
+        "branch.\n"
+        "  2. Renumber any PR migration revision that already exists on the base "
+        "branch to the next unused revision id, and update the filename and "
+        "in-file `revision` consistently.\n"
+        "  3. Rechain the PR migration's `down_revision` onto the current base "
+        "head. If the PR contains a sequence of migrations, preserve their "
+        "relative order and rechain each descendant onto the newly renumbered "
+        "predecessor.\n"
+        "  4. Do not edit, delete, or rename migrations that already exist on "
+        "the base branch; only rewrite this PR's migration files.\n"
+        "  5. Run the relevant Alembic/backend checks, then commit and "
+        "force-push with `--force-with-lease`."
+    )
+
+
 async def _check_fix_mid_retry_defer(
     source_task: Task,
     session: AsyncSession,
@@ -2302,6 +2333,46 @@ async def _spawn_pipeline_task(
             )
         return (None, False)
 
+    # ── No-op fix short-circuit ─────────────────────────────────────────
+    # The immediately-preceding fix completed with zero net diff
+    # (``./done --already-done`` / ``no_op_reason`` set). The deliverable is
+    # already present on the target branch via another path, so spawning a
+    # fresh review would only loop: the review would find the branch behind
+    # again (same change already in base), spawn another futile fix that
+    # also produces zero diff, and the cycle repeats until churn halt.
+    #
+    # Close the chain as converged immediately instead.  On the Nth
+    # consecutive no-op the churn halt above catches it; for N < limit we
+    # short-circuit here.  The churn counter is still incremented by the
+    # block above for observability, but we never reach the spawn logic.
+    if _source_noop_fix:
+        logger.info(
+            f"[PIPELINE] No-op fix for PR #{pr_number}: zero net diff after "
+            f"rebase — closing review/fix chain as converged (deliverable "
+            f"already satisfied)"
+        )
+        source_task.latest_status_message = (
+            f"No-op fix — deliverable already present for PR #{pr_number}; "
+            f"closing review/fix chain."
+        )
+        if orig_task is not None:
+            _set_review_loop_terminal_outcome(
+                orig_task,
+                kind="converged",
+                reason="noop_fix_already_satisfied",
+                pr_number=pr_number,
+                iterations=supersede_churn_count,
+                detail=(
+                    "Fix task completed with zero net diff — the deliverable "
+                    "is already present on the target branch via another path. "
+                    "No review needed."
+                ),
+            )
+        _set_spawn_reason(source_task, SPAWN_REASON_SUPERSEDE_CHURN)
+        session.add(source_task)
+        await session.commit()
+        return (None, False)
+
     # Mid-retry defer: when spawning a review, treat the chain as busy if a
     # same-PR fix is FAILED/CANCELLED with an infra failure_category within the
     # grace window AND still has retry budget remaining — the fix will be requeued
@@ -2624,7 +2695,7 @@ async def _spawn_pipeline_task(
     # review or a different fix iteration). Override with spawn parameters.
     if task_type == "panel_review":
         _spawn_lane = LANE_ARBITRATION
-    elif fix_reason in ("merge_conflict", "update_branch_failed"):
+    elif fix_reason in ("merge_conflict", "update_branch_failed", "migration_guard"):
         _spawn_lane = LANE_CONFLICT
     elif fix_reason == "ci_failure":
         _spawn_lane = LANE_CI

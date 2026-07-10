@@ -6317,6 +6317,85 @@ class TestMessages:
         assert marker["excerpt"] == "Prioritize the release blocker."
 
     @pytest.mark.asyncio
+    async def test_strategic_session_message_allows_attachment_only_content(
+        self, client: AsyncClient, db_session
+    ):
+        """Attachment-only strategic chat turns persist with a small placeholder."""
+        from app.project_message_projection import project_message_base
+
+        project = await _make_project(db_session)
+        attachment = {
+            "type": "image",
+            "mime_type": "image/png",
+            "name": "screenshot.png",
+            "size_bytes": 4,
+            "url": (
+                "https://storage.googleapis.com/blueprint-agent-artifacts/"
+                "message-attachments/project/att/screenshot.png?X-Goog-Signature=abc"
+            ),
+        }
+
+        async def _preview(_session, _project_id, _state_response, message):
+            return project_message_base(message)
+
+        session_response = {
+            "project_id": str(project.id),
+            "status": "idle",
+            "location": "none",
+            "status_reason": None,
+            "session": {},
+            "workbench": None,
+            "strategic": {},
+            "runtime": {},
+            "context_package": None,
+            "conversation": {"items": [], "limit": 20},
+            "recent_outputs": [],
+        }
+
+        with (
+            patch(
+                "app.routers.admin_project_strategic_session.get_project_strategic_state",
+                new=AsyncMock(return_value={}),
+            ),
+            patch(
+                "app.routers.admin_project_strategic_session._message_preview_for_session_state",
+                new=AsyncMock(side_effect=_preview),
+            ),
+            patch(
+                "app.routers.admin_project_strategic_session._persist_message_preview_strategic_session_descriptors",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.routers.admin_project_strategic_session._build_strategic_session_response",
+                new=AsyncMock(return_value=session_response),
+            ),
+            patch(
+                "app.routers.admin_project_strategic_session.broadcast_to_project",
+                new=AsyncMock(),
+            ),
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/strategic-session/messages",
+                json={
+                    "message_type": "NOTE",
+                    "content": "",
+                    "context": {"attachments": [attachment]},
+                    "idempotency_key": "strategic-session-message-attachment-only-1",
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "created"
+        assert body["message"]["content"] == "Sent attachment."
+        assert body["message"]["context"]["attachments"] == [attachment]
+
+        msg = await db_session.get(ProjectMessage, uuid.UUID(body["id"]))
+        assert msg is not None
+        assert msg.content == "Sent attachment."
+        assert (msg.context or {})["attachments"] == [attachment]
+
+    @pytest.mark.asyncio
     async def test_create_message_stamps_resident_session_id_when_active(
         self, client: AsyncClient, db_session
     ):
@@ -7304,6 +7383,33 @@ class TestMessagesWorkbenchState:
         # (lowest i) should appear first
         assert listed[0]["hostname"] == "runner-000"
         assert listed[-1]["hostname"] == "runner-049"
+        # token_age_days is None when token_created_at is not set
+        assert listed[0]["token_age_days"] is None
+
+    @pytest.mark.asyncio
+    async def test_list_runners_includes_token_age_days(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash="abcd" + "f" * 60,
+            hostname="old-token-runner",
+            status="active",
+            token_created_at=_utcnow() - timedelta(days=100),
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners"
+        )
+        assert resp.status_code == 200
+        listed = resp.json()
+        assert len(listed) == 1
+        assert listed[0]["hostname"] == "old-token-runner"
+        # token_age_days must reflect the 100-day-old token
+        assert listed[0]["token_age_days"] == 100
 
     @pytest.mark.asyncio
     async def test_leaving_continuous_mode_clears_local_continuation_marker(
@@ -8693,6 +8799,48 @@ class TestNotificationConfigSettings:
         assert bad.status_code == 400
         bad2 = await client.patch(
             "/api/admin/settings", json={"review_second_opinion_gate_enabled": 0}
+        )
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_blind_multi_reviewer_enabled_by_default(self, client: AsyncClient):
+        """blind_multi_reviewer_gate_enabled defaults to True for trunk
+        merges, independent of any PATCH mutation — the blind multi-reviewer
+        system (N=3 independent reviewers, 2/3 majority, zero visibility into
+        each other's findings or the primary verdict) is the default gate mode
+        for judgment-shaped acceptance decisions (direction
+        independent-acceptance-verification pillar 2)."""
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["blind_multi_reviewer_gate_enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_patch_blind_multi_reviewer_gate_enabled(self, client: AsyncClient):
+        """blind_multi_reviewer_gate_enabled accepts booleans, rejects
+        non-booleans, and round-trips on GET (operator enablement for the
+        independent multi-reviewer redundancy path). Guards all wiring points."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"blind_multi_reviewer_gate_enabled": True},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["blind_multi_reviewer_gate_enabled"] is True
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"blind_multi_reviewer_gate_enabled": False},
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["blind_multi_reviewer_gate_enabled"] is False
+
+        bad = await client.patch(
+            "/api/admin/settings",
+            json={"blind_multi_reviewer_gate_enabled": "true"},
+        )
+        assert bad.status_code == 400
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"blind_multi_reviewer_gate_enabled": 1}
         )
         assert bad2.status_code == 400
 
@@ -28035,3 +28183,277 @@ class TestStrategistCancelTask:
             },
         )
         assert cancel_resp.status_code == 400, cancel_resp.text
+
+
+# ---------------------------------------------------------------------------
+# Spend accounting — LLM costs in project spend
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_project_recent_spend_includes_llm_costs(db_session):
+    """LLM API costs are included in get_project_recent_spend_usd total."""
+    from app.models import TaskStatus, _utcnow
+    from app.resource_envelope import get_project_recent_spend_usd
+    from testing.factories import make_project, make_task
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        provider="anthropic",
+        model="claude-opus-4-8",
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+        },
+        vm_runtime_cost_banked_db=5.0,
+        updated_at=now - timedelta(days=1),
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await get_project_recent_spend_usd(
+        db_session, project_id=project.id, window_days=30
+    )
+
+    # LLM cost: 1000 input @ 5e-6 + 200 output @ 25e-6 = 0.01
+    assert result["llm"] == pytest.approx(0.01, abs=1e-6)
+    # Separate VM cost
+    assert result["agent_vm"] == pytest.approx(5.0, abs=1e-6)
+    # Total includes both cost types
+    assert result["total"] == pytest.approx(5.01, abs=1e-6)
+
+
+# ── POST /api/admin/projects/{project_id}/messages/attachment-upload-url ─────
+
+
+@pytest.mark.asyncio
+async def test_get_message_attachment_upload_url_success(
+    client: AsyncClient, db_session
+):
+    """Successfully generate signed upload + download URLs for a message attachment."""
+    from unittest.mock import MagicMock
+
+    project = Project(name="Attach Upload", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="member")
+    db_session.add(member)
+    await db_session.commit()
+
+    mock_blob = MagicMock()
+    mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-upload"
+    mock_bucket = MagicMock()
+    mock_bucket.blob.return_value = mock_blob
+    mock_client = MagicMock()
+    mock_client.bucket.return_value = mock_bucket
+
+    from app import storage as _app_storage
+
+    with patch.object(_app_storage.storage, "Client", return_value=mock_client):
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+            json={"filename": "test-image.png", "content_type": "image/png"},
+        )
+
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["upload_url"] == "https://storage.googleapis.com/signed-upload"
+    # The mock returns the same URL for both upload and download signing.
+    assert data["download_url"] == "https://storage.googleapis.com/signed-upload"
+    assert "gs://" in data["storage_uri"]
+    assert "message-attachments/" in data["storage_uri"]
+    assert data["content_type"] == "image/png"
+    assert data["attachment_id"] is not None
+    assert len(data["attachment_id"]) > 0
+    assert mock_blob.generate_signed_url.call_args_list[0].kwargs["method"] == "PUT"
+    assert mock_blob.generate_signed_url.call_args_list[0].kwargs["content_type"] == "image/png"
+    assert mock_blob.generate_signed_url.call_args_list[0].kwargs["expiration"].total_seconds() == 900
+    assert mock_blob.generate_signed_url.call_args_list[1].kwargs["method"] == "GET"
+    assert mock_blob.generate_signed_url.call_args_list[1].kwargs["expiration"].total_seconds() == 3600
+
+
+@pytest.mark.asyncio
+async def test_get_message_attachment_upload_url_sanitizes_filename_and_content_type(
+    client: AsyncClient, db_session
+):
+    """Object names stay under the project attachment prefix with safe filename segments."""
+    from unittest.mock import MagicMock
+
+    project = Project(name="Attach Upload Sanitized", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="member")
+    db_session.add(member)
+    await db_session.commit()
+
+    mock_blob = MagicMock()
+    mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed-upload"
+    mock_bucket = MagicMock()
+    mock_bucket.blob.return_value = mock_blob
+    mock_client = MagicMock()
+    mock_client.bucket.return_value = mock_bucket
+
+    from app import storage as _app_storage
+
+    with patch.object(_app_storage.storage, "Client", return_value=mock_client):
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+            json={"filename": "../../nested\\evil file!!.png"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["content_type"] == "application/octet-stream"
+    assert f"message-attachments/{project.id}/" in data["storage_uri"]
+    assert data["storage_uri"].endswith("/evil_file_.png")
+    assert mock_bucket.blob.call_args_list[0].args[0].endswith("/evil_file_.png")
+    assert mock_blob.generate_signed_url.call_args_list[0].kwargs["content_type"] == "application/octet-stream"
+
+
+@pytest.mark.asyncio
+async def test_get_message_attachment_upload_url_auth_failure(
+    override_get_session, db_session
+):
+    """Unauthenticated callers are rejected with 401/403."""
+    from unittest.mock import MagicMock
+    from app.auth import get_current_user
+
+    project = Project(name="Attach Upload Auth", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="member")
+    db_session.add(member)
+    await db_session.commit()
+
+    async def _reject():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    app.dependency_overrides[get_current_user] = _reject
+    try:
+        from httpx import AsyncClient, ASGITransport
+
+        mock_blob = MagicMock()
+        mock_blob.generate_signed_url.return_value = "https://storage.googleapis.com/signed"
+        mock_bucket = MagicMock()
+        mock_bucket.blob.return_value = mock_blob
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+
+        from app import storage as _app_storage
+
+        _TEST_CSRF_TOKEN = "test-csrf-token-auth"
+
+        with patch.object(_app_storage.storage, "Client", return_value=mock_client):
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                headers={"X-CSRF-Token": _TEST_CSRF_TOKEN},
+                cookies={"csrf_token": _TEST_CSRF_TOKEN},
+            ) as anon:
+                resp = await anon.post(
+                    f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+                    json={"filename": "test.png", "content_type": "image/png"},
+                )
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert resp.status_code in (401, 403), f"Expected auth failure, got {resp.status_code}"
+
+
+@pytest.mark.asyncio
+async def test_get_message_attachment_upload_url_nonmember_rejected_before_signing(
+    client: AsyncClient, db_session
+):
+    """Project membership is checked before any signed URL is minted."""
+    from unittest.mock import MagicMock
+
+    project = Project(name="Attach Upload Private", user_id="other-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mock_client = MagicMock()
+
+    from app import storage as _app_storage
+
+    with patch.object(_app_storage.storage, "Client", return_value=mock_client):
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+            json={"filename": "test.png", "content_type": "image/png"},
+        )
+
+    assert resp.status_code == 404, resp.text
+    mock_client.bucket.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_message_attachment_upload_url_rejects_invalid_content_type(
+    client: AsyncClient, db_session
+):
+    """Invalid Content-Type values are rejected before GCS signing."""
+    from unittest.mock import MagicMock
+
+    project = Project(name="Attach Upload Bad Content Type", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="member")
+    db_session.add(member)
+    await db_session.commit()
+
+    mock_client = MagicMock()
+
+    from app import storage as _app_storage
+
+    with patch.object(_app_storage.storage, "Client", return_value=mock_client):
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+            json={"filename": "test.png", "content_type": "image/png\r\nx: y"},
+        )
+
+    assert resp.status_code == 400, resp.text
+    mock_client.bucket.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_message_attachment_upload_url_storage_unavailable(
+    client: AsyncClient, db_session
+):
+    """When GCS signing fails, the endpoint returns 503."""
+    from unittest.mock import MagicMock
+
+    project = Project(name="Attach Upload Fail", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="member")
+    db_session.add(member)
+    await db_session.commit()
+
+    mock_blob = MagicMock()
+    mock_blob.generate_signed_url.side_effect = Exception("GCS signing failed")
+    mock_bucket = MagicMock()
+    mock_bucket.blob.return_value = mock_blob
+    mock_client = MagicMock()
+    mock_client.bucket.return_value = mock_bucket
+
+    from app import storage as _app_storage
+
+    with patch.object(_app_storage.storage, "Client", return_value=mock_client):
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+            json={"filename": "test.png", "content_type": "image/png"},
+        )
+
+    assert resp.status_code == 503, f"Expected 503, got {resp.status_code}: {resp.text}"

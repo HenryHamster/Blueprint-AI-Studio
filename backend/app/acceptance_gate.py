@@ -45,6 +45,7 @@ from typing import Any, Callable, Iterable, Mapping
 from app.ci_resolution import is_degraded_unverified_reason
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
 from app.landed_signal import merge_verification_status
+from sqlalchemy import String, cast, exists, not_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -52,6 +53,7 @@ from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.artifact_prerequisites import downstream_artifact_logical_key
 from app.models import Artifact
 from app.models import ArtifactConsumption
+from app.models import CriterionEvidence
 from app.models import Project
 from app.models import Task
 from app.models import TaskStatus
@@ -119,6 +121,19 @@ def criterion_met(value: Any, op: str, threshold: Any) -> bool:
 # ``target_defect_reproduction``. Absence of the key means "no acceptance
 # verdict was recorded" and preserves prior bare-merge scoring exactly.
 CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
+
+# Context key where the verify-tests handler stores the coverage measurement
+# result for the coverage_delta acceptance gate to consume. The value is a dict
+# with at least ``{"coverage_pct": <float>}``.
+#
+# ``coverage_pct`` represents LINE / STATEMENT coverage (the fraction of source
+# lines exercised by the test suite), NOT the test pass rate. When coverage
+# instrumentation (pytest-cov, c8) is active, the value is the actual line
+# coverage percentage from the instrumentation tool. When no instrumentation is
+# active, the orchestrator falls back to the "test suite execution coverage" —
+# the percentage of tests that passed — as a less meaningful but always-available
+# proxy.
+TEST_COVERAGE_RESULT_KEY = "test_coverage_result"
 
 ACCEPTANCE_AGGREGATE_BUCKETS: tuple[str, ...] = (
     "proven",
@@ -218,6 +233,27 @@ def _paths_match(changed: str, declared: str) -> bool:
     return changed.rsplit("/", 1)[-1] == declared.rsplit("/", 1)[-1]
 
 
+# Cross-cutting/shared test files that validate invariants or integrations
+# spanning multiple production modules (not tied to any single module).
+# These are exempt from the per-module stem-match heuristic in
+# _test_semantically_grounded because their name does not follow the
+# test_<module>.py convention — add new cross-cutting entries here.
+_CROSS_CUTTING_TEST_FILES: frozenset[str] = frozenset({
+    "backend/testing/test_invariants.py",
+    "backend/testing/test_admin_auth_invariant.py",
+    "backend/testing/test_agent_branch_invariants.py",
+    "backend/testing/test_backmerge_invariants.py",
+    "backend/testing/test_c5_approval_gate_invariant.py",
+    "backend/testing/test_event_type_invariants.py",
+    "backend/testing/test_schema_invariants.py",
+})
+
+
+def get_cross_cutting_test_files() -> frozenset[str]:
+    """Return the set of cross-cutting test file paths exempt from stem-match."""
+    return _CROSS_CUTTING_TEST_FILES
+
+
 def _test_semantically_grounded(
     declared_test_path: str, seam_files: list[str]
 ) -> bool:
@@ -243,6 +279,12 @@ def _test_semantically_grounded(
     for path in seam_files:
         prod_basename = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         if prod_basename == test_stem:
+            return True
+    # Cross-cutting test files (e.g., test_invariants.py) do not map to a
+    # single production module — accept them as intrinsically grounded when
+    # any non-test production seam exists (already verified by the caller).
+    for known in _CROSS_CUTTING_TEST_FILES:
+        if _paths_match(known, declared_test_path):
             return True
     return False
 
@@ -464,6 +506,92 @@ def _evaluate_visual(task: Task, evidence: AcceptanceEvidence) -> AcceptanceGate
     )
 
 
+def _evaluate_coverage_delta(
+    evidence: AcceptanceEvidence,
+    context: Mapping[str, Any] | None,
+) -> AcceptanceGateVerdict:
+    """Fail-closed gate for a ``coverage_delta`` acceptance declaration.
+
+    Reads the coverage measurement stored in task context (``TEST_COVERAGE_RESULT_KEY``)
+    by the verify-tests handler and compares the achieved ``coverage_pct`` against
+    the declared threshold.  Passes only when the coverage result is present and
+    carries a numeric ``coverage_pct`` at or above the threshold.
+
+    Note: Unlike :func:`_evaluate_named_test`, this function does **not** receive
+    the ``verified`` flag.  The coverage measurement itself is produced only by a
+    real test run, so an absent result implicitly means no test ran — no separate
+    verification gate is needed.
+
+    The result is marked ``proven=True`` only when the ``coverage_pct`` comes
+    from genuine line/statement coverage instrumentation (pytest-cov, c8), NOT
+    from the test-pass-rate fallback.  When the orchestrator stores a pass-rate
+    proxy (``source="pass_rate"``) because no instrumentation was active, the
+    verdict is ``satisfied=True`` but ``proven=False`` — pass-rate is semantically
+    distinct from changed-line coverage.
+
+    Absent / non-numeric result, absent or non-numeric threshold, or coverage below
+    threshold all fail closed.
+    """
+    threshold = coerce_number(evidence.threshold)
+    if threshold is None:
+        return AcceptanceGateVerdict(
+            True, False, evidence.kind,
+            "coverage_delta acceptance evidence requires a numeric threshold "
+            "(coverage percentage 0–100)",
+        )
+
+    result = (context or {}).get(TEST_COVERAGE_RESULT_KEY)
+    if not isinstance(result, dict):
+        return AcceptanceGateVerdict(
+            True, False, evidence.kind,
+            "coverage_delta acceptance evidence requires a test coverage result "
+            f"in task context ({TEST_COVERAGE_RESULT_KEY}) — no result found",
+        )
+
+    coverage_pct = coerce_number(result.get("coverage_pct"))
+    if coverage_pct is None:
+        return AcceptanceGateVerdict(
+            True, False, evidence.kind,
+            "coverage_delta acceptance evidence: coverage result is missing "
+            "numeric coverage_pct",
+        )
+
+    # Distinguish instrumented line coverage from the test-pass-rate fallback.
+    # When the orchestrator stored source="pass_rate", the value represents
+    # the fraction of tests that passed, NOT line coverage — the claim can be
+    # satisfied (a real test run happened) but is NOT machine-checked proof
+    # of changed-line coverage.
+    is_pass_rate = result.get("source") == "pass_rate"
+
+    if criterion_met(coverage_pct, ">=", threshold):
+        if is_pass_rate:
+            reason = (
+                f"coverage_delta acceptance evidence: achieved {coverage_pct}% "
+                f"test pass rate >= {threshold}% threshold (pass-rate proxy — "
+                f"no line-coverage instrumentation was active)"
+            )
+        else:
+            reason = (
+                f"coverage_delta acceptance evidence: achieved {coverage_pct}% "
+                f"coverage >= {threshold}% threshold"
+            )
+        return AcceptanceGateVerdict(
+            True, True, evidence.kind,
+            reason,
+            proven=not is_pass_rate,
+            proof_ref=(
+                None if is_pass_rate
+                else f"coverage_delta={coverage_pct}%"
+            ),
+        )
+
+    return AcceptanceGateVerdict(
+        True, False, evidence.kind,
+        f"coverage_delta acceptance evidence: achieved {coverage_pct}% "
+        f"coverage < {threshold}% threshold",
+    )
+
+
 def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     """Evaluate ``task``'s declared acceptance evidence, fail-closed.
 
@@ -491,6 +619,9 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
 
     if evidence.kind == "visual":
         return _evaluate_visual(task, evidence)
+
+    if evidence.kind == "coverage_delta":
+        return _evaluate_coverage_delta(evidence, task.context)
 
     # observable_behavior carries no machine-checkable assertion the backend can
     # independently re-run at completion. To the extent checkable, require that
@@ -972,6 +1103,171 @@ def summarize_version_acceptance_aggregate(
         round(satisfied / aggregate["total"], 3) if aggregate["total"] > 0 else None
     )
     return aggregate
+
+
+# ---------------------------------------------------------------------------
+# Backfill: false-negative acceptance verdicts (pre-fix)
+# ---------------------------------------------------------------------------
+
+
+async def backfill_acceptance_verdicts(session) -> int:
+    """Re-evaluate pre-fix named_test acceptance verdicts that may have been
+    false-negatives before the ``_CROSS_CUTTING_TEST_FILES`` semantic-grounding
+    fix (8acdd3780, 2026-07-09T09:23 UTC).
+
+    Finds merged tasks whose recorded verdict is ``named_test`` with
+    ``satisfied=True`` but ``proven=False``, re-evaluates with the current
+    (fixed) logic, and records :class:`~app.models.CriterionEvidence` via
+    :func:`~app.acceptance_criteria.record_task_merge_evidence` when the new
+    verdict is ``proven=True``.
+
+    Bounded to 200 tasks per call so the reaper cycle is never blocked.
+    Selection is ordered by ``completed_at`` ascending (oldest-first) so the
+    LIMIT window advances deterministically across successive reaper cycles.
+    Tasks that already have a proven ``CriterionEvidence`` row are excluded
+    from the query to avoid re-scanning already-proven rows and to keep the
+    window moving toward unprocessed candidates.
+
+    Best-effort: individual evidence-recording failures are logged and
+    skipped without aborting the remaining tasks.
+
+    Returns the number of upgraded verdicts.
+    """
+    from datetime import datetime, timezone
+
+    FIX_TIMESTAMP = datetime(2026, 7, 9, 9, 23, 0, tzinfo=timezone.utc)
+
+    # Exclude tasks that already have a proven CriterionEvidence row from a
+    # prior backfill run so the LIMIT window advances to unprocessed tasks.
+    _proven_exists = (
+        exists(
+            select(1).where(
+                CriterionEvidence.source_kind == "task_merge",
+                CriterionEvidence.source_id == cast(Task.id, String),
+                CriterionEvidence.detail["proven"].astext == "true",
+            )
+        )
+        .correlate(Task)
+    )
+    # Use a portable JSON key-existence check: ``has_key`` (Postgres ``?``)
+    # on Postgres, ``func.json_extract`` on SQLite, so the standalone smoke
+    # gate (which runs against SQLite) does not fail.
+    from app.database import resolve_dialect_name
+    _dialect = resolve_dialect_name(session)
+    if _dialect == "sqlite":
+        from sqlalchemy import func
+        _backfill_checked = func.json_extract(
+            Task.context, "$._backfill_checked_at"
+        ).is_(None)
+    else:
+        _backfill_checked = not_(Task.context.has_key("_backfill_checked_at"))
+    # Collect IDs only — not Task objects — so a mid-loop rollback inside
+    # record_task_merge_evidence (which unconditionally expires ALL session
+    # objects regardless of expire_on_commit) cannot leave the remaining
+    # iterations' task objects stale.  Each iteration re-fetches its task
+    # fresh via session.get() at the top of the loop.
+    result = await session.execute(
+        select(Task.id).where(
+            Task.status == TaskStatus.COMPLETED,
+            Task.completed_at < FIX_TIMESTAMP,
+            not_(_proven_exists),
+            _backfill_checked,
+        ).order_by(Task.completed_at.asc()).limit(200)
+    )
+    task_ids = list(result.scalars().all())
+
+    # expire_on_commit=False prevents a commit inside record_task_merge_evidence
+    # from expiring the freshly-fetched task object before its attributes are
+    # read by that function.  A ROLLBACK still expires all objects, but each
+    # iteration re-fetches its own task so the next iteration is unaffected.
+    _prior_expire = session.sync_session.expire_on_commit
+    session.sync_session.expire_on_commit = False
+    try:
+        upgraded = 0
+        marked_ids: list = []
+        for task_id in task_ids:
+            # Re-fetch fresh each iteration: a rollback from record_evidence
+            # (IntegrityError on CriterionEvidence unique constraint) expires
+            # all session objects; re-fetching here avoids MissingGreenlet on
+            # the subsequent attribute access.
+            task = await session.get(Task, task_id)
+            if task is None:
+                continue
+            verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+            if not isinstance(verdict_data, dict):
+                marked_ids.append(task_id)
+                continue
+            if verdict_data.get("kind") != "named_test":
+                marked_ids.append(task_id)
+                continue
+            if verdict_data.get("satisfied") is not True:
+                marked_ids.append(task_id)
+                continue
+            if verdict_data.get("proven") is True:
+                marked_ids.append(task_id)
+                continue
+
+            re_eval = evaluate_code_acceptance(task)
+            if re_eval.proven:
+                ctx = dict(task.context or {})
+                ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+                    "satisfied": True,
+                    "proven": True,
+                    "kind": "named_test",
+                    "reason": re_eval.reason,
+                    "proof_ref": re_eval.proof_ref,
+                    "backfilled": True,
+                }
+                task.context = ctx
+                session.add(task)
+                # Commit the verdict upgrade FIRST so a rollback inside
+                # record_evidence (IntegrityError guard) does not undo it.
+                await session.commit()
+
+                from app.acceptance_criteria import record_task_merge_evidence
+                try:
+                    await record_task_merge_evidence(session, task, task.project_id)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "backfill_acceptance_verdicts: evidence recording failed for "
+                        "task %s",
+                        getattr(task, "id", None),
+                        exc_info=True,
+                    )
+                upgraded += 1
+            else:
+                # Re-evaluation could not prove — stamp marker so the
+                # LIMIT-200 window advances past this task in future calls.
+                marked_ids.append(task_id)
+
+        # Stamp backfill-checked marker on every examined task that was NOT
+        # upgraded, so the query window advances past tasks that can never be
+        # proven (wrong verdict kind, not satisfied, or re-evaluation still
+        # returns proven=False). Without this marker, those tasks permanently
+        # occupy the LIMIT-200 window and starve newer but later-ordered tasks
+        # from ever being examined.
+        if marked_ids:
+            now_ts = datetime.now(timezone.utc).isoformat()
+            for mid in marked_ids:
+                # Re-fetch so any mid-loop rollback from a prior iteration
+                # does not leave these objects expired at stamping time.
+                t = await session.get(Task, mid)
+                if t is None:
+                    continue
+                ctx = dict(t.context or {})
+                ctx["_backfill_checked_at"] = now_ts
+                t.context = ctx
+                session.add(t)
+            await session.commit()
+
+        if upgraded:
+            logger.info(
+                "backfill_acceptance_verdicts: upgraded %d task(s)",
+                upgraded,
+            )
+        return upgraded
+    finally:
+        session.sync_session.expire_on_commit = _prior_expire
 
 
 # ---------------------------------------------------------------------------

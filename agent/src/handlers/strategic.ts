@@ -62,10 +62,11 @@ import {
   buildQuestionSection,
   buildOpenMessagesText,
   buildDirSummaryText,
-  buildDirHealthSummary,
+  buildDirectionPortfolioSection,
   buildSweepComparisonSection,
   buildCiComplianceSection,
   buildCompletionDebtSection,
+  buildPendingFollowupsSection,
   buildPayloadStalenessSection,
   buildResidentExamLeadsSection,
 } from './strategic-sections.js';
@@ -168,6 +169,36 @@ export function buildLocalRunnerSection(status: unknown): string {
       '- GPU hardware is OFFLINE: a GPU `compute_experiment` authored now would FALL BACK to billable cloud GPU. Prefer to defer GPU experiments until the operator\'s runner is live, unless the cloud spend is justified.',
     );
   }
+  return lines.join('\n');
+}
+
+/**
+ * Build a prompt section listing gaps whose history entries warrant compaction.
+ * Takes the backend's ``compaction_hints`` list (each item has gap_id, name,
+ * history_entry_count, past_moves_count, total_entries) and renders a compact
+ * advisory block so the strategist can apply targeted ``_compactions``
+ * watermarks. Returns '' when the list is absent or empty.
+ */
+function buildCompactionHintsSection(
+  hints: Array<Record<string, unknown>> | undefined,
+): string {
+  if (!hints || !Array.isArray(hints) || hints.length === 0) return '';
+
+  const lines: string[] = [
+    '## Gap compaction candidates',
+    'The following gaps have accumulated enough history entries to warrant `_compactions` watermark compaction. Run `./fetch problem-model` (or `./fetch gap <gap_id>`) to review the full durable history before emitting compaction directives.',
+  ];
+  for (const h of hints) {
+    const id = strVal(h.gap_id, '');
+    const name = strVal(h.name, '');
+    const hist = Number(h.history_entry_count ?? 0);
+    const pm = Number(h.past_moves_count ?? 0);
+    lines.push(`- ${id}: "${name}" (${hist} history entries, ${pm} past_moves)`);
+  }
+  lines.push(
+    '',
+    'Emit `_compactions` directives in your problem-model update to permanently compact the history you have verified. See the "Model-size hygiene" section for the compaction contract.',
+  );
   return lines.join('\n');
 }
 
@@ -331,6 +362,10 @@ export async function handleStrategic(
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
     const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
     const completionDebtSection = buildCompletionDebtSection(payload.open_completion_debt);
+    const pendingFollowupsSection = buildPendingFollowupsSection(payload.pending_followups);
+    const compactionHintsSection = buildCompactionHintsSection(
+      payload.compaction_hints as Array<Record<string, unknown>> | undefined,
+    );
 
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
     const outcomeSection = buildOutcomeSection(outcomeEval);
@@ -382,27 +417,28 @@ export async function handleStrategic(
     const fetchProjectId = (projectMetadataForFetch?.project_id as string | undefined) ?? '';
     writeStrategicHelpers(taskId, fetchProjectId, WORKSPACE);
 
-    // ── Compute direction health summary for thinker prompt ──
+    // ── Compute direction portfolio section for thinker prompt ──
     const maxActiveDirections = typeof payload.max_active_directions === 'number'
       ? payload.max_active_directions
       : 10;
     const activeDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
-    const dirHealthSummary = buildDirHealthSummary(
-      directionsSummary,
-      maxActiveDirections,
-      authoritativeActive !== undefined
-        ? { active: authoritativeActive, paused: authoritativePaused ?? 0 }
-        : undefined,
-    );
-
-    // Portfolio composition: category mix, system coverage gaps, concentration
-    // risk, in-flight scope, direction age — so the thinker doesn't have to
-    // re-compute these from scattered per-direction lines.
     const outcomeSystems = outcomeEval && Array.isArray(outcomeEval.systems)
       ? outcomeEval.systems as Array<Record<string, unknown>>
       : (vision && Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : []);
     const activeByScopeForPortfolio = (payload.recent_interventions as Record<string, unknown> | undefined)
       ?.active_by_scope as Record<string, number> | undefined;
+    const directionPortfolioSection = buildDirectionPortfolioSection(
+      directionsSummary,
+      maxActiveDirections,
+      outcomeSystems,
+      activeByScopeForPortfolio,
+      authoritativeActive,
+      authoritativePaused,
+      authoritativeSystemCounts,
+    );
+
+    // Portfolio composition: still computed for the strategic challenge pass
+    // (runStrategicChallenge receives dirSummaryText and portfolioCompositionText).
     const portfolioCompositionText = buildPortfolioComposition(
       activeDirections,
       outcomeSystems,
@@ -731,8 +767,7 @@ prompts, schemas, tools, or orchestration.` : '';
       previousDecisionOutcomes: formatPreviousDecisionOutcomes(payload.previous_decision_outcomes),
       pastRetirementCritiquesSection,
       retiredDirectionsSummarySection: formatRetiredDirectionsSummary(payload.retired_directions_summary),
-      dirSummaryText,
-      dirHealthSummary,
+      directionPortfolioSection,
       stagedDirectionsSection,
       // Live self-hosted local-runner availability note (M7) — built from the
       // backend's `local_runner_status` payload field so the strategist avoids
@@ -741,7 +776,6 @@ prompts, schemas, tools, or orchestration.` : '';
       userPausedSection: buildUserPausedSection(directionsSummary),
       rejectedProposalsSection: buildRejectedProposalsSection(Array.isArray(payload.rejected_proposals) ? payload.rejected_proposals as Array<Record<string, unknown>> : []),
       operatorOverridesSection: buildOperatorOverridesSection(Array.isArray(payload.operator_overrides) ? payload.operator_overrides as Array<Record<string, unknown>> : []),
-      portfolioCompositionText,
       modelHealthSection,
       pruneCandidatesSection,
       systemMaturitySection,
@@ -758,6 +792,8 @@ prompts, schemas, tools, or orchestration.` : '';
       efficiencySnapshotSection,
       ciComplianceSection,
       completionDebtSection,
+      pendingFollowupsSection,
+      compactionHintsSection,
       // Shared capability vocabulary + uniform provides_capability / prerequisite
       // declaration guidance, so the strategist draws cross-lane capability refs
       // from the same registry namespace every other task type uses.
@@ -810,13 +846,11 @@ prompts, schemas, tools, or orchestration.` : '';
       ['decision_outcomes', thinkerParams.previousDecisionOutcomes],
       ['retirement_critiques', thinkerParams.pastRetirementCritiquesSection],
       ['retired_directions', thinkerParams.retiredDirectionsSummarySection],
-      ['dir_summary', thinkerParams.dirSummaryText],
-      ['dir_health', thinkerParams.dirHealthSummary],
+      ['direction_portfolio', thinkerParams.directionPortfolioSection],
       ['staged_directions', thinkerParams.stagedDirectionsSection || ''],
       ['user_paused', thinkerParams.userPausedSection],
       ['rejected_proposals', thinkerParams.rejectedProposalsSection],
       ['operator_overrides', thinkerParams.operatorOverridesSection],
-      ['portfolio_composition', thinkerParams.portfolioCompositionText],
       ['available_capabilities', thinkerParams.availableCapabilitiesSection || ''],
       ['model_health', thinkerParams.modelHealthSection],
       ['prune_candidates', thinkerParams.pruneCandidatesSection || ''],
@@ -833,8 +867,10 @@ prompts, schemas, tools, or orchestration.` : '';
       ['efficiency_snapshot', thinkerParams.efficiencySnapshotSection],
       ['ci_compliance', thinkerParams.ciComplianceSection || ''],
       ['completion_debt', thinkerParams.completionDebtSection || ''],
+      ['pending_followups', thinkerParams.pendingFollowupsSection || ''],
       ['sweep_comparison', thinkerParams.sweepComparisonSection || ''],
       ['local_runner', thinkerParams.localRunnerSection || ''],
+      ['compaction_hints', thinkerParams.compactionHintsSection || ''],
       ['payload_staleness', thinkerParams.payloadStalenessSection || ''],
     ];
     const thinkerTelemetry = buildPromptSizeTelemetry(thinkerPromptWithSuffix, thinkerPromptSectionTuples);
@@ -1024,6 +1060,11 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 
 # Direction operations (link each create to a gap_id from the problem_model).
 # conflicts_with: list direction IDs that touch overlapping code/systems — they won't run in parallel.
+#   OMIT conflicts_with (or pass []) when no real overlap exists — directions without
+#   conflicts run concurrently, which is the default and preferred dispatch mode.
+#   "Overlap" means conflicting file rewrites, incompatible architecture shifts, or a
+#   shared resource that cannot be used concurrently — NOT "both are big" or "both touch
+#   the backend." When in doubt, omit: extra conflicts serialize work unnecessarily.
 # recommended_mode: audit|fundamentals|ship|pause — your judgment for this direction's system health.
 ./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"], "recommended_mode": "ship", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "implementation_constraints": "optional constraints for implementors", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "one-line justification why this is distinct in scope or mechanism"}}'
 # To create a NEW idea that belongs to the NEXT version, pass "staged": true on

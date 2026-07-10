@@ -1,5 +1,5 @@
 import { strVal } from '../index.js';
-import { calcMessageAge, parseResearchContext } from './research-plan.js';
+import { calcMessageAge, parseResearchContext, buildPortfolioComposition } from './research-plan.js';
 import { formatRetiredDirectionGrounding } from './research-direction-context.js';
 
 export function fmtScalar(v: unknown, fallback = '?'): string {
@@ -1255,6 +1255,74 @@ export function buildDirSummaryText(
 }
 
 /**
+ * Render a single consolidated `## Direction Portfolio` section that combines
+ * the health header, per-direction listing, and portfolio statistics (category
+ * mix, system coverage, concentration, scope) into one block. Replaces the
+ * prior three separate sections (dir_summary + dir_health + portfolio_composition),
+ * eliminating redundant section headers and interstitial prose.
+ */
+export function buildDirectionPortfolioSection(
+  directionsSummary: Array<Record<string, unknown>>,
+  maxActiveDirections: number,
+  systems: Array<Record<string, unknown>>,
+  activeByScope: Record<string, number> | undefined,
+  authoritativeActiveCount?: number,
+  authoritativePausedCount?: number,
+  authoritativeSystemCounts?: Record<string, number>,
+): string {
+  // ── Health header (consolidated from buildDirHealthSummary) ──
+  const shippedActiveDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
+  const shippedActiveCount = shippedActiveDirections.length;
+  const shippedPaused = directionsSummary.filter(d => strVal(d.status) === 'paused');
+  const activeCount = authoritativeActiveCount ?? shippedActiveCount;
+  const pausedCount = authoritativePausedCount ?? shippedPaused.length;
+  const detailComplete = authoritativeActiveCount === undefined || shippedActiveCount >= activeCount;
+  const autoPausedCount = shippedPaused.filter(d => d.auto_paused === true).length;
+  const userPausedCount = Math.max(0, pausedCount - autoPausedCount);
+  const saturatedCount = shippedActiveDirections.filter(d => d.possibly_saturated === true).length;
+  const productCount = shippedActiveDirections.filter(d => strVal(d.category) === 'product').length;
+  const availableSlots = Math.max(0, maxActiveDirections - activeCount);
+
+  const gaps: string[] = [];
+  if (detailComplete && productCount === 0) gaps.push('NO_PRODUCT_DIRECTIONS');
+  if (detailComplete && saturatedCount === activeCount && activeCount > 0) gaps.push('ALL_SATURATED');
+  if (activeCount < 3) gaps.push('BELOW_MINIMUM');
+
+  const pausedNote = pausedCount > 0
+    ? ` Paused: ${pausedCount} (${autoPausedCount} auto, ${userPausedCount} user) — listed below but not consuming active slots.`
+    : '';
+  const trimNote = (authoritativeActiveCount !== undefined && shippedActiveCount < activeCount)
+    ? ` Showing ${shippedActiveCount} of ${activeCount} active directions below — ${activeCount - shippedActiveCount} trimmed for budget; saturation/product counts reflect only the shipped subset. Fetch the rest with \`./fetch direction <id>\`.`
+    : '';
+
+  const healthHeader = [
+    `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.${pausedNote}${trimNote}`,
+    gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
+  ].join('\n');
+
+  // ── Direction listing ──
+  const dirList = buildDirSummaryText(directionsSummary, authoritativeActiveCount);
+
+  // ── Portfolio stats ──
+  const portfolio = buildPortfolioComposition(
+    shippedActiveDirections,
+    systems,
+    activeByScope,
+    activeCount,
+    authoritativeSystemCounts,
+  );
+
+  return [
+    '## Direction Portfolio',
+    healthHeader,
+    '',
+    dirList,
+    '',
+    portfolio,
+  ].join('\n');
+}
+
+/**
  * Render the backend-computed CI compliance snapshot for the current integration
  * branch HEAD. Surfaces module-size breaches and branch-literal offenders so the
  * strategist sees compliance drift immediately instead of discovering it at
@@ -1354,6 +1422,44 @@ export function buildCompletionDebtSection(debt: unknown): string {
   }
   lines.push('\n_Dispose an obligation once its work lands: `./strategic dispose-completion-debt \'{"debt_id":"<id>","disposition":"resolved","evidence":"<what proved it done>"}\'` (use `"dismissed"` with a reason if it no longer applies). When spawning follow-up work, pass `"debt_id":"<id>"` in the spawn-task/spawn-fix DATA to link the task to its obligation._');
   lines.push('_Address open completion debt before adding new obligations in the same area._');
+  return lines.join('\n');
+}
+
+export function buildPendingFollowupsSection(followups: unknown): string {
+  const entries = Array.isArray(followups) ? followups as Array<Record<string, unknown>> : [];
+  if (entries.length === 0) return '';
+  const lines: string[] = ['\n## Pending Knowledge Follow-ups'];
+  lines.push(`${entries.length} design/web_research document(s) completed but not yet consumed or dismissed — the strategist should review and act on these:`);
+  const now = Date.now();
+  for (const e of entries) {
+    const id = strVal(e.id);
+    const title = strVal(e.title, '(no title)');
+    const summary = strVal(e.summary, '');
+    const sourceKind = strVal(e.source_kind, 'unknown');
+    const topic = strVal(e.topic);
+    const dirId = strVal(e.direction_id);
+    const createdAt = strVal(e.created_at);
+    let ageStr = '';
+    if (createdAt) {
+      const ageMs = now - new Date(createdAt).getTime();
+      const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+      ageStr = ageDays > 0 ? ` (${ageDays}d ago)` : ' (today)';
+    }
+    const tagList = Array.isArray(e.tags) ? (e.tags as string[]).slice(0, 5) : [];
+    const tagStr = tagList.length > 0 ? ` [${tagList.join(', ')}]` : '';
+    const topicStr = topic ? ` — topic: ${topic}` : '';
+    const idTag = id ? ` \`${id}\`` : '';
+    lines.push(`  - [${sourceKind}]${idTag} ${title}${ageStr}${topicStr}${tagStr}`);
+    if (summary) {
+      lines.push(`    ${summary}`);
+    }
+    if (dirId) {
+      lines.push(`    Direction: ${dirId}`);
+    }
+  }
+  lines.push('\n_To consume (acted on / direction spawned): `./strategic consume-knowledge-followup \'{"document_id":"<id>","reason":"<what was done / which direction was spawned>"}\'`_');
+  lines.push('_To dismiss (not actionable): `./strategic dismiss-knowledge-followup \'{"document_id":"<id>","reason":"<why not actionable>"}\'`_');
+  lines.push('_Consider spawning a direction to act on pending knowledge, or consuming it if already addressed._');
   return lines.join('\n');
 }
 

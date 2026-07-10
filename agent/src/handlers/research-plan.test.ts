@@ -123,6 +123,7 @@ const {
     'getResidentTurnLatencyTelemetry',
     'recordLlmCallStart',
     'recordLlmTokens',
+    'recordProviderReportedUsage',
     'recordNumTurns',
     'recordResidentTurnLatency',
     'recordToolResultBytes',
@@ -568,6 +569,36 @@ describe('aggregateDirectionStats', () => {
     }];
     const result = aggregateDirectionStats(history, {});
     expect(result).not.toContain('conversion:');
+  });
+
+  it('includes salvage counts when salvage metadata present in history', () => {
+    const history = [
+      {
+        tasks_created: 2,
+        prs_merged: 0,
+        salvage: { salvage_task_id: 'task-1', salvaged_count: 3, salvaged_at: '2026-07-09T00:00:00' },
+        filter_breakdown: { hash_dedup: 1, salvaged: 3 },
+      },
+      {
+        tasks_created: 1,
+        prs_merged: 0,
+        salvage: { salvage_task_id: 'task-2', salvaged_count: 2, salvaged_at: '2026-07-09T00:00:00' },
+        filter_breakdown: { salvaged: 2 },
+      },
+    ];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).toContain('filtered: 1');
+    expect(result).toContain('hash 1');
+    expect(result).toContain('5 findings salvaged across 2 cycles');
+    expect(result).toContain('bundled for consolidated action');
+  });
+
+  it('omits salvage section when no salvage metadata in history', () => {
+    const history = [{ tasks_created: 1, prs_merged: 0 }];
+    const result = aggregateDirectionStats(history, {});
+    expect(result).not.toContain('salvaged');
+    expect(result).not.toContain('salvage');
+    expect(result).not.toContain('bundled for consolidated action');
   });
 });
 
@@ -1643,9 +1674,9 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('blocker=test_file_deleted');
   });
 
-  it('renders sub-scores and audit findings for the current last_qualification, including the binding dimension', () => {
-    // No hard blocker and smoketest enabled (flag absent → enabled): the binding
-    // constraint is the lowest numeric sub-score.
+  it('renders sub-scores and audit findings for the current last_qualification as a compact summary', () => {
+    // formatQualificationDetails has been removed — only the compact
+    // "Last qualification:" summary line remains.
     const result = buildVersionPhaseSection({
       version_number: 2,
       phase: 'stabilize',
@@ -1653,176 +1684,15 @@ describe('buildVersionPhaseSection', () => {
         status: 'not_promoted',
         confidence: 0.61,
         candidate_sha: 'abcdef0123456789',
-        sub_scores: {
-          audit: 0.74,
-          test_erosion: 0.42,
-          smoketest: 0.88,
-        },
-        audit_findings: [
-          { severity: 'low', summary: 'documentation drift' },
-          { severity: 'critical', summary: 'unsafe release path' },
-          { severity: 'high', summary: 'broken retry guard' },
-          { severity: 'medium', summary: 'missing null check' },
-        ],
       },
     });
-    expect(result).toContain('sub-scores: audit=0.74, test_erosion=0.42, smoketest=0.88 (binding=test_erosion=0.42)');
-    expect(result).toContain('Audit findings: critical: unsafe release path; high: broken retry guard; medium: missing null check (+1 more)');
+    expect(result).toContain('Last qualification:');
+    expect(result).toContain('status=not_promoted');
+    expect(result).toContain('confidence=0.61');
   });
 
-  it('renders the excluded-audit-findings caveat and section when findings were excluded for lacking verification', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 2,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        confidence: 0.93,
-        sub_scores: { audit: 0.98, test_erosion: 1.0, smoketest: 0.95 },
-        // Scored findings list is empty (all higher-severity findings excluded).
-        audit_findings: [],
-        excluded_audit_findings: [
-          { severity: 'high', summary: 'broken retry guard', unverified: 'true' },
-          { severity: 'critical', summary: 'unsafe release path', unverified: 'true' },
-          { severity: 'medium', summary: 'missing null check', unverified: 'true' },
-          { severity: 'medium', summary: 'second medium', unverified: 'true' },
-        ],
-        audit_reconciliation: {
-          model_reported_score: 0.70,
-          findings_derived_score: 0.98,
-          score_delta: 0.28,
-          excluded_findings_count: 4,
-        },
-      },
-    });
-    // Part (1): the audit-score caveat names the excluded count and the divergence.
-    expect(result).toContain('Audit score caveat: audit sub-score reflects only verified findings; 4 higher-severity findings excluded for lacking verification; model-reported audit 0.70 vs findings-derived 0.98 (Δ0.28)');
-    // Part (2): the excluded findings are rendered, clearly marked unverified, sorted most-severe first and capped at 3.
-    expect(result).toContain('Excluded audit findings (UNVERIFIED — not confirmed blockers): critical: unsafe release path; high: broken retry guard; medium: missing null check (+1 more)');
-  });
 
-  it('omits the excluded-findings caveat and section when nothing was excluded', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 2,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        confidence: 0.61,
-        sub_scores: { audit: 0.74, test_erosion: 0.42, smoketest: 0.88 },
-        excluded_audit_findings: [],
-        audit_reconciliation: {
-          model_reported_score: 0.74,
-          findings_derived_score: 0.74,
-          score_delta: 0.0,
-          excluded_findings_count: 0,
-        },
-      },
-    });
-    expect(result).not.toContain('Audit score caveat:');
-    expect(result).not.toContain('Excluded audit findings');
-  });
-
-  it('renders test-erosion detail (deleted files + negative deltas) when carried', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 2,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        confidence: 0.4,
-        test_erosion_detail: {
-          deleted_test_files: ['testing/test_foo.py', 'testing/test_bar.py'],
-          deleted_test_files_truncated: 3,
-          test_count_delta: -4,
-          assertion_delta: -12,
-        },
-      },
-    });
-    expect(result).toContain('Test erosion: deleted testing/test_foo.py, testing/test_bar.py (+3 more); -4 tests; -12 assertions');
-  });
-
-  it('renders smoketest detail (failed suite + named failing tests) when carried', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 2,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        confidence: 0.4,
-        smoketest_detail: {
-          startup_failed: true,
-          failed_suite: 'startup',
-          failed_tests: ['boot_check', 'health_probe'],
-          failed_tests_truncated: 2,
-          passed: 1,
-          total: 5,
-        },
-      },
-    });
-    expect(result).toContain('Smoketest: startup suite failed; failed: boot_check, health_probe (+2 more)');
-  });
-
-  it('omits test-erosion and smoketest detail lines when absent', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 2,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        confidence: 0.61,
-        test_erosion_detail: null,
-        smoketest_detail: null,
-        sub_scores: { audit: 0.74, test_erosion: 0.42, smoketest: 0.88 },
-      },
-    });
-    expect(result).not.toContain('Test erosion:');
-    expect(result).not.toContain('Smoketest:');
-  });
-
-  it('excludes a disabled smoketest dimension from the sub-scores line and binding selection', () => {
-    // smoketest_enabled=false → the smoketest 0.0 is a placeholder, not a real
-    // low score. It must not appear in the sub-scores line, and must never be
-    // chosen as the binding constraint even though its placeholder is the min.
-    const result = buildVersionPhaseSection({
-      version_number: 3,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'promoted',
-        confidence: 0.93,
-        smoketest_enabled: false,
-        sub_scores: {
-          audit: 0.95,
-          test_erosion: 1.0,
-          smoketest: 0.0,
-        },
-      },
-    });
-    expect(result).toContain('sub-scores: audit=0.95, test_erosion=1.00 (binding=audit=0.95)');
-    expect(result).not.toContain('smoketest=');
-    expect(result).not.toContain('binding=smoketest');
-  });
-
-  it('reports a hard CI blocker (smoketest disabled) as the binding constraint, not a numeric minimum', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 4,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        confidence: 0,
-        smoketest_enabled: false,
-        blocker: 'ci_not_green',
-        sub_scores: {
-          audit: 0.0,
-          test_erosion: 0.0,
-          smoketest: 0.0,
-        },
-      },
-    });
-    expect(result).toContain('binding=ci_not_green');
-    // The numeric-minimum binding form must NOT appear under a hard blocker.
-    expect(result).not.toContain('binding=audit=');
-    expect(result).not.toContain('binding=test_erosion=');
-    // Disabled smoketest stays excluded from the rendered sub-scores.
-    expect(result).not.toContain('smoketest=');
-  });
-
-  it('reports a test_file_deleted blocker as the binding constraint even when smoketest is enabled', () => {
+  it('reports a blocker in the compact qualification summary line', () => {
     const result = buildVersionPhaseSection({
       version_number: 5,
       phase: 'stabilize',
@@ -1830,79 +1700,10 @@ describe('buildVersionPhaseSection', () => {
         status: 'not_promoted',
         confidence: 0,
         blocker: 'test_file_deleted',
-        sub_scores: {
-          audit: 0.81,
-          test_erosion: 0.0,
-          smoketest: 0.62,
-        },
       },
     });
-    expect(result).toContain('sub-scores: audit=0.81, test_erosion=0.00, smoketest=0.62 (binding=test_file_deleted)');
-    expect(result).not.toContain('binding=test_erosion=');
-  });
-
-  it('surfaces CI blocker provenance (state and detail) alongside the blocker code', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 3,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        confidence: 0,
-        blocker: 'ci_unresolved',
-        ci_resolution: {
-          state: 'PENDING',
-          resolved_sha: 'abc123',
-          detail: 'build not started',
-        },
-        sub_scores: {
-          audit: 0.9,
-          test_erosion: 0.9,
-          smoketest: 0.9,
-        },
-      },
-    });
-    expect(result).toContain('binding=ci_unresolved');
-    expect(result).toContain('state: PENDING');
-    expect(result).toContain('build not started');
-  });
-
-  it('surfaces audit blocker provenance (missing reason) alongside the blocker code', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 3,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        confidence: 0,
-        blocker: 'audit_missing',
-        audit_missing_reason: 'empty_report',
-        sub_scores: {
-          audit: null,
-          test_erosion: 0.9,
-          smoketest: 0.9,
-        },
-      },
-    });
-    expect(result).toContain('binding=audit_missing');
-    expect(result).toContain('reason: empty_report');
-  });
-
-  it('identifies a genuine low audit score as the binding constraint (smoketest disabled, no blocker)', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 6,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        confidence: 0.55,
-        smoketest_enabled: false,
-        sub_scores: {
-          audit: 0.41,
-          test_erosion: 0.92,
-          smoketest: 0.0,
-        },
-      },
-    });
-    expect(result).toContain('sub-scores: audit=0.41, test_erosion=0.92 (binding=audit=0.41)');
-    expect(result).not.toContain('smoketest=');
+    expect(result).toContain('Last qualification:');
+    expect(result).toContain('blocker=test_file_deleted');
   });
 
   it('renders a pending last_qualification and instructs the agent NOT to re-emit qualify_request', () => {
@@ -2099,56 +1900,6 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toMatch(/omit|no change|do NOT emit/i);
   });
 
-  it('renders promotion_readiness block when present', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 3,
-      phase: 'stabilize',
-      promotion_readiness: {
-        ready: true,
-        would_promote_rate: 0.9,
-        consecutive_clean_passes: 4,
-        verdicts_evaluated: 5,
-        reason: 'qualifier looks trustworthy',
-        recurring_blockers: {},
-        confidence: { mean: 0.87, stdev: 0.03, stable: true },
-      },
-    });
-    expect(result).toContain('Promotion readiness');
-    expect(result).toContain('ready=YES');
-    expect(result).toContain('would_promote_rate=0.9');
-    expect(result).toContain('consecutive_clean_passes=4');
-    expect(result).toContain('verdicts_evaluated=5');
-    expect(result).toContain('qualifier looks trustworthy');
-    expect(result).toContain('confidence_mean=0.87');
-    expect(result).toContain('stable');
-  });
-
-  it('renders recurring_blockers in promotion_readiness when present', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 3,
-      phase: 'stabilize',
-      promotion_readiness: {
-        ready: false,
-        would_promote_rate: 0.3,
-        consecutive_clean_passes: 0,
-        verdicts_evaluated: 5,
-        reason: 'recurring hard blocker: ci_red',
-        recurring_blockers: { ci_red: 3 },
-        confidence: { mean: 0.5, stdev: 0.1, stable: false },
-      },
-    });
-    expect(result).toContain('ready=NO');
-    expect(result).toContain('Recurring blockers');
-    expect(result).toContain('ci_redx3');
-  });
-
-  it('omits promotion_readiness block gracefully when absent', () => {
-    const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
-    expect(result).not.toContain('Promotion readiness');
-    expect(result).not.toContain('Recurring blockers');
-    expect(result).toContain('Version Phase');
-  });
-
   it('renders recent_versions list when present', () => {
     const result = buildVersionPhaseSection({
       version_number: 3,
@@ -2172,30 +1923,7 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('promoted');
     expect(result).toContain('qual=promoted');
     expect(result).toContain('confidence=0.91');
-    expect(result).toContain('binding=smoketest=0.49');
-    expect(result).toContain('Audit findings: high: flaky audit step');
     expect(result).toContain('v1');
-  });
-
-  it('renders recent_versions qualification details with smoketest as the binding dimension', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 4,
-      phase: 'stabilize',
-      recent_versions: [
-        {
-          version_number: 3,
-          status: 'promoted',
-          last_qualification: {
-            status: 'not_promoted',
-            confidence: 0.5,
-            sub_scores: { audit: 0.71, test_erosion: 0.64, smoketest: 0.31 },
-            audit_findings: [{ severity: 'medium', summary: 'startup-suite regression' }],
-          },
-        },
-      ],
-    });
-    expect(result).toContain('binding=smoketest=0.31');
-    expect(result).toContain('Audit findings: medium: startup-suite regression');
   });
 
   it('omits recent_versions gracefully when absent', () => {
@@ -2379,242 +2107,6 @@ describe('buildVersionPhaseSection', () => {
     expect(absent).not.toContain('Acceptance criteria coverage');
     expect(zeroTotal).not.toContain('Acceptance criteria coverage');
     expect(malformed).not.toContain('Acceptance criteria coverage');
-  });
-
-  it('renders criterion coverage before legacy drift and goal-alignment signals', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'build',
-      criterion_coverage: {
-        total: 3,
-        covered: 1,
-        partial: 1,
-        uncovered: 1,
-      },
-      goal_coverage_drift: {
-        signal: 'drifting',
-        coverage: 0.45,
-      },
-      last_qualification: {
-        status: 'not_promoted',
-        goal_alignment: {
-          status: 'partial',
-        },
-      },
-    });
-
-    expect(result.indexOf('Acceptance criteria coverage (canonical)')).toBeLessThan(result.indexOf('Legacy heuristic - Goal-coverage drift'));
-    expect(result.indexOf('Acceptance criteria coverage (canonical)')).toBeLessThan(result.indexOf('Legacy heuristic - Last qualification goal alignment'));
-  });
-
-  it('renders a drifting goal_coverage_drift signal with emphasis and biggest_gap', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'build',
-      goal_coverage_drift: {
-        signal: 'drifting',
-        coverage: 0.45,
-        biggest_gap: 'feature Y not covered',
-        merges_since_grade: 3,
-        stale: true,
-        detail: 'Accumulated work deviates from frozen goal',
-      },
-    });
-    expect(result).toContain('drifting');
-    expect(result).toContain('biggest_gap=feature Y not covered');
-    expect(result).toContain('merges_since_grade=3');
-    expect(result).toContain('stale=true');
-    expect(result).toContain('Legacy heuristic - Goal-coverage drift');
-    expect(result).toContain('course-correct or propose a goal amendment');
-    expect(result).toContain('Drift detail: Accumulated work deviates from frozen goal');
-  });
-
-  it('renders an on_track goal_coverage_drift signal without drifting emphasis', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'build',
-      goal_coverage_drift: {
-        signal: 'on_track',
-        coverage: 0.85,
-        biggest_gap: 'minor gap A',
-        merges_since_grade: 1,
-        stale: false,
-      },
-    });
-    expect(result).toContain('Goal-coverage drift: signal=on_track');
-    expect(result).toContain('Legacy heuristic - Goal-coverage drift');
-    expect(result).not.toContain('course-correct or propose a goal amendment');
-  });
-
-  it('omits the goal_coverage_drift section entirely when absent', () => {
-    const result = buildVersionPhaseSection({ version_number: 2, phase: 'build' });
-    expect(result).not.toContain('Goal-coverage drift');
-  });
-
-  it('omits goal_coverage_drift section when signal is missing', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 2,
-      phase: 'build',
-      goal_coverage_drift: { coverage: 0.5 },
-    });
-    expect(result).not.toContain('Goal-coverage drift');
-  });
-
-  it('renders goal_alignment from last_qualification when present', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 4,
-      phase: 'stabilize',
-      last_qualification: {
-        status: 'not_promoted',
-        goal_alignment: {
-          status: 'partial',
-          coverage: 0.6,
-          biggest_gap: 'feature Y not shipped',
-        },
-      },
-    });
-    expect(result).toContain('Last qualification goal alignment: status=partial');
-    expect(result).toContain('Legacy heuristic - Last qualification goal alignment');
-    expect(result).toContain('coverage=0.6');
-    expect(result).toContain('biggest_gap=feature Y not shipped');
-  });
-
-  it('omits goal_alignment line when last_qualification is absent', () => {
-    const result = buildVersionPhaseSection({ version_number: 2, phase: 'build' });
-    expect(result).not.toContain('Last qualification goal alignment');
-  });
-
-  it('omits goal_alignment line when last_qualification has no goal_alignment', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 2,
-      phase: 'build',
-      last_qualification: { status: 'pending' },
-    });
-    expect(result).not.toContain('Last qualification goal alignment');
-  });
-
-  it('renders candidate currency as CURRENT when last_qualification_candidate_currency.current is true', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'stabilize',
-      last_qualification_candidate_currency: {
-        current: true,
-        candidate_sha: 'aabbcc001122',
-        head_sha: 'aabbcc001122',
-      },
-    });
-    expect(result).toContain('Qualification candidate currency: CURRENT');
-    expect(result).toContain('aabbcc001122');
-    expect(result).toContain('matches integration HEAD');
-    expect(result).not.toContain('STALE');
-  });
-
-  it('renders candidate currency as STALE when last_qualification_candidate_currency.current is false', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'stabilize',
-      last_qualification_candidate_currency: {
-        current: false,
-        candidate_sha: 'oldsha1234567890',
-        head_sha: 'newsha9876543210',
-      },
-    });
-    expect(result).toContain('Qualification candidate currency: STALE');
-    expect(result).toContain('oldsha123456');
-    expect(result).toContain('newsha987654');
-    expect(result).toContain('fresh qualification');
-    expect(result).not.toContain('CURRENT');
-  });
-
-  it('renders candidate currency as API UNREACHABLE (not STALE) for verdict api_unreachable', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'stabilize',
-      last_qualification_candidate_currency: {
-        verdict: 'api_unreachable',
-        resolved: false,
-        reason: 'github_http_502',
-        candidate_sha: 'candsha012345',
-      },
-    });
-    expect(result).toContain('Qualification candidate currency: API UNREACHABLE');
-    expect(result).toContain('github_http_502');
-    expect(result).toContain('candsha01234');
-    // Regression: a transient GitHub outage must NOT be framed as STALE.
-    expect(result).not.toContain('candidate currency: STALE');
-    expect(result).toContain('temporary reachability problem');
-  });
-
-  it('renders candidate currency as UNKNOWN (not STALE) for genuine indeterminacy', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'stabilize',
-      last_qualification_candidate_currency: {
-        verdict: 'unknown',
-        resolved: false,
-        reason: 'repo_credentials_unavailable',
-        candidate_sha: 'candsha678901',
-      },
-    });
-    expect(result).toContain('Qualification candidate currency: UNKNOWN');
-    expect(result).toContain('Not confirmed stale');
-    expect(result).not.toContain('candidate currency: STALE');
-    expect(result).not.toContain('candidate currency: CURRENT');
-  });
-
-  it('renders STALE when verdict is stale even without a boolean current field', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 5,
-      phase: 'stabilize',
-      last_qualification_candidate_currency: {
-        verdict: 'stale',
-        resolved: true,
-        current: false,
-        candidate_sha: 'oldsha1234567890',
-        head_sha: 'newsha9876543210',
-      },
-    });
-    expect(result).toContain('Qualification candidate currency: STALE');
-    expect(result).toContain('oldsha123456');
-  });
-
-  it('omits candidate currency block when last_qualification_candidate_currency is absent', () => {
-    const result = buildVersionPhaseSection({ version_number: 3, phase: 'stabilize' });
-    expect(result).not.toContain('Qualification candidate currency');
-  });
-
-  it('omits candidate currency block when last_qualification_candidate_currency is null', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 3,
-      phase: 'stabilize',
-      last_qualification_candidate_currency: null,
-    });
-    expect(result).not.toContain('Qualification candidate currency');
-  });
-
-  it('renders qualification_state_disagreement note when present', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 4,
-      phase: 'stabilize',
-      last_qualification: { status: 'not_promoted', candidate_sha: 'deadbeef1234' },
-      qualification_state_disagreement: {
-        last_qualification_status: 'pending',
-        verdict_terminal_status: 'not_promoted',
-      },
-    });
-    expect(result).toContain('qualification_state_disagreement');
-    expect(result).toContain("last_qualification.status='pending'");
-    expect(result).toContain("finalized verdict reports 'not_promoted'");
-    expect(result).toContain('finalized verdict');
-  });
-
-  it('omits qualification_state_disagreement note when absent', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 4,
-      phase: 'stabilize',
-      last_qualification: { status: 'not_promoted', candidate_sha: 'deadbeef1234' },
-    });
-    expect(result).not.toContain('qualification_state_disagreement');
   });
 
   it('renders enriched qualification_state and serving_status for recent_versions entries', () => {
@@ -3081,7 +2573,7 @@ describe('buildEfficiencySnapshotSection', () => {
     expect(result).toContain('+28.8%');
   });
 
-  it('renders llm_cost_attribution block with dominant model/task-type/failure-class, rework_share, self_repair_burn_share', () => {
+  it('omits llm_cost_attribution block even when present (trimmed for conciseness)', () => {
     const snapshot = {
       axes: { llm_cost_per_merged_pr: { current: 1.2, baseline: 1.0, drift_pct: 20.0 } },
       llm_cost_attribution: {
@@ -3094,13 +2586,7 @@ describe('buildEfficiencySnapshotSection', () => {
       },
     };
     const result = buildEfficiencySnapshotSection(snapshot);
-    expect(result).toContain('LLM cost attribution');
-    expect(result).toContain('claude-opus-4-8');
-    expect(result).toContain('create');
-    expect(result).toContain('AGENT_TIMEOUT');
-    expect(result).toContain('18.0%'); // rework_share
-    expect(result).toContain('7.0%'); // self_repair_burn_share
-    expect(result).toContain('42.5'); // total_llm_usd
+    expect(result).not.toContain('LLM cost attribution');
   });
 
   it('omits llm_cost_attribution block when absent', () => {
@@ -3111,7 +2597,7 @@ describe('buildEfficiencySnapshotSection', () => {
     expect(result).not.toContain('LLM cost attribution');
   });
 
-  it('renders llm_cost_attribution gracefully when dominant rows are null', () => {
+  it('omits llm_cost_attribution block with gracefully-null data (trimmed for conciseness)', () => {
     const snapshot = {
       axes: { cost_per_merged_pr: { current: 0.5, baseline: 0.4, drift_pct: 25.0 } },
       llm_cost_attribution: {
@@ -3124,10 +2610,7 @@ describe('buildEfficiencySnapshotSection', () => {
       },
     };
     const result = buildEfficiencySnapshotSection(snapshot);
-    expect(result).toContain('LLM cost attribution');
-    expect(result).toContain('dominant model: n/a');
-    expect(result).toContain('rework_share: n/a');
-    expect(result).toContain('self_repair_burn_share: n/a');
+    expect(result).not.toContain('LLM cost attribution');
   });
 
   it('renders panel_review_effectiveness gate_health when present', () => {
@@ -4128,8 +3611,9 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     const script = helperCall ? helperCall[1] : '';
     expect(script).toContain('set-evidence-progress)');
     expect(script).toContain('_call "set_evidence_progress"');
-    // Usage string advertises the new op (record-finding-resolution is the last CLI op).
-    expect(script).toContain('set-evidence-progress|set-acceptance-criteria|record-finding-resolution <json-or-file>');
+	    // Usage string advertises the ops (set-memory set-session-summary added for memory; consume/dismiss-knowledge for knowledge lifecycle).
+	    expect(script).toContain("set-evidence-progress|set-acceptance-criteria|record-finding-resolution|set-memory|set-session-summary|consume-knowledge|dismiss-knowledge|request-qualification <json-or-file>");
+
   });
 });
 
@@ -4593,5 +4077,6 @@ describe('shared prompt boilerplate blocks', () => {
     expect(CAPABILITY_DECLARATION_DOC).toMatch(/never rejected/);
     expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('named_test');
     expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('observable_behavior');
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('coverage_delta');
   });
 });

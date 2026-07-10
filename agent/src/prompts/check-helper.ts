@@ -1,4 +1,6 @@
 import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
 import { SHELL_CMD_RE } from '../shell-safety.js';
@@ -18,6 +20,40 @@ export const BLUEPRINT_AGENT_ESLINT_CMD = 'npx eslint 2>&1';
 export const BLUEPRINT_AGENT_TSC_CMD = 'npx tsc --noEmit 2>&1';
 export const BLUEPRINT_BACKEND_RUFF_CHECK_CMD = 'python3 -m ruff check --select E,F,W --ignore E501 2>&1';
 export const BLUEPRINT_BACKEND_RUFF_FORMAT_CMD = 'python3 -m ruff format --check 2>&1';
+
+// ── Lazy-loaded bash templates (extracted to .sh files) ───────────────────────
+// Per CLAUDE.md "Generating Code for One Language From Another": multi-line
+// bash blocks are extracted to real .sh files (directly lintable, testable).
+// The generator reads them at module-load time and injects them directly into
+// the generated script — no base64 needed because these are bash fragments
+// embedded in a bash generation context (not a different language inside bash).
+// Lazy-loaded so test suites which mock fs do not crash on module import.
+const _CHECK_HELPER_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+const _CI_FAILURE_VERIFY_PATH = path.join(_CHECK_HELPER_DIR, 'check_ci_failure_verify.sh');
+function loadCiFailureVerifyScript(): string {
+  try { return fs.readFileSync(_CI_FAILURE_VERIFY_PATH, 'utf8'); } catch { return ''; }
+}
+
+const _MERGE_VERIFY_PATH = path.join(_CHECK_HELPER_DIR, 'check_merge_verify.sh');
+function loadMergeVerifyScript(): string {
+  try { return fs.readFileSync(_MERGE_VERIFY_PATH, 'utf8'); } catch { return ''; }
+}
+
+const _IMPACTED_TEST_PATH = path.join(_CHECK_HELPER_DIR, 'check_impacted_test.sh');
+function loadImpactedTestScript(): string {
+  try { return fs.readFileSync(_IMPACTED_TEST_PATH, 'utf8'); } catch { return ''; }
+}
+
+const _VIEWPORT_UPLOAD_PATH = path.join(_CHECK_HELPER_DIR, 'check_viewport_upload.sh');
+function loadViewportUploadScript(): string {
+  try { return fs.readFileSync(_VIEWPORT_UPLOAD_PATH, 'utf8'); } catch { return ''; }
+}
+
+const _VISUAL_CAPTURE_PATH = path.join(_CHECK_HELPER_DIR, 'check_visual_capture.sh');
+function loadVisualCaptureScript(): string {
+  try { return fs.readFileSync(_VISUAL_CAPTURE_PATH, 'utf8'); } catch { return ''; }
+}
 
 /** Emit the ci_failure closed-loop verify block for the generated ./check.
  *
@@ -50,28 +86,9 @@ function buildCiFailureVerifyBlock(selectors: string[], taskId: string): string 
   if (selectors.length === 0) return '';
   // Single-quoted bash literals — selectors cleared PYTEST_SELECTOR_RE.
   const quoted = selectors.map(s => `'${s}'`).join(' ');
-  return `
-# ── ci_failure closed-loop verify ───────────────────────────────────────────
-# This is a CI-failure fix: verify the EXACT CI-failing pytest selector(s)
-# pass locally BEFORE ./pr open can push. Targeted selectors (never the full
-# suite — that OOMs the 8 GB agent VM); the harness memory guard exempts them.
-# A still-failing target test fails this gate; ./pr open blocks until green.
-CI_FAIL_SELECTORS=(${quoted})
-if [ \${#CI_FAIL_SELECTORS[@]} -gt 0 ]; then
-  if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then
-    echo "[check] ci_failure verify: running \${#CI_FAIL_SELECTORS[@]} targeted CI-failing selector(s) via the sanctioned harness..."
-    run "ci_failure selectors verify" bash -c 'set -o pipefail; bash scripts/test-backend.sh --postgres "$@" 2>&1 | tail -200' _ "\${CI_FAIL_SELECTORS[@]}"
-  else
-    # No Docker → the sanctioned harness can't run here and a bare local pytest
-    # would be the unfaithful SQLite fallback. Don't block on an infra artifact
-    # (CI runs the authoritative Postgres suite on the PR after ./pr open); warn
-    # and record a GATE-ENVIRONMENT marker ./pr surfaces after the gate.
-    echo "[check] ci_failure verify: SKIPPED — Docker unavailable, can't run the sanctioned harness for the CI-failing selectors on this VM."
-    echo "[check]   The targeted CI-failing tests were NOT verified locally; CI runs the authoritative Postgres suite on the PR."
-    printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "ci_failure selector verify skipped — no Docker for the sanctioned harness; CI verifies the failing selectors on the PR" >> /tmp/check_gate_env_${taskId}.txt
-  fi
-fi
-`;
+  return loadCiFailureVerifyScript()
+    .replace(/@CI_FAIL_SELECTORS@/g, quoted)
+    .replace(/@TASK_ID@/g, taskId);
 }
 
 /** Emit the merge-resolution closed-loop verify block for the generated ./check.
@@ -97,39 +114,7 @@ fi
  *  the authoritative suite on the PR). Derivation uses only $CHANGED + on-disk
  *  test-file existence, so it reflects the RESOLVED tree at ./check time. */
 function buildMergeVerifyBlock(taskId: string): string {
-  return `
-# ── merge-resolution closed-loop verify ─────────────────────────────────────
-# This fix resolved a base-branch merge conflict. Verify the affected backend
-# test files pass under Postgres BEFORE ./pr open can push — a silent drop or a
-# code/test vintage skew from the resolution would otherwise surface only in CI.
-MERGE_VERIFY_CAP=8
-_mv_all=$(
-  {
-    printf '%s\\n' "$CHANGED" | grep -E '^backend/testing/test_[A-Za-z0-9_]+\\.py$'
-    printf '%s\\n' "$CHANGED" | grep -E '^backend/app/[A-Za-z0-9_]+\\.py$' \\
-      | sed -E 's|^backend/app/([A-Za-z0-9_]+)\\.py$|backend/testing/test_\\1.py|'
-  } | sort -u | grep -v '^$' | while read -r _mv_f; do [ -f "$_mv_f" ] && printf '%s\\n' "$_mv_f"; done
-)
-if [ -n "$_mv_all" ]; then
-  _mv_count=$(printf '%s\\n' "$_mv_all" | grep -c '^' || true)
-  if [ "$_mv_count" -gt "$MERGE_VERIFY_CAP" ]; then
-    echo "[check] merge-resolution verify: $_mv_count affected test file(s); running first $MERGE_VERIFY_CAP under Postgres, CI verifies the rest:"
-    printf '%s\\n' "$_mv_all" | tail -n +$((MERGE_VERIFY_CAP + 1)) | sed 's|^|[check]   deferred-to-CI: |'
-  fi
-  # Strip the backend/ prefix: scripts/test-backend.sh runs from backend/ and
-  # expects testing/test_x.py selectors.
-  _mv_run=$(printf '%s\\n' "$_mv_all" | head -n "$MERGE_VERIFY_CAP" | sed 's|^backend/||')
-  if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then
-    echo "[check] merge-resolution verify: running affected backend test file(s) via the sanctioned Postgres harness..."
-    # shellcheck disable=SC2086
-    run "merge-resolution verify" bash -c 'set -o pipefail; bash scripts/test-backend.sh --postgres "$@" 2>&1 | tail -200' _ $_mv_run
-  else
-    echo "[check] merge-resolution verify: SKIPPED — Docker unavailable, can't run the sanctioned Postgres harness on this VM."
-    echo "[check]   The affected backend tests were NOT verified locally; CI runs the authoritative Postgres suite on the PR."
-    printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "merge-resolution verify skipped — no Docker for the sanctioned harness; CI verifies affected tests on the PR" >> /tmp/check_gate_env_${taskId}.txt
-  fi
-fi
-`;
+  return loadMergeVerifyScript().replace(/@TASK_ID@/g, taskId);
 }
 
 /** Emit the impacted-test merge-time gate for the generated ./check.
@@ -155,46 +140,7 @@ fi
  *  output, no failure) when the impacted set is empty. It is additive — it does
  *  NOT replace the standalone smoke run; the two are complementary. */
 function buildImpactedTestBlock(taskId: string): string {
-  return `
-    # ── impacted-test merge-time gate ───────────────────────────────────────
-    # Complement to the standalone smoke run above: mechanically run the backend
-    # test files IMPACTED by this diff (test files that import a changed
-    # app.<module> or mock-patch it by string target, plus any test file the PR
-    # itself adds). Derived from $CHANGED via the committed reverse-dep resolver
-    # (invoked BY REFERENCE — no embedded Python heredoc, see CLAUDE.md), run
-    # bounded under the sanctioned Postgres harness so an impacted-test failure
-    # blocks ./pr open instead of leaking to the promotion suite.
-    IMPACTED_TEST_CAP=8
-    _it_stderr_f=$(mktemp /tmp/check_impacted_XXXXXX)
-    _it_all=$(printf '%s\\n' "$CHANGED" | python3 backend/testing/impacted_tests.py 2>"$_it_stderr_f")
-    _it_rc=$?
-    if [ "$_it_rc" -ne 0 ]; then
-      echo "[check] impacted-test resolver: crashed (exit $_it_rc) — stderr follows:" >&2
-      cat "$_it_stderr_f" >&2
-      echo "[check] impacted-test resolver: crash surfaced as gate failure" >&2
-      FAILED+=("impacted-test resolver crash")
-    fi
-    rm -f "$_it_stderr_f"
-    if [ -n "$_it_all" ]; then
-      _it_count=$(printf '%s\\n' "$_it_all" | grep -c '^' || true)
-      if [ "$_it_count" -gt "$IMPACTED_TEST_CAP" ]; then
-        echo "[check] impacted-test gate: $_it_count impacted test file(s); running first $IMPACTED_TEST_CAP under Postgres, CI verifies the rest:"
-        printf '%s\\n' "$_it_all" | tail -n +$((IMPACTED_TEST_CAP + 1)) | sed 's|^|[check]   deferred-to-CI: |'
-      fi
-      # Strip the backend/ prefix: scripts/test-backend.sh runs from backend/ and
-      # expects testing/test_x.py selectors.
-      _it_run=$(printf '%s\\n' "$_it_all" | head -n "$IMPACTED_TEST_CAP" | sed 's|^backend/||')
-      if [ -f scripts/test-backend.sh ] && command -v docker >/dev/null 2>&1; then
-        echo "[check] impacted-test gate: running impacted backend test file(s) via the sanctioned Postgres harness..."
-        # shellcheck disable=SC2086
-        run "impacted-test gate" bash -c 'set -o pipefail; bash scripts/test-backend.sh --postgres "$@" 2>&1 | tail -200' _ $_it_run
-      else
-        echo "[check] impacted-test gate: SKIPPED — Docker unavailable, can't run the sanctioned Postgres harness on this VM."
-        echo "[check]   The impacted backend tests were NOT verified locally; CI runs the authoritative Postgres suite on the PR."
-        printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "impacted-test gate skipped — no Docker for the sanctioned harness; CI verifies impacted tests on the PR" >> /tmp/check_gate_env_${taskId}.txt
-      fi
-    fi
-`;
+  return loadImpactedTestScript().replace(/@TASK_ID@/g, taskId);
 }
 
 /** Emit a bash sub-block that uploads the failed viewport screenshot(s) for a
@@ -215,103 +161,7 @@ function buildImpactedTestBlock(taskId: string): string {
  *  5. POSTs to the signed-URL endpoint and PUTs the PNG to the returned URL.
  *  6. Logs the storage_uri on success. */
 function buildViewportUploadBlock(taskId: string): string {
-  return `
-      # ── viewport screenshot upload (PR-only regression evidence) ──────────
-      # Non-fatal: missing JSON / PNG / tools / token → WARN and skip.
-      if command -v curl >/dev/null 2>&1 \\
-          && _load_agent_token 2>/dev/null && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
-        VP_JSON="admin-ui/test-results/viewport-failures.json"
-        if [ -f "$VP_JSON" ]; then
-          _vp_slugify() {
-            printf '%s' "$1" | sed -E 's/[^A-Za-z0-9]+/-/g; s/^-+|-+$//g'
-          }
-          _vp_component_from_name() {
-            printf '%s' "$1" | sed -E 's/[[:space:]]+viewport[[:space:]].*$//' | sed -E 's/[[:space:]]+[-—–]+$//' | awk '
-              {
-                last = $NF;
-                for (i = 1; i <= NF; i++) {
-                  if ($i ~ /^[A-Z][A-Za-z0-9._-]*$/) {
-                    comp = $i;
-                  }
-                }
-              }
-              END {
-                if (comp != "") print comp;
-                else if (last != "") print last;
-              }
-            '
-          }
-          while IFS=$'\t' read -r _vp_file _vp_name; do
-            [ -z "$_vp_name" ] && continue
-            # Extract component from the pre-viewport title while preserving
-            # compound component names like "MessagesPanel composed with shell
-            # panels — viewport regression ...".
-            _vp_comp=$(_vp_component_from_name "$_vp_name")
-            # Extract width: first run of digits immediately before "px".
-            _vp_width=$(printf '%s' "$_vp_name" | grep -oE '[0-9]+px' | head -1 | tr -d 'px')
-            if [ -z "$_vp_comp" ] || [ -z "$_vp_width" ]; then
-              echo "[check] WARN: viewport upload — could not parse component/width from: $_vp_name"
-              continue
-            fi
-            # Match the screenshot for this exact failed assertion when Vitest
-            # emits one. Falling back to a broad glob would risk publishing the
-            # wrong pixels for a different failure.
-            _vp_name_slug=$(_vp_slugify "$_vp_name")
-            _vp_file_slug=$(_vp_slugify "\${_vp_file##*/}")
-            _vp_png=$(
-              find admin-ui/test-results -maxdepth 6 -type f -name "*\${_vp_file_slug}*\${_vp_name_slug}*.png" 2>/dev/null \
-                | sort | head -1 || true
-            )
-            if [ -z "$_vp_png" ]; then
-              _vp_png=$(find admin-ui/test-results -maxdepth 6 -type f -name "*\${_vp_name_slug}*.png" 2>/dev/null | sort | head -1 || true)
-            fi
-            if [ -z "$_vp_png" ]; then
-              echo "[check] WARN: viewport upload — no screenshot PNG found for $_vp_comp@\${_vp_width}px"
-              continue
-            fi
-            # POST for a signed upload URL.
-            _vp_resp=$(curl -sf -X POST \\
-              -H "Authorization: Bearer $TOKEN" \\
-              -H "Content-Type: application/json" \\
-              -d "{\\"task_id\\":\\"${taskId}\\",\\"component\\":\\"$_vp_comp\\",\\"width\\":$_vp_width}" \\
-              "\${ORCHESTRATOR_URL}/api/agent/viewport/failure-screenshot-upload-url") || {
-              echo "[check] WARN: viewport upload — signing request failed for $_vp_comp@\${_vp_width}px"
-              continue
-            }
-            _vp_url=$(printf '%s' "$_vp_resp" | _json_field upload_url 2>/dev/null || true)
-            _vp_uri=$(printf '%s' "$_vp_resp" | _json_field storage_uri 2>/dev/null || true)
-            if [ -z "$_vp_url" ]; then
-              echo "[check] WARN: viewport upload — empty upload_url for $_vp_comp@\${_vp_width}px"
-              continue
-            fi
-            # PUT the PNG to the signed URL.
-            curl -sf -T "$_vp_png" -H "Content-Type: image/png" "$_vp_url" || {
-              echo "[check] WARN: viewport upload — PUT failed for $_vp_comp@\${_vp_width}px"
-              continue
-            }
-            # Save a local copy for the fixing agent to read before making changes.
-            # The agent cannot open gs:// URIs, so a local path makes the screenshot
-            # accessible via its file-reading tool.
-            _vp_local_path="/tmp/viewport_failure_${taskId}_\${_vp_comp}_\${_vp_width}.png"
-            cp "$_vp_png" "$_vp_local_path" 2>/dev/null || true
-            echo "[check] viewport screenshot uploaded: $_vp_uri ($_vp_comp@\${_vp_width}px) — local copy: $_vp_local_path"
-          done < <(
-            python3 -c '
-import json, sys
-with open(sys.argv[1]) as f:
-    data = json.load(f)
-for tr in data.get("testResults", []):
-    fname = tr.get("name") or tr.get("filepath") or tr.get("file") or tr.get("testFile") or ""
-    for ar in tr.get("assertionResults", []):
-        if ar.get("status") == "failed":
-            title = ar.get("fullName") or ar.get("title") or ""
-            print(fname + "\t" + title)
-' "$VP_JSON" 2>/dev/null || true
-          )
-        fi
-      fi
-      # ── end viewport screenshot upload ───────────────────────────────────
-`;
+  return loadViewportUploadScript().replace(/@TASK_ID@/g, taskId);
 }
 
 /** Emit the SUCCESS-PATH visual-acceptance capture+upload block.  Presence-gated
@@ -340,56 +190,10 @@ for tr in data.get("testResults", []):
  *  blocking gate. component/width are validated shell-safe by
  *  validateCfgShellSafety, so single-quote/JSON interpolation here is injection-safe. */
 function buildVisualCaptureBlock(taskId: string, component: string, width: number): string {
-  return `
-# ── visual acceptance evidence capture+upload (success path) ─────────────────
-# Presence-gated: emitted only when this task declares a \`visual\` acceptance
-# requirement. Best-effort — every failure mode is WARN + continue, never a
-# blocking gate. Runs only when ./check is otherwise GREEN so the captured
-# screenshot reflects a passing change, making the declared visual evidence
-# satisfiable (the upload stamps the canonical (component, width) context URI
-# the acceptance gate resolves against).
-if [ \${#FAILED[@]} -eq 0 ] && admin_ui_runtime_touched \\
-    && command -v curl >/dev/null 2>&1 \\
-    && _load_agent_token 2>/dev/null && [ -n "\${ORCHESTRATOR_URL:-}" ]; then
-  _VA_COMPONENT='${component}'
-  _VA_WIDTH=${width}
-  _VA_SHOT_DIR="/tmp/check_visual_shots_${taskId}"
-  rm -rf "$_VA_SHOT_DIR" 2>/dev/null || true
-  mkdir -p "$_VA_SHOT_DIR"
-  echo "[check] visual acceptance: capturing $_VA_COMPONENT@\${_VA_WIDTH}px screenshot..."
-  # Capture ONLY the declared component's viewport test(s) — the positional
-  # filter is a vitest substring match against the test file path.
-  if ! ( cd admin-ui && VIEWPORT_SHOT_DIR="$_VA_SHOT_DIR" VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run test:viewport:capture -- "$_VA_COMPONENT" >/tmp/check_visual_capture_${taskId}.log 2>&1 ); then
-    echo "[check] WARN: visual acceptance — capture run failed (non-fatal); see /tmp/check_visual_capture_${taskId}.log"
-  fi
-  # The PNG for this exact width: maybeCapture writes <dir>/<slug(file)>/<slug(test)>-<width>px.png.
-  _VA_PNG=$(find "$_VA_SHOT_DIR" -type f -name "*-\${_VA_WIDTH}px.png" 2>/dev/null | sort | head -1 || true)
-  if [ -z "$_VA_PNG" ]; then
-    echo "[check] WARN: visual acceptance — no screenshot PNG captured for $_VA_COMPONENT@\${_VA_WIDTH}px; skipping upload"
-  else
-    # POST for a signed upload URL bound to the canonical (component, width) object.
-    _VA_RESP=$(curl -sf -X POST \\
-      -H "Authorization: Bearer $TOKEN" \\
-      -H "Content-Type: application/json" \\
-      -d "{\\"task_id\\":\\"${taskId}\\",\\"component\\":\\"$_VA_COMPONENT\\",\\"width\\":$_VA_WIDTH}" \\
-      "\${ORCHESTRATOR_URL}/api/agent/viewport/failure-screenshot-upload-url") || _VA_RESP=""
-    if [ -z "$_VA_RESP" ]; then
-      echo "[check] WARN: visual acceptance — signing request failed for $_VA_COMPONENT@\${_VA_WIDTH}px"
-    else
-      _VA_URL=$(printf '%s' "$_VA_RESP" | _json_field upload_url 2>/dev/null || true)
-      _VA_URI=$(printf '%s' "$_VA_RESP" | _json_field storage_uri 2>/dev/null || true)
-      if [ -z "$_VA_URL" ]; then
-        echo "[check] WARN: visual acceptance — empty upload_url for $_VA_COMPONENT@\${_VA_WIDTH}px"
-      elif curl -sf -T "$_VA_PNG" -H "Content-Type: image/png" "$_VA_URL"; then
-        echo "[check] visual acceptance screenshot uploaded: $_VA_URI ($_VA_COMPONENT@\${_VA_WIDTH}px)"
-      else
-        echo "[check] WARN: visual acceptance — PUT failed for $_VA_COMPONENT@\${_VA_WIDTH}px"
-      fi
-    fi
-  fi
-fi
-# ── end visual acceptance evidence capture+upload ────────────────────────────
-`;
+  return loadVisualCaptureScript()
+    .replace(/@TASK_ID@/g, taskId)
+    .replace(/@COMPONENT@/g, component)
+    .replace(/@WIDTH@/g, String(width));
 }
 
 /** Detect whether the given stack can capture visual evidence. Capability-gated
@@ -798,10 +602,55 @@ if touches backend/; then
     # invariant set (security, pipeline, invariants, audit-finding-class,
     # admin-auth, metric-manifest + emitter-inventory contracts) which
     # catches file-size breaches, security regressions, and basic pipeline
-    # and contract assertions — the rest is CI's job. \`set -o pipefail\` so the harness's non-zero
-    # exit propagates through \`| tail\` (same rationale as the agent
-    # vitest line above — the outer pipefail does not reach a fresh bash -c).
-    run "backend pytest" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'
+    # and contract assertions — the rest is CI's job.
+    # Baseline-recheck: if the standalone suite fails, re-run it on the
+    # base branch to distinguish pre-existing failures (WARN, not blocking)
+    # from regressions introduced by this PR (real failure, blocking).
+    # Mirrors the viewport and eslint baseline-recheck pattern exactly.
+    echo "[check] backend pytest..."
+    BPYTEST_PR_LOG=/tmp/check_backend_pytest_pr.log
+    if ( set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200 ) > "$BPYTEST_PR_LOG" 2>&1; then
+      tail -20 "$BPYTEST_PR_LOG"
+      echo "[check] backend pytest OK"
+    else
+      echo "[check] backend pytest FAILED on PR — checking baseline on origin/$BASE..."
+      BPYTEST_BASELINE_FAILED=0
+      BPYTEST_BASELINE_REASON=""
+      BPYTEST_BASE_REF="origin/$BASE"
+      if ! git rev-parse --verify "$BPYTEST_BASE_REF" >/dev/null 2>&1; then
+        BPYTEST_BASE_REF="$BASE"
+        git rev-parse --verify "$BPYTEST_BASE_REF" >/dev/null 2>&1 || BPYTEST_BASELINE_REASON="base ref unavailable"
+      fi
+      if [ -z "$BPYTEST_BASELINE_REASON" ]; then
+        BPYTEST_WT=/tmp/check_backend_pytest_baseline_wt
+        # Stale worktree from a prior run can wedge \`worktree add\`.
+        # \`worktree remove --force\` is the safe cleanup (no rm -rf).
+        git worktree remove --force "$BPYTEST_WT" >/dev/null 2>&1 || true
+        if ! git worktree add --detach "$BPYTEST_WT" "$BPYTEST_BASE_REF" >/tmp/check_backend_pytest_wt.log 2>&1; then
+          BPYTEST_BASELINE_REASON="worktree add failed (see /tmp/check_backend_pytest_wt.log)"
+        else
+          BPYTEST_MAIN_LOG=/tmp/check_backend_pytest_main.log
+          if ( set -o pipefail; cd "$BPYTEST_WT" && bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200 ) > "$BPYTEST_MAIN_LOG" 2>&1; then
+            BPYTEST_BASELINE_FAILED=0
+          else
+            BPYTEST_BASELINE_FAILED=1
+          fi
+          git worktree remove --force "$BPYTEST_WT" >/dev/null 2>&1 || true
+        fi
+      fi
+      if [ "$BPYTEST_BASELINE_FAILED" = "1" ]; then
+        echo "[check] backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR"
+        echo "[check] PR-side tail:"
+        tail -30 "$BPYTEST_PR_LOG" || true
+        echo "[check] Baseline-side tail:"
+        tail -30 "$BPYTEST_MAIN_LOG" || true
+      else
+        echo "[check] backend pytest FAILED — passes on $BPYTEST_BASE_REF, fails on PR. Real regression."
+        [ -n "$BPYTEST_BASELINE_REASON" ] && echo "[check] (baseline check skipped: $BPYTEST_BASELINE_REASON — treating PR failure as real)"
+        tail -100 "$BPYTEST_PR_LOG" || true
+        FAILED+=("backend pytest")
+      fi
+    fi
 ${buildImpactedTestBlock(cfg.taskId)}  fi
   # Fast migration-chain guard: no DB, no Docker, sub-second. Runs only
   # when at least one alembic/versions/ file was added or changed.

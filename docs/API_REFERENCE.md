@@ -600,7 +600,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | cancel_task | dispose_completion_debt | set_problem_model | set_running_update | reflect | pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | spawn_fix | cancel_task | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | set_running_update | reflect | pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
   "data": { }
 }
 ```
@@ -623,6 +623,10 @@ truncated). Notable behaviors:
   `finding_key` (string, ≤ 64 chars), `state` (`resolved` | `stale`). Optional:
   `severity`, `note`, `resolving_ref`, `verified_against_sha`. Returns `409`
   when no open version exists.
+- `set_memory` records a durable behavioral preference or strategic insight that
+  persists across session restarts. Required `data` fields: `key` (string, ≤ 200
+  chars) and `content` (string, ≤ 2000 chars). Entries are capped at 50; oldest
+  are evicted first.
 
 ---
 

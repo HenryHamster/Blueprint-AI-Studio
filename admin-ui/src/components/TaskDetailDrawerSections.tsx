@@ -268,6 +268,46 @@ export function ResearchOriginSection({ task, tasks, onNavigateToTask }: { task:
   );
 }
 
+export function SalvageActivitySection({ task, onNavigateToTask }: { task: Task; onNavigateToTask?: (taskId: string) => void }) {
+  const ctx = task.context as Record<string, unknown> | undefined;
+  const salvageActivity = ctx?.salvage_activity as {
+    salvage_task_id?: string;
+    salvaged_count?: number;
+    salvaged_at?: string;
+  } | undefined;
+  if (!salvageActivity?.salvage_task_id) return null;
+
+  return (
+    <>
+      <SectionHeader>Salvage Activity</SectionHeader>
+      <div className="space-y-2 bg-amber-950/10 rounded-lg p-3 border border-amber-900/30">
+        <DetailRow label="Findings captured">
+          <span className="text-sm text-neutral-200">
+            {salvageActivity.salvaged_count ?? 0} finding{(salvageActivity.salvaged_count ?? 0) !== 1 ? 's' : ''}
+          </span>
+        </DetailRow>
+        <DetailRow label="Salvage Task">
+          {onNavigateToTask ? (
+            <button
+              onClick={() => onNavigateToTask(salvageActivity.salvage_task_id!)}
+              className="font-mono text-sm text-blue-400 hover:text-blue-300 hover:underline text-left"
+            >
+              {salvageActivity.salvage_task_id}
+            </button>
+          ) : (
+            <CopyableId value={salvageActivity.salvage_task_id} />
+          )}
+        </DetailRow>
+        {salvageActivity.salvaged_at && (
+          <DetailRow label="Salvaged at">
+            <span className="text-sm text-neutral-300">{formatAbsolute(salvageActivity.salvaged_at)}</span>
+          </DetailRow>
+        )}
+      </div>
+    </>
+  );
+}
+
 export function AdversarialGateDiagnosticSection({ diag, onNavigateToTask }: { diag: AdversarialGateDiagnostic; onNavigateToTask?: (id: string) => void }) {
   const stateClass = diag.completion_state === 'completed'
     ? 'bg-neutral-800/60 text-neutral-300'

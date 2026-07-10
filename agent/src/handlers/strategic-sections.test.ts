@@ -18,10 +18,12 @@ import {
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
+  buildDirectionPortfolioSection,
   buildCiComplianceSection,
   buildSweepComparisonSection,
   buildPayloadStalenessSection,
   buildCompletionDebtSection,
+  buildPendingFollowupsSection,
 } from './strategic-sections.js';
 import { buildThinkerPrompt } from '../prompts/thinker.js';
 
@@ -2172,12 +2174,10 @@ describe('buildPayloadStalenessSection', () => {
       previousDecisionOutcomes: '',
       pastRetirementCritiquesSection: '',
       retiredDirectionsSummarySection: '',
-      dirSummaryText: '',
-      dirHealthSummary: '',
+      directionPortfolioSection: '',
       userPausedSection: '',
       rejectedProposalsSection: '',
       operatorOverridesSection: '',
-      portfolioCompositionText: '',
       modelHealthSection: '',
       systemMaturitySection: '',
       driftSection: '',
@@ -2467,5 +2467,360 @@ describe('reconciliation_sections fixture contract (agent render coverage)', () 
       `Add a renderer in agent/src/handlers/strategic-sections.ts: ` +
       missingRenderers.join(', '),
     ).toEqual([]);
+  });
+});
+
+describe('buildDirectionPortfolioSection', () => {
+  it('produces a consolidated portfolio block with basic direction list', () => {
+    const dirs = [
+      { id: 'd-1', text: 'improve auth', status: 'active', priority: 'high', total_cycles: 3, category: 'product', possibly_saturated: false },
+      { id: 'd-2', text: 'refactor db', status: 'active', priority: 'medium', total_cycles: 1, category: 'structural', possibly_saturated: false },
+      { id: 'd-3', text: 'add tests', status: 'active', priority: 'low', total_cycles: 2, category: 'product', possibly_saturated: false },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined);
+    expect(result).toContain('## Direction Portfolio');
+    expect(result).toContain('Active: 3/10 slots used');
+    expect(result).toContain('Product directions: 2');
+    expect(result).toContain('No critical gaps detected');
+    expect(result).toContain('improve auth');
+    expect(result).toContain('refactor db');
+    expect(result).toContain('add tests');
+  });
+
+  it('detects all three gap types when product=0, all saturated, below minimum', () => {
+    const dirs = [
+      { id: 'd-1', text: 'auth dir', status: 'active', category: 'structural', possibly_saturated: true, priority: 'medium', total_cycles: 5 },
+      { id: 'd-2', text: 'infra dir', status: 'active', category: 'infra', possibly_saturated: true, priority: 'medium', total_cycles: 2 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined, 2);
+    expect(result).toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).toContain('ALL_SATURATED');
+    expect(result).toContain('BELOW_MINIMUM');
+    expect(result).toContain('GAPS DETECTED: NO_PRODUCT_DIRECTIONS, ALL_SATURATED, BELOW_MINIMUM');
+  });
+
+  it('includes trim note when authoritative count is larger than shipped list', () => {
+    const dirs = [
+      { id: 'd-1', text: 'one dir', status: 'active', category: 'product', possibly_saturated: false, priority: 'high', total_cycles: 2 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 15, [], undefined, 6, 0);
+    expect(result).toContain('Showing 1 of 6 active directions below');
+    expect(result).toContain('trimmed for budget');
+    expect(result).toContain('./fetch direction');
+  });
+
+  it('constructs paused-note with auto/user breakdown', () => {
+    const dirs = [
+      { id: 'd-1', text: 'active dir', status: 'active', category: 'product', possibly_saturated: false, priority: 'high', total_cycles: 3 },
+      { id: 'd-p1', text: 'auto paused', status: 'paused', category: 'structural', auto_paused: true, paused_reason: 'waiting', priority: 'low', total_cycles: 0 },
+      { id: 'd-p2', text: 'user paused', status: 'paused', category: 'product', auto_paused: false, paused_reason: '', priority: 'low', total_cycles: 0 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined);
+    expect(result).toContain('Paused: 2 (1 auto, 1 user)');
+    expect(result).toContain('listed below but not consuming active slots');
+  });
+
+  it('handles empty direction list with authoritative counts (suppresses NO_PRODUCT_DIRECTIONS when detail incomplete)', () => {
+    // authoritative=1, shipped=0 → shippedActiveCount < activeCount → detailComplete=false
+    // so NO_PRODUCT_DIRECTIONS is suppressed. BELOW_MINIMUM fires (1 < 3).
+    const result = buildDirectionPortfolioSection([], 10, [], undefined, 1, 0);
+    expect(result).toContain('Active: 1/10 slots used');
+    expect(result).toContain('BELOW_MINIMUM');
+    expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('ALL_SATURATED');
+  });
+
+  it('handles empty systems array gracefully', () => {
+    const dirs = [
+      { id: 'd-1', text: 'only dir', status: 'active', category: 'product', possibly_saturated: false, priority: 'high', total_cycles: 1 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined);
+    expect(result).toContain('Active: 1/10 slots used');
+    expect(result).toContain('BELOW_MINIMUM');
+  });
+
+  it('renders single gaps independently — BELOW_MINIMUM alone', () => {
+    const dirs = [
+      { id: 'd-1', text: 'product dir', status: 'active', category: 'product', possibly_saturated: false, priority: 'high', total_cycles: 1 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined);
+    expect(result).toContain('BELOW_MINIMUM');
+    expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('ALL_SATURATED');
+  });
+
+  it('renders single gaps independently — ALL_SATURATED alone', () => {
+    const dirs = [
+      { id: 'd-1', text: 'sat product', status: 'active', category: 'product', possibly_saturated: true, priority: 'high', total_cycles: 10 },
+      { id: 'd-2', text: 'sat structural', status: 'active', category: 'structural', possibly_saturated: true, priority: 'medium', total_cycles: 8 },
+      { id: 'd-3', text: 'sat infra', status: 'active', category: 'infra', possibly_saturated: true, priority: 'medium', total_cycles: 6 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined, 3);
+    expect(result).toContain('ALL_SATURATED');
+    expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('BELOW_MINIMUM');
+  });
+
+  it('renders single gaps independently — NO_PRODUCT_DIRECTIONS alone (3+ active, not saturated, not below_min)', () => {
+    const dirs = [
+      { id: 'd-1', text: 'infra dir', status: 'active', category: 'infra', possibly_saturated: false, priority: 'high', total_cycles: 3 },
+      { id: 'd-2', text: 'structural dir', status: 'active', category: 'structural', possibly_saturated: false, priority: 'high', total_cycles: 2 },
+      { id: 'd-3', text: 'chore dir', status: 'active', category: 'infra', possibly_saturated: false, priority: 'medium', total_cycles: 1 },
+    ];
+    const result = buildDirectionPortfolioSection(dirs, 10, [], undefined, 3);
+    expect(result).toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('ALL_SATURATED');
+    expect(result).not.toContain('BELOW_MINIMUM');
+  });
+
+  it('skips gap details when detailComplete is false (shipped list incomplete)', () => {
+    // authoritative=2, shipped=0 → shippedActiveCount < activeCount → detailComplete=false
+    // so NO_PRODUCT_DIRECTIONS and ALL_SATURATED are suppressed.
+    // BELOW_MINIMUM still fires because activeCount (2) < 3, regardless of detailComplete.
+    const result = buildDirectionPortfolioSection([], 10, [], undefined, 2, 0);
+    expect(result).not.toContain('NO_PRODUCT_DIRECTIONS');
+    expect(result).not.toContain('ALL_SATURATED');
+    expect(result).toContain('BELOW_MINIMUM');
+  });
+});
+
+describe('buildPendingFollowupsSection', () => {
+  it('returns empty string for undefined input', () => {
+    expect(buildPendingFollowupsSection(undefined)).toBe('');
+  });
+
+  it('returns empty string for null input', () => {
+    expect(buildPendingFollowupsSection(null)).toBe('');
+  });
+
+  it('returns empty string for empty array', () => {
+    expect(buildPendingFollowupsSection([])).toBe('');
+  });
+
+  it('returns empty string for non-array (object) input', () => {
+    expect(buildPendingFollowupsSection({ id: 'x', title: 'Y' })).toBe('');
+  });
+
+  it('renders header and entry count for a single pending doc', () => {
+    const followups = [
+      {
+        id: 'abc-123',
+        title: 'Performance Analysis',
+        summary: 'Summary of performance findings.',
+        source_kind: 'design',
+        topic: 'perf',
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('## Pending Knowledge Follow-ups');
+    expect(result).toContain('1 design/web_research document(s)');
+    expect(result).toContain('abc-123');
+    expect(result).toContain('Performance Analysis');
+    expect(result).toContain('[design]');
+  });
+
+  it('renders topic when present', () => {
+    const followups = [
+      {
+        id: 'doc-1',
+        title: 'Caching Study',
+        summary: 'Overview.',
+        source_kind: 'web_research',
+        topic: 'caching-layer',
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('topic: caching-layer');
+  });
+
+  it('renders tags when present (up to 5)', () => {
+    const followups = [
+      {
+        id: 'doc-tags',
+        title: 'Tagged Doc',
+        summary: 'A tagged doc.',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: ['alpha', 'beta', 'gamma'],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('[alpha, beta, gamma]');
+  });
+
+  it('omits topic when null', () => {
+    const followups = [
+      {
+        id: 'doc-notopic',
+        title: 'No Topic Doc',
+        summary: 'No topic here.',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).not.toContain('topic:');
+  });
+
+  it('renders direction_id when present', () => {
+    const followups = [
+      {
+        id: 'doc-dir',
+        title: 'Direction-linked Doc',
+        summary: 'Has a direction.',
+        source_kind: 'web_research',
+        topic: null,
+        direction_id: 'd-11223344',
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('Direction: d-11223344');
+  });
+
+  it('omits direction line when direction_id is null', () => {
+    const followups = [
+      {
+        id: 'doc-nodir',
+        title: 'No Direction Doc',
+        summary: 'Has no direction.',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).not.toContain('Direction:');
+  });
+
+  it('renders summary when non-empty', () => {
+    const followups = [
+      {
+        id: 'doc-sum',
+        title: 'Doc with summary',
+        summary: 'This is the summary text.',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('This is the summary text.');
+  });
+
+  it('renders age as "(today)" for a same-day timestamp', () => {
+    const followups = [
+      {
+        id: 'doc-today',
+        title: 'Today Doc',
+        summary: '',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('(today)');
+  });
+
+  it('renders age as "(Nd ago)" for an older timestamp', () => {
+    const pastDate = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const followups = [
+      {
+        id: 'doc-old',
+        title: 'Old Doc',
+        summary: '',
+        source_kind: 'web_research',
+        topic: null,
+        direction_id: null,
+        created_at: pastDate,
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('d ago');
+  });
+
+  it('includes consume and dismiss action hints', () => {
+    const followups = [
+      {
+        id: 'doc-action',
+        title: 'Action Hints Doc',
+        summary: '',
+        source_kind: 'design',
+        topic: null,
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: [],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('consume-knowledge-followup');
+    expect(result).toContain('dismiss-knowledge-followup');
+  });
+
+  it('renders all entries when multiple followups are provided', () => {
+    const followups = [
+      {
+        id: 'doc-multi-1',
+        title: 'First Doc',
+        summary: 'First summary.',
+        source_kind: 'design',
+        topic: 'auth',
+        direction_id: null,
+        created_at: new Date().toISOString(),
+        tags: ['x'],
+      },
+      {
+        id: 'doc-multi-2',
+        title: 'Second Doc',
+        summary: 'Second summary.',
+        source_kind: 'web_research',
+        topic: 'billing',
+        direction_id: 'd-abcdef01',
+        created_at: new Date().toISOString(),
+        tags: ['y', 'z'],
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('2 design/web_research document(s)');
+    expect(result).toContain('doc-multi-1');
+    expect(result).toContain('First Doc');
+    expect(result).toContain('doc-multi-2');
+    expect(result).toContain('Second Doc');
+    expect(result).toContain('Direction: d-abcdef01');
+  });
+
+  it('handles entry with no optional fields gracefully (no topic, no direction, no summary, no tags)', () => {
+    const followups = [
+      {
+        id: 'doc-bare',
+        title: 'Bare Doc',
+        source_kind: 'design',
+        // no summary, topic, direction_id, created_at, tags
+      },
+    ];
+    const result = buildPendingFollowupsSection(followups);
+    expect(result).toContain('Bare Doc');
+    expect(result).not.toContain('topic:');
+    expect(result).not.toContain('Direction:');
   });
 });

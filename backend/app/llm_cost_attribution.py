@@ -1377,6 +1377,7 @@ def _compact_llm_cost_attribution(
         "rework_share": rework.get("rework_share_of_total_llm_cost"),
         "total_llm_usd": total_usd,
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
+        "unpriced_combos": breakdown.get("unpriced_combos", []),
         SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
         "strategic_cycle_cost_per_event": strategic_cycle_cost_per_event,
         "total_tool_result_bytes": breakdown["totals"].get("total_tool_result_bytes"),

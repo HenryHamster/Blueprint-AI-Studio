@@ -16,6 +16,7 @@ export function useProjectsState(
 ) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsFetchError, setProjectsFetchError] = useState<string | null>(null);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
 
   const fetchProjects = async (silent = false) => {
     try {
@@ -27,6 +28,7 @@ export function useProjectsState(
         const res = await authGet(`${API_BASE_URL}/api/admin/projects?limit=${PAGE_LIMIT}&offset=${offset}`);
         if (!res.ok) {
           setProjectsFetchError('Failed to load projects');
+          setProjectsLoaded(true);
           if (!silent) addToast('Failed to load projects', 'error');
           return;
         }
@@ -41,6 +43,8 @@ export function useProjectsState(
       console.error('Failed to fetch projects:', err);
       setProjectsFetchError('Failed to load projects');
       if (!silent) addToast('Failed to load projects', 'error');
+    } finally {
+      setProjectsLoaded(true);
     }
   };
 
@@ -79,7 +83,7 @@ export function useProjectsState(
   };
 
   return {
-    projects, setProjects, projectsFetchError,
+    projects, setProjects, projectsFetchError, projectsLoaded,
     fetchProjects, handlePauseAllAutonomous, handleClearWaveDeps,
   };
 }

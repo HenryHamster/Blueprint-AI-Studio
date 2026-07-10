@@ -3287,6 +3287,118 @@ def test_registry_contains_capability_claim_reconciliation():
     assert "capability_claim_reconciliation" in names
 
 
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_flags_contradicted_evidence(
+    db, monkeypatch
+):
+    """A working capability with a proven evidence_ref whose backing path is
+    definitively removed at HEAD should be flagged (evidence is contradicted)."""
+    import app.source_ref_validation as srv
+
+    project = await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/present.py"],
+                "evidence_refs": [
+                    {
+                        "kind": "named_test",
+                        "ref": "backend/testing/test_repo_map.py",
+                        "proven": True,
+                        "source_id": "task-abc",
+                    }
+                ],
+            }
+        ],
+    )
+
+    async def _mixed(path, *args, **kwargs):
+        # backing path is present; evidence ref path is removed
+        if path == "backend/app/present.py":
+            return True
+        return False  # evidence ref path removed
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _mixed)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.subject == str(project.id)
+    assert "repo_map" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_flags_working_unproven(
+    db, monkeypatch
+):
+    """A working capability with empty evidence_refs (proven=False, no evidence)
+    should be flagged via claim_contradicts_evidence."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py"],
+                "evidence_refs": [],  # explicitly empty — claim contradicts evidence
+            }
+        ],
+    )
+
+    async def _present(path, *args, **kwargs):
+        return True  # backing_path still exists — not flagged by backing-path check
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _present)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    assert "repo_map" in flagged[0].detail
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_ok_when_proven_ref_present(
+    db, monkeypatch
+):
+    """A working capability with a proven evidence_ref whose path still exists
+    at HEAD should NOT be flagged."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py"],
+                "evidence_refs": [
+                    {
+                        "kind": "named_test",
+                        "ref": "backend/testing/test_repo_map.py",
+                        "proven": True,
+                        "source_id": "task-abc",
+                    }
+                ],
+            }
+        ],
+    )
+
+    async def _present(path, *args, **kwargs):
+        return True  # all paths present
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _present)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok
+
+
 # --- Check: merged_pr_count_consistency --------------------------------------
 
 

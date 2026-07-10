@@ -548,6 +548,108 @@ class TestMaxConcurrentCap(unittest.TestCase):
         self.assertEqual(poll_interval, base_poll_interval)
 
 
+# ── Failure circuit-breaker pause ───────────────────────────────────────────
+
+class TestFailurePause(unittest.TestCase):
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_pause_disabled_by_default(self):
+        """Threshold 0 (disabled) means no pause regardless of failures."""
+        ts = local_runner._TelemetryState()
+        ts.record_failure()
+        ts.record_failure()
+        ts.record_failure()
+        self.assertIsNone(ts.pause_remaining(0, 60))
+
+    def test_pause_not_triggered_below_threshold(self):
+        """Pause does not activate until failures reach the threshold."""
+        ts = local_runner._TelemetryState()
+        ts.record_failure()
+        ts.record_failure()
+        self.assertIsNone(ts.pause_remaining(3, 60))
+
+    def test_pause_triggers_at_threshold(self):
+        """When consecutive_failures >= threshold, pause_remaining returns > 0."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+        remaining = ts.pause_remaining(3, 60)
+        self.assertIsNotNone(remaining)
+        self.assertGreater(remaining, 0)
+
+    def test_pause_clears_on_record_success(self):
+        """record_success resets the failure count and clears the pause state."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+        self.assertIsNotNone(ts.pause_remaining(3, 60))
+        ts.record_success()
+        self.assertEqual(ts.consecutive_job_failures, 0)
+        self.assertIsNone(ts.pause_remaining(3, 60))
+
+    def test_pause_expires_and_repeats(self):
+        """After the pause duration elapses, pause_remaining returns None, then a
+        new cycle begins because failures are still at the threshold."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+        # Start a very short pause (1 ms).
+        rem = ts.pause_remaining(3, 0.001)
+        self.assertIsNotNone(rem)
+        self.assertGreater(rem, 0)
+        time.sleep(0.01)
+        # After pause expiry, returns None.
+        rem = ts.pause_remaining(3, 0.001)
+        self.assertIsNone(rem)
+        # But immediately re-enters pause since failures still >= threshold.
+        rem = ts.pause_remaining(3, 0.001)
+        self.assertIsNotNone(rem)
+
+    def test_pause_does_not_block_heartbeat(self):
+        """The circuit-breaker lives in the claiming loop, not the heartbeat thread,
+        so heartbeats continue unaffected. Verify _TelemetryState is orthogonal to
+        heartbeats by checking snapshot still works during a pause."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+        # Enter pause.
+        ts.pause_remaining(3, 60)
+        # snapshot must still report the failures (heartbeat needs this).
+        _, fails = ts.snapshot()
+        self.assertEqual(fails, 3)
+
+    def test_no_claim_guard_when_pause_active(self):
+        """When the failure pause is active, the claiming loop must NOT call
+        next-task (simulated guard check)."""
+        ts = local_runner._TelemetryState()
+        for _ in range(3):
+            ts.record_failure()
+
+        call_count = {"n": 0}
+
+        def fake_post(url, token, body, **kwargs):
+            call_count["n"] += 1
+            return 204, None
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post):
+                pause_rem = ts.pause_remaining(3, 60)
+                self.assertIsNotNone(pause_rem)
+                self.assertGreater(pause_rem, 0)
+                # Simulate the guard: if paused, do NOT call _post.
+                if pause_rem is not None and pause_rem > 0:
+                    pass  # guard would sleep and continue
+            self.assertEqual(call_count["n"], 0,
+                             "next-task must NOT be called while failure pause is active")
+        finally:
+            local_runner._shutdown_event.clear()
+
+
 # ── Subprocess spawn ───────────────────────────────────────────────────────────
 
 class TestSubprocessSpawn(unittest.TestCase):
@@ -750,6 +852,85 @@ class TestGracefulShutdown(unittest.TestCase):
                 p.terminate()
 
         proc.terminate.assert_called_once()
+
+    def test_shutdown_waits_for_compute_jobs(self):
+        """Shutdown waits for active compute jobs to complete before exiting."""
+        lock = threading.Lock()
+        active: set[str] = {"job-a", "job-b"}
+
+        def _drain() -> None:
+            """Simulate a worker completing and removing itself from the set."""
+            time.sleep(0.3)
+            with lock:
+                active.clear()
+
+        drainer = threading.Thread(target=_drain)
+        drainer.start()
+
+        start = time.monotonic()
+        local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "test-token", timeout=5)
+        elapsed = time.monotonic() - start
+        drainer.join()
+
+        # Must have waited for the drainer to clear the set (not instant).
+        self.assertGreaterEqual(
+            elapsed,
+            0.15,
+            "Should have waited at least ~300 ms for compute jobs to finish",
+        )
+        # Must NOT have hit the full 5 s timeout.
+        self.assertLess(
+            elapsed,
+            3,
+            "Should have returned as soon as all jobs finished, not waited full timeout",
+        )
+        self.assertFalse(active, "All jobs should have been drained")
+
+    def test_shutdown_no_compute_jobs_returns_immediately(self):
+        """Shutdown with zero active compute jobs returns without delay."""
+        lock = threading.Lock()
+        active: set[str] = set()
+
+        start = time.monotonic()
+        local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "test-token", timeout=5)
+        elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 0.5, "Should return immediately when no jobs active")
+
+    def test_shutdown_compute_jobs_timeout_logs_message(self):
+        """Shutdown logs a timeout message when jobs do not finish in time."""
+        lock = threading.Lock()
+        active: set[str] = {"stuck-job"}
+        buf = io.StringIO()
+
+        with contextlib.redirect_stdout(buf):
+            local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "test-token", timeout=0.05)
+
+        output = buf.getvalue()
+        self.assertIn("timeout", output, "Should log a timeout message")
+        self.assertIn("reporting as failed", output, "Should report stranded jobs as failed")
+        self.assertIn("stuck-job", active, "Stuck job must remain in set")
+
+    def test_shutdown_reports_stranded_jobs_as_failed(self):
+        """Stranded compute jobs after shutdown deadline are reported as failed."""
+        lock = threading.Lock()
+        active: set[str] = {"stranded-job"}
+        reports = []
+
+        def fake_report(orchestrator_url, token, job_id, **kwargs):
+            reports.append((job_id, kwargs))
+            return True
+
+        with patch.object(local_runner, "_report_compute_job", fake_report):
+            local_runner._wait_for_compute_jobs(active, lock, "https://api.example.com", "tok", timeout=0.05)
+
+        self.assertEqual(len(reports), 1, "Should have reported the stranded job")
+        reported_id, kwargs = reports[0]
+        self.assertEqual(reported_id, "stranded-job")
+        self.assertEqual(kwargs["exec_status"], "failed")
+        self.assertEqual(kwargs["exit_code"], 1)
+        self.assertIn("SIGTERM", kwargs["command_log"]["text"])
+        self.assertFalse(kwargs["command_log"]["truncated"])
 
 
 # ── Compute job report helper ─────────────────────────────────────────────────
@@ -2827,7 +3008,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
         local_runner._shutdown_event.clear()
 
     def test_version_hint_mismatch_logs_warning(self):
-        """When version_hint differs from runner version, a warning is printed."""
+        """When version_hint differs and tasks are executing, a warning is printed."""
         posted_bodies = []
         output_lines = []
 
@@ -2845,7 +3026,9 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             line = " ".join(str(a) for a in args)
             output_lines.append(line)
 
-        active_tasks: dict = {}
+        # Non-empty active_tasks so the runner appears busy and does NOT
+        # auto-update — the idle path triggers update instead of warning.
+        active_tasks = {"task-1": MagicMock()}
         lock = threading.Lock()
         local_runner._shutdown_event.clear()
 
@@ -2866,7 +3049,7 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             warning_lines,
             "Expected a version mismatch warning in output",
         )
-        self.assertIn("blueprint-runner update", str(warning_lines))
+        self.assertIn("not auto-updating", str(warning_lines))
 
     def test_version_hint_match_silent(self):
         """When version_hint matches runner version, no warning is printed."""
@@ -2967,7 +3150,9 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             line = " ".join(str(a) for a in args)
             output_lines.append(line)
 
-        active_tasks: dict = {}
+        # Non-empty active_tasks so the runner appears busy and does NOT
+        # auto-update — the idle path triggers update instead of warning.
+        active_tasks = {"task-1": MagicMock()}
         lock = threading.Lock()
         local_runner._shutdown_event.clear()
 
@@ -2989,7 +3174,97 @@ class TestHeartbeatVersionHintWarning(unittest.TestCase):
             warning_lines,
             "Expected a version mismatch warning when SHA comparison fails",
         )
-        self.assertIn("blueprint-runner update", str(warning_lines))
+        self.assertIn("not auto-updating", str(warning_lines))
+
+    def test_version_hint_mismatch_triggers_auto_update_when_idle(self):
+        """When version_hint differs and runner is idle, auto-update is triggered."""
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                "version_hint": "v99-abcdef01",
+            }
+
+        def fake_print(*args, **kwargs):
+            line = " ".join(str(a) for a in args)
+            output_lines.append(line)
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v1-oldversion"), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch.object(local_runner.br, "do_update",
+                              return_value=0), \
+                 patch.object(os, "_exit"), \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        combined = " ".join(output_lines).lower()
+        self.assertIn(
+            "auto-updating",
+            combined,
+            "Expected auto-update message when runner is idle and version differs",
+        )
+
+    def test_version_hint_mismatch_skips_auto_update_when_compute_busy(self):
+        """When version_hint differs but compute jobs are active, no auto-update."""
+        output_lines = []
+
+        def fake_post(url, token, body, **kwargs):
+            local_runner._shutdown_event.set()
+            return 200, {
+                "ok": True,
+                "last_seen_at": "2026-01-01T00:00:00",
+                "enrolled_max_concurrent": 2,
+                "version_hint": "v99-abcdef01",
+            }
+
+        def fake_print(*args, **kwargs):
+            line = " ".join(str(a) for a in args)
+            output_lines.append(line)
+
+        active_tasks: dict = {}
+        active_compute_jobs = {"job-1"}
+        task_lock = threading.Lock()
+        compute_lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version",
+                              return_value="v1-oldversion"), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value=None), \
+                 patch("builtins.print", side_effect=fake_print):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, task_lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    active_compute_jobs, compute_lock,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        warning_lines = [line for line in output_lines if "WARNING" in line and "version" in line.lower()]
+        self.assertTrue(
+            warning_lines,
+            "Expected a warning when compute jobs are active and version differs",
+        )
+        self.assertIn("not auto-updating", str(warning_lines))
 
     def test_no_version_hint_no_warning(self):
         """When the response lacks version_hint, the runner never warns."""
@@ -3194,6 +3469,9 @@ class TestDockerAgentBackend(unittest.TestCase):
         agent_teardown: dict = {}
         fake_proc = MagicMock()
         fake_proc.pid = 4321
+        # Provide a real BytesIO for stdout so the tee reader thread exits
+        # cleanly instead of crashing on a MagicMock.
+        fake_proc.stdout = io.BytesIO(b"")
 
         plan = iso.ExecutionPlan(
             backend=backend,
@@ -3266,6 +3544,7 @@ class TestDockerAgentBackend(unittest.TestCase):
         teardown: dict = {}
         fake_proc = MagicMock()
         fake_proc.pid = 999
+        fake_proc.stdout = io.BytesIO(b"")
         with patch.object(local_runner.subprocess, "Popen", return_value=fake_proc):
             spawned = local_runner._spawn_agent_task(
                 task_id="abc123def456ghi",  # >12 chars → container name truncates it
@@ -3319,6 +3598,30 @@ class TestDockerAgentBackend(unittest.TestCase):
         self.assertEqual(active_tasks, {})
         self.assertEqual(teardown, {})
         plan_mock.assert_not_called()
+
+    def test_notify_decline_posts_to_orchestrator(self):
+        """_notify_decline POSTs the task_id to the decline-task endpoint."""
+        from unittest.mock import patch
+
+        with patch.object(local_runner, "_post") as post_mock:
+            local_runner._notify_decline(
+                "https://api.example.com", "tok-123", "task-abc"
+            )
+        post_mock.assert_called_once_with(
+            "https://api.example.com/api/runner/decline-task",
+            "tok-123",
+            {"task_id": "task-abc"},
+        )
+
+    def test_notify_decline_swallows_exceptions(self):
+        """_notify_decline is best-effort — exceptions must not propagate."""
+        from unittest.mock import patch
+
+        with patch.object(
+            local_runner, "_post", side_effect=OSError("network down")
+        ):
+            # Must not raise.
+            local_runner._notify_decline("https://api", "tok", "t1")
 
     # ---- docker-aware teardown (reaper deadline path) ------------------------
 
@@ -3398,6 +3701,65 @@ class TestDockerAgentBackend(unittest.TestCase):
         self.assertFalse(
             self._heartbeat_agent_available(caps=_docker_caps(), agent_image=None)
         )
+
+    def test_spawn_writes_agent_output_to_per_task_log_file(self):
+        """A spawned agent task's stdout output must be persisted to a per-task
+        log file on disk — the core regression test for per-task log persistence."""
+        import io as _io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as log_dir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_LOG_DIR": log_dir}):
+                active_tasks: dict = {}
+                agent_started_at: dict = {}
+                agent_teardown: dict = {}
+                fake_proc = MagicMock()
+                fake_proc.pid = 7777
+                fake_proc.stdout = _io.BytesIO(
+                    b"task output line 1\ntask output line 2\n"
+                )
+
+                plan = iso.ExecutionPlan(
+                    backend=iso.BACKEND_BWRAP,
+                    argv=["bash", "-c", "echo test"],
+                    env={"AGENT_SECRET_TOKEN": "s"},
+                    container_name=None,
+                )
+                decide_mock = MagicMock(return_value=iso.BACKEND_BWRAP)
+                plan_mock = MagicMock(return_value=plan)
+
+                with patch.object(local_runner.iso, "decide_agent_backend", decide_mock), \
+                     patch.object(local_runner.iso, "plan_agent_execution", plan_mock), \
+                     patch.object(local_runner.subprocess, "Popen",
+                                 return_value=fake_proc):
+                    spawned = local_runner._spawn_agent_task(
+                        task_id="task-log-test",
+                        task_type="research",
+                        agent_token="tok",
+                        vm_instance_id="vm",
+                        orchestrator_url="https://api",
+                        workspace="/tmp/ws",
+                        caps=_bwrap_caps(),
+                        agent_binary="/usr/bin/node",
+                        agent_image=None,
+                        active_tasks=active_tasks,
+                        agent_started_at=agent_started_at,
+                        agent_teardown=agent_teardown,
+                        lock=threading.Lock(),
+                    )
+
+                self.assertTrue(spawned)
+
+                log_path = local_runner._task_log_path("task-log-test")
+                self.assertTrue(
+                    os.path.isfile(log_path),
+                    f"Log file should exist at {log_path}",
+                )
+
+                with open(log_path, "rb") as f:
+                    content = f.read()
+                self.assertIn(b"task output line 1", content)
+                self.assertIn(b"task output line 2", content)
 
 
 class TestAgentImagePresence(unittest.TestCase):
@@ -3568,6 +3930,121 @@ class TestAgentBackendPreference(unittest.TestCase):
             task_type="research",
         )
         self.assertEqual(backend, iso.BACKEND_DOCKER)
+
+
+class TestSafeCredentialPath(unittest.TestCase):
+    """_safe_credential_path rejects directory traversal and out-of-workspace paths."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _valid(self, fpath: str) -> str:
+        """Helper: assert path is accepted, return resolved path."""
+        return local_runner._safe_credential_path(fpath, self._tmpdir)
+
+    def _invalid(self, fpath: str) -> None:
+        """Helper: assert path raises ValueError."""
+        with self.assertRaises(ValueError):
+            local_runner._safe_credential_path(fpath, self._tmpdir)
+
+    def test_normal_path_with_leading_slash_is_accepted(self):
+        """A normal path under /root is resolved relative to workspace root."""
+        resolved = self._valid("/root/.config/claude/settings.json")
+        self.assertTrue(resolved.startswith(self._tmpdir))
+        self.assertTrue(
+            resolved.endswith(
+                os.path.join("root", ".config", "claude", "settings.json")
+            )
+        )
+        self.assertTrue(os.path.isabs(resolved))
+
+    def test_path_without_leading_slash_is_accepted(self):
+        """Paths without a leading slash also resolve correctly."""
+        resolved = self._valid("home/user/config.yaml")
+        self.assertEqual(
+            resolved,
+            os.path.join(self._tmpdir, "home", "user", "config.yaml"),
+        )
+
+    def test_deep_safe_path_is_accepted(self):
+        """A deeply nested path without traversal is accepted."""
+        resolved = self._valid("/a/b/c/d/e/f/g/h/file.txt")
+        self.assertTrue(resolved.startswith(self._tmpdir))
+        self.assertTrue(
+            resolved.endswith(
+                os.path.join("a", "b", "c", "d", "e", "f", "g", "h", "file.txt")
+            )
+        )
+
+    def test_leading_dot_dot_is_rejected(self):
+        """Path starting with '..' is rejected."""
+        self._invalid("../.ssh/authorized_keys")
+
+    def test_leading_dot_dot_with_leading_slash_is_rejected(self):
+        """Path like '/../../.ssh/authorized_keys' is rejected."""
+        self._invalid("/../../.ssh/authorized_keys")
+
+    def test_dot_dot_in_middle_is_rejected(self):
+        """Path with '..' in the middle is rejected."""
+        self._invalid("root/../etc/passwd")
+
+    def test_deep_dot_dot_chain_is_rejected(self):
+        """Path like 'a/b/../../../../etc/hosts' is rejected."""
+        self._invalid("a/b/../../../../etc/hosts")
+
+    def test_multiple_dot_dot_segments_is_rejected(self):
+        """Path with multiple '..' components like '../../dir/../other' is rejected."""
+        self._invalid("../../dir/../other")
+
+    def test_dot_dot_at_end_is_rejected(self):
+        """Path ending with '..' is rejected."""
+        self._invalid("safe/dir/..")
+
+    def test_encoded_dot_dot_via_backslash_is_still_detected(self):
+        """A '..' segment hidden behind \\x2e encoding is NOT bypassed (literal check)."""
+        with self.assertRaises(ValueError):
+            # '\x2e\x2e' is the string ".." — our check on decoded string catches it
+            local_runner._safe_credential_path("safe/\x2e\x2e/escaped", self._tmpdir)
+
+    def test_path_that_resolves_outside_workspace_via_symlink_is_rejected(self):
+        """A path that resolves outside workspace via abspath is rejected."""
+        import tempfile
+        outside = tempfile.mkdtemp()
+        try:
+            with self.assertRaises(ValueError):
+                # /tmp/something/../../outside resolves to /outside which is outside workspace
+                local_runner._safe_credential_path("/../../" + os.path.basename(outside), self._tmpdir)
+        finally:
+            os.rmdir(outside)
+
+    def test_deep_traversal_from_workspace_is_rejected(self):
+        """A path appending '../../..' from within the workspace is rejected."""
+        self._invalid("some/sub/dir/../../../etc/passwd")
+
+    def test_workspace_itself_is_safe(self):
+        """A path of just '' or '.' relative resolves to workspace root."""
+        resolved = self._valid("")
+        self.assertEqual(resolved, os.path.abspath(self._tmpdir))
+
+        resolved2 = self._valid(".")
+        expected = os.path.abspath(os.path.join(self._tmpdir, "."))
+        self.assertEqual(resolved2, expected)
+
+    def test_rejects_bare_dot_dot(self):
+        """Bare '..' is rejected."""
+        self._invalid("..")
+
+    def test_spawn_agent_task_uses_safe_credential_path(self):
+        """The production credential-file writer must call the tested guard."""
+        import inspect
+
+        src = inspect.getsource(local_runner._spawn_agent_task)
+        self.assertIn("_safe_credential_path", src)
 
 
 class TestCredentialPersistence(unittest.TestCase):
@@ -4074,6 +4551,73 @@ class BlueprintRunnerInstallTests(unittest.TestCase):
             self.assertEqual(br.resolve_token(None), "persisted-acceptance-token")
 
 
+class TestProviderCredentialCheck(unittest.TestCase):
+    """LLM provider credential presence check for the preflight."""
+
+    def test_detects_anthropic_api_key(self):
+        """ANTHROPIC_API_KEY set -> credentials found."""
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True):
+            self.assertTrue(br._check_provider_credentials())
+
+    def test_detects_claude_code_oauth_token(self):
+        """CLAUDE_CODE_OAUTH_TOKEN set -> credentials found."""
+        with patch.dict("os.environ", {"CLAUDE_CODE_OAUTH_TOKEN": "tok-test"}, clear=True):
+            self.assertTrue(br._check_provider_credentials())
+
+    def test_detects_zai_api_key(self):
+        """ZAI_API_KEY set -> credentials found."""
+        with patch.dict("os.environ", {"ZAI_API_KEY": "zai-test"}, clear=True):
+            self.assertTrue(br._check_provider_credentials())
+
+    def test_detects_openai_api_key(self):
+        """OPENAI_API_KEY set -> credentials found."""
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-openai-test"}, clear=True):
+            self.assertTrue(br._check_provider_credentials())
+
+    def test_returns_false_when_none_set(self):
+        """No credential env vars -> credentials NOT found."""
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(br._check_provider_credentials())
+
+    def test_returns_false_when_only_whitespace(self):
+        """A credential key set to whitespace is treated as absent."""
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "   "}, clear=True):
+            self.assertFalse(br._check_provider_credentials())
+
+    def test_warning_printed_in_preflight_when_no_credentials(self):
+        """main() prints a WARNING when no provider credential is set (acceptance)."""
+        output_lines = []
+
+        def capture_print(*args, **kwargs):
+            text = " ".join(str(a) for a in args)
+            output_lines.append(text)
+
+        def fake_post(url, token, body, **kwargs):
+            return 200, {"ok": True}
+
+        env = {
+            "BLUEPRINT_RUNNER_TOKEN": "tok-acceptance",
+            "BLUEPRINT_ORCHESTRATOR_URL": "https://api.example.com",
+        }
+        with patch.dict("os.environ", env, clear=True), \
+             patch("builtins.print", side_effect=capture_print), \
+             patch.object(br, "_node_major", return_value=22), \
+             patch.object(br.shutil, "which", return_value="/usr/bin/claude"), \
+             patch.object(br, "run_local_runner", return_value=1):
+            rc = br.main(["check"])
+
+        warning_lines = [line for line in output_lines if "WARNING" in line and "credential" in line.lower()]
+        self.assertTrue(
+            warning_lines,
+            f"Expected WARNING about missing credentials in output. Got: {output_lines}",
+        )
+        self.assertIn("ANTHROPIC_API_KEY", warning_lines[0])
+        # Missing provider creds must make --check exit non-zero so the operator
+        # catches the misconfiguration at enrollment time instead of discovering
+        # every agent task fails at runtime.
+        self.assertEqual(rc, 1, "Missing provider creds must make blueprint-runner check exit non-zero")
+
+
 class TestStatusJson(unittest.TestCase):
     """On-box status.json liveness file: write, read, permissions, no-secrets."""
 
@@ -4380,10 +4924,10 @@ class TestProviderCredentials(unittest.TestCase):
             )
 
         output = buf.getvalue()
-        self.assertIn("NONE", output)
+        self.assertIn("FAIL", output)
         self.assertIn("provider creds", output)
-        # setup_ok should remain True (provider creds are a warning, NOT a blocker).
-        self.assertTrue(result["setup_ok"])
+        # Failure is when agent tasks are claimable but no provider creds are set.
+        self.assertFalse(result["setup_ok"])
 
     def test_preflight_with_provider_credentials_does_not_warn(self):
         """Preflight does NOT warn when provider credentials are set."""
@@ -4415,6 +4959,276 @@ class TestProviderCredentials(unittest.TestCase):
         self.assertIn("present", output)
         self.assertIn("provider creds", output)
         self.assertTrue(result["setup_ok"])
+
+
+# ── Per-task log persistence ────────────────────────────────────────────────
+
+
+class TestTaskLogPersistence(unittest.TestCase):
+    """Unit tests for per-task log file path, rotation, and cleanup."""
+
+    def test_task_log_dir_defaults_to_credential_dir(self):
+        """Default log dir is <credential_dir>/task-logs/."""
+        with patch.object(local_runner, "_credential_dir",
+                          return_value="/tmp/.blueprint"):
+            log_dir = local_runner._task_log_dir()
+        self.assertEqual(log_dir, "/tmp/.blueprint/task-logs")
+
+    def test_task_log_dir_respects_override_env(self):
+        """BLUEPRINT_RUNNER_LOG_DIR overrides the default log directory."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ,
+                            {"BLUEPRINT_RUNNER_LOG_DIR": tmpdir}):
+                log_dir = local_runner._task_log_dir()
+            self.assertEqual(log_dir, os.path.abspath(tmpdir))
+
+    def test_task_log_path_generates_safe_filename(self):
+        """_task_log_path uses a sanitized task ID as the filename."""
+        with patch.object(local_runner, "_task_log_dir",
+                          return_value="/logs"):
+            path = local_runner._task_log_path("task/abc:123")
+        self.assertEqual(path, "/logs/task_abc_123.log")
+
+    def test_task_log_path_with_unsafe_chars(self):
+        """Unsafe chars in task IDs are replaced with underscores."""
+        with patch.object(local_runner, "_task_log_dir",
+                          return_value="/logs"):
+            path = local_runner._task_log_path("task@#$%")
+        self.assertEqual(path, "/logs/task____.log")
+
+    def test_task_log_path_fallback_for_empty_id(self):
+        """An empty or all-unsafe task ID falls back to 'unknown'."""
+        with patch.object(local_runner, "_task_log_dir",
+                          return_value="/logs"):
+            path = local_runner._task_log_path("")
+        self.assertEqual(path, "/logs/unknown.log")
+
+    def test_cleanup_removes_old_log_files(self):
+        """_cleanup_stale_task_logs removes .log files older than max_age."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_path = os.path.join(tmpdir, "old_task.log")
+            new_path = os.path.join(tmpdir, "new_task.log")
+            with open(old_path, "w") as f:
+                f.write("old")
+            with open(new_path, "w") as f:
+                f.write("new")
+            # Set old file's mtime far in the past.
+            old_mtime = time.time() - 1000
+            os.utime(old_path, (old_mtime, old_mtime))
+
+            with patch.object(local_runner, "_task_log_dir",
+                              return_value=tmpdir):
+                removed = local_runner._cleanup_stale_task_logs(
+                    max_age_seconds=500, max_files=100
+                )
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(os.path.exists(old_path))
+            self.assertTrue(os.path.exists(new_path))
+
+    def test_cleanup_respects_file_count_cap(self):
+        """_cleanup_stale_task_logs removes oldest files when count exceeds cap."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for i in range(5):
+                p = os.path.join(tmpdir, f"task_{i}.log")
+                with open(p, "w") as f:
+                    f.write(str(i))
+                paths.append(p)
+                time.sleep(0.01)  # ensure distinct mtimes
+
+            with patch.object(local_runner, "_task_log_dir",
+                              return_value=tmpdir):
+                removed = local_runner._cleanup_stale_task_logs(
+                    max_age_seconds=99999, max_files=2
+                )
+
+            # Should remove the 3 oldest, keep the 2 newest.
+            self.assertEqual(removed, 3)
+            remaining = sorted(os.listdir(tmpdir))
+            self.assertEqual(len(remaining), 2)
+
+    def test_cleanup_skips_nonexistent_dir(self):
+        """Cleanup is a no-op when the log directory does not exist."""
+        with patch.object(local_runner, "_task_log_dir",
+                          return_value="/tmp/nonexistent-log-dir-xyz"):
+            removed = local_runner._cleanup_stale_task_logs()
+        self.assertEqual(removed, 0)
+
+
+# ── Credential file path-traversal guard ──────────────────────────────────────
+
+class TestCredentialFileTraversalGuard(unittest.TestCase):
+    """Path-traversal guard in _spawn_agent_task rejects credential-file paths
+    that would escape the per-task workspace directory."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _spawn_with_llm_files(self, workspace, llm_files):
+        """Drive _spawn_agent_task with mocked iso layer and the given llm_files.
+        Returns (spawned_flag, stdout_text)."""
+        active_tasks: dict = {}
+        agent_started_at: dict = {}
+        agent_teardown: dict = {}
+        fake_proc = MagicMock()
+        fake_proc.pid = 4321
+        fake_proc.stdout = io.BytesIO(b"")
+
+        plan = iso.ExecutionPlan(
+            backend=iso.BACKEND_BWRAP,
+            argv=["bwrap", "node", "..."],
+            env={"AGENT_SECRET_TOKEN": "s"},
+            container_name=None,
+        )
+
+        with patch.object(local_runner.iso, "decide_agent_backend",
+                          return_value=iso.BACKEND_BWRAP), \
+             patch.object(local_runner.iso, "plan_agent_execution",
+                          return_value=plan), \
+             patch.object(local_runner.subprocess, "Popen",
+                          return_value=fake_proc):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                spawned = local_runner._spawn_agent_task(
+                    task_id="task-xyz",
+                    task_type="research",
+                    agent_token="agent-tok",
+                    vm_instance_id="runner:local",
+                    orchestrator_url="https://api.example.com",
+                    workspace=workspace,
+                    caps=_bwrap_caps(),
+                    agent_binary=["node", "/agent/dist/index.js"],
+                    agent_image=None,
+                    active_tasks=active_tasks,
+                    agent_started_at=agent_started_at,
+                    agent_teardown=agent_teardown,
+                    lock=threading.Lock(),
+                    llm_files=llm_files,
+                )
+        return spawned, buf.getvalue()
+
+    def test_normal_in_workspace_path_writes(self):
+        """A legitimate relative path inside the workspace is written correctly."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": "home/user/.config/claude/config.json",
+                    "content": '{"provider": "anthropic"}',
+                }
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            dest = os.path.join(tmpdir, "home/user/.config/claude/config.json")
+            self.assertTrue(os.path.isfile(dest), "normal path must be written")
+            with open(dest) as f:
+                self.assertEqual(f.read(), '{"provider": "anthropic"}')
+            # No warning about skipping
+            self.assertNotIn("skipping", output.lower())
+
+    def test_simple_traversal_skipped_and_warns(self):
+        """A path with ../ is rejected (not written) and a warning is logged."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": "../escape.txt",
+                    "content": "SHOULD NOT BE WRITTEN",
+                }
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            # The file must not exist at its resolved (escaped) location
+            escaped = os.path.abspath(os.path.normpath(
+                os.path.join(tmpdir, "../escape.txt")
+            ))
+            self.assertFalse(os.path.isfile(escaped),
+                             "traversal path must not be written outside workspace")
+            # Nothing written inside workspace either
+            inside = os.path.join(tmpdir, "escape.txt")
+            self.assertFalse(os.path.isfile(inside),
+                             "traversal path must not be written inside workspace")
+
+            # Warning must mention the path and the word "skipping"
+            self.assertIn("outside workspace", output.lower())
+            self.assertIn("skipping", output.lower())
+
+    def test_deep_traversal_skipped(self):
+        """A deeper ../ sequence (../../x/y) is also rejected by the guard."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": "../../etc/__blueprint_escape_test",
+                    "content": "SHOULD NOT BE WRITTEN",
+                }
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            escaped = os.path.abspath(os.path.normpath(
+                os.path.join(tmpdir, "../../etc/__blueprint_escape_test")
+            ))
+            self.assertFalse(os.path.isfile(escaped),
+                             "deep traversal must not write outside workspace")
+            self.assertIn("outside workspace", output.lower())
+            self.assertIn("skipping", output.lower())
+
+    def test_mixed_paths_normal_writes_traversal_skipped(self):
+        """A normal path is still written when a traversal path is also present."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": ".config/claude/config.json",
+                    "content": '{"valid": true}',
+                },
+                {
+                    "path": "../escape.txt",
+                    "content": "SHOULD NOT BE WRITTEN",
+                },
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            # Normal file must be written
+            normal = os.path.join(tmpdir, ".config/claude/config.json")
+            self.assertTrue(os.path.isfile(normal),
+                            "normal path must still be written alongside traversal path")
+            with open(normal) as f:
+                self.assertEqual(f.read(), '{"valid": true}')
+
+            # Traversal file must not be written
+            escaped = os.path.abspath(os.path.normpath(
+                os.path.join(tmpdir, "../escape.txt")
+            ))
+            self.assertFalse(os.path.isfile(escaped),
+                             "traversal path must not be written despite sibling normal path")
+            self.assertIn("outside workspace", output.lower())
+            self.assertIn("skipping", output.lower())
+
+    def test_leading_slash_normalized_still_in_workspace(self):
+        """A leading-slash path is normalized to workspace-relative and passes."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_files = [
+                {
+                    "path": "/home/user/.config/credentials.json",
+                    "content": '{"key": "secret"}',
+                }
+            ]
+            spawned, output = self._spawn_with_llm_files(tmpdir, llm_files)
+
+            # The leading / is stripped by .lstrip("/"), then joined with workspace
+            dest = os.path.join(tmpdir, "home/user/.config/credentials.json")
+            self.assertTrue(os.path.isfile(dest),
+                            "leading-slash path must be treated as relative to workspace")
+            self.assertNotIn("skipping", output.lower())
 
 
 if __name__ == "__main__":

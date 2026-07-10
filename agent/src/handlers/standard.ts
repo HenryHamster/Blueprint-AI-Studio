@@ -782,7 +782,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     sendLog(ws, `[PrereqArtifacts] Injected ${artifactPointers.length} commissioned artifact pointer(s); resolved ${signedArtifactUrls.size} signed URL(s).\n`);
   }
 
-  const finalPromptWithTree = fileTree + repoMap + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection + finalPrompt;
+  const finalPromptWithTree = finalPrompt + fileTree + repoMap + analysisContext + prerequisiteKnowledgeSection + prerequisiteArtifactSection;
   const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
     codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
   });
@@ -1431,4 +1431,73 @@ IMPORTANT: Only update minor/patch versions. If a package would require a major 
     runLintFix: false,
     runTestFix: false,
   });
+}
+
+// ── Handler: Salvage Bundle (consolidated fix for decayed findings) ──────
+/**
+ * Handle a 'salvage_bundle' task: consolidate multiple decayed/discarded research
+ * findings into a SINGLE pull request.
+ *
+ * Extracts the salvaged findings from the payload, builds a prompt instructing
+ * the agent to produce ONE consolidated PR addressing all findings, then
+ * delegates to the standard create handler flow.
+ */
+export async function handleSalvageBundle(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+): Promise<void> {
+  const rawFindings = payload.salvaged_findings;
+  const salvagedFindings = Array.isArray(rawFindings)
+    ? rawFindings as Array<Record<string, unknown>>
+    : [];
+  const findingsText = salvagedFindings.length > 0
+    ? salvagedFindings.map((f, i) => {
+        let text = `${i + 1}. ${strVal(f.title) || '(untitled)'} (reason: ${strVal(f.discard_reason) || 'unknown'})`;
+        const prompt = strVal(f.prompt);
+        if (prompt) {
+          text += `\n   Prompt: ${prompt.slice(0, 500)}`;
+        } else {
+          const desc = strVal(f.description);
+          if (desc) text += `\n   Description: ${desc.slice(0, 200)}`;
+        }
+        const claims = f.claims;
+        if (Array.isArray(claims) && claims.length > 0) {
+          const claimLines = claims.map((c: unknown) => {
+            const claimStr = typeof c === 'string' ? c : strVal((c as Record<string, unknown>).claim ?? (c as Record<string, unknown>).text ?? '');
+            return claimStr ? `     - ${claimStr}` : '';
+          }).filter(Boolean);
+          if (claimLines.length > 0) text += `\n   Claims:\n${claimLines.join('\n')}`;
+        }
+        const files = f.related_files;
+        if (Array.isArray(files) && files.length > 0) {
+          const fileList = files.map((rf: unknown) =>
+            strVal(typeof rf === 'string' ? rf : (rf as Record<string, unknown>).path ?? (rf as Record<string, unknown>).file ?? '')
+          ).filter(Boolean).join(', ');
+          if (fileList) text += `\n   Related files: ${fileList}`;
+        }
+        return text;
+      }).join('\n')
+    : 'No specific findings provided.';
+  const prompt = `SALVAGE BUNDLE — ${salvagedFindings.length} decayed finding(s)
+
+Salvaged findings:
+${findingsText}
+
+INSTRUCTIONS:
+- Fix ALL of the above findings in a SINGLE pull request.
+- Do NOT split this into multiple PRs.
+- For each finding, scan its "Related files" — those files are the most
+  likely locations for the needed change. Start by reading them.
+- When a fix changes logic (not just comments/whitespace/formatting),
+  add or update tests that cover the changed behavior.
+- In the PR description, include a table mapping every finding to the
+  change that addresses it. Example format:
+  | Finding | Change | Files |
+  |---------|--------|-------|
+  | ...     | ...    | ...   |
+- Run the project's checks and open one PR with all fixes integrated.`;
+
+  const enrichedPayload = { ...payload, prompt };
+  return handleCreate(taskId, enrichedPayload, task, ghToken, owner, repo, ws, statusRef, model, effort);
 }

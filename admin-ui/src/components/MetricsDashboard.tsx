@@ -86,7 +86,7 @@ function NoDataMessage() {
 
 function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: number }) {
   const [now] = useState(Date.now);
-  const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const filtered = useMemo(() => points.filter((p) => p.timestamp >= now - windowMs), [points, now, windowMs]);
   const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
@@ -109,7 +109,7 @@ function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: num
 
 function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[]; maxConcurrentVMs: number; windowMs: number }) {
   const [now] = useState(Date.now);
-  const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const filtered = useMemo(() => points.filter((p) => p.timestamp >= now - windowMs), [points, now, windowMs]);
   const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
@@ -173,15 +173,19 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
 
 function FailureRateChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: number }) {
   const [now] = useState(Date.now);
-  const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const { filtered, ratePoints } = useMemo(() => {
+    const f = points.filter((p) => p.timestamp >= now - windowMs);
+    return {
+      filtered: f,
+      ratePoints: f.map((p) => {
+        const total = p.completedCount + p.failedCount;
+        const failureRate = total > 0 ? (p.failedCount / total) * 100 : 0;
+        return { timestamp: p.timestamp, failureRate };
+      }),
+    };
+  }, [points, now, windowMs]);
   const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
-
-  const ratePoints = filtered.map((p) => {
-    const total = p.completedCount + p.failedCount;
-    const failureRate = total > 0 ? (p.failedCount / total) * 100 : 0;
-    return { timestamp: p.timestamp, failureRate };
-  });
 
   return (
     <ResponsiveContainer width="100%" height={160}>
@@ -229,6 +233,7 @@ interface EfficiencyAxisDef {
   label: string;
   unit: string;
   favorableDirection: 'lower' | 'higher';
+  percent?: boolean;
 }
 
 interface EfficiencyAxisLocal extends EfficiencyAxis {
@@ -470,6 +475,11 @@ const EFFICIENCY_AXES: EfficiencyAxisDef[] = [
   { key: 'median_api_calls_per_task', label: 'Median API calls per task', unit: '', favorableDirection: 'lower' },
   { key: 'median_review_iterations', label: 'Median review iterations', unit: '', favorableDirection: 'lower' },
   { key: 'llm_cost_per_merged_pr', label: 'LLM token cost per merged PR', unit: '$', favorableDirection: 'lower' },
+  { key: 'cost_per_verified_task', label: 'Cost per verified task', unit: '$', favorableDirection: 'lower' },
+  { key: 'llm_cost_per_verified_task', label: 'LLM cost per verified task', unit: '$', favorableDirection: 'lower' },
+  { key: 'total_cost_per_verified_task', label: 'Total cost per verified task', unit: '$', favorableDirection: 'lower' },
+  { key: 'llm_cache_hit_rate', label: 'LLM cache hit rate', unit: '%', favorableDirection: 'higher', percent: true },
+  { key: 'rework_cost_share', label: 'Rework cost share', unit: '%', favorableDirection: 'lower', percent: true },
   { key: 'lane_cost_per_merged_pr', label: 'Lane cost per merged PR', unit: '$', favorableDirection: 'lower' },
   { key: 'lane_warm_resume_rate', label: 'Lane warm resume rate', unit: '', favorableDirection: 'higher' },
   { key: 'checkpoint_loss_rate', label: 'Checkpoint loss rate', unit: '', favorableDirection: 'lower' },
@@ -585,8 +595,8 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             <div className="flex justify-between items-center">
               <span className="text-neutral-400">{axisDef.label}</span>
               <div className="flex gap-4 items-center text-neutral-300 font-mono">
-                <span>{current !== null ? `${current.toFixed(1)}${axisDef.unit}` : '—'}</span>
-                <span className="text-neutral-500">baseline: {baseline !== null ? `${baseline.toFixed(1)}${axisDef.unit}` : '—'}</span>
+                <span>{current !== null ? `${(axisDef.percent ? current * 100 : current).toFixed(1)}${axisDef.unit}` : '—'}</span>
+                <span className="text-neutral-500">baseline: {baseline !== null ? `${(axisDef.percent ? baseline * 100 : baseline).toFixed(1)}${axisDef.unit}` : '—'}</span>
                 <span className={`${driftColor} min-w-12 text-right`}>{driftDisplay}</span>
               </div>
             </div>
@@ -1089,7 +1099,7 @@ export default function MetricsDashboard({
   }
 
   const cardClass = 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4';
-  const filteredMetrics = metricsHistory.filter((p) => p.timestamp >= now - windowMs);
+  const filteredMetrics = useMemo(() => metricsHistory.filter((p) => p.timestamp >= now - windowMs), [metricsHistory, now, windowMs]);
   const exportMetrics = (format: 'csv' | 'json') => {
     const rows = filteredMetrics.map((p) => ({
       timestamp: new Date(p.timestamp).toISOString(),

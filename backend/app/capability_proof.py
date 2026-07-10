@@ -24,6 +24,7 @@ from app.capability_registry import (
     compose_capability_markers,
     normalize_capability_name,
 )
+from app.evidence_primitive import EvidenceRef  # noqa: F401 — imported for shape doc
 
 # Re-exported for back-compat: the annotation body lives in the IO-free
 # capability_registry leaf so every spawn path shares ONE implementation.
@@ -103,6 +104,55 @@ def _proof_entries_for_capability(
     if not isinstance(raw_entries, list):
         return []
     return [entry for entry in raw_entries if isinstance(entry, dict)]
+
+
+def _append_evidence_refs_to_capabilities(
+    project: Any,
+    cap_names: list[str],
+    ref_entry: dict[str, Any],
+) -> None:
+    """Append an EvidenceRef-shaped entry to each matching Capability's evidence_refs.
+
+    Fail-open: if problem_model is missing or malformed, logs a warning and
+    returns without raising. The proof is still recorded in capability_proof_records.
+    """
+    try:
+        pm = getattr(project, "problem_model", None)
+        if not isinstance(pm, dict):
+            return
+        capabilities = pm.get("capabilities")
+        if not isinstance(capabilities, list):
+            return
+        updated = False
+        norm_names = set(cap_names)
+        for cap in capabilities:
+            if not isinstance(cap, dict):
+                continue
+            cap_name = cap.get("name")
+            if not isinstance(cap_name, str):
+                continue
+            if normalize_capability_name(cap_name) not in norm_names:
+                continue
+            refs: list = cap.setdefault("evidence_refs", [])
+            # Dedup by source_id.
+            source_id = ref_entry.get("source_id")
+            if source_id and any(
+                isinstance(r, dict) and r.get("source_id") == source_id
+                for r in refs
+            ):
+                continue
+            refs.append(dict(ref_entry))
+            if len(refs) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+                cap["evidence_refs"] = refs[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+            updated = True
+        if updated:
+            flag_modified(project, "problem_model")
+    except Exception:
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to append evidence_refs to problem_model; "
+            "proof_records still recorded",
+            exc_info=True,
+        )
 
 
 def enrich_problem_model_capability_proofs(
@@ -217,6 +267,17 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
             recorded,
             proof_kind,
         )
+        _append_evidence_refs_to_capabilities(
+            project,
+            recorded,
+            {
+                "kind": proof_kind,
+                "ref": proof_ref,
+                "proven": True,
+                "source_id": task_id,
+                "recorded_at": proved_at,
+            },
+        )
 
     return recorded
 
@@ -279,6 +340,17 @@ def record_capability_proof_from_trial(
         proof_entry.get("lift"),
         proof_entry.get("n_with"),
         proof_entry.get("n_without"),
+    )
+    _append_evidence_refs_to_capabilities(
+        project,
+        [norm],
+        {
+            "kind": _PROOF_KIND_TRIAL_ADOPTION,
+            "ref": norm,
+            "proven": True,
+            "source_id": dedup_task_id,
+            "recorded_at": proved_at,
+        },
     )
 
 

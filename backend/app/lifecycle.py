@@ -14,6 +14,7 @@ from typing import Dict, List
 
 from sqlalchemy import func as _func
 from sqlalchemy import text as _text
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 import app.shared_state as _shared_state
@@ -346,11 +347,17 @@ async def _seed_routing_verdict_from_snapshot():
         from app.efficiency_snapshot import DESIGN_DOC_KEY
 
         async with AsyncSessionLocal() as seed_session:
-            project_ids = (
-                (await seed_session.execute(select(Project.id))).scalars().all()
+            project_rows = (
+                (
+                    await seed_session.execute(
+                        select(Project).options(load_only(Project.id, Project.design_doc, raiseload=True))
+                    )
+                )
+                .scalars()
+                .all()
             )
-            for project_id in project_ids:
-                project = await seed_session.get(Project, project_id)
+            for project in project_rows:
+
                 if not project or not project.design_doc:
                     continue
                 container = project.design_doc.get(DESIGN_DOC_KEY)
@@ -385,7 +392,7 @@ async def _seed_routing_verdict_from_snapshot():
                     logger.info(
                         "[STARTUP] Seeded provider_routing_verdict_state=%s from project %s",
                         state,
-                        project_id,
+                        project.id,
                     )
                     return  # First project with a verdict is sufficient
     except Exception:
@@ -956,6 +963,28 @@ async def lifespan(app):
             "[STARTUP] Branch backfill failed (non-fatal): %s", _bf_exc, exc_info=True
         )
 
+    # Backfill _file_to_system reverse index for all existing design-doc
+    # systems/* pages. The index was originally built only from the
+    # "modules" field, but most pages use "key_paths" (or "key_files");
+    # this sweep applies the corrected field-reading logic to every
+    # existing systems page without waiting for each to be re-set.
+    try:
+        from app.routers.admin_agent_ops import backfill_file_to_system_index
+
+        async with AsyncSessionLocal() as _fts_session:
+            _fts_count = await backfill_file_to_system_index(_fts_session)
+            await _fts_session.commit()
+            logger.info(
+                "[STARTUP] _file_to_system backfill complete: %d projects updated",
+                _fts_count,
+            )
+    except Exception as _fts_exc:
+        logger.error(
+            "[STARTUP] _file_to_system backfill failed (non-fatal): %s",
+            _fts_exc,
+            exc_info=True,
+        )
+
     # Reclaim lane warm-workspace states whose backing pool VM was deleted while
     # the orchestrator was stopped (crash / deploy / manual removal).  The live
     # path (clear_lanes_for_torn_down_vm) handles in-process teardowns; this
@@ -1037,6 +1066,7 @@ async def lifespan(app):
         from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
             maybe_alert_pool_payoff_transition,
+            maybe_alert_provider_routing_transition,
             maybe_alert_self_repair_burn_share,
             maybe_alert_unpriced_models_coverage,
             maybe_write_daily_snapshot,
@@ -1137,6 +1167,31 @@ async def lifespan(app):
                                 "self-repair-burn-share alert error=%s",
                                 project_id,
                                 repair_exc,
+                            )
+                        # Provider routing verdict transition alert: same hourly
+                        # tick, edge-triggered, so ADOPT/REJECT pages the operator
+                        # instead of requiring manual polling. Best-effort.
+                        try:
+                            routing_fired = (
+                                await maybe_alert_provider_routing_transition(
+                                    scan_session, project_id
+                                )
+                            )
+                            await scan_session.commit()
+                            if routing_fired is not None:
+                                logger.info(
+                                    "[EFFICIENCY_SNAPSHOT] project=%s "
+                                    "routing verdict alert fired verdict=%s",
+                                    project_id,
+                                    routing_fired,
+                                )
+                        except Exception as routing_exc:
+                            await scan_session.rollback()
+                            logger.warning(
+                                "[EFFICIENCY_SNAPSHOT] project=%s "
+                                "routing-verdict alert error=%s",
+                                project_id,
+                                routing_exc,
                             )
             except asyncio.CancelledError:
                 raise
@@ -1262,6 +1317,13 @@ async def lifespan(app):
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
+    # Per-instance credential sweep — clears resolved Secret Manager secrets
+    # from idle accounts every 5 minutes, bounding in-process credential dwell
+    # time.  Re-fetches on next select_max_plan_account call.
+    from app.max_plan_pool import credential_sweep_service
+
+    credential_sweep_task = asyncio.create_task(credential_sweep_service())
+
     # Per-instance runtime_config sync — propagates admin mutations across
     # Cloud Run instances (each has its own in-memory dict; DB is shared).
     config_sync_task = asyncio.create_task(runtime_config_sync_service())
@@ -1317,6 +1379,7 @@ async def lifespan(app):
     from app.shared_state import background_tasks as _bg_tasks
 
     _bg_tasks["orchestrator"] = orchestrator_task
+    _bg_tasks["credential_sweep"] = credential_sweep_task
     _bg_tasks["reaper"] = reaper_task
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
     _bg_tasks["gcp_image_cleanup"] = gcp_image_cleanup_task

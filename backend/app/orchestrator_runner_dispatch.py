@@ -42,9 +42,12 @@ from app.runner_health_monitors import (  # noqa: F401
     _RUNNER_DEGRADED_FAILURE_THRESHOLD,
     _RUNNER_LIVENESS_SECONDS,
     _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT,
+    _RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT,
     _check_degraded_runners,
     _check_fleet_no_healthy_runner,
+    _check_idle_gpu_runners,
     _check_low_disk_runners,
+    _check_low_memory_runners,
     _sweep_runner_deactivated_escalations,
 )
 from app.shared_state import runtime_config as _runtime_config

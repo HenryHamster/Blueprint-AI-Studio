@@ -1,5 +1,6 @@
 """Tests for scripts/blueprint_runner.py (the blueprint-runner launcher)."""
 
+import json
 import os
 import re
 import sys
@@ -1121,11 +1122,11 @@ class UpdateCommandTests(unittest.TestCase):
     """Tests for the ``blueprint-runner update`` command."""
 
     def test_update_routed_from_main(self):
-        """``main(["update"])`` routes to ``do_update``."""
-        with patch.object(br, "do_update", return_value=0) as upd:
+        """``main(["update"])`` routes to ``_run_update_and_report``."""
+        with patch.object(br, "_run_update_and_report", return_value=0) as routed:
             rc = br.main(["update"])
         self.assertEqual(rc, 0)
-        upd.assert_called_once()
+        routed.assert_called_once()
 
     def test_update_returns_1_when_git_unavailable(self):
         """When _git returns None (git absent), do_update prints an error and returns 1."""
@@ -1238,6 +1239,134 @@ class UpdateCommandTests(unittest.TestCase):
         rc = br.do_update(_run=run)
         self.assertEqual(rc, 1)
 
+    def test_update_restarts_service(self):
+        """After successful fast-forward, _restart_runner_service is called."""
+        run = _git_recorder()
+        with patch.object(br, "_restart_runner_service", return_value=True) as restart_mock:
+            rc = br.do_update(_run=run)
+        self.assertEqual(rc, 0)
+        restart_mock.assert_called_once()
+
+    def test_update_reports_success_to_orchestrator(self):
+        """_run_update_and_report POSTs the update result on success."""
+        with patch.object(br, "do_update", return_value=0) as update_mock, \
+             patch.object(br, "_post_update_result") as post_mock, \
+             patch.object(br, "_git", return_value=MagicMock(returncode=0, stdout="a" * 40)), \
+             patch.object(br, "resolve_url", return_value="https://example.com"), \
+             patch.object(br, "resolve_token", return_value="test-token"):
+            rc = br._run_update_and_report()
+        self.assertEqual(rc, 0)
+        update_mock.assert_called_once()
+        post_mock.assert_called_once()
+        kwargs = post_mock.call_args[1]
+        self.assertEqual(kwargs["status"], "success")
+        self.assertEqual(kwargs["old_version"], "a" * 40)
+        self.assertEqual(kwargs["new_version"], "a" * 40)
+
+    def test_update_reports_failure_to_orchestrator(self):
+        """_run_update_and_report POSTs the update result on failure."""
+        with patch.object(br, "do_update", return_value=1) as update_mock, \
+             patch.object(br, "_post_update_result") as post_mock, \
+             patch.object(br, "_git", return_value=MagicMock(returncode=0, stdout="a" * 40)), \
+             patch.object(br, "resolve_url", return_value="https://example.com"), \
+             patch.object(br, "resolve_token", return_value="test-token"):
+            rc = br._run_update_and_report()
+        self.assertEqual(rc, 1)
+        update_mock.assert_called_once()
+        post_mock.assert_called_once()
+        kwargs = post_mock.call_args[1]
+        self.assertEqual(kwargs["status"], "failure")
+
+    def test_update_report_does_not_block_on_post_failure(self):
+        """_run_update_and_report returns the update exit code even if POST fails."""
+        with patch.object(br, "do_update", return_value=0), \
+             patch.object(br, "_post_update_result", side_effect=RuntimeError("network error")), \
+             patch.object(br, "_git", return_value=MagicMock(returncode=0, stdout="a" * 40)), \
+             patch.object(br, "resolve_url", return_value="https://example.com"), \
+             patch.object(br, "resolve_token", return_value="test-token"):
+            rc = br._run_update_and_report()
+        self.assertEqual(rc, 0)
+
+    def test_update_main_routes_to_run_update_and_report(self):
+        """``main(["update"])`` routes to ``_run_update_and_report``, not ``do_update``."""
+        with patch.object(br, "_run_update_and_report", return_value=0) as routed:
+            rc = br.main(["update"])
+        self.assertEqual(rc, 0)
+        routed.assert_called_once()
+
+
+class RestartServiceTests(unittest.TestCase):
+    """Tests for :func:`_restart_runner_service`."""
+
+    def test_restarts_user_service(self):
+        """When user unit exists and is active, restarts via systemctl --user."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", return_value=True):
+            result = br._restart_runner_service(_run=run)
+        self.assertTrue(result)
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(
+            any("systemctl --user restart blueprint-runner.service" in j for j in joined)
+        )
+
+    def test_restarts_system_service_when_no_user_unit(self):
+        """When only system unit exists, restarts via systemctl (no --user)."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", side_effect=lambda p: "etc/systemd" in str(p)):
+            result = br._restart_runner_service(_run=run)
+        self.assertTrue(result)
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(
+            any("systemctl restart blueprint-runner.service" in j for j in joined)
+        )
+        self.assertFalse(
+            any("--user" in j and "restart" in j for j in joined)
+        )
+
+    def test_noop_when_not_installed(self):
+        """Returns False when no unit file exists."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", return_value=False):
+            result = br._restart_runner_service(_run=run)
+        self.assertFalse(result)
+        self.assertFalse(any("restart" in " ".join(c) for c in calls))
+
+    def test_noop_when_unit_inactive(self):
+        """Returns False when unit exists but is-active fails."""
+        calls = []
+        run = _systemctl_recorder(fail_on={"is-active": 3}, record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", return_value=True):
+            result = br._restart_runner_service(_run=run)
+        self.assertFalse(result)
+        self.assertFalse(any("restart" in " ".join(c) for c in calls))
+
+    def test_noop_when_systemctl_absent(self):
+        """Returns False when systemctl is not on PATH."""
+        with patch.object(br.shutil, "which", return_value=None):
+            result = br._restart_runner_service()
+        self.assertFalse(result)
+
+    def test_user_scope_preferred_over_system(self):
+        """When both user and system units exist, restarts user scope first."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"), \
+             patch.object(br.os.path, "isfile", return_value=True):
+            result = br._restart_runner_service(_run=run)
+        self.assertTrue(result)
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(
+            any("systemctl --user restart" in j for j in joined),
+            "user scope must be checked (and restarted) first when both exist",
+        )
+
 
 class PrintNoSystemdGuidanceTests(unittest.TestCase):
     def test_output_includes_actionable_guidance(self):
@@ -1259,6 +1388,358 @@ class PrintNoSystemdGuidanceTests(unittest.TestCase):
             br._print_no_systemd_guidance(system=True)
         output = fake_stderr.getvalue()
         self.assertIn("install --system", output)
+
+
+class StatusCommandTests(unittest.TestCase):
+    """Tests for the ``blueprint-runner status`` command."""
+
+    def test_status_routed_from_main(self):
+        """``main(["status"])`` routes to ``do_status``."""
+        with patch.object(br, "do_status", return_value=0) as status_mock:
+            rc = br.main(["status"])
+        self.assertEqual(rc, 0)
+        status_mock.assert_called_once()
+
+    def test_status_command_reads_status_json(self):
+        """do_status reads ~/.blueprint/status.json and prints a human-readable summary."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "status.json")
+            with open(status_path, "w") as f:
+                json.dump({
+                    "runner_id": "test-runner-1",
+                    "last_heartbeat_at": "2026-07-09T12:00:00+00:00",
+                    "last_heartbeat_status": "ok",
+                    "active_task_ids": ["task-1", "task-2"],
+                    "active_compute_job_ids": ["job-1"],
+                    "bwrap_ok": True,
+                    "docker_usable": False,
+                    "agent_backend": "bwrap",
+                    "compute_backend": "process",
+                }, f)
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+            self.assertEqual(rc, 0)
+            output = fake_stdout.getvalue()
+            self.assertIn("runner_id", output)
+            self.assertIn("test-runner-1", output)
+            self.assertIn("last_heartbeat_at", output)
+            self.assertIn("2026-07-09T12:00:00+00:00", output)
+            self.assertIn("last_heartbeat_status", output)
+            self.assertIn("ok", output)
+            self.assertIn("task-1", output)
+            self.assertIn("task-2", output)
+            self.assertIn("job-1", output)
+            self.assertIn("bwrap_ok", output)
+            self.assertIn("True", output)
+
+    def test_status_missing_file_returns_1(self):
+        """do_status returns 1 when status.json does not exist."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stderr = io.StringIO()
+                with patch.object(br.sys, "stderr", fake_stderr):
+                    rc = br.do_status()
+            self.assertEqual(rc, 1)
+            self.assertIn("status file not found", fake_stderr.getvalue())
+
+    def test_status_bad_json_returns_1(self):
+        """do_status returns 1 when status.json contains invalid JSON."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "status.json")
+            with open(status_path, "w") as f:
+                f.write("not valid json")
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stderr = io.StringIO()
+                with patch.object(br.sys, "stderr", fake_stderr):
+                    rc = br.do_status()
+            self.assertEqual(rc, 1)
+            self.assertIn("could not parse", fake_stderr.getvalue())
+
+    def test_status_empty_active_ids(self):
+        """do_status handles empty active_task_ids / active_compute_job_ids gracefully."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "status.json")
+            with open(status_path, "w") as f:
+                json.dump({
+                    "runner_id": "r1",
+                    "last_heartbeat_at": "2026-07-09T12:00:00+00:00",
+                    "last_heartbeat_status": "ok",
+                    "active_task_ids": [],
+                    "active_compute_job_ids": [],
+                    "bwrap_ok": True,
+                    "docker_usable": False,
+                }, f)
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+            self.assertEqual(rc, 0)
+            output = fake_stdout.getvalue()
+            self.assertIn("none", output)
+
+    def test_status_oserror_returns_1(self):
+        """do_status returns 1 when the status file exists but cannot be read."""
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_path = os.path.join(tmpdir, "status.json")
+            with open(status_path, "w") as f:
+                f.write("{}")
+            # Make file unreadable
+            os.chmod(status_path, 0o000)
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stderr = io.StringIO()
+                with patch.object(br.sys, "stderr", fake_stderr):
+                    rc = br.do_status()
+            self.assertEqual(rc, 1)
+            self.assertIn("could not read", fake_stderr.getvalue())
+
+
+class WriteEnvFileResourceLimitsTests(unittest.TestCase):
+    """_write_env_file writes resource-limit env vars when supplied."""
+
+    def test_resource_limits_written_to_env_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            br._write_env_file(
+                path,
+                url="https://orch.example",
+                token="tok",
+                resource_limits={
+                    "BLUEPRINT_RUNNER_MAX_CONCURRENT": "4",
+                    "BLUEPRINT_RUNNER_GPU_INDICES": "0,1",
+                },
+            )
+            with open(path) as f:
+                content = f.read()
+        self.assertIn("BLUEPRINT_RUNNER_MAX_CONCURRENT=4", content)
+        self.assertIn("BLUEPRINT_RUNNER_GPU_INDICES=0,1", content)
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL=https://orch.example", content)
+        self.assertIn("BLUEPRINT_RUNNER_TOKEN=tok", content)
+
+    def test_no_resource_limits_omits_limit_lines(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            br._write_env_file(path, url="https://orch.example", token=None)
+            with open(path) as f:
+                content = f.read()
+        self.assertNotIn("MAX_CONCURRENT", content)
+        self.assertNotIn("GPU", content)
+
+    def test_all_resource_limit_flags_written(self):
+        import tempfile
+        limits = {env_var: f"val_{i}" for i, (_, env_var, _, _) in enumerate(br._RESOURCE_LIMIT_VARS)}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            br._write_env_file(path, url="https://orch.example", token=None, resource_limits=limits)
+            with open(path) as f:
+                content = f.read()
+        for env_var, value in limits.items():
+            self.assertIn(f"{env_var}={value}", content)
+
+    def test_env_file_mode_is_0600(self):
+        import tempfile
+        import stat
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            br._write_env_file(path, url="https://o.example", token=None)
+            mode = oct(stat.S_IMODE(os.stat(path).st_mode))
+        self.assertEqual(mode, oct(0o600))
+
+
+class ReadEnvFileTests(unittest.TestCase):
+    """_read_env_file parses key=value pairs correctly."""
+
+    def test_parses_key_value_pairs(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            with open(path, "w") as f:
+                f.write("# comment\nFOO=bar\nBAZ=qux\n")
+            result = br._read_env_file(path)
+        self.assertEqual(result, {"FOO": "bar", "BAZ": "qux"})
+
+    def test_missing_file_returns_empty_dict(self):
+        result = br._read_env_file("/nonexistent/path/runner.env")
+        self.assertEqual(result, {})
+
+    def test_blank_lines_and_comments_skipped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            with open(path, "w") as f:
+                f.write("# header\n\nKEY=value\n\n# another comment\n")
+            result = br._read_env_file(path)
+        self.assertEqual(result, {"KEY": "value"})
+
+
+class InstallResourceLimitFlagsTests(unittest.TestCase):
+    """install subcommand writes resource-limit flags into the env file."""
+
+    def _fake_systemd(self, *, available=True, active=True, enabled=True):
+        """Return fakes for _systemd_available and _systemctl."""
+        def fake_systemd_avail(**kwargs):
+            return available
+
+        def fake_systemctl(args, **kwargs):
+            sub = args[0] if args else ""
+            rc = 0
+            if sub == "is-active" and not active:
+                rc = 1
+            if sub == "is-enabled" and not enabled:
+                rc = 1
+            return MagicMock(returncode=rc)
+
+        return fake_systemd_avail, fake_systemctl
+
+    def test_max_concurrent_flag_written_to_env_file(self):
+        import tempfile
+        avail, systemctl = self._fake_systemd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(br, "_credential_dir", return_value=tmpdir), \
+                 patch.object(br, "_user_unit_path", return_value=os.path.join(tmpdir, "unit")), \
+                 patch.object(br, "_systemd_available", avail), \
+                 patch.object(br, "_systemctl", systemctl), \
+                 patch.object(br, "render_unit", return_value="[Unit]"), \
+                 patch.object(br, "_install_user", return_value="testuser"):
+                rc = br.do_install(
+                    url="https://o.example",
+                    resource_limits={"BLUEPRINT_RUNNER_MAX_CONCURRENT": "6"},
+                )
+            env_path = os.path.join(tmpdir, "runner.env")
+            with open(env_path) as f:
+                content = f.read()
+        self.assertEqual(rc, 0)
+        self.assertIn("BLUEPRINT_RUNNER_MAX_CONCURRENT=6", content)
+
+    def test_gpu_indices_flag_written_to_env_file(self):
+        import tempfile
+        avail, systemctl = self._fake_systemd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(br, "_credential_dir", return_value=tmpdir), \
+                 patch.object(br, "_user_unit_path", return_value=os.path.join(tmpdir, "unit")), \
+                 patch.object(br, "_systemd_available", avail), \
+                 patch.object(br, "_systemctl", systemctl), \
+                 patch.object(br, "render_unit", return_value="[Unit]"), \
+                 patch.object(br, "_install_user", return_value="testuser"):
+                rc = br.do_install(
+                    url="https://o.example",
+                    resource_limits={"BLUEPRINT_RUNNER_GPU_INDICES": "2,3"},
+                )
+            env_path = os.path.join(tmpdir, "runner.env")
+            with open(env_path) as f:
+                content = f.read()
+        self.assertEqual(rc, 0)
+        self.assertIn("BLUEPRINT_RUNNER_GPU_INDICES=2,3", content)
+
+    def test_no_resource_limits_installs_cleanly(self):
+        import tempfile
+        avail, systemctl = self._fake_systemd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(br, "_credential_dir", return_value=tmpdir), \
+                 patch.object(br, "_user_unit_path", return_value=os.path.join(tmpdir, "unit")), \
+                 patch.object(br, "_systemd_available", avail), \
+                 patch.object(br, "_systemctl", systemctl), \
+                 patch.object(br, "render_unit", return_value="[Unit]"), \
+                 patch.object(br, "_install_user", return_value="testuser"):
+                rc = br.do_install(url="https://o.example")
+        self.assertEqual(rc, 0)
+
+    def test_install_parser_accepts_resource_limit_flags(self):
+        """argparse install subparser accepts all resource-limit flags."""
+        parser = br.build_parser()
+        args = parser.parse_args([
+            "install", "--token", "tok",
+            "--max-concurrent", "4",
+            "--max-concurrent-compute-jobs", "2",
+            "--gpu-indices", "0,1",
+            "--gpus-per-job", "2",
+            "--cpu-limit", "8",
+            "--mem-limit", "16g",
+            "--min-disk-bytes", "10000000",
+        ])
+        self.assertEqual(args.max_concurrent, "4")
+        self.assertEqual(args.gpu_indices, "0,1")
+        self.assertEqual(args.mem_limit, "16g")
+        self.assertEqual(args.min_disk_bytes, "10000000")
+
+
+class StatusResourceLimitsTests(unittest.TestCase):
+    """do_status displays resource-limit config from runner.env."""
+
+    def _write_status(self, tmpdir: str) -> None:
+        status_path = os.path.join(tmpdir, "status.json")
+        with open(status_path, "w") as f:
+            json.dump({
+                "runner_id": "r1",
+                "last_heartbeat_at": "2026-07-09T12:00:00+00:00",
+                "last_heartbeat_status": "ok",
+                "active_task_ids": [],
+                "active_compute_job_ids": [],
+            }, f)
+
+    def test_status_shows_configured_resource_limits(self):
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_status(tmpdir)
+            env_path = os.path.join(tmpdir, "runner.env")
+            with open(env_path, "w") as f:
+                f.write("BLUEPRINT_ORCHESTRATOR_URL=https://o.example\n")
+                f.write("BLUEPRINT_RUNNER_MAX_CONCURRENT=8\n")
+                f.write("BLUEPRINT_RUNNER_GPU_INDICES=0,1,2\n")
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+        self.assertEqual(rc, 0)
+        output = fake_stdout.getvalue()
+        self.assertIn("max-concurrent", output)
+        self.assertIn("8", output)
+        self.assertIn("gpu-indices", output)
+        self.assertIn("0,1,2", output)
+
+    def test_status_shows_not_set_for_unconfigured_limits(self):
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_status(tmpdir)
+            env_path = os.path.join(tmpdir, "runner.env")
+            with open(env_path, "w") as f:
+                f.write("BLUEPRINT_ORCHESTRATOR_URL=https://o.example\n")
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+        self.assertEqual(rc, 0)
+        output = fake_stdout.getvalue()
+        self.assertIn("not set (using default)", output)
+
+    def test_status_notes_when_env_file_absent(self):
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_status(tmpdir)
+            # No runner.env written — simulates uninstalled / direct-run scenario
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+        self.assertEqual(rc, 0)
+        output = fake_stdout.getvalue()
+        self.assertIn("env file not found", output)
 
 
 if __name__ == "__main__":

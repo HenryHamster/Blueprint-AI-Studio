@@ -517,6 +517,14 @@ class Project(SQLModel, table=True):
         default_factory=list,
         sa_column=Column(JSONB, nullable=True, default=[]),
     )
+    # Strategic memory notes — append-only list of durable behavioral lessons
+    # and operator preferences. Written by the set_memory strategic op so the
+    # resident strategist can persist corrections / preferences across sessions.
+    # Each entry is {"note": <string>, "set_at": <iso_timestamp>}.
+    strategic_memory_notes: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=True, default=[]),
+    )
     # Running update — a single markdown document the strategic agent
     # maintains as a living narrative of what the project is and what's
     # shifting. Rewritten each cycle (not appended) so the user always
@@ -1178,6 +1186,17 @@ class Task(SQLModel, table=True):
     format_compliance_summary: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Provider-reported token usage from the agent's independent accumulator
+    # (Component B of cost-telemetry reconciliation). Sourced from the raw
+    # Anthropic messages.create() response.usage object, accumulated through a
+    # SEPARATE code path from api_call_summary so the reconciliation can
+    # cross-check the two paths and detect accumulation bugs. Backwards-
+    # compatible — agents that don't ship this field leave it NULL.
+    # Shape: {"input_tokens": int, "output_tokens": int,
+    #         "cache_creation_input_tokens": int, "cache_read_input_tokens": int}
+    provider_reported_usage: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
     # Retry-attribution banking now has dedicated nullable columns. The
     # accessors below still fall back to legacy context keys so in-flight rows
     # written before the migration keep their banked totals during rollout.
@@ -1529,6 +1548,11 @@ class Task(SQLModel, table=True):
         # test_model_indexes_covered_by_migrations.
         Index("ix_task_created_at", "created_at"),
         Index("ix_task_started_at", "started_at"),
+        # Standalone index on updated_at for reaper staleness sweeps,
+        # strategic spawning (ORDER BY updated_at DESC), operator attention,
+        # and work session recheck queries (~15 query sites total). Without
+        # this index every staleness sweep does a full sort of the tasks table.
+        Index("ix_task_updated_at", "updated_at"),
         # Partial index on vm_stopped_at for anomaly_detection cost-window queries
         # that filter vm_stopped_at IS NOT NULL and order by vm_stopped_at.
         # Without this, the query full-scans all task history linearly.
@@ -2064,6 +2088,7 @@ class ComputeJob(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_computejob_project_status", "project_id", "status"),
+        Index("ix_computejob_project_status_created", "project_id", "status", "created_at"),
         Index("ix_computejob_task_status", "task_id", "status"),
         Index("ix_computejob_backend_external", "backend", "external_compute_id"),
         Index("ix_computejob_status_deadline", "status", "wall_clock_deadline"),
@@ -2655,6 +2680,7 @@ class Alert(SQLModel, table=True):
         Index("ix_alert_project_domain", "project_id", "domain"),
         Index("ix_alert_project_event_type", "project_id", "event_type"),
         Index("ix_alert_project_source", "project_id", "source"),
+        Index("ix_alert_project_created_at", "project_id", "created_at"),
         Index(
             "ux_alert_active_dedupe_key",
             "project_id",
@@ -2696,7 +2722,7 @@ class StrategicCycle(SQLModel, table=True):
     """
 
     id: str = Field(primary_key=True, max_length=36)  # cycle_id (UUID hex)
-    project_id: uuid.UUID = Field(foreign_key="project.id")
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
 
     # outcome enum-ish: in_progress | phase1_running | phase1_done |
     # phase2_running | completed | failed_phase1 | failed_phase2 |
@@ -2708,7 +2734,7 @@ class StrategicCycle(SQLModel, table=True):
 
     # Phase tracking. *_started_at = task creation time;
     # *_completed_at = terminal status.
-    phase1_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id")
+    phase1_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id", index=True)
     phase1_started_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
@@ -2717,7 +2743,7 @@ class StrategicCycle(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
-    phase2_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id")
+    phase2_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id", index=True)
     phase2_started_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -3163,6 +3189,20 @@ class MaxPlanAccount(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )  # When the token was added (for age tracking)
     rate_limit_state: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
+    # Persisted rate-limit/usage headroom snapshot (latest probe data). Populated
+    # by _refresh_usage_snapshot in max_plan_pool on each successful probe so
+    # the data survives orchestrator restarts even before the next probe fires.
+    # Structure: {"five_hour": {"utilization": float, "resets_at": str},
+    #             "seven_day": {"utilization": float, "resets_at": str},
+    #             "unified_5h": {"remaining_tokens": int, "limit_tokens": int,
+    #                           "status": str, "resets_at": str},
+    #             "updated_at": str, "source": str}
+    # The unified_5h sub-dict is populated when Messages API response headers are
+    # captured (direct_llm_client calls); the five_hour/seven_day windows are
+    # populated by the OAuth usage probe on every probe cycle.
+    rate_limit_usage: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
     # Usage caps (null = unlimited).
@@ -3617,6 +3657,29 @@ class KnowledgeDocument(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
+    # Lifecycle tracking for the strategist follow-up workflow.
+    # New documents start as "pending"; the strategist can mark them
+    # "consumed" (read + acted on) or "dismissed" (not actionable).
+    lifecycle_status: str = Field(
+        default="pending",
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=text("'pending'"),
+        ),
+    )
+    consumed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    dismissed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    dismissed_reason: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -3656,6 +3719,14 @@ class KnowledgeDocument(SQLModel, table=True):
         Index("ix_knowledge_document_origin_finding_hash", "origin_finding_hash"),
         Index("ix_knowledge_document_sweep_id", "sweep_id"),
         Index("ix_knowledge_document_project_direction", "project_id", "direction_id"),
+        Index("ix_knowledge_document_lifecycle_status", "lifecycle_status"),
+        Index(
+            "ix_knowledge_document_project_source_lifecycle",
+            "project_id",
+            "source_kind",
+            "lifecycle_status",
+        ),
+        Index("ix_knowledge_document_project_lifecycle_created", "project_id", "lifecycle_status", "created_at"),
     )
 
 
@@ -3993,7 +4064,7 @@ class MigrationReservation(SQLModel, table=True):
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    project_id: uuid.UUID = Field(foreign_key="project.id")
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
     # Detach-on-delete (SET NULL), NOT cascade: a reservation is durable
     # allocation history that must outlive its originating task so a merge-time
     # finalize/expiry can still reconcile the provisional id. Mirrors
@@ -4297,7 +4368,7 @@ class TaskWakeRegistration(SQLModel, table=True):
             index=True,
         ),
     )
-    project_id: uuid.UUID = Field(foreign_key="project.id")
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
 
     # Source identity. ``wake_source_kind`` is an open categorical string (the
     # first shipped value is "compute_job_terminal"); ``wake_source_ref`` is the
@@ -4634,6 +4705,11 @@ class LocalRunner(SQLModel, table=True):
     consecutive_job_failures: int = Field(
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    # When the runner's current token was created/rotated (for age/staleness tracking).
+    token_created_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     created_at: datetime = Field(
         default_factory=_utcnow,

@@ -415,6 +415,14 @@ class HeartbeatRequest(BaseModel):
     # byte-for-byte unchanged and pricing falls back to the base input rate.
     total_cache_creation_input_tokens: int | None = Field(None, ge=0)
     total_cache_read_input_tokens: int | None = Field(None, ge=0)
+    # Provider-reported token usage from the agent's SEPARATE accumulator
+    # (Component B of cost-telemetry reconciliation). Raw provider response.usage
+    # fields accumulated independently from api_call_summary. The reconciliation
+    # cross-checks this against api_call_summary to detect accumulation bugs.
+    # Shape: {"input_tokens": int, "output_tokens": int,
+    #         "cache_creation_input_tokens": int, "cache_read_input_tokens": int}.
+    # Optional/backwards-compatible — agents that don't emit this leave it NULL.
+    provider_reported_usage: Dict[str, int] | None = None
     # Cumulative per-task structured-output format-compliance telemetry, sibling
     # to the LLM fields above. Optional/backwards-compatible — older agents that
     # don't emit these leave Task.format_compliance_summary NULL. format_miss_by_reason
@@ -939,6 +947,10 @@ class ResourceEnvelope(BaseModel):
     # to compute_experiment tasks for now; a future field could extend the
     # policy to other task types. Absent/None ⇒ False (cloud fallback permitted).
     require_local_runner: bool | None = Field(None)
+    # When True, exceeding the spend ceiling automatically pauses the project
+    # (project.paused = True) until an operator manually unpauses it.
+    # Absent/None ⇒ False (soft-defer tasks but don't pause the project).
+    pause_on_ceiling_exceeded: bool | None = Field(None)
 
     @field_validator("allowed_machine_types", mode="before")
     @classmethod

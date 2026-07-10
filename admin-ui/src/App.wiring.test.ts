@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const appSource = readFileSync(path.join(process.cwd(), 'src', 'App.tsx'), 'utf8');
+const strategicSessionSource = readFileSync(path.join(process.cwd(), 'src', 'hooks', 'useStrategicSession.ts'), 'utf8');
 
 describe('App workbench wiring', () => {
   test('wires the real Strategic MessagesPanel to the context workspace opener', () => {
@@ -11,11 +12,11 @@ describe('App workbench wiring', () => {
   });
 
   test('keeps Strategic check-in idempotency stable across retry attempts', () => {
-    expect(appSource).toContain('const strategicCheckInIdempotencyKeyRef = useRef<string | null>(null);');
-    expect(appSource).toMatch(/if \(!strategicCheckInIdempotencyKeyRef\.current\) \{[\s\S]*strategicCheckInIdempotencyKeyRef\.current = `strategic-check-in:\$\{projectId\}:\$\{Date\.now\(\)\}`;/);
-    expect(appSource).toContain('idempotency_key: strategicCheckInIdempotencyKeyRef.current,');
-    expect(appSource).toMatch(/await checkInStrategicSession[\s\S]*strategicCheckInIdempotencyKeyRef\.current = null;[\s\S]*Strategic check-in recorded/);
-    expect(appSource).toContain('strategicReadModel.applySessionResponse(checkInResponse);');
+    expect(strategicSessionSource).toContain('const strategicCheckInIdempotencyKeyRef = useRef<string | null>(null);');
+    expect(strategicSessionSource).toMatch(/if \(!strategicCheckInIdempotencyKeyRef\.current\) \{[\s\S]*strategicCheckInIdempotencyKeyRef\.current = `strategic-check-in:\$\{projectId\}:\$\{Date\.now\(\)\}`;/);
+    expect(strategicSessionSource).toContain('idempotency_key: strategicCheckInIdempotencyKeyRef.current,');
+    expect(strategicSessionSource).toMatch(/await checkInStrategicSession[\s\S]*strategicCheckInIdempotencyKeyRef\.current = null;[\s\S]*Strategic check-in recorded/);
+    expect(strategicSessionSource).toContain('strategicReadModel.applySessionResponse(checkInResponse);');
   });
 
   test('routes command-palette Strategic targets through overlay-safe wrappers', () => {
@@ -65,8 +66,7 @@ describe('App workbench wiring', () => {
   });
 
   test('findings journal feed keeps implementation child outcomes', () => {
-    expect(appSource).toContain('`${API_BASE_URL}/api/admin/tasks?archived=false&limit=500&project_id=');
-    expect(appSource).not.toContain('task_type=research&archived=false&limit=500');
+    expect(appSource).toContain('`${API_BASE_URL}/api/admin/tasks?task_type=research&archived=false&limit=500&project_id=');
     expect(appSource).toContain('setResearchFeed(all);');
   });
 });

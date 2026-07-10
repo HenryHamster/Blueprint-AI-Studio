@@ -29,17 +29,17 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictBool, StrictStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import create_agent_token, get_current_runner
+from app.broadcast import broadcast_to_project
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
-from app.compute_manifest import _apply_llm_env, _resolve_provider_materials
 from app.runner_rate_limiter import check_runner_rate_limit
 from app.database import get_session
-from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Project, Task, TaskStatus, _utcnow
-from app.shared_state import runtime_config as _runtime_config
+from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobStatus, LocalRunner, Project, Task, TaskStatus, _utcnow
 from app.task_capabilities import agent_capability_slice
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -187,6 +187,8 @@ class HeartbeatRequest(BaseModel):
     last_successful_job_at: str | None = None
     consecutive_job_failures: int | None = None
     disk_free_bytes: int | None = None
+    cpu_load_avg: float | None = None
+    memory_free_bytes: int | None = None
     gpu_utilization_pct: int | None = None
 
 
@@ -234,130 +236,145 @@ async def next_task(
     # perform the PROVISIONING → IN_PROGRESS transition (same contract as GCP VMs).
     task.started_at = _utcnow()
     session.add(task)
+
+    # ── Resolve per-task LLM credentials from the account pool ────────────────
+    # Self-hosted runners receive credential env vars (PROVIDER, AUTH_MODE, and
+    # provider-specific secret keys) alongside the task, exactly like cloud VMs
+    # get them from their startup-secret manifest.  When no pool account is
+    # selected (no accounts configured, or the pool is full/rate-limited), the
+    # runner falls back to host env vars — same as the current behavior.
+    task_type = (task.first_payload or {}).get("type", "")
+    credentials = None
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        _rc_dict = dict(_rc) if _rc else {}
+        if _rc_dict:
+            project = await session.get(Project, task.project_id)
+            if project is not None:
+                from app.max_plan_pool import (
+                    apply_task_llm_runtime_context,
+                    select_llm_runtime_for_task,
+                )
+                from app.compute_manifest import (
+                    _apply_llm_env,
+                    _resolve_provider_materials,
+                )
+
+                # Resolve the billing user: launcher pays; fall back to project owner.
+                dispatch_user_id = (
+                    task.launched_by_user_id
+                    if task.launched_by_user_id
+                    else project.user_id
+                )
+
+                selection = await select_llm_runtime_for_task(
+                    user_id=dispatch_user_id,
+                    task=task,
+                    runtime_config=_rc_dict,
+                )
+                if selection is not None and selection.account is not None:
+                    account = selection.account
+
+                    # Stamp runtime context so cost attribution works.
+                    new_context = apply_task_llm_runtime_context(
+                        task.context,
+                        account_id=account.get("id"),
+                        provider=selection.provider,
+                        auth_mode=selection.auth_mode,
+                        model=selection.model,
+                        execution_mode=selection.execution_mode,
+                    )
+                    task.context = new_context
+                    task.llm_account_id = account.get("id")
+                    from sqlalchemy.orm.attributes import flag_modified
+
+                    flag_modified(task, "context")
+
+                    # Build credential env/files using the same provider-impl
+                    # path that cloud-VM manifests use.
+                    materials = _resolve_provider_materials(
+                        oauth_token=account.get("runtime_secret")
+                        or account.get("oauth_token"),
+                        claude_config_json=account.get("claude_config_json"),
+                        provider=selection.provider,
+                        auth_mode=selection.auth_mode,
+                        model=selection.model,
+                        provider_metadata=account.get("provider_metadata"),
+                        provider_settings=selection.settings,
+                    )
+                    cred_env: dict[str, str] = {
+                        "PROVIDER": materials.provider_name,
+                        "AUTH_MODE": materials.auth_mode_value,
+                    }
+                    _apply_llm_env(
+                        cred_env,
+                        model=selection.model,
+                        execution_mode=selection.execution_mode,
+                        provider_settings=selection.settings,
+                        materials=materials,
+                    )
+                    credentials = {
+                        "env": cred_env,
+                        "files": [
+                            {
+                                "path": item.path,
+                                "content": item.content,
+                                "mode": item.mode,
+                            }
+                            for item in materials.files
+                        ],
+                    }
+
+                    logger.info(
+                        "[RUNNERS] Dispatched task %s (type=%s) to runner %s "
+                        "with pooled account %s (provider=%s model=%s)",
+                        task.id,
+                        task_type,
+                        runner.id,
+                        account.get("id"),
+                        selection.provider,
+                        selection.model,
+                    )
+                else:
+                    # Pool exhausted — no eligible account.  Roll back the dispatch
+                    # marker so the task stays claimable by a future poll once an
+                    # account frees up.
+                    logger.warning(
+                        "[RUNNERS] No LLM account available for task %s (type=%s) — "
+                        "pool exhausted; leaving task unclaimed",
+                        task.id,
+                        task_type,
+                    )
+                    task.started_at = None
+                    session.add(task)
+                    await session.commit()
+                    return JSONResponse(
+                        {"pool_exhausted": True},
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    )
+    except Exception:
+        logger.exception(
+            "[RUNNERS] Failed to resolve LLM credentials for task %s; "
+            "rolling back dispatch so task stays claimable",
+            task.id,
+        )
+        task.started_at = None
+        session.add(task)
+        await session.commit()
+        return JSONResponse(
+            {"pool_exhausted": True},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
     await session.commit()
 
-    task_type = (task.first_payload or {}).get("type", "")
     agent_token = create_agent_token(
         str(task.id),
         vm_instance_id=pinned_vm_id,
         task_type=task_type,
         project_id=str(task.project_id),
     )
-
-    # Resolve a pooled LLM account for this task — same path as the orchestrator's
-    # cloud-VM dispatch (select_llm_runtime_for_task).  The self-hosted runner no
-    # longer carries its own static LLM credentials; the backend assigns one per
-    # task from the pool, and the runner injects the resolved credential env vars
-    # into the agent process.
-    llm_env: dict[str, str] = {}
-    llm_files: list[dict[str, str]] = []
-    llm_provider: str | None = None
-    llm_auth_mode: str | None = None
-    llm_model: str | None = None
-
-    try:
-        from app.max_plan_pool import select_llm_runtime_for_task
-
-        # Resolve the billing user: launcher pays; fall back to project owner.
-        if task.launched_by_user_id:
-            dispatch_user_id = task.launched_by_user_id
-        else:
-            task_project = await session.get(Project, task.project_id)
-            dispatch_user_id = task_project.user_id if task_project else ""
-
-        runtime_selection = await select_llm_runtime_for_task(
-            user_id=dispatch_user_id,
-            task=task,
-            runtime_config=_runtime_config,
-        )
-        if runtime_selection is None or runtime_selection.account is None:
-            # Pool exhausted — no eligible account.  Roll back the dispatch marker
-            # so the task stays claimable by a future poll once an account frees up.
-            logger.warning(
-                "[RUNNERS] No LLM account available for task %s (type=%s) — "
-                "pool exhausted; leaving task unclaimed",
-                task.id,
-                task_type,
-            )
-            task.started_at = None
-            session.add(task)
-            await session.commit()
-            response.status_code = status.HTTP_204_NO_CONTENT
-            return response
-
-        acct = runtime_selection.account
-        llm_provider = runtime_selection.provider
-        llm_auth_mode = runtime_selection.auth_mode
-        llm_model = runtime_selection.model
-
-        # Build the credential env vars and files from the resolved account using
-        # the SAME material-resolution path as cloud-VM boot and warm re-target.
-        runtime_secret = acct.get("runtime_secret") or acct.get("oauth_token")
-        materials = _resolve_provider_materials(
-            oauth_token=runtime_secret,
-            claude_config_json=acct.get("claude_config_json"),
-            provider=llm_provider,
-            auth_mode=llm_auth_mode,
-            model=llm_model,
-            provider_metadata=acct.get("provider_metadata") or {},
-            provider_settings=runtime_selection.settings,
-        )
-        llm_env = {
-            "PROVIDER": materials.provider_name,
-            "AUTH_MODE": materials.auth_mode_value,
-        }
-        _apply_llm_env(
-            llm_env,
-            model=llm_model,
-            execution_mode=None,
-            provider_settings=runtime_selection.settings,
-            materials=materials,
-        )
-        llm_files = [
-            {"path": f.path, "content": f.content, "mode": str(f.mode)}
-            for f in materials.files
-        ]
-
-        # Persist the resolved account identity in the task context so the
-        # completion / failure handler can release the account slot and record
-        # the actual provider/model used for analytics.
-        task.context = {
-            **(task.context or {}),
-            "llm_provider": llm_provider,
-            "llm_model": llm_model,
-            "llm_auth_mode": llm_auth_mode,
-            "llm_account_id": acct.get("id"),
-        }
-        # Keep the promoted column in sync with context (D2 over-fetch fix).
-        task.llm_account_id = acct.get("id")
-        from sqlalchemy.orm.attributes import flag_modified
-        flag_modified(task, "context")
-        session.add(task)
-        await session.commit()
-
-        logger.info(
-            "[RUNNERS] Dispatched task %s (type=%s) to runner %s "
-            "with pooled account %s (provider=%s model=%s)",
-            task.id,
-            task_type,
-            runner.id,
-            acct.get("id"),
-            llm_provider,
-            llm_model,
-        )
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception(
-            "[RUNNERS] LLM account selection failed for task %s — "
-            "rolling back dispatch",
-            task.id,
-        )
-        task.started_at = None
-        session.add(task)
-        await session.commit()
-        response.status_code = status.HTTP_204_NO_CONTENT
-        return response
 
     return {
         "task_id": str(task.id),
@@ -366,12 +383,87 @@ async def next_task(
         "payload": task.payloads,
         "task_type": task_type,
         "capability_slice": agent_capability_slice(task_type),
-        "provider": llm_provider,
-        "auth_mode": llm_auth_mode,
-        "model": llm_model,
-        "llm_env": llm_env,
-        "llm_files": llm_files,
+        "credentials": credentials,
     }
+
+
+class DeclineTaskRequest(BaseModel):
+    task_id: str
+
+
+@router.post("/decline-task")
+async def decline_task(
+    payload: DeclineTaskRequest,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Runner declines a previously-dispatched task — release it back to QUEUED.
+
+    A runner may decline a task after claiming it from /next-task if the
+    isolation backend cannot build a sandbox for the task type (no bwrap,
+    read-only docker image on a write task, etc.).  Without this notification
+    the task strands in PROVISIONING until the stale-runner sweep fires — which
+    only happens when THIS runner goes offline.
+    """
+    pinned_vm_id = f"runner:{runner.id}"
+    result = await session.execute(
+        select(Task).where(
+            Task.id == payload.task_id,
+            Task.status == TaskStatus.PROVISIONING,
+            Task.vm_instance_id == pinned_vm_id,
+        )
+    )
+    task = result.scalars().first()
+    if task is None:
+        # Task doesn't exist, isn't in PROVISIONING, or isn't pinned to this
+        # runner — no pin to release.  Return ok so the runner doesn't retry
+        # (idempotent; the stale-runner sweep is the safety net).
+        return {"ok": True}
+
+    # Release the LLM pool account that was claimed when the task was
+    # dispatched via /next-task, so the slot isn't leaked indefinitely.
+    # Use the same idempotent ``_slot_released`` marker as the park path
+    # in task_lifecycle.py to guard against double-release.
+    acct_id = None
+    try:
+        from app.max_plan_pool import (
+            get_task_llm_account_id,
+            release_max_plan_account,
+        )
+
+        acct_id = get_task_llm_account_id(task)
+        if acct_id and not (task.context or {}).get("_slot_released"):
+            await release_max_plan_account(acct_id)
+    except Exception:
+        logger.exception(
+            "[RUNNERS] pool account release failed for declined task %s",
+            payload.task_id,
+        )
+
+    task.llm_account_id = None
+    task.status = TaskStatus.QUEUED
+    task.vm_instance_id = None
+    task.vm_provisioned_at = None
+    task.started_at = None
+    new_ctx = dict(task.context or {})
+    for key in (
+        "llm_account_id", "llm_provider", "llm_auth_mode", "llm_model",
+        "llm_execution_mode", "max_plan_account_id", "runner_target_id",
+        "_slot_released",
+    ):
+        new_ctx.pop(key, None)
+    task.context = new_ctx
+    session.add(task)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Runner %s declined task %s — released back to QUEUED "
+        "(pool account %s released)",
+        runner.id,
+        payload.task_id,
+        acct_id,
+    )
+    return {"ok": True}
 
 
 @router.post("/heartbeat")
@@ -456,6 +548,10 @@ async def heartbeat(
         runner.consecutive_job_failures = max(0, int(payload.consecutive_job_failures))
     if payload.disk_free_bytes is not None:
         caps["disk_free_bytes"] = max(0, int(payload.disk_free_bytes))
+    if payload.cpu_load_avg is not None:
+        caps["cpu_load_avg"] = max(0.0, float(payload.cpu_load_avg))
+    if payload.memory_free_bytes is not None:
+        caps["memory_free_bytes"] = max(0, int(payload.memory_free_bytes))
     if payload.gpu_utilization_pct is not None:
         caps["gpu_utilization_pct"] = max(0, min(100, int(payload.gpu_utilization_pct)))
     if payload.hostname:
@@ -542,6 +638,85 @@ async def heartbeat(
         "enrolled_max_concurrent": caps.get("max_concurrent"),
         "version_hint": _current_sha,
     }
+
+
+class RunnerUpdateReportRequest(BaseModel):
+    """Report the outcome of a runner self-update.
+
+    Sent by ``blueprint-runner update`` after completion (or failure) so the
+    operator console surfaces whether the auto-update succeeded or failed.
+    """
+
+    status: str  # "success" or "failure"
+    old_version: str | None = None
+    new_version: str | None = None
+
+
+@router.post("/update-report")
+async def update_report(
+    payload: RunnerUpdateReportRequest,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Create an operator alert for a runner's self-update outcome.
+
+    Called best-effort by ``blueprint-runner update`` after the update
+    completes (or fails).  Creates an INFO alert on success, WARNING on
+    failure, and broadcasts it so the operator console surfaces the outcome
+    immediately — no need to SSH or grep logs to see if the version bump
+    landed.
+
+    Authenticated via the runner's bearer token (same as heartbeat).
+    Best-effort contract: the runner never blocks its own update CLI on
+    this call — any failure is logged and swallowed.
+    """
+    if payload.status not in ("success", "failure"):
+        raise HTTPException(status_code=400, detail="status must be 'success' or 'failure'")
+
+    runner_label = runner.hostname or f"runner {str(runner.id)[:8]}"
+
+    if payload.status == "success":
+        severity = AlertSeverity.INFO
+        title = f"Runner self-update succeeded: {runner_label}"
+        detail = ""
+        if payload.old_version and payload.new_version:
+            detail = f" {payload.old_version[:10]} → {payload.new_version[:10]}"
+        message = (
+            f"Self-hosted runner {runner_label} ({str(runner.id)[:8]}) "
+            f"auto-updated successfully.{detail}"
+        )
+    else:
+        severity = AlertSeverity.WARNING
+        title = f"Runner self-update failed: {runner_label}"
+        message = (
+            f"Self-hosted runner {runner_label} ({str(runner.id)[:8]}) "
+            f"self-update failed — check the runner's logs for details."
+        )
+
+    alert = Alert(
+        project_id=runner.project_id,
+        severity=severity,
+        title=title,
+        message=message[:1000],
+        source="runner",
+        event_type="runner.self_update",
+    )
+    session.add(alert)
+    await session.commit()
+
+    await broadcast_to_project(
+        str(runner.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+            "domain": alert.domain or "core",
+            "event_type": alert.event_type,
+        },
+    )
+
+    return {"ok": True}
 
 
 class ComputeJobReportRequest(BaseModel):
@@ -684,6 +859,30 @@ async def report_compute_job(
     )
     job = result.scalars().first()
     if job is None:
+        # Check whether the job exists under a different project — if so, emit a
+        # structured warning so operators can detect misconfigured runners.
+        mismatch_result = await session.execute(
+            select(ComputeJob).where(ComputeJob.id == job_id).limit(1)
+        )
+        mismatch_job = mismatch_result.scalars().first()
+        if mismatch_job is not None:
+            logger.warning(
+                "[RUNNERS] Cross-project access mismatch: runner_id=%s runner_project_id=%s "
+                "job_id=%s job_actual_project_id=%s — runner cannot access jobs from another project",
+                runner.id,
+                runner.project_id,
+                job_id,
+                mismatch_job.project_id,
+            )
+            from app.runner_health_alerts import _maybe_create_runner_cross_project_mismatch_alert
+            await _maybe_create_runner_cross_project_mismatch_alert(
+                session,
+                project_id=runner.project_id,
+                runner_id=runner.id,
+                job_id=job_id,
+                job_project_id=mismatch_job.project_id,
+                hostname=getattr(runner, "hostname", None),
+            )
         raise HTTPException(status_code=404, detail="compute job not found")
 
     _TERMINAL_STATUSES = {

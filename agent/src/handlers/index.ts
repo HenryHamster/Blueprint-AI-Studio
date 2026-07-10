@@ -17,7 +17,7 @@
 
 import type WebSocket from 'ws';
 import type { AgentTaskType } from '../taskCapabilities.js';
-import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA, handleSalvageBundle } from './standard.js';
 import { handleReview, handleFix } from './review-fix.js';
 import { handlePanelReview } from './panel-review.js';
 import { handlePlan, handleResearch } from './research-plan.js';
@@ -115,6 +115,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   web_research: handleWebResearch,
   design: handleDesign,
   repo_bootstrap: handleRepoBootstrap,
+  salvage_bundle: handleSalvageBundle,
 };
 
 // ── Contract-driven handler resolution ───────────────────────────────────────

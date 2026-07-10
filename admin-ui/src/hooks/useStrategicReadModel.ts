@@ -1,6 +1,6 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchStrategicState, type StrategicSessionResponse, type StrategicStateResponse } from '../strategicStateApi';
+import { fetchStrategicStateWithRevision, type StrategicSessionResponse, type StrategicStateResponse } from '../strategicStateApi';
 import { DEFAULT_POLL_MS, usePoller } from './usePoller';
 
 export function useStrategicReadModel(projectId: string | null, opts?: { pollerEnabled?: boolean }) {
@@ -16,12 +16,17 @@ export function useStrategicReadModel(projectId: string | null, opts?: { pollerE
   // still the one it claimed — so a stale, in-flight pre-mutation GET can never
   // clobber freshly merged session state (or a newer refresh's result).
   const requestGenerationRef = useRef(0);
+  // Opaque revision token returned by the server. Passed on the next poll so
+  // the server can skip the expensive context-package build when inputs are
+  // unchanged. Reset when the project changes.
+  const stateRevisionRef = useRef<string | null>(null);
 
   useEffect(() => {
     setData(null);
     setError(null);
     setLoading(Boolean(projectId));
     requestGenerationRef.current += 1;
+    stateRevisionRef.current = null;
   }, [projectId]);
 
   const refresh = useCallback(
@@ -30,9 +35,10 @@ export function useStrategicReadModel(projectId: string | null, opts?: { pollerE
       if (signal?.aborted) return;
       const requestedProjectId = projectId;
       const requestGeneration = (requestGenerationRef.current += 1);
+      const revision = stateRevisionRef.current;
       setLoading(prev => prev || data == null);
       try {
-        const next = await fetchStrategicState(requestedProjectId, signal);
+        const next = await fetchStrategicStateWithRevision(requestedProjectId, revision, signal);
         if (
           currentProjectIdRef.current !== requestedProjectId ||
           next.project_id !== requestedProjectId ||
@@ -40,6 +46,7 @@ export function useStrategicReadModel(projectId: string | null, opts?: { pollerE
         ) {
           return;
         }
+        stateRevisionRef.current = next.state_revision ?? null;
         setData(next);
         setError(null);
       } catch (err) {

@@ -417,7 +417,7 @@ async def call_inline_llm_json(
 
     for attempt in range(2):
         try:
-            raw = await call_direct_llm(
+            raw, _ = await call_direct_llm(
                 target.api_key,
                 messages=payload_messages,
                 max_tokens=settings.max_tokens,

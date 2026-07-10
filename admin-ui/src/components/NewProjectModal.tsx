@@ -111,6 +111,17 @@ function deriveMergeVerificationVerdict(config: BuildConfig | null): MergeVerifi
     : { state: 'unverified', test_commands: [] };
 }
 
+function installErrorBannerContent(error: string, owner?: string, repo?: string) {
+  if (!error.includes('installation token')) return null;
+  const repoRef = owner && repo ? `${owner}/${repo}` : 'the target repository';
+  return (
+    <>
+      <p>The Blueprint GitHub App isn't installed on {repoRef} yet. Install it on the repo (or the org, scoped to include this repo), then try again.</p>
+      <p className="mt-1 opacity-60">{error}</p>
+    </>
+  );
+}
+
 const STEP_LABELS: Record<string, string> = { repo: 'Repository', config: 'Confirm', success: 'Created' };
 
 export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProjectModalProps) {
@@ -749,7 +760,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 </div>
               ) : previewError ? (
                 <div className="mb-4 p-3 bg-amber-950/40 border border-amber-900/50 rounded-lg text-xs text-amber-300">
-                  {previewError}
+                  {installErrorBannerContent(previewError, parsed?.owner, parsed?.repo) ?? previewError}
                 </div>
               ) : null}
 
@@ -891,7 +902,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
               {submitError && (
                 <div className="mb-4 p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-xs text-red-400">
-                  {submitError}
+                  {installErrorBannerContent(submitError, parsed?.owner, parsed?.repo) ?? submitError}
                 </div>
               )}
 

@@ -7,6 +7,8 @@ import type {
   EffortEfficiencyRow,
   ModelEfficiencyRow,
   ProviderRoutingVerdict,
+  ProviderRoutingShare,
+  CostTelemetryReconciliation,
 } from '../types/digest';
 
 function bucket(overrides: Partial<EfficiencyBucket> = {}): EfficiencyBucket {
@@ -351,8 +353,156 @@ describe('EffortEfficiencyPanel', () => {
     expect(screen.getByText(/0.42x/)).toBeInTheDocument();
   });
 
+  it('renders provider routing distribution table with per-provider stats and totals', () => {
+    const share: ProviderRoutingShare = {
+      by_provider: [
+        { provider: 'deepseek', run_count: 30, pr_eligible_run_count: 28, verified_landed_count: 20, verified_landed_rate: 0.714, total_cost_usd: 12.5, cost_per_merge: 0.63 },
+        { provider: 'anthropic', run_count: 10, pr_eligible_run_count: 8, verified_landed_count: 6, verified_landed_rate: 0.75, total_cost_usd: 5.0, cost_per_merge: 0.83 },
+      ],
+      total_run_count: 40,
+      total_pr_eligible_run_count: 36,
+    };
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_share: share })} />);
+    // Section heading.
+    expect(screen.getByText(/Provider Routing Distribution/)).toBeInTheDocument();
+    // Per-provider rows: lowercase provider names (CSS capitalize, not text transform).
+    expect(screen.getByText('deepseek')).toBeInTheDocument();
+    expect(screen.getByText('anthropic')).toBeInTheDocument();
+    // DeepSeek-specific numbers unique to the routing share.
+    expect(screen.getByText('30')).toBeInTheDocument();  // deepseek run_count
+    expect(screen.getByText('28')).toBeInTheDocument();  // deepseek pr_eligible
+    // Anthropic-specific numbers.
+    expect(screen.getByText('8')).toBeInTheDocument();   // anthropic pr_eligible
+    // Verified rates.
+    expect(screen.getByText(/71%/)).toBeInTheDocument();  // deepseek rate
+    expect(screen.getByText(/75%/)).toBeInTheDocument();  // anthropic rate
+    // Cost per merge
+    expect(screen.getByText(/\$0\.63/)).toBeInTheDocument();
+    expect(screen.getByText(/\$0\.83/)).toBeInTheDocument();
+    // Totals row.
+    expect(screen.getByText('Total')).toBeInTheDocument();
+    expect(screen.getByText('36')).toBeInTheDocument();  // total_pr_eligible
+  });
+
+  it('renders a single provider row for routing distribution', () => {
+    const share: ProviderRoutingShare = {
+      by_provider: [
+        { provider: 'deepseek', run_count: 5, pr_eligible_run_count: 5, verified_landed_count: 3, verified_landed_rate: 0.6, total_cost_usd: 10.0, cost_per_merge: 3.33 },
+      ],
+      total_run_count: 5,
+      total_pr_eligible_run_count: 5,
+    };
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_share: share })} />);
+    expect(screen.getByText(/Provider Routing Distribution/)).toBeInTheDocument();
+    expect(screen.getByText('deepseek')).toBeInTheDocument();
+    expect(screen.getByText('Total')).toBeInTheDocument();
+    // Single provider totals match.
+    expect(screen.getAllByText('5').length).toBeGreaterThanOrEqual(2); // runs + pr-eligible + total
+  });
+
+  it('hides the routing distribution table when provider_routing_share is absent', () => {
+    render(<EffortEfficiencyPanel data={makeData({ provider_routing_share: undefined })} />);
+    expect(screen.queryByText(/Provider Routing Distribution/)).not.toBeInTheDocument();
+  });
+
   it('hides the verdict callout when provider_routing_verdict is absent', () => {
     render(<EffortEfficiencyPanel data={makeData({ provider_routing_verdict: undefined })} />);
     expect(screen.queryByText(/Provider Routing A\/B/)).not.toBeInTheDocument();
+  });
+
+  // --- Cost telemetry reconciliation trust indicator ---
+
+  function reconciliationData(
+    overrides: Partial<CostTelemetryReconciliation> = {},
+  ): CostTelemetryReconciliation {
+    return {
+      total_cost_snapshot_path: 50.0,
+      total_cost_direct_path: 50.000001,
+      absolute_delta: 0.000001,
+      relative_delta: 2e-8,
+      within_tolerance: true,
+      tolerance: 1e-6,
+      total_input_tokens_snapshot_path: 1000000,
+      total_input_tokens_direct_path: 1000000,
+      total_cache_read_input_tokens_snapshot_path: 200000,
+      total_cache_read_input_tokens_direct_path: 200000,
+      total_cache_creation_input_tokens_snapshot_path: 50000,
+      total_cache_creation_input_tokens_direct_path: 50000,
+      cache_hit_rate_snapshot_path: 0.2,
+      cache_hit_rate_direct_path: 0.2,
+      cache_hit_rate_delta: 0,
+      cache_hit_rate_within_tolerance: true,
+      task_count: 15,
+      per_task: [],
+      ...overrides,
+    };
+  }
+
+  it('renders cost telemetry reconciled badge when within tolerance', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({ cost_telemetry_reconciliation: reconciliationData() })}
+      />,
+    );
+    // Green badge indicates reconciliation passed.
+    expect(screen.getByText(/✓ Reconciled/)).toBeInTheDocument();
+    // Section label visible.
+    expect(screen.getByText(/Cost Telemetry/)).toBeInTheDocument();
+    // Delta = 0.0000010 (toFixed(7)) and tolerance = 0.000001 shown.
+    expect(screen.getAllByText(/\$0\.0000010?/).length).toBeGreaterThanOrEqual(2);
+    // Task count shown.
+    expect(screen.getByText('15')).toBeInTheDocument();
+    // Trustworthy message.
+    expect(screen.getByText(/telemetry is trustworthy/)).toBeInTheDocument();
+  });
+
+  it('renders cost telemetry warning badge when out of tolerance', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({
+          cost_telemetry_reconciliation: reconciliationData({
+            within_tolerance: false,
+            absolute_delta: 0.05,
+          }),
+        })}
+      />,
+    );
+    // Amber badge indicates mismatch.
+    expect(screen.getByText(/⚠ Mismatch/)).toBeInTheDocument();
+    // Diverged delta value.
+    expect(screen.getByText(/\$0\.0500000/)).toBeInTheDocument();
+    // Cost tolerance shown.
+    expect(screen.getByText(/±\$0\.000001/)).toBeInTheDocument();
+    // Investigate message.
+    expect(screen.getByText(/telemetry paths diverge/)).toBeInTheDocument();
+  });
+
+  it('renders cost telemetry warning when cache hit rate diverges but cost within tolerance', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({
+          cost_telemetry_reconciliation: reconciliationData({
+            within_tolerance: true,
+            cache_hit_rate_within_tolerance: false,
+            cache_hit_rate_delta: 0.15,
+          }),
+        })}
+      />,
+    );
+    // Mismatch badge (cache hit rate divergence overrides cost agreement).
+    expect(screen.getByText(/⚠ Mismatch/)).toBeInTheDocument();
+    // Cache-hit rate divergence noted.
+    expect(screen.getByText(/diverged/)).toBeInTheDocument();
+  });
+
+  it('hides cost telemetry callout when reconciliation is undefined', () => {
+    render(
+      <EffortEfficiencyPanel
+        data={makeData({ cost_telemetry_reconciliation: undefined })}
+      />,
+    );
+    expect(screen.queryByText(/Cost Telemetry/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/✓ Reconciled/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/⚠ Mismatch/)).not.toBeInTheDocument();
   });
 });

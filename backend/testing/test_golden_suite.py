@@ -55,6 +55,7 @@ VALID_TASK_TYPES: set[str] = {
     "web_research",
     "design",
     "repo_bootstrap",
+    "salvage_bundle",
 }
 
 VALID_EFFORTS: set[str] = {"low", "medium", "high", "max"}
@@ -467,6 +468,22 @@ class TestSuiteIntegrity:
             msg = "\n".join(f"  {sid}: {errs}" for sid, errs in failures)
             pytest.fail(f"{len(failures)} spec(s) failed validation:\n{msg}")
 
+    def test_valid_task_types_superset_of_backend_registry(self):
+        """VALID_TASK_TYPES must be a superset of the backend's ALL_TASK_TYPES.
+
+        When a new task type is registered in backend/app/task_capabilities.py
+        this test fails until the golden-task runner's VALID_TASK_TYPES (and
+        this inline copy) are updated in lockstep.
+        """
+        from app.task_capabilities import ALL_TASK_TYPES as backend_types  # noqa: PLC0415
+        missing = backend_types - VALID_TASK_TYPES
+        assert not missing, (
+            f"VALID_TASK_TYPES is missing task type(s) registered in "
+            f"backend/app/task_capabilities.py: {sorted(missing)}. "
+            f"Add each missing type to VALID_TASK_TYPES in "
+            f"golden_tasks/runner.py and update this inline copy."
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-spec field validation
@@ -686,3 +703,181 @@ class TestBackendSchemaValidation:
             pytest.fail(
                 f"{len(failures)} payload(s) failed schema validation:\n{msg}"
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent runner smoke tests (no DB, no LLM, no agent binary required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestAgentRunnerImport:
+    """Smoke tests for the ``golden_tasks.agent_runner`` module.
+
+    These tests verify the module is importable, exposes the expected public
+    API, and that the dry-run fallback path still works.  They do NOT require
+    an agent binary or LLM credentials.
+    """
+
+    @staticmethod
+    def _try_import(name: str):
+        """Import from golden_tasks.agent_runner or skip the test."""
+        try:
+            import golden_tasks.agent_runner as mod  # noqa: PLC0415
+            return getattr(mod, name)
+        except ImportError:
+            pytest.skip("golden_tasks.agent_runner not importable (expected in Docker)")
+
+    def test_module_is_importable(self):
+        """The agent_runner module should be importable from the golden_tasks package."""
+        _ = self._try_import("AgentBinaryNotFound")  # side-effect: skip on ImportError
+        # Reached only when import succeeds
+        import golden_tasks.agent_runner  # noqa: PLC0415, F401
+
+    def test_agent_binary_not_found_is_exception(self):
+        """AgentBinaryNotFound should be an Exception subclass."""
+        cls = self._try_import("AgentBinaryNotFound")
+        assert issubclass(cls, Exception)
+
+    def test_run_single_task_is_callable(self):
+        """run_single_task should be a callable with the expected signature."""
+        fn = self._try_import("run_single_task")
+        assert callable(fn)
+
+    def test_locate_agent_binary_returns_list_or_none(self):
+        """_locate_agent_binary should return list[str] or None."""
+        fn = self._try_import("_locate_agent_binary")
+        result = fn()
+        # When no binary is installed, returns None
+        if result is not None:
+            assert isinstance(result, list), f"Expected list[str], got {type(result)}"
+            for item in result:
+                assert isinstance(item, str), f"Expected str, got {type(item)}"
+
+    def test_run_single_task_raises_agent_binary_not_found_without_binary(self):
+        """run_single_task should raise AgentBinaryNotFound when no binary exists.
+
+        This test is only meaningful when no agent binary is available.
+        When ``tsx`` is on PATH and ``agent/src/index.ts`` exists (common on
+        development VMs), the binary WILL be found and this test gracefully skips.
+        """
+        AgentBinaryNotFound = self._try_import("AgentBinaryNotFound")
+        _locate_agent_binary = self._try_import("_locate_agent_binary")
+        run_single_task = self._try_import("run_single_task")
+        # Check if an agent binary would be found — if so, skip gracefully.
+        import os
+        old_val = os.environ.pop("BLUEPRINT_AGENT_BINARY", None)
+        try:
+            binary = _locate_agent_binary()
+            if binary is not None:
+                pytest.skip(
+                    f"Agent binary found ({binary!r}) — "
+                    "cannot test binary-not-found path on this VM"
+                )
+            with pytest.raises(AgentBinaryNotFound):
+                run_single_task(
+                    {"type": "research", "prompt": "test", "title": "test"},
+                    timeout_seconds=1,
+                )
+        finally:
+            if old_val is not None:
+                os.environ["BLUEPRINT_AGENT_BINARY"] = old_val
+
+    def test_mock_orchestrator_claim_response_shape(self):
+        """The claim response built by the mock orchestrator must have required fields."""
+        _build_claim_response = self._try_import("_build_claim_response")
+        payload = {"type": "research", "prompt": "hello", "title": "Test task"}
+        response = _build_claim_response(payload)
+        assert "task_id" in response
+        assert "payloads" in response
+        assert isinstance(response["payloads"], list)
+        assert len(response["payloads"]) == 1
+        assert response["payloads"][0] == payload
+        assert "project_metadata" in response
+        pm = response["project_metadata"]
+        for key in ("project_id", "github_owner", "github_repo", "build_config", "integration_branch"):
+            assert key in pm, f"project_metadata missing {key!r}"
+
+    def test_cost_estimation_recognises_sonnet(self):
+        """_estimate_cost_usd should return non-zero for known model prefixes."""
+        _estimate_cost_usd = self._try_import("_estimate_cost_usd")
+        cost = _estimate_cost_usd(
+            model_id="claude-sonnet-4-20250514",
+            input_tokens=1_000_000,
+            output_tokens=500_000,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        assert cost > 0, f"Expected non-zero cost for known model, got {cost}"
+        # 1M input @ $3 + 500K output @ $15 = $3.00 + $7.50 = $10.50
+        assert 10.0 <= cost <= 11.0, f"Expected ~$10.50, got ${cost:.4f}"
+
+    def test_cost_estimation_unknown_model_returns_zero(self):
+        """_estimate_cost_usd should return 0.0 for unrecognised models."""
+        _estimate_cost_usd = self._try_import("_estimate_cost_usd")
+        cost = _estimate_cost_usd(
+            model_id="unknown-model-v1",
+            input_tokens=1_000_000,
+            output_tokens=500_000,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        assert cost == 0.0
+
+
+class TestDryRunMetrics:
+    """Verify that ``--dry-run`` produces the expected simulated metrics shape."""
+
+    def test_simulated_metrics_match_expected_shape(self):
+        """Simulated metrics should have the same field set as before the change."""
+        pytest.importorskip(
+            "golden_tasks.runner",
+            reason="golden_tasks.runner not importable (outside Docker build context)",
+        )
+        import golden_tasks.runner  # noqa: PLC0415
+        metrics = golden_tasks.runner.RunMetrics()
+        # Populate as _run_simulated does
+        metrics.prompt_tokens = 150
+        metrics.completion_tokens = 450
+        metrics.total_tokens = 600
+        metrics.cost_usd = 0.015
+        metrics.llm_provider = "anthropic"
+        metrics.model_id = "claude-sonnet-4-20250514"
+        metrics.stop(success=True)
+
+        d = metrics.to_dict()
+        # Core fields that were present before the change
+        for key in ("wall_time_s", "prompt_tokens", "completion_tokens",
+                     "total_tokens", "cost_usd", "success"):
+            assert key in d, f"Missing key {key!r} in simulated metrics dict"
+        # New fields should also be present (even if zero)
+        # These are now available but optional in the dict
+        assert metrics.cache_read_input_tokens == 0
+        assert metrics.cache_creation_input_tokens == 0
+        assert metrics.llm_call_count == 0
+        assert metrics.num_turns == 0
+
+    def test_aggregate_includes_new_telemetry_keys(self):
+        """RunMetrics.aggregate() should include cache + provider/model breakdown keys."""
+        pytest.importorskip(
+            "golden_tasks.runner",
+            reason="golden_tasks.runner not importable (outside Docker build context)",
+        )
+        import golden_tasks.runner  # noqa: PLC0415
+        metrics = golden_tasks.runner.RunMetrics()
+        metrics.prompt_tokens = 500
+        metrics.completion_tokens = 200
+        metrics.total_tokens = 700
+        metrics.cache_read_input_tokens = 100
+        metrics.cache_creation_input_tokens = 50
+        metrics.llm_provider = "anthropic"
+        metrics.model_id = "claude-sonnet-4-20250514"
+        metrics.stop(success=True)
+
+        summary = golden_tasks.runner.RunMetrics.aggregate([metrics])
+        assert summary["total_cache_read_input_tokens"] == 100
+        assert summary["total_cache_creation_input_tokens"] == 50
+        assert summary["cache_hit_rate"] == 0.2  # 100/500
+        assert "providers" in summary
+        assert "models" in summary
+        assert summary["providers"] == {"anthropic": 1}
+        assert summary["models"] == {"claude-sonnet-4-20250514": 1}

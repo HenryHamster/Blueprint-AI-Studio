@@ -693,3 +693,133 @@ class TestRecordCapabilityProofFromTrial:
             record_capability_proof_from_trial(project, "related_tests", entry)
 
         assert "related-tests" in project.capability_proof_records
+
+
+# ── evidence_refs wiring tests ────────────────────────────────────────────────
+
+
+def _make_project_with_problem_model(cap_name: str, extra_cap_fields: dict | None = None) -> MagicMock:
+    """Build a project with a problem_model containing one capability."""
+    project = MagicMock()
+    project.capability_proof_records = {}
+    cap = {"name": cap_name, "status": "working"}
+    if extra_cap_fields:
+        cap.update(extra_cap_fields)
+    project.problem_model = {"capabilities": [cap]}
+    return project
+
+
+class TestRecordCapabilityProofEvidenceRefs:
+    """record_capability_proof also writes EvidenceRef entries to problem_model."""
+
+    def test_record_capability_proof_appends_evidence_refs(self):
+        """Named acceptance test: record_capability_proof must append an EvidenceRef
+        entry to the matching Capability's evidence_refs in problem_model."""
+        cap_name = "language-aware-repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        task = _make_task(
+            provides_capability=cap_name,
+            verdict=_named_test_verdict("testing/test_prompt.py::test_map"),
+            commit_sha="abc123",
+        )
+
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            recorded = record_capability_proof(task, project)
+
+        assert recorded == [cap_name]
+        cap = project.problem_model["capabilities"][0]
+        refs = cap.get("evidence_refs", [])
+        assert len(refs) == 1, f"expected 1 evidence_ref, got {refs}"
+        r = refs[0]
+        assert r["proven"] is True
+        assert r["kind"] == "named_test"
+        assert r["ref"] == "testing/test_prompt.py::test_map"
+        assert r["source_id"] == task.id
+        assert "recorded_at" in r
+        # flag_modified must be called for both columns.
+        called_args = [call.args[1] for call in mock_fm.call_args_list]
+        assert "capability_proof_records" in called_args
+        assert "problem_model" in called_args
+
+    def test_record_capability_proof_evidence_refs_capped(self):
+        """evidence_refs is capped at _MAX_PROOF_ENTRIES_PER_CAPABILITY entries."""
+        cap_name = "language-aware-repo-map"
+        existing_refs = [
+            {"kind": "named_test", "ref": f"test_{i}.py", "proven": True, "source_id": f"task-{i}"}
+            for i in range(_MAX_PROOF_ENTRIES_PER_CAPABILITY)
+        ]
+        project = _make_project_with_problem_model(cap_name, {"evidence_refs": existing_refs[:]})
+
+        task = _make_task(
+            task_id="new-task-xyz",
+            provides_capability=cap_name,
+            verdict=_named_test_verdict(),
+        )
+
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof(task, project)
+
+        refs = project.problem_model["capabilities"][0].get("evidence_refs", [])
+        assert len(refs) == _MAX_PROOF_ENTRIES_PER_CAPABILITY
+        assert refs[-1]["source_id"] == "new-task-xyz"
+
+    def test_record_capability_proof_evidence_refs_dedup_by_source_id(self):
+        """evidence_refs deduplicates by source_id (task_id)."""
+        cap_name = "language-aware-repo-map"
+        task_id = "task-dup-ref"
+        existing_refs = [
+            {"kind": "named_test", "ref": "test_foo.py", "proven": True, "source_id": task_id}
+        ]
+        project = _make_project_with_problem_model(cap_name, {"evidence_refs": existing_refs[:]})
+        project.capability_proof_records = {cap_name: [
+            {"task_id": "other-task", "proved_at": "2026-01-01T00:00:00",
+             "proof_kind": "named_test", "proof_ref": "test_foo.py", "commit_sha": ""}
+        ]}
+
+        task = _make_task(
+            task_id=task_id,
+            provides_capability=cap_name,
+            verdict=_named_test_verdict(),
+        )
+
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof(task, project)
+
+        # proof_records: same task_id → deduped (returns [])
+        # evidence_refs: same source_id → not duplicated
+        refs = project.problem_model["capabilities"][0].get("evidence_refs", [])
+        assert len(refs) == 1
+
+    def test_record_capability_proof_fail_open_on_malformed_model(self):
+        """If problem_model is absent/malformed, record_capability_proof does not raise."""
+        project = MagicMock()
+        project.capability_proof_records = {}
+        project.problem_model = None  # malformed
+
+        task = _make_task(
+            provides_capability="some-cap",
+            verdict=_named_test_verdict(),
+        )
+
+        with patch("app.capability_proof.flag_modified"):
+            recorded = record_capability_proof(task, project)
+
+        # proof_records still recorded even though problem_model is absent
+        assert "some-cap" in recorded
+
+    def test_record_capability_proof_from_trial_appends_evidence_refs(self):
+        """record_capability_proof_from_trial appends a trial_adoption EvidenceRef."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+
+        entry = {"verdict": "adopt", "lift": 0.08, "n_with": 35, "n_without": 32}
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_proof_from_trial(project, cap_name, entry)
+
+        cap = project.problem_model["capabilities"][0]
+        refs = cap.get("evidence_refs", [])
+        assert len(refs) == 1
+        r = refs[0]
+        assert r["proven"] is True
+        assert r["kind"] == _PROOF_KIND_TRIAL_ADOPTION
+        assert r["ref"] == cap_name

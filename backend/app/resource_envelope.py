@@ -98,6 +98,17 @@ def resolve_project_require_local_runner(project: Project) -> bool:
     return raw is True
 
 
+def resolve_project_pause_on_ceiling_exceeded(project: Project) -> bool:
+    """Return True when the project should auto-pause on spend ceiling breach.
+
+    Reads ``project.build_config["resource_envelope"]["pause_on_ceiling_exceeded"]``.
+    Returns False when absent, null, or not a bool — soft-defer (no pause) is the
+    default so legacy projects are unaffected.
+    """
+    raw = _get_envelope(project).get("pause_on_ceiling_exceeded")
+    return raw is True
+
+
 def resolve_project_spend_warning_fraction(project: Project) -> float:
     """Return the warning fraction of the spend ceiling, defaulting to 0.8.
 
@@ -119,7 +130,7 @@ async def get_project_recent_spend_usd(
 ) -> dict[str, float]:
     """Return project spend (USD) over a rolling window, broken down by source.
 
-    Combines three spend sources:
+    Combines four spend sources:
 
     1. **Settled compute-job spend** — ``final_cost_usd`` over terminal
        ``ComputeJob`` rows whose ``completed_at`` falls within
@@ -132,21 +143,26 @@ async def get_project_recent_spend_usd(
        and terminal tasks; tasks that were provisioned before but still running
        (or finished) during the window are captured.
 
-    3. **Warm-pool idle cost** — attributed idle cost for this project's pool
+    3. **LLM API cost** — sum of ``_task_llm_cost`` over the same tasks,
+       pricing each attempt's token usage via the ``LLM_TOKEN_PRICING`` table.
+
+    4. **Warm-pool idle cost** — attributed idle cost for this project's pool
        VMs over the same rolling window, via
        ``efficiency_snapshot._compute_windowed_idle_cost``.  Includes both
        settled ``PoolIdleSpan`` rows (``settled_at >= since``) and the
        in-progress idle portion of any currently-IDLE pool VMs.
 
-    All three components use the same ``[now - window_days, now)`` window so
+    All four components use the same ``[now - window_days, now)`` window so
     the total is consistent across dispatch-gate, spawn-gate, and operator
     display callers.
 
-    Returns a dict with keys ``total``, ``compute``, ``agent_vm``, ``idle``.
+    Returns a dict with keys ``total``, ``compute``, ``agent_vm``, ``llm``,
+    ``idle``.
     Callers that only need the ceiling-gate check should use ``result["total"]``.
     """
     from app.compute_jobs import get_recent_terminal_compute_spend_usd
     from app.efficiency_snapshot import _compute_windowed_idle_cost
+    from app.llm_cost_attribution import _task_llm_cost
     from app.models import Task, get_task_total_vm_cost_usd
 
     now = _utcnow()
@@ -167,6 +183,7 @@ async def get_project_recent_spend_usd(
     )
     tasks = result.scalars().all()
     task_vm_spend = sum(get_task_total_vm_cost_usd(t) for t in tasks)
+    task_llm_spend = sum(_task_llm_cost(t)[0] for t in tasks)
 
     idle_cost_result = await _compute_windowed_idle_cost(session, project_id, since)
     idle_spend = idle_cost_result["total"]
@@ -174,9 +191,11 @@ async def get_project_recent_spend_usd(
     compute_f = float(compute_spend)
     agent_vm_f = float(task_vm_spend)
     idle_f = float(idle_spend)
+    llm_f = float(task_llm_spend)
     return {
-        "total": compute_f + agent_vm_f + idle_f,
+        "total": compute_f + agent_vm_f + idle_f + llm_f,
         "compute": compute_f,
         "agent_vm": agent_vm_f,
         "idle": idle_f,
+        "llm": llm_f,
     }

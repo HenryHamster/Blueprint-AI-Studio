@@ -235,7 +235,7 @@ function DeadLetterPanel({
     fetchDeadLetters(selectedProjectId)
       .then(data => {
         if (!mountedRef.current) return;
-        setDeadLetters(data);
+        setDeadLetters(data.items);
         setDeadLettersError('');
       })
       .catch(e => {

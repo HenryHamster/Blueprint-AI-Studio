@@ -142,6 +142,7 @@ export function useLogViewer({
   // Live resident-session transcript buffer, appended from strategic_session events.
   const [strategicSessionTranscript, setStrategicSessionTranscript] = useState<StrategicSessionDelta[]>([]);
   const gatedTypesRefreshSeqRef = useRef(0);
+  const [ceilingDeferredProjectIds, setCeilingDeferredProjectIds] = useState<Set<string>>(new Set());
   const pipelineThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsConnectingProjectRef = useRef<string | null>(null);
@@ -451,6 +452,18 @@ export function useLogViewer({
         if (pipelineThrottleTimerRef.current) clearTimeout(pipelineThrottleTimerRef.current);
         const clearMs = (msg.data.recovery_seconds ?? 60) * 1000;
         pipelineThrottleTimerRef.current = setTimeout(() => setPipelineThrottle(null), clearMs);
+      }
+      if (projectEventApplies && msg.event === 'project_spend_ceiling_deferred') {
+        const pid: string | undefined = msg.data?.project_id;
+        if (pid) setCeilingDeferredProjectIds(prev => new Set(prev).add(pid));
+      }
+      if (projectEventApplies && msg.event === 'project_spend_ceiling_restored') {
+        const pid: string | undefined = msg.data?.project_id;
+        if (pid) setCeilingDeferredProjectIds(prev => {
+          const next = new Set(prev);
+          next.delete(pid);
+          return next;
+        });
       }
       if (projectEventApplies && msg.event === 'type_throttle' && typeof msg.data?.type === 'string') {
         void refreshGatedTaskTypes();
@@ -836,6 +849,7 @@ export function useLogViewer({
     handleViewLogs, closeLogViewer,
     wsRef, wsConnected,
     pipelineThrottle,
+    ceilingDeferredProjectIds,
     gatedTaskTypes,
     strategistActive,
     cycleProgress,
