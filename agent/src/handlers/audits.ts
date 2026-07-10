@@ -620,8 +620,19 @@ export async function handleReleaseAudit(
     });
     return;
   }
-  // Three-dot (merge-base) diff of the pinned candidate vs main.
-  const diffRange = `${baseBranch}...${candidateSha}`;
+  // The full LTS range is always the fail-closed fallback. A prior clean audit
+  // may request a smaller direct delta, but that hint is trusted only after
+  // proving the old candidate is an ancestor of this pinned candidate.
+  const fullDiffRange = `${baseBranch}...${candidateSha}`;
+  let diffRange = fullDiffRange;
+  const requestedAuditBaseSha = typeof payload.audit_base_sha === 'string'
+    && /^[0-9a-f]{40}$/i.test(payload.audit_base_sha.trim())
+    ? payload.audit_base_sha.trim()
+    : null;
+  let auditScopeMode: 'full' | 'incremental' = 'full';
+  let auditScopeFallbackReason: string | null = requestedAuditBaseSha
+    ? 'incremental_base_not_verified'
+    : null;
 
   statusRef.value = `Cloning ${owner}/${repo} (${baseBranch}) for release audit...`;
   sendLog(ws, `Starting release audit — cloning ${baseBranch} (reference branch), candidate ${candidateSha.slice(0, 12)}...\n`);
@@ -658,21 +669,21 @@ export async function handleReleaseAudit(
   // unresolvable range after a clean fetch still fails loud below.
   sendLog(ws, `Fetching candidate commit ${candidateSha.slice(0, 12)} (full history) for diff computation (staying on ${baseBranch})...\n`);
   const { diffRangeResolves, diffRangeFailDetail } =
-    await fetchCandidateCommitWithRetry(candidateSha, diffRange, ws);
+    await fetchCandidateCommitWithRetry(candidateSha, fullDiffRange, ws);
 
   if (!diffRangeResolves) {
     // Never let the agent run an unaudited audit. A diff range that does not
     // resolve makes every downstream audit_score meaningless — post a FAILED
     // status with a clear failure category so the qualifier records a blocker
     // rather than a false audit_score: 1.0.
-    sendLog(ws, `Aborting release audit: cannot compute ${diffRange} — refusing to emit an unaudited audit_score.\n`);
+    sendLog(ws, `Aborting release audit: cannot compute ${fullDiffRange} — refusing to emit an unaudited audit_score.\n`);
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'FAILED',
       artifact_type: 'ERROR_LOG',
       failure_category: 'diff_range_unresolvable',
       logs: sanitize(
-        `Release audit aborted: diff range ${diffRange} does not resolve. ` +
+        `Release audit aborted: diff range ${fullDiffRange} does not resolve. ` +
         `The candidate commit ${candidateSha} could not be fetched, or the ` +
         `merge-base of ${baseBranch} and the candidate is unreachable, so ` +
         `git diff would error or produce a wrong diff. ` +
@@ -680,6 +691,31 @@ export async function handleReleaseAudit(
       ),
     });
     return;
+  }
+
+  if (requestedAuditBaseSha) {
+    try {
+      execFileSync('git', ['cat-file', '-e', `${requestedAuditBaseSha}^{commit}`], {
+        cwd: WORKSPACE, stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      execFileSync('git', ['merge-base', '--is-ancestor', requestedAuditBaseSha, candidateSha], {
+        cwd: WORKSPACE, stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      const candidateDelta = `${requestedAuditBaseSha}..${candidateSha}`;
+      // Force git to parse both endpoints/range before selecting it. An empty
+      // delta is valid; a missing object or malformed range throws.
+      execFileSync('git', ['rev-list', '--count', candidateDelta], {
+        cwd: WORKSPACE, stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      diffRange = candidateDelta;
+      auditScopeMode = 'incremental';
+      auditScopeFallbackReason = null;
+      sendLog(ws, `Using incremental audit range ${diffRange}; prior candidate was clean and is an ancestor.\n`);
+    } catch (e) {
+      auditScopeFallbackReason = e instanceof Error ? e.message.slice(0, 500) : String(e).slice(0, 500);
+      diffRange = fullDiffRange;
+      sendLog(ws, `[WARNING] Incremental audit base ${requestedAuditBaseSha.slice(0, 12)} is not usable; falling back to full range ${fullDiffRange}.\n`);
+    }
   }
 
   // Deterministically compute test erosion from the actual diff so the
@@ -692,6 +728,7 @@ export async function handleReleaseAudit(
     deleted_test_file_classifications?: { path: string; classification: string; rationale: string }[];
   };
   let computedTestErosion: ComputedTestErosion | null = null;
+  let auditedChangedPaths: string[] = [];
   try {
     // Matches test paths at any depth: root-level (testing/foo.py) or nested
     // (src/testing/foo.py), plus .test. / .spec. file markers.
@@ -708,6 +745,12 @@ export async function handleReleaseAudit(
         .map((line: string) => line.slice(2).trim())
         .filter((p: string) => p.length > 0)
     );
+    auditedChangedPaths = [...new Set(
+      nameStatus.split('\n').flatMap((line: string) => {
+        const fields = line.trim().split('\t');
+        return fields.length >= 2 ? fields.slice(1) : [];
+      }).filter((p: string) => p.length > 0)
+    )].sort();
     const deletedTestFiles = [...allDeletedFiles].filter((p: string) => TEST_PATH_RE.test(p));
 
     // Derive the subject source file path(s) for a given test file path.
@@ -848,7 +891,7 @@ export async function handleReleaseAudit(
     ? `\n- Authorized migration revision-identity divergences are owned by a separate deterministic gate, NOT the audit. If the diff renumbers or reuses a migration revision id that is an authorized, reconciled divergence, do NOT raise a finding for the revision-identity/renumber itself — the qualifier's migration-identity gate evaluates it and deploy-time reconciliation handles it. You SHOULD still flag genuinely broken migration BODIES (bad DDL, missing/incorrect downgrade, destructive re-apply, data-loss risk) on those same files.`
     : '';
 
-  const releaseAuditCorePrompt = `You are a release audit agent. You have been cloned onto \`${baseBranch}\` — the last known-good LTS branch — and your job is to review the incoming diff range \`${diffRange}\` against \`${baseBranch}\`'s standards. \`${candidateSha}\` is the PINNED release candidate commit (a snapshot of the integration branch); it has already been fetched into this clone, so the diff range resolves.
+  const releaseAuditCorePrompt = `You are a release audit agent. You have been cloned onto \`${baseBranch}\` — the last known-good LTS branch — and your job is to review the incoming ${auditScopeMode === 'incremental' ? 'changed-path delta since the last clean audit' : 'full candidate diff'} range \`${diffRange}\` against \`${baseBranch}\`'s standards. \`${candidateSha}\` is the PINNED release candidate commit (a snapshot of the integration branch); it has already been fetched into this clone, so the diff range resolves.
 
 IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge the incoming changes by \`${baseBranch}\`'s standards, NOT by the new code's standards. This asymmetry is the entire point of the audit.
 
@@ -949,14 +992,48 @@ Rules:
     findings?: unknown[];
   } | null;
 
+  const enrichAuditOutput = (output: Record<string, unknown>): Record<string, unknown> => {
+    const rawFindings = Array.isArray(output.findings) ? output.findings : null;
+    const findings = rawFindings === null ? output.findings : rawFindings.map((raw) => {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw;
+      const finding = { ...(raw as Record<string, unknown>) };
+      const path = typeof finding.file === 'string' ? finding.file.trim() : '';
+      if (path) {
+        try {
+          finding.blob_sha = execFileSync('git', ['rev-parse', `${candidateSha}:${path}`], {
+            cwd: WORKSPACE, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim();
+        } catch {
+          // Cross-cutting/deleted/renamed paths have no candidate blob. The
+          // finding remains usable, but cannot be reused by exact blob identity.
+        }
+      }
+      return finding;
+    });
+    return {
+      ...output,
+      ...(rawFindings === null ? {} : { findings }),
+      ...(computedTestErosion === null ? {} : { computed_test_erosion: computedTestErosion }),
+      audit_scope: {
+        mode: auditScopeMode,
+        requested_base_sha: requestedAuditBaseSha,
+        effective_base_sha: auditScopeMode === 'incremental' ? requestedAuditBaseSha : null,
+        candidate_sha: candidateSha,
+        diff_range: diffRange,
+        changed_paths: auditedChangedPaths,
+        fallback_reason: auditScopeFallbackReason,
+      },
+    };
+  };
+
   // Inject computed_test_erosion into the artifact so the backend can use it
   // as the authoritative signal rather than the LLM's self-reported test_erosion.
   // deleted_test_file_classifications (the per-file dead_code_removal /
   // genuine_erosion disposition) is carried through verbatim from the parsed
   // handler output so it reaches release_scoring._score_audit, which retired the
   // hardcoded AUTHORIZED_TEST_DELETIONS allowlist in favour of this signal.
-  const enrichedOutput = handlerOutput !== null && computedTestErosion !== null
-    ? { ...handlerOutput, computed_test_erosion: computedTestErosion }
+  const enrichedOutput = handlerOutput !== null
+    ? enrichAuditOutput(handlerOutput as Record<string, unknown>)
     : handlerOutput;
 
   let logs = '';
@@ -981,9 +1058,7 @@ Output ONLY the JSON object now — with top-level "audit_score", "test_erosion"
       retryStatus: 'Repairing release audit JSON...',
     });
     if (repaired.value !== null) {
-      const enrichedExtracted = computedTestErosion !== null
-        ? { ...repaired.value, computed_test_erosion: computedTestErosion }
-        : repaired.value;
+      const enrichedExtracted = enrichAuditOutput(repaired.value);
       logs = sanitize(JSON.stringify(enrichedExtracted));
     } else {
       releaseAuditUnparseable = exitCode === 0;

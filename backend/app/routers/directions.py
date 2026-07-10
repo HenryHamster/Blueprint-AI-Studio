@@ -1668,44 +1668,54 @@ async def create_direction_research_task(
             ),
         )
 
-    # Legacy fallback: very old tasks that stored the direction in the
-    # 'directions' payload array rather than a top-level current_direction_id.
-    active_research = (
-        (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.project_id == project.id,
-                    Task.status.in_(active_statuses),
-                    Task.payloads[0]["type"].as_string() == "research",
-                )
-                .options(load_only(Task.id, Task.payloads, Task.status, raiseload=True))
+    # Legacy fallback: very old tasks stored the direction only in the first
+    # payload's ``directions`` array. The array match can't be expressed
+    # portably in SQL (JSONB containment is PostgreSQL-only), so page through
+    # the project's active research tasks by keyset and match in Python. The
+    # legacy population is tiny and shrinking, so this rarely exceeds one page.
+    _LEGACY_SCAN_PAGE_SIZE = 200
+    last_seen_id = None
+    while True:
+        page_query = (
+            select(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.status.in_(active_statuses),
+                Task.payloads[0]["type"].as_string() == "research",
             )
+            .options(load_only(Task.id, Task.payloads, Task.status, raiseload=True))
+            .order_by(Task.id)
+            .limit(_LEGACY_SCAN_PAGE_SIZE)
         )
-        .scalars()
-        .all()
-    )
-    for rt in active_research:
-        rp = rt.first_payload
-        if rp.get("type") != "research":
-            continue
-        rt_direction_id = rp.get("current_direction_id") or next(
-            (
-                d.get("id")
-                for d in (rp.get("directions") or [])
-                if isinstance(d, dict) and d.get("id")
-            ),
-            None,
-        )
-        if rt_direction_id == direction_id:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Research is already in progress on this direction "
-                    f"(task {str(rt.id)[:8]}, status {rt.status}). "
-                    f"Cancel it before starting another."
+        if last_seen_id is not None:
+            page_query = page_query.where(Task.id > last_seen_id)
+        page = (await session.execute(page_query)).scalars().all()
+        if not page:
+            break
+        last_seen_id = page[-1].id
+        for rt in page:
+            rp = rt.first_payload
+            if rp.get("type") != "research":
+                continue
+            rt_direction_id = rp.get("current_direction_id") or next(
+                (
+                    d.get("id")
+                    for d in (rp.get("directions") or [])
+                    if isinstance(d, dict) and d.get("id")
                 ),
+                None,
             )
+            if rt_direction_id == direction_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Research is already in progress on this direction "
+                        f"(task {str(rt.id)[:8]}, status {rt.status}). "
+                        f"Cancel it before starting another."
+                    ),
+                )
+        if len(page) < _LEGACY_SCAN_PAGE_SIZE:
+            break
 
     if not bypass_cooldown:
         refractory_info = get_direction_refractory_info(direction)

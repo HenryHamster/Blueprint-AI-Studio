@@ -459,6 +459,77 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     expect(prompt).not.toContain('git diff main...automain');
   });
 
+  it('uses a verified prior clean candidate as the incremental range and explains the scope', async () => {
+    const auditBaseSha = '0123456789abcdef0123456789abcdef01234567';
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/main.py\n';
+      if (a[0] === 'diff') return '';
+      return '';
+    });
+
+    await handleReleaseAudit(
+      TASK_ID, { ...RELEASE_PAYLOAD, audit_base_sha: auditBaseSha }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const deltaRange = `${auditBaseSha}..${CANDIDATE_SHA}`;
+    expect(vi.mocked(runClaudeCode).mock.calls[0][0]).toContain(`git diff ${deltaRange}`);
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string);
+    expect(report.audit_scope).toMatchObject({
+      mode: 'incremental',
+      effective_base_sha: auditBaseSha,
+      diff_range: deltaRange,
+      changed_paths: ['backend/app/main.py'],
+      fallback_reason: null,
+    });
+  });
+
+  it('falls back to the full range when the requested baseline is not an ancestor', async () => {
+    const auditBaseSha = '0123456789abcdef0123456789abcdef01234567';
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'merge-base') throw new Error('not an ancestor');
+      if (a[0] === 'diff' && a[1] === '--name-status') return '';
+      if (a[0] === 'diff') return '';
+      return '';
+    });
+
+    await handleReleaseAudit(
+      TASK_ID, { ...RELEASE_PAYLOAD, audit_base_sha: auditBaseSha }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls[0][0]).toContain(`git diff ${DIFF_RANGE}`);
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string);
+    expect(report.audit_scope.mode).toBe('full');
+    expect(report.audit_scope.effective_base_sha).toBeNull();
+    expect(report.audit_scope.fallback_reason).toContain('not an ancestor');
+  });
+
+  it('attaches the candidate blob SHA to path findings', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 0.98,
+      findings: [{ severity: 'low', summary: 'cache issue', file: 'backend/app/cache.py' }],
+    });
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'rev-parse' && a[1] === `${CANDIDATE_SHA}:backend/app/cache.py`) {
+        return `${'c'.repeat(40)}\n`;
+      }
+      if (a[0] === 'diff') return '';
+      return '';
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string);
+    expect(report.findings[0].blob_sha).toBe('c'.repeat(40));
+  });
+
   it('FAILS LOUD with diff_range_unresolvable when no valid candidate_sha is supplied', async () => {
     // Missing candidate_sha is a real contract bug — there is no commit to
     // diff. The handler must not fall back to the bare `automain` name.

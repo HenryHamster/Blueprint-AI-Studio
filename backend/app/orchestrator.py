@@ -2716,7 +2716,29 @@ async def orchestrator_worker():
                 # (get_project_recent_spend_usd, session.get(Project)) when multiple
                 # tasks from the same project are dispatched in one cycle — mirrors
                 # the caching pattern in _filter_project_resource_dispatch_eligible.
-                _project_cache_for_dispatch: dict[uuid.UUID, Project | None] = {}
+                # Populate full Project rows in one round trip before the task
+                # loop. The earlier Project->user_id cache is only a projection
+                # and cannot serve the resource-envelope checks below.
+                # Pre-seeding absent ids with None also prevents a concurrently
+                # deleted project from falling back to a point lookup.
+                _project_cache_for_dispatch: dict[uuid.UUID, Project | None] = {
+                    project_id: None for project_id in _all_candidate_pids
+                }
+                if _all_candidate_pids:
+                    _dispatch_projects = (
+                        (
+                            await session.execute(
+                                select(Project).where(
+                                    Project.id.in_(_all_candidate_pids)
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    _project_cache_for_dispatch.update(
+                        {project.id: project for project in _dispatch_projects}
+                    )
                 _spend_cache_for_dispatch: dict[uuid.UUID, tuple[float, float, int]] = {}
 
                 for _qt_id, _task_type_for_gate in _queued_task_gate_info:

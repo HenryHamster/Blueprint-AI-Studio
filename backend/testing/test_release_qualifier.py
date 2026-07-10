@@ -2623,6 +2623,24 @@ class TestExtractAuditFindings:
             "dup summary", "a.py"
         )
 
+    def test_extract_audit_findings_carries_blob_keyed_surface_identity(self):
+        report = {
+            "findings": [
+                {
+                    "severity": "low",
+                    "summary": "Leaky cache lifetime.",
+                    "file": "backend/app/cache.py",
+                    "blob_sha": "b" * 40,
+                }
+            ]
+        }
+        finding = rq._extract_audit_findings(report)[0]
+        assert finding["blob_sha"] == "b" * 40
+        assert finding["surface_key"]
+        changed_blob = {**report["findings"][0], "blob_sha": "c" * 40}
+        changed = rq._extract_audit_findings({"findings": [changed_blob]})[0]
+        assert changed["surface_key"] != finding["surface_key"]
+
     def test_path_field_used_as_file_fallback(self):
         """When the raw finding keys the location as 'path' (not 'file'), the
         carried finding still gets file attribution."""
@@ -7741,6 +7759,41 @@ class TestComputeAuditedSurfaceHash:
             )
             is None
         )
+
+
+class TestIncrementalAuditBaseline:
+    OLD = "a" * 40
+    NEW = "b" * 40
+
+    @staticmethod
+    def clean(**overrides):
+        record = {
+            "status": "not_promoted",
+            "candidate_sha": TestIncrementalAuditBaseline.OLD,
+            "sub_scores": {"audit": 1.0},
+            "audit_findings": [],
+            "excluded_audit_findings": [],
+            "audit_findings_total": 0,
+            "excluded_audit_findings_total": 0,
+        }
+        record.update(overrides)
+        return record
+
+    def test_clean_audit_can_anchor_delta_even_if_another_gate_blocked(self):
+        assert rq._incremental_audit_base_sha(self.clean(), self.NEW) == self.OLD
+
+    def test_any_verified_or_unverified_finding_forces_full_audit(self):
+        assert rq._incremental_audit_base_sha(
+            self.clean(audit_findings=[{"summary": "x"}]), self.NEW
+        ) is None
+        assert rq._incremental_audit_base_sha(
+            self.clean(excluded_audit_findings=[{"summary": "x"}]), self.NEW
+        ) is None
+
+    def test_legacy_record_without_audit_score_forces_full_audit(self):
+        assert rq._incremental_audit_base_sha(
+            self.clean(sub_scores={}), self.NEW
+        ) is None
 
 
 @pytest.mark.asyncio
