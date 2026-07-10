@@ -10781,7 +10781,7 @@ class TestGetAllProjectsPagination:
 
     @pytest.mark.asyncio
     async def test_limit_max_enforced(self, client: AsyncClient, db_session):
-        resp = await client.get("/api/admin/projects?limit=200")
+        resp = await client.get("/api/admin/projects?limit=501")
         assert resp.status_code == 422
 
     @pytest.mark.asyncio
@@ -12826,6 +12826,7 @@ class TestAcceptanceCriteriaRouter:
             "version_number": 1,
             "total": 0,
             "covered": 0,
+            "attested": 0,
             "partial": 0,
             "uncovered": 0,
             "inactive": 0,

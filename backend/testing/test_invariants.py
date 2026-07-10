@@ -1617,6 +1617,7 @@ class TestSchemaRevisionSync:
             "create_unique_constraint",
             "create_check_constraint",
             "batch_alter_table",
+            "get_bind",
         }
 
         migrations_dir = os.path.join(

@@ -346,6 +346,7 @@ async def test_seed_is_idempotent(client: AsyncClient, db_session):
     assert len(tools) == 1
 
 
+
 @pytest.mark.asyncio
 async def test_seed_requires_owner(client: AsyncClient, db_session):
     """A member (below owner) cannot seed default tools -> 403."""

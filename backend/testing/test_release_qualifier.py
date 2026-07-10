@@ -9746,7 +9746,7 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
 
     Exercises the production read-surface wiring in
     ``routers/agent_strategic_fetch.py`` (which threads the shared
-    ``compute_qualification_trigger_state`` classifier onto every branch of
+    ``explain_qualification_trigger`` classifier onto every branch of
     ``agent_fetch_qualification``), end-to-end over the real HTTP route.
     """
     from httpx import AsyncClient  # noqa: PLC0415
@@ -9793,6 +9793,9 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     assert armed is not None
     assert armed["auto_trigger"] == "armed"
     assert armed["next_expected_trigger"] is not None
+    assert armed["decision"]["reason"] == "armed"
+    assert armed["decision"]["fire"] is True
+    assert armed["decision"]["blocking"] == []
 
     # BLOCKED: add a second active criterion with no covering evidence →
     # coverage becomes incomplete (1/2) so the trigger is blocked, and the
@@ -9809,9 +9812,14 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     assert res.status_code == 200, res.text
     blocked = res.json()["qualification_trigger_state"]
     assert blocked is not None
-    assert blocked["auto_trigger"] in ("blocked", "waiting")
+    assert blocked["auto_trigger"] == "waiting"
     assert blocked["next_expected_trigger"] is not None
     assert blocked["attempts"]["count"] == 0
+    assert blocked["decision"]["reason"] == "coverage_incomplete"
+    assert blocked["decision"]["fire"] is False
+    assert any(
+        "criterion coverage incomplete" in b for b in blocked["decision"]["blocking"]
+    ), f"expected coverage message in blocking list: {blocked['decision']['blocking']}"
 
 
 @pytest.mark.asyncio
@@ -10333,6 +10341,7 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
     assert version.last_qualification["criterion_coverage"] == {
         "total": 0,
         "covered": 0,
+        "attested": 0,
         "partial": 0,
         "uncovered": 0,
         "retracted": 0,

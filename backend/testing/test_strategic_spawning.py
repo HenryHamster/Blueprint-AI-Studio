@@ -8159,11 +8159,12 @@ async def test_version_phase_block_carries_criterion_coverage(
     coverage = vp.get("criterion_coverage")
     assert coverage is not None, "criterion_coverage should be present in version_phase"
     assert coverage["total"] == 3
-    assert coverage["covered"] == 1
+    assert coverage["covered"] == 0
+    assert coverage["attested"] == 1
     assert coverage["partial"] == 1
     assert coverage["uncovered"] == 1
     by_key = {entry["criterion_key"]: entry for entry in coverage["criteria"]}
-    assert by_key[c_covered.criterion_key]["coverage"] == "covered"
+    assert by_key[c_covered.criterion_key]["coverage"] == "attested"
     assert by_key[c_partial.criterion_key]["coverage"] == "partial"
     assert by_key[c_uncovered.criterion_key]["coverage"] == "uncovered"
 

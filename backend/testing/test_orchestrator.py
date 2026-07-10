@@ -9312,7 +9312,9 @@ class TestDispatchCrashContainment:
             self._clear_slots(_orch_module)
 
         release_mock.assert_any_await(
-            "acct-poison-release", revert_daily_task_count=True
+            "acct-poison-release",
+            revert_daily_task_count=True,
+            project_id=str(project.id),
         )
 
     @pytest.mark.asyncio

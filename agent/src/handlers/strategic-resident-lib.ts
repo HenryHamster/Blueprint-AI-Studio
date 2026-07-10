@@ -552,7 +552,6 @@ function buildFileReference(att: Record<string, unknown>): string {
   const sizeStr = sizeBytes !== null ? `, ${sizeBytes} bytes` : '';
   return `[File attachment: ${name} (${mimeType}${sizeStr})]`;
 }
-
 export interface AttachmentFetchResponse {
   ok: boolean;
   status: number;
@@ -634,13 +633,13 @@ export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] 
                   name: attachmentName(att.name) || undefined,
                 },
               });
+              imageCount++;
             } else {
               blocks.push(attachmentUnavailableBlock(
                 { type: 'url', url: '', media_type: mediaType, name: attachmentName(att.name) || undefined },
                 'unsupported download URL',
               ));
-            }
-            imageCount++;
+          }
           }
         } else {
           // Non-image attachment: decode text-like content or emit a reference block.
