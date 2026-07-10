@@ -1505,5 +1505,242 @@ class StatusCommandTests(unittest.TestCase):
             self.assertIn("could not read", fake_stderr.getvalue())
 
 
+class WriteEnvFileResourceLimitsTests(unittest.TestCase):
+    """_write_env_file writes resource-limit env vars when supplied."""
+
+    def test_resource_limits_written_to_env_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            br._write_env_file(
+                path,
+                url="https://orch.example",
+                token="tok",
+                resource_limits={
+                    "BLUEPRINT_RUNNER_MAX_CONCURRENT": "4",
+                    "BLUEPRINT_RUNNER_GPU_INDICES": "0,1",
+                },
+            )
+            with open(path) as f:
+                content = f.read()
+        self.assertIn("BLUEPRINT_RUNNER_MAX_CONCURRENT=4", content)
+        self.assertIn("BLUEPRINT_RUNNER_GPU_INDICES=0,1", content)
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL=https://orch.example", content)
+        self.assertIn("BLUEPRINT_RUNNER_TOKEN=tok", content)
+
+    def test_no_resource_limits_omits_limit_lines(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            br._write_env_file(path, url="https://orch.example", token=None)
+            with open(path) as f:
+                content = f.read()
+        self.assertNotIn("MAX_CONCURRENT", content)
+        self.assertNotIn("GPU", content)
+
+    def test_all_resource_limit_flags_written(self):
+        import tempfile
+        limits = {env_var: f"val_{i}" for i, (_, env_var, _, _) in enumerate(br._RESOURCE_LIMIT_VARS)}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            br._write_env_file(path, url="https://orch.example", token=None, resource_limits=limits)
+            with open(path) as f:
+                content = f.read()
+        for env_var, value in limits.items():
+            self.assertIn(f"{env_var}={value}", content)
+
+    def test_env_file_mode_is_0600(self):
+        import tempfile
+        import stat
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            br._write_env_file(path, url="https://o.example", token=None)
+            mode = oct(stat.S_IMODE(os.stat(path).st_mode))
+        self.assertEqual(mode, oct(0o600))
+
+
+class ReadEnvFileTests(unittest.TestCase):
+    """_read_env_file parses key=value pairs correctly."""
+
+    def test_parses_key_value_pairs(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            with open(path, "w") as f:
+                f.write("# comment\nFOO=bar\nBAZ=qux\n")
+            result = br._read_env_file(path)
+        self.assertEqual(result, {"FOO": "bar", "BAZ": "qux"})
+
+    def test_missing_file_returns_empty_dict(self):
+        result = br._read_env_file("/nonexistent/path/runner.env")
+        self.assertEqual(result, {})
+
+    def test_blank_lines_and_comments_skipped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "runner.env")
+            with open(path, "w") as f:
+                f.write("# header\n\nKEY=value\n\n# another comment\n")
+            result = br._read_env_file(path)
+        self.assertEqual(result, {"KEY": "value"})
+
+
+class InstallResourceLimitFlagsTests(unittest.TestCase):
+    """install subcommand writes resource-limit flags into the env file."""
+
+    def _fake_systemd(self, *, available=True, active=True, enabled=True):
+        """Return fakes for _systemd_available and _systemctl."""
+        def fake_systemd_avail(**kwargs):
+            return available
+
+        def fake_systemctl(args, **kwargs):
+            sub = args[0] if args else ""
+            rc = 0
+            if sub == "is-active" and not active:
+                rc = 1
+            if sub == "is-enabled" and not enabled:
+                rc = 1
+            return MagicMock(returncode=rc)
+
+        return fake_systemd_avail, fake_systemctl
+
+    def test_max_concurrent_flag_written_to_env_file(self):
+        import tempfile
+        avail, systemctl = self._fake_systemd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(br, "_credential_dir", return_value=tmpdir), \
+                 patch.object(br, "_user_unit_path", return_value=os.path.join(tmpdir, "unit")), \
+                 patch.object(br, "_systemd_available", avail), \
+                 patch.object(br, "_systemctl", systemctl), \
+                 patch.object(br, "render_unit", return_value="[Unit]"), \
+                 patch.object(br, "_install_user", return_value="testuser"):
+                rc = br.do_install(
+                    url="https://o.example",
+                    resource_limits={"BLUEPRINT_RUNNER_MAX_CONCURRENT": "6"},
+                )
+            env_path = os.path.join(tmpdir, "runner.env")
+            with open(env_path) as f:
+                content = f.read()
+        self.assertEqual(rc, 0)
+        self.assertIn("BLUEPRINT_RUNNER_MAX_CONCURRENT=6", content)
+
+    def test_gpu_indices_flag_written_to_env_file(self):
+        import tempfile
+        avail, systemctl = self._fake_systemd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(br, "_credential_dir", return_value=tmpdir), \
+                 patch.object(br, "_user_unit_path", return_value=os.path.join(tmpdir, "unit")), \
+                 patch.object(br, "_systemd_available", avail), \
+                 patch.object(br, "_systemctl", systemctl), \
+                 patch.object(br, "render_unit", return_value="[Unit]"), \
+                 patch.object(br, "_install_user", return_value="testuser"):
+                rc = br.do_install(
+                    url="https://o.example",
+                    resource_limits={"BLUEPRINT_RUNNER_GPU_INDICES": "2,3"},
+                )
+            env_path = os.path.join(tmpdir, "runner.env")
+            with open(env_path) as f:
+                content = f.read()
+        self.assertEqual(rc, 0)
+        self.assertIn("BLUEPRINT_RUNNER_GPU_INDICES=2,3", content)
+
+    def test_no_resource_limits_installs_cleanly(self):
+        import tempfile
+        avail, systemctl = self._fake_systemd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(br, "_credential_dir", return_value=tmpdir), \
+                 patch.object(br, "_user_unit_path", return_value=os.path.join(tmpdir, "unit")), \
+                 patch.object(br, "_systemd_available", avail), \
+                 patch.object(br, "_systemctl", systemctl), \
+                 patch.object(br, "render_unit", return_value="[Unit]"), \
+                 patch.object(br, "_install_user", return_value="testuser"):
+                rc = br.do_install(url="https://o.example")
+        self.assertEqual(rc, 0)
+
+    def test_install_parser_accepts_resource_limit_flags(self):
+        """argparse install subparser accepts all resource-limit flags."""
+        parser = br.build_parser()
+        args = parser.parse_args([
+            "install", "--token", "tok",
+            "--max-concurrent", "4",
+            "--max-concurrent-compute-jobs", "2",
+            "--gpu-indices", "0,1",
+            "--gpus-per-job", "2",
+            "--cpu-limit", "8",
+            "--mem-limit", "16g",
+            "--min-disk-bytes", "10000000",
+        ])
+        self.assertEqual(args.max_concurrent, "4")
+        self.assertEqual(args.gpu_indices, "0,1")
+        self.assertEqual(args.mem_limit, "16g")
+        self.assertEqual(args.min_disk_bytes, "10000000")
+
+
+class StatusResourceLimitsTests(unittest.TestCase):
+    """do_status displays resource-limit config from runner.env."""
+
+    def _write_status(self, tmpdir: str) -> None:
+        status_path = os.path.join(tmpdir, "status.json")
+        with open(status_path, "w") as f:
+            json.dump({
+                "runner_id": "r1",
+                "last_heartbeat_at": "2026-07-09T12:00:00+00:00",
+                "last_heartbeat_status": "ok",
+                "active_task_ids": [],
+                "active_compute_job_ids": [],
+            }, f)
+
+    def test_status_shows_configured_resource_limits(self):
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_status(tmpdir)
+            env_path = os.path.join(tmpdir, "runner.env")
+            with open(env_path, "w") as f:
+                f.write("BLUEPRINT_ORCHESTRATOR_URL=https://o.example\n")
+                f.write("BLUEPRINT_RUNNER_MAX_CONCURRENT=8\n")
+                f.write("BLUEPRINT_RUNNER_GPU_INDICES=0,1,2\n")
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+        self.assertEqual(rc, 0)
+        output = fake_stdout.getvalue()
+        self.assertIn("max-concurrent", output)
+        self.assertIn("8", output)
+        self.assertIn("gpu-indices", output)
+        self.assertIn("0,1,2", output)
+
+    def test_status_shows_not_set_for_unconfigured_limits(self):
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_status(tmpdir)
+            env_path = os.path.join(tmpdir, "runner.env")
+            with open(env_path, "w") as f:
+                f.write("BLUEPRINT_ORCHESTRATOR_URL=https://o.example\n")
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+        self.assertEqual(rc, 0)
+        output = fake_stdout.getvalue()
+        self.assertIn("not set (using default)", output)
+
+    def test_status_notes_when_env_file_absent(self):
+        import tempfile
+        import io
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_status(tmpdir)
+            # No runner.env written — simulates uninstalled / direct-run scenario
+            with patch.object(br, "_credential_dir", return_value=tmpdir):
+                fake_stdout = io.StringIO()
+                with patch.object(br.sys, "stdout", fake_stdout):
+                    rc = br.do_status()
+        self.assertEqual(rc, 0)
+        output = fake_stdout.getvalue()
+        self.assertIn("env file not found", output)
+
+
 if __name__ == "__main__":
     unittest.main()

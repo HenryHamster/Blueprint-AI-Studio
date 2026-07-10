@@ -66,6 +66,53 @@ _USER_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner.service")
 _SYSTEM_SERVICE_TEMPLATE = os.path.join(_SCRIPT_DIR, "blueprint-runner-system.service")
 _SYSTEM_WANTED_BY = "multi-user.target"
 
+# Resource-limit env vars: (cli-flag, env-var, argparse-dest, help-text).
+# Used by the install flags and by `status` to show effective config.
+_RESOURCE_LIMIT_VARS: list[tuple[str, str, str, str]] = [
+    (
+        "--max-concurrent",
+        "BLUEPRINT_RUNNER_MAX_CONCURRENT",
+        "max_concurrent",
+        "Max simultaneous agent subprocesses (default: 2).",
+    ),
+    (
+        "--max-concurrent-compute-jobs",
+        "BLUEPRINT_RUNNER_MAX_CONCURRENT_COMPUTE_JOBS",
+        "max_concurrent_compute_jobs",
+        "Max simultaneous compute jobs (default: 2).",
+    ),
+    (
+        "--gpu-indices",
+        "BLUEPRINT_RUNNER_GPU_INDICES",
+        "gpu_indices",
+        "Comma-separated GPU-index allowlist (default: all GPUs).",
+    ),
+    (
+        "--gpus-per-job",
+        "BLUEPRINT_RUNNER_GPUS_PER_JOB",
+        "gpus_per_job",
+        "GPUs assigned per compute job (default: 1).",
+    ),
+    (
+        "--cpu-limit",
+        "BLUEPRINT_RUNNER_CPU_LIMIT",
+        "cpu_limit",
+        "Best-effort CPU cap (cores) per task.",
+    ),
+    (
+        "--mem-limit",
+        "BLUEPRINT_RUNNER_MEM_LIMIT",
+        "mem_limit",
+        "Best-effort memory cap per task (e.g. 8g).",
+    ),
+    (
+        "--min-disk-bytes",
+        "BLUEPRINT_RUNNER_MIN_DISK_BYTES",
+        "min_disk_bytes",
+        "Stop claiming work when free disk space is below this many bytes (default: 0 = disabled).",
+    ),
+]
+
 
 @dataclass(frozen=True)
 class Prereq:
@@ -590,7 +637,30 @@ def _print_no_systemd_guidance(*, system: bool) -> None:
     )
 
 
-def _write_env_file(path: str, *, url: str, token: str | None) -> None:
+def _read_env_file(path: str) -> dict[str, str]:
+    """Parse key=value pairs from a runner.env file, skipping blank lines and comments."""
+    result: dict[str, str] = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, val = line.partition("=")
+                    result[key.strip()] = val.strip()
+    except OSError:
+        pass
+    return result
+
+
+def _write_env_file(
+    path: str,
+    *,
+    url: str,
+    token: str | None,
+    resource_limits: dict[str, str] | None = None,
+) -> None:
     """Seed the 0600 EnvironmentFile so the service has its config on first start.
 
     The orchestrator URL is required (local_runner._require_env). The token is
@@ -598,6 +668,9 @@ def _write_env_file(path: str, *, url: str, token: str | None) -> None:
     persists it to ``runner_token`` and the service reads it from there, so we
     prefer not to keep it here indefinitely, but seeding it makes a fresh install
     connect on its very first boot with no manual step.
+
+    ``resource_limits`` maps env-var name to value string for any resource-limit
+    knobs the operator supplied at install time (all optional).
     """
     cred_dir = os.path.dirname(path)
     os.makedirs(cred_dir, exist_ok=True)
@@ -611,6 +684,9 @@ def _write_env_file(path: str, *, url: str, token: str | None) -> None:
     ]
     if token:
         lines.append(f"BLUEPRINT_RUNNER_TOKEN={token}\n")
+    if resource_limits:
+        for env_var, value in resource_limits.items():
+            lines.append(f"{env_var}={value}\n")
     with open(path, "w", encoding="utf-8") as fh:
         fh.writelines(lines)
     try:
@@ -625,6 +701,7 @@ def do_install(
     token: str | None = None,
     url: str,
     dry_run: bool = False,
+    resource_limits: dict[str, str] | None = None,
     _run=subprocess.run,
 ) -> int:
     """Render, install, enable, and persist the runner service. Returns rc."""
@@ -664,7 +741,7 @@ def do_install(
         print("\n" + unit_text, flush=True)
         return 0
 
-    _write_env_file(env_file, url=url, token=token)
+    _write_env_file(env_file, url=url, token=token, resource_limits=resource_limits)
 
     try:
         os.makedirs(os.path.dirname(unit_path), exist_ok=True)
@@ -1034,6 +1111,20 @@ def do_status() -> int:
         else:
             print("  health                 : OK", flush=True)
 
+    # ── Resource-limit config (from runner.env) ──
+    env_file = _env_file_path()
+    env_vars = _read_env_file(env_file)
+    env_file_found = bool(env_vars) or os.path.exists(env_file)
+    print("", flush=True)
+    print("resource limits (from runner.env):", flush=True)
+    if not env_file_found:
+        print(f"  (env file not found at {env_file} — runner may not be installed as a service)", flush=True)
+    for _flag, env_var, _dest, _help in _RESOURCE_LIMIT_VARS:
+        value = env_vars.get(env_var)
+        display = value if value is not None else "not set (using default)"
+        label = env_var.lower().replace("blueprint_runner_", "").replace("_", "-")
+        print(f"  {label:<34}: {display}", flush=True)
+
     return 0
 
 
@@ -1175,6 +1266,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Print the rendered unit and the commands that would run, without touching the host.",
     )
+    for _flag, _env_var, _dest, _help_text in _RESOURCE_LIMIT_VARS:
+        install_parser.add_argument(_flag, dest=_dest, default=None, help=_help_text)
 
     uninstall_parser = sub.add_parser(
         "uninstall",
@@ -1264,11 +1357,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install":
         # The token is OPTIONAL for install: if omitted, the service reads the
         # persisted ~/.blueprint/runner_token written on the runner's first start.
+        resource_limits: dict[str, str] = {}
+        for _flag, env_var, dest, _help in _RESOURCE_LIMIT_VARS:
+            val = getattr(args, dest, None)
+            if val is not None:
+                resource_limits[env_var] = str(val)
         return do_install(
             system=getattr(args, "system", False),
             token=resolve_token(getattr(args, "token", None)),
             url=resolve_url(getattr(args, "url", None)),
             dry_run=getattr(args, "dry_run", False),
+            resource_limits=resource_limits or None,
         )
 
     token = resolve_token(getattr(args, "token", None))
