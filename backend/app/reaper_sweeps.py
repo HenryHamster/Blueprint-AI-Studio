@@ -571,6 +571,137 @@ async def sweep_metrics_integrity(session, now=None) -> dict | None:
     return await run_metrics_integrity_sweep(session, now)
 
 
+# Cadence gate for the capability backing-proof sweep. Hourly to bound overall
+# reaper cycle time — the sweep iterates projects and verifies file paths via
+# git ls-files, so a slow project or deep file tree should not run every tick.
+_BACKING_PROOF_INTERVAL_SECONDS = 3600
+_last_backing_proof_sweep: datetime | None = None
+
+
+async def sweep_capability_backing_proofs(session, now=None) -> int:
+    """Step 22: Record backing-path proof for capabilities whose backing files
+    all resolve at HEAD.
+
+    Iterates projects (bounded, default 25), finds working capabilities with
+    non-empty ``backing_paths``, verifies each path via git ls-files against
+    HEAD, and — when ALL paths are definitely present — records a bounded
+    ``backing_path`` proof entry on the project via
+    :func:`app.capability_proof.record_capability_backing_path_proof`.
+
+    Cadence-gated to hourly. Returns the number of new proof entries recorded.
+    Any path returning ``None`` (indeterminate) prevents proof recording for
+    that capability — only a definite True on every path triggers a record.
+    Wrapped so it can never crash the reaper cycle.
+    """
+    global _last_backing_proof_sweep
+    from app import source_ref_validation as _srv
+    from app.capability_proof import record_capability_backing_path_proof
+    from app.models import Project
+    from sqlalchemy.orm import load_only
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_backing_proof_sweep, _BACKING_PROOF_INTERVAL_SECONDS, _now
+    ):
+        return 0
+    _last_backing_proof_sweep = _now
+
+    max_projects = 25
+    rows = (
+        (
+            await session.execute(
+                select(Project)
+                .options(
+                    load_only(
+                        Project.id,
+                        Project.problem_model,
+                        Project.capability_proof_records,
+                        raiseload=True,
+                    )
+                )
+                .limit(max_projects)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not rows:
+        return 0
+
+    total_recorded = 0
+    for project in rows:
+        project_recorded = 0
+        try:
+            pm = getattr(project, "problem_model", None)
+            if not isinstance(pm, dict):
+                continue
+            capabilities = pm.get("capabilities")
+            if not isinstance(capabilities, list):
+                continue
+
+            for cap in capabilities:
+                if not isinstance(cap, dict):
+                    continue
+                status = cap.get("status", "").strip().lower()
+                if status not in ("working", "partial"):
+                    continue
+                backing_paths = cap.get("backing_paths")
+                if not isinstance(backing_paths, list) or not backing_paths:
+                    continue
+
+                cap_name = cap.get("name")
+                if not isinstance(cap_name, str) or not cap_name:
+                    continue
+
+                # Filter to file-like paths; skip globs, logical ids, etc.
+                file_paths = [
+                    p
+                    for p in backing_paths
+                    if isinstance(p, str) and _srv._looks_like_file_path(p)
+                ]
+                if not file_paths:
+                    continue
+
+                # Check every path against HEAD. A single None (indeterminate)
+                # prevents proof recording — only definite True on ALL paths
+                # is sufficient.
+                all_present = True
+                for p in file_paths:
+                    exists = await _srv._path_exists_at_head(p)
+                    if exists is not True:
+                        all_present = False
+                        break
+
+                if all_present and file_paths:
+                    recorded = record_capability_backing_path_proof(
+                        project, cap_name
+                    )
+                    if recorded:
+                        project_recorded += 1
+
+            if project_recorded:
+                session.add(project)
+                await session.commit()
+                total_recorded += project_recorded
+
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] Capability backing-proof sweep failed for project %s:",
+                getattr(project, "id", "?"),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    if total_recorded:
+        logger.info(
+            "[REAPER] Step 22: recorded %d backing-path proof(s)",
+            total_recorded,
+        )
+    return total_recorded
+
+
 async def sweep_stuck_qualifications(session, *, session_factory) -> int:
     """Step 9: Finalize release qualifications stuck 'pending'.
 

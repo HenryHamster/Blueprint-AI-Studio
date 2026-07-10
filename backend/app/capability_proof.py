@@ -32,6 +32,7 @@ __all__ = [
     "annotate_capability_proof_status",
     "carry_proof_records_for_consolidation",
     "enrich_problem_model_capability_proofs",
+    "record_capability_backing_path_proof",
     "record_capability_proof",
     "record_capability_proof_from_trial",
     "record_gap_evidence",
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 _PROOF_KIND_NAMED_TEST = "named_test"
 _PROOF_KIND_DOWNSTREAM_ARTIFACT = "downstream_artifact"
 _PROOF_KIND_TRIAL_ADOPTION = "trial_adoption"
+_PROOF_KIND_BACKING_PATH = "backing_path"
 _MAX_PROOF_ENTRIES_PER_CAPABILITY = 10
 
 # Context key where we read the acceptance verdict.
@@ -353,6 +355,89 @@ def record_capability_proof_from_trial(
             "recorded_at": proved_at,
         },
     )
+
+
+def record_capability_backing_path_proof(project: Any, cap_name: str) -> bool:
+    """Record a bounded proof entry when a working capability's declared
+    ``backing_paths`` all resolve at HEAD (verified by the caller).
+
+    Uses dedup key ``backing:<normalized_cap_name>`` — same prefix-based stable
+    key pattern as ``record_capability_proof_from_trial`` — so a standing
+    verification does not produce duplicate proof entries on re-evaluation.
+
+    Non-raising: all errors are logged at WARNING level so they can never
+    crash the caller (typically a reaper sweep).
+
+    Returns ``True`` when a new entry was recorded, ``False`` when already
+    present (dedup) or when the capability name cannot be normalized.
+    """
+    from app.time_utils import _utcnow
+
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        logger.warning(
+            "[CAPABILITY_PROOF] cannot record backing-path proof — "
+            "capability name %r could not be normalized",
+            cap_name,
+        )
+        return False
+
+    # Stable dedup key: one proof record per capability backing-path verification.
+    dedup_task_id = f"backing:{norm}"
+    proved_at = _utcnow().isoformat()
+
+    proof_entry: dict[str, Any] = {
+        "task_id": dedup_task_id,
+        "proved_at": proved_at,
+        "proof_kind": _PROOF_KIND_BACKING_PATH,
+        "proof_ref": norm,
+        "commit_sha": "",
+    }
+
+    try:
+        if not isinstance(getattr(project, "capability_proof_records", None), dict):
+            project.capability_proof_records = {}
+    except Exception:
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to read capability_proof_records on project",
+            exc_info=True,
+        )
+        return False
+
+    entries: list[dict] = list(project.capability_proof_records.get(norm) or [])
+    if any(e.get("task_id") == dedup_task_id for e in entries):
+        return False
+
+    entries.append(proof_entry)
+    if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+        entries = entries[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+    project.capability_proof_records[norm] = entries
+    try:
+        flag_modified(project, "capability_proof_records")
+    except Exception:
+        logger.warning(
+            "[CAPABILITY_PROOF] flag_modified failed for capability_proof_records",
+            exc_info=True,
+        )
+        return False
+
+    logger.info(
+        "[CAPABILITY_PROOF] recorded backing-path proof for cap=%s",
+        norm,
+    )
+
+    _append_evidence_refs_to_capabilities(
+        project,
+        [norm],
+        {
+            "kind": _PROOF_KIND_BACKING_PATH,
+            "ref": norm,
+            "proven": True,
+            "source_id": dedup_task_id,
+            "recorded_at": proved_at,
+        },
+    )
+    return True
 
 
 def record_gap_evidence(task: Any, project: Any) -> None:

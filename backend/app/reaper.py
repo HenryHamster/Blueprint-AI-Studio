@@ -295,6 +295,7 @@ from app.reaper_sweeps import (
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
     sweep_metrics_integrity,
+    sweep_capability_backing_proofs,
     sweep_closed_handmerge_prs,
     _sweep_strategic_cycle_starvation,
 )
@@ -2908,6 +2909,23 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Backfill-acceptance-verdicts sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22: Capability backing-proof sweep — record backing_path
+                # proof for working capabilities whose declared backing_paths all
+                # resolve at HEAD. Hourly cadence-gated. This is a PRODUCER (writes
+                # proof records), NOT an auditor — it creates evidence for capabilities
+                # that already meet the bar rather than flagging those that don't.
+                # Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    await sweep_capability_backing_proofs(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Capability backing-proof sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

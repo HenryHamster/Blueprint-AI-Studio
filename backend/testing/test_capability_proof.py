@@ -15,12 +15,14 @@ from unittest.mock import MagicMock, patch
 
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
+    _PROOF_KIND_BACKING_PATH,
     _PROOF_KIND_TRIAL_ADOPTION,
     _extract_proof_ref,
     _proof_kind_from_verdict,
     annotate_capability_proof_status,
     carry_proof_records_for_consolidation,
     enrich_problem_model_capability_proofs,
+    record_capability_backing_path_proof,
     record_capability_proof,
     record_capability_proof_from_trial,
     record_gap_evidence,
@@ -813,6 +815,117 @@ class TestRecordCapabilityProofFromTrial:
             record_capability_proof_from_trial(project, "related_tests", entry)
 
         assert "related-tests" in project.capability_proof_records
+
+
+# ── record_capability_backing_path_proof ─────────────────────────────────────
+
+
+class TestRecordCapabilityBackingPathProof:
+    """record_capability_backing_path_proof records backing_path proof entries."""
+
+    def test_records_proof_entry_with_correct_shape(self):
+        """A proof entry is recorded with the correct fields."""
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_backing_path_proof(project, "repo-map")
+
+        assert result is True
+        assert "repo-map" in project.capability_proof_records
+        entries = project.capability_proof_records["repo-map"]
+        assert len(entries) == 1
+        e = entries[0]
+        assert e["proof_kind"] == _PROOF_KIND_BACKING_PATH
+        assert e["proof_ref"] == "repo-map"
+        assert e["task_id"] == "backing:repo-map"
+        assert "proved_at" in e
+        assert e["commit_sha"] == ""
+
+    def test_dedup_returns_false_on_repeat_call(self):
+        """A second call with the same capability name returns False (no duplicate)."""
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            first = record_capability_backing_path_proof(project, "repo-map")
+            second = record_capability_backing_path_proof(project, "repo-map")
+
+        assert first is True
+        assert second is False
+        assert len(project.capability_proof_records["repo-map"]) == 1
+
+    def test_capped_at_max_entries(self):
+        """The proof entry list is bounded at _MAX_PROOF_ENTRIES_PER_CAPABILITY."""
+        cap_key = "repo-map"
+        existing = [
+            {
+                "task_id": f"task-{i}",
+                "proved_at": "2026-01-01T00:00:00",
+                "proof_kind": "named_test",
+                "proof_ref": cap_key,
+                "commit_sha": "",
+            }
+            for i in range(_MAX_PROOF_ENTRIES_PER_CAPABILITY)
+        ]
+        project = _make_project()
+        project.capability_proof_records = {cap_key: existing[:]}
+
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_backing_path_proof(project, "repo-map")
+
+        assert result is True
+        result_entries = project.capability_proof_records[cap_key]
+        assert len(result_entries) == _MAX_PROOF_ENTRIES_PER_CAPABILITY
+        assert result_entries[-1]["task_id"] == "backing:repo-map"
+
+    def test_normalizes_cap_name_with_underscores(self):
+        """Capability names with underscores are normalized to hyphens."""
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_backing_path_proof(project, "related_tests")
+
+        assert result is True
+        # Normalized: "related_tests" → "related-tests"
+        assert "related-tests" in project.capability_proof_records
+        assert "related_tests" not in project.capability_proof_records
+
+    def test_normalize_returns_false_when_name_is_invalid(self):
+        """A capability name that cannot be normalized returns False."""
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            result = record_capability_backing_path_proof(project, "")
+
+        assert result is False
+        mock_fm.assert_not_called()
+
+    def test_appends_evidence_refs(self):
+        """An EvidenceRef with kind=backing_path is appended to problem_model."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_backing_path_proof(project, cap_name)
+
+        assert result is True
+        cap = project.problem_model["capabilities"][0]
+        refs = cap.get("evidence_refs", [])
+        assert len(refs) == 1
+        r = refs[0]
+        assert r["proven"] is True
+        assert r["kind"] == _PROOF_KIND_BACKING_PATH
+        assert r["ref"] == cap_name
+        assert r["source_id"] == "backing:repo-map"
+        assert "recorded_at" in r
+
+    def test_fail_open_on_malformed_project(self):
+        """If capability_proof_records is absent, the function does not raise."""
+        # A MagicMock with no real dict attribute — the isinstance guard
+        # initializes an empty dict, so proof recording still works.
+        project = MagicMock()
+        project.capability_proof_records = None  # explicitly broken
+        project.problem_model = None
+
+        # Must not raise regardless of state
+        result = record_capability_backing_path_proof(project, "repo-map")
+        # The isinstance guard repairs None → {}, so it still works
+        assert result is True
 
 
 # ── evidence_refs wiring tests ────────────────────────────────────────────────
