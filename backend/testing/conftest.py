@@ -381,6 +381,50 @@ async def unauthenticated_client(override_get_session):
 
 
 @pytest.fixture
+def missing_greenlet_proxy():
+    """Factory: wrap an object so that accessing ``poison_attr`` after
+    ``.poison()`` is called raises ``MissingGreenlet`` — mimicking asyncpg's
+    behaviour when production code lazy-reads an expired ORM attribute in an
+    async context after a session rollback.
+
+    Usage::
+
+        proxy = missing_greenlet_proxy(project, poison_attr="id")
+        # ... trigger rollback in production code ...
+        proxy.poison()   # arm the proxy
+        # any read of proxy.id now raises MissingGreenlet
+
+    This fixture generalises the ad-hoc ``_ProjectIdPoisonAfterRollback`` proxy
+    used in ``test_sync_resident_snapshots_project_id_before_rollback`` so that
+    future MissingGreenlet regression tests can reach for a shared, reusable
+    helper instead of reinventing the proxy each time.
+    """
+    from sqlalchemy.exc import MissingGreenlet as _MG
+
+    class _Proxy:
+        def __init__(self, real_obj: object, poison_attr: str) -> None:
+            object.__setattr__(self, "_real", real_obj)
+            object.__setattr__(self, "_attr", poison_attr)
+            object.__setattr__(self, "_poisoned", False)
+
+        def poison(self) -> None:
+            object.__setattr__(self, "_poisoned", True)
+
+        def __getattr__(self, name: str) -> object:
+            if object.__getattribute__(self, "_poisoned") and name == object.__getattribute__(self, "_attr"):
+                raise _MG(
+                    "simulated post-rollback lazy-load of expired attribute "
+                    "(missing_greenlet_proxy fixture)"
+                )
+            return getattr(object.__getattribute__(self, "_real"), name)
+
+    def _factory(real_obj: object, *, poison_attr: str) -> _Proxy:
+        return _Proxy(real_obj, poison_attr)
+
+    return _factory
+
+
+@pytest.fixture
 def mock_provision_vm(mocker):
     return mocker.patch("app.main.provision_agent_vm", return_value=None)
 
