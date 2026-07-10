@@ -7,6 +7,7 @@ surfaces. It is intentionally small and IO-free.
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING
 from app.evidence_primitive import classify_evidence
 
 if TYPE_CHECKING:
+    from app.evidence_primitive import EvidenceStatus
     from app.models import Task
 
 _NORMALIZE_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -226,6 +228,154 @@ def registry_satisfies_capability_need(
         return False
     normalized = normalize_capability_name(need.get("ref"))
     return normalized is not None and normalized in set(working_names)
+
+
+def _iter_capability_evidence_entries(problem_model: object):
+    """Yield ``(raw_name, status, absorbs, evidence_refs)`` quadruples.
+
+    The evidence-aware sibling of :func:`_iter_capability_entries`: it draws from
+    the exact same ``capabilities`` source (accepting either the pydantic
+    ``ProblemModel`` instance or a dict-like payload) but additionally surfaces
+    each capability's ``evidence_refs`` so the proof-aware resolvers can classify
+    the backing evidence WITHOUT widening the shared 3-tuple contract three other
+    call sites unpack. ``evidence_refs`` is whatever the payload carries (a list,
+    ``None`` on older/dict payloads that omit it, or junk) — callers coerce it
+    before handing it to :func:`classify_evidence`.
+    """
+    if isinstance(problem_model, Mapping):
+        raw_caps = problem_model.get("capabilities")
+    else:
+        raw_caps = getattr(problem_model, "capabilities", None)
+    if not isinstance(raw_caps, Iterable):
+        return
+    for cap in raw_caps:
+        if isinstance(cap, Mapping):
+            yield (
+                cap.get("name"),
+                cap.get("status"),
+                cap.get("absorbs"),
+                cap.get("evidence_refs"),
+            )
+        else:
+            yield (
+                getattr(cap, "name", None),
+                getattr(cap, "status", None),
+                getattr(cap, "absorbs", None),
+                getattr(cap, "evidence_refs", None),
+            )
+
+
+def working_capability_proof_status(
+    problem_model: object,
+) -> dict[str, EvidenceStatus]:
+    """Map every ``working`` capability's canonical name to its evidence status.
+
+    The proof-aware companion to :func:`working_capability_names`: it selects the
+    exact same set of names (only ``working`` capabilities, alias-aware over each
+    entry's ``absorbs`` list) but pairs each name with the :data:`EvidenceStatus`
+    that :func:`classify_evidence` derives from the capability's
+    ``evidence_refs`` — ``proven`` / ``partial`` / ``unproven`` / ``unverified``.
+    A ``working`` capability with an empty or missing ``evidence_refs`` classifies
+    as ``unproven`` (the "declared working with zero proof" case this gate exists
+    to surface); one carrying a ``proven=True`` ref classifies as ``proven``.
+
+    IO-free and additive — the observe-mode wiring in both the spawn-time
+    resolver and the blocked-resume sweep builds this map once per project
+    (mirroring how they cache :func:`working_capability_names`) and looks needs up
+    against it via :func:`capability_need_proof_status`. First-seen wins when two
+    entries normalize to the same name, matching the name reader's dedupe order.
+    """
+    out: dict[str, EvidenceStatus] = {}
+    for raw_name, status, absorbs, evidence_refs in _iter_capability_evidence_entries(
+        problem_model
+    ):
+        if not (isinstance(status, str) and status.strip().lower() == "working"):
+            continue
+        # Coerce a missing/None evidence_refs to the empty list so a capability
+        # that simply omits the field classifies as ``unproven`` (definite absence
+        # of proof), matching the pydantic ``Capability`` default of ``[]``.
+        refs = evidence_refs if isinstance(evidence_refs, list) else []
+        proof_status = classify_evidence(refs)
+        for name in (
+            normalize_capability_name(raw_name),
+            *_normalized_absorbed_names(absorbs),
+        ):
+            if name and name not in out:
+                out[name] = proof_status
+    return out
+
+
+def capability_need_proof_status(
+    need: Mapping, proof_status_by_name: Mapping[str, EvidenceStatus]
+) -> EvidenceStatus | None:
+    """Proof status of the ``working`` capability that satisfies ``need``, or ``None``.
+
+    The proof-aware companion to :func:`registry_satisfies_capability_need`,
+    sharing its match semantics exactly: a non-capability need, an unnormalizable
+    ref, or a ref that names no ``working`` capability all return ``None``
+    (no-match). When the ref DOES match a ``working`` capability, this returns
+    that capability's :data:`EvidenceStatus` (from ``proof_status_by_name``, built
+    by :func:`working_capability_proof_status`) so a consumer can distinguish a
+    proof-backed resolution from an unproven "declared working with zero
+    evidence" one. Non-``working`` capabilities are absent from the map by
+    construction, so they read as no-match — only ``working`` capabilities
+    currently satisfy a prerequisite. This is a pure lookup; the observe-mode
+    consumers log on the unproven branch without changing resolution behavior.
+    """
+    if not isinstance(need, Mapping) or need.get("kind") != "capability":
+        return None
+    normalized = normalize_capability_name(need.get("ref"))
+    if normalized is None:
+        return None
+    return proof_status_by_name.get(normalized)
+
+
+def capability_proof_enforce_enabled() -> bool:
+    """True when proof-gate ENFORCE mode is active for capability resolution.
+
+    Reads the ``CAPABILITY_PROOF_ENFORCE`` env var *at call time* — never cached
+    at import — so the gate can be toggled at runtime without a restart. Default
+    is observe mode: unset or ``"0"`` → ``False`` (an unproven ``working``
+    capability still satisfies a prerequisite; the observe-mode wiring only logs
+    a warning). ``"1"`` → ``True`` (enforce: an unproven/partial ``working``
+    capability does NOT satisfy the prerequisite, so the dependent stays gated).
+    Any other value is treated as observe mode, keeping the fail-safe default of
+    "do not re-block runnable work" unless enforcement is explicitly requested.
+    """
+    return os.getenv("CAPABILITY_PROOF_ENFORCE", "0").strip() == "1"
+
+
+def capability_need_blocked_by_proof_gate(
+    need: Mapping,
+    proof_status_by_name: Mapping[str, EvidenceStatus],
+    *,
+    enforce: bool,
+) -> bool:
+    """True iff enforce mode should BLOCK this capability need on proof status.
+
+    The single shared gate predicate both consumers (the spawn-time resolver and
+    the blocked-resume sweep) call before their observe-mode warning branch, so
+    the "not proven ⇒ blocked when enforcing" decision lives in exactly one
+    place. Returns ``True`` only when ALL of the following hold:
+
+    * ``enforce`` mode is active,
+    * ``need`` matches a ``working`` registry capability (via
+      :func:`capability_need_proof_status`), and
+    * that capability's proof status is anything other than ``"proven"`` — i.e.
+      ``unproven`` / ``partial`` / ``unverified`` / ``contradicted`` — mirroring
+      the same "not proven" threshold the observe-mode warning uses.
+
+    Returns ``False`` in observe mode, for a no-match need (not registry-
+    satisfied at all, so normal resolution applies), and for a proven capability.
+    In every ``False`` case the caller treats the need exactly as observe mode
+    does, so enabling enforce only changes the unproven-match path.
+    """
+    if not enforce:
+        return False
+    proof_status = capability_need_proof_status(need, proof_status_by_name)
+    if proof_status is None:
+        return False
+    return proof_status != "proven"
 
 
 def off_registry_capability_refs(

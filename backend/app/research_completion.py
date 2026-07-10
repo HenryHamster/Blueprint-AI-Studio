@@ -5607,8 +5607,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # the structural source rather than deferred to the dispatch-time cycle breaker.
     from app.blocked_need_resolution import _would_create_cycle
     from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        capability_need_proof_status,
+        capability_proof_enforce_enabled,
         registry_satisfies_capability_need,
         working_capability_names,
+        working_capability_proof_status,
     )
     from app.task_blocked import build_need, enter_blocked_state
 
@@ -5621,6 +5625,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # while X is being BUILT), rides the recheck sweep to the escalation deadline,
     # and lands on the operator — for work that was runnable all along.
     _working_registry_caps = working_capability_names(
+        getattr(project_obj, "problem_model", None)
+    )
+    # Proof-status companion of the working-capability set, built from the SAME
+    # registry so an unproven "declared working with zero evidence" resolution can
+    # be surfaced. OBSERVE mode only: this map drives a WARNING log below and does
+    # NOT change which needs resolve — the enforce gate is a separate follow-up.
+    _working_registry_proof = working_capability_proof_status(
         getattr(project_obj, "problem_model", None)
     )
     # Prerequisites already satisfied by SHIPPED prior-cycle work or a durable
@@ -5909,13 +5920,53 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 if prereq_need and registry_satisfies_capability_need(
                     prereq_need, _working_registry_caps
                 ):
-                    logger.info(
-                        "[RESEARCH] Finding '%s' prerequisite capability:%s is "
-                        "already 'working' per the problem_model registry — "
-                        "satisfied by the codebase, no gate",
-                        finding_title,
-                        prereq.get("ref"),
+                    _proof_status = capability_need_proof_status(
+                        prereq_need, _working_registry_proof
                     )
+                    if capability_need_blocked_by_proof_gate(
+                        prereq_need,
+                        _working_registry_proof,
+                        enforce=capability_proof_enforce_enabled(),
+                    ):
+                        # ENFORCE mode: an unproven/partial 'working' capability
+                        # does NOT satisfy the prerequisite. Gate the dependent —
+                        # wire the need as blocking exactly as an unresolved
+                        # explicit prerequisite would, so the task parks BLOCKED
+                        # instead of spawning on an unproven codebase foundation.
+                        logger.warning(
+                            "[RESEARCH][capability-proof-enforce] Finding '%s' "
+                            "prerequisite capability:%s NOT satisfied — the "
+                            "registry capability is 'working' with proof_status=%s "
+                            "(unproven); enforce mode gates the dependent BLOCKED",
+                            finding_title,
+                            prereq.get("ref"),
+                            _proof_status,
+                        )
+                        needs.append(prereq_need)
+                        unresolved_entries.append(prereq)
+                    elif _proof_status is not None and _proof_status != "proven":
+                        # OBSERVE mode: surface (never gate) a resolution backed by
+                        # a capability declared 'working' with no proven evidence.
+                        # The need still resolves as satisfied-by-the-codebase; this
+                        # only makes the unproven claim visible while enforce is off.
+                        logger.warning(
+                            "[RESEARCH][capability-proof-observe] Finding '%s' "
+                            "prerequisite capability:%s resolved as "
+                            "satisfied-by-the-codebase, but the registry "
+                            "capability is 'working' with proof_status=%s — "
+                            "unproven resolution (observe mode, not gated)",
+                            finding_title,
+                            prereq.get("ref"),
+                            _proof_status,
+                        )
+                    else:
+                        logger.info(
+                            "[RESEARCH] Finding '%s' prerequisite capability:%s is "
+                            "already 'working' per the problem_model registry — "
+                            "satisfied by the codebase, no gate",
+                            finding_title,
+                            prereq.get("ref"),
+                        )
                 elif prereq_need:
                     needs.append(prereq_need)
                     unresolved_entries.append(prereq)

@@ -371,6 +371,23 @@ async def _fetch_working_capability_names(session, project_id) -> set:
     return working_capability_names(getattr(project, "problem_model", None))
 
 
+async def _fetch_working_capability_proof_status(session, project_id) -> dict:
+    """``{canonical_name: proof_status}`` for the project's ``working`` capabilities.
+
+    The proof-aware companion of :func:`_fetch_working_capability_names`, drawn
+    from the SAME ``project.problem_model.capabilities`` registry. Its keys are
+    exactly the working-capability name set (both readers select the identical
+    alias-aware working set), so the boolean registry-satisfies check derives its
+    name set from these keys — one project fetch serves both the resolution and
+    the OBSERVE-mode proof surfacing. Cached per project across the sweep batch.
+    """
+    from app.capability_registry import working_capability_proof_status
+    from app.models import Project
+
+    project = await session.get(Project, project_id)
+    return working_capability_proof_status(getattr(project, "problem_model", None))
+
+
 async def _classify_blocker_needs(
     task,
     session,
@@ -418,7 +435,12 @@ async def _classify_blocker_needs(
         need_matched_dead_foundation,
         knowledge_substance_satisfies_need,
     )
-    from app.capability_registry import registry_satisfies_capability_need
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        capability_need_proof_status,
+        capability_proof_enforce_enabled,
+        registry_satisfies_capability_need,
+    )
 
     needs = get_blocker_needs(task)
     disp = {
@@ -450,14 +472,21 @@ async def _classify_blocker_needs(
     if knowledge is None:
         knowledge = await _fetch_knowledge_substance_index(session, task.project_id)
         knowledge_cache[task.project_id] = knowledge
-    # Registry working-capability set, fetched only when a capability need is
-    # actually present (the common task-kind path pays no extra query).
-    working_caps = registry_cache.get(task.project_id)
-    if working_caps is None and any(n.get("kind") == "capability" for n in needs):
-        working_caps = await _fetch_working_capability_names(session, task.project_id)
-        registry_cache[task.project_id] = working_caps
-    if working_caps is None:
-        working_caps = set()
+    # Registry working-capability proof map, fetched only when a capability need
+    # is actually present (the common task-kind path pays no extra query). The map
+    # keys ARE the working-capability name set (both readers select the identical
+    # alias-aware working set), so the boolean registry-satisfies check derives its
+    # name set from the keys — one fetch serves both the resolution and the
+    # OBSERVE-mode proof surfacing below.
+    working_proof = registry_cache.get(task.project_id)
+    if working_proof is None and any(n.get("kind") == "capability" for n in needs):
+        working_proof = await _fetch_working_capability_proof_status(
+            session, task.project_id
+        )
+        registry_cache[task.project_id] = working_proof
+    if working_proof is None:
+        working_proof = {}
+    working_caps = set(working_proof)
 
     # Stranded-parent set so a GENUINE ghost merge does NOT satisfy a completed
     # need. LANDED-IN-BASE-LINEAGE semantics: the ghost-merge exclusion fires ONLY
@@ -501,6 +530,40 @@ async def _classify_blocker_needs(
         # stale terminal provider of a still-working capability can never
         # cancel the dependent.
         if registry_satisfies_capability_need(need, working_caps):
+            _proof_status = capability_need_proof_status(need, working_proof)
+            if capability_need_blocked_by_proof_gate(
+                need, working_proof, enforce=capability_proof_enforce_enabled()
+            ):
+                # ENFORCE mode: an unproven/partial 'working' capability does NOT
+                # satisfy the need. Leave it in ``residual`` (do NOT route to
+                # completed_needs) so the dependent stays BLOCKED — the codebase
+                # foundation is only claimed, not proven, so no edge is wired and
+                # the task does not resume.
+                logger.warning(
+                    "[BLOCKED-RESUME][capability-proof-enforce] task=%s need "
+                    "capability:%s NOT satisfied — the registry capability is "
+                    "'working' with proof_status=%s (unproven); enforce mode holds "
+                    "the dependent BLOCKED instead of resuming it",
+                    task.id,
+                    need.get("ref"),
+                    _proof_status,
+                )
+                disp["residual"].append(need)
+                continue
+            # OBSERVE mode: surface (never gate) a blocked-resume resolution backed
+            # by a capability declared 'working' with no proven evidence. The need
+            # still routes to completed_needs below; this only makes the unproven
+            # claim visible while enforce mode is off.
+            if _proof_status is not None and _proof_status != "proven":
+                logger.warning(
+                    "[BLOCKED-RESUME][capability-proof-observe] task=%s need "
+                    "capability:%s resolved as satisfied-by-the-codebase, but the "
+                    "registry capability is 'working' with proof_status=%s — "
+                    "unproven resolution (observe mode, not gated)",
+                    task.id,
+                    need.get("ref"),
+                    _proof_status,
+                )
             disp["completed_needs"].append(need)
             continue
         if need_matched_dead_foundation(task, need, dead):

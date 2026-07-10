@@ -5,6 +5,7 @@ over in-memory ``Task`` objects (no DB / no session) — the sweep integration i
 covered separately in ``test_reaper.py``.
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta
 
@@ -346,6 +347,344 @@ def test_registry_satisfies_capability_need_matches_working_only():
     assert not registry_satisfies_capability_need(
         {"kind": "capability", "ref": "   "}, working
     )
+
+
+# ---------------------------------------------------------------------------
+# Proof-aware capability resolver (observe-mode wiring, non-gating)
+# ---------------------------------------------------------------------------
+
+
+def _proven_ref() -> dict:
+    """One machine-checked evidence ref (``proven=True``)."""
+    return {"kind": "named_test", "ref": "testing/test_x.py::test_x", "proven": True}
+
+
+def test_working_capability_proof_status_maps_names_to_status():
+    from app.capability_registry import working_capability_proof_status
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Proven cap", status="working", evidence_refs=[_proven_ref()]
+            ),
+            Capability(name="Unproven cap", status="working"),
+            Capability(
+                name="Partial cap",
+                status="working",
+                evidence_refs=[{"kind": "named_test", "ref": "t", "proven": False}],
+            ),
+            # Non-working capabilities are excluded from the map entirely.
+            Capability(name="Planned cap", status="planned", evidence_refs=[_proven_ref()]),
+        ]
+    )
+
+    assert working_capability_proof_status(model) == {
+        "proven-cap": "proven",
+        "unproven-cap": "unproven",
+        "partial-cap": "partial",
+    }
+    assert working_capability_proof_status(None) == {}
+
+
+def test_proof_aware_resolver_returns_proven_for_proven_capability():
+    from app.capability_registry import (
+        capability_need_proof_status,
+        working_capability_proof_status,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Seeded evaluation harness",
+                status="working",
+                evidence_refs=[_proven_ref()],
+            )
+        ]
+    )
+    proof = working_capability_proof_status(model)
+
+    # The agent's raw phrasing normalizes before matching, exactly like the
+    # boolean registry-satisfies predicate.
+    assert (
+        capability_need_proof_status(
+            {"kind": "capability", "ref": "Seeded Evaluation Harness"}, proof
+        )
+        == "proven"
+    )
+
+
+def test_proof_aware_resolver_returns_unproven_for_unproven_capability():
+    """A capability declared 'working' with zero evidence resolves as ``unproven``.
+
+    This is the exact seam the observe-mode gate exists to surface: a self-declared
+    working capability with no ``evidence_refs`` satisfies a prerequisite today, and
+    the proof-aware resolver now names that resolution ``unproven`` (distinct from a
+    proof-backed ``proven`` one) without yet changing whether the need resolves.
+    """
+    from app.capability_registry import (
+        capability_need_proof_status,
+        registry_satisfies_capability_need,
+        working_capability_names,
+        working_capability_proof_status,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            # 'working' but with an empty evidence_refs list → zero proof.
+            Capability(name="Seeded evaluation harness", status="working"),
+        ]
+    )
+    proof = working_capability_proof_status(model)
+    need = {"kind": "capability", "ref": "seeded-evaluation-harness"}
+
+    # The proof-aware resolver classifies the resolution as unproven ...
+    assert capability_need_proof_status(need, proof) == "unproven"
+    # ... while observe mode leaves the boolean resolution unchanged: the unproven
+    # working capability STILL satisfies the need (non-gating).
+    assert registry_satisfies_capability_need(
+        need, working_capability_names(model)
+    )
+    # The map keys are exactly the working-capability name set the boolean check
+    # consumes — the invariant the sweep relies on to fetch once and serve both.
+    assert set(proof) == working_capability_names(model)
+
+
+def test_proof_aware_resolver_no_match_cases_return_none():
+    from app.capability_registry import capability_need_proof_status
+
+    proof = {"seeded-evaluation-harness": "unproven"}
+    # Non-capability need kind never matches.
+    assert (
+        capability_need_proof_status(
+            {"kind": "task", "ref": "seeded-evaluation-harness"}, proof
+        )
+        is None
+    )
+    # Capability ref that names no working capability (absent from the map).
+    assert (
+        capability_need_proof_status(
+            {"kind": "capability", "ref": "pr-promotion"}, proof
+        )
+        is None
+    )
+    # Blank / unnormalizable ref.
+    assert (
+        capability_need_proof_status({"kind": "capability", "ref": "   "}, proof)
+        is None
+    )
+    # Non-mapping need.
+    assert capability_need_proof_status(None, proof) is None
+
+
+def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
+    """An absorbed old capability name resolves to the surviving cap's proof status."""
+    from app.capability_registry import (
+        capability_need_proof_status,
+        working_capability_proof_status,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Unified harness",
+                status="working",
+                absorbs=["Old harness name"],
+                evidence_refs=[_proven_ref()],
+            )
+        ]
+    )
+    proof = working_capability_proof_status(model)
+
+    # Both the survivor name and the absorbed alias carry the survivor's status.
+    assert (
+        capability_need_proof_status(
+            {"kind": "capability", "ref": "unified-harness"}, proof
+        )
+        == "proven"
+    )
+    assert (
+        capability_need_proof_status(
+            {"kind": "capability", "ref": "old-harness-name"}, proof
+        )
+        == "proven"
+    )
+
+
+def test_working_capability_proof_status_accepts_dict_form_problem_model():
+    """Dict-form payloads classify identically; a missing evidence_refs → unproven."""
+    from app.capability_registry import working_capability_proof_status
+
+    payload = {
+        "capabilities": [
+            {"name": "Dict cap", "status": "working"},  # evidence_refs key absent
+            {
+                "name": "Dict proven",
+                "status": "working",
+                "evidence_refs": [_proven_ref()],
+            },
+        ]
+    }
+
+    assert working_capability_proof_status(payload) == {
+        "dict-cap": "unproven",
+        "dict-proven": "proven",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Proof-gated capability resolution (enforce-mode toggle)
+# ---------------------------------------------------------------------------
+
+
+def test_capability_proof_enforce_disabled_by_default(monkeypatch):
+    """Unset / "0" / junk values → observe mode (fail-safe default)."""
+    from app.capability_registry import capability_proof_enforce_enabled
+
+    monkeypatch.delenv("CAPABILITY_PROOF_ENFORCE", raising=False)
+    assert capability_proof_enforce_enabled() is False
+    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "0")
+    assert capability_proof_enforce_enabled() is False
+    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "yes")  # not exactly "1"
+    assert capability_proof_enforce_enabled() is False
+
+
+def test_capability_proof_enforce_enabled_when_flag_set(monkeypatch):
+    """Exactly "1" (whitespace-tolerant) → enforce mode; read at call time."""
+    from app.capability_registry import capability_proof_enforce_enabled
+
+    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "1")
+    assert capability_proof_enforce_enabled() is True
+    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", " 1 ")
+    assert capability_proof_enforce_enabled() is True
+
+
+def test_proof_gate_blocks_unproven_only_under_enforce():
+    """The shared gate predicate: enforce + not-proven ⇒ blocked; every other
+    combination (observe mode, proven cap, no-match need) ⇒ not blocked."""
+    from app.capability_registry import capability_need_blocked_by_proof_gate
+
+    proof = {
+        "unproven-cap": "unproven",
+        "partial-cap": "partial",
+        "proven-cap": "proven",
+    }
+    unproven_need = {"kind": "capability", "ref": "unproven-cap"}
+    partial_need = {"kind": "capability", "ref": "partial-cap"}
+    proven_need = {"kind": "capability", "ref": "proven-cap"}
+    nomatch_need = {"kind": "capability", "ref": "not-in-registry"}
+
+    # Enforce: unproven AND partial are gated; proven and no-match are not.
+    assert capability_need_blocked_by_proof_gate(
+        unproven_need, proof, enforce=True
+    ) is True
+    assert capability_need_blocked_by_proof_gate(
+        partial_need, proof, enforce=True
+    ) is True
+    assert capability_need_blocked_by_proof_gate(
+        proven_need, proof, enforce=True
+    ) is False
+    assert capability_need_blocked_by_proof_gate(
+        nomatch_need, proof, enforce=True
+    ) is False
+    # Observe: nothing is gated, even an unproven match.
+    assert capability_need_blocked_by_proof_gate(
+        unproven_need, proof, enforce=False
+    ) is False
+
+
+def _capability_blocker_task(ref: str, project_id=None):
+    """A BLOCKED task waiting on a single capability need ``ref``."""
+    task = _task(
+        status=TaskStatus.BLOCKED,
+        context={"blocker": {"needs": [{"kind": "capability", "ref": ref}]}},
+    )
+    if project_id is not None:
+        task.project_id = project_id
+    return task
+
+
+def _classify_capability_need(ref: str, proof_map: dict) -> dict:
+    """Run ``_classify_blocker_needs`` with every candidate cache pre-populated
+    (so no DB/session is touched) and the registry proof map injected — returns
+    the disposition dict, isolating the registry/proof-gate branch."""
+    from app import blocked_task_unblock_sweeps as btu
+
+    task = _capability_blocker_task(ref)
+    pid = task.project_id
+    return asyncio.run(
+        btu._classify_blocker_needs(
+            task,
+            None,
+            candidate_cache={pid: []},
+            completed_cache={pid: []},
+            dead_cache={pid: []},
+            knowledge_cache={pid: []},
+            registry_cache={pid: proof_map},
+        )
+    )
+
+
+def test_unproven_working_capability_does_not_satisfy_need_in_enforce_mode(monkeypatch):
+    """ACCEPTANCE EVIDENCE. Enforce mode + a need whose ref matches a ``working``
+    registry capability with ``proof_status=unproven`` must NOT satisfy the
+    prerequisite — the blocked-resume sweep leaves the need in ``residual`` (the
+    dependent stays BLOCKED) instead of routing it to ``completed_needs``."""
+    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "1")
+
+    proof = {"seeded-evaluation-harness": "unproven"}
+    disp = _classify_capability_need("seeded-evaluation-harness", proof)
+
+    # The unproven working capability does NOT satisfy the need under enforce:
+    # it stays residual (task remains BLOCKED) and is NOT marked completed.
+    assert disp["residual"] == [
+        {"kind": "capability", "ref": "seeded-evaluation-harness"}
+    ]
+    assert disp["completed_needs"] == []
+    assert disp["edges"] == []
+    assert disp["dead"] is False
+
+
+def test_proven_working_capability_satisfies_need_in_enforce_mode(monkeypatch):
+    """Enforce mode does NOT gate a PROVEN working capability: the need is still
+    satisfied by the codebase (routed to ``completed_needs``, not residual)."""
+    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "1")
+
+    proof = {"seeded-evaluation-harness": "proven"}
+    disp = _classify_capability_need("seeded-evaluation-harness", proof)
+
+    assert disp["completed_needs"] == [
+        {"kind": "capability", "ref": "seeded-evaluation-harness"}
+    ]
+    assert disp["residual"] == []
+
+
+def test_observe_mode_still_satisfies_unproven(monkeypatch):
+    """Observe mode (the default) still treats an unproven working capability as
+    satisfied — the need routes to ``completed_needs`` exactly as before."""
+    monkeypatch.delenv("CAPABILITY_PROOF_ENFORCE", raising=False)
+
+    proof = {"seeded-evaluation-harness": "unproven"}
+    disp = _classify_capability_need("seeded-evaluation-harness", proof)
+
+    assert disp["completed_needs"] == [
+        {"kind": "capability", "ref": "seeded-evaluation-harness"}
+    ]
+    assert disp["residual"] == []
+
+
+def test_blocked_resume_sweep_routes_unproven_by_mode(monkeypatch):
+    """The blocked-resume sweep routes an unproven working-capability need to
+    ``residual`` under enforce and to ``completed_needs`` under observe — the two
+    modes diverge only on the unproven-match path (partial gates the same way)."""
+    proof = {"seeded-evaluation-harness": "partial"}
+
+    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "1")
+    enforced = _classify_capability_need("seeded-evaluation-harness", proof)
+    assert enforced["residual"] and not enforced["completed_needs"]
+
+    monkeypatch.setenv("CAPABILITY_PROOF_ENFORCE", "0")
+    observed = _classify_capability_need("seeded-evaluation-harness", proof)
+    assert observed["completed_needs"] and not observed["residual"]
 
 
 def test_capability_ambiguous_resolves_to_canonical():
