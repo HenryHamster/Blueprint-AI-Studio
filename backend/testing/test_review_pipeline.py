@@ -4710,6 +4710,7 @@ async def test_second_opinion_state_not_propagated_to_spawned_tasks(db_session, 
         "awaiting_review_second_opinion": str(uuid.uuid4()),
         "review_second_opinion_parked": {"verdict": "REQUEST_CHANGES", "issues": []},
         "review_second_opinion_for_task_id": str(uuid.uuid4()),
+        "blind_review_for_task_id": str(uuid.uuid4()),
     }
     # The literal keys above must stay in lockstep with the canonical family —
     # if a key is renamed or added, this test must be updated alongside it.

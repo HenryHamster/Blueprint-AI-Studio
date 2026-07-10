@@ -1212,6 +1212,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.web_research: WebResearchPayload,
     TaskType.design: DesignPayload,
     TaskType.repo_bootstrap: RepoBootstrapPayload,
+    TaskType.salvage_bundle: BasePayload,
 }
 
 

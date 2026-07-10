@@ -491,6 +491,14 @@ async def _propagate_landed_to_staging_merged_descendants(
     queue: list = [parent_task_id]
     stamped: list[Task] = []
 
+    # Read test_coverage_result from the root parent so it can be propagated
+    # to descendants; coverage_delta acceptance evidence needs this key
+    # present on each child task's context at verdict time.
+    _parent = await session.get(Task, parent_task_id)
+    _parent_coverage: dict | None = (_parent.context or {}).get(
+        "test_coverage_result"
+    )
+
     while queue:
         rows = (
             (
@@ -514,6 +522,17 @@ async def _propagate_landed_to_staging_merged_descendants(
                 and has_merge_unblock_signal(row)
                 and not has_landed_signal(row)
             ):
+                # Propagate test_coverage_result from the root parent to this
+                # descendant so the coverage_delta acceptance gate
+                # (_evaluate_coverage_delta) can find measured coverage data
+                # instead of failing closed with "no result found".  Use
+                # setdefault so any existing per-descendant coverage data is
+                # never overwritten.
+                if _parent_coverage is not None:
+                    _desc_ctx = dict(row.context or {})
+                    _desc_ctx.setdefault("test_coverage_result", _parent_coverage)
+                    row.context = _desc_ctx
+
                 mark_landed_on_integration(row)
                 session.add(row)
                 stamped.append(row)

@@ -829,6 +829,10 @@ class TestDryRunMetrics:
 
     def test_simulated_metrics_match_expected_shape(self):
         """Simulated metrics should have the same field set as before the change."""
+        pytest.importorskip(
+            "golden_tasks.runner",
+            reason="golden_tasks.runner not importable (outside Docker build context)",
+        )
         import golden_tasks.runner  # noqa: PLC0415
         metrics = golden_tasks.runner.RunMetrics()
         # Populate as _run_simulated does
@@ -854,6 +858,10 @@ class TestDryRunMetrics:
 
     def test_aggregate_includes_new_telemetry_keys(self):
         """RunMetrics.aggregate() should include cache + provider/model breakdown keys."""
+        pytest.importorskip(
+            "golden_tasks.runner",
+            reason="golden_tasks.runner not importable (outside Docker build context)",
+        )
         import golden_tasks.runner  # noqa: PLC0415
         metrics = golden_tasks.runner.RunMetrics()
         metrics.prompt_tokens = 500

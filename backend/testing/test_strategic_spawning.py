@@ -1266,6 +1266,7 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "origin_provenance",
         "sweep_id",
         "arm_label",
+        "lifecycle_status",
     }
 
 

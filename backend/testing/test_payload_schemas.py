@@ -330,6 +330,7 @@ EXPECTED_TYPES = {
     "web_research",
     "design",
     "repo_bootstrap",
+    "salvage_bundle",
 }
 
 
