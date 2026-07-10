@@ -19839,3 +19839,224 @@ class TestDecayThresholdDBIntegration:
         )
         salvage_list = await self._get_salvage_tasks(task, db_session)
         assert len(salvage_list) == 0
+
+
+# ---------------------------------------------------------------------------
+# End-to-end integration: combined decay + dedup-filtered → salvage bundle
+# ---------------------------------------------------------------------------
+
+
+@_pytest.mark.asyncio
+async def test_salvage_bundle_combined_decay_and_dedup_path(db_session, mocker):
+    """Genuine end-to-end integration: both a decayed finding (decay path) and a
+    dedup-filtered finding (dedup path, #13879 ``finding`` key) flow through
+    the REAL _handle_research_completion() code, are collected into
+    _salvage_candidates, and appear together in the spawned salvage_bundle task.
+
+    This test closes the direction's success_evidence gate by proving:
+    1. The decay collection at research_completion.py:2113 picks up the prior-
+       deferred finding (ultra_low_confidence, count>=4) and puts it in
+       _salvage_candidates.
+    2. The dedup-filtered salvage gate at research_completion.py:3396-3416 picks
+       up a region-overlap-filtered finding whose full payload is carried in the
+       DedupOutcome.filtered[].finding key (the #13879 enhancement), and appends
+       it to _salvage_candidates.
+    3. Both candidates merge into a single salvage_bundle task payload, with
+       title, discard_reason, direction_id, prompt, description, related_files,
+       claims, and sources preserved for each finding.
+    """
+    from app.finding_deduplication import DedupOutcome
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-combined-salvage-e2e"
+    )
+
+    # ── Path 1: decay-path finding ────────────────────────────────────────
+    # ultra_low_confidence deferred 4 times triggers the decay gate.
+    # Include full rich context so we can assert it survives into the payload.
+    decayed_finding = {
+        "title": "Slow N+1 query in report generation (decay path)",
+        "description": "The report generation loop issues one query per row, causing O(n) DB calls",
+        "prompt": "Add selectinload to the report query in reporting.py",
+        "related_files": ["backend/app/reporting.py", "backend/app/models.py"],
+        "claims": [{"claim": "N+1 pattern confirmed in profiler trace", "confidence": "high"}],
+        "sources": [{"ref": "perf_trace_report_gen.json", "trust": "high"}],
+        "type": "improvement",
+        "priority": "medium",
+        "scope": "small",
+        "risk": "low",
+        "direction_id": direction["id"],
+        "deferred_reason": "ultra_low_confidence",
+        "deferred_count": 4,
+        "originally_researched_at": _utcnow().isoformat(),
+    }
+    task.context = {
+        **(task.context or {}),
+        "prior_deferred_findings": [decayed_finding],
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    # ── Path 2: dedup-filtered finding (#13879 ``finding`` key) ──────────
+    # A fresh finding filtered by region overlap.  The ``finding`` key carries the
+    # full payload — this is the enhancement from PR #13879 that the old
+    # title-based lookup could not preserve without a separate lookup.
+    dedup_filtered_finding = {
+        "title": "Missing index on task.status causes full table scan (dedup path)",
+        "description": "The task listing query performs a full table scan on status column",
+        "prompt": "Add a covering index on task.status + task.created_at in alembic",
+        "related_files": [
+            "backend/app/models.py",
+            "backend/alembic/versions/next_migration.py",
+        ],
+        "claims": [
+            {"claim": "Full table scan observed in EXPLAIN ANALYZE", "confidence": "high"},
+            {"claim": "Index selectivity > 80%", "confidence": "medium"},
+        ],
+        "sources": [{"ref": "db_query_plan_20260710.txt", "trust": "high"}],
+        "type": "improvement",
+        "priority": "high",
+        "scope": "small",
+        "risk": "low",
+        "direction_id": direction["id"],
+    }
+    # A surviving finding (required so dedup produces a deduplicated list).
+    surviving_finding = _make_finding(
+        "Unrelated sentinel finding", direction_id=direction["id"]
+    )
+
+    # Build the DedupOutcome that the production code will consume.
+    # The ``finding`` key in the filtered entry is the PR-#13879 addition —
+    # it carries the full payload so no title-based lookup is needed.
+    mock_dedup_outcome = DedupOutcome()
+    mock_dedup_outcome.deduplicated = [(0, surviving_finding, "hash-sentinel")]
+    mock_dedup_outcome.word_overlap_count = 1
+    mock_dedup_outcome.filtered = [
+        {
+            "title": dedup_filtered_finding["title"][:120],
+            "direction_id": direction["id"],
+            "reason": "region overlap with: existing index task",
+            # The ``finding`` key is what #13879 added — full payload,
+            # not just title/direction_id as before.
+            "finding": dedup_filtered_finding,
+        }
+    ]
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[dedup_filtered_finding, surviving_finding],
+    )
+    mocker.patch(
+        "app.research_completion.deduplicate_findings",
+        return_value=mock_dedup_outcome,
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    # ── Exercise the REAL production path ────────────────────────────────
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    # ── Assert salvage_activity was recorded on the parent task ──────────
+    salvage_activity = (task.context or {}).get("salvage_activity")
+    assert salvage_activity is not None, (
+        "salvage_activity must be recorded on the parent task when both "
+        "decay-path and dedup-path findings are salvaged"
+    )
+    assert salvage_activity["salvaged_count"] == 2, (
+        f"Expected 2 salvaged findings (1 decay + 1 dedup), "
+        f"got {salvage_activity['salvaged_count']}"
+    )
+    assert "salvage_task_id" in salvage_activity
+    assert "salvaged_at" in salvage_activity
+
+    # ── Assert exactly one salvage_bundle child task was spawned ─────────
+    result = await db_session.execute(
+        _select(_Task).where(_Task.parent_task_id == task.id)
+    )
+    all_children = result.scalars().all()
+    salvage_tasks = [
+        t
+        for t in all_children
+        if (t.context or {}).get("salvage_source_task_id") == str(task.id)
+    ]
+    assert len(salvage_tasks) == 1, (
+        f"Expected exactly 1 salvage_bundle child task, "
+        f"found {len(salvage_tasks)} among {len(all_children)} total children"
+    )
+
+    salvage_task = salvage_tasks[0]
+    assert salvage_task.context.get("salvage_finding_count") == 2
+    assert "discarded" in salvage_task.title.lower()
+
+    # ── Assert the combined payload contains BOTH findings ────────────────
+    payload = salvage_task.first_payload
+    assert payload is not None
+    assert payload["type"] == "salvage_bundle"
+    assert payload["total_discarded"] == 2
+    assert len(payload["salvaged_findings"]) == 2
+
+    entries_by_title = {e["title"]: e for e in payload["salvaged_findings"]}
+
+    # ── Decay-path finding: verify title, discard_reason, and rich context
+    decay_key = "Slow N+1 query in report generation (decay path)"
+    assert decay_key in entries_by_title, (
+        f"Decayed finding must appear in salvage payload. "
+        f"Found titles: {list(entries_by_title)}"
+    )
+    decay_entry = entries_by_title[decay_key]
+    assert decay_entry["discard_reason"] == "ultra_low_confidence", (
+        f"decay entry discard_reason must be 'ultra_low_confidence', "
+        f"got {decay_entry['discard_reason']!r}"
+    )
+    assert decay_entry["direction_id"] == direction["id"]
+    assert decay_entry["prompt"] == "Add selectinload to the report query in reporting.py"
+    assert decay_entry["description"] == (
+        "The report generation loop issues one query per row, causing O(n) DB calls"
+    )
+    assert decay_entry["related_files"] == [
+        "backend/app/reporting.py",
+        "backend/app/models.py",
+    ]
+    assert len(decay_entry["claims"]) == 1
+    assert decay_entry["claims"][0]["claim"] == "N+1 pattern confirmed in profiler trace"
+    assert len(decay_entry["sources"]) == 1
+    assert decay_entry["sources"][0]["ref"] == "perf_trace_report_gen.json"
+
+    # ── Dedup-path finding: verify title, discard_reason, and rich context
+    # This is the key #13879 assertion: the full finding payload is preserved
+    # via the ``finding`` key rather than a title-based lookup.
+    dedup_key = "Missing index on task.status causes full table scan (dedup path)"
+    assert dedup_key in entries_by_title, (
+        f"Dedup-filtered finding must appear in salvage payload. "
+        f"Found titles: {list(entries_by_title)}"
+    )
+    dedup_entry = entries_by_title[dedup_key]
+    assert "dedup:" in (dedup_entry["discard_reason"] or ""), (
+        f"dedup entry discard_reason must start with 'dedup:', "
+        f"got {dedup_entry['discard_reason']!r}"
+    )
+    assert "region overlap" in (dedup_entry["discard_reason"] or ""), (
+        f"dedup discard_reason must preserve the original dedup reason, "
+        f"got {dedup_entry['discard_reason']!r}"
+    )
+    assert dedup_entry["direction_id"] == direction["id"]
+    assert dedup_entry["prompt"] == (
+        "Add a covering index on task.status + task.created_at in alembic"
+    )
+    assert dedup_entry["description"] == (
+        "The task listing query performs a full table scan on status column"
+    )
+    assert dedup_entry["related_files"] == [
+        "backend/app/models.py",
+        "backend/alembic/versions/next_migration.py",
+    ]
+    assert len(dedup_entry["claims"]) == 2
+    assert dedup_entry["claims"][0]["claim"] == "Full table scan observed in EXPLAIN ANALYZE"
+    assert dedup_entry["claims"][1]["claim"] == "Index selectivity > 80%"
+    assert len(dedup_entry["sources"]) == 1
+    assert dedup_entry["sources"][0]["ref"] == "db_query_plan_20260710.txt"
