@@ -6577,3 +6577,66 @@ async def test_backfill_unverified_merge_skips_no_seam_files(db_session):
 
     evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
     assert evidence == [], "No evidence for test-only diff"
+
+
+# ---------------------------------------------------------------------------
+# attestation spawns corroboration task (acceptance test)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attestation_spawns_corroboration_task(client: AsyncClient, db_session):
+    """Operator attestation spawns a QUEUED research task targeting the criterion.
+
+    When the operator attests a stuck criterion via POST .../attest, the endpoint
+    must also create a Task row with ``criterion_ids=[criterion_key]`` so the
+    existing record_task_merge_evidence machinery can later transition it from
+    ``'attested'`` to ``'covered'`` when the task merges with a proven verdict.
+    """
+    project = await _make_project_with_member(db_session, name="Attest-Corroboration")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Stuck criterion needing verification"
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
+        json={"reason": "Direction retired; spawn verification task"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # A Task must have been created targeting this criterion.
+    from app.models import Task as _Task
+
+    tasks = (
+        (await db_session.execute(
+            select(_Task).where(
+                _Task.project_id == project.id,
+                _Task.created_by == "SYSTEM_AUTO_REVIEW",
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) >= 1, (
+        f"Expected at least one verification task from SYSTEM_AUTO_REVIEW, "
+        f"got {len(tasks)}"
+    )
+    spawned = tasks[-1]  # most recently created
+    assert spawned.status == TaskStatus.QUEUED, (
+        f"Task should be QUEUED, got {spawned.status}"
+    )
+    assert criterion.criterion_key in spawned.criterion_ids, (
+        f"Task criterion_ids {spawned.criterion_ids} must include "
+        f"{criterion.criterion_key}"
+    )
+    assert spawned.created_by == "SYSTEM_AUTO_REVIEW", (
+        f"Expected created_by=SYSTEM_AUTO_REVIEW, got {spawned.created_by}"
+    )
+    assert "Verify: " in spawned.title, (
+        f"Task title {spawned.title!r} should start with 'Verify:'"
+    )

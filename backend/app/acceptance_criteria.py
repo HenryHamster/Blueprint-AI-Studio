@@ -1812,3 +1812,62 @@ async def get_version_coverage_summary(
         "stuck_count": stuck_count,
         "criteria": criteria_detail,
     }
+
+
+async def spawn_corroboration_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    criterion_key: str,
+    criterion_text: str,
+    reason: str,
+) -> None:
+    """Spawn a research task to investigate and earn real coverage for a criterion.
+
+    Called after an operator attests a criterion (see
+    :func:`~app.routers.admin_acceptance_criteria.attest_criterion`).  The spawned
+    task carries ``criterion_ids=[criterion_key]`` so that, when it later completes
+    and merges with a proven acceptance verdict, the existing
+    :func:`record_task_merge_evidence` machinery writes ``task_merge`` +
+    ``reachability`` evidence, transitioning the criterion from ``'attested'`` to
+    ``'covered'``.
+
+    The task is best-effort: any failure is logged and swallowed so the
+    attestation itself is never blocked by a spawn failure.
+    """
+    try:
+        from app.models import Task  # noqa: PLC0415
+
+        task = Task(
+            project_id=project_id,
+            title=f"Verify: {criterion_key}",
+            criterion_ids=[criterion_key],
+            context={"corroboration_of": criterion_key, "spawned_by": "operator_attestation"},
+            payloads=[
+                {
+                    "type": "research",
+                    "prompt": (
+                        f"Verify acceptance criterion: {criterion_text}\n\n"
+                        f"Operator attestation reason: {reason}\n\n"
+                        "Determine what test or automated check would prove this "
+                        "criterion is satisfied, and implement it so the criterion "
+                        "can transition from operator attestation to real machine-verified coverage."
+                    ),
+                }
+            ],
+            created_by="SYSTEM_AUTO_REVIEW",
+        )
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[AC] Corroboration task spawned for criterion %s (project %s) — task_id=%s",
+            criterion_key,
+            project_id,
+            task.id,
+        )
+    except Exception:
+        logger.exception(
+            "[AC] Failed to spawn corroboration task for criterion %s (project %s) — "
+            "attestation itself is unaffected",
+            criterion_key,
+            project_id,
+        )

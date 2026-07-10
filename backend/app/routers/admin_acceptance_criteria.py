@@ -411,7 +411,22 @@ async def attest_criterion(
             attested_at,
             body.reason,
         )
+
+        # Best-effort: spawn a fresh corroboration task on re-attestation so the
+        # system keeps trying to earn real coverage, not just extending the waiver.
+        await ac.spawn_corroboration_task(
+            session, project_id, criterion_key, row.text, body.reason
+        )
+
         return {"status": "ok", "criterion_key": criterion_key, "coverage": "attested"}
+
+    # Best-effort: spawn a research task targeting this criterion so the system
+    # can attempt to earn real machine-verified coverage (transition from
+    # 'attested' to 'covered') rather than relying solely on the time-bounded
+    # waiver. Failure here never blocks the attestation itself.
+    await ac.spawn_corroboration_task(
+        session, project_id, criterion_key, row.text, body.reason
+    )
 
     logger.info(
         "[AC] Operator attestation recorded: project=%s criterion=%s user=%s "
