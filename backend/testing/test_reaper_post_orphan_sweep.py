@@ -16,6 +16,7 @@ Focus: the _rollup_task_batch batch-fetch pattern in run_post_orphan_sweep
 """
 
 import contextlib
+import os
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock
@@ -26,6 +27,10 @@ from sqlmodel import SQLModel
 
 from app.models import Project, Task, TaskStatus
 from app.reaper_post_orphan_sweep import run_post_orphan_sweep
+
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 # ── SQLite fixture ────────────────────────────────────────────────────────────
@@ -396,6 +401,16 @@ async def test_rollup_loop_landed_cb_called_after_successful_rollup(sweep_db, mo
     landed.assert_awaited_once_with(parent.id, sweep_db)
 
 
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason=(
+        "MissingGreenlet on expired ORM attribute is asyncpg-specific; aiosqlite "
+        "lazy-loads succeed in the async greenlet, masking the regression. "
+        "Fault injection is not practical here because the sweep builds "
+        "_rollup_task_batch via internal DB queries and accesses task.status "
+        "before any mockable hook is called."
+    ),
+)
 @pytest.mark.asyncio
 async def test_rollup_loop_internal_rollback_does_not_leave_expired_batch(
     sweep_db, mocker, expire_fidelity

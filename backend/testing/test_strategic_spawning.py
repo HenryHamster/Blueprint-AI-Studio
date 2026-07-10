@@ -12,10 +12,12 @@ Covers:
 """
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone, timedelta
 
 import pytest
+from sqlalchemy.exc import MissingGreenlet
 from unittest.mock import AsyncMock, call, patch
 from sqlalchemy import select, update
 
@@ -70,6 +72,10 @@ from app.task_evaluators import (
     CHALLENGE_DISAGREES,
     CHALLENGE_INDETERMINATE,
 )
+
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 def _assert_generated_at_iso_utc(payload: dict) -> None:
@@ -1058,7 +1064,7 @@ async def test_spawn_strategic_review_cadence_still_runs_context_build(db_sessio
 
 @pytest.mark.asyncio
 async def test_drift_snapshot_failure_does_not_expire_caller_instances(
-    db_session, mocker
+    db_session, monkeypatch
 ):
     """A failed best-effort drift snapshot must not poison the shared session.
 
@@ -1069,28 +1075,66 @@ async def test_drift_snapshot_failure_does_not_expire_caller_instances(
     read then attempted IO and raised ``MissingGreenlet``, failing the whole
     design_doc completion (tasks a9bf1317 / 94594516, 2026-06-11). The drift
     block now runs in a SAVEPOINT, so its failure leaves ``project`` loaded.
+
+    Fault-injection: a proxy wraps ``project`` and raises ``MissingGreenlet``
+    on any attribute access if ``session.rollback()`` (a full rollback, not a
+    SAVEPOINT rollback via ``begin_nested``) has been called.  With the fix the
+    drift block rolls back only its SAVEPOINT, never the outer session, so the
+    proxy is never poisoned and ``proxy.vision`` returns the live in-memory
+    value.  Without the fix a bare ``session.rollback()`` would poison the
+    proxy, making the post-spawn ``proxy.vision`` access raise
+    ``MissingGreenlet`` — exactly the production failure mode.
     """
+    import app.drift_detection as _drift_mod
+
+    class _ProjectPoisonAfterOuterRollback:
+        """Delegates all attribute access to the real project until a full
+        ``session.rollback()`` is observed; after that any access raises
+        ``MissingGreenlet``, mimicking asyncpg post-rollback expiry."""
+
+        def __init__(self, real_project):
+            self._real = real_project
+            self._rolled_back = False
+
+        def __getattr__(self, name):
+            if self._rolled_back:
+                raise MissingGreenlet(
+                    f"simulated post-rollback lazy-load: attribute '{name}' expired"
+                )
+            return getattr(self._real, name)
+
     project = _make_project(vision={"purpose": "test purpose"})
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
     await _seed_legacy_cycles(db_session, project)
 
+    proxy = _ProjectPoisonAfterOuterRollback(project)
+    real_rollback = db_session.rollback
+
+    async def rollback_then_poison(*args, **kwargs):
+        result = await real_rollback(*args, **kwargs)
+        proxy._rolled_back = True
+        return result
+
+    monkeypatch.setattr(db_session, "rollback", rollback_then_poison)
+
     # Force the best-effort drift snapshot to fail mid-spawn.
-    mocker.patch(
-        "app.drift_detection.persist_drift_snapshot",
-        new=AsyncMock(side_effect=RuntimeError("drift flush boom")),
+    monkeypatch.setattr(
+        _drift_mod,
+        "persist_drift_snapshot",
+        AsyncMock(side_effect=RuntimeError("drift flush boom")),
     )
 
-    spawned = await _spawn_strategic_review(project, db_session)
+    spawned = await _spawn_strategic_review(proxy, db_session)
 
     # The spawn still lands the strategic_review task despite the drift failure.
     assert spawned is True
     # Regression guard: the caller's ``project`` is NOT expired — a synchronous
     # attribute read must return the in-memory value without IO. Under the old
     # bare-rollback this access raised MissingGreenlet.
-    assert project.vision.get("purpose") == "test purpose"
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert proxy.vision.get("purpose") == "test purpose"
+    result = await db_session.execute(select(Task).where(Task.project_id == proxy.id))
     assert any(
         t.payloads[0].get("type") == "strategic_review" for t in result.scalars().all()
     )
@@ -2942,6 +2986,16 @@ async def test_spawn_strategic_review_aborts_when_peer_holds_spawn_lock_at_inser
     assert result.scalars().all() == []
 
 
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason=(
+        "MissingGreenlet on expired ORM attribute is asyncpg-specific; aiosqlite "
+        "lazy-loads succeed in the async greenlet, masking the regression. "
+        "Fault injection is not practical: _finalize_strategic_review_spawn "
+        "receives project_id (a plain UUID), not the project ORM object, so "
+        "there is no proxy intercept point inside the bail path after rollback."
+    ),
+)
 @pytest.mark.asyncio
 async def test_spawn_strategic_review_bail_survives_rollback_expiry(db_session, mocker):
     """Bail paths do not raise MissingGreenlet when the session rollback expires ORM instances.

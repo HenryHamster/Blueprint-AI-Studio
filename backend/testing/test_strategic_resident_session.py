@@ -12,10 +12,12 @@ Session/lease state lives in ``Project.vision`` JSON, so these run
 standalone-friendly (no Postgres-only features).
 """
 
+import os
 from datetime import timedelta
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.exc import MissingGreenlet
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -58,6 +60,10 @@ from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
     strategic_local_continuation_status_from_vision,
 )
+
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 TEST_USER_ID = "test-user-123"
 
@@ -1516,18 +1522,49 @@ async def test_start_compensation_receives_plain_snapshotted_project_id(
     The ``except`` block's ``session.rollback()`` expires ``project``'s ORM
     attributes; under asyncpg a subsequent ``project.id`` read emits a sync
     lazy-load in an async context → ``MissingGreenlet`` (the ~1-2/hr prod wedge).
-    A full fault repro is impractical on the SQLite harness (it retains the PK
-    through the rollback and services any re-load on the single shared connection
-    instead of raising), so this test locks the observable contract the fix
-    guarantees: compensation (``_release_start_claim``) is handed the correct,
-    concrete ``uuid.UUID`` and runs to completion (claim cleared). The sibling
-    ``test_sync_resident_snapshots_project_id_before_rollback`` is the true
-    fault-injecting guard for the same snapshot-before-rollback discipline.
+
+    Fault-injection: a proxy wraps ``project`` and raises ``MissingGreenlet`` on
+    ``.id`` access once ``session.rollback()`` has been called.  With the fix,
+    the except block captures ``project_id = project.id`` (via
+    ``proxy.id``) BEFORE the rollback, so the subsequent compensation call
+    uses the pre-captured scalar and never touches the poisoned proxy.  Without
+    the fix, code that read ``project.id`` after rollback would trigger the
+    proxy's guard and raise ``MissingGreenlet`` — exactly the production failure.
     """
+
+    class _ProjectIdPoisonAfterRollback:
+        """Delegates ``.id`` to the real project until ``session.rollback()``
+        is called; after that ``.id`` raises ``MissingGreenlet``."""
+
+        def __init__(self, real_project):
+            self._real = real_project
+            self._rolled_back = False
+
+        @property
+        def id(self):
+            if self._rolled_back:
+                raise MissingGreenlet(
+                    "simulated post-rollback lazy-load of expired 'id'"
+                )
+            return self._real.id
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
     project = await _make_project_with_member(db_session)  # no live strategic task
     await _make_live_local_runner(db_session, project)
     # Snapshot the expected id while ``project`` is still loaded (before the run).
     expected_id = project.id
+
+    proxy = _ProjectIdPoisonAfterRollback(project)
+    real_rollback = db_session.rollback
+
+    async def rollback_then_poison(*args, **kwargs):
+        result = await real_rollback(*args, **kwargs)
+        proxy._rolled_back = True
+        return result
+
+    monkeypatch.setattr(db_session, "rollback", rollback_then_poison)
 
     async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None, session_summary=None):
         t = Task(
@@ -1566,7 +1603,7 @@ async def test_start_compensation_receives_plain_snapshotted_project_id(
     with pytest.raises(RuntimeError):
         await start_resident_session(
             db_session,
-            project,
+            proxy,
             operator_user_id=TEST_USER_ID,
             session_factory=factory,
         )
@@ -2167,6 +2204,15 @@ async def test_build_resident_runner_options_flags(db_session):
     assert all(isinstance(o["name"], str) and o["name"] for o in options)
 
 
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason=(
+        "MissingGreenlet on pool pre-ping is asyncpg-specific; aiosqlite uses a "
+        "single shared connection that does not pre-ping and handles re-use "
+        "transparently, masking the poisoned-session failure mode. Fault injection "
+        "would require intercepting SQLAlchemy connection-pool internals."
+    ),
+)
 @pytest.mark.asyncio
 async def test_release_start_claim_runs_on_dedicated_session(db_session):
     """Compensation must run on a DEDICATED session opened via the injected

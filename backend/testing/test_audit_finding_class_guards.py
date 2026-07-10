@@ -6,7 +6,7 @@ The goal: every finding class that recurred in v22 or earlier is covered by a
 guard that fails on reintroduction, making the 2026-07-04 acceptance criterion
 verifiable in a single module.
 
-Five classes are addressed:
+Six classes are addressed:
 
 1. **Module file-density caps** — already guarded via
    ``backend/testing/test_invariants.py`` (``TestBackendModuleSizeGuardrails``)
@@ -32,11 +32,18 @@ Five classes are addressed:
    ``TestLongLivedDocsDoNotReferenceRemovedCodePaths`` scans .md files and
    verifies none contain references to components in the removed-code registry.
 
+6. **SQLite-masked MissingGreenlet tests** — tests that mention ``MissingGreenlet``
+   in their docstring but neither raise it (fault injection) nor skip on SQLite
+   (``skipif(not USE_POSTGRES)``) pass tautologically on the default aiosqlite
+   CI run. ``TestMissingGreenletTestsFaithful`` AST-scans the five specific
+   test files that historically harboured unfaithful instances.
+
 Safe to run standalone (``pytest --standalone --no-postgres``): no DB imports.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 from pathlib import Path
@@ -568,7 +575,102 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
 
 
 # ---------------------------------------------------------------------------
-# 6. Standalone roster enforcement — audit-finding guards run in all contexts
+# 6. MissingGreenlet test fidelity guard
+# ---------------------------------------------------------------------------
+
+_GREENLET_SCANNED_FILES = [
+    "test_reaper_post_orphan_sweep.py",
+    "test_acceptance_gate.py",
+    "test_admin_endpoint_cache.py",
+    "test_strategic_spawning.py",
+    "test_strategic_resident_session.py",
+]
+
+
+def _unfaithful_greenlet_tests(path: Path) -> list[str]:
+    """Return ``module::test_name`` for every async test function in *path* that
+    mentions ``MissingGreenlet`` in its docstring but is neither fault-injecting
+    (contains ``raise MissingGreenlet`` anywhere in the function body or nested
+    classes) nor Postgres-only (has ``@pytest.mark.skipif`` with ``USE_POSTGRES``
+    in its decorator list)."""
+    source = path.read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        if not node.name.startswith("test_"):
+            continue
+        docstring = ast.get_docstring(node)
+        if not docstring or "MissingGreenlet" not in docstring:
+            continue
+
+        # Faithful if the function (or any nested class/function inside it)
+        # contains a ``raise MissingGreenlet(...)`` statement.
+        has_raise = any(
+            isinstance(child, ast.Raise)
+            and child.exc is not None
+            and "MissingGreenlet" in ast.unparse(child.exc)
+            for child in ast.walk(node)
+        )
+        if has_raise:
+            continue
+
+        # Faithful if any decorator is ``pytest.mark.skipif`` conditioned on
+        # ``USE_POSTGRES``.
+        has_skipif = any(
+            "skipif" in ast.unparse(deco) and "USE_POSTGRES" in ast.unparse(deco)
+            for deco in node.decorator_list
+        )
+        if has_skipif:
+            continue
+
+        violations.append(f"{path.name}::{node.name}")
+    return violations
+
+
+class TestMissingGreenletTestsFaithful:
+    """Every test that mentions ``MissingGreenlet`` in its docstring must be
+    either fault-injecting (body contains ``raise MissingGreenlet``) or
+    explicitly Postgres-only (``@pytest.mark.skipif(not USE_POSTGRES, ...)``).
+
+    Tests that merely mention ``MissingGreenlet`` in a docstring without one of
+    these guards are tautological on the default SQLite/aiosqlite CI run:
+    aiosqlite lazy-loads expired ORM attributes successfully (via the async
+    greenlet), so the test passes vacuously and provides no regression coverage
+    for the asyncpg failure mode.
+
+    Scope: the five test files that historically harboured unfaithful instances.
+    Allowlist is empty — all known instances were migrated; this class is a pure
+    regression-prevention gate for future additions.
+    """
+
+    def test_missing_greenlet_tests_are_faithful(self):
+        violations: list[str] = []
+        for filename in _GREENLET_SCANNED_FILES:
+            path = _THIS_DIR / filename
+            if not path.exists():
+                pytest.fail(f"Expected test file not found: {path}")
+            violations.extend(_unfaithful_greenlet_tests(path))
+
+        assert not violations, (
+            "The following tests mention MissingGreenlet in their docstring but "
+            "are neither fault-injecting (no ``raise MissingGreenlet`` in body) "
+            "nor Postgres-only (no ``@pytest.mark.skipif(not USE_POSTGRES, ...)`` "
+            "decorator). Either inject the fault via a proxy that raises "
+            "MissingGreenlet after rollback (see "
+            "test_strategic_resident_session.py::_ProjectIdPoisonAfterRollback "
+            "for the pattern), or mark the test Postgres-only:\n"
+            + "\n".join(f"  - {v}" for v in violations)
+        )
+
+
+# ---------------------------------------------------------------------------
+# 7. Standalone roster enforcement — audit-finding guards run in all contexts
 # ---------------------------------------------------------------------------
 
 
@@ -596,6 +698,7 @@ class TestStandaloneRosterIncludesGuardModule:
             TestDroppedColumnResidualAbsent,
             TestTestDurationsNotTracked,
             TestLongLivedDocsDoNotReferenceRemovedCodePaths,
+            TestMissingGreenletTestsFaithful,
             TestStandaloneRosterIncludesGuardModule,
         ]
         assert guard_classes, "Guard classes must be defined in this module"

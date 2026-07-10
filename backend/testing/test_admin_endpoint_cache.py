@@ -15,6 +15,7 @@ JSONB scans run in parallel and have caused OOM/instance kill before
 """
 
 import asyncio
+import os
 from typing import Any, Dict
 from unittest.mock import AsyncMock, patch
 
@@ -30,6 +31,10 @@ from app.routers.admin_health import get_health_overview  # noqa: F401  (route r
 from app.routers.admin_pool_accounts import get_account_health_summary  # noqa: F401
 from app.digest_cache import get_digest_cache
 from app.shared_state import runtime_config as _runtime_config
+
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +192,16 @@ async def test_warm_vm_state_exposes_per_project_pool_guard_and_caches(
     assert guard_by_project[str(good.id)]["engaged"] is False
 
 
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason=(
+        "MissingGreenlet on deferred-column lazy-load is asyncpg-specific; "
+        "aiosqlite loads all columns eagerly regardless of load_only(), so the "
+        "regression is invisible on SQLite. No proxy-based fault injection is "
+        "practical because the deferred-column access occurs deep inside "
+        "SQLAlchemy's attribute machinery, not at an application-level hook point."
+    ),
+)
 @pytest.mark.asyncio
 async def test_health_overview_stuck_tasks_no_missing_greenlet(client, db_session):
     """Regression: the REAL _compute_health_overview must not raise MissingGreenlet

@@ -12,6 +12,7 @@ in-memory tests run under ``bash scripts/test-backend.sh --standalone``; DB
 tests (consumed artifact upgrade) run under the full test harness.
 """
 
+import os
 import uuid
 
 import pytest
@@ -51,6 +52,10 @@ from app.models import (
 )
 from app.payload_schemas import AcceptanceEvidence
 from testing.factories import make_project
+
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 def _make_code_task(
@@ -2186,6 +2191,16 @@ async def test_backfill_verdicts_no_starvation(db_session):
     assert final == 0, "No false negatives should remain after full sweep"
 
 
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason=(
+        "MissingGreenlet on expired task attributes is asyncpg-specific; aiosqlite "
+        "lazy-loads succeed in the async greenlet, masking the regression. "
+        "Fault injection is not practical: the rollback happens inside "
+        "record_task_merge_evidence which re-fetches the task via session.get(), "
+        "leaving no ORM object that a proxy could intercept."
+    ),
+)
 @pytest.mark.asyncio
 async def test_backfill_verdicts_resilient_to_mid_loop_rollback(db_session):
     """A rollback inside record_task_merge_evidence (e.g. IntegrityError on
