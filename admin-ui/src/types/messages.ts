@@ -87,6 +87,8 @@ export interface MessageAttachment {
   size_bytes?: number;
   url?: string;
   thumbnail_url?: string;
+  /** Internal stable key for React reconciliation; never serialized. */
+  _attachmentKey?: string;
 }
 
 export type ProjectMessageContext = Record<string, unknown> & {

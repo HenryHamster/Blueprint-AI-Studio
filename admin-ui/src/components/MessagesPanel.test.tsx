@@ -38,6 +38,17 @@ vi.mock('../api', async (importOriginal) => {
 
 import { apiFetch } from '../api';
 
+// Mock fileToMessageAttachment so the FileReader error path can be tested
+// at the integration level (the error-handling composition inside
+// MessagesPanel.handleAttachFiles). Default implementation delegates to
+// the real FileReader so existing attachment-integration tests still work.
+const { mockFileToMessageAttachment } = vi.hoisted(() => ({
+  mockFileToMessageAttachment: vi.fn(),
+}));
+vi.mock('../utils/attachments', () => ({
+  fileToMessageAttachment: mockFileToMessageAttachment,
+}));
+
 // jsdom does not implement scrollIntoView; several panel actions invoke it
 // (summary card → routine section scroll, showOnlyNew → scroll to first new
 // bubble). Stub it module-wide so click handlers do not throw and surface as
@@ -5251,6 +5262,288 @@ describe('MessagesPanel send arming receipt', () => {
     expect(addToast).toHaveBeenCalledWith(armingToastCopy('duplicate'), 'success');
     expect(hintText(el)).toBe(armingHintCopy('duplicate'));
     expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Attachment integration ─────────────────────────────────────────────────────
+// Verifies that handleAttachFiles populates pendingAttachments (visible as
+// preview chips), handleRemoveAttachment removes by index, and that submitted
+// messages include context.attachments in the POST body.
+
+describe('MessagesPanel attachment integration', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(async () => {
+    localStorage.clear();
+    // Restore the real fileToMessageAttachment implementation so existing
+    // attachment tests continue to work through the mock (cleared by
+    // vi.clearAllMocks in afterEach).
+    const realModule = await vi.importActual<typeof import('../utils/attachments')>('../utils/attachments');
+    mockFileToMessageAttachment.mockImplementation(realModule.fileToMessageAttachment);
+  });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    vi.clearAllMocks();
+  });
+
+  function _setupAttachmentMock(capturedBodies: Record<string, unknown>[]): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'POST') {
+        capturedBodies.push(JSON.parse(String((init as RequestInit).body)));
+        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  }
+
+  async function renderPanel(
+    addToast: (msg: string, level: string) => void,
+    props: Partial<MessagesPanelProps> = {},
+  ) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          {...props}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  async function attachFile(el: HTMLElement, name: string, content: string, mimeType: string): Promise<void> {
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    const file = new File([content], name, { type: mimeType });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    // Use a writable data-property descriptor so the same input can be reused
+    // across multiple calls in one test (re-defining is allowed when configurable).
+    Object.defineProperty(fileInput, 'files', {
+      value: dt.files,
+      writable: true,
+      configurable: true,
+    });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+
+  test('handleAttachFiles renders attachment preview chips with file name', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    await attachFile(el, 'test.txt', 'Hello, world!', 'text/plain');
+
+    await waitFor(() => {
+      expect(el.textContent).toContain('test.txt');
+    });
+  });
+
+  test('handleRemoveAttachment removes attachment chip by index', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    // Attach two files
+    await attachFile(el, 'first.txt', 'first', 'text/plain');
+    await attachFile(el, 'second.txt', 'second', 'text/plain');
+
+    await waitFor(() => {
+      expect(el.textContent).toContain('first.txt');
+      expect(el.textContent).toContain('second.txt');
+    });
+
+    // Remove the first attachment (index 0)
+    const removeButtons = el.querySelectorAll<HTMLButtonElement>('button[aria-label^="Remove"]');
+    expect(removeButtons.length).toBe(2);
+    await act(async () => {
+      removeButtons[0].click();
+    });
+
+    // The first file's name should be gone while second remains
+    await waitFor(() => {
+      expect(el.textContent).not.toContain('first.txt');
+    });
+    expect(el.textContent).toContain('second.txt');
+  });
+
+  test('sending with pendingAttachments includes context.attachments in POST body', async () => {
+    const addToast = vi.fn();
+    const capturedBodies: Record<string, unknown>[] = [];
+    _setupAttachmentMock(capturedBodies);
+    const el = await renderPanel(addToast);
+
+    // Attach a file so pendingAttachments is non-empty
+    await attachFile(el, 'report.txt', 'report content', 'text/plain');
+
+    await waitFor(() => {
+      expect(el.textContent).toContain('report.txt');
+    });
+
+    // Type and send a message (full chrome path: POST /api/admin/messages)
+    const textarea = el.querySelector('textarea[placeholder="Type a message..."]') as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype, 'value',
+    )!.set!;
+    await act(async () => {
+      nativeSetter.call(textarea, 'Here is the file');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const sendBtn = el.querySelector('button[class*="bg-blue-600"]') as HTMLButtonElement;
+    expect(sendBtn).toBeTruthy();
+    await act(async () => { sendBtn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    // The POST body must include context.attachments set from pendingAttachments
+    // with the full shape (type, name, mime_type, data, size_bytes) so a
+    // regression that drops file content is caught.
+    expect(capturedBodies.length).toBeGreaterThanOrEqual(1);
+    const postBody = capturedBodies[capturedBodies.length - 1];
+    expect(postBody).toMatchObject({
+      content: 'Here is the file',
+      context: expect.objectContaining({
+        attachments: expect.arrayContaining([
+          expect.objectContaining({
+            type: 'file',
+            name: 'report.txt',
+            mime_type: 'text/plain',
+            data: expect.any(String),
+            size_bytes: 14,
+          }),
+        ]),
+      }),
+    });
+  });
+
+  test('oversized files (>50MB) are rejected with a toast and no chips', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    // Create a file that looks small but reports >50MB via size override
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    const file = new File(['tiny'], 'huge.mp4', { type: 'video/mp4' });
+    Object.defineProperty(file, 'size', { value: 55 * 1024 * 1024 });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    Object.defineProperty(fileInput, 'files', {
+      value: dt.files,
+      writable: true,
+      configurable: true,
+    });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
+
+    // The size-limit toast must fire
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('50 MB size limit'),
+      'error',
+    );
+    // No attachment chips should appear (the file was rejected)
+    expect(el.querySelector('[aria-label^="Remove"]')).toBeNull();
+  });
+
+  test('all files oversized triggers early return with no chips', async () => {
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    // Two oversized files — both must be rejected
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    const file1 = new File(['x'], 'big1.bin', { type: 'application/octet-stream' });
+    Object.defineProperty(file1, 'size', { value: 60 * 1024 * 1024 });
+    const file2 = new File(['y'], 'big2.bin', { type: 'application/octet-stream' });
+    Object.defineProperty(file2, 'size', { value: 70 * 1024 * 1024 });
+    const dt = new DataTransfer();
+    dt.items.add(file1);
+    dt.items.add(file2);
+    Object.defineProperty(fileInput, 'files', {
+      value: dt.files,
+      writable: true,
+      configurable: true,
+    });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
+
+    // One toast for both files
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('50 MB size limit'),
+      'error',
+    );
+    expect(addToast).toHaveBeenCalledTimes(1);
+    // No chips — early return before any file reading
+    expect(el.querySelector('[aria-label^="Remove"]')).toBeNull();
+  });
+
+  test('FileReader error shows failure toast without rendering chips', async () => {
+    mockFileToMessageAttachment.mockRejectedValue(new Error('mock FileReader error'));
+    const addToast = vi.fn();
+    _setupAttachmentMock([]);
+    const el = await renderPanel(addToast);
+
+    // Attach a valid-size file — the mock will reject during reading
+    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
+    expect(fileInput).toBeTruthy();
+    const file = new File(['content'], 'broken.txt', { type: 'text/plain' });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    Object.defineProperty(fileInput, 'files', {
+      value: dt.files,
+      writable: true,
+      configurable: true,
+    });
+    await act(async () => {
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    // Wait for the async Promise.allSettled to settle
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('failed to read'),
+      'error',
+    );
+    // No chips should appear since all reads failed
+    expect(el.querySelector('[aria-label^="Remove"]')).toBeNull();
   });
 });
 

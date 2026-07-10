@@ -11,7 +11,7 @@ import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './t
 import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
-import type { ProjectMessage } from '../types/messages';
+import type { ProjectMessage, MessageAttachment } from '../types/messages';
 import {
   computeStrategicStreamingTurn,
   computeStrategicSessionActivity,
@@ -28,6 +28,7 @@ import { armingToastCopy, parseArmingOutcome, type ArmingOutcome, WORKDAY_CAPABI
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
+import { fileToMessageAttachment } from '../utils/attachments';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
@@ -442,6 +443,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
   const [newType, setNewType] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.type ?? 'FEEDBACK');
   const [newContent, setNewContent] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.content ?? '');
+  /** Files the operator has picked / dropped / pasted but not yet sent. */
+  /** Files the operator has picked / dropped / pasted but not yet sent. */
+  const [pendingAttachments, setPendingAttachments] = useState<MessageAttachment[]>([]);
+  /** True while FileReader is decoding attached files — blocks send to prevent
+   *  submitting before pendingAttachments are populated. */
+  const [attachmentsLoading, setAttachmentsLoading] = useState(false);
+  const attachmentsLoadingRef = useRef(false);
+  /** Monotonic counter for stable attachment chip keys. */
+  const nextAttachmentKeyRef = useRef(0);
   const [submitting, setSubmitting] = useState(false);
   // Synchronous in-flight guard. `submitting` state updates asynchronously, so
   // two rapid keypresses (double-Enter) can both read the pre-update value and
@@ -1520,6 +1530,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // `setSubmitting` has a chance to re-render, so rapid double-Enter cannot
     // launch two requests.
     if (submittingRef.current) return;
+    // Block send while attachments are still being decoded — the file-reading
+    // Promise.allSettled inside handleAttachFiles may not have resolved yet,
+    // so pendingAttachments would be empty and the message would send without
+    // the file content.
+    if (attachmentsLoadingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     try {
@@ -1528,17 +1543,26 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       // question) and marks the question resolved so the strategist sees it answered.
       if (replyTo && replyTo.message_type === 'QUESTION' && replyTo.status === 'open') {
         const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
+        const patchBody: Record<string, unknown> = {
+          resolution: newContent.trim(),
+        };
+        // Include any pending attachments in the PATCH body so they are
+        // not silently discarded when an operator answers a question.
+        if (pendingAttachments.length > 0) {
+          patchBody.context = { attachments: pendingAttachments };
+        }
+        if (workbenchContext) {
+          patchBody.workbench_context = workbenchContext;
+        }
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${replyTo.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            resolution: newContent.trim(),
-            ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
-          }),
+          body: JSON.stringify(patchBody),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         idempotencyKeyRef.current = null;
         setNewContent('');
+        setPendingAttachments([]);
         clearComposerDraft(auth.currentUser?.email, selectedProjectId);
         setReplyTo(null);
         setLastArming(null);
@@ -1553,6 +1577,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       if (replyTo) {
         context.reply_to = replyTo.id;
         context.reply_preview = replyTo.content.slice(0, 120);
+      }
+      if (pendingAttachments.length > 0) {
+        context.attachments = pendingAttachments;
       }
       const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
       // Reuse the draft's key across a double-submit / retry so the backend
@@ -1576,6 +1603,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         setWorkingSince(Date.now());
         // Clear the composer immediately so the optimistic bubble reads as sent.
         setNewContent('');
+        setPendingAttachments([]);
         clearComposerDraft(auth.currentUser?.email, selectedProjectId);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         const data = await createStrategicSessionMessage(selectedProjectId, {
@@ -1642,6 +1670,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       // Sent cleanly — the next distinct message gets a fresh key.
       idempotencyKeyRef.current = null;
       setNewContent('');
+      setPendingAttachments([]);
       clearComposerDraft(auth.currentUser?.email, selectedProjectId);
       setReplyTo(null);
       setLastArming(arming);
@@ -1733,6 +1762,50 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       setDeletingIds(prev => { const next = new Set(prev); next.delete(msgId); return next; });
     }
   }, [fetchMessages]);
+
+  function handleAttachFiles(rawFiles: File[]) {
+    // Client-side file size guard: refuse files larger than 50 MB before reading.
+    const MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024;
+    const validFiles = rawFiles.filter(f => f.size <= MAX_ATTACHMENT_SIZE);
+    const oversized = rawFiles.length - validFiles.length;
+    if (oversized > 0) {
+      addToast(`${oversized} file(s) exceed the 50 MB size limit and were skipped`, 'error');
+    }
+    if (validFiles.length === 0) return;
+    // Set the loading guard before the async FileReader work so that
+    // handleSubmit will reject concurrent sends while files are being read.
+    attachmentsLoadingRef.current = true;
+    setAttachmentsLoading(true);
+    Promise.allSettled(validFiles.map(fileToMessageAttachment)).then(results => {
+      const newAtts: MessageAttachment[] = [];
+      let failures = 0;
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          newAtts.push({
+            ...result.value,
+            // Stable key for React reconciliation — avoids unmount/re-mount
+            // when a preceding chip is removed (array-index shift).
+            _attachmentKey: `att_${nextAttachmentKeyRef.current++}`,
+          });
+        } else {
+          failures++;
+        }
+      }
+      if (newAtts.length > 0) {
+        setPendingAttachments(prev => [...prev, ...newAtts]);
+      }
+      if (failures > 0) {
+        addToast(`${failures} file(s) failed to read`, 'error');
+      }
+    }).finally(() => {
+      attachmentsLoadingRef.current = false;
+      setAttachmentsLoading(false);
+    });
+  }
+
+  const handleRemoveAttachment = useCallback((index: number) => {
+    setPendingAttachments(prev => prev.filter((_, i) => i !== index));
+  }, []);
 
   async function handleCreateDirection(msg: ProjectMessage, silent = false): Promise<boolean> {
     if (!selectedProjectId) return false;
@@ -2308,7 +2381,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         textareaRef={textareaRef}
         newType={effectiveNewType}
         newContent={newContent}
-        submitting={submitting}
+        submitting={submitting || attachmentsLoading}
         replyTo={replyTo}
         lastArming={lastArming}
         strategistBusy={strategistActive}
@@ -2320,6 +2393,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         starterPrompts={starterPrompts ?? undefined}
         capabilityHint={starterPrompts ? WORKDAY_CAPABILITY_HINT : undefined}
         onPickStarterPrompt={(value) => { setNewContent(value); saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); focusComposerTextarea(); }}
+        pendingAttachments={pendingAttachments}
+        onAttachFiles={handleAttachFiles}
+        onRemoveAttachment={handleRemoveAttachment}
         chrome={conversationMode ? 'minimal' : 'full'}
         strategicContext={strategicComposerContext}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}

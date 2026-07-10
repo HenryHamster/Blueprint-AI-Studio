@@ -1,10 +1,11 @@
-import { type RefObject } from 'react';
-import { Command, X, Send, Reply } from 'lucide-react';
+import { type RefObject, useRef, useState } from 'react';
+import { Command, X, Send, Reply, Paperclip, FileText } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
 import { MESSAGE_CONTENT_MAX } from '../api';
+import type { MessageAttachment } from '../types/messages';
 
 export interface MessagesComposerProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
@@ -27,6 +28,12 @@ export interface MessagesComposerProps {
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
   onSubmit: () => void;
+  /** Pending file attachments to show as preview chips before sending. */
+  pendingAttachments?: MessageAttachment[];
+  /** Called when the user picks, drops, or pastes files. */
+  onAttachFiles?: (files: File[]) => void;
+  /** Called when the user removes a pending attachment by index. */
+  onRemoveAttachment?: (index: number) => void;
   chrome?: 'full' | 'minimal';
 }
 
@@ -58,7 +65,48 @@ export function MessagesComposer({
   onSubmit,
   onPickStarterPrompt,
   chrome = 'full',
+  pendingAttachments = [],
+  onAttachFiles,
+  onRemoveAttachment,
 }: MessagesComposerProps) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    if (e.target.files?.length && onAttachFiles) onAttachFiles(Array.from(e.target.files));
+    e.target.value = '';
+  }
+
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    if (!onAttachFiles) return;
+    const files = Array.from(e.clipboardData?.items || [])
+      .filter(i => i.kind === 'file')
+      .map(i => i.getAsFile())
+      .filter(Boolean) as File[];
+    if (files.length) { e.preventDefault(); onAttachFiles(files); }
+  }
+
+  function handleDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    setDragOver(true);
+  }
+
+  function handleDragLeave(e: React.DragEvent) {
+    // Only clear the drag-over highlight when the cursor actually leaves the
+    // drop-zone container — not when it moves from the container to a child
+    // element (textarea, button, etc.) inside it.
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setDragOver(false);
+  }
+
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setDragOver(false);
+    if (e.dataTransfer.files.length && onAttachFiles) {
+      onAttachFiles(Array.from(e.dataTransfer.files));
+    }
+  }
+
   // Auto-resize textarea — max 3 rows (~96px).
   function handleTextareaInput() {
     const el = textareaRef.current;
@@ -124,9 +172,14 @@ export function MessagesComposer({
       <div
         data-testid={minimal ? 'strategic-composer-box' : undefined}
         className={minimal
-        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-workbench-border-strong/80 bg-workbench-card p-1 shadow-[0_10px_28px_rgba(0,0,0,0.20),inset_0_1px_0_rgba(255,255,255,0.035)]`
+        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border ${dragOver ? 'border-emerald-500/60' : 'border-workbench-border-strong/80'} bg-workbench-card p-1 shadow-[0_10px_28px_rgba(0,0,0,0.20),inset_0_1px_0_rgba(255,255,255,0.035)]`
         : 'flex gap-2 items-end'
-      }>
+      }
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
+        <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileSelect} />
         {!minimal && (
           <MessageTypeDropdown value={newType} onChange={onChangeType} compact={minimal} />
         )}
@@ -142,11 +195,21 @@ export function MessagesComposer({
             <span className="hidden font-mono text-ui-sm text-neutral-500 sm:inline">Ctrl+K</span>
           </button>
         )}
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          title="Attach file"
+          aria-label="Attach file"
+          className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:text-neutral-300 md:min-h-8 md:min-w-8"
+        >
+          <Paperclip className="w-4 h-4" />
+        </button>
         <div className="relative flex-1">
           <textarea
             ref={textareaRef}
             value={newContent}
             onChange={e => { onChangeContent(e.target.value); handleTextareaInput(); }}
+            onPaste={handlePaste}
             onKeyDown={e => {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!composerDisabled && !overLimit) onSubmit(); }
             }}
@@ -173,6 +236,27 @@ export function MessagesComposer({
           <Send className="w-4 h-4" />
         </button>
       </div>
+      {/* Attachment preview strip */}
+      {pendingAttachments.length > 0 && (
+        <div className={`${minimal ? minimalColumnClass : ''} mt-2 flex flex-wrap gap-2`}>
+          {pendingAttachments.map((att, i) => (
+            <div key={att._attachmentKey ?? `${i}-${att.name || ''}-${att.size_bytes || 0}`} className="flex items-center gap-1.5 rounded border border-neutral-700/60 bg-neutral-800/40 px-2.5 py-1.5">
+              {att.mime_type?.startsWith('image/') && att.data ? (
+                <img src={`data:${att.mime_type};base64,${att.data}`} alt={att.name || ''} className="h-8 w-8 rounded object-cover" />
+              ) : (
+                <FileText className="h-4 w-4 shrink-0 text-neutral-500" />
+              )}
+              <span className="max-w-[120px] truncate text-xs text-neutral-300">{att.name || 'File'}</span>
+              {att.size_bytes != null && (
+                <span className="shrink-0 text-xs text-neutral-500">({(att.size_bytes / 1024).toFixed(0)} KB)</span>
+              )}
+              <button type="button" onClick={() => onRemoveAttachment?.(i)} className="text-neutral-500 hover:text-neutral-300 p-0.5 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto" aria-label={`Remove ${att.name || 'file'}`}>
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       {/* Steering hint: grounded in the last send's real outcome when available,
           otherwise predicted from the selected type. */}
       {(showHint || nearLimit) && (
