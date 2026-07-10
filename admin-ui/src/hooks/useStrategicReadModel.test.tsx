@@ -15,6 +15,7 @@ vi.mock('../strategicStateApi', () => ({
   executeStrategicWorkSessionCommand: vi.fn(),
   startStrategicSession: vi.fn(),
   stopStrategicSession: vi.fn(),
+  getMessageAttachmentUploadUrl: vi.fn(),
   fetchStrategicState: vi.fn(),
 }));
 

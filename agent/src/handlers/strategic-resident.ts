@@ -25,7 +25,7 @@ import {
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
   BoundedSeenSet, dedupNewMessages, combineOperatorMessages,
-  buildBootstrapPrompt, buildAutonomousPrompt, resolveTerminalStatus,
+  materializeContentBlocks, buildBootstrapPrompt, buildAutonomousPrompt, resolveTerminalStatus,
   nextAuthorityHeld, autonomousActive, FrameCoalescer,
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES,
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
@@ -493,7 +493,7 @@ export async function handleStrategicResident(
     // Autonomous turns get a deeper per-turn stall budget so a long read/verify
     // step isn't killed mid-thought; operator turns keep the responsive default.
     const r = await session.sendTurn(
-      Array.isArray(full) ? toRecordBlocks(full) : full,
+      Array.isArray(full) ? toRecordBlocks(await materializeContentBlocks(full)) : full,
       operator ? undefined : { stallTimeoutMs: cfg.autonomousTurnTimeoutMs });
     streamer.flush();
     streamer.done();

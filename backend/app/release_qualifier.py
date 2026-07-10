@@ -345,6 +345,47 @@ def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
     return h.hexdigest()
 
 
+def _incremental_audit_base_sha(
+    prior_qualification: dict[str, Any] | None,
+    candidate_sha: str,
+) -> str | None:
+    """Return the prior fully-cleared audit SHA eligible as a delta baseline.
+
+    Incremental review is safe only after an audit left no verified *or*
+    unverified findings. A version may still be ``not_promoted`` for an
+    independent gate, so status alone is deliberately not a proxy for audit
+    cleanliness. Missing legacy fields fail closed to a full audit.
+
+    The provenance shape is also suitable for Phase 1's
+    ``QualificationDimensionResult.detail`` JSON. This branch intentionally
+    stores it in ``last_qualification`` until that ledger is backmerged.
+    """
+    if not isinstance(prior_qualification, dict):
+        return None
+    if prior_qualification.get("status") not in {
+        *_CONCLUSIVE_VERDICT_STATUSES,
+        "promotion_failed",
+    }:
+        return None
+    prior_sha = str(prior_qualification.get("candidate_sha") or "").strip()
+    if not prior_sha or prior_sha == candidate_sha:
+        return None
+    sub_scores = prior_qualification.get("sub_scores")
+    if not isinstance(sub_scores, dict) or not isinstance(
+        sub_scores.get("audit"), (int, float)
+    ):
+        return None
+    if prior_qualification.get("audit_findings"):
+        return None
+    if prior_qualification.get("excluded_audit_findings"):
+        return None
+    if prior_qualification.get("audit_findings_total") not in (0, None):
+        return None
+    if prior_qualification.get("excluded_audit_findings_total") not in (0, None):
+        return None
+    return prior_sha
+
+
 def _promotion_failed_reuse_eligible(
     qual: dict[str, Any] | None, candidate_diff_hash: str | None
 ) -> bool:
@@ -2178,6 +2219,7 @@ async def run_qualification(
             base_branch=promotion_target,
             diff_range=diff_range,
             candidate_sha=candidate_sha,
+            audit_base_sha=_incremental_audit_base_sha(prior_qual, candidate_sha),
             version_goal=version.goal,
         )
         audit_task_id = str(audit_task.id)
@@ -2239,6 +2281,7 @@ async def run_qualification(
         "status": "pending",
         "candidate_sha": candidate_sha,
         "candidate_diff_hash": candidate_diff_hash,
+        "audit_base_sha": _incremental_audit_base_sha(prior_qual, candidate_sha),
         "ci_green": ci_green,
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
@@ -4297,6 +4340,9 @@ async def _finalize_qualification(
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": smoketest_task_id,
         "audit_findings": audit_findings,
+        # Agent-authored, backend-preserved explanation of delta selection or
+        # full fallback. Kept schema-free and shaped for later dimension detail.
+        "audit_scope": (audit_report or {}).get("audit_scope"),
         "excluded_audit_findings": excluded_audit_findings,
         # Pre-cap totals + truncation flags so consumers can tell whether the
         # carried lists above are complete or were clipped at _MAX_CARRIED_FINDINGS.

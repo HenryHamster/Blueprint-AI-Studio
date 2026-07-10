@@ -1340,11 +1340,12 @@ async def pause_all_autonomous(
         .scalars()
         .all()
     )
-    if len(user_project_ids) > 500:
+    # _user_project_ids returns a SELECT for use inside .in_(), not a list, so
+    # detect cap truncation from the fetched page size instead of counting it.
+    if len(projects) == 500:
         logger.warning(
-            "pause-all: user has %d projects but cap limited fetch to 500; "
-            "%d projects were NOT paused",
-            len(user_project_ids), len(user_project_ids) - 500,
+            "pause-all: fetch hit the 500-project cap; projects beyond the "
+            "cap were NOT paused"
         )
     for p in projects:
         p.autonomous_enabled = False

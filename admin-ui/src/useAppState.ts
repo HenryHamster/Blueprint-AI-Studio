@@ -1,5 +1,5 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
-import { useState, useEffect, useMemo, useRef, type MutableRefObject } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback, type MutableRefObject } from 'react';
 import type { Task } from './types/task';
 import type { Project } from './types/project';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api/core';
@@ -43,6 +43,55 @@ interface UseAppStateOptions {
   refreshStrategicReadModelRef?: MutableRefObject<() => void>;
   refreshMessagesRef?: MutableRefObject<() => void>;
   refreshFleetRunnersRef?: MutableRefObject<() => void>;
+}
+
+function useShallowMemo<T extends Record<string, unknown>>(value: T): T {
+  type StableCallbackSlot = {
+    current: (...args: unknown[]) => unknown;
+    stable: (...args: unknown[]) => unknown;
+  };
+  const previousRef = useRef<T | null>(null);
+  const callbackSlotsRef = useRef(new Map<keyof T, StableCallbackSlot>());
+
+  return useMemo(() => {
+    // Composed domain hooks do not all memoize their callbacks. Give every
+    // function-valued facade field a stable delegate that always invokes the
+    // latest implementation; otherwise one fresh callback defeats memoization
+    // of the entire return object (or, worse, omitting it from dependencies
+    // leaves consumers with a stale closure).
+    const normalized = {} as T;
+    const normalizedRecord = normalized as Record<keyof T, unknown>;
+    for (const key of Object.keys(value) as Array<keyof T>) {
+      const field = value[key];
+      if (typeof field !== 'function') {
+        normalizedRecord[key] = field;
+        continue;
+      }
+      let slot = callbackSlotsRef.current.get(key);
+      if (!slot) {
+        const newSlot = {} as StableCallbackSlot;
+        newSlot.current = field as (...args: unknown[]) => unknown;
+        newSlot.stable = (...args: unknown[]) => newSlot.current(...args);
+        slot = newSlot;
+        callbackSlotsRef.current.set(key, slot);
+      } else {
+        slot.current = field as (...args: unknown[]) => unknown;
+      }
+      normalizedRecord[key] = slot.stable;
+    }
+
+    const previous = previousRef.current;
+    const keys = Object.keys(normalized) as Array<keyof T>;
+    if (
+      previous !== null
+      && keys.length === Object.keys(previous).length
+      && keys.every(key => Object.is(normalized[key], previous[key]))
+    ) {
+      return previous;
+    }
+    previousRef.current = normalized;
+    return normalized;
+  }, [value]);
 }
 
 export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef }: UseAppStateOptions = {}) {
@@ -486,7 +535,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
 
   // ── Cross-domain glue handlers ────────────────────────────────────────────
 
-  const handleRestartOrchestrator = async () => {
+  const handleRestartOrchestrator = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/restart-orchestrator`, {
         method: 'POST',
@@ -499,17 +548,17 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
       addToast('Failed to restart orchestrator', 'error');
       throw error;
     }
-  };
+  }, [addToast]);
 
-  const refreshSettings = () => {
+  const refreshSettings = useCallback(() => {
     fetchSettings();
     // Refresh the authoritative roster every time settings are entered so a
     // just-added/edited account is always present without waiting on the heavy
     // settings payload.
     fetchMaxPlanAccounts();
-  };
+  }, [fetchSettings, fetchMaxPlanAccounts]);
 
-  const handleUpdateBuildConfig = async (config: import('./types/project').BuildConfig) => {
+  const handleUpdateBuildConfig = useCallback(async (config: import('./types/project').BuildConfig) => {
     if (!selectedProjectId) return;
     try {
       await updateBuildConfig(selectedProjectId, config);
@@ -518,9 +567,9 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     } catch {
       addToast('Failed to save build config', 'error');
     }
-  };
+  }, [selectedProjectId, updateBuildConfig, addToast, fetchProjects]);
 
-  const handleDetectBuildConfig = async () => {
+  const handleDetectBuildConfig = useCallback(async () => {
     if (!selectedProjectId) return;
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/detect-build-config`, {
@@ -543,9 +592,9 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     } catch {
       addToast('Detection failed', 'error');
     }
-  };
+  }, [selectedProjectId, addToast, fetchProjects, setBuildConfig]);
 
-  return {
+  return useShallowMemo({
     // Auth
     user, authLoading, userRole, accessDenied, error, setError,
     // Tasks
@@ -703,5 +752,5 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     addAllowedUser, updateAllowedUserRole, removeAllowedUser,
     // Project members
     projectMembers, fetchProjectMembers, addProjectMember, updateProjectMemberRole, removeProjectMember,
-  };
+  });
 }

@@ -11,7 +11,7 @@ import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './t
 import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
-import type { ProjectMessage } from '../types/messages';
+import type { MessageAttachment, ProjectMessage } from '../types/messages';
 import {
   computeStrategicStreamingTurn,
   computeStrategicSessionActivity,
@@ -23,7 +23,7 @@ import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
-import { MessagesComposer } from './MessagesComposer';
+import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
 import { armingToastCopy, parseArmingOutcome, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
@@ -31,6 +31,12 @@ import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
+import {
+  createPendingAttachment,
+  removePendingAttachment,
+  revokePendingAttachmentPreviews,
+  uploadPendingMessageAttachments,
+} from './messageAttachmentUpload';
 import {
   createStrategicSessionMessage,
   fetchStrategicConversation,
@@ -406,7 +412,6 @@ function messageListsEqual(a: ProjectMessage[], b: ProjectMessage[]): boolean {
   return a.length === b.length && a.every((message, i) => messagesEqual(message, b[i]));
 }
 
-
 export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
@@ -443,6 +448,18 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [newType, setNewType] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.type ?? 'FEEDBACK');
   const [newContent, setNewContent] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.content ?? '');
   const [submitting, setSubmitting] = useState(false);
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
+  // eslint-disable-next-line react-hooks/refs
+  pendingAttachmentsRef.current = pendingAttachments;
+  const clearPendingAttachments = useCallback(() => {
+    setPendingAttachments(prev => {
+      revokePendingAttachmentPreviews(prev);
+      pendingAttachmentsRef.current = [];
+      return [];
+    });
+  }, []);
   // Synchronous in-flight guard. `submitting` state updates asynchronously, so
   // two rapid keypresses (double-Enter) can both read the pre-update value and
   // each fire a request before React re-renders. This ref is set synchronously
@@ -779,6 +796,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const draft = loadComposerDraft(auth.currentUser?.email, selectedProjectId);
     setNewContent(draft?.content ?? '');
     setNewType(draft?.type ?? 'FEEDBACK');
+    clearPendingAttachments();
+    setUploading(false);
     if (selectedProjectId) {
       // Prefer server saved views over localStorage — picks up views created on another device.
       fetchServerSavedViews(selectedProjectId).then(serverViews => {
@@ -790,7 +809,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       });
     }
     return () => { active = false; };
-  }, [selectedProjectId]);
+  }, [selectedProjectId, clearPendingAttachments]);
+
+  useEffect(() => {
+    return () => revokePendingAttachmentPreviews(pendingAttachmentsRef.current);
+  }, []);
 
   // Close kebab menu on outside click — same pattern as MessageTypeDropdown.
   useEffect(() => {
@@ -1514,8 +1537,29 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }
 
+  function handleAddAttachment(file: File) {
+    if (submittingRef.current) return;
+    setPendingAttachments(prev => {
+      const next = [...prev, createPendingAttachment(file)];
+      pendingAttachmentsRef.current = next;
+      return next;
+    });
+  }
+
+  function handleRemoveAttachment(id: string) {
+    if (submittingRef.current) return;
+    setPendingAttachments(prev => {
+      const next = removePendingAttachment(prev, id);
+      pendingAttachmentsRef.current = next;
+      return next;
+    });
+  }
+
   async function handleSubmit() {
-    if (!selectedProjectId || !newContent.trim()) return;
+    const submittedContent = newContent.trim();
+    const attachmentsForSubmit = pendingAttachmentsRef.current;
+    if (!selectedProjectId || (!submittedContent && attachmentsForSubmit.length === 0)) return;
+    if (replyTo && replyTo.message_type === 'QUESTION' && replyTo.status === 'open' && !submittedContent) return;
     // Synchronous guard first — reject re-entrant calls before the async
     // `setSubmitting` has a chance to re-render, so rapid double-Enter cannot
     // launch two requests.
@@ -1532,7 +1576,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            resolution: newContent.trim(),
+            resolution: submittedContent,
             ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
           }),
         });
@@ -1549,7 +1593,23 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         await fetchMessages();
         return;
       }
+      let uploadedAttachments: MessageAttachment[] = [];
+      if (attachmentsForSubmit.length > 0) {
+        setUploading(true);
+        try {
+          uploadedAttachments = await uploadPendingMessageAttachments(selectedProjectId, attachmentsForSubmit);
+        } catch (err) {
+          addToast(err instanceof Error ? err.message : 'Failed to upload attachment', 'error');
+          return;
+        } finally {
+          setUploading(false);
+        }
+      }
+
       const context: Record<string, unknown> = {};
+      if (uploadedAttachments.length > 0) {
+        context.attachments = uploadedAttachments;
+      }
       if (replyTo) {
         context.reply_to = replyTo.id;
         context.reply_preview = replyTo.content.slice(0, 120);
@@ -1560,7 +1620,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       if (!idempotencyKeyRef.current) {
         idempotencyKeyRef.current = generateIdempotencyKey();
       }
-      const submittedContent = newContent.trim();
       if (conversationMode) {
         // INSTANT ACK: optimistically show the operator's message + working state
         // the moment they Send, before the POST round-trips (zero dead time). The
@@ -1589,6 +1648,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         idempotencyKeyRef.current = null;
         setReplyTo(null);
         setLastArming(arming);
+        clearPendingAttachments();
         addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
         let didRefreshStrategicState = false;
         if (arming === 'steering') {
@@ -1645,6 +1705,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       clearComposerDraft(auth.currentUser?.email, selectedProjectId);
       setReplyTo(null);
       setLastArming(arming);
+      clearPendingAttachments();
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
       // A genuine steering message the server could not arm (`not_armed`) is a
       // partial outcome — the message saved, but the strategist was not woken.
@@ -2313,6 +2374,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         lastArming={lastArming}
         strategistBusy={strategistActive}
         disabledReason={selectedProjectId ? null : 'Select a project to message Strategic'}
+        pendingAttachments={pendingAttachments}
+        uploading={uploading}
+        onAddAttachment={handleAddAttachment}
+        onRemoveAttachment={handleRemoveAttachment}
         onChangeType={(value) => { setNewType(value); setLastArming(null); if (newContent) saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: value, content: newContent }); }}
         onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
         onCancelReply={() => setReplyTo(null)}

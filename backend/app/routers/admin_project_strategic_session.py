@@ -7,9 +7,11 @@ admin_projects_router under the same /api/admin prefix.
 """
 
 import asyncio
+import datetime as _dt
 import hashlib
 import json
 import logging
+import re
 import time
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -108,6 +110,13 @@ from app.work_session_check_in import (
 )
 from app.server_timing import async_timed
 from app.shared_state import runtime_config
+from app.storage import (
+    ARTIFACT_BUCKET_NAME,
+    GCP_PROJECT_ID,
+    _generate_v4_signed_url,
+    generate_download_signed_url,
+    storage as gcs_storage,
+)
 from app.strategic_resident_session import (
     STRATEGIC_SESSION_ENABLED_SETTING,
     build_resident_runner_options,
@@ -463,6 +472,50 @@ class StrategicSessionCommandExecute(BaseModel):
 
 class StrategicResidentSessionStart(BaseModel):
     runner_id: str | None = None
+
+
+_ATTACHMENT_DEFAULT_CONTENT_TYPE = "application/octet-stream"
+_ATTACHMENT_DEFAULT_FILENAME = "attachment"
+_ATTACHMENT_FILENAME_MAX_CHARS = 200
+_ATTACHMENT_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_ATTACHMENT_CONTENT_TYPE_RE = re.compile(
+    r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+/[A-Za-z0-9!#$%&'*+.^_`|~-]+$"
+)
+
+
+def _sanitize_message_attachment_filename(filename: str) -> str:
+    """Return a single safe GCS object-name segment for an uploaded attachment."""
+
+    raw = (filename or "").strip().replace("\\", "/")
+    name = raw.rsplit("/", 1)[-1].strip()
+    name = _ATTACHMENT_SAFE_FILENAME_RE.sub("_", name).strip("._")
+    if not name:
+        return _ATTACHMENT_DEFAULT_FILENAME
+    if len(name) <= _ATTACHMENT_FILENAME_MAX_CHARS:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if dot and 1 <= len(ext) <= 32:
+        keep = max(1, _ATTACHMENT_FILENAME_MAX_CHARS - len(dot) - len(ext))
+        return f"{stem[:keep]}{dot}{ext}"
+    return name[:_ATTACHMENT_FILENAME_MAX_CHARS]
+
+
+def _attachment_content_type(content_type: str | None) -> str:
+    """Validate the Content-Type header that will be bound into the signed PUT."""
+
+    value = (content_type or "").strip()
+    if not value:
+        return _ATTACHMENT_DEFAULT_CONTENT_TYPE
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise HTTPException(status_code=400, detail="Invalid content_type")
+    if not _ATTACHMENT_CONTENT_TYPE_RE.fullmatch(value):
+        raise HTTPException(status_code=400, detail="Invalid content_type")
+    return value
+
+
+def _message_context_has_attachments(context: Dict[str, Any] | None) -> bool:
+    raw = context.get("attachments") if isinstance(context, dict) else None
+    return isinstance(raw, list) and any(isinstance(item, dict) for item in raw)
 
 
 def _work_session_command_by_id(
@@ -1899,7 +1952,11 @@ async def create_project_strategic_session_message(
         project=project,
         user_id=current_user["user_id"],
         message_type=parse_operator_message_type(payload.message_type),
-        content=payload.content,
+        content=(
+            payload.content
+            if payload.content.strip() or not _message_context_has_attachments(payload.context)
+            else "Sent attachment."
+        ),
         context=payload.context,
         workbench_context=payload.workbench_context,
         idempotency_key=payload.idempotency_key,
@@ -1954,6 +2011,72 @@ async def create_project_strategic_session_message(
             result.message_event,
         )
     return response
+
+
+class MessageAttachmentUploadUrlRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=512)
+    content_type: str | None = Field(default=None, max_length=128)
+
+
+@router.post("/projects/{project_id}/messages/attachment-upload-url")
+@limiter.limit("60/minute")
+async def get_message_attachment_upload_url(
+    request: Request,
+    project_id: uuid.UUID,
+    req: MessageAttachmentUploadUrlRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Generate a signed upload URL for a message attachment."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member",
+    )
+    safe_filename = _sanitize_message_attachment_filename(req.filename)
+    content_type = _attachment_content_type(req.content_type)
+    attachment_id = str(uuid.uuid4())
+    object_name = f"message-attachments/{project_id}/{attachment_id}/{safe_filename}"
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    def _generate() -> str:
+        blob = (
+            gcs_storage.Client(project=GCP_PROJECT_ID)
+            .bucket(ARTIFACT_BUCKET_NAME)
+            .blob(object_name)
+        )
+        return _generate_v4_signed_url(
+            blob,
+            version="v4",
+            expiration=_dt.timedelta(minutes=15),
+            method="PUT",
+            content_type=content_type,
+        )
+
+    try:
+        upload_url = await asyncio.to_thread(_generate)
+    except Exception as exc:
+        logger.warning(
+            "[ATTACHMENT] signed upload URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(status_code=503, detail="Storage unavailable") from exc
+
+    try:
+        download_url = await generate_download_signed_url(
+            storage_uri,
+            expiration_minutes=60,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[ATTACHMENT] signed download URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(status_code=503, detail="Storage unavailable") from exc
+
+    return {
+        "upload_url": upload_url,
+        "download_url": download_url,
+        "storage_uri": storage_uri,
+        "attachment_id": attachment_id,
+        "content_type": content_type,
+    }
 
 
 @router.post("/projects/{project_id}/strategic-session/start")

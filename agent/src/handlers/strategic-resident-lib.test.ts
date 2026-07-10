@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
   BoundedSeenSet, dedupNewMessages, extractMessageTurn, combineOperatorMessages,
+  materializeContentBlocks, isAllowedAttachmentDownloadUrl,
   buildBootstrapPrompt, buildAutonomousPrompt,
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
@@ -13,7 +14,7 @@ import {
   AUTONOMOUS_FLOOR_TICK_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
-  MAX_IMAGE_BASE64_LENGTH, MAX_IMAGES_PER_TURN,
+  MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN,
   modelContextLimit, compactionThreshold, buildCompactionCheckpoint,
   DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
   type ExamSurface, type ExamRecord, type ContentBlock,
@@ -255,7 +256,7 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     expect(out).toHaveLength(2);
     expect(out[0]).toEqual({ type: 'text', text: 'check' });
     expect(out[1]).toHaveProperty('type', 'image');
-    expect((out[1] as { source: Record<string, unknown> }).source).toEqual({ type: 'base64', media_type: 'image/jpeg', data: '/9j/4AAQ=' });
+    expect((out[1] as unknown as { source: Record<string, unknown> }).source).toEqual({ type: 'base64', media_type: 'image/jpeg', data: '/9j/4AAQ=' });
   });
 
   it('preserves image blocks through combine batch path (2+ messages)', () => {
@@ -275,12 +276,13 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     expect(images[1]).toHaveProperty('source.data', '/9j/4AAQ=');
   });
 
-  it('rejects non-image mime_types in extractMessageTurn', () => {
+  it('rejects non-image and unsupported image mime_types in extractMessageTurn', () => {
     const r = extractMessageTurn({
       content: 'file attached',
       context: {
         attachments: [
           { type: 'image', mime_type: 'application/pdf', data: 'JVBERi0=' },
+          { type: 'image', mime_type: 'image/svg+xml', data: 'PHN2Zz4=' },
           { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=' },
         ],
       },
@@ -327,6 +329,170 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     for (let i = 0; i < MAX_IMAGES_PER_TURN; i++) {
       expect(r[i + 1]).toHaveProperty('source.data', `data${i}`);
     }
+  });
+
+  it('extracts GCS URL-sourced image attachment from context', () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/screenshot.png?X-Goog-Signature=abc123';
+    const r = extractMessageTurn({
+      content: 'see the screenshot',
+      context: {
+        attachments: [
+          {
+            type: 'image',
+            mime_type: 'image/png',
+            url: signedUrl,
+            name: 'screenshot.png',
+          },
+        ],
+      },
+    });
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'see the screenshot' });
+    expect(r[1]).toEqual({
+      type: 'image',
+      source: {
+        type: 'url',
+        url: signedUrl,
+        media_type: 'image/png',
+        name: 'screenshot.png',
+      },
+    });
+  });
+
+  it('rejects unsigned or non-GCS image attachment URLs before fetch', () => {
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com/bucket/a.png?X-Goog-Signature=abc123')).toBe(true);
+    expect(isAllowedAttachmentDownloadUrl('https://bucket.storage.googleapis.com/a.png?X-Goog-Signature=abc123')).toBe(true);
+    expect(isAllowedAttachmentDownloadUrl('https://storage.googleapis.com/bucket/a.png')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('http://storage.googleapis.com/bucket/a.png?X-Goog-Signature=abc123')).toBe(false);
+    expect(isAllowedAttachmentDownloadUrl('https://example.com/a.png?X-Goog-Signature=abc123')).toBe(false);
+
+    const r = extractMessageTurn({
+      content: 'bad url',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'image/png', url: 'https://example.com/a.png?X-Goog-Signature=abc123', name: 'a.png' },
+        ],
+      },
+    });
+    expect(r).toEqual([
+      { type: 'text', text: 'bad url' },
+      { type: 'text', text: '[Attached image "a.png" could not be loaded: unsupported download URL.]' },
+    ]);
+  });
+
+  it('prefers base64 data over GCS URL when both are present', () => {
+    const r = extractMessageTurn({
+      content: 'inline data',
+      context: {
+        attachments: [
+          {
+            type: 'image',
+            mime_type: 'image/jpeg',
+            data: '/9j/4AAQ=',
+            url: 'https://storage.googleapis.com/bucket/photo.jpg?signed=...',
+          },
+        ],
+      },
+    });
+    // Should use the base64 data, not the URL.
+    expect(r).toHaveLength(2);
+    expect(r[1]).toHaveProperty('type', 'image');
+    expect(r[1]).toHaveProperty('source.type', 'base64');
+    expect(r[1]).toHaveProperty('source.data', '/9j/4AAQ=');
+  });
+
+  it('materializes signed GCS image URLs as base64 model blocks', async () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/photo.png?X-Goog-Signature=abc123';
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const fetchCalls: string[] = [];
+    const out = await materializeContentBlocks([
+      { type: 'text', text: 'look' },
+      { type: 'image', source: { type: 'url', url: signedUrl, media_type: 'image/png', name: 'photo.png' } },
+    ], async (url) => {
+      fetchCalls.push(url);
+      return {
+        ok: true,
+        status: 200,
+        headers: {
+          get(name: string) {
+            if (name.toLowerCase() === 'content-length') return String(bytes.byteLength);
+            if (name.toLowerCase() === 'content-type') return 'image/png';
+            return null;
+          },
+        },
+        arrayBuffer: async () => bytes.buffer,
+      };
+    });
+
+    expect(fetchCalls).toEqual([signedUrl]);
+    expect(out).toEqual([
+      { type: 'text', text: 'look' },
+      {
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: 'image/png',
+          data: Buffer.from(bytes).toString('base64'),
+        },
+      },
+    ]);
+  });
+
+  it('materializes URL fetch failures as text notices without throwing', async () => {
+    const out = await materializeContentBlocks([
+      {
+        type: 'image',
+        source: {
+          type: 'url',
+          url: 'https://storage.googleapis.com/bucket/missing.png?X-Goog-Signature=abc123',
+          media_type: 'image/png',
+          name: 'missing.png',
+        },
+      },
+    ], async () => ({
+      ok: false,
+      status: 403,
+      headers: { get: () => null },
+      arrayBuffer: async () => new ArrayBuffer(0),
+    }));
+
+    expect(out).toEqual([
+      { type: 'text', text: '[Attached image "missing.png" could not be loaded: download failed (403).]' },
+    ]);
+  });
+
+  it('does not download images declared larger than the model input cap', async () => {
+    let readBody = false;
+    const out = await materializeContentBlocks([
+      {
+        type: 'image',
+        source: {
+          type: 'url',
+          url: 'https://storage.googleapis.com/bucket/huge.png?X-Goog-Signature=abc123',
+          media_type: 'image/png',
+          name: 'huge.png',
+        },
+      },
+    ], async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get(name: string) {
+          return name.toLowerCase() === 'content-length'
+            ? String(MAX_IMAGE_DOWNLOAD_BYTES + 1)
+            : null;
+        },
+      },
+      arrayBuffer: async () => {
+        readBody = true;
+        return new ArrayBuffer(0);
+      },
+    }));
+
+    expect(readBody).toBe(false);
+    expect(out).toEqual([
+      { type: 'text', text: '[Attached image "huge.png" could not be loaded: image is too large.]' },
+    ]);
   });
 });
 

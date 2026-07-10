@@ -13,6 +13,7 @@ export function createStrategicStateApiMock(overrides: Record<string, unknown> =
     executeStrategicWorkSessionCommand: vi.fn(),
     startStrategicSession: vi.fn(),
     stopStrategicSession: vi.fn(),
+    getMessageAttachmentUploadUrl: vi.fn(),
   };
   return { ...base, ...overrides };
 }
