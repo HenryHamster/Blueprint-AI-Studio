@@ -1231,6 +1231,7 @@ async def _maybe_create_self_repair_burn_share_alert(
     burn_share: float,
     threshold: float,
     severity: AlertSeverity = AlertSeverity.WARNING,
+    top_schemas: list[tuple[str, int]] | None = None,
 ) -> None:
     """Create a deduplicated operator Alert when a project's self-repair burn-share
     exceeds the efficiency ceiling.
@@ -1261,12 +1262,18 @@ async def _maybe_create_self_repair_burn_share_alert(
         return
     burn_share_pct = (burn_share * 100) if burn_share is not None else 0.0
     threshold_pct = threshold * 100
+    schema_suffix = ""
+    if top_schemas:
+        schema_lines = ", ".join(
+            f"{name} ({attempts} attempts)" for name, attempts in top_schemas
+        )
+        schema_suffix = f" Top offending schemas: {schema_lines}."
     message = (
         f"Self-repair tokens consumed {burn_share_pct:.1f}% of total LLM tokens, "
         f"exceeding the efficiency ceiling of {threshold_pct:.1f}%. High repair "
         f"overhead indicates multiple format-recovery attempts are required; "
         f"investigate whether recent prompt or schema changes have degraded "
-        f"structured-output success rates."
+        f"structured-output success rates.{schema_suffix}"
     )[:1000]
     alert = Alert(
         project_id=project_id,

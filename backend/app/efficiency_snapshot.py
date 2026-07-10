@@ -134,6 +134,8 @@ VERIFIED_TASK_DRIFT_MIN_COUNT = 20
 AXIS_REWORK_COST_SHARE = "rework_cost_share"
 AXIS_SALVAGE_COUNT = "salvage_count"
 AXIS_SALVAGE_MERGE_RATE = "salvage_merge_rate"
+AXIS_ACCEPTANCE_PROVEN_RATE = "acceptance_proven_rate"
+AXIS_ACCEPTANCE_SATISFIED_RATE = "acceptance_satisfied_rate"
 
 # Guard threshold for prompt_static_bytes: alert when static prompt size exceeds
 # this many source characters. Set well above the current measured value (~31k chars)
@@ -171,6 +173,8 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_REWORK_COST_SHARE,
     AXIS_SALVAGE_COUNT,
     AXIS_SALVAGE_MERGE_RATE,
+    AXIS_ACCEPTANCE_PROVEN_RATE,
+    AXIS_ACCEPTANCE_SATISFIED_RATE,
 )
 
 # ---------------------------------------------------------------------------
@@ -238,6 +242,12 @@ AXIS_CONSUMERS: dict[str, dict] = {
     },
     AXIS_SALVAGE_MERGE_RATE: {
         "consumer": "MetricsDashboard.EFFICIENCY_AXES (admin-ui operator dashboard)"
+    },
+    AXIS_ACCEPTANCE_PROVEN_RATE: {
+        "pending": "acceptance quality trend axis — awaiting UI consumer"
+    },
+    AXIS_ACCEPTANCE_SATISFIED_RATE: {
+        "pending": "acceptance quality trend axis — awaiting UI consumer"
     },
 }
 
@@ -2718,6 +2728,17 @@ async def _compute_salvage_axes(
     }
 
 
+def _acceptance_quality_axes(tasks: list[Task]) -> dict[str, float | None]:
+    """Return proven_rate and satisfied_rate snapshot axes from recent tasks."""
+    from app.acceptance_gate import summarize_version_acceptance_aggregate
+
+    agg = summarize_version_acceptance_aggregate(tasks)
+    return {
+        AXIS_ACCEPTANCE_PROVEN_RATE: agg["proven_rate"],
+        AXIS_ACCEPTANCE_SATISFIED_RATE: agg["satisfied_rate"],
+    }
+
+
 async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
@@ -2922,6 +2943,12 @@ async def compute_current_axes(
         # the declared tolerance. Non-zero tasks with at least one priced attempt
         # are required for a meaningful check.
         "cost_telemetry_reconciliation": _compute_cost_telemetry_reconciliation(tasks),
+        # Acceptance evidence quality trend (direction d-99daddbd): proven_rate
+        # (machine-checked proofs / total merges) and satisfied_rate
+        # (proven + satisfied_unproven / total merges) persisted as snapshot axes
+        # so operators can observe whether evidence quality improves or degrades
+        # as acceptance-gate changes land. None when no completed tasks in window.
+        **_acceptance_quality_axes(tasks),
     }
 
 
@@ -4205,9 +4232,21 @@ async def maybe_alert_self_repair_burn_share(
     from app.models import AlertSeverity
     from app.task_locking import with_design_doc_locked
 
+    from app.digest_metrics import _accumulate_format_compliance
+
     tasks = await _load_recent_tasks(session, project_id)
     llm_attribution = _compact_llm_cost_attribution(tasks)
     burn_share = llm_attribution.get(SELF_REPAIR_BURN_SHARE_KEY)
+
+    # Extract top offending schemas by repair_attempt count for actionable alert context.
+    fc_block = _accumulate_format_compliance(tasks)
+    by_schema = fc_block.get("by_schema") or {}
+    top_schemas: list[tuple[str, int]] = sorted(
+        ((name, entry.get("repair_attempts", 0)) for name, entry in by_schema.items()
+         if entry.get("repair_attempts", 0) > 0),
+        key=lambda x: x[1],
+        reverse=True,
+    )[:3]
 
     # Elevated when burn_share exists and exceeds the threshold.
     elevated = (
@@ -4242,6 +4281,7 @@ async def maybe_alert_self_repair_burn_share(
         burn_share=burn_share,
         threshold=SELF_REPAIR_BURN_SHARE_THRESHOLD,
         severity=AlertSeverity.WARNING,
+        top_schemas=top_schemas or None,
     )
     logger.info(
         "[SELF_REPAIR_BURN_SHARE_ALERT] project=%s burn_share=%.4f threshold=%.4f",
