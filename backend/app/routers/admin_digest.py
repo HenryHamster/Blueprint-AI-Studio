@@ -150,6 +150,7 @@ from app.anomaly_detection import (  # noqa: E402, F401
 )
 from app.cost_telemetry_reconciliation import (  # noqa: E402, F401
     reconcile_llm_cost,
+    reconcile_provider_reported_usage,
 )
 from app.efficiency_snapshot import (  # noqa: E402, F401
     compute_provider_routing_share,
@@ -349,6 +350,7 @@ DIGEST_PAYLOAD_METRIC_MANIFEST: dict[str, dict] = {
     "effort_model_efficiency": {"consumer": "DashboardHome"},
     "provider_routing_share": {"consumer": "EffortEfficiencyPanel"},
     "cost_telemetry_reconciliation": {"consumer": "EffortEfficiencyPanel"},
+    "cost_telemetry_reconciliation_provider_reported": {"consumer": "EffortEfficiencyPanel"},
     "overall_type_distribution": {"consumer": "CatchUpStatsRow"},
     "total_estimated_cost_usd": {"consumer": "CatchUpStatsRow"},
     "spot_cost_usd": {"consumer": "CatchUpStatsRow"},
@@ -517,6 +519,10 @@ async def _compute_digest(
             Task.model,
             Task.attempt_history_db,
             Task.api_call_summary,
+            # provider_reported_usage: read by reconcile_provider_reported_usage
+            # (cost_telemetry_reconciliation.py) for cross-checking agent token
+            # counters against the Anthropic API's raw response.usage fields.
+            Task.provider_reported_usage,
             Task.llm_input_tokens_banked_db,
             Task.llm_output_tokens_banked_db,
             Task.llm_call_count_banked_db,
@@ -1346,6 +1352,22 @@ async def _compute_digest(
         if _reconciliation_window
         else None
     )
+    _provider_recon = (
+        reconcile_provider_reported_usage(_reconciliation_window)
+        if _reconciliation_window
+        else None
+    )
+    if _provider_recon is not None and not _provider_recon.provider_reported_within_tolerance and _provider_recon.task_count > 0:
+        logger.warning(
+            "cost_telemetry_reconciliation provider_reported FAILED — "
+            "delta=%.4f (tolerance=%.4f) over %d task(s) with provider data",
+            _provider_recon.provider_reported_delta,
+            _provider_recon.provider_reported_tolerance,
+            _provider_recon.task_count,
+        )
+    effort_model_efficiency["cost_telemetry_reconciliation_provider_reported"] = (
+        _provider_recon.asdict() if _provider_recon is not None else None
+    )
 
     # --- Scope mismatch diagnostics ---
     # Aggregate calibration data across terminal tasks in the window to surface
@@ -2129,6 +2151,9 @@ async def _compute_digest(
         ),
         "cost_telemetry_reconciliation": effort_model_efficiency.get(
             "cost_telemetry_reconciliation"
+        ),
+        "cost_telemetry_reconciliation_provider_reported": effort_model_efficiency.get(
+            "cost_telemetry_reconciliation_provider_reported"
         ),
         "overall_type_distribution": overall_type_distribution or None,
         "total_estimated_cost_usd": total_estimated_cost_usd,

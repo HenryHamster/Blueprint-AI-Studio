@@ -21,6 +21,7 @@ from app.cost_telemetry_reconciliation import (
 )
 from app.llm_cost_attribution import LLM_TOKEN_PRICING
 from app.models import TaskStatus, bank_task_current_attempt
+from app.routers.admin_digest import _compute_digest
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -1477,3 +1478,64 @@ async def test_reconcile_llm_cost_asdict_has_all_reconciliation_fields(db_sessio
     assert deserialized["agent_accumulated_output_tokens"] == 0
     assert deserialized["provider_reported_output_tokens"] == 0
     assert deserialized["source"] == "internal_recompute"
+
+
+# ---------------------------------------------------------------------------
+# Digest payload integration: provider-reported reconciliation in _compute_digest
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_payload_includes_provider_reported_reconciliation(db_session):
+    """_compute_digest includes cost_telemetry_reconciliation_provider_reported in
+    the payload when the task window has tasks with provider_reported_usage data.
+
+    Verifies that reconcile_provider_reported_usage is wired into the live
+    digest path (not test-only), and that its result is surfaced as a top-level
+    key alongside the legacy cost_telemetry_reconciliation."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task with both api_call_summary and provider_reported_usage — gets checked.
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 1500,
+            "total_output_tokens": 500,
+            "total_cache_creation_input_tokens": 200,
+            "total_cache_read_input_tokens": 300,
+            "llm_call_count": 5,
+        },
+        provider_reported_usage={
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 300,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _compute_digest(hours=24, project_id=project.id, session=db_session)
+
+    # Top-level key must be present.
+    assert "cost_telemetry_reconciliation_provider_reported" in result, (
+        "digest payload must include cost_telemetry_reconciliation_provider_reported"
+    )
+
+    pr = result["cost_telemetry_reconciliation_provider_reported"]
+    assert pr is not None, "provider-reported reconciliation must not be None when tasks exist"
+    assert pr["source"] == "provider_reported"
+    # At least one task had provider data.
+    assert pr["task_count"] >= 1
+    # The tolerance flag must be present.
+    assert "provider_reported_within_tolerance" in pr
+    # Legacy reconciliation must also still be present.
+    assert "cost_telemetry_reconciliation" in result
+    assert result["cost_telemetry_reconciliation"] is not None
