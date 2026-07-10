@@ -30,6 +30,49 @@ from app.migration_reconciliation import (
 _ALEMBIC_VERSIONS_DIR = "backend/alembic/versions"
 
 
+class PremergeMigrationGuardResult:
+    """Two-value-unpackable guard result with the detailed verdict retained.
+
+    Existing call sites do ``ok, reason = await enforce_premerge_migration_guard``.
+    Keep that contract while exposing ``.verdict`` to callers that must
+    distinguish deterministic ``block`` from transient ``defer``.
+    """
+
+    __slots__ = ("ok", "reason", "verdict")
+
+    def __init__(self, verdict: str, reason: str | None):
+        if verdict not in {"ok", "block", "defer"}:
+            raise ValueError(f"unknown migration guard verdict: {verdict!r}")
+        self.verdict = verdict
+        self.ok = verdict == "ok"
+        self.reason = None if self.ok else reason
+
+    def __iter__(self):
+        yield self.ok
+        yield self.reason
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, index: int):
+        if index == 0:
+            return self.ok
+        if index == 1:
+            return self.reason
+        raise IndexError(index)
+
+    def __eq__(self, other):
+        if isinstance(other, tuple) and len(other) == 2:
+            return (self.ok, self.reason) == other
+        return super().__eq__(other)
+
+    def __repr__(self) -> str:
+        return (
+            "PremergeMigrationGuardResult("
+            f"ok={self.ok!r}, reason={self.reason!r}, verdict={self.verdict!r})"
+        )
+
+
 def _exc_detail(e: BaseException) -> str:
     """Format an exception for use in hold-reason strings.
 
@@ -431,7 +474,7 @@ async def enforce_premerge_migration_guard(
     pr_number: int,
     target_branch: str | None,
     promotion_target: str | None = None,
-) -> tuple[bool, str | None]:
+) -> PremergeMigrationGuardResult:
     """Fail-safe pre-merge Alembic dual-head guard for non-autoreconcile paths.
 
     Wraps :func:`_validate_rollup_migration_chain` and collapses its
@@ -456,9 +499,7 @@ async def enforce_premerge_migration_guard(
         target_branch=target_branch,
         promotion_target=promotion_target,
     )
-    if verdict == "ok":
-        return (True, None)
-    return (False, reason)
+    return PremergeMigrationGuardResult(verdict, reason)
 
 
 def _divergence_record_is_authorized(
