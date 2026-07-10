@@ -602,10 +602,55 @@ if touches backend/; then
     # invariant set (security, pipeline, invariants, audit-finding-class,
     # admin-auth, metric-manifest + emitter-inventory contracts) which
     # catches file-size breaches, security regressions, and basic pipeline
-    # and contract assertions — the rest is CI's job. \`set -o pipefail\` so the harness's non-zero
-    # exit propagates through \`| tail\` (same rationale as the agent
-    # vitest line above — the outer pipefail does not reach a fresh bash -c).
-    run "backend pytest" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'
+    # and contract assertions — the rest is CI's job.
+    # Baseline-recheck: if the standalone suite fails, re-run it on the
+    # base branch to distinguish pre-existing failures (WARN, not blocking)
+    # from regressions introduced by this PR (real failure, blocking).
+    # Mirrors the viewport and eslint baseline-recheck pattern exactly.
+    echo "[check] backend pytest..."
+    BPYTEST_PR_LOG=/tmp/check_backend_pytest_pr.log
+    if ( set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200 ) > "$BPYTEST_PR_LOG" 2>&1; then
+      tail -20 "$BPYTEST_PR_LOG"
+      echo "[check] backend pytest OK"
+    else
+      echo "[check] backend pytest FAILED on PR — checking baseline on origin/$BASE..."
+      BPYTEST_BASELINE_FAILED=0
+      BPYTEST_BASELINE_REASON=""
+      BPYTEST_BASE_REF="origin/$BASE"
+      if ! git rev-parse --verify "$BPYTEST_BASE_REF" >/dev/null 2>&1; then
+        BPYTEST_BASE_REF="$BASE"
+        git rev-parse --verify "$BPYTEST_BASE_REF" >/dev/null 2>&1 || BPYTEST_BASELINE_REASON="base ref unavailable"
+      fi
+      if [ -z "$BPYTEST_BASELINE_REASON" ]; then
+        BPYTEST_WT=/tmp/check_backend_pytest_baseline_wt
+        # Stale worktree from a prior run can wedge \`worktree add\`.
+        # \`worktree remove --force\` is the safe cleanup (no rm -rf).
+        git worktree remove --force "$BPYTEST_WT" >/dev/null 2>&1 || true
+        if ! git worktree add --detach "$BPYTEST_WT" "$BPYTEST_BASE_REF" >/tmp/check_backend_pytest_wt.log 2>&1; then
+          BPYTEST_BASELINE_REASON="worktree add failed (see /tmp/check_backend_pytest_wt.log)"
+        else
+          BPYTEST_MAIN_LOG=/tmp/check_backend_pytest_main.log
+          if ( set -o pipefail; cd "$BPYTEST_WT" && bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200 ) > "$BPYTEST_MAIN_LOG" 2>&1; then
+            BPYTEST_BASELINE_FAILED=0
+          else
+            BPYTEST_BASELINE_FAILED=1
+          fi
+          git worktree remove --force "$BPYTEST_WT" >/dev/null 2>&1 || true
+        fi
+      fi
+      if [ "$BPYTEST_BASELINE_FAILED" = "1" ]; then
+        echo "[check] backend pytest WARN — also broken on $BPYTEST_BASE_REF; not blocking PR"
+        echo "[check] PR-side tail:"
+        tail -30 "$BPYTEST_PR_LOG" || true
+        echo "[check] Baseline-side tail:"
+        tail -30 "$BPYTEST_MAIN_LOG" || true
+      else
+        echo "[check] backend pytest FAILED — passes on $BPYTEST_BASE_REF, fails on PR. Real regression."
+        [ -n "$BPYTEST_BASELINE_REASON" ] && echo "[check] (baseline check skipped: $BPYTEST_BASELINE_REASON — treating PR failure as real)"
+        tail -100 "$BPYTEST_PR_LOG" || true
+        FAILED+=("backend pytest")
+      fi
+    fi
 ${buildImpactedTestBlock(cfg.taskId)}  fi
   # Fast migration-chain guard: no DB, no Docker, sub-second. Runs only
   # when at least one alembic/versions/ file was added or changed.
