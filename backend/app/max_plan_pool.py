@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Mapping
 
 from app.database import AsyncSessionLocal
+from app.field_encryption import decrypt_field
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import UsageSnapshot, merge_settings
 from app.providers.registry import get_provider
@@ -957,7 +958,7 @@ async def load_max_plan_pool():
             acct_id = str(acct.id)
             provider = acct.provider or LLMProviderName.ANTHROPIC
             auth_mode = acct.auth_mode or LLMAuthMode.OAUTH
-            runtime_secret = acct.secret_blob_ref or acct.oauth_token
+            runtime_secret = decrypt_field(acct.secret_blob_ref) or decrypt_field(acct.oauth_token)
             if runtime_secret and runtime_secret.startswith("projects/"):
                 try:
                     from app.secrets_manager import get_user_secret
@@ -984,12 +985,12 @@ async def load_max_plan_pool():
                 "auth_mode": auth_mode.value
                 if isinstance(auth_mode, LLMAuthMode)
                 else str(auth_mode),
-                "secret_blob_ref": acct.secret_blob_ref,
+                "secret_blob_ref": decrypt_field(acct.secret_blob_ref),
                 "provider_metadata": acct.provider_metadata or {},
                 "runtime_secret": runtime_secret,
                 "oauth_token": token,
                 "runtime_ready": bool(runtime_secret),
-                "claude_config_json": acct.claude_config_json,
+                "claude_config_json": decrypt_field(acct.claude_config_json),
                 "enabled": acct.enabled,
                 "active_tasks": active_per_account.get(acct_id, 0),
                 "total_tasks": acct.total_tasks,
@@ -2424,7 +2425,10 @@ async def select_max_plan_account_balanced(
         account["active_tasks"] = account.get("active_tasks", 0) + 1
         account["daily_task_count"] = int(account.get("daily_task_count") or 0) + 1
         _pending_cap_persists.add(account["id"])
-        return account, prov, model
+        selected_winner = (account, prov, model)
+
+    await _maybe_refresh_account_secret(selected_winner[0])
+    return selected_winner
 
 
 async def select_max_plan_account(
@@ -2546,7 +2550,10 @@ async def select_max_plan_account(
         account["active_tasks"] = account.get("active_tasks", 0) + 1
         account["daily_task_count"] = int(account.get("daily_task_count") or 0) + 1
         _pending_cap_persists.add(account["id"])
-        return account
+        selected = account
+
+    await _maybe_refresh_account_secret(selected)
+    return selected
 
 
 async def select_llm_runtime_for_task(
@@ -2862,10 +2869,55 @@ async def select_llm_runtime_for_task(
     return None
 
 
+async def _maybe_refresh_account_secret(acct: Dict[str, Any]) -> None:
+    """Re-fetch runtime_secret from Secret Manager when it has been cleared.
+
+    Called after selecting an account, outside the pool lock, so I/O does not
+    block other pool operations.  Only acts when runtime_secret is absent and
+    secret_blob_ref is a Secret Manager path (starts with "projects/").
+    """
+    if acct.get("runtime_secret"):
+        return
+    secret_ref = acct.get("secret_blob_ref")
+    if not secret_ref or not str(secret_ref).startswith("projects/"):
+        return
+    try:
+        from app.secrets_manager import get_user_secret
+
+        resolved = await get_user_secret(secret_ref)
+        if resolved:
+            acct["runtime_secret"] = resolved
+            provider = (
+                _normalize_provider_name(acct.get("provider"))
+                or LLMProviderName.ANTHROPIC.value
+            )
+            auth_mode = (
+                _normalize_auth_mode(acct.get("auth_mode")) or LLMAuthMode.OAUTH.value
+            )
+            if (
+                provider == LLMProviderName.ANTHROPIC.value
+                and auth_mode == LLMAuthMode.OAUTH.value
+            ):
+                acct["oauth_token"] = resolved
+            logger.debug(
+                f"[POOL] Refreshed runtime_secret for account {acct.get('name')} ({acct.get('id')})"
+            )
+    except Exception:
+        logger.exception(
+            f"[POOL] Failed to refresh secret from Secret Manager for account {acct.get('name')}"
+        )
+
+
 async def release_max_plan_account(
     account_id: str, *, revert_daily_task_count: bool = False
 ):
-    """Decrement active tasks for an account when a task finishes or aborts."""
+    """Decrement active tasks for an account when a task finishes or aborts.
+
+    When active_tasks drops to zero and the account's credential is backed by
+    Secret Manager (secret_blob_ref starts with "projects/"), runtime_secret is
+    cleared from the in-memory dict so the resolved credential does not linger
+    indefinitely.  The next select_max_plan_account call re-fetches it.
+    """
     async with _max_plan_pool_lock:
         account = _account_by_id.get(account_id)
         if account:
@@ -2879,6 +2931,10 @@ async def release_max_plan_account(
                     0, int(account.get("daily_task_count") or 0) - 1
                 )
                 _pending_cap_persists.add(account_id)
+            if account["active_tasks"] == 0:
+                secret_ref = account.get("secret_blob_ref")
+                if secret_ref and str(secret_ref).startswith("projects/"):
+                    account.pop("runtime_secret", None)
 
 
 async def reserve_max_plan_account(account_id: str) -> bool:
@@ -3575,3 +3631,33 @@ async def recheck_disabled_accounts():
                 _pending_cap_persists.discard(acct_id)
         except Exception as e:
             logger.warning(f"[POOL] Failed to persist usage-cap state: {e}")
+
+
+_CREDENTIAL_SWEEP_INTERVAL_SECONDS = 5 * 60  # 5 minutes
+
+
+async def credential_sweep_service() -> None:
+    """Background service: periodically clears runtime_secret for idle accounts.
+
+    Accounts with zero active_tasks and a Secret Manager-backed secret_blob_ref
+    (starts with "projects/") have their resolved credential cleared every
+    _CREDENTIAL_SWEEP_INTERVAL_SECONDS.  The next select_max_plan_account call
+    re-fetches from Secret Manager, bounding how long a resolved credential
+    lives in process memory.
+
+    This is a non-leader service: every process instance runs its own sweep
+    against its own in-memory pool state.
+    """
+    while True:
+        await asyncio.sleep(_CREDENTIAL_SWEEP_INTERVAL_SECONDS)
+        try:
+            async with _max_plan_pool_lock:
+                for acct in _account_by_id.values():
+                    if acct.get("active_tasks", 0) == 0:
+                        secret_ref = acct.get("secret_blob_ref")
+                        if secret_ref and str(secret_ref).startswith("projects/"):
+                            acct.pop("runtime_secret", None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[POOL] credential_sweep_service error")
