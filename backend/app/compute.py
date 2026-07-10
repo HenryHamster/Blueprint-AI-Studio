@@ -1744,7 +1744,22 @@ def _materialize_local_manifest(vm_instance_id: str, manifest: dict) -> dict[str
     }
     for item in manifest.get("files", []) or []:
         original_path = str(item["path"])
+        # Pre-check: reject path traversal sequences before any processing.
+        if ".." in original_path.split("/"):
+            raise ValueError(
+                f"Path traversal detected in manifest file path: {original_path!r} "
+                f"(contains '..' segment)"
+            )
         local_path = root / original_path.lstrip("/").replace("/", os.sep)
+        # Resolve symlinks and verify the final path stays within root.
+        resolved = local_path.resolve()
+        try:
+            resolved.relative_to(root.resolve())
+        except ValueError:
+            raise ValueError(
+                f"Manifest file path {original_path!r} resolves outside "
+                f"the manifest root: {resolved} not under {root}"
+            )
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_text(str(item.get("content", "")), encoding="utf-8")
         try:

@@ -9,7 +9,7 @@ plus the ``get_current_user`` / ``require_admin`` FastAPI dependencies that
 resolve the caller against the ``AllowedUser`` table.
 """
 
-from fastapi import Security, HTTPException, status, Depends
+from fastapi import Security, HTTPException, status, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -21,6 +21,7 @@ import jwt
 import secrets
 import hashlib
 import uuid
+import ipaddress as _ipaddress
 from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import auth as firebase_auth
@@ -66,6 +67,26 @@ if not _ws_ticket_secret:
     raise ValueError("WS_TICKET_SECRET environment variable is required")
 _validate_jwt_secret(_ws_ticket_secret, "WS_TICKET_SECRET")
 WS_TICKET_SECRET: str = _ws_ticket_secret
+
+# ---------------------------------------------------------------------------
+# Admin JWT (short-lived token exchange for ADMIN_API_KEY)
+# ---------------------------------------------------------------------------
+#
+# ADMIN_JWT_SECRET is OPTIONAL. When set, callers can exchange ADMIN_API_KEY
+# for a short-lived JWT via POST /api/admin/token, and all admin endpoints
+# accept that JWT. When unset, the legacy direct ADMIN_API_KEY check remains
+# the only path (with audit logging and optional IP allowlist enforcement).
+
+_CRANKED_admin_jwt_secret = os.getenv("ADMIN_JWT_SECRET")
+ADMIN_JWT_SECRET: str | None = (
+    _validate_jwt_secret(_CRANKED_admin_jwt_secret, "ADMIN_JWT_SECRET")
+    or _CRANKED_admin_jwt_secret
+) if _CRANKED_admin_jwt_secret else None
+
+ADMIN_JWT_ALGORITHM = "HS256"
+
+# Admin JWT expiry (default 1 hour, configurable via env)
+_ADMIN_JWT_EXPIRE_MINUTES = int(os.getenv("ADMIN_JWT_EXPIRE_MINUTES", "60"))
 
 
 def create_ws_ticket(user_id: str, project_id: str) -> str:
@@ -198,6 +219,126 @@ def verify_agent_jwt(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Agent token expired") from None
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid agent token") from None
+
+
+# ---------------------------------------------------------------------------
+# Admin JWT — short-lived token exchange
+# ---------------------------------------------------------------------------
+
+
+def _parse_admin_ip_allowlist() -> list:
+    """Parse ADMIN_API_KEY_ALLOWED_IPS into a list of ip_network objects.
+
+    Returns an empty list when the env var is unset or empty (meaning no
+    IP restriction — the default). Each entry is a CIDR notation string;
+    entries are separated by commas.
+    """
+    raw = os.getenv("ADMIN_API_KEY_ALLOWED_IPS", "")
+    if not raw:
+        return []
+    nets: list = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if entry:
+            try:
+                nets.append(_ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                logger.warning("Ignoring invalid CIDR in ADMIN_API_KEY_ALLOWED_IPS: %r", entry)
+    return nets
+
+
+def _check_admin_api_key_source_ip(request: Request | None) -> bool:
+    """Check *request* source-IP against ADMIN_API_KEY_ALLOWED_IPS.
+
+    Returns ``True`` when either:
+    * No allowlist is configured (env var is empty/unset).
+    * The request client IP falls within at least one allowlist entry.
+
+    Returns ``False`` (denying access) when:
+    * An allowlist IS configured and the request IP does not match.
+    * ``request`` is ``None`` or has no ``client`` (defensive — caller should
+      always pass a real request in production).
+    """
+    allowlist = _parse_admin_ip_allowlist()
+    if not allowlist:
+        return True  # No allowlist configured = no restriction
+    if request is None or request.client is None:
+        return False  # Missing request context = deny closed
+    try:
+        src = _ipaddress.ip_address(request.client.host)
+        return any(src in net for net in allowlist)
+    except ValueError:
+        return False
+
+
+def _audit_log_admin_api_key(request: Request | None, *, action: str) -> None:
+    """Emit a structured log entry recording that ADMIN_API_KEY was used.
+
+    *action* describes the usage context — ``"direct_use"`` (legacy bearer
+    check), ``"token_exchange"`` (JWT exchange endpoint), etc.
+    """
+    extra: dict = {
+        "audit_event": "admin_api_key_usage",
+        "action": action,
+    }
+    if request is not None:
+        extra["source_ip"] = (
+            request.client.host if request.client else "unknown"
+        )
+        extra["user_agent"] = request.headers.get("user-agent", "")
+    else:
+        extra["source_ip"] = "unknown"
+        extra["user_agent"] = ""
+    logger.warning("ADMIN_API_KEY used [action=%s]", action, extra=extra)
+
+
+def create_admin_token(
+    user_id: str,
+    expire_minutes: int | None = None,
+) -> str:
+    """Mint a short-lived JWT that authenticates as ``user_id`` with ``role=admin``.
+
+    Requires ``ADMIN_JWT_SECRET`` to be set (raises ``ValueError`` otherwise).
+    The token carries ``token_type=admin_api_exchange`` so token-type checks
+    in ``verify_admin_token`` prevent non-admin JWTs from being accepted.
+    """
+    if not ADMIN_JWT_SECRET:
+        raise ValueError("ADMIN_JWT_SECRET is not configured")
+    if expire_minutes is None:
+        expire_minutes = _ADMIN_JWT_EXPIRE_MINUTES
+    expire = datetime.now(timezone.utc) + timedelta(minutes=expire_minutes)
+    to_encode: dict = {
+        "sub": user_id,
+        "role": "admin",
+        "token_type": "admin_api_exchange",
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(to_encode, ADMIN_JWT_SECRET, algorithm=ADMIN_JWT_ALGORITHM)
+
+
+def verify_admin_token(token: str) -> dict | None:
+    """Verify an admin JWT signed with ``ADMIN_JWT_SECRET``.
+
+    Returns the decoded payload dict on success, or ``None`` when:
+    * ``ADMIN_JWT_SECRET`` is not configured.
+    * The token has expired, is malformed, or has wrong ``token_type``/``role``.
+    """
+    if not ADMIN_JWT_SECRET:
+        return None
+    try:
+        payload: dict = jwt.decode(
+            token, ADMIN_JWT_SECRET, algorithms=[ADMIN_JWT_ALGORITHM]
+        )
+        if payload.get("token_type") != "admin_api_exchange":
+            return None
+        if payload.get("role") != "admin":
+            return None
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.PyJWTError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -334,16 +475,46 @@ async def _persist_auth_metadata_best_effort(
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Security(security),
     session: AsyncSession = Depends(get_session),
+    request: Request = None,
 ):
     """
     FastAPI Dependency to verify the frontend user's JWT using Firebase Auth,
     then look up the user in the AllowedUser table for role assignment.
-    Also allows programmatic access via ADMIN_API_KEY.
+    Also allows programmatic access via ADMIN_API_KEY or an admin JWT
+    (short-lived token obtained from ``POST /api/admin/token``).
     """
     token = credentials.credentials
 
+    # 1. Try admin JWT first (short-lived token from /api/admin/token exchange).
+    #    This is the preferred programmatic path when ADMIN_JWT_SECRET is set.
+    admin_jwt_payload = verify_admin_token(token)
+    if admin_jwt_payload is not None:
+        return {
+            "user_id": admin_jwt_payload["sub"],
+            "email": "admin@system.local",
+            "role": "admin",
+        }
+
+    # 2. Fall back to ADMIN_API_KEY shared-secret (legacy path).
     admin_api_key = os.getenv("ADMIN_API_KEY")
     if admin_api_key and secrets.compare_digest(token, admin_api_key):
+        # Source-IP allowlist enforcement (opt-in).
+        if not _check_admin_api_key_source_ip(request):
+            logger.warning(
+                "ADMIN_API_KEY rejected from disallowed IP",
+                extra={
+                    "audit_event": "admin_api_key_rejected",
+                    "source_ip": request.client.host if request and request.client else "unknown",
+                },
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin API key usage not allowed from this IP",
+            )
+
+        # Audit log every direct ADMIN_API_KEY authentication.
+        _audit_log_admin_api_key(request, action="direct_use")
+
         # Resolve real admin UID so API key has same data access as the admin user
         admin_uid = "admin-api-key"
         try:
@@ -483,23 +654,38 @@ def require_admin(current_user: dict = Depends(get_current_user)):
 async def get_metrics_reader(
     credentials: HTTPAuthorizationCredentials = Security(security),
     session: AsyncSession = Depends(get_session),
+    request: Request = None,
 ) -> dict:
     """FastAPI dependency for READ-ONLY operator-metric endpoints.
 
     Accepts EITHER:
+    - A short-lived admin JWT (from ``POST /api/admin/token``)
     - A token matching ADMIN_API_KEY (existing server-to-server admin path)
     - A valid agent JWT signed with AGENT_JWT_SECRET (task-scoped or VM-scoped)
     - A Firebase token for an allowed admin user (browser admin UI path)
 
-    Returns a small principal dict for logging/audit. Does NOT call into Firebase.
+    Returns a small principal dict for logging/audit. Does NOT call into Firebase
     unless the token is neither ADMIN_API_KEY nor an agent JWT. This is a
     deliberately narrow path — READ-ONLY metric access only. It MUST NEVER be
     placed on mutating endpoints.
     """
     token = credentials.credentials
 
+    # 1. Admin JWT (short-lived token exchange — preferred programmatic path).
+    admin_jwt_payload = verify_admin_token(token)
+    if admin_jwt_payload is not None:
+        return {"role": "admin"}
+
+    # 2. ADMIN_API_KEY legacy path with audit logging + IP allowlist.
     admin_api_key = os.getenv("ADMIN_API_KEY")
     if admin_api_key and secrets.compare_digest(token, admin_api_key):
+        if not _check_admin_api_key_source_ip(request):
+            logger.warning("ADMIN_API_KEY rejected from disallowed IP in metrics_reader")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin API key usage not allowed from this IP",
+            )
+        _audit_log_admin_api_key(request, action="metrics_reader")
         return {"role": "admin"}
 
     try:

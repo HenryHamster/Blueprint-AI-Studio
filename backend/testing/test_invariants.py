@@ -330,7 +330,12 @@ def test_all_admin_routes_require_auth():
     # Intentional exceptions — should stay empty. If a route is intentionally
     # public (for example, a monitored liveness probe), add its path here with
     # a short comment explaining why the public surface is deliberate.
-    public_allowlist: dict[str, str] = {}
+    public_allowlist: dict[str, str] = {
+        # POST /api/admin/token authenticates via direct ADMIN_API_KEY comparison
+        # (not Depends(get_current_user) / require_admin), because it is the
+        # token-issuance endpoint that exchanges the shared secret for a JWT.
+        "/api/admin/token": "exchanges ADMIN_API_KEY for short-lived JWT",
+    }
 
     # get_metrics_reader is a narrowly scoped read-only dep that accepts agent
     # JWTs; it is a valid auth callable for metrics-only endpoints.

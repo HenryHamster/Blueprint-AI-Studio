@@ -2801,6 +2801,47 @@ def _preflight(
     }
 
 
+def _safe_credential_path(fpath: str, workspace_root: str) -> str:
+    """Validate and resolve a credential file path, rejecting directory traversal.
+
+    The backend supplies ``fpath`` as a sandbox-absolute path (e.g.
+    ``/root/.config/claude/settings.json``). Leading ``/`` is stripped
+    so the path is relative to *workspace_root* (which is bind-mounted at
+    the sandbox root for both bwrap and docker backends).
+
+    Raises ``ValueError`` on any path containing ``..`` segments or whose
+    resolved absolute path falls outside *workspace_root* — so a compromised
+    or buggy orchestrator cannot write credential files to arbitrary host
+    locations via e.g. ``../../.ssh/authorized_keys``.
+    """
+    # Defense-in-depth: reject '..' path segments before any processing.
+    stripped = fpath.lstrip("/")
+    for component in stripped.split("/"):
+        if component == "..":
+            raise ValueError(
+                f"credential path contains '..' (directory traversal): {fpath!r}"
+            )
+
+    # Resolve relative to workspace root and verify containment.
+    full_path = os.path.abspath(os.path.join(workspace_root, stripped))
+    ws_abs = os.path.abspath(workspace_root)
+
+    try:
+        rel = os.path.relpath(full_path, ws_abs)
+    except ValueError:
+        raise ValueError(
+            f"credential path {fpath!r} resolves outside workspace "
+            f"{ws_abs!r} (os.path.relpath failed)"
+        )
+    if rel.startswith("..") or os.path.isabs(rel):
+        raise ValueError(
+            f"credential path {fpath!r} resolves to {full_path}, "
+            f"which is outside workspace {ws_abs}"
+        )
+
+    return full_path
+
+
 def _spawn_agent_task(
     *,
     task_id: str,
