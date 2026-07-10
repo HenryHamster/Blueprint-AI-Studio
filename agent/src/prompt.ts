@@ -709,9 +709,17 @@ _load_agent_token || exit 1
 TASK="${taskId}"
 ${retryPostShellFn()}
 if [ "$OP" = "get" ]; then
-  printf '{"task_id":"%s","op":"get"}' "$TASK" | \\
-    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+  if [ -n "$KEY" ]; then
+    PAYLOAD=$(printf '{"task_id":%s,"op":"get","key":%s}' \\
+      "$(_json_str "$TASK")" "$(_json_str "$KEY")")
+    printf '%s' "$PAYLOAD" | \\
+      curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
+        -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+  else
+    printf '{"task_id":"%s","op":"get"}' "$TASK" | \\
+      curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
+        -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+  fi
 elif [ "$OP" = "set" ]; then
   [ -z "$KEY" ] || [ -z "$VALUE" ] && { echo "Error: set requires <key> and <content>" >&2; exit 1; }
   # Capture branch/HEAD provenance at write time so the backend can stamp it on

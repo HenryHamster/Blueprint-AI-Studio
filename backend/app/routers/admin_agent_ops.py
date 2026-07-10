@@ -568,8 +568,33 @@ async def update_playbook(
     if op == "get":
         project = await session.get(Project, task.project_id)
         doc = project.design_doc or {} if project else {}
-        entries = {}
         my_id = str(task.id)
+
+        # Single-key scoped retrieval
+        if payload.key and payload.key.strip():
+            full_key = f"playbook/{payload.key.strip()}"
+            v = doc.get(full_key) if doc else None
+            if isinstance(v, dict):
+                pending_source = v.get("pending_source")
+                if pending_source and pending_source != my_id:
+                    return {"status": "ok", "op": op, "entries": {}}
+                return {
+                    "status": "ok",
+                    "op": op,
+                    "entries": {
+                        payload.key.strip(): {
+                            "content": v.get("content", ""),
+                            "updated_at": v.get("updated_at", ""),
+                            "source_task_id": v.get("source_task_id", ""),
+                            "branch": v.get("branch", ""),
+                            "head_sha": v.get("head_sha", ""),
+                        }
+                    },
+                }
+            return {"status": "ok", "op": op, "entries": {}}
+
+        # No specific key — return all entries (existing behavior)
+        entries = {}
         for k, v in doc.items():
             if k.startswith("playbook/") and isinstance(v, dict):
                 # Hide pending entries written by OTHER non-completed tasks —

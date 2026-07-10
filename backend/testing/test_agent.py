@@ -4789,6 +4789,30 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     assert entries["build-commands"]["content"] == "npm run build"
     assert "lint-rules" in entries
 
+    # Get single playbook entry by key
+    resp_key = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get", "key": "build-commands"},
+        headers=headers,
+    )
+    assert resp_key.status_code == 200
+    data_key = resp_key.json()
+    assert data_key["status"] == "ok"
+    assert data_key["op"] == "get"
+    key_entries = data_key["entries"]
+    assert "build-commands" in key_entries
+    assert key_entries["build-commands"]["content"] == "npm run build"
+    assert "lint-rules" not in key_entries
+
+    # Get non-existent key returns empty entries
+    resp_miss = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get", "key": "nonexistent-key"},
+        headers=headers,
+    )
+    assert resp_miss.status_code == 200
+    assert resp_miss.json()["entries"] == {}
+
     # List keys
     resp4 = await client.post(
         "/api/agent/playbook",
