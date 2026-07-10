@@ -4828,6 +4828,71 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     assert "playbook/build-commands" in project.design_doc
 
 
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_playbook_get_with_key(client: AsyncClient, db_session):
+    """Key-scoped get returns a single entry; no-key returns all; unknown key returns empty."""
+    project = Project(name="Playbook Key Test", user_id="test-user-456")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do something"}],
+        vm_instance_id="agent-vm-playbook-key",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-playbook-key")
+    headers = {"x-agent-token": token}
+
+    # Set two playbook entries
+    for kv in [("key-one", "value-one"), ("key-two", "value-two")]:
+        resp = await client.post(
+            "/api/agent/playbook",
+            json={"task_id": str(task.id), "op": "set", "key": kv[0], "value": kv[1]},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+
+    # Get with a specific key — returns only that entry
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get", "key": "key-one"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["op"] == "get"
+    assert set(data["entries"].keys()) == {"key-one"}
+    assert data["entries"]["key-one"]["content"] == "value-one"
+
+    # Get with non-existent key — returns empty dict
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get", "key": "nonexistent"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["entries"] == {}
+
+    # Get with no key — returns all entries (backward compatible)
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={"task_id": str(task.id), "op": "get"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert set(data["entries"].keys()) == {"key-one", "key-two"}
+
+
 @pytest.mark.asyncio
 async def test_playbook_set_records_branch_head_provenance(
     client: AsyncClient, db_session
