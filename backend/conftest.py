@@ -61,3 +61,14 @@ def expire_fidelity():
     _InstanceState._expire = _orig_instance_expire  # type: ignore[assignment]
     yield
     _InstanceState._expire = _noop_expire  # type: ignore[assignment]
+
+
+# Pytest fixture names that guarantee MissingGreenlet test fidelity on SQLite.
+# Recognised by TestMissingGreenletTestsFaithful in test_audit_finding_class_guards.py:
+# a test that accepts one of these as a function argument is considered faithful
+# because the fixture either restores real expiry (expire_fidelity) or raises
+# MissingGreenlet directly on expired-attribute access (missing_greenlet_proxy).
+GREENLET_FIDELITY_FIXTURE_NAMES: tuple[str, ...] = (
+    "expire_fidelity",       # restores _InstanceState._expire for one test
+    "missing_greenlet_proxy",  # proxy factory that raises MissingGreenlet on poison
+)

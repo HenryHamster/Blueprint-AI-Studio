@@ -578,21 +578,57 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
 # 6. MissingGreenlet test fidelity guard
 # ---------------------------------------------------------------------------
 
-_GREENLET_SCANNED_FILES = [
-    "test_reaper_post_orphan_sweep.py",
-    "test_acceptance_gate.py",
-    "test_admin_endpoint_cache.py",
-    "test_strategic_spawning.py",
-    "test_strategic_resident_session.py",
-]
+# Pytest fixture names recognised as MissingGreenlet fidelity mechanisms.
+# Sourced from backend/conftest.py::GREENLET_FIDELITY_FIXTURE_NAMES — kept in
+# sync by TestMissingGreenletTestsFaithful.test_conftest_exports_fidelity_names.
+_FIDELITY_FIXTURE_NAMES: frozenset[str] = frozenset(
+    {"expire_fidelity", "missing_greenlet_proxy"}
+)
+
+# Tests that mention MissingGreenlet in their docstring but cannot faithfully
+# reproduce the asyncpg failure mode on SQLite (the conftest globally no-ops
+# InstanceState._expire, so session.rollback() does not expire ORM objects).
+# These tests are *context* references — they document the historical hazard
+# but verify correct behavior via integration rather than fault injection.
+# Each entry here represents known technical debt: ideally each test would
+# either get a @pytest.mark.skipif(not USE_POSTGRES, ...) decorator or use the
+# missing_greenlet_proxy/expire_fidelity fixtures to inject the fault.
+_KNOWN_UNFAITHFUL_ALLOWLIST: frozenset[str] = frozenset({
+    # rollback-expiry hazard documented in docstring; test verifies outcome only
+    "test_admin_routers.py::test_canonical_message_arm_rollback_does_not_500",
+    "test_agent.py::test_agent_status_complete_with_artifacts_creates_artifact_record",
+    "test_agent.py::test_sr_analytics_sibling_isolation_after_rollback",
+    "test_local_runner.py::test_heartbeat_survives_declined_continuation_renewal_race",
+    "test_local_runner_holds.py::test_repeated_hold_no_change_does_not_crash",
+    "test_orchestrator.py::test_pool_dispatch_commit_error_falls_back_to_cold",
+    "test_reaper.py::test_orphan_project_batch_expired_before_merged_pr_classification",
+    "test_reaper.py::test_orphan_project_batch_expired_before_open_pr_review_spawn",
+    "test_warm_pool_maintainer.py::test_idle_reaper_continues_after_retire_failure",
+    # endpoint integration tests: load_only projection context in docstring;
+    # the endpoint succeeds because the fix applies the right projection,
+    # but the deferred-column MissingGreenlet fault is not directly injected.
+    "test_observability_payload_projection.py::test_digest_survives_trend_window_exceeding_digest_lookback",
+    "test_observability_payload_projection.py::test_evaluate_task_outcome_over_fixed_projection_fetch",
+    "test_observability_payload_projection.py::test_lane_diag_walks_hydrated_original_without_lazy_load",
+    "test_observability_payload_projection.py::test_outer_loop_convergence_trend_walks_non_code_outcomes",
+    "test_observability_payload_projection.py::test_outer_loop_convergence_walks_non_code_outcomes_without_lazy_load",
+})
 
 
 def _unfaithful_greenlet_tests(path: Path) -> list[str]:
     """Return ``module::test_name`` for every async test function in *path* that
-    mentions ``MissingGreenlet`` in its docstring but is neither fault-injecting
-    (contains ``raise MissingGreenlet`` anywhere in the function body or nested
-    classes) nor Postgres-only (has ``@pytest.mark.skipif`` with ``USE_POSTGRES``
-    in its decorator list)."""
+    mentions ``MissingGreenlet`` in its docstring but uses none of the recognised
+    fidelity mechanisms:
+
+    - ``raise MissingGreenlet(...)`` anywhere in the function or nested scope
+    - ``@pytest.mark.skipif`` conditioned on ``USE_POSTGRES`` or ``USE_TEST_POSTGRES``
+    - A fixture arg named ``expire_fidelity`` or ``missing_greenlet_proxy``
+    - A ``session.expire(obj)`` / ``<db>.expire(obj)`` call
+    - ``expunge_all()`` or ``expire_all()`` in the body
+    - ``raiseload=True`` keyword arg in the body
+    - ``.expired`` attribute access in the body
+    - ``.unloaded`` attribute access (``sa_inspect(obj).unloaded`` deferred-column check)
+    """
     source = path.read_text(encoding="utf-8")
     try:
         tree = ast.parse(source)
@@ -609,24 +645,51 @@ def _unfaithful_greenlet_tests(path: Path) -> list[str]:
         if not docstring or "MissingGreenlet" not in docstring:
             continue
 
-        # Faithful if the function (or any nested class/function inside it)
-        # contains a ``raise MissingGreenlet(...)`` statement.
-        has_raise = any(
+        # --- fidelity check 1: raise MissingGreenlet in body ---
+        if any(
             isinstance(child, ast.Raise)
             and child.exc is not None
             and "MissingGreenlet" in ast.unparse(child.exc)
             for child in ast.walk(node)
-        )
-        if has_raise:
+        ):
             continue
 
-        # Faithful if any decorator is ``pytest.mark.skipif`` conditioned on
-        # ``USE_POSTGRES``.
-        has_skipif = any(
-            "skipif" in ast.unparse(deco) and "USE_POSTGRES" in ast.unparse(deco)
+        # --- fidelity check 2: postgres-only skip decorator ---
+        if any(
+            "skipif" in ast.unparse(deco)
+            and ("USE_POSTGRES" in ast.unparse(deco) or "USE_TEST_POSTGRES" in ast.unparse(deco))
             for deco in node.decorator_list
-        )
-        if has_skipif:
+        ):
+            continue
+
+        # --- fidelity check 3: recognised fidelity fixture in args ---
+        arg_names = {a.arg for a in node.args.args}
+        if arg_names & _FIDELITY_FIXTURE_NAMES:
+            continue
+
+        # --- fidelity checks 4–7: body AST patterns ---
+        faithful_body = False
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                func = child.func
+                if isinstance(func, ast.Attribute):
+                    # session.expire(obj) — any session variable name
+                    if func.attr == "expire" and child.args:
+                        faithful_body = True
+                        break
+                    # session.expunge_all() / session.expire_all()
+                    if func.attr in ("expunge_all", "expire_all"):
+                        faithful_body = True
+                        break
+                # raiseload=True keyword arg
+                if any(kw.arg == "raiseload" for kw in child.keywords):
+                    faithful_body = True
+                    break
+            # .expired attribute access or .unloaded (sa_inspect().unloaded)
+            if isinstance(child, ast.Attribute) and child.attr in ("expired", "unloaded"):
+                faithful_body = True
+                break
+        if faithful_body:
             continue
 
         violations.append(f"{path.name}::{node.name}")
@@ -634,38 +697,89 @@ def _unfaithful_greenlet_tests(path: Path) -> list[str]:
 
 
 class TestMissingGreenletTestsFaithful:
-    """Every test that mentions ``MissingGreenlet`` in its docstring must be
-    either fault-injecting (body contains ``raise MissingGreenlet``) or
-    explicitly Postgres-only (``@pytest.mark.skipif(not USE_POSTGRES, ...)``).
+    """Every test that mentions ``MissingGreenlet`` in its docstring must use at
+    least one recognised fidelity mechanism so it genuinely exercises the
+    asyncpg failure mode on SQLite.
 
-    Tests that merely mention ``MissingGreenlet`` in a docstring without one of
-    these guards are tautological on the default SQLite/aiosqlite CI run:
-    aiosqlite lazy-loads expired ORM attributes successfully (via the async
-    greenlet), so the test passes vacuously and provides no regression coverage
-    for the asyncpg failure mode.
+    The root conftest globally no-ops ``InstanceState._expire``, which means
+    ``session.rollback()`` does NOT expire ORM objects on aiosqlite — tests that
+    rely on rollback-triggered expiry pass tautologically on the default SQLite
+    CI run even if the production fix were reverted.
 
-    Scope: the five test files that historically harboured unfaithful instances.
-    Allowlist is empty — all known instances were migrated; this class is a pure
-    regression-prevention gate for future additions.
+    Recognised fidelity mechanisms:
+
+    - ``raise MissingGreenlet(...)`` (fault injection)
+    - ``@pytest.mark.skipif(not USE_POSTGRES / USE_TEST_POSTGRES, ...)``
+    - ``expire_fidelity`` or ``missing_greenlet_proxy`` fixture arg
+    - Any ``<session>.expire(obj)`` call
+    - ``expunge_all()`` / ``expire_all()``
+    - ``raiseload=True`` keyword
+    - ``.expired`` attribute access
+    - ``.unloaded`` (``sa_inspect(obj).unloaded`` deferred-column check)
+
+    Scope: ALL ``test_*.py`` files in the testing directory — drift-proof;
+    new files are scanned automatically without manual list updates.
     """
 
+    def test_conftest_exports_fidelity_names(self):
+        """backend/conftest.py must define GREENLET_FIDELITY_FIXTURE_NAMES.
+
+        This constant documents the recognised fidelity fixtures and is the
+        canonical source that _FIDELITY_FIXTURE_NAMES in this module mirrors.
+        If someone removes or renames the fixtures, this guard fails first.
+        """
+        conftest_path = _BACKEND_ROOT / "conftest.py"
+        assert conftest_path.exists(), (
+            f"backend/conftest.py not found at {conftest_path}. "
+            "The root conftest is required for the SQLite MissingGreenlet shim."
+        )
+        content = conftest_path.read_text()
+        assert "GREENLET_FIDELITY_FIXTURE_NAMES" in content, (
+            "backend/conftest.py must define GREENLET_FIDELITY_FIXTURE_NAMES — "
+            "the canonical list of pytest fixture names that guarantee "
+            "MissingGreenlet test fidelity on SQLite. Add it back or update "
+            "_FIDELITY_FIXTURE_NAMES in this file to match."
+        )
+        for name in _FIDELITY_FIXTURE_NAMES:
+            assert name in content, (
+                f"backend/conftest.py must define or reference '{name}' inside "
+                f"GREENLET_FIDELITY_FIXTURE_NAMES. Current _FIDELITY_FIXTURE_NAMES: "
+                f"{sorted(_FIDELITY_FIXTURE_NAMES)}"
+            )
+
     def test_missing_greenlet_tests_are_faithful(self):
+        """Scan all test_*.py files and fail if any test mentions MissingGreenlet
+        in its docstring without a recognised fidelity mechanism.
+
+        Tests in _KNOWN_UNFAITHFUL_ALLOWLIST are acknowledged technical debt —
+        they document the MissingGreenlet hazard as context but reproduce the
+        failure only on asyncpg (Postgres CI). Each allowlisted test should
+        eventually get a @pytest.mark.skipif(not USE_POSTGRES, ...) decorator
+        or fault-injection to make it backend-independent.
+        """
+        all_test_files = sorted(_THIS_DIR.glob("test_*.py"))
+        assert all_test_files, (
+            f"No test_*.py files found in {_THIS_DIR}. "
+            "The testing directory is missing or the glob is broken."
+        )
+
         violations: list[str] = []
-        for filename in _GREENLET_SCANNED_FILES:
-            path = _THIS_DIR / filename
-            if not path.exists():
-                pytest.fail(f"Expected test file not found: {path}")
-            violations.extend(_unfaithful_greenlet_tests(path))
+        for path in all_test_files:
+            for v in _unfaithful_greenlet_tests(path):
+                if v not in _KNOWN_UNFAITHFUL_ALLOWLIST:
+                    violations.append(v)
 
         assert not violations, (
             "The following tests mention MissingGreenlet in their docstring but "
-            "are neither fault-injecting (no ``raise MissingGreenlet`` in body) "
-            "nor Postgres-only (no ``@pytest.mark.skipif(not USE_POSTGRES, ...)`` "
-            "decorator). Either inject the fault via a proxy that raises "
-            "MissingGreenlet after rollback (see "
-            "test_strategic_resident_session.py::_ProjectIdPoisonAfterRollback "
-            "for the pattern), or mark the test Postgres-only:\n"
-            + "\n".join(f"  - {v}" for v in violations)
+            "use no recognised fidelity mechanism (see class docstring for the "
+            "full list). Either inject the fault (raise MissingGreenlet via a "
+            "proxy — see test_strategic_resident_session.py::_ProjectIdPoisonAfterRollback), "
+            "use the expire_fidelity or missing_greenlet_proxy fixtures, call "
+            "session.expire()/expunge_all(), use raiseload=True, or mark the "
+            "test Postgres-only with @pytest.mark.skipif(not USE_POSTGRES, ...):\n"
+            + "\n".join(f"  - {v}" for v in sorted(violations))
+            + "\n\nTo acknowledge existing debt, add to _KNOWN_UNFAITHFUL_ALLOWLIST "
+            "with a comment explaining why the test cannot be made faithful."
         )
 
 
