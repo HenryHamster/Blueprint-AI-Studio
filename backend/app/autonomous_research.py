@@ -2995,26 +2995,19 @@ async def _check_autonomous_research(owner: str, repo: str):
     if vm_consuming >= _runtime_config["max_concurrent_vms"]:
         return
 
-    # Phase 2 — pre-fetch all projects in one batch query, then spawn per project
-    # in its own isolated session. The batch query replaces N individual
-    # session.get(Project, project_id) calls with a single round-trip.
-    projects_by_id: dict[uuid.UUID, Project] = {}
-    if project_ids:
-        async with AsyncSessionLocal() as batch_session:
-            project_rows = (
-                (await batch_session.execute(
-                    select(Project).where(Project.id.in_(project_ids))
-                ))
-                .scalars()
-                .all()
-            )
-            projects_by_id = {p.id: p for p in project_rows}
+    # Phase 2 — spawn each project in its own isolated session.  The Project
+    # instance MUST be loaded by that same session: carrying ORM instances out
+    # of a batch session leaves them detached, and persistence operations in the
+    # spawn path (notably ``session.refresh(project)``) then raise
+    # ``InvalidRequestError: Instance ... is not persistent within this
+    # Session``.  Re-fetching by id also ensures pause/config changes made after
+    # enumeration are observed before spawning.
     for project_id in project_ids:
-        project = projects_by_id.get(project_id)
-        if project is None:
-            continue
         try:
             async with AsyncSessionLocal() as session:
+                project = await session.get(Project, project_id)
+                if project is None:
+                    continue
                 await _spawn_research_task(project, session)
         except Exception as e:
             logger.error(
@@ -3174,26 +3167,16 @@ async def _check_idle_research():
         )
         return
 
-    # Phase 2 — pre-fetch all projects in one batch query, then spawn per project
-    # in its own isolated session. The batch query replaces N individual
-    # session.get(Project, project_id) calls with a single round-trip.
-    projects_by_id: dict[uuid.UUID, Project] = {}
-    if project_ids:
-        async with AsyncSessionLocal() as batch_session:
-            project_rows = (
-                (await batch_session.execute(
-                    select(Project).where(Project.id.in_(project_ids))
-                ))
-                .scalars()
-                .all()
-            )
-            projects_by_id = {p.id: p for p in project_rows}
+    # Phase 2 — spawn each project in its own isolated session.  Load the
+    # Project in the session that will run the spawn so it remains persistent
+    # for every refresh/write in ``_run_idle_research_for_project``.  Passing a
+    # Project loaded by a now-closed batch session is a detached-instance bug.
     for project_id in project_ids:
-        project = projects_by_id.get(project_id)
-        if project is None:
-            continue
         try:
             async with AsyncSessionLocal() as session:
+                project = await session.get(Project, project_id)
+                if project is None:
+                    continue
                 await _run_idle_research_for_project(project, session, vm_consuming)
         except Exception as e:
             logger.error(
