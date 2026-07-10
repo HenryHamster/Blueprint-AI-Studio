@@ -1674,6 +1674,10 @@ class TestSchemaRevisionSync:
                     and isinstance(n.func.value, ast.Name)
                     and n.func.value.id == "op"
                 ]
+                # Data-only migrations: upgrade only calls data-access ops
+                # (execute, get_bind) or has no op.* calls at all (e.g.
+                # migrations using bind.execute() through helper functions
+                # for encryption/decryption).
                 if up_calls and all(
                     c.func.attr in _DATA_ONLY_OP_ATTRS for c in up_calls
                 ):

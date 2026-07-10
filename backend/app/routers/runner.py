@@ -272,6 +272,7 @@ async def next_task(
                     user_id=dispatch_user_id,
                     task=task,
                     runtime_config=_rc_dict,
+                    project_id=str(task.project_id) if task.project_id else None,
                 )
                 if selection is not None and selection.account is not None:
                     account = selection.account
@@ -433,7 +434,10 @@ async def decline_task(
 
         acct_id = get_task_llm_account_id(task)
         if acct_id and not (task.context or {}).get("_slot_released"):
-            await release_max_plan_account(acct_id)
+            await release_max_plan_account(
+                acct_id,
+                project_id=str(task.project_id) if task.project_id else None,
+            )
     except Exception:
         logger.exception(
             "[RUNNERS] pool account release failed for declined task %s",

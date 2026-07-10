@@ -94,7 +94,10 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
         # Release account slot if held
         cancel_acct = get_task_llm_account_id(cancel_task)
         if cancel_acct and not (cancel_task.context or {}).get("_slot_released"):
-            await release_max_plan_account(cancel_acct)
+            await release_max_plan_account(
+                cancel_acct,
+                project_id=str(cancel_task.project_id) if cancel_task.project_id else None,
+            )
             cancel_task.context = {
                 **(cancel_task.context or {}),
                 "_slot_released": True,
@@ -126,7 +129,10 @@ async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -
             child.latest_status_message = "Cancelled: parent dependency failed"
             child_acct = get_task_llm_account_id(child)
             if child_acct and not (child.context or {}).get("_slot_released"):
-                await release_max_plan_account(child_acct)
+                await release_max_plan_account(
+                    child_acct,
+                    project_id=str(child.project_id) if child.project_id else None,
+                )
                 child.context = {**(child.context or {}), "_slot_released": True}
             cancel_session.add(child)
             # Track child VM IDs for post-commit deletion

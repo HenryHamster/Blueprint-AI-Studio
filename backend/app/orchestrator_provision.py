@@ -325,6 +325,7 @@ async def provision_and_handle(
             await release_max_plan_account(
                 acct_id_for_release,
                 revert_daily_task_count=True,
+                project_id=str(p_id) if p_id else None,
             )
     if not success:
         provision_err = get_provision_error(vm_id)

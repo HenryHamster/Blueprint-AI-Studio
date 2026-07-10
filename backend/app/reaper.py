@@ -1235,7 +1235,10 @@ async def reaper_service():
                             and not _slot_already_released
                             and not _slot_now_released
                         ):
-                            await release_max_plan_account(acct_id)
+                            await release_max_plan_account(
+                                acct_id,
+                                project_id=str(task.project_id) if task.project_id else None,
+                            )
                             task.context = {
                                 **(task.context or {}),
                                 "_slot_released": True,

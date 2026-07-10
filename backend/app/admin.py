@@ -1164,6 +1164,7 @@ async def bulk_action_tasks(
                     (
                         child.vm_instance_id,
                         (child.context or {}).get("max_plan_account_id"),
+                        str(child.project_id) if child.project_id else None,
                     )
                     for child in active_children
                 ]
@@ -1227,15 +1228,21 @@ async def bulk_action_tasks(
                 if parent_vm_id:
                     await _ensure_vm_deleted(parent_vm_id, reason="admin_bulk_cancel")
                     if parent_acct_id:
-                        await release_max_plan_account(parent_acct_id)
+                        await release_max_plan_account(
+                            parent_acct_id,
+                            project_id=str(task.project_id) if task.project_id else None,
+                        )
 
-                for child_vm_id, child_acct_id in child_vm_info:
+                for child_vm_id, child_acct_id, child_project_id in child_vm_info:
                     if child_vm_id:
                         await _ensure_vm_deleted(
                             child_vm_id, reason="parent_bulk_cancelled"
                         )
                     if child_acct_id:
-                        await release_max_plan_account(child_acct_id)
+                        await release_max_plan_account(
+                            child_acct_id,
+                            project_id=child_project_id,
+                        )
 
                 if active_children:
                     logger.info(

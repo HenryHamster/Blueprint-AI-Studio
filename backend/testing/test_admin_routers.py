@@ -26385,6 +26385,146 @@ class TestPoolAccountMutationsRequireAdmin:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Per-project pool consumption endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestProjectPoolUsageEndpoint:
+    """GET /api/admin/pool-accounts/project-usage and project-summary endpoints."""
+
+    @pytest.mark.asyncio
+    async def test_project_usage_requires_auth(self, override_get_session):
+        from fastapi import HTTPException
+
+        async def reject_auth():
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        app.dependency_overrides[get_current_user] = reject_auth
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    "/api/admin/pool-accounts/project-usage"
+                    "?project_id=00000000-0000-0000-0000-000000000001"
+                )
+            assert resp.status_code == 401
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    @pytest.mark.asyncio
+    async def test_project_usage_404_for_unknown_project(
+        self, client, db_session
+    ):
+        """Non-existent project or non-member → 404."""
+        import uuid as _uuid
+        from app.models import Project
+
+        pid = _uuid.uuid4()
+        project = Project(
+            id=pid,
+            name="orphan-project",
+            user_id="someone-else",
+            github_owner="other",
+            github_repo="repo",
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/pool-accounts/project-usage?project_id={pid}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_project_summary_returns_empty_for_user_with_no_projects(
+        self, client, db_session
+    ):
+        """When the user has no pool accounts with project state, return empty list."""
+        resp = await client.get("/api/admin/pool-accounts/project-summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "projects" in data
+        assert isinstance(data["projects"], list)
+        assert "generated_at" in data
+
+    @pytest.mark.asyncio
+    async def test_project_usage_response_shape(
+        self, client, db_session
+    ):
+        """Verify the response shape when the user is a member of the project."""
+        import uuid as _uuid
+        from app.models import Project, ProjectMember
+        from app.max_plan_pool import _account_by_id, _max_plan_pools
+
+        pid = _uuid.uuid4()
+        user_id = "test-user-123"
+
+        project = Project(
+            id=pid,
+            name="test-project",
+            user_id=user_id,
+            github_owner="test",
+            github_repo="repo",
+        )
+        db_session.add(project)
+        db_session.add(
+            ProjectMember(
+                project_id=pid, user_id=user_id, role="owner"
+            )
+        )
+        await db_session.commit()
+
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+        try:
+            acct = {
+                "id": "acc-1",
+                "user_id": user_id,
+                "name": "Test Account",
+                "provider": "anthropic",
+                "auth_mode": "oauth",
+                "enabled": True,
+                "active_tasks": 5,
+                "daily_task_count": 20,
+                "daily_task_cap": 50,
+                "max_concurrent_tasks": 10,
+                "runtime_ready": True,
+                "oauth_token": "sk-ant-test",
+                "project_state": {
+                    str(pid): {"active_tasks": 3, "daily_task_count": 12}
+                },
+                "project_daily_task_cap": {str(pid): 40},
+                "project_max_concurrent_tasks": {str(pid): 8},
+            }
+            _account_by_id["acc-1"] = acct
+            _max_plan_pools[user_id] = [acct]
+
+            resp = await client.get(
+                f"/api/admin/pool-accounts/project-usage?project_id={pid}"
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["project_id"] == str(pid)
+            assert data["total_project_active_tasks"] == 3
+            assert data["total_project_daily_task_count"] == 12
+            assert data["total_accounts"] == 1
+            assert "accounts" in data
+            assert len(data["accounts"]) == 1
+            a = data["accounts"][0]
+            assert a["account_id"] == "acc-1"
+            assert a["project_active_tasks"] == 3
+            assert a["project_daily_task_count"] == 12
+            assert a["project_daily_task_cap"] == 40
+            assert a["project_max_concurrent_tasks"] == 8
+            assert a["at_project_cap"] is False
+            assert a["global_active_tasks"] == 5
+        finally:
+            _account_by_id.clear()
+            _max_plan_pools.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Task payload secret redaction (compute_experiment launch-spec secrets)
 # ═══════════════════════════════════════════════════════════════════════════════
 

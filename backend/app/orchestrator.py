@@ -1244,7 +1244,9 @@ async def orchestrator_worker():
                             acct_id = get_task_llm_account_id(fresh_t)
                             if acct_id:
                                 await release_max_plan_account(
-                                    acct_id, revert_daily_task_count=True
+                                    acct_id,
+                                    revert_daily_task_count=True,
+                                    project_id=str(fresh_t.project_id) if fresh_t.project_id else None,
                                 )
                             session.add(fresh_t)
                             await _maybe_create_failure_alert(
@@ -1264,7 +1266,9 @@ async def orchestrator_worker():
                         acct_id = get_task_llm_account_id(fresh_t)
                         if acct_id:
                             await release_max_plan_account(
-                                acct_id, revert_daily_task_count=True
+                                acct_id,
+                                revert_daily_task_count=True,
+                                project_id=str(fresh_t.project_id) if fresh_t.project_id else None,
                             )
                         # Cancel any lingering coroutine reference
                         zombie = _provision_coroutines.pop(str(t.id), None)
@@ -2741,6 +2745,7 @@ async def orchestrator_worker():
                     # commit) or an existing early-exit path already released
                     # the slot, so the handler can never double-release.
                     _iter_preclaimed_account_id: str | None = None
+                    _iter_preclaimed_project_id: str | None = None
                     try:
                         task = await _lock_dispatchable_task_for_mutation(
                             session, _qt_id
@@ -3079,6 +3084,7 @@ async def orchestrator_worker():
                             task=task,
                             runtime_config=_runtime_config,
                             blacklist=_effective_blacklist,
+                            project_id=str(task.project_id) if task.project_id else None,
                         )
                         # From here until ownership transfers, the containment
                         # handler owns releasing the slot this selection
@@ -3086,6 +3092,9 @@ async def orchestrator_worker():
                         if runtime_selection and runtime_selection.account:
                             _iter_preclaimed_account_id = runtime_selection.account.get(
                                 "id"
+                            )
+                            _iter_preclaimed_project_id = (
+                                str(task.project_id) if task.project_id else None
                             )
 
                         # Warm-pool dispatch hook (efficiency direction d-5fd69fe1):
@@ -3174,8 +3183,10 @@ async def orchestrator_worker():
                                         await release_max_plan_account(
                                             runtime_selection.account["id"],
                                             revert_daily_task_count=True,
+                                            project_id=str(task.project_id) if task.project_id else None,
                                         )
                                     _iter_preclaimed_account_id = None
+                                    _iter_preclaimed_project_id = None
                                     await session.rollback()
                                     # session.rollback() expires every session-bound
                                     # instance (independent of expire_on_commit=False),
@@ -3193,6 +3204,7 @@ async def orchestrator_worker():
                                     # warm task — the containment handler must
                                     # not release it past this point.
                                     _iter_preclaimed_account_id = None
+                                    _iter_preclaimed_project_id = None
                                     record_pool_lease_hit(
                                         account=(
                                             runtime_selection.account.get("id")
@@ -3251,8 +3263,10 @@ async def orchestrator_worker():
                                 await release_max_plan_account(
                                     runtime_selection.account["id"],
                                     revert_daily_task_count=True,
+                                    project_id=str(task.project_id) if task.project_id else None,
                                 )
                             _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
                             await session.rollback()
                             continue
 
@@ -3597,6 +3611,7 @@ async def orchestrator_worker():
                             # (acct_id_for_release) once the PROVISIONING commit
                             # lands — the containment handler must not release it.
                             _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
                             # active_tasks already pre-incremented in select_max_plan_account()
                             project_active_counts[task.project_id] = (
                                 project_active_counts.get(task.project_id, 0) + 1
@@ -3641,9 +3656,12 @@ async def orchestrator_worker():
                             # Release the pre-incremented slot on commit failure
                             if account_id:
                                 await release_max_plan_account(
-                                    account_id, revert_daily_task_count=True
+                                    account_id,
+                                    revert_daily_task_count=True,
+                                    project_id=str(task.project_id) if task.project_id else None,
                                 )
                             _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
                             task.context = clear_task_llm_runtime_context(task.context)
                             # Keep the promoted column in sync (D2 over-fetch fix).
                             task.llm_account_id = None
@@ -3742,6 +3760,7 @@ async def orchestrator_worker():
                                 await release_max_plan_account(
                                     _iter_preclaimed_account_id,
                                     revert_daily_task_count=True,
+                                    project_id=_iter_preclaimed_project_id,
                                 )
                             except Exception:
                                 logger.exception(

@@ -947,10 +947,16 @@ async def load_max_plan_pool():
             .all()
         )
         active_per_account: Dict[str, int] = {}
+        active_per_account_project: Dict[str, Dict[str, int]] = {}
         for t in active_tasks:
             acct_id = get_task_llm_account_id(t)
             if acct_id:
                 active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
+                # Per-project reconciliation: count active tasks per (account, project).
+                pid = str(t.project_id) if t.project_id else None
+                if pid:
+                    proj_map = active_per_account_project.setdefault(acct_id, {})
+                    proj_map[pid] = proj_map.get(pid, 0) + 1
 
         _max_plan_pools.clear()
         _account_by_id.clear()
@@ -975,6 +981,17 @@ async def load_max_plan_pool():
                 and auth_mode == LLMAuthMode.OAUTH
                 else None
             )
+            # Build reconciled per-project state from DB-persisted state + active task reconciliation.
+            # Mirrors the project_state JSONB column shape:
+            #   {project_id: {active_tasks: int, daily_task_count: int}}.
+            reconciled_project_state: Dict[str, Dict[str, int]] = {}
+            db_project_state = getattr(acct, "project_state", None) or {}
+            for pid, pstate in db_project_state.items():
+                if isinstance(pstate, dict):
+                    reconciled_project_state[pid] = dict(pstate)
+            # Override active_tasks with reconciled counts from current DB (tasks table).
+            for pid, count in active_per_account_project.get(acct_id, {}).items():
+                reconciled_project_state.setdefault(pid, {})["active_tasks"] = count
             entry = {
                 "id": acct_id,
                 "user_id": acct.user_id,
@@ -999,11 +1016,16 @@ async def load_max_plan_pool():
                 else None,
                 "daily_task_cap": acct.daily_task_cap,
                 "max_concurrent_tasks": acct.max_concurrent_tasks,
+                # Per-project caps (persisted config — null or empty dict = unlimited).
+                "project_daily_task_cap": getattr(acct, "project_daily_task_cap", None) or {},
+                "project_max_concurrent_tasks": getattr(acct, "project_max_concurrent_tasks", None) or {},
                 "auto_disable_after_rate_limits": acct.auto_disable_after_rate_limits,
                 "daily_task_count": acct.daily_task_count,
                 "daily_task_count_reset_at": acct.daily_task_count_reset_at,
                 "disabled_reason": acct.disabled_reason,
                 "disabled_at": acct.disabled_at,
+                # Per-project runtime state (reconciled from DB on restart).
+                "project_state": reconciled_project_state,
             }
             # Restore rate-limit state from DB (skip expired cooldowns)
             rl_state = acct.rate_limit_state or {}
@@ -1127,6 +1149,13 @@ def _daily_reset_if_elapsed(acct: dict, now: datetime | None = None) -> bool:
     if (now - reset_at).total_seconds() >= _DAILY_WINDOW_SECONDS:
         acct["daily_task_count"] = 0
         acct["daily_task_count_reset_at"] = now
+        # Also reset per-project daily_task_count in project_state so
+        # project_daily_task_cap is not a permanent lifetime cap.
+        pstate = acct.get("project_state")
+        if pstate:
+            for proj_entry in pstate.values():
+                if isinstance(proj_entry, dict) and "daily_task_count" in proj_entry:
+                    proj_entry["daily_task_count"] = 0
         return True
     return False
 
@@ -1143,6 +1172,35 @@ def _account_at_cap(acct: dict) -> str | None:
         concurrent_cap
     ):
         return f"concurrent cap ({concurrent_cap}) reached"
+    return None
+
+
+def _project_at_cap(acct: dict, project_id: str | None) -> str | None:
+    """Return a reason string if *project_id* is at its per-project cap on
+    *acct*, else None.
+
+    When *project_id* is None or the account has no per-project cap set for
+    that project, returns None (no per-project gating). This makes the
+    per-project layer fully backward-compatible: absent caps = no limit.
+    """
+    if project_id is None:
+        return None
+    # Check per-project daily cap.
+    project_daily_cap = acct.get("project_daily_task_cap") or {}
+    daily_cap = project_daily_cap.get(project_id)
+    if daily_cap is not None:
+        proj_state = (acct.get("project_state") or {}).get(project_id, {}) or {}
+        proj_daily = int(proj_state.get("daily_task_count", 0))
+        if proj_daily >= int(daily_cap):
+            return f"project daily cap ({daily_cap}) reached"
+    # Check per-project concurrent cap.
+    project_concurrent_cap = acct.get("project_max_concurrent_tasks") or {}
+    concurrent_cap = project_concurrent_cap.get(project_id)
+    if concurrent_cap is not None:
+        proj_state = (acct.get("project_state") or {}).get(project_id, {}) or {}
+        proj_active = int(proj_state.get("active_tasks", 0))
+        if proj_active >= int(concurrent_cap):
+            return f"project concurrent cap ({concurrent_cap}) reached"
     return None
 
 
@@ -1308,15 +1366,24 @@ def _account_available_for_model(acct: dict, model: str | None) -> bool:
 
 
 def summarize_pool_state(
-    model: str | None, user_id: str | None = None
+    model: str | None, user_id: str | None = None, project_id: str | None = None
 ) -> Dict[str, Any]:
     """Summarize account pool state for diagnostics. Returns counts per state
     plus the earliest cooldown recovery time across rate-limited accounts.
 
     If user_id is provided, only that user's accounts are considered; otherwise
     the entire pool is summarized.
+
+    If project_id is provided, only accounts that have per-project usage for
+    that project are included in the summary.
     """
     accts = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
+    if project_id:
+        accts = [
+            a for a in accts
+            if (a.get("project_state") or {}).get(project_id, {}).get("active_tasks", 0) > 0
+            or (a.get("project_state") or {}).get(project_id, {}).get("daily_task_count", 0) > 0
+        ]
     now = _utcnow()
     healthy = probing = rate_limited = 0
     other_unavailable = 0
@@ -1356,7 +1423,7 @@ def summarize_pool_state(
 
 
 def get_all_account_health_summaries(
-    user_id: str | None = None, now: datetime | None = None
+    user_id: str | None = None, now: datetime | None = None, project_id: str | None = None
 ) -> list[dict]:
     """Return per-account health summaries for the admin dashboard.
 
@@ -1369,6 +1436,10 @@ def get_all_account_health_summaries(
     daily_task_count, daily_task_cap, max_concurrent_tasks,
     disqualify_threshold, disabled_reason, and rate_limited_models (with
     model name, kind, hits, cooldown_remaining_seconds per entry).
+
+    When *project_id* is provided, each entry also includes
+    project_active_tasks, project_daily_task_count, project_daily_task_cap,
+    and project_max_concurrent_tasks scoped to that project.
     """
     now = now or _utcnow()
     accts = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
@@ -1408,32 +1479,217 @@ def get_all_account_health_summaries(
                 entry["regression_stats"] = dict(info["regression_stats"])
             rate_limited_models.append(entry)
 
+        entry_dict = {
+            "id": acct["id"],
+            "name": acct.get("name", ""),
+            "provider": acct.get("provider", "anthropic"),
+            "auth_mode": acct.get("auth_mode", "oauth"),
+            "state": state,
+            "disabled_reason": acct.get("disabled_reason"),
+            "health_score": health_stats["health_score"],
+            "success_rate_7d": health_stats["success_rate_7d"],
+            "completions_24h": health_stats["completions_24h"],
+            "rl_events_24h": health_stats["rl_events_24h"],
+            "avg_duration_seconds": health_stats["avg_duration_seconds"],
+            "active_tasks": acct.get("active_tasks", 0),
+            "daily_task_count": acct.get("daily_task_count", 0),
+            "daily_task_cap": acct.get("daily_task_cap"),
+            "max_concurrent_tasks": acct.get("max_concurrent_tasks"),
+            "disqualify_threshold": _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
+            "rate_limited_models": rate_limited_models,
+            # Additive: latest cached proactive usage-headroom snapshot
+            # (5h/7d utilization, reset times, probed_at, known/stale).
+            # "known": False covers never-probed and probe-unknown states.
+            "usage_snapshot": _usage_snapshot_summary(acct, now),
+        }
+        # Per-project fields when scoped to a specific project.
+        if project_id:
+            proj_state = (acct.get("project_state") or {}).get(project_id, {}) or {}
+            proj_daily_cap = acct.get("project_daily_task_cap") or {}
+            proj_concurrent_cap = acct.get("project_max_concurrent_tasks") or {}
+            entry_dict["proj_state"] = proj_state
+            entry_dict["project_active_tasks"] = int(proj_state.get("active_tasks", 0))
+            entry_dict["project_daily_task_count"] = int(proj_state.get("daily_task_count", 0))
+            entry_dict["project_daily_task_cap"] = proj_daily_cap.get(project_id)
+            entry_dict["project_max_concurrent_tasks"] = proj_concurrent_cap.get(project_id)
+        results.append(entry_dict)
+    return results
+
+
+def get_project_account_usage(
+    project_id: str, user_id: str
+) -> list[dict[str, Any]]:
+    """Return per-account consumption for a single project, read from the in-memory pool.
+
+    For each account in *user_id*'s pool, returns the project's active task count,
+    daily task count, configured per-project caps, and whether the project is at
+    any cap on this account. Includes global (non-project-scoped) account usage
+    for cross-project contention visibility.
+
+    Returns an empty list when the user has no pool entries or the project has
+    no recorded activity on any account.
+    """
+    accts = _max_plan_pools.get(user_id, [])
+    results: list[dict[str, Any]] = []
+    for acct in accts:
+        pstate = (acct.get("project_state") or {}).get(project_id, {})
+        pdaily_cap = (acct.get("project_daily_task_cap") or {}).get(project_id)
+        pconcurrent_cap = (acct.get("project_max_concurrent_tasks") or {}).get(
+            project_id
+        )
+        project_active = int(pstate.get("active_tasks") or 0)
+        project_daily = int(pstate.get("daily_task_count") or 0)
+
+        at_project_daily_cap = (
+            pdaily_cap is not None and project_daily >= int(pdaily_cap)
+        )
+        at_project_concurrent_cap = (
+            pconcurrent_cap is not None and project_active >= int(pconcurrent_cap)
+        )
+
         results.append(
             {
-                "id": acct["id"],
-                "name": acct.get("name", ""),
+                "account_id": acct["id"],
+                "account_name": acct.get("name", ""),
                 "provider": acct.get("provider", "anthropic"),
-                "auth_mode": acct.get("auth_mode", "oauth"),
-                "state": state,
-                "disabled_reason": acct.get("disabled_reason"),
-                "health_score": health_stats["health_score"],
-                "success_rate_7d": health_stats["success_rate_7d"],
-                "completions_24h": health_stats["completions_24h"],
-                "rl_events_24h": health_stats["rl_events_24h"],
-                "avg_duration_seconds": health_stats["avg_duration_seconds"],
-                "active_tasks": acct.get("active_tasks", 0),
-                "daily_task_count": acct.get("daily_task_count", 0),
-                "daily_task_cap": acct.get("daily_task_cap"),
-                "max_concurrent_tasks": acct.get("max_concurrent_tasks"),
-                "disqualify_threshold": _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
-                "rate_limited_models": rate_limited_models,
-                # Additive: latest cached proactive usage-headroom snapshot
-                # (5h/7d utilization, reset times, probed_at, known/stale).
-                # "known": False covers never-probed and probe-unknown states.
-                "usage_snapshot": _usage_snapshot_summary(acct, now),
+                "enabled": acct.get("enabled", True),
+                "project_active_tasks": project_active,
+                "project_daily_task_count": project_daily,
+                "project_daily_task_cap": pdaily_cap,
+                "project_max_concurrent_tasks": pconcurrent_cap,
+                "at_project_daily_cap": at_project_daily_cap,
+                "at_project_concurrent_cap": at_project_concurrent_cap,
+                "at_project_cap": at_project_daily_cap or at_project_concurrent_cap,
+                "global_active_tasks": acct.get("active_tasks", 0),
+                "global_daily_task_count": acct.get("daily_task_count", 0),
+                "global_daily_task_cap": acct.get("daily_task_cap"),
+                "global_max_concurrent_tasks": acct.get("max_concurrent_tasks"),
             }
         )
     return results
+
+
+async def get_user_project_pool_summary(
+    user_id: str, session: Any
+) -> list[dict[str, Any]]:
+    """Return a per-project pool-consumption summary for all of a user's projects.
+
+    Reads from the in-memory pool for counters and caps; does a single batched
+    Project lookup for display names. Returns one entry per project the user
+    belongs to.
+
+    Each entry: project_id, project_name, total_active_tasks, total_daily_task_count,
+    accounts_at_cap (count of accounts where this project is at a per-project cap),
+    accounts_available (accounts with no per-project cap or below cap).
+    """
+    from sqlmodel import select as sql_select
+    from app.models import Project, ProjectMember
+
+    # Collect all project_ids referenced across the user's pool accounts
+    all_project_ids: set[str] = set()
+    accts = _max_plan_pools.get(user_id, [])
+    for acct in accts:
+        pstate = acct.get("project_state") or {}
+        pdaily_cap = acct.get("project_daily_task_cap") or {}
+        pconcurrent_cap = acct.get("project_max_concurrent_tasks") or {}
+        all_project_ids.update(pstate.keys())
+        all_project_ids.update(pdaily_cap.keys())
+        all_project_ids.update(pconcurrent_cap.keys())
+
+    # Also include all projects the user is a member of (even those with no
+    # pool activity yet — they show as zero-state entries).
+    member_project_ids: set[str] = set()
+    try:
+        member_rows = (
+            await session.execute(
+                sql_select(ProjectMember.project_id).where(
+                    ProjectMember.user_id == user_id
+                )
+            )
+        ).all()
+        member_project_ids = {str(pid) for (pid,) in member_rows}
+        all_project_ids.update(member_project_ids)
+    except Exception:
+        logger.debug(
+            "[POOL] get_user_project_pool_summary: failed to query ProjectMember rows"
+        )
+
+    if not all_project_ids:
+        return []
+
+    # Single batched project-name lookup
+    project_names: dict[str, str] = {}
+    try:
+        project_rows = (
+            await session.execute(
+                sql_select(Project.id, Project.name).where(
+                    Project.id.in_(
+                        [pid for pid in all_project_ids if _is_valid_uuid(pid)]
+                    )
+                )
+            )
+        ).all()
+        project_names = {str(pid): name for pid, name in project_rows}
+    except Exception:
+        logger.debug(
+            "[POOL] get_user_project_pool_summary: failed to query Project names"
+        )
+
+    results: list[dict[str, Any]] = []
+    for pid in sorted(all_project_ids):
+        total_active = 0
+        total_daily = 0
+        accounts_at_cap = 0
+        accounts_available = 0
+        caps_configured = False
+
+        for acct in accts:
+            pstate = (acct.get("project_state") or {}).get(pid, {})
+            pdaily_cap = (acct.get("project_daily_task_cap") or {}).get(pid)
+            pconcurrent_cap = (acct.get("project_max_concurrent_tasks") or {}).get(pid)
+
+            pa = int(pstate.get("active_tasks") or 0)
+            pd = int(pstate.get("daily_task_count") or 0)
+            total_active += pa
+            total_daily += pd
+
+            if pdaily_cap is not None or pconcurrent_cap is not None:
+                caps_configured = True
+
+            at_cap = False
+            if pdaily_cap is not None and pd >= int(pdaily_cap):
+                at_cap = True
+            if pconcurrent_cap is not None and pa >= int(pconcurrent_cap):
+                at_cap = True
+
+            if at_cap:
+                accounts_at_cap += 1
+            else:
+                accounts_available += 1
+
+        results.append(
+            {
+                "project_id": pid,
+                "project_name": project_names.get(pid, pid[:8]),
+                "total_active_tasks": total_active,
+                "total_daily_task_count": total_daily,
+                "accounts_at_cap": accounts_at_cap,
+                "accounts_available": accounts_available,
+                "total_accounts": len(accts),
+                "caps_configured": caps_configured,
+            }
+        )
+
+    return results
+
+
+def _is_valid_uuid(value: str) -> bool:
+    """Return True if *value* is a valid UUID string."""
+    try:
+        uuid.UUID(value)
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 def account_in_rate_limit_cooldown(account_id: str | None) -> bool:
@@ -1571,6 +1827,7 @@ def pool_wide_rate_limit_cooldown(
     user_id: str | None = None,
     providers: list[str] | None = None,
     model: str | None = None,
+    project_id: str | None = None,
 ) -> bool:
     """Return True if every eligible account is in rate-limit cooldown.
 
@@ -1580,10 +1837,18 @@ def pool_wide_rate_limit_cooldown(
     - model: use model-specific state check; omitting falls back to the
       conservative model=None path (any disabled entry → unavailable)
 
+    When *project_id* is provided, accounts at their per-project cap for
+    that project are treated as unavailable (skipped in the check).
+
     Returns False when the eligible pool is empty or any account is healthy/probing.
     Safe to call from synchronous contexts — individual dict reads are atomic in CPython.
     """
     accts: list[dict] = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
+    # Filter out accounts at per-project cap for this project (if provided).
+    if project_id:
+        accts = [
+            a for a in accts if not _project_at_cap(a, project_id)
+        ]
     if providers:
         norm_providers = {
             _normalize_provider_name(p) or LLMProviderName.ANTHROPIC.value
@@ -2278,6 +2543,7 @@ async def select_max_plan_account_balanced(
     blacklist: List[str] | None = None,
     task_type: str | None = None,
     runtime_config: Mapping[str, Any] | None = None,
+    project_id: str | None = None,
 ) -> tuple[Dict[str, Any], str, str | None] | None:
     """Balanced-mode selection: flatten all accounts across the given providers
     into one pool and pick the single best by (health_score, -active_tasks).
@@ -2291,7 +2557,9 @@ async def select_max_plan_account_balanced(
     eligible only when its ``active_tasks == 0`` (serialized probe). Healthy
     accounts win over probing when both are available, matching the
     single-provider selector's contract.
-    """
+
+    When *project_id* is provided, per-project cap gating is applied BEFORE
+    the global cap check. See ``_project_at_cap``."""
     if not provider_models:
         return None
     async with _max_plan_pool_lock:
@@ -2320,6 +2588,9 @@ async def select_max_plan_account_balanced(
                     continue
                 if _daily_reset_if_elapsed(a, now):
                     dirty_from_reset.append(a["id"])
+                # Per-project cap check runs BEFORE global cap check.
+                if _project_at_cap(a, project_id):
+                    continue
                 if _account_at_cap(a):
                     continue
                 state = _account_state_for_model(a, model, now)
@@ -2424,6 +2695,11 @@ async def select_max_plan_account_balanced(
         account, prov, model = winner
         account["active_tasks"] = account.get("active_tasks", 0) + 1
         account["daily_task_count"] = int(account.get("daily_task_count") or 0) + 1
+        # Per-project counter increment (runtime-only, best-effort).
+        if project_id:
+            proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+            proj_state["active_tasks"] = proj_state.get("active_tasks", 0) + 1
+            proj_state["daily_task_count"] = proj_state.get("daily_task_count", 0) + 1
         _pending_cap_persists.add(account["id"])
         selected_winner = (account, prov, model)
 
@@ -2438,6 +2714,7 @@ async def select_max_plan_account(
     provider: str | LLMProviderName | None = None,
     task_type: str | None = None,
     runtime_config: Mapping[str, Any] | None = None,
+    project_id: str | None = None,
 ) -> Dict[str, Any] | None:
     """Select a Max plan account for a task. Two-tier circuit-breaker selection:
 
@@ -2447,6 +2724,12 @@ async def select_max_plan_account(
        de-facto probe, preventing a thundering herd on a still-rate-limited
        account. If the probe succeeds, the COMPLETED path clears disabled_models
        (restoring full concurrency); if it 429s, the mark path extends cooldown.
+
+    When *project_id* is provided, per-project cap gating is applied BEFORE
+    the global cap check: accounts at their per-project daily/concurrent cap
+    for this project are skipped, and per-project counters are incremented on
+    selection alongside the global counters. When *project_id* is None, no
+    per-project gating is applied (fully backward-compatible).
 
     Pre-increments active_tasks atomically under lock."""
     async with _max_plan_pool_lock:
@@ -2470,6 +2753,10 @@ async def select_max_plan_account(
                 continue
             if _daily_reset_if_elapsed(a, now):
                 dirty_from_reset.append(a["id"])
+            # Per-project cap check runs BEFORE global cap check.
+            proj_cap_reason = _project_at_cap(a, project_id)
+            if proj_cap_reason:
+                continue
             cap_reason = _account_at_cap(a)
             if cap_reason:
                 continue
@@ -2549,6 +2836,11 @@ async def select_max_plan_account(
 
         account["active_tasks"] = account.get("active_tasks", 0) + 1
         account["daily_task_count"] = int(account.get("daily_task_count") or 0) + 1
+        # Per-project counter increment (runtime-only, best-effort).
+        if project_id:
+            proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+            proj_state["active_tasks"] = proj_state.get("active_tasks", 0) + 1
+            proj_state["daily_task_count"] = proj_state.get("daily_task_count", 0) + 1
         _pending_cap_persists.add(account["id"])
         selected = account
 
@@ -2561,6 +2853,7 @@ async def select_llm_runtime_for_task(
     task: Any,
     runtime_config: Mapping[str, Any],
     blacklist: List[str] | None = None,
+    project_id: str | None = None,
 ) -> LLMSelectionResult | None:
     explicit_model = _extract_task_model(task)
     mode = provider_selection_mode(runtime_config)
@@ -2574,8 +2867,15 @@ async def select_llm_runtime_for_task(
         explicit_model, runtime_config
     )
     routing_task_type = _task_type(task)
-    project_id = str(getattr(task, "project_id", None) or "unknown")
-    logger.info("[LLM_SELECT] project=%s user=%s task_type=%s", project_id, user_id, routing_task_type)
+    # Resolve project_id: explicit parameter takes precedence, then task attribute.
+    _resolved_project_id = (
+        project_id
+        if project_id is not None
+        else str(getattr(task, "project_id", None) or "")
+        or None
+    )
+    _log_project_id = _resolved_project_id or "unknown"
+    logger.info("[LLM_SELECT] project=%s user=%s task_type=%s", _log_project_id, user_id, routing_task_type)
 
     # If the inferred explicit_provider isn't allowed by the resolved
     # routing, drop the pin so category_routing wins. Catches:
@@ -2621,9 +2921,10 @@ async def select_llm_runtime_for_task(
                 provider=provider_name,
                 task_type=routing_task_type,
                 runtime_config=runtime_config,
+                project_id=_resolved_project_id,
             )
             if account:
-                logger.info("[LLM_SELECT] project=%s account=%s provider=%s model=%s", project_id, account.get("id"), provider_name, model_name)
+                logger.info("[LLM_SELECT] project=%s account=%s provider=%s model=%s", _log_project_id, account.get("id"), provider_name, model_name)
                 return LLMSelectionResult(
                     provider=provider_name,
                     auth_mode=_normalize_auth_mode(account.get("auth_mode"))
@@ -2692,6 +2993,7 @@ async def select_llm_runtime_for_task(
                 blacklist=blacklist,
                 task_type=routing_task_type,
                 runtime_config=runtime_config,
+                project_id=_resolved_project_id,
             )
             if balanced_result is not None:
                 account, provider_name, chosen_model = balanced_result
@@ -2745,6 +3047,7 @@ async def select_llm_runtime_for_task(
             provider=provider_name,
             task_type=routing_task_type,
             runtime_config=runtime_config,
+            project_id=_resolved_project_id,
         )
         if account:
             if intended_provider and provider_name != intended_provider:
@@ -2784,12 +3087,13 @@ async def select_llm_runtime_for_task(
                 provider=provider_name,
                 task_type=routing_task_type,
                 runtime_config=runtime_config,
+                project_id=_resolved_project_id,
             )
             if account:
                 logger.warning(
                     "[LLM_SELECT] project=%s No pool account has %s; falling back to GA "
                     "counterpart %s on %s.",
-                    project_id,
+                    _log_project_id,
                     model,
                     fallback,
                     provider_name,
@@ -2909,14 +3213,19 @@ async def _maybe_refresh_account_secret(acct: Dict[str, Any]) -> None:
 
 
 async def release_max_plan_account(
-    account_id: str, *, revert_daily_task_count: bool = False
+    account_id: str,
+    *,
+    revert_daily_task_count: bool = False,
+    project_id: str | None = None,
 ):
     """Decrement active tasks for an account when a task finishes or aborts.
 
-    When active_tasks drops to zero and the account's credential is backed by
-    Secret Manager (secret_blob_ref starts with "projects/"), runtime_secret is
-    cleared from the in-memory dict so the resolved credential does not linger
-    indefinitely.  The next select_max_plan_account call re-fetches it.
+    When *project_id* is provided, per-project active_tasks are also
+    decremented (best-effort, floored at zero).  When active_tasks drops to zero
+    and the account's credential is backed by Secret Manager (secret_blob_ref
+    starts with "projects/"), runtime_secret is cleared from the in-memory dict
+    so the resolved credential does not linger indefinitely.  The next
+    select_max_plan_account call re-fetches it.
     """
     async with _max_plan_pool_lock:
         account = _account_by_id.get(account_id)
@@ -2926,10 +3235,29 @@ async def release_max_plan_account(
                     f"[POOL] Account {account['name']} ({account_id}) release underflow — active_tasks was {account['active_tasks']}"
                 )
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
+            # Per-project active_tasks release (best-effort).
+            if project_id:
+                proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+                current = proj_state.get("active_tasks", 0)
+                if current > 0:
+                    proj_state["active_tasks"] = current - 1
+                elif current <= 0 and account.get("active_tasks", 0) >= 0:
+                    # Non-zero underflow on per-project is unusual but not
+                    # actionable — log and floor.
+                    logger.debug(
+                        f"[POOL] Per-project release underflow for project {project_id} "
+                        f"on account {account['name']} ({account_id}) — was {current}"
+                    )
             if revert_daily_task_count:
                 account["daily_task_count"] = max(
                     0, int(account.get("daily_task_count") or 0) - 1
                 )
+                # Per-project daily_task_count revert (best-effort).
+                if project_id:
+                    proj_state = account.setdefault("project_state", {}).setdefault(project_id, {})
+                    current_daily = proj_state.get("daily_task_count", 0)
+                    if current_daily > 0:
+                        proj_state["daily_task_count"] = current_daily - 1
                 _pending_cap_persists.add(account_id)
             if account["active_tasks"] == 0:
                 secret_ref = account.get("secret_blob_ref")
@@ -3625,6 +3953,7 @@ async def recheck_disabled_accounts():
                     db_acct.disabled_reason = acct.get("disabled_reason")
                     db_acct.enabled = acct.get("enabled", True)
                     db_acct.disabled_at = acct.get("disabled_at")
+                    db_acct.project_state = acct.get("project_state")
                     cap_session.add(db_acct)
                 await cap_session.commit()
             for acct_id in flush_ids:

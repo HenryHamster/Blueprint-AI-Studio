@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import ClassVar
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -31,6 +31,7 @@ from app.max_plan_pool import (
     _USAGE_SNAPSHOT_TTL_SECONDS,
     _account_at_cap,
     _account_available_for_model,
+    _project_at_cap,
     _account_by_id,
     _account_state_for_model,
     _build_rate_limit_state_blob,
@@ -271,6 +272,51 @@ class TestDailyResetIfElapsed:
         assert acct["daily_task_count"] == 0
         assert acct["daily_task_count_reset_at"] == now
 
+    def test_resets_per_project_daily_counts_too(self):
+        now = _utcnow()
+        acct = _acct(
+            daily_task_count=10,
+            daily_task_count_reset_at=now - timedelta(hours=25),
+            project_state={
+                "p1": {"active_tasks": 0, "daily_task_count": 8},
+                "p2": {"active_tasks": 1, "daily_task_count": 3},
+                "p3": {"active_tasks": 2},  # no daily_task_count — left alone
+            },
+        )
+        assert _daily_reset_if_elapsed(acct, now) is True
+        assert acct["daily_task_count"] == 0
+        # Per-project daily counts reset
+        assert acct["project_state"]["p1"]["daily_task_count"] == 0
+        assert acct["project_state"]["p2"]["daily_task_count"] == 0
+        # Entry without daily_task_count key unchanged
+        assert acct["project_state"]["p3"]["active_tasks"] == 2
+        assert "daily_task_count" not in acct["project_state"]["p3"]
+        # Non-dict project_state entries are skipped
+        acct["project_state"]["p4"] = "bogus"
+        # Move reset_at backwards so the window check triggers again
+        acct["daily_task_count_reset_at"] = now - timedelta(hours=25)
+        assert _daily_reset_if_elapsed(acct, now) is True  # no crash
+
+    def test_per_project_daily_reset_skipped_when_no_project_state(self):
+        now = _utcnow()
+        acct = _acct(
+            daily_task_count=10,
+            daily_task_count_reset_at=now - timedelta(hours=25),
+            # no project_state key
+        )
+        assert _daily_reset_if_elapsed(acct, now) is True
+        assert acct["daily_task_count"] == 0
+
+    def test_per_project_daily_reset_skipped_when_empty_project_state(self):
+        now = _utcnow()
+        acct = _acct(
+            daily_task_count=10,
+            daily_task_count_reset_at=now - timedelta(hours=25),
+            project_state={},
+        )
+        assert _daily_reset_if_elapsed(acct, now) is True
+        assert acct["daily_task_count"] == 0
+
 
 # ── _account_at_cap ─────────────────────────────────────────────────────────
 
@@ -298,6 +344,98 @@ class TestAccountAtCap:
     def test_concurrent_cap_under_limit_returns_none(self):
         acct = _acct(max_concurrent_tasks=2, active_tasks=1)
         assert _account_at_cap(acct) is None
+
+
+# ── _project_at_cap ──────────────────────────────────────────────────────────
+
+
+class TestProjectAtCap:
+    """Per-project cap enforcement: _project_at_cap gates on per-project daily
+    and concurrent caps stored in the in-memory account entry."""
+
+    def test_none_project_id_returns_none(self):
+        """When project_id is None, no per-project gating is applied."""
+        acct = _acct(
+            project_daily_task_cap={"proj-1": 5},
+            project_state={"proj-1": {"daily_task_count": 10, "active_tasks": 0}},
+        )
+        assert _project_at_cap(acct, None) is None
+
+    def test_no_caps_configured_returns_none(self):
+        """When no per-project caps are set (empty dicts), returns None."""
+        acct = _acct()
+        assert _project_at_cap(acct, "proj-1") is None
+
+    def test_missing_key_in_cap_dict_returns_none(self):
+        """When the project isn't in the cap dict, there's no limit."""
+        acct = _acct(
+            project_daily_task_cap={"other-proj": 5},
+            project_state={"proj-1": {"daily_task_count": 10, "active_tasks": 0}},
+        )
+        assert _project_at_cap(acct, "proj-1") is None
+
+    def test_project_daily_cap_reached_returns_reason(self):
+        acct = _acct(
+            project_daily_task_cap={"proj-1": 5},
+            project_state={"proj-1": {"daily_task_count": 5, "active_tasks": 0}},
+        )
+        reason = _project_at_cap(acct, "proj-1")
+        assert reason is not None
+        assert "project daily cap" in reason
+
+    def test_project_daily_cap_reached_above_limit_returns_reason(self):
+        acct = _acct(
+            project_daily_task_cap={"proj-1": 5},
+            project_state={"proj-1": {"daily_task_count": 7, "active_tasks": 0}},
+        )
+        assert _project_at_cap(acct, "proj-1") is not None
+
+    def test_project_daily_cap_under_limit_returns_none(self):
+        acct = _acct(
+            project_daily_task_cap={"proj-1": 5},
+            project_state={"proj-1": {"daily_task_count": 4, "active_tasks": 0}},
+        )
+        assert _project_at_cap(acct, "proj-1") is None
+
+    def test_project_concurrent_cap_reached_returns_reason(self):
+        acct = _acct(
+            project_max_concurrent_tasks={"proj-1": 2},
+            project_state={"proj-1": {"daily_task_count": 0, "active_tasks": 2}},
+        )
+        reason = _project_at_cap(acct, "proj-1")
+        assert reason is not None
+        assert "project concurrent cap" in reason
+
+    def test_project_concurrent_cap_under_limit_returns_none(self):
+        acct = _acct(
+            project_max_concurrent_tasks={"proj-1": 2},
+            project_state={"proj-1": {"daily_task_count": 0, "active_tasks": 1}},
+        )
+        assert _project_at_cap(acct, "proj-1") is None
+
+    def test_project_at_daily_but_not_concurrent_returns_daily_reason(self):
+        """When the project is over daily but under concurrent, the daily
+        cap is the blocking reason."""
+        acct = _acct(
+            project_daily_task_cap={"proj-1": 5},
+            project_max_concurrent_tasks={"proj-1": 2},
+            project_state={"proj-1": {"daily_task_count": 5, "active_tasks": 1}},
+        )
+        reason = _project_at_cap(acct, "proj-1")
+        assert reason is not None
+        assert "daily" in reason
+
+    def test_project_at_concurrent_but_not_daily_returns_concurrent_reason(self):
+        """When the project is over concurrent but under daily, the concurrent
+        cap is the blocking reason."""
+        acct = _acct(
+            project_daily_task_cap={"proj-1": 5},
+            project_max_concurrent_tasks={"proj-1": 2},
+            project_state={"proj-1": {"daily_task_count": 3, "active_tasks": 2}},
+        )
+        reason = _project_at_cap(acct, "proj-1")
+        assert reason is not None
+        assert "concurrent" in reason
 
 
 # ── _account_available_for_model ────────────────────────────────────────────
@@ -2526,6 +2664,214 @@ class TestSelectionUsageGate:
         assert account["id"] == "unk"
 
 
+# ── select_max_plan_account / release_max_plan_account — per-project caps ───
+
+
+class TestSelectMaxPlanAccountWithProjectCaps:
+    """Selection with per-project caps: a project at its cap cannot claim an
+    account while another project CAN claim the same account. Per-project
+    counters are incremented/decremented on claim/release."""
+
+    _USER = "test-proj-cap-user"
+    _PROJ_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    _PROJ_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    def _setup(self, accounts):
+        _max_plan_pools.clear()
+        _account_by_id.clear()
+        _pending_cap_persists.clear()
+        _max_plan_pools[self._USER] = list(accounts)
+        for a in accounts:
+            _account_by_id[a["id"]] = a
+
+    def _healthy(self, acct_id, **kw):
+        acct = _acct(
+            id=acct_id, name=acct_id, provider="anthropic", auth_mode="oauth", **kw
+        )
+        return acct
+
+    # ── _project_at_cap gating in selection ──────────────────────────────
+
+    async def test_project_at_daily_cap_cannot_claim(self):
+        """A project at its per-project daily cap is excluded from selection."""
+        acct = self._healthy(
+            "acct-1",
+            project_daily_task_cap={self._PROJ_A: 5},
+            project_state={self._PROJ_A: {"daily_task_count": 5, "active_tasks": 0}},
+        )
+        self._setup([acct])
+        result = await select_max_plan_account(
+            self._USER, model=OPUS, project_id=self._PROJ_A
+        )
+        assert result is None
+
+    async def test_project_under_cap_can_claim(self):
+        """A project under its per-project daily cap claims successfully."""
+        acct = self._healthy(
+            "acct-1",
+            project_daily_task_cap={self._PROJ_A: 5},
+            project_state={self._PROJ_A: {"daily_task_count": 4, "active_tasks": 0}},
+        )
+        self._setup([acct])
+        result = await select_max_plan_account(
+            self._USER, model=OPUS, project_id=self._PROJ_A
+        )
+        assert result is not None
+        assert result["id"] == "acct-1"
+        # Per-project counters incremented (via project_state).
+        proj_state = (result.get("project_state") or {}).get(self._PROJ_A, {})
+        assert proj_state.get("active_tasks") == 1
+        assert proj_state.get("daily_task_count") == 5
+
+    async def test_project_at_concurrent_cap_cannot_claim(self):
+        """A project at its per-project concurrent cap is excluded."""
+        acct = self._healthy(
+            "acct-1",
+            project_max_concurrent_tasks={self._PROJ_A: 2},
+            project_state={self._PROJ_A: {"daily_task_count": 0, "active_tasks": 2}},
+        )
+        self._setup([acct])
+        result = await select_max_plan_account(
+            self._USER, model=OPUS, project_id=self._PROJ_A
+        )
+        assert result is None
+
+    async def test_other_project_can_claim_when_project_a_at_cap(self):
+        """Project B can claim the account even when Project A is at its cap."""
+        acct = self._healthy(
+            "acct-1",
+            project_daily_task_cap={self._PROJ_A: 5},
+            project_state={self._PROJ_A: {"daily_task_count": 5, "active_tasks": 0}},
+        )
+        self._setup([acct])
+        result = await select_max_plan_account(
+            self._USER, model=OPUS, project_id=self._PROJ_B
+        )
+        assert result is not None
+        assert result["id"] == "acct-1"
+
+    async def test_project_id_none_skips_per_project_enforcement(self):
+        """When project_id is None, per-project caps are ignored."""
+        acct = self._healthy(
+            "acct-1",
+            project_daily_task_cap={self._PROJ_A: 1},
+            project_state={self._PROJ_A: {"daily_task_count": 5, "active_tasks": 0}},
+        )
+        self._setup([acct])
+        result = await select_max_plan_account(
+            self._USER, model=OPUS, project_id=None
+        )
+        assert result is not None
+        assert result["id"] == "acct-1"
+
+    async def test_project_none_increments_global_but_not_per_project(self):
+        """When project_id is None, global counters increment but
+        per-project counters stay empty."""
+        acct = self._healthy("acct-1")
+        self._setup([acct])
+        result = await select_max_plan_account(
+            self._USER, model=OPUS, project_id=None
+        )
+        assert result is not None
+        assert result["active_tasks"] == 1
+        assert result["daily_task_count"] == 1
+        # Per-project counters unchanged when project_id is None.
+        assert result.get("project_state") in (None, {})
+
+    async def test_per_project_decremented_on_release(self):
+        """Releasing with project_id decrements per-project active_tasks."""
+        acct = self._healthy(
+            "acct-1",
+            active_tasks=1,
+            project_state={self._PROJ_A: {"daily_task_count": 0, "active_tasks": 1}},
+        )
+        self._setup([acct])
+        await release_max_plan_account("acct-1", project_id=self._PROJ_A)
+        # Global counter decremented.
+        assert acct["active_tasks"] == 0
+        # Per-project counter decremented.
+        proj_state = (acct.get("project_state") or {}).get(self._PROJ_A, {})
+        assert proj_state.get("active_tasks", 0) == 0
+
+    async def test_release_without_project_id_does_not_touch_per_project(self):
+        """Releasing without project_id leaves per-project counters alone."""
+        acct = self._healthy(
+            "acct-1",
+            active_tasks=1,
+            project_state={self._PROJ_A: {"daily_task_count": 0, "active_tasks": 1}},
+        )
+        self._setup([acct])
+        await release_max_plan_account("acct-1", project_id=None)
+        assert acct["active_tasks"] == 0
+        # Per-project counter unchanged (release did not touch it).
+        proj_state = (acct.get("project_state") or {}).get(self._PROJ_A, {})
+        assert proj_state.get("active_tasks") == 1
+
+    async def test_release_floors_per_project_at_zero(self):
+        """Defensive .get with default 0 handles missing per-project key."""
+        acct = self._healthy(
+            "acct-1",
+            active_tasks=1,
+        )
+        self._setup([acct])
+        # Release with a project_id that has no entry (shouldn't crash).
+        await release_max_plan_account("acct-1", project_id=self._PROJ_A)
+        assert acct["active_tasks"] == 0
+        # No crash; project_state may have been created with floor value.
+        proj_state = (acct.get("project_state") or {}).get(self._PROJ_A, {})
+        assert proj_state.get("active_tasks", 0) == 0
+
+    # ── Global caps still apply ──────────────────────────────────────────
+
+    async def test_global_daily_cap_still_blocks_when_project_under_cap(self):
+        """Global daily cap blocks even when per-project caps are fine."""
+        acct = self._healthy(
+            "acct-1",
+            daily_task_cap=2,
+            daily_task_count=2,
+            project_daily_task_cap={self._PROJ_A: 10},
+            project_state={self._PROJ_A: {"daily_task_count": 3, "active_tasks": 0}},
+        )
+        self._setup([acct])
+        result = await select_max_plan_account(
+            self._USER, model=OPUS, project_id=self._PROJ_A
+        )
+        assert result is None
+
+    # ── Balanced-mode per-project gating ─────────────────────────────────
+
+    async def test_balanced_mode_respects_per_project_cap(self):
+        """Balanced mode also gates on per-project caps."""
+        acct = self._healthy(
+            "acct-1",
+            project_daily_task_cap={self._PROJ_A: 1},
+            project_state={self._PROJ_A: {"daily_task_count": 1, "active_tasks": 0}},
+        )
+        self._setup([acct])
+        result = await select_max_plan_account_balanced(
+            self._USER,
+            [("anthropic", OPUS)],
+            project_id=self._PROJ_A,
+        )
+        assert result is None
+
+    async def test_balanced_mode_allows_other_project(self):
+        """Balanced mode allows another project to claim when first is at cap."""
+        acct = self._healthy(
+            "acct-1",
+            project_daily_task_cap={self._PROJ_A: 1},
+            project_state={self._PROJ_A: {"daily_task_count": 1, "active_tasks": 0}},
+        )
+        self._setup([acct])
+        result = await select_max_plan_account_balanced(
+            self._USER,
+            [("anthropic", OPUS)],
+            project_id=self._PROJ_B,
+        )
+        assert result is not None
+        assert result[0]["id"] == "acct-1"
+
+
 class TestNoIOUnderLock:
     _USER = "u"
 
@@ -2929,6 +3275,9 @@ class _FakeMaxPlanAccount:
         self.disabled_reason = disabled_reason
         self.disabled_at = None
         self.rate_limit_state = rate_limit_state
+        self.project_daily_task_cap = None
+        self.project_max_concurrent_tasks = None
+        self.project_state = None
 
 
 class _FakeLoadSession:
@@ -3284,6 +3633,488 @@ async def test_persist_rate_limit_usage_no_row_is_noop(monkeypatch):
 
     # Should not raise
     await _persist_rate_limit_usage_to_db("nonexistent-id", snap)
+
+
+# ── get_project_account_usage / get_user_project_pool_summary ────────────────
+
+
+class TestGetProjectAccountUsage:
+    def _reset_pools(self):
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    def test_empty_user_returns_empty_list(self):
+        self._reset_pools()
+        try:
+            from app.max_plan_pool import get_project_account_usage
+
+            result = get_project_account_usage("p1", "nobody")
+            assert result == []
+        finally:
+            self._reset_pools()
+
+    def test_project_with_no_state_returns_zero_counts(self):
+        self._reset_pools()
+        try:
+            from app.max_plan_pool import get_project_account_usage
+
+            acct = _acct(id="a1", user_id="u1", name="Acct1")
+            _account_by_id["a1"] = acct
+            _max_plan_pools["u1"] = [acct]
+
+            result = get_project_account_usage("p1", "u1")
+            assert len(result) == 1
+            r = result[0]
+            assert r["account_id"] == "a1"
+            assert r["account_name"] == "Acct1"
+            assert r["project_active_tasks"] == 0
+            assert r["project_daily_task_count"] == 0
+            assert r["at_project_cap"] is False
+            assert r["global_active_tasks"] == 0
+        finally:
+            self._reset_pools()
+
+    def test_project_with_active_tasks_and_caps(self):
+        self._reset_pools()
+        try:
+            from app.max_plan_pool import get_project_account_usage
+
+            acct = _acct(
+                id="a1",
+                user_id="u1",
+                name="Acct1",
+                active_tasks=5,
+                daily_task_count=12,
+                project_state={"p1": {"active_tasks": 3, "daily_task_count": 8}},
+                project_daily_task_cap={"p1": 10},
+                project_max_concurrent_tasks={"p1": 5},
+            )
+            _account_by_id["a1"] = acct
+            _max_plan_pools["u1"] = [acct]
+
+            result = get_project_account_usage("p1", "u1")
+            assert len(result) == 1
+            r = result[0]
+            assert r["project_active_tasks"] == 3
+            assert r["project_daily_task_count"] == 8
+            assert r["project_daily_task_cap"] == 10
+            assert r["project_max_concurrent_tasks"] == 5
+            assert r["at_project_daily_cap"] is False  # 8 < 10
+            assert r["at_project_concurrent_cap"] is False  # 3 < 5
+            assert r["at_project_cap"] is False
+            assert r["global_active_tasks"] == 5
+            assert r["global_daily_task_count"] == 12
+
+            # Test at daily cap
+            acct["project_state"]["p1"]["daily_task_count"] = 10
+            result2 = get_project_account_usage("p1", "u1")
+            assert result2[0]["at_project_daily_cap"] is True
+            assert result2[0]["at_project_cap"] is True
+
+            # Test at concurrent cap
+            acct["project_state"]["p1"]["daily_task_count"] = 8
+            acct["project_state"]["p1"]["active_tasks"] = 5
+            result3 = get_project_account_usage("p1", "u1")
+            assert result3[0]["at_project_concurrent_cap"] is True
+            assert result3[0]["at_project_cap"] is True
+        finally:
+            self._reset_pools()
+
+    def test_mixed_cap_state_across_accounts(self):
+        self._reset_pools()
+        try:
+            from app.max_plan_pool import get_project_account_usage
+
+            acct1 = _acct(
+                id="a1",
+                user_id="u1",
+                name="Acct1",
+                project_state={"p1": {"active_tasks": 5, "daily_task_count": 12}},
+                project_daily_task_cap={"p1": 10},
+            )
+            acct2 = _acct(
+                id="a2",
+                user_id="u1",
+                name="Acct2",
+                project_state={"p1": {"active_tasks": 1, "daily_task_count": 2}},
+            )
+            _account_by_id["a1"] = acct1
+            _account_by_id["a2"] = acct2
+            _max_plan_pools["u1"] = [acct1, acct2]
+
+            result = get_project_account_usage("p1", "u1")
+            assert len(result) == 2
+            assert result[0]["at_project_daily_cap"] is True  # 12 >= 10
+            assert result[0]["at_project_cap"] is True
+            assert result[1]["at_project_cap"] is False
+        finally:
+            self._reset_pools()
+
+    def test_different_project_id_isolates_state(self):
+        self._reset_pools()
+        try:
+            from app.max_plan_pool import get_project_account_usage
+
+            acct = _acct(
+                id="a1",
+                user_id="u1",
+                name="Acct1",
+                project_state={
+                    "p1": {"active_tasks": 3, "daily_task_count": 5},
+                    "p2": {"active_tasks": 7, "daily_task_count": 2},
+                },
+                project_daily_task_cap={"p1": 10},
+                project_max_concurrent_tasks={"p2": 5},
+            )
+            _account_by_id["a1"] = acct
+            _max_plan_pools["u1"] = [acct]
+
+            r1 = get_project_account_usage("p1", "u1")
+            assert r1[0]["project_active_tasks"] == 3
+            assert r1[0]["project_daily_task_cap"] == 10
+            assert r1[0]["project_max_concurrent_tasks"] is None
+
+            r2 = get_project_account_usage("p2", "u1")
+            assert r2[0]["project_active_tasks"] == 7
+            assert r2[0]["project_daily_task_cap"] is None
+            assert r2[0]["project_max_concurrent_tasks"] == 5
+        finally:
+            self._reset_pools()
+
+
+class TestGetUserProjectPoolSummary:
+    """Dedicated unit tests for get_user_project_pool_summary.
+
+    Tests the batched ProjectMember query, Project name lookups, accumulated
+    totals across accounts, accounts_at_cap counting, caps_configured flag,
+    and DB exception handling.
+    """
+
+    def _reset_pools(self):
+        """Convenience: clear in-memory pool state."""
+        _account_by_id.clear()
+        _max_plan_pools.clear()
+
+    @pytest.mark.asyncio
+    async def test_no_accounts_no_memberships_returns_empty_list(self):
+        """When the user has no pool accounts and no project memberships."""
+        from app.max_plan_pool import get_user_project_pool_summary
+
+        mock_result = MagicMock()
+        mock_result.all.return_value = []
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        result = await get_user_project_pool_summary("u1", mock_session)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_batched_project_member_query(self):
+        """Verify that ProjectMember rows are included and project name query is
+        batched via the valid-UUID filter."""
+        from app.max_plan_pool import get_user_project_pool_summary
+        import uuid as _uuid
+
+        pid = str(_uuid.uuid4())
+        acct = _acct(
+            id="a1",
+            user_id="u1",
+            name="Acct",
+            project_state={pid: {"active_tasks": 2, "daily_task_count": 5}},
+            project_daily_task_cap={pid: 10},
+        )
+        _account_by_id["a1"] = acct
+        _max_plan_pools["u1"] = [acct]
+
+        # First execute call returns a ProjectMember row for pid
+        member_result = MagicMock()
+        member_result.all.return_value = [(pid,)]
+
+        # Second execute call returns the Project name
+        project_result = MagicMock()
+        project_result.all.return_value = [(pid, "My Project")]
+
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(side_effect=[member_result, project_result])
+
+        try:
+            result = await get_user_project_pool_summary("u1", mock_session)
+            assert len(result) == 1
+            r = result[0]
+            assert r["project_id"] == pid
+            assert r["project_name"] == "My Project"
+            assert r["total_active_tasks"] == 2
+            assert r["total_daily_task_count"] == 5
+            assert r["caps_configured"] is True
+        finally:
+            self._reset_pools()
+
+    @pytest.mark.asyncio
+    async def test_accumulated_totals_across_accounts(self):
+        """Multiple accounts for the same project are summed up."""
+        from app.max_plan_pool import get_user_project_pool_summary
+
+        acct1 = _acct(
+            id="a1",
+            user_id="u1",
+            name="Acct1",
+            project_state={"p1": {"active_tasks": 3, "daily_task_count": 8}},
+        )
+        acct2 = _acct(
+            id="a2",
+            user_id="u1",
+            name="Acct2",
+            project_state={"p1": {"active_tasks": 2, "daily_task_count": 5}},
+        )
+        _account_by_id["a1"] = acct1
+        _account_by_id["a2"] = acct2
+        _max_plan_pools["u1"] = [acct1, acct2]
+
+        # ProjectMember query: no rows, but IDs come from project_state keys
+        mock_result = MagicMock()
+        mock_result.all.return_value = []
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        try:
+            result = await get_user_project_pool_summary("u1", mock_session)
+            assert len(result) == 1
+            r = result[0]
+            assert r["project_id"] == "p1"
+            assert r["total_active_tasks"] == 5  # 3 + 2
+            assert r["total_daily_task_count"] == 13  # 8 + 5
+            assert r["total_accounts"] == 2
+        finally:
+            self._reset_pools()
+
+    @pytest.mark.asyncio
+    async def test_accounts_at_cap_and_available(self):
+        """accounts_at_cap reflects accounts where project is at either daily or
+        concurrent cap, and accounts_available counts the rest."""
+        from app.max_plan_pool import get_user_project_pool_summary
+
+        # acct1: at daily cap (8 >= 8)
+        acct1 = _acct(
+            id="a1",
+            user_id="u1",
+            name="Acct1",
+            project_state={"p1": {"active_tasks": 1, "daily_task_count": 8}},
+            project_daily_task_cap={"p1": 8},
+        )
+        # acct2: at concurrent cap (3 >= 3)
+        acct2 = _acct(
+            id="a2",
+            user_id="u1",
+            name="Acct2",
+            project_state={"p1": {"active_tasks": 3, "daily_task_count": 2}},
+            project_max_concurrent_tasks={"p1": 3},
+        )
+        # acct3: no caps at all — available
+        acct3 = _acct(
+            id="a3",
+            user_id="u1",
+            name="Acct3",
+            project_state={"p1": {"active_tasks": 0, "daily_task_count": 0}},
+        )
+        # acct4: below both caps — available
+        acct4 = _acct(
+            id="a4",
+            user_id="u1",
+            name="Acct4",
+            project_state={"p1": {"active_tasks": 1, "daily_task_count": 3}},
+            project_daily_task_cap={"p1": 10},
+        )
+        _account_by_id["a1"] = acct1
+        _account_by_id["a2"] = acct2
+        _account_by_id["a3"] = acct3
+        _account_by_id["a4"] = acct4
+        _max_plan_pools["u1"] = [acct1, acct2, acct3, acct4]
+
+        mock_result = MagicMock()
+        mock_result.all.return_value = []
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        try:
+            result = await get_user_project_pool_summary("u1", mock_session)
+            assert len(result) == 1
+            r = result[0]
+            assert r["accounts_at_cap"] == 2  # acct1 + acct2
+            assert r["accounts_available"] == 2  # acct3 + acct4
+            assert r["total_accounts"] == 4
+            assert r["caps_configured"] is True
+        finally:
+            self._reset_pools()
+
+    @pytest.mark.asyncio
+    async def test_caps_configured_flag(self):
+        """caps_configured is True when ANY account has a per-project cap for
+        the project, even if others don't."""
+        from app.max_plan_pool import get_user_project_pool_summary
+
+        acct1 = _acct(
+            id="a1",
+            user_id="u1",
+            name="Acct1",
+            project_state={"p1": {"active_tasks": 0, "daily_task_count": 0}},
+            project_daily_task_cap={"p1": 10},
+        )
+        acct2 = _acct(
+            id="a2",
+            user_id="u1",
+            name="Acct2",
+            project_state={"p1": {"active_tasks": 0, "daily_task_count": 0}},
+            # No per-project cap
+        )
+        _account_by_id["a1"] = acct1
+        _account_by_id["a2"] = acct2
+        _max_plan_pools["u1"] = [acct1, acct2]
+
+        mock_result = MagicMock()
+        mock_result.all.return_value = []
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        try:
+            result = await get_user_project_pool_summary("u1", mock_session)
+            assert len(result) == 1
+            assert result[0]["caps_configured"] is True
+
+            # Remove caps — caps_configured should be False
+            del acct1["project_daily_task_cap"]
+            result2 = await get_user_project_pool_summary("u1", mock_session)
+            assert result2[0]["caps_configured"] is False
+        finally:
+            self._reset_pools()
+
+    @pytest.mark.asyncio
+    async def test_no_caps_configured_returns_false(self):
+        """When no account has per-project caps, caps_configured is False."""
+        from app.max_plan_pool import get_user_project_pool_summary
+
+        acct = _acct(
+            id="a1",
+            user_id="u1",
+            name="Acct1",
+            project_state={"p1": {"active_tasks": 1, "daily_task_count": 2}},
+        )
+        _account_by_id["a1"] = acct
+        _max_plan_pools["u1"] = [acct]
+
+        mock_result = MagicMock()
+        mock_result.all.return_value = []
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        try:
+            result = await get_user_project_pool_summary("u1", mock_session)
+            assert result[0]["caps_configured"] is False
+            assert result[0]["accounts_at_cap"] == 0
+            assert result[0]["accounts_available"] == 1
+        finally:
+            self._reset_pools()
+
+    @pytest.mark.asyncio
+    async def test_db_exception_on_project_member_query(self):
+        """A DB exception in the ProjectMember query is caught and logged;
+        results are built from pool state alone."""
+        from app.max_plan_pool import get_user_project_pool_summary
+
+        acct = _acct(
+            id="a1",
+            user_id="u1",
+            name="Acct1",
+            project_state={"p1": {"active_tasks": 2, "daily_task_count": 5}},
+        )
+        _account_by_id["a1"] = acct
+        _max_plan_pools["u1"] = [acct]
+
+        mock_session = AsyncMock()
+        # First execute call raises an exception
+        mock_session.execute = AsyncMock(side_effect=Exception("DB connection lost"))
+
+        try:
+            # Should not raise — exception is caught
+            result = await get_user_project_pool_summary("u1", mock_session)
+            # Results still built from pool state
+            assert len(result) == 1
+            assert result[0]["project_id"] == "p1"
+            assert result[0]["total_active_tasks"] == 2
+            assert result[0]["total_daily_task_count"] == 5
+        finally:
+            self._reset_pools()
+
+    @pytest.mark.asyncio
+    async def test_db_exception_on_project_name_query(self):
+        """A DB exception in the Project name query is caught; project_name
+        falls back to truncated project_id."""
+        from app.max_plan_pool import get_user_project_pool_summary
+
+        acct = _acct(
+            id="a1",
+            user_id="u1",
+            name="Acct1",
+            project_state={"p1": {"active_tasks": 1, "daily_task_count": 3}},
+        )
+        _account_by_id["a1"] = acct
+        _max_plan_pools["u1"] = [acct]
+
+        # First call (ProjectMember) succeeds with no rows
+        member_result = MagicMock()
+        member_result.all.return_value = []
+
+        # Second call (Project name) raises
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(
+            side_effect=[member_result, Exception("name query failed")]
+        )
+
+        try:
+            result = await get_user_project_pool_summary("u1", mock_session)
+            assert len(result) == 1
+            # Name falls back to truncated project_id since query failed
+            assert result[0]["project_name"] == "p1"
+            assert result[0]["total_active_tasks"] == 1
+        finally:
+            self._reset_pools()
+
+    @pytest.mark.asyncio
+    async def test_multiple_projects_aggregated_separately(self):
+        """Two different projects each get their own summary entry with correct
+        totals."""
+        from app.max_plan_pool import get_user_project_pool_summary
+
+        acct = _acct(
+            id="a1",
+            user_id="u1",
+            name="Acct1",
+            project_state={
+                "p1": {"active_tasks": 3, "daily_task_count": 8},
+                "p2": {"active_tasks": 1, "daily_task_count": 4},
+            },
+            project_daily_task_cap={"p1": 10},
+        )
+        _account_by_id["a1"] = acct
+        _max_plan_pools["u1"] = [acct]
+
+        mock_result = MagicMock()
+        mock_result.all.return_value = []
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+
+        try:
+            result = await get_user_project_pool_summary("u1", mock_session)
+            assert len(result) == 2
+            r1 = next(r for r in result if r["project_id"] == "p1")
+            r2 = next(r for r in result if r["project_id"] == "p2")
+            assert r1["total_active_tasks"] == 3
+            assert r1["total_daily_task_count"] == 8
+            assert r1["caps_configured"] is True
+            assert r2["total_active_tasks"] == 1
+            assert r2["total_daily_task_count"] == 4
+            assert r2["caps_configured"] is False  # p2 has no cap
+        finally:
+            self._reset_pools()
 
 
 # ── Credential sweep and release secret clearing ───────────────────────────

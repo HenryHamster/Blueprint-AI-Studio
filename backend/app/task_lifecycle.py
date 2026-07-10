@@ -6791,7 +6791,10 @@ async def park_task(
 
         acct_id = get_task_llm_account_id(task)
         if acct_id and not (task.context or {}).get("_slot_released"):
-            await release_max_plan_account(acct_id)
+            await release_max_plan_account(
+                acct_id,
+                project_id=str(task.project_id) if task.project_id else None,
+            )
             task.context = {**(task.context or {}), "_slot_released": True}
     except Exception:
         logger.exception("[PARK] slot release failed for task %s", task.id)

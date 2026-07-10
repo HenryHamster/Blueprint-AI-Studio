@@ -414,7 +414,10 @@ async def _handle_ci_waiting_backstop(
             vms_to_delete.append(child)
         child_acct = (child.context or {}).get("max_plan_account_id")
         if child_acct:
-            await release_max_plan_account(child_acct)
+            await release_max_plan_account(
+                child_acct,
+                project_id=str(child.project_id) if child.project_id else None,
+            )
         session.add(child)
     await maybe_create_failure_alert(
         task,

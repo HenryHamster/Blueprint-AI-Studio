@@ -169,6 +169,7 @@ async def _terminal_cleanup_bg(
     parent_acct_id: str | None,
     children_cleanup: List[tuple],
     force_kill: bool,
+    parent_project_id: str | None = None,
 ) -> None:
     """Slow VM/account cleanup for admin-driven terminal transitions.
 
@@ -189,13 +190,16 @@ async def _terminal_cleanup_bg(
             )
     if parent_acct_id:
         try:
-            await release_max_plan_account(parent_acct_id)
+            await release_max_plan_account(
+                parent_acct_id,
+                project_id=parent_project_id,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[ADMIN] BG cleanup: account release failed for parent={parent_task_id} acct={parent_acct_id}: {exc}"
             )
 
-    for child_task_id, child_vm_id, child_acct_id in children_cleanup:
+    for child_task_id, child_vm_id, child_acct_id, child_project_id in children_cleanup:
         if child_vm_id:
             try:
                 await _ensure_vm_deleted(child_vm_id, reason="parent_cancelled")
@@ -205,7 +209,10 @@ async def _terminal_cleanup_bg(
                 )
         if child_acct_id:
             try:
-                await release_max_plan_account(child_acct_id)
+                await release_max_plan_account(
+                    child_acct_id,
+                    project_id=child_project_id,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     f"[ADMIN] BG cleanup: account release failed for child={child_task_id} acct={child_acct_id}: {exc}"
@@ -296,6 +303,7 @@ async def _apply_status_mutation(
                     str(child.id),
                     child.vm_instance_id,
                     (child.context or {}).get("max_plan_account_id"),
+                    str(child.project_id) if child.project_id else None,
                 )
             )
             session.add(child)
@@ -318,6 +326,7 @@ async def _apply_status_mutation(
             parent_acct_id=parent_acct_id_for_bg,
             children_cleanup=children_cleanup_for_bg,
             force_kill=force_kill,
+            parent_project_id=str(task.project_id) if task.project_id else None,
         )
 
     if new_status == TaskStatus.QUEUED:

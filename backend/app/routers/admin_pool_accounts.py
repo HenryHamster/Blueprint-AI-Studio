@@ -819,6 +819,65 @@ async def _compute_provider_model_breakdown(
     return {"rows": rows, "generated_at": _utcnow().isoformat()}
 
 
+@router.get("/pool-accounts/project-usage")
+async def get_project_pool_usage(
+    project_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Per-account pool consumption for a single project.
+
+    Returns, for each account in the authenticated user's pool, the project's
+    active task count, daily task count, per-project caps, and whether the
+    project is at any cap on that account. Includes global account usage for
+    cross-project contention visibility.
+
+    Requires project membership (404 if the user is not a member of the project).
+    """
+    from app.max_plan_pool import get_project_account_usage
+
+    user_id = current_user["user_id"]
+    await _get_user_project(project_id, user_id, session)
+
+    accounts = get_project_account_usage(str(project_id), user_id)
+
+    total_project_active = sum(a["project_active_tasks"] for a in accounts)
+    total_project_daily = sum(a["project_daily_task_count"] for a in accounts)
+    accounts_at_cap = sum(1 for a in accounts if a["at_project_cap"])
+
+    return {
+        "project_id": str(project_id),
+        "total_project_active_tasks": total_project_active,
+        "total_project_daily_task_count": total_project_daily,
+        "accounts_at_cap": accounts_at_cap,
+        "total_accounts": len(accounts),
+        "accounts": accounts,
+        "generated_at": _utcnow().isoformat(),
+    }
+
+
+@router.get("/pool-accounts/project-summary")
+async def get_project_pool_summary(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Pool-wide per-project consumption summary for all of the user's projects.
+
+    Returns one entry per project the user belongs to, with total active tasks,
+    daily task counts, accounts-at-cap counts, and whether per-project caps are
+    configured. Reads from the in-memory pool for counters/caps; project names
+    come from a single batched DB query.
+    """
+    from app.max_plan_pool import get_user_project_pool_summary
+
+    user_id = current_user["user_id"]
+    projects = await get_user_project_pool_summary(user_id, session)
+    return {
+        "projects": projects,
+        "generated_at": _utcnow().isoformat(),
+    }
+
+
 @router.post("/max-plan-accounts")
 @limiter.limit("10/minute")
 async def add_max_plan_account(

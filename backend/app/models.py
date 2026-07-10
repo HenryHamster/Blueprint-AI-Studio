@@ -3215,6 +3215,22 @@ class MaxPlanAccount(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Per-project caps: JSON dicts mapping project_id (str) → cap value.
+    # Null keys or a null dict means "no per-project cap configured" — the
+    # global daily_task_cap / max_concurrent_tasks apply to all projects.
+    # project_daily_task_cap: {project_id: int} — per-project daily cap
+    # project_max_concurrent_tasks: {project_id: int} — per-project concurrent cap
+    # project_state: {project_id: {active_tasks: int, daily_task_count: int}} —
+    #   persisted per-project counters, mirrored in the in-memory pool entry.
+    project_daily_task_cap: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
+    project_max_concurrent_tasks: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
+    project_state: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
     disabled_reason: str | None = Field(default=None)
     # Set when auto-disable trips (rate-limit threshold). Persisted so
     # recheck_disabled_accounts can re-enable after cooldown across
