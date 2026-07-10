@@ -3088,6 +3088,23 @@ def test_orchestrator_no_ci_gate_redetects_missing_test_command_wiring():
     )
 
 
+def test_orchestrator_no_ci_redetect_refreshes_snapshot_before_gate_check():
+    """A successful no-test-command re-detect must be visible in the same poll."""
+    import re
+
+    src = _orchestrator_source()
+    assert re.search(
+        r"_redetected = await maybe_redetect_missing_test_command\(.+?"
+        r"if _redetected:\s+_ci_proj = \(\s+await _resnapshot_project\(_ci_proj_orm\)",
+        src,
+        re.DOTALL,
+    ), (
+        "orchestrator no-CI re-detection must refresh the cached _ProjectSnapshot "
+        "before re-checking should_run_no_ci_test_gate; otherwise a newly found "
+        "test command still merges UNVERIFIED for one poll."
+    )
+
+
 # ---------------------------------------------------------------------------
 # PR-caused self-suppression: the PR's OWN diff disabled tests AND the suite
 # stopped verifying (all-skipped, or a mostly-skipped pass). The gate must BLOCK
@@ -3496,6 +3513,8 @@ def test_orchestrator_no_checks_escalation_backstop_wiring():
     required = [
         "resolve_no_checks_escalation",
         "maybe_redetect_ci_presence",
+        "_esc_redetected = await maybe_redetect_ci_presence",
+        "await _resnapshot_project(_esc_proj_orm)",
         # The escalation block sets the sticky verify-gate marker...
         'ci_loop["no_ci_escalation_verify_gate"] = (',
         # ...and the gate block honors it on the next poll via the base marker.

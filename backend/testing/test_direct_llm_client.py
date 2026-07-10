@@ -128,6 +128,23 @@ def test_normalize_rate_limit_data_with_all_headers():
     assert result["tokens"]["limit"] == 50000
 
 
+def test_normalize_rate_limit_data_keeps_token_families_separate():
+    from app.direct_llm_client import normalize_rate_limit_data
+
+    raw_headers = {
+        "anthropic-ratelimit-tokens-remaining": "5000",
+        "anthropic-ratelimit-tokens-limit": "50000",
+        "anthropic-ratelimit-input-tokens-remaining": "111",
+        "anthropic-ratelimit-input-tokens-limit": "222",
+        "anthropic-ratelimit-output-tokens-remaining": "333",
+        "anthropic-ratelimit-output-tokens-limit": "444",
+    }
+    result = normalize_rate_limit_data(raw_headers)
+
+    assert result["tokens"]["remaining"] == 5000
+    assert result["tokens"]["limit"] == 50000
+
+
 def test_normalize_rate_limit_data_with_limit_and_utilization():
     from app.direct_llm_client import normalize_rate_limit_data
 

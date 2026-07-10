@@ -3956,19 +3956,30 @@ class TestSafeCredentialPath(unittest.TestCase):
         """A normal path under /root is resolved relative to workspace root."""
         resolved = self._valid("/root/.config/claude/settings.json")
         self.assertTrue(resolved.startswith(self._tmpdir))
-        self.assertTrue(resolved.endswith("root/.config/claude/settings.json"))
+        self.assertTrue(
+            resolved.endswith(
+                os.path.join("root", ".config", "claude", "settings.json")
+            )
+        )
         self.assertTrue(os.path.isabs(resolved))
 
     def test_path_without_leading_slash_is_accepted(self):
         """Paths without a leading slash also resolve correctly."""
         resolved = self._valid("home/user/config.yaml")
-        self.assertEqual(resolved, os.path.join(self._tmpdir, "home/user/config.yaml"))
+        self.assertEqual(
+            resolved,
+            os.path.join(self._tmpdir, "home", "user", "config.yaml"),
+        )
 
     def test_deep_safe_path_is_accepted(self):
         """A deeply nested path without traversal is accepted."""
         resolved = self._valid("/a/b/c/d/e/f/g/h/file.txt")
         self.assertTrue(resolved.startswith(self._tmpdir))
-        self.assertTrue(resolved.endswith("a/b/c/d/e/f/g/h/file.txt"))
+        self.assertTrue(
+            resolved.endswith(
+                os.path.join("a", "b", "c", "d", "e", "f", "g", "h", "file.txt")
+            )
+        )
 
     def test_leading_dot_dot_is_rejected(self):
         """Path starting with '..' is rejected."""
@@ -4027,6 +4038,13 @@ class TestSafeCredentialPath(unittest.TestCase):
     def test_rejects_bare_dot_dot(self):
         """Bare '..' is rejected."""
         self._invalid("..")
+
+    def test_spawn_agent_task_uses_safe_credential_path(self):
+        """The production credential-file writer must call the tested guard."""
+        import inspect
+
+        src = inspect.getsource(local_runner._spawn_agent_task)
+        self.assertIn("_safe_credential_path", src)
 
 
 class TestCredentialPersistence(unittest.TestCase):

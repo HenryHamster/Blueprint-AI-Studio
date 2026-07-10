@@ -548,7 +548,7 @@ async def test_reconciliation_failure_triggers_alert(db_session):
     }
 
     with patch(
-        "backend.app.efficiency_snapshot._compute_cost_telemetry_reconciliation",
+        "app.efficiency_snapshot._compute_cost_telemetry_reconciliation",
         return_value=failing_reconciliation,
     ), patch(
         "app.alert_dispatch.broadcast_to_project",
@@ -1057,7 +1057,7 @@ async def test_provider_reported_output_tokens_zero_when_missing_from_api_summar
 @pytest.mark.asyncio
 async def test_provider_reported_provider_output_tokens_aggregate(db_session):
     """provider_reported_output_tokens aggregates across multiple tasks even
-    though it is not used in the delta calculation (which is input-only)."""
+    though it is independently tolerance-checked from input tokens."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -1246,9 +1246,8 @@ async def test_provider_reported_api_call_summary_empty_dict(db_session):
 @pytest.mark.asyncio
 async def test_provider_reported_output_tokens_divergence(db_session):
     """When agent-accumulated output tokens diverge from provider-reported
-    output tokens, both values are independently reported (output divergence
-    does NOT affect the delta, which is input-only, but both fields must be
-    accurate)."""
+    output tokens, the provider-reported reconciliation fails tolerance just
+    like an input-token divergence."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
@@ -1274,15 +1273,55 @@ async def test_provider_reported_output_tokens_divergence(db_session):
     result = reconcile_provider_reported_usage([task])
 
     assert result.task_count == 1
-    # Inputs match → delta=0, within_tolerance.
-    assert result.provider_reported_within_tolerance is True
-    assert result.provider_reported_delta == 0.0
-    # Output divergence is visible in the independent fields.
+    # Inputs match, but output differs by |200 - 250| / 200 = 25%.
+    assert result.provider_reported_input_delta == 0.0
+    assert result.provider_reported_output_delta == pytest.approx(0.25, abs=1e-9)
+    assert result.provider_reported_delta == pytest.approx(0.25, abs=1e-9)
+    assert result.provider_reported_within_tolerance is False
     assert result.agent_accumulated_output_tokens == 250
     assert result.provider_reported_output_tokens == 200
     # Per-task detail also reflects the divergence.
     assert result.per_task[0]["agent_accumulated_output_tokens"] == 250
     assert result.per_task[0]["provider_reported_output_tokens"] == 200
+    assert result.per_task[0]["provider_reported_output_delta"] == 0.25
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_output_only_data_is_checked(db_session):
+    """Provider data with only output tokens is still real provider data and
+    must enter reconciliation instead of being skipped as input-only."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "total_input_tokens": 0,
+            "total_output_tokens": 105,
+            "llm_call_count": 1,
+        },
+        provider_reported_usage={
+            "input_tokens": 0,
+            "output_tokens": 100,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = reconcile_provider_reported_usage([task])
+
+    assert result.task_count == 1
+    assert result.provider_reported_input_delta == 0.0
+    assert result.provider_reported_output_delta == pytest.approx(0.05, abs=1e-9)
+    assert result.provider_reported_within_tolerance is False
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ DIRECT_LLM_MODEL = "claude-haiku-4-5-20251001"
 
 # Prefix for Anthropic rate-limit response headers.
 _RATE_LIMIT_HEADER_PREFIX = "anthropic-ratelimit-"
+_RATE_LIMIT_TOKENS_HEADER_PREFIX = f"{_RATE_LIMIT_HEADER_PREFIX}tokens-"
 
 
 def get_anthropic_api_key() -> str:
@@ -155,7 +156,7 @@ def normalize_rate_limit_data(
     tokens: dict[str, Any] = {}
     for key, raw_val in raw_headers.items():
         lk = key.lower()
-        if "tokens-" not in lk:
+        if not lk.startswith(_RATE_LIMIT_TOKENS_HEADER_PREFIX):
             continue
         val = parse_rate_limit_header_value(raw_val)
         if "remaining" in lk and isinstance(val, int):
