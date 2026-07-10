@@ -133,6 +133,11 @@ beforeEach(() => {
   delete process.env.ANTHROPIC_API_KEY;
   delete process.env.ANTHROPIC_AUTH_TOKEN;
   delete process.env.ANTHROPIC_BASE_URL;
+  delete process.env.ANTHROPIC_MODEL;
+  delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
+  delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL;
+  delete process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+  delete process.env.CLAUDE_CODE_SUBAGENT_MODEL;
   delete process.env.ZAI_API_KEY;
   delete process.env.ZAI_ANTHROPIC_BASE_URL;
   delete process.env.ZAI_BASE_URL;
@@ -2073,6 +2078,128 @@ describe('provider runner prompt transport', () => {
     const command = runner.buildRunCommand('prompt body', 'deepseek-v4-flash', 'low');
 
     expect(command.env.ANTHROPIC_BASE_URL).toBe('https://proxy.test/deepseek');
+  });
+
+  it('sets the documented DeepSeek Claude Code model env and aligns ANTHROPIC_MODEL with the requested model', () => {
+    // DeepSeek's documented integration selects models via env; without it the
+    // CLI resolves its claude-* aliases, which DeepSeek silently remaps
+    // (unknown/sonnet/haiku ids → v4-flash) — the Resident Pro-task failure
+    // mode. The env must carry the documented defaults, and ANTHROPIC_MODEL
+    // must track the explicitly requested model so the env-driven paths
+    // (resident stream-json session, subagent spawns) resolve the same model
+    // the --model flag names.
+    process.env.PROVIDER = 'deepseek';
+    process.env.DEEPSEEK_API_KEY = 'deepseek-test-key';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', 'deepseek-v4-pro', 'high');
+
+    expect(command.env.ANTHROPIC_MODEL).toBe('deepseek-v4-pro');
+    expect(command.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('deepseek-v4-pro');
+    expect(command.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-v4-pro');
+    expect(command.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('deepseek-v4-flash');
+    expect(command.env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('deepseek-v4-flash');
+
+    // A different requested model re-aligns ANTHROPIC_MODEL (defaults stay).
+    const flash = runner.buildRunCommand('prompt body', 'deepseek-v4-flash', 'low');
+    expect(flash.env.ANTHROPIC_MODEL).toBe('deepseek-v4-flash');
+    expect(flash.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('deepseek-v4-pro');
+  });
+
+  it('lets operator-provided model env override the DeepSeek defaults', () => {
+    process.env.PROVIDER = 'deepseek';
+    process.env.DEEPSEEK_API_KEY = 'deepseek-test-key';
+    process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = 'deepseek-v4-pro';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', undefined, 'low');
+
+    // Account/pool-materialized env wins over the built-in defaults.
+    expect(command.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('deepseek-v4-pro');
+    // No explicit model requested → the documented default stands.
+    expect(command.env.ANTHROPIC_MODEL).toBe('deepseek-v4-pro');
+  });
+
+  it('preserves LLM_CLI_TRANSLATION env over DeepSeek defaults, below process.env', () => {
+    // Precedence contract for the deepseek model env: process.env (account
+    // materialization) > translation env (settings bag) > documented default.
+    process.env.PROVIDER = 'deepseek';
+    process.env.DEEPSEEK_API_KEY = 'deepseek-test-key';
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'deepseek-v4-flash'; // materialized
+    process.env.LLM_CLI_TRANSLATION = JSON.stringify({
+      env: {
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek-v4-pro',   // translation layer
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-v4-pro',  // loses to process.env
+      },
+      args: [],
+      prompt_fragments: [],
+      unsupported: [],
+    });
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', undefined, 'low');
+
+    // Translation env survives the default fill (was clobbered pre-fix).
+    expect(command.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('deepseek-v4-pro');
+    // Materialized process.env still outranks the translation layer.
+    expect(command.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-v4-flash');
+    // Untouched keys fall through to the documented defaults.
+    expect(command.env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('deepseek-v4-flash');
+  });
+
+  it('does not leak DeepSeek model env into Anthropic runs on a retargeted VM', () => {
+    // A warm VM retargeted deepseek→anthropic may still carry the DeepSeek
+    // model env in process.env; the anthropic branch must not propagate it,
+    // or the Claude CLI would request a nonexistent Anthropic model.
+    process.env.PROVIDER = 'anthropic';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'oauth-token';
+    process.env.ANTHROPIC_MODEL = 'deepseek-v4-pro';
+    process.env.CLAUDE_CODE_SUBAGENT_MODEL = 'deepseek-v4-flash';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', 'claude-opus-4-8', 'high');
+
+    expect(command.env.ANTHROPIC_MODEL).toBeUndefined();
+    expect(command.env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
+  });
+
+  it('validates the requested model instead of a bare auth probe (Claude-compat providers)', () => {
+    // A validation that never names the model proves only that the key
+    // authenticates — AGENT_AUTH_OK could pass while the requested model is
+    // broken (the DeepSeek Resident failure mode: Pro tasks validated OK,
+    // then every resident session died on its first turn).
+    process.env.PROVIDER = 'deepseek';
+    process.env.DEEPSEEK_API_KEY = 'deepseek-test-key';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const validation = defined(runner.buildValidationCommand('deepseek-v4-pro'));
+
+    expect(validation.command).toBe('claude');
+    expect(validation.args).toContain('--model');
+    expect(validation.args[validation.args.indexOf('--model') + 1]).toBe('deepseek-v4-pro');
+    expect(validation.env.ANTHROPIC_MODEL).toBe('deepseek-v4-pro');
+
+    // Model-less validation still works (no --model flag, env defaults only).
+    const bare = defined(runner.buildValidationCommand());
+    expect(bare.args).not.toContain('--model');
+  });
+
+  it('passes --model to the Anthropic validation command when the pool selected one', () => {
+    process.env.PROVIDER = 'anthropic';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'oauth-token';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const validation = defined(runner.buildValidationCommand('claude-opus-4-8'));
+    expect(validation.args).toContain('--model');
+    expect(validation.args[validation.args.indexOf('--model') + 1]).toBe('claude-opus-4-8');
+    // No DeepSeek-style env pinning outside the deepseek branch.
+    expect(validation.env.ANTHROPIC_MODEL).toBeUndefined();
   });
 });
 

@@ -1483,44 +1483,6 @@ def _copy_default_provider_matrix(provider: str) -> dict[str, dict[str, Any]]:
     }
 
 
-def _insert_provider_once(providers: list[Any], provider: str, index: int) -> None:
-    if provider in providers:
-        return
-    providers.insert(max(0, min(index, len(providers))), provider)
-
-
-def _remove_provider(providers: list[Any], provider: str) -> None:
-    providers[:] = [candidate for candidate in providers if candidate != provider]
-
-
-def _move_provider_once(providers: list[Any], provider: str, index: int) -> None:
-    _remove_provider(providers, provider)
-    providers.insert(max(0, min(index, len(providers))), provider)
-
-
-def _insert_provider_after(
-    providers: list[Any], provider: str, after_provider: str
-) -> None:
-    if provider in providers:
-        return
-    try:
-        index = providers.index(after_provider) + 1
-    except ValueError:
-        index = len(providers)
-    providers.insert(index, provider)
-
-
-def _move_provider_after(
-    providers: list[Any], provider: str, after_provider: str
-) -> None:
-    _remove_provider(providers, provider)
-    try:
-        index = providers.index(after_provider) + 1
-    except ValueError:
-        index = len(providers)
-    providers.insert(index, provider)
-
-
 def _ensure_route_defaults(
     category_routing: dict[str, Any], category: str
 ) -> dict[str, Any]:
@@ -1540,6 +1502,12 @@ def _ensure_route_defaults(
         default_entry = runtime_config["category_routing"].get(category) or {}
         entry["effort"] = default_entry.get("effort") or "medium"
     return entry
+
+
+# Last warning set emitted by the DeepSeek-first routing check in
+# _backfill_provider_runtime_defaults; the check runs on every config sync,
+# so it logs only when the set CHANGES. None = never evaluated.
+_last_deepseek_routing_warnings: list[str] | None = None
 
 
 def _validate_deepseek_routing_invariant(config: Dict[str, Any]) -> list[str]:
@@ -1570,8 +1538,11 @@ def _validate_deepseek_routing_invariant(config: Dict[str, Any]) -> list[str]:
 def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
     """Add provider defaults introduced after the settings-bag migration.
 
-    Explicit single-provider routes are preserved. Multi-provider broad routes
-    are normalized to keep high-volume work off GLM by default after upgrade.
+    Existing routes are operator-owned and must remain byte-for-byte stable.
+    This helper runs on every persisted-config sync, not just once during an
+    upgrade, so rewriting an existing provider list here would silently undo a
+    successful settings PATCH on the next sync cycle. Missing categories are
+    still seeded from the current defaults by ``_ensure_route_defaults``.
     """
     categories = config.setdefault("task_type_categories", {})
     if isinstance(categories, dict):
@@ -1630,24 +1601,7 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
     category_routing = config.setdefault("category_routing", {})
     if isinstance(category_routing, dict):
         for category in ("_default", "strategic", "initiative", "build", "review", "ops"):
-            route = _ensure_route_defaults(category_routing, category)
-            providers = route.get("providers")
-            if not isinstance(providers, list):
-                continue
-            if len(providers) <= 1:
-                continue
-            if category == "strategic":
-                _move_provider_once(providers, "zai", 0)
-                _move_provider_after(providers, "deepseek", "anthropic")
-            elif category == "review":
-                _remove_provider(providers, "zai")
-                _move_provider_after(providers, "deepseek", "anthropic")
-            elif category == "ops":
-                _remove_provider(providers, "zai")
-                _move_provider_once(providers, "deepseek", 0)
-            else:
-                _remove_provider(providers, "zai")
-                _move_provider_once(providers, "deepseek", 0)
+            _ensure_route_defaults(category_routing, category)
 
     if config.get("provider_selection_mode") not in (
         "balanced",
@@ -1656,11 +1610,20 @@ def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
     ):
         config["provider_selection_mode"] = runtime_config["provider_selection_mode"]
 
+    # Observability only — detection is decoupled from repair. Operator routes
+    # are preserved verbatim above, so a route that violates the DeepSeek-first
+    # cost default is a deliberate choice; log it ONCE per distinct warning set
+    # (this runs on every config sync, so an unconditional log would spam).
+    global _last_deepseek_routing_warnings
     routing_warnings = _validate_deepseek_routing_invariant(config)
-    if routing_warnings:
-        logger.warning(
-            "DeepSeek routing invariant violated: %s", "; ".join(routing_warnings)
-        )
+    if routing_warnings != _last_deepseek_routing_warnings:
+        _last_deepseek_routing_warnings = routing_warnings
+        if routing_warnings:
+            logger.warning(
+                "DeepSeek-first routing default not met (operator routing is "
+                "preserved; informational only): %s",
+                "; ".join(routing_warnings),
+            )
 
 
 def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
