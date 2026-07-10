@@ -449,6 +449,11 @@ export interface CriterionCoverageEntry {
   status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
   stuck_reason?: 'no_mapping' | 'direction_retired' | null;
+  /** ISO-8601 UTC timestamp when the operator attestation expires.
+   *  Present only when coverage='attested' and the attestation carries a
+   *  parseable attested_at timestamp. Null/absent for legacy (non-expiring)
+   *  attestations and for all non-attested coverage tiers. */
+  attestation_expires_at?: string | null;
 }
 
 export interface VersionCriterionCoverage {

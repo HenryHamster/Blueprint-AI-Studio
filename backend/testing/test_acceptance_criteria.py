@@ -725,6 +725,80 @@ async def test_stuck_criterion_attention_item(db_session):
     )
 
 
+@pytest.mark.asyncio
+async def test_expired_attestation_emits_attention_item(db_session):
+    """An expired operator attestation on an active criterion emits an attestation-expiry attention item.
+
+    build_operator_attention must surface expired attestations as
+    'attestation_expired' needs_operator items so the operator knows to
+    re-attest or provide machine evidence.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Expired-attestation criterion"
+    )
+    # Record an expired operator attestation (> ATTESTATION_WINDOW_DAYS old).
+    stale_at = (
+        _utcnow() - timedelta(days=ac.ATTESTATION_WINDOW_DAYS + 1)
+    ).isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": stale_at, "reason": "was OK at the time"},
+    )
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["attestation_expired"] == 1
+    attest_id = f"version:{version.id}:attestation_expired:{criterion.criterion_key}"
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert attest_id in items_by_id, (
+        f"Expected attestation_expired item {attest_id} in {list(items_by_id)}"
+    )
+    item = items_by_id[attest_id]
+    assert item["reason"] == "attestation_expired"
+    assert item["label"] == "Attestation expired"
+    assert item["release_version_id"] == str(version.id)
+    assert "re-attest" in item["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_fresh_attestation_no_expiry_attention_item(db_session):
+    """A fresh (non-expired) operator attestation emits NO attestation-expiry item.
+
+    Only expired attestations should surface; a valid attestation keeps the
+    criterion in 'attested' coverage and must not trigger the expiry alert.
+    """
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Fresh-attestation criterion"
+    )
+    fresh_at = _utcnow().isoformat()
+    await ac.record_evidence(
+        db_session,
+        criterion.id,
+        project.id,
+        source_kind="operator_attestation",
+        source_id=_TEST_USER_ID,
+        detail={"attested_at": fresh_at, "reason": "still valid"},
+    )
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+
+    assert attention["counts"]["attestation_expired"] == 0
+    attest_id = f"version:{version.id}:attestation_expired:{criterion.criterion_key}"
+    items_by_id = {item["id"]: item for item in attention["items"]}
+    assert attest_id not in items_by_id, (
+        f"Unexpected attestation_expired item {attest_id} for a fresh attestation"
+    )
+
+
 # ---------------------------------------------------------------------------
 # get_criterion_by_key, criterion_ids propagation, and merge evidence recording
 # ---------------------------------------------------------------------------
@@ -3053,6 +3127,77 @@ async def test_attest_duplicate_attestation_refreshes_expiry(client: AsyncClient
     assert crit2["evidence"][0]["detail"]["reason"] == "re-attested; still accepted"
     # attested_at is refreshed (>= the original; equal is acceptable on a fast clock).
     assert crit2["evidence"][0]["detail"]["attested_at"] >= first_attested_at
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_carries_attestation_expiry(db_session):
+    """get_version_coverage_summary includes attestation_expires_at for attested criteria.
+
+    When a criterion is covered by a timestamped operator_attestation, the
+    per-criterion entry must carry attestation_expires_at as an ISO-8601 string
+    whose value is approximately attested_at + ATTESTATION_WINDOW_DAYS.
+    Non-attested criteria carry attestation_expires_at=None.
+    Legacy (timestamp-less) attestations carry attestation_expires_at=None
+    (non-expiring — no deadline to surface).
+    """
+    from datetime import datetime as _dt
+
+    project = await _make_project(db_session, "AttestExpiry")
+    version = await _make_version(db_session, project)
+
+    c_attested = await ac.create_criterion(db_session, project.id, version.id, "Attested criterion")
+    c_uncovered = await ac.create_criterion(db_session, project.id, version.id, "Uncovered criterion")
+    c_legacy = await ac.create_criterion(db_session, project.id, version.id, "Legacy attestation")
+
+    # Timestamped attestation for c_attested.
+    attested_at = _utcnow()
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c_attested.id,
+        project_id=project.id,
+        source_kind="operator_attestation",
+        source_id="test-user",
+        detail={"reason": "accepted", "attested_at": attested_at.isoformat()},
+    )
+
+    # Legacy (timestamp-less) attestation for c_legacy — should be non-expiring.
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c_legacy.id,
+        project_id=project.id,
+        source_kind="operator_attestation",
+        source_id="test-user",
+        detail={"reason": "legacy, no timestamp"},
+    )
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+
+    # Timestamped attestation: expiry must be present and ~attested_at + window.
+    attested_entry = by_key[c_attested.criterion_key]
+    assert attested_entry["coverage"] == "attested"
+    assert "attestation_expires_at" in attested_entry
+    expiry_str = attested_entry["attestation_expires_at"]
+    assert expiry_str is not None, "attestation_expires_at must not be None for a timestamped attestation"
+    expiry_dt = _dt.fromisoformat(expiry_str)
+    expected_expiry = attested_at + timedelta(days=ac.ATTESTATION_WINDOW_DAYS)
+    assert abs((expiry_dt - expected_expiry).total_seconds()) < 2, (
+        f"expiry {expiry_dt!r} deviates from expected {expected_expiry!r}"
+    )
+
+    # Legacy attestation: non-expiring → attestation_expires_at=None.
+    legacy_entry = by_key[c_legacy.criterion_key]
+    assert legacy_entry["coverage"] == "attested"
+    assert legacy_entry.get("attestation_expires_at") is None, (
+        "Legacy (timestamp-less) attestation must carry attestation_expires_at=None"
+    )
+
+    # Uncovered criterion: attestation_expires_at must be None (not attested).
+    uncovered_entry = by_key[c_uncovered.criterion_key]
+    assert uncovered_entry["coverage"] == "uncovered"
+    assert uncovered_entry.get("attestation_expires_at") is None, (
+        "Non-attested criterion must carry attestation_expires_at=None"
+    )
 
 
 @pytest.mark.asyncio

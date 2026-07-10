@@ -2,6 +2,17 @@ import { useState, type JSX } from 'react';
 import type { ChangelogEntry, VersionCriterionCoverage, CriterionCoverageEntry } from '../api';
 import { isSafeUrl } from './TaskCard';
 
+function formatExpiresIn(expiresAt: string): string {
+  try {
+    const diffMs = new Date(expiresAt).getTime() - Date.now();
+    if (diffMs <= 0) return 'expired';
+    const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+    return `expires ${diffDays}d`;
+  } catch {
+    return '';
+  }
+}
+
 // Group changelog entries by task_type, preserving newest-first order within each group.
 function groupByType(entries: ChangelogEntry[]): Map<string, ChangelogEntry[]> {
   const groups = new Map<string, ChangelogEntry[]>();
@@ -216,6 +227,15 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
               {isInProgress && (
                 <span className="shrink-0 text-ui-sm text-slate-400 ml-1" data-testid={`in-progress-${c.criterion_key}`} title="Active direction is working on this criterion">
                   in progress
+                </span>
+              )}
+              {c.coverage === 'attested' && c.attestation_expires_at != null && (
+                <span
+                  className="shrink-0 text-ui-sm text-amber-500 ml-1"
+                  data-testid={`attestation-expiry-${c.criterion_key}`}
+                  title={`Attestation expires at ${c.attestation_expires_at}`}
+                >
+                  {formatExpiresIn(c.attestation_expires_at)}
                 </span>
               )}
               {c.evidence_count > 0 && (

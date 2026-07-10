@@ -495,6 +495,29 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     return "partial"
 
 
+def _compute_attestation_expires_at(evidence: list[CriterionEvidence]) -> str | None:
+    """Return the ISO-8601 expiry timestamp of the latest valid attestation, or None.
+
+    Iterates evidence in reverse (latest first) and returns the expiry of the
+    first non-expired operator_attestation that carries a parseable ``attested_at``
+    timestamp. Legacy attestations (no ``attested_at``) are non-expiring and return
+    ``None``. Called only when coverage == ``'attested'``.
+    """
+    for e in reversed(evidence):
+        if not _evidence_is_attested(e):
+            continue
+        detail = e.detail if isinstance(e.detail, dict) else {}
+        attested_at_raw = detail.get("attested_at")
+        if not attested_at_raw:
+            return None  # legacy non-expiring attestation
+        try:
+            attested_at = _coerce_naive_utc(datetime.fromisoformat(str(attested_at_raw)))
+            return (attested_at + timedelta(days=ATTESTATION_WINDOW_DAYS)).isoformat()
+        except (TypeError, ValueError):
+            return None  # unparseable timestamp — treat as non-expiring
+    return None
+
+
 def _criterion_evidence_summary_entries(
     evidence: list[CriterionEvidence],
 ) -> list[dict[str, Any]]:
@@ -1769,6 +1792,11 @@ async def get_version_coverage_summary(
                 "evidence_truncated": evidence_truncated,
                 "stuck_reason": stuck_reason,
                 "evidence": _criterion_evidence_summary_entries(evidence),
+                "attestation_expires_at": (
+                    _compute_attestation_expires_at(evidence)
+                    if coverage == "attested"
+                    else None
+                ),
             }
         )
 

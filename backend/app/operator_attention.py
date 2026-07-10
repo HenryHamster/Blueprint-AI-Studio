@@ -123,6 +123,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "stuck_criteria"): 65,
     ("needs_operator", "stuck_acceptance_criterion"): 65,
     ("needs_operator", "coverage_blocked"): 66,
+    ("needs_operator", "attestation_expired"): 67,
     ("needs_operator", "manual_intervention"): 70,
     ("needs_operator", "churn_retirement_recommended"): 72,
     ("needs_operator", "stale_completion_debt"): 75,
@@ -243,6 +244,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "acceptance_criteria_lifecycle",
         "clears_when": "criterion_covered_or_version_closed",
         "operator_action": "monitor_active_direction_progress",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "attestation_expired": {
+        "mode": "acceptance_criteria_lifecycle",
+        "clears_when": "criterion_covered_or_version_closed_or_re_attested",
+        "operator_action": "re_attest_or_provide_evidence",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -690,6 +698,44 @@ def _stuck_acceptance_criterion_attention_item(
         "ref": {
             "kind": "acceptance_criterion",
             "id": criterion.criterion_key,
+            "project_id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "manage",
+        }),
+    }
+
+
+def _attestation_expired_attention_item(
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+    criterion_key: str,
+    criterion_text: str,
+) -> dict[str, Any]:
+    """Attention item for an active criterion whose operator attestation has expired.
+
+    The criterion is stuck in 'partial' coverage with no valid attestation or
+    machine-verified evidence.  The operator must re-attest or provide evidence.
+    """
+    return {
+        "id": f"version:{version.id}:attestation_expired:{criterion_key}",
+        "kind": "acceptance_criterion",
+        "severity": "needs_operator",
+        "reason": "attestation_expired",
+        "label": "Attestation expired",
+        "detail": _compact_text(
+            f"Criterion '{criterion_text}' was operator-attested but the "
+            f"attestation window has expired — re-attest or provide evidence",
+            max_chars=180,
+        ),
+        "criterion_key": criterion_key,
+        "release_version_id": str(version.id),
+        "release_version_number": version.version_number,
+        "ref": {
+            "kind": "acceptance_criterion",
+            "id": criterion_key,
             "project_id": str(project_id),
         },
         "target": _attention_target({
@@ -1963,6 +2009,8 @@ async def build_operator_attention(
     stuck_acceptance_criteria_count = 0
     stuck_acceptance_criteria: list[dict[str, Any]] = []
     coverage_blocked_count = 0
+    attestation_expired_count = 0
+    attestation_expired_items: list[dict[str, Any]] = []
     try:
         open_version = await current_open_version(session, project.id)
         if open_version is not None:
@@ -1980,6 +2028,29 @@ async def build_operator_attention(
                     and reason is None
                 ):
                     coverage_blocked_count += 1
+                # Detect expired attestations: active criteria with 'partial'
+                # coverage whose evidence includes an operator_attestation (the
+                # attestation window lapsed, dropping coverage from 'attested' to
+                # 'partial' — re-attestation or machine evidence is needed).
+                elif (
+                    criterion.get("status") == "active"
+                    and criterion.get("coverage") == "partial"
+                ):
+                    evidence = criterion.get("evidence", [])
+                    has_operator_attestation = any(
+                        e.get("source_kind") == "operator_attestation"
+                        for e in evidence
+                    )
+                    if has_operator_attestation:
+                        attestation_expired_count += 1
+                        attestation_expired_items.append(
+                            _attestation_expired_attention_item(
+                                project.id,
+                                open_version,
+                                criterion["criterion_key"],
+                                criterion.get("text", ""),
+                            )
+                        )
             stuck_by_key = {
                 c["criterion_key"]: c
                 for c in coverage.get("criteria", [])
@@ -2094,6 +2165,8 @@ async def build_operator_attention(
         )
     for item in stuck_acceptance_criteria:
         add_candidate(item)
+    for item in attestation_expired_items:
+        add_candidate(item)
     for alert in alerts:
         add_candidate(_alert_attention_item(alert))
     for task in held_tasks:
@@ -2143,6 +2216,7 @@ async def build_operator_attention(
         + error_alert_count
         + stuck_criteria_count
         + coverage_blocked_count
+        + attestation_expired_count
         + (1 if stale_debt_count > 0 else 0)
     )
     total_watch = (
@@ -2210,6 +2284,7 @@ async def build_operator_attention(
             "churn_retirement_recommended": len(churn_recommended_directions),
             "stuck_criteria": stuck_criteria_count,
             "coverage_blocked": coverage_blocked_count,
+            "attestation_expired": attestation_expired_count,
             "alerts": error_alert_count + warning_alert_count,
             "error_alerts": error_alert_count,
             "warning_alerts": warning_alert_count,
