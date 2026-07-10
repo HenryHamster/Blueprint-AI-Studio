@@ -462,7 +462,12 @@ async def update_design_doc(
                 status_code=400, detail=f"Value too large ({val_size} bytes, max 50KB)"
             )
         doc[key] = payload.value
-        total_size = len(_json.dumps(doc))
+        # Measure only agent-facing keys: reserved keys have their own internal
+        # retention caps and must not consume the agent-write budget.
+        agent_keys_doc = {
+            k: v for k, v in doc.items() if k not in _RESERVED_DESIGN_DOC_KEYS
+        }
+        total_size = len(_json.dumps(agent_keys_doc))
         if total_size > DESIGN_DOC_MAX_BYTES:
             del doc[key]  # rollback
             raise HTTPException(

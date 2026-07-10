@@ -315,8 +315,10 @@ UNPRICED_ALERT_MIN_TASKS = 3
 # Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
 
-# Cap snapshot history length (~1 year of daily snapshots).
-_SNAPSHOT_HISTORY_MAX = 365
+# Cap snapshot history length (2 weeks of daily snapshots).
+# Each snapshot is ~17–21 KB; 14 entries keeps efficiency_baseline bounded at
+# roughly 300 KB while still covering a meaningful trend window.
+_SNAPSHOT_HISTORY_MAX = 14
 
 # Metric-definition version stamp applied to every new snapshot.  Increment
 # this whenever a metric's computation changes in a way that produces a

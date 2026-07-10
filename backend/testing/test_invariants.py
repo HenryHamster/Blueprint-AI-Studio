@@ -2487,7 +2487,9 @@ class TestPreMergeDualHeadGuardCoverage:
         ci_guard_assignments = _guard_assignments(ci_func)
         assert len(ci_guard_assignments) == 1
         ci_guard_stmt, ci_verdict_vars = ci_guard_assignments[0]
-        assert ci_verdict_vars == {"_ok_to_merge", "_hold_reason"}
+        # ci_completion.py stores the raw guard result in _guard_result, then
+        # derives _ok_to_merge via coerce_migration_guard_result(_guard_result).
+        assert ci_verdict_vars == {"_guard_result"}
         ci_fail_closed = next(
             stmt
             for stmt in ast.walk(ci_func)
@@ -2507,7 +2509,7 @@ class TestPreMergeDualHeadGuardCoverage:
         )
         assert not _name_assignments_after(
             ci_func,
-            "_ok_to_merge",
+            "_guard_result",
             getattr(ci_guard_stmt, "lineno", 0),
         )
 
