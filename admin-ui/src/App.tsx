@@ -18,7 +18,7 @@ import { fetchTask } from './api/tasks';
 import { apiFetch, API_BASE_URL } from './api/core';
 import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
 import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
-import { TaskDetailDrawer } from './components/TaskDetailDrawer';
+const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then(m => ({ default: m.TaskDetailDrawer })));
 import { ToastContainer } from './components/Toasts';
 import { AlertsPopover } from './components/AlertsPopover';
 import { FleetDetailDrawer } from './components/FleetDetailDrawer';
@@ -39,8 +39,9 @@ import { ProjectMembers } from './components/ProjectMembers';
 const MessagesPanel = lazy(() => import('./components/MessagesPanel').then(m => ({ default: m.MessagesPanel })));
 const ActivityFeed = lazy(() => import('./components/ActivityFeed'));
 const StrategicContextWorkspace = lazy(() => import('./components/StrategicContextWorkspace').then(m => ({ default: m.StrategicContextWorkspace })));
-import { StrategicContextRail } from './components/StrategicContextRail';
-import { StrategicSessionControl, type StrategicAccountSpendStatus, type StrategicInteractionMode } from './components/StrategicSessionControl';
+const StrategicContextRail = lazy(() => import('./components/StrategicContextRail').then(m => ({ default: m.StrategicContextRail })));
+const StrategicSessionControl = lazy(() => import('./components/StrategicSessionControl').then(m => ({ default: m.StrategicSessionControl })));
+import type { StrategicAccountSpendStatus, StrategicInteractionMode } from './components/StrategicSessionControl';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
 import { KeyboardShortcutsOverlay } from './components/KeyboardShortcutsOverlay';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
@@ -1238,6 +1239,7 @@ export default function App() {
           showTitle={false}
           actions={(
             <>
+              <Suspense fallback={null}>
               <StrategicSessionControl
                 mode={normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode)}
                 saving={savingStrategicWorkbench}
@@ -1270,6 +1272,7 @@ export default function App() {
                 hideDetailsOnMobile
                 className="flex"
               />
+              </Suspense>
               {!chatComposerContextDescriptor && (
                 <button
                   type="button"
@@ -1316,6 +1319,7 @@ export default function App() {
               </Suspense>
             )}
             rail={(
+              <Suspense fallback={null}>
               <StrategicContextRail
                 state={strategicReadModel.data ?? null}
                 loading={strategicReadModel.loading}
@@ -1340,6 +1344,7 @@ export default function App() {
                 savingSessionRefs={savingStrategicWorkbench}
                 onUpdateSessionRefs={updateStrategicSessionRefs}
               />
+              </Suspense>
             )}
             railClassName="bg-workbench-rail"
           />
@@ -1700,6 +1705,7 @@ export default function App() {
 
       {s.logTask && (
         <ErrorBoundary level="panel">
+        <Suspense fallback={<WorkspaceSkeleton />}>
         <TaskDetailDrawer
           task={s.logTask}
           tasks={s.tasks}
@@ -1735,6 +1741,7 @@ export default function App() {
             handleViewTaskById(taskId);
           }}
         />
+        </Suspense>
         </ErrorBoundary>
       )}
 
