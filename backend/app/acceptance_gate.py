@@ -1149,11 +1149,24 @@ async def backfill_acceptance_verdicts(session) -> int:
         )
         .correlate(Task)
     )
+    # Use a portable JSON key-existence check: ``has_key`` (Postgres ``?``)
+    # on Postgres, ``func.json_extract`` on SQLite, so the standalone smoke
+    # gate (which runs against SQLite) does not fail.
+    from app.database import resolve_dialect_name
+    _dialect = resolve_dialect_name(session)
+    if _dialect == "sqlite":
+        from sqlalchemy import func
+        _backfill_checked = func.json_extract(
+            Task.context, "$._backfill_checked_at"
+        ).is_(None)
+    else:
+        _backfill_checked = not_(Task.context.has_key("_backfill_checked_at"))
     result = await session.execute(
         select(Task).where(
             Task.status == TaskStatus.COMPLETED,
             Task.completed_at < FIX_TIMESTAMP,
             not_(_proven_exists),
+            _backfill_checked,
         ).order_by(Task.completed_at.asc()).limit(200)
     )
     tasks = list(result.scalars().all())
@@ -1164,15 +1177,20 @@ async def backfill_acceptance_verdicts(session) -> int:
     session.sync_session.expire_on_commit = False
     try:
         upgraded = 0
+        marked: list[Task] = []
         for task in tasks:
             verdict_data = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
             if not isinstance(verdict_data, dict):
+                marked.append(task)
                 continue
             if verdict_data.get("kind") != "named_test":
+                marked.append(task)
                 continue
             if verdict_data.get("satisfied") is not True:
+                marked.append(task)
                 continue
             if verdict_data.get("proven") is True:
+                marked.append(task)
                 continue
 
             re_eval = evaluate_code_acceptance(task)
@@ -1203,6 +1221,25 @@ async def backfill_acceptance_verdicts(session) -> int:
                         exc_info=True,
                     )
                 upgraded += 1
+            else:
+                # Re-evaluation could not prove — stamp marker so the
+                # LIMIT-200 window advances past this task in future calls.
+                marked.append(task)
+
+        # Stamp backfill-checked marker on every examined task that was NOT
+        # upgraded, so the query window advances past tasks that can never be
+        # proven (wrong verdict kind, not satisfied, or re-evaluation still
+        # returns proven=False). Without this marker, those tasks permanently
+        # occupy the LIMIT-200 window and starve newer but later-ordered tasks
+        # from ever being examined.
+        if marked:
+            now_ts = datetime.now(timezone.utc).isoformat()
+            for task in marked:
+                ctx = dict(task.context or {})
+                ctx["_backfill_checked_at"] = now_ts
+                task.context = ctx
+                session.add(task)
+            await session.commit()
 
         if upgraded:
             logger.info(

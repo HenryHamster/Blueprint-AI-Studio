@@ -2184,3 +2184,145 @@ async def test_backfill_verdicts_no_starvation(db_session):
     # Confirm idempotent: a final pass returns 0
     final = await backfill_acceptance_verdicts(db_session)
     assert final == 0, "No false negatives should remain after full sweep"
+
+
+@pytest.mark.asyncio
+async def test_backfill_verdicts_advances_past_unprovable(db_session):
+    """The backfill query advances past tasks that can never be proven (wrong
+    verdict kind, not satisfied, or re-evaluation still unprovable), instead of
+    getting stuck on them permanently and starving newer tasks behind them.
+
+    Regression test for the starvation bug where the LIMIT-200 window never
+    advanced because non-upgradeable tasks received no marker and blocked all
+    later-ordered tasks from ever being examined.
+    """
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    # Create an open release version so record_task_merge_evidence persists
+    # CriterionEvidence rows for upgraded tasks — this is required by the
+    # NOT EXISTS filter that handles already-proven rows.
+    version = ReleaseVersion(project_id=project.id)
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-backfill-advance-test",
+        text="Backfill advance test criterion",
+    )
+    db_session.add(criterion)
+    await db_session.flush()
+    criterion_key = criterion.criterion_key
+
+    OLD_TS = datetime(2026, 7, 9, 7, 0, 0, tzinfo=timezone.utc)  # Pre-fix
+    NEW_TS = datetime(2026, 7, 9, 9, 0, 0, tzinfo=timezone.utc)  # Also pre-fix, newer
+
+    def _make_candidate(
+        *,
+        verdict_kind: str = "named_test",
+        satisfied: bool = True,
+        proven: bool = False,
+        completed_at: datetime = OLD_TS,
+        test_path: str | None = None,
+        changed_files: list[str] | None = None,
+    ) -> Task:
+        task = _make_code_task(
+            acceptance_evidence=(
+                {"kind": "named_test", "test_path": test_path or "backend/testing/test_invariants.py"}
+                if verdict_kind == "named_test"
+                else {"kind": "observable_behavior"}
+            ),
+            changed_files=changed_files or [
+                "backend/app/acceptance_gate.py",
+                "backend/testing/test_invariants.py",
+            ],
+        )
+        task.project_id = project.id
+        task.completed_at = completed_at
+        task.criterion_ids = [criterion_key]
+        ctx = dict(task.context or {})
+        ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+            "satisfied": satisfied,
+            "proven": proven,
+            "kind": verdict_kind,
+            "reason": "simulated for advance test",
+        }
+        task.context = ctx
+        return task
+
+    # ── Old non-upgradeable tasks (occupy the front of the LIMIT window) ──
+    # We create >= 200 tasks that the backfill examines and marks but can
+    # never upgrade. These fill the entire LIMIT-200 window on every call,
+    # so WITHOUT the _backfill_checked_at marker the window never advances
+    # past them and the upgradeable tasks behind them are starved.
+    # Three categories are cycled:
+    #   - Wrong verdict kind (not named_test)
+    #   - Not satisfied
+    #   - Re-evaluation still unprovable
+    BLOCKER_COUNT = 215  # > LIMIT-200 to saturate the window
+    for i in range(BLOCKER_COUNT):
+        category = i % 3
+        if category == 0:
+            # Wrong verdict kind — skipped at the kind guard
+            task = _make_candidate(verdict_kind="observable_behavior")
+        elif category == 1:
+            # Not satisfied — skipped at the satisfied guard
+            task = _make_candidate(satisfied=False)
+        else:
+            # Re-evaluation still unprovable — test_path not in changed_files
+            task = _make_candidate(
+                test_path="backend/testing/test_reaper.py",
+                changed_files=["backend/app/reaper.py"],
+            )
+        db_session.add(task)
+    await db_session.flush()
+
+    # ── Newer upgradeable tasks behind the stuck ones ─────────────────────
+    # These are only reachable across successive backfill calls if the
+    # _backfill_checked_at marker excludes the blocker tasks from the query.
+    FALSE_NEGATIVE = 205
+    for _ in range(FALSE_NEGATIVE):
+        task = _make_candidate(
+            completed_at=NEW_TS,
+            test_path="backend/testing/test_invariants.py",
+            changed_files=[
+                "backend/app/acceptance_gate.py",
+                "backend/testing/test_invariants.py",
+            ],
+        )
+        db_session.add(task)
+    await db_session.flush()
+
+    # ── Run backfill repeatedly until exhausted ──────────────────────────
+    # The loop does NOT break on upgraded==0 because the first 1-2 calls
+    # may return 0 upgrades while filling the LIMIT-200 window with blocker
+    # tasks that the marker stamps. Only when all blockers are marked (and
+    # thus excluded via _backfill_checked) does the query advance to the
+    # upgradeable false-negative tasks.
+    # Without the marker fix, the window stays stuck on the 215 blockers
+    # permanently and total_upgraded stays 0 → assertion catches it.
+    total_upgraded = 0
+    for iteration in range(6):
+        upgraded = await backfill_acceptance_verdicts(db_session)
+        total_upgraded += upgraded
+
+    # All 205 false negatives must be upgraded. WITHOUT the marker fix the
+    # window stays stuck on the 215 blocker tasks (all in the LIMIT-200 query
+    # result on every call since none get marked) and the upgradeable tasks
+    # are never reached.
+    assert total_upgraded == FALSE_NEGATIVE, (
+        f"Expected {FALSE_NEGATIVE} upgrades (all false-negative tasks), "
+        f"got {total_upgraded} — the backfill window is stuck on "
+        f"non-upgradeable tasks"
+    )
+
+    # Confirm idempotent: a final pass returns 0
+    final = await backfill_acceptance_verdicts(db_session)
+    assert final == 0, "No false negatives should remain after full sweep"
