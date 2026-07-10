@@ -187,6 +187,8 @@ class HeartbeatRequest(BaseModel):
     last_successful_job_at: str | None = None
     consecutive_job_failures: int | None = None
     disk_free_bytes: int | None = None
+    cpu_load_avg: float | None = None
+    memory_free_bytes: int | None = None
     gpu_utilization_pct: int | None = None
 
 
@@ -539,6 +541,10 @@ async def heartbeat(
         runner.consecutive_job_failures = max(0, int(payload.consecutive_job_failures))
     if payload.disk_free_bytes is not None:
         caps["disk_free_bytes"] = max(0, int(payload.disk_free_bytes))
+    if payload.cpu_load_avg is not None:
+        caps["cpu_load_avg"] = max(0.0, float(payload.cpu_load_avg))
+    if payload.memory_free_bytes is not None:
+        caps["memory_free_bytes"] = max(0, int(payload.memory_free_bytes))
     if payload.gpu_utilization_pct is not None:
         caps["gpu_utilization_pct"] = max(0, min(100, int(payload.gpu_utilization_pct)))
     if payload.hostname:

@@ -16,8 +16,10 @@ callers keep working without change.
 Re-exported symbols:
   _RUNNER_LIVENESS_SECONDS, _RUNNER_DEGRADED_FAILURE_THRESHOLD,
   _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT,
+  _RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT,
   _sweep_runner_deactivated_escalations,
-  _check_low_disk_runners, _check_fleet_no_healthy_runner,
+  _check_low_disk_runners, _check_low_memory_runners,
+  _check_fleet_no_healthy_runner,
   _check_degraded_runners, _check_idle_gpu_runners
 """
 
@@ -47,6 +49,10 @@ _RUNNER_DEGRADED_FAILURE_THRESHOLD = 3
 # Default free-disk floor (bytes) below which a live runner is considered low-disk.
 # 1 GB — configurable at runtime via ``runner_low_disk_threshold_bytes``.
 _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT = 1_073_741_824  # 1 GiB
+
+# Default free-memory floor (bytes) below which a live runner is considered low-
+# memory.  512 MB — configurable at runtime via ``runner_low_memory_threshold_bytes``.
+_RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT = 536_870_912  # 512 MiB
 
 
 async def _sweep_runner_deactivated_escalations(session: AsyncSession) -> None:
@@ -359,6 +365,107 @@ async def _check_idle_gpu_runners(session: AsyncSession) -> None:
                 )
 
 
+async def _check_low_memory_runners(session: AsyncSession) -> None:
+    """Detect live runners whose free memory has fallen below the floor and alert/resolve.
+
+    Queries active runners with a recent heartbeat; for those reporting
+    ``memory_free_bytes`` below the configurable threshold, calls
+    :func:`~app.alert_dispatch._maybe_create_runner_low_memory_alert` to raise (or
+    dedup) a WARNING alert. Resolves alerts for runners whose memory has recovered.
+
+    Called from :func:`_check_degraded_runners` so it shares the same 300s cadence
+    as the other health sweeps.
+    """
+    from app.alert_dispatch import (
+        _RUNNER_LOW_MEMORY_EVENT_TYPE,
+        _maybe_create_runner_low_memory_alert,
+        _resolve_runner_low_memory_alert,
+    )
+    from app.models import Alert
+
+    threshold = int(
+        _runtime_config.get(
+            "runner_low_memory_threshold_bytes", _RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT
+        )
+    )
+
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    active_rows = (
+        await session.execute(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.hostname,
+                LocalRunner.capabilities,
+            ).where(
+                LocalRunner.status == "active",
+                LocalRunner.last_seen_at.is_not(None),
+                LocalRunner.last_seen_at >= cutoff,
+            )
+        )
+    ).all()
+
+    low_memory_runner_ids: set[uuid.UUID] = set()
+    for runner_id, project_id, hostname, capabilities in active_rows:
+        mem_free = (capabilities or {}).get("memory_free_bytes")
+        if mem_free is None:
+            continue
+        if int(mem_free) < threshold:
+            low_memory_runner_ids.add(runner_id)
+            try:
+                await _maybe_create_runner_low_memory_alert(
+                    session,
+                    project_id=project_id,
+                    runner_id=runner_id,
+                    hostname=hostname,
+                    memory_free_bytes=int(mem_free),
+                    threshold_bytes=threshold,
+                )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] Failed to create low-memory alert for runner %s", runner_id
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RUNNERS] rollback after low-memory alert create failed for %s",
+                        runner_id,
+                    )
+
+    # Resolve alerts for runners whose memory has recovered (or that stopped reporting).
+    open_low_memory = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _RUNNER_LOW_MEMORY_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+    for project_id_row, dedupe_key in open_low_memory:
+        if not dedupe_key:
+            continue
+        try:
+            runner_id = uuid.UUID(dedupe_key.split(":", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if runner_id in low_memory_runner_ids:
+            continue
+        try:
+            await _resolve_runner_low_memory_alert(session, project_id_row, runner_id)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve low-memory alert for runner %s", runner_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after low-memory alert resolve failed for %s",
+                    runner_id,
+                )
+
+
 async def _check_fleet_no_healthy_runner(
     session: AsyncSession,
     degraded_runner_ids: set[uuid.UUID],
@@ -582,3 +689,9 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
         await _check_idle_gpu_runners(session)
     except Exception:
         logger.exception("[RUNNERS] Failed to sweep idle-GPU runner alerts")
+
+    # 7. Proactive low-memory alert: runners reporting free memory below the floor.
+    try:
+        await _check_low_memory_runners(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep low-memory runner alerts")

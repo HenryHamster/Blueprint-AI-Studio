@@ -1049,8 +1049,12 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     session.add(parent)
     await session.commit()
 
-    for child in children:
-        await session.refresh(child)
+    # Batch-reload all children at once (N+1 guard: commit above expired
+    # the session; one batch SELECT replaces N individual session.refresh calls).
+    if children:
+        await session.execute(
+            select(Task).where(Task.id.in_([c.id for c in children]))
+        )
     await broadcast_to_project(
         str(parent.project_id),
         "task_updated",

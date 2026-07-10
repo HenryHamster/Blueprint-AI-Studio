@@ -5545,8 +5545,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         session, task, stage="child-task spawn"
     ):
         return
-    for ct in child_tasks:
-        await session.refresh(ct)
+    # Batch-reload all child tasks (N+1 guard: commit above expired the
+    # session; one batch SELECT + identity-map lookups replaces N individual
+    # session.refresh calls). Build a fresh map so the downstream code that
+    # accesses attributes on child_tasks entries gets non-expired instances.
+    if child_tasks:
+        _ct_ids = [ct.id for ct in child_tasks]
+        _ct_result = await session.execute(
+            select(Task).where(Task.id.in_(_ct_ids))
+        )
+        _ct_fresh = {str(t.id): t for t in _ct_result.scalars().all()}
+        for _i, _ct in enumerate(child_tasks):
+            _fresh = _ct_fresh.get(str(_ct.id))
+            if _fresh is not None:
+                child_tasks[_i] = _fresh
 
     # Resolve explicit depends_on_indices to actual UUIDs (agent-specified inter-finding deps only)
     finding_to_child = {fi: ci for ci, fi in enumerate(finding_indices)}

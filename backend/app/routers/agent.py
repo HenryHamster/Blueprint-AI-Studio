@@ -5224,14 +5224,21 @@ async def spawn_subtask(
     await session.commit()
 
     # Log history for each new task
+    # Batch-reload all new tasks (N+1 guard: commit expired the session;
+    # one batch SELECT + identity-map lookups replaces N individual
+    # session.refresh calls).
+    if new_tasks:
+        await session.execute(
+            select(Task).where(Task.id.in_([t.id for t in new_tasks]))
+        )
     for task in new_tasks:
-        await session.refresh(task)
+        fresh_task = await session.get(Task, task.id)
         history = TaskHistory(
-            task_id=task.id,
+            task_id=fresh_task.id if fresh_task else task.id,
             action="SPAWNED",
             details={
                 "spawned_by": f"AGENT_{parent_task.id}",
-                "requires_approval": task.requires_approval,
+                "requires_approval": fresh_task.requires_approval if fresh_task else task.requires_approval,
                 "context": req.context,
             },
         )

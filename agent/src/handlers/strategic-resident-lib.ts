@@ -110,6 +110,13 @@ export interface ResidentConfig {
   /** Max ops to batch in one autonomous turn — surfaced in the self-prompt as a hint.
    *  Default: 3. */
   maxOpsPerTurn: number;
+  /** Explicit compaction threshold in input tokens. When set (>0) this overrides the
+   *  model-derived threshold. When zero compaction is disabled. When absent (undefined)
+   *  the threshold is derived from the model's context-window limit. */
+  compactionThresholdTokens?: number;
+  /** Minimum wall-clock cooldown between compactions (ms). Prevents double-compacting
+   *  when consecutive turns both land above the threshold. Default: 5 min. */
+  compactionCooldownMs: number;
 }
 
 function num(v: unknown, fallback: number): number {
@@ -244,6 +251,12 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
   const autonomousEnabled =
     payload.strategic_session_autonomous === false ? false : mode !== 'monitor';
   const idleTickMs = Math.max(1000, Math.round(idleTickSec * 1000));
+  // Compaction threshold: explicit payload override (0 = disabled), else derived
+  // from the model's context-window limit below.
+  const compactionThresholdTokens = payload.strategic_session_compaction_threshold_tokens !== undefined
+    ? num(payload.strategic_session_compaction_threshold_tokens, 0)
+    : undefined;
+  const compactionCooldownSec = num(payload.strategic_session_compaction_cooldown_seconds, 300);
   return {
     idleTickMs,
     // Poll operator messages faster than the heartbeat tick so a turn starts
@@ -256,7 +269,127 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     minTickMs: Math.max(idleTickMs, Math.round(minTickSec * 1000)),
     autonomousTurnTimeoutMs: Math.max(15_000, Math.round(autonomousTurnTimeoutSec * 1000)),
     maxOpsPerTurn,
+    compactionThresholdTokens,
+    compactionCooldownMs: Math.max(60_000, Math.round(compactionCooldownSec * 1000)),
   };
+}
+
+// ── Compaction: context-window pressure detection ─────────────────────────
+
+/** Per-model context-window limits (tokens). The resident session tracks
+ *  cumulative input tokens and triggers compaction at 80% of the model's
+ *  limit, restarting the Claude subprocess with a condensed checkpoint.
+ *  Model IDs are matched by substring (case-insensitive) so short aliases
+ *  like "sonnet" match "claude-sonnet-5-20251001". */
+const MODEL_CONTEXT_LIMITS: ReadonlyArray<{ pattern: string; limit: number }> = [
+  // Claude Opus family: 200K context window
+  { pattern: 'opus', limit: 200_000 },
+  // Claude Sonnet family: 200K context window
+  { pattern: 'sonnet', limit: 200_000 },
+  // Claude Haiku family: 128K (older), 200K (haiku-4-5+)
+  { pattern: 'haiku-4-5', limit: 200_000 },
+  { pattern: 'haiku', limit: 128_000 },
+  // Claude Fable family: 200K
+  { pattern: 'fable', limit: 200_000 },
+];
+
+/** Default context-window limit when the model is unrecognized (tokens). */
+export const DEFAULT_CONTEXT_LIMIT = 200_000;
+
+/** Fraction of the context-window limit at which compaction triggers. */
+export const COMPACTION_THRESHOLD_RATIO = 0.80;
+
+/**
+ * Resolve the context-window limit for a model id string. Matches by
+ * case-insensitive substring against the known patterns; falls back to
+ * {@link DEFAULT_CONTEXT_LIMIT} when no pattern matches.
+ */
+export function modelContextLimit(model?: string): number {
+  if (!model) return DEFAULT_CONTEXT_LIMIT;
+  const lower = model.toLowerCase();
+  for (const entry of MODEL_CONTEXT_LIMITS) {
+    if (lower.includes(entry.pattern)) return entry.limit;
+  }
+  return DEFAULT_CONTEXT_LIMIT;
+}
+
+/**
+ * Compute the compaction threshold for a model + explicit override.
+ * When `explicitThreshold` is a positive number, it is used directly.
+ * When it is zero, compaction is disabled (returns Infinity). When undefined,
+ * the threshold is derived as {@link COMPACTION_THRESHOLD_RATIO} of the
+ * model's context-window limit.
+ */
+export function compactionThreshold(
+  model?: string,
+  explicitThreshold?: number,
+): number {
+  if (explicitThreshold !== undefined) {
+    return explicitThreshold > 0 ? explicitThreshold : Number.POSITIVE_INFINITY;
+  }
+  return Math.floor(modelContextLimit(model) * COMPACTION_THRESHOLD_RATIO);
+}
+
+export interface CompactionCheckpointContext {
+  /** Condensed role identity section (from the original bootstrap). */
+  roleIdentity: string;
+  /** Current exam ledger serialized as JSON. */
+  examLedgerJson: string;
+  /** Human-readable summary of recent operator interactions and key decisions. */
+  recentInteractions: string;
+  /** Current autonomous state snapshot (agenda, focus rotation, open leads). */
+  autonomousState: string;
+}
+
+/**
+ * Build the compaction checkpoint prompt — a condensed context package
+ * delivered to a FRESH subprocess so the session continues coherently
+ * after a context-window compaction restart.
+ *
+ * This is NOT the full bootstrap prompt. It preserves high-signal content:
+ * (i) resident role identity and tool descriptions, (ii) the current exam
+ * ledger state, (iii) a brief summary of recent operator interactions and
+ * key decisions made, (iv) the current autonomous state.
+ *
+ * Pure and unit-testable — no imports from index.js.
+ */
+export function buildCompactionCheckpoint(ctx: CompactionCheckpointContext): string {
+  const sections: string[] = [];
+
+  // (i) Condensed role identity — the session is resuming, not starting fresh.
+  sections.push(`# Session checkpoint — compaction restart
+
+The resident session's Claude subprocess was restarted because the context
+window approached its limit. This is a CHECKPOINT restore, not a fresh start.
+Your previous session was compacted; you retain your role, tools, and all
+durable state. Continue operating exactly where you left off.
+
+${ctx.roleIdentity}`);
+
+  // (ii) Exam ledger state.
+  if (ctx.examLedgerJson.trim()) {
+    sections.push(`## Examination ledger (carried forward)
+\`\`\`json
+${ctx.examLedgerJson.trim()}
+\`\`\``);
+  }
+
+  // (iii) Recent operator interactions and decisions.
+  if (ctx.recentInteractions.trim()) {
+    sections.push(`## Recent context (carried forward)
+${ctx.recentInteractions.trim()}`);
+  }
+
+  // (iv) Autonomous state.
+  if (ctx.autonomousState.trim()) {
+    sections.push(`## Current state
+${ctx.autonomousState.trim()}`);
+  }
+
+  sections.push(`Resume from this checkpoint. Your next turn will arrive as a
+normal operator or autonomous prompt — this checkpoint is informational only.`);
+
+  return sections.join('\n\n');
 }
 
 /**
@@ -452,6 +585,7 @@ export interface BootstrapContext {
   sessionId: string;
   fetchGuidanceText?: string;
   priorSessionContextText?: string;
+
 }
 
 /**

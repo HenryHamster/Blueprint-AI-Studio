@@ -357,6 +357,7 @@ async def _seed_routing_verdict_from_snapshot():
                 .all()
             )
             for project in project_rows:
+
                 if not project or not project.design_doc:
                     continue
                 container = project.design_doc.get(DESIGN_DOC_KEY)

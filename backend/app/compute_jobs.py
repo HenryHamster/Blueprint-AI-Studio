@@ -303,7 +303,7 @@ async def create_compute_job(
         # GPU job: route to local GPU when present, fall back to cloud.
         normalized_backend = (
             LOCAL_GPU_BACKEND_NAME
-            if detect_local_gpu() is not None
+            if (await asyncio.to_thread(detect_local_gpu)) is not None
             else GCP_BACKEND_NAME
         )
     else:

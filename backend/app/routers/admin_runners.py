@@ -59,6 +59,8 @@ _FAILURE_STREAK_DEGRADED_THRESHOLD = 3
 _SUCCESS_STALE_SECONDS = 1800  # 30 min
 # Advisory low-disk flag (does not by itself degrade a runner).
 _LOW_DISK_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+# Advisory low-memory flag (does not by itself degrade a runner).
+_LOW_MEMORY_FREE_BYTES = 512 * 1024 * 1024  # 512 MiB
 _STRATEGIC_LOCAL_TASK_TYPES = sorted(STRATEGIC_TASK_TYPES)
 _KNOWN_TASK_TYPES = {task_type.value for task_type in TaskType}
 
@@ -169,6 +171,22 @@ def _runner_int_telemetry(
     return None
 
 
+def _runner_float_telemetry(
+    capabilities: Dict[str, Any] | None, key: str
+) -> float | None:
+    """Read a non-negative float telemetry value stashed on capabilities.
+
+    Used for the display-only trust telemetry (``cpu_load_avg``) the runner
+    reports on each heartbeat. Tolerant of absent/None/malformed values.
+    """
+    raw = (capabilities or {}).get(key)
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw) if float(raw) >= 0.0 else None
+    return None
+
+
 def _runner_max_concurrent(capabilities: Dict[str, Any] | None) -> int | None:
     raw = (capabilities or {}).get("max_concurrent")
     if isinstance(raw, bool):
@@ -249,6 +267,14 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         runner.capabilities, "gpu_utilization_pct"
     )
     disk_low = disk_free_bytes is not None and disk_free_bytes < _LOW_DISK_FREE_BYTES
+    memory_free_bytes = _runner_int_telemetry(
+        runner.capabilities, "memory_free_bytes"
+    )
+    memory_low = (
+        memory_free_bytes is not None
+        and memory_free_bytes < _LOW_MEMORY_FREE_BYTES
+    )
+    cpu_load_avg = _runner_float_telemetry(runner.capabilities, "cpu_load_avg")
 
     # device_status is the operator-facing tone. "degraded" is distinct from
     # "connected": the runner is live (recent heartbeat) but its jobs are failing,
@@ -291,6 +317,9 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "consecutive_job_failures": consecutive_job_failures,
         "disk_free_bytes": disk_free_bytes,
         "disk_low": disk_low,
+        "memory_free_bytes": memory_free_bytes,
+        "memory_low": memory_low,
+        "cpu_load_avg": cpu_load_avg,
         "gpu_utilization_pct": gpu_utilization_pct,
         "failure_streak_threshold": _FAILURE_STREAK_DEGRADED_THRESHOLD,
     }
@@ -569,6 +598,7 @@ async def fleet_runners_health_summary(
         "stale": 0,
         "offline": 0,
         "low_disk": 0,
+        "low_memory": 0,
     }
     per_project_entries: List[Dict[str, Any]] = []
 
@@ -581,6 +611,7 @@ async def fleet_runners_health_summary(
             "stale": 0,
             "offline": 0,
             "low_disk": 0,
+            "low_memory": 0,
             "runners": [],
         }
         for runner in project_runners:
@@ -598,8 +629,10 @@ async def fleet_runners_health_summary(
                 entry["offline"] += 1
             if view["health"].get("disk_low"):
                 entry["low_disk"] += 1
+            if view["health"].get("memory_low"):
+                entry["low_memory"] += 1
 
-        for key in ("total", "connected", "degraded", "stale", "offline", "low_disk"):
+        for key in ("total", "connected", "degraded", "stale", "offline", "low_disk", "low_memory"):
             fleet[key] += entry[key]
 
         per_project_entries.append(entry)

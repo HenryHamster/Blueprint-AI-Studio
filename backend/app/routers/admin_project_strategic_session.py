@@ -1471,7 +1471,6 @@ async def get_project_strategic_state(
         "strategic_memory_notes": project.strategic_memory_notes or [],
     }
 
-
 @router.get("/projects/{project_id}/strategic-session")
 @limiter.limit("30/minute")
 async def get_project_strategic_session(

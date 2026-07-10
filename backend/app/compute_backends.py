@@ -822,7 +822,7 @@ class LocalGPUComputeBackend:
 
     async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
         result = await self._delegate.launch(spec)
-        gpu_info = detect_local_gpu()
+        gpu_info = await asyncio.to_thread(detect_local_gpu)
         if gpu_info is not None:
             result.metadata["local_gpu"] = gpu_info
         return result

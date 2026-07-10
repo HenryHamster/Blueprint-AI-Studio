@@ -541,6 +541,24 @@ async def _download_candidate_repo_archive(
     return response.content
 
 
+def _extract_snapshot_repo_root(
+    tmp_dir: str, archive_bytes: bytes
+) -> str:
+    """Extract a candidate repo archive and return the repo root path (blocking I/O)."""
+    with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as tar:
+        _safe_tar_extractall(tar, tmp_dir)
+    extracted_roots = [
+        os.path.join(tmp_dir, name)
+        for name in os.listdir(tmp_dir)
+        if os.path.isdir(os.path.join(tmp_dir, name))
+    ]
+    if not extracted_roots:
+        raise _MigrationApplyError(
+            "candidate code snapshot unpacked to no repo root"
+        )
+    return extracted_roots[0]
+
+
 async def _build_candidate_required_metadata_from_snapshot(
     gh_token: str,
     owner: str,
@@ -563,25 +581,9 @@ async def _build_candidate_required_metadata_from_snapshot(
         )
 
     with tempfile.TemporaryDirectory() as tmp:
-        try:
-            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
-                _safe_tar_extractall(tar, tmp)
-        except Exception as exc:
-            raise _MigrationApplyError(
-                f"could not unpack the candidate code snapshot at "
-                f"{candidate_ref!r}: {type(exc).__name__}: {exc}"
-            ) from exc
-
-        extracted_roots = [
-            os.path.join(tmp, name)
-            for name in os.listdir(tmp)
-            if os.path.isdir(os.path.join(tmp, name))
-        ]
-        if not extracted_roots:
-            raise _MigrationApplyError(
-                f"candidate code snapshot at {candidate_ref!r} unpacked to no repo root"
-            )
-        repo_root = extracted_roots[0]
+        repo_root = await asyncio.to_thread(
+            _extract_snapshot_repo_root, tmp, archive
+        )
 
         env = os.environ.copy()
         env["CANDIDATE_REPO_ROOT"] = repo_root

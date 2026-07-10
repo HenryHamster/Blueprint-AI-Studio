@@ -361,6 +361,8 @@ def resident_session_snapshot(vision: dict[str, Any] | None) -> dict[str, Any] |
         "ended_at": blob.get("ended_at"),
         "last_progress_at": blob.get("last_progress_at"),
         "last_operator_interaction_at": blob.get("last_operator_interaction_at"),
+        "compaction_count": blob.get("compaction_count"),
+        "last_compaction_at": blob.get("last_compaction_at"),
     }
 
 
@@ -1958,6 +1960,8 @@ async def renew_resident_session_lease(
     message_cursor: str | None = None,
     handled_message_ids: list[str] | None = None,
     turn_latency_summary: dict | None = None,
+    compaction_count: int | None = None,
+    last_compaction_at: str | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
@@ -2229,6 +2233,12 @@ async def renew_resident_session_lease(
         # observability. Bounded to a simple dict; ignored when absent/None.
         if isinstance(turn_latency_summary, dict):
             updated["_turn_latency_summary"] = turn_latency_summary
+        # Persist compaction metadata reported by the agent. These are
+        # opaque agent-reported values — the backend never derives them.
+        if isinstance(compaction_count, int) and compaction_count > 0:
+            updated["compaction_count"] = compaction_count
+        if isinstance(last_compaction_at, str) and last_compaction_at:
+            updated["last_compaction_at"] = last_compaction_at
         vision[RESIDENT_SESSION_KEY] = updated
 
     await with_vision_locked(session, project.id, _renew, skip_locked=False)
@@ -2392,6 +2402,8 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     message_cursor: str | None = None
     handled_message_ids: list[str] | None = None
     turn_latency_summary: dict | None = None
+    compaction_count: int | None = None
+    last_compaction_at: str | None = None
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -2423,4 +2435,6 @@ async def resident_session_heartbeat(
         message_cursor=payload.message_cursor,
         handled_message_ids=payload.handled_message_ids,
         turn_latency_summary=payload.turn_latency_summary,
+        compaction_count=payload.compaction_count,
+        last_compaction_at=payload.last_compaction_at,
     )

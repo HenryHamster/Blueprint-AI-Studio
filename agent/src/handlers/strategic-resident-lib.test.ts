@@ -14,7 +14,10 @@ import {
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
   MAX_IMAGE_BASE64_LENGTH, MAX_IMAGES_PER_TURN,
+  modelContextLimit, compactionThreshold, buildCompactionCheckpoint,
+  DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
   type ExamSurface, type ExamRecord, type ContentBlock,
+  type CompactionCheckpointContext,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -28,6 +31,8 @@ describe('residentConfig', () => {
     expect(c.minTickMs).toBe(600_000);
     expect(c.autonomousTurnTimeoutMs).toBe(300_000);
     expect(c.maxOpsPerTurn).toBe(3);
+    expect(c.compactionThresholdTokens).toBeUndefined(); // model-derived by default
+    expect(c.compactionCooldownMs).toBe(300_000); // 5 min default
   });
 
   it('reads the payload knobs (seconds → ms)', () => {
@@ -1229,5 +1234,147 @@ describe('refreshSurfaceCatalog', () => {
     const catalog = [makeDir('d-1')];
     const result = refreshSurfaceCatalog(catalog, ['d-1', 'd-2'], {});
     expect(result.map(s => s.key)).toEqual(['direction:d-1', 'direction:d-2']);
+  });
+});
+
+// ── Compaction helpers ─────────────────────────────────────────────────────
+
+describe('modelContextLimit', () => {
+  it('returns 200K for opus models', () => {
+    expect(modelContextLimit('claude-opus-4-8')).toBe(200_000);
+    expect(modelContextLimit('claude-opus-4-7')).toBe(200_000);
+    expect(modelContextLimit('claude-opus-4')).toBe(200_000);
+  });
+
+  it('returns 200K for sonnet models', () => {
+    expect(modelContextLimit('claude-sonnet-5')).toBe(200_000);
+    expect(modelContextLimit('claude-sonnet-4-5')).toBe(200_000);
+    expect(modelContextLimit('sonnet')).toBe(200_000);
+  });
+
+  it('returns 128K for older haiku models', () => {
+    expect(modelContextLimit('claude-haiku-3-5')).toBe(128_000);
+    expect(modelContextLimit('haiku')).toBe(128_000);
+  });
+
+  it('returns 200K for haiku-4-5', () => {
+    expect(modelContextLimit('claude-haiku-4-5')).toBe(200_000);
+    expect(modelContextLimit('haiku-4-5')).toBe(200_000);
+  });
+
+  it('returns 200K for fable models', () => {
+    expect(modelContextLimit('claude-fable-5')).toBe(200_000);
+    expect(modelContextLimit('fable')).toBe(200_000);
+  });
+
+  it('returns DEFAULT_CONTEXT_LIMIT for unrecognized models', () => {
+    expect(modelContextLimit('unknown-model')).toBe(DEFAULT_CONTEXT_LIMIT);
+    expect(modelContextLimit('')).toBe(DEFAULT_CONTEXT_LIMIT);
+    expect(modelContextLimit()).toBe(DEFAULT_CONTEXT_LIMIT);
+  });
+
+  it('matches case-insensitively', () => {
+    expect(modelContextLimit('CLAUDE-OPUS-4-8')).toBe(200_000);
+    expect(modelContextLimit('Claude-Sonnet-5')).toBe(200_000);
+  });
+});
+
+describe('compactionThreshold', () => {
+  it('returns 80% of model limit by default', () => {
+    // 80% of 200K = 160K
+    expect(compactionThreshold('claude-opus-4-8')).toBe(160_000);
+    // 80% of 128K = 102400
+    expect(compactionThreshold('claude-haiku-3-5')).toBe(Math.floor(128_000 * COMPACTION_THRESHOLD_RATIO));
+  });
+
+  it('uses explicit override when provided', () => {
+    expect(compactionThreshold('claude-opus-4-8', 50_000)).toBe(50_000);
+  });
+
+  it('returns Infinity when explicit threshold is 0 (disabled)', () => {
+    expect(compactionThreshold('claude-opus-4-8', 0)).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it('falls back to DEFAULT_CONTEXT_LIMIT for unknown models', () => {
+    expect(compactionThreshold('unknown')).toBe(Math.floor(DEFAULT_CONTEXT_LIMIT * COMPACTION_THRESHOLD_RATIO));
+  });
+});
+
+describe('buildCompactionCheckpoint', () => {
+  const fullCtx: CompactionCheckpointContext = {
+    roleIdentity: 'You are the resident strategist for TestProject.',
+    examLedgerJson: JSON.stringify({ records: [{ surfaceKey: 'direction:d-1', atTick: 5, at: '2026-01-01T00:00:00Z', verdict: 'found', note: 'needs follow-up' }], tick: 5, corrective: false }),
+    recentInteractions: 'Recent: examined direction:d-1 — found actionable lead.',
+    autonomousState: 'Examination tick: 5\nFocus rotation: direction:d-1, qualification',
+  };
+
+  it('includes all sections in the checkpoint', () => {
+    const result = buildCompactionCheckpoint(fullCtx);
+    expect(result).toContain('Session checkpoint');
+    expect(result).toContain('compaction restart');
+    expect(result).toContain('You are the resident strategist for TestProject');
+    expect(result).toContain('Examination ledger (carried forward)');
+    expect(result).toContain('direction:d-1');
+    expect(result).toContain('Recent context (carried forward)');
+    expect(result).toContain('examined direction:d-1');
+    expect(result).toContain('Current state');
+    expect(result).toContain('Examination tick: 5');
+  });
+
+  it('omits sections with empty content', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'role only',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    });
+    expect(result).toContain('role only');
+    expect(result).not.toContain('Examination ledger');
+    expect(result).not.toContain('Recent context');
+    expect(result).not.toContain('Current state');
+  });
+
+  it('produces a non-empty string for minimal context', () => {
+    const result = buildCompactionCheckpoint({
+      roleIdentity: 'minimal role',
+      examLedgerJson: '',
+      recentInteractions: '',
+      autonomousState: '',
+    });
+    expect(result.length).toBeGreaterThan(0);
+    expect(result).toContain('minimal role');
+    expect(result).toContain('Session checkpoint');
+  });
+
+  it('includes a resume instruction at the end', () => {
+    const result = buildCompactionCheckpoint(fullCtx);
+    expect(result).toContain('Resume from this checkpoint');
+  });
+});
+
+describe('residentConfig compaction knobs', () => {
+  it('reads explicit compaction threshold from payload', () => {
+    const c = residentConfig({ strategic_session_compaction_threshold_tokens: 50_000 });
+    expect(c.compactionThresholdTokens).toBe(50_000);
+  });
+
+  it('treats zero explicit threshold as disabled (0)', () => {
+    const c = residentConfig({ strategic_session_compaction_threshold_tokens: 0 });
+    expect(c.compactionThresholdTokens).toBe(0);
+  });
+
+  it('leaves threshold undefined when payload omits it', () => {
+    const c = residentConfig({});
+    expect(c.compactionThresholdTokens).toBeUndefined();
+  });
+
+  it('reads compaction cooldown from payload', () => {
+    const c = residentConfig({ strategic_session_compaction_cooldown_seconds: 120 });
+    expect(c.compactionCooldownMs).toBe(120_000);
+  });
+
+  it('clamps compaction cooldown to minimum 60s', () => {
+    const c = residentConfig({ strategic_session_compaction_cooldown_seconds: 10 });
+    expect(c.compactionCooldownMs).toBe(60_000);
   });
 });

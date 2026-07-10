@@ -1601,3 +1601,174 @@ async def test_idle_gpu_runner_check_integration(db_session, mocker):
     await _check_degraded_runners(db_session)
     await db_session.refresh(alerts[0])
     assert alerts[0].dismissed_at is not None, "idle-GPU alert must auto-resolve on recovery"
+
+
+# ── Low-memory runner alert ────────────────────────────────────────────────────
+
+from app.alert_dispatch import (  # noqa: E402
+    _RUNNER_LOW_MEMORY_EVENT_TYPE,
+    _maybe_create_runner_low_memory_alert,
+    _resolve_runner_low_memory_alert,
+)
+
+
+async def _low_memory_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _RUNNER_LOW_MEMORY_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_runner_low_memory_alert_creates_and_broadcasts(db_session, mocker):
+    """A runner below the memory floor raises one WARNING alert and broadcasts it."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    threshold = 1_073_741_824  # 1 GiB
+    mem_free = 100_000_000     # ~95 MB — below threshold
+
+    created = await _maybe_create_runner_low_memory_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="runner-mem-01",
+        memory_free_bytes=mem_free,
+        threshold_bytes=threshold,
+    )
+
+    assert created is True
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "low memory" in alert.title.lower()
+    assert "95" in alert.message  # ~95 MB free
+    assert "1024" in alert.message  # 1.0 GiB = 1024 MB threshold
+    bcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_runner_low_memory_alert_deduped(db_session, mocker):
+    """Repeated sweep passes create exactly one alert row."""
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    for _ in range(3):
+        await _maybe_create_runner_low_memory_alert(
+            db_session,
+            project_id=project.id,
+            runner_id=runner_id,
+            hostname="runner-mem-01",
+            memory_free_bytes=100_000_000,
+            threshold_bytes=1_073_741_824,
+        )
+
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1, "repeated sweep passes must dedup to one alert"
+
+
+@pytest.mark.asyncio
+async def test_runner_low_memory_alert_auto_resolves_on_recovery(db_session, mocker):
+    """Alert fires when memory is low and auto-resolves when memory recovers."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    threshold = 1_073_741_824  # 1 GiB
+
+    # Runner reports low memory → alert fires.
+    created = await _maybe_create_runner_low_memory_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="runner-mem-01",
+        memory_free_bytes=100_000_000,
+        threshold_bytes=threshold,
+    )
+    assert created is True
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].dismissed_at is None
+
+    # Memory recovers → alert resolves.
+    resolved = await _resolve_runner_low_memory_alert(db_session, project.id, runner_id)
+    assert resolved == 1
+
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "alert must dismiss once memory recovers"
+
+    # Broadcast: once for create, once for dismiss.
+    assert bcast.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_low_memory_runner_check_integration(db_session, mocker):
+    """_check_degraded_runners raises a low-memory alert and auto-resolves on recovery."""
+    from app.models import LocalRunner
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+    from app.time_utils import _utcnow
+
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Active runner reporting low memory (50 MB — well below the 512 MiB default threshold).
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="hash-low-mem",
+        status="active",
+        last_seen_at=_utcnow(),
+        consecutive_job_failures=0,
+        capabilities={"memory_free_bytes": 50_000_000},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep → low-memory alert must fire.
+    await _check_degraded_runners(db_session)
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].dismissed_at is None
+
+    # Second sweep → deduplication (no second alert).
+    await _check_degraded_runners(db_session)
+    alerts = await _low_memory_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+    # Runner frees memory (2 GiB — above the 512 MiB threshold).
+    await db_session.refresh(runner)
+    caps = dict(runner.capabilities or {})
+    caps["memory_free_bytes"] = 2_147_483_648  # 2 GiB
+    runner.capabilities = caps
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep again → alert must be dismissed.
+    await _check_degraded_runners(db_session)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "low-memory alert must auto-resolve on recovery"

@@ -16,7 +16,7 @@ import {
 } from '../git-credential.js';
 import {
   startResidentClaudeSession,
-  type ResidentSession, type ResidentTurnResult,
+  type ResidentSession, type ResidentSessionEvent, type ResidentTurnResult,
 } from '../providers/resident-session.js';
 import {
   buildDirSummaryText,
@@ -32,8 +32,10 @@ import {
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads,
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
+  compactionThreshold, buildCompactionCheckpoint,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
+  type CompactionCheckpointContext,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
@@ -362,6 +364,45 @@ export async function handleStrategicResident(
   let correctiveNextTick = restoredLedger?.corrective ?? false;
   // The previous autonomous turn ended AGENDA-CONTINUE → re-tick promptly.
   let previousTurnAgendaContinue = false;
+
+  // ── Compaction state ─────────────────────────────────────────────────────
+  // Track cumulative input tokens (latest turn) and the last compaction time
+  // so the session detects context-window pressure and compacts before the
+  // model's context limit is reached.
+  let compactionCount = 0;
+  let lastCompactionAt = 0;
+  const projectName = strVal(payload.project_name, 'this project');
+
+  /** Build the compaction checkpoint context from current handler state. */
+  const buildCheckpointContext = (): CompactionCheckpointContext => {
+    const roleIdentity = [
+      `You are the resident strategist for ${projectName}.`,
+      'You operate at two speeds — interactive (operator chat) and autonomous',
+      '(between messages). Your tools: ./strategic, ./fetch, ./design-doc,',
+      './messages send. All strategic state you write describes the MANAGED',
+      'project — never this execution environment or this prompt.',
+    ].join(' ');
+
+    const examLedgerJson = serializeLedger(examRecords, examTick, correctiveNextTick);
+
+    const recentRecords = examRecords.slice(-10);
+    const recentInteractions = recentRecords.length > 0
+      ? `Recent examination activity (last ${recentRecords.length} ticks):\n${recentRecords.map(r => `- [${r.verdict}] ${r.surfaceKey}: ${r.note}`).join('\n')}`
+      : '(no examination records yet)';
+
+    const currentFocus = nextFocus(surfaceCatalog, examRecords, FOCUS_LIST_SIZE);
+    const openFound = openFoundLeads(examRecords);
+    const autonomousState = [
+      `Examination tick: ${examTick}`,
+      `Focus rotation: ${currentFocus.map(f => f.key).join(', ') || '(none)'}`,
+      openFound.length > 0 ? `Open leads (${openFound.length}): ${openFound.map(f => `${f.surfaceKey}: ${f.note.slice(0, 120)}`).join('; ')}` : '',
+      `Corrective next tick: ${correctiveNextTick}`,
+      `Previous turn agenda-continue: ${previousTurnAgendaContinue}`,
+      `Compaction count: ${compactionCount + 1}`,
+    ].filter(Boolean).join('\n');
+
+    return { roleIdentity, examLedgerJson, recentInteractions, autonomousState };
+  };
   // An operator turn just completed → run an autonomous turn to act on it.
   let operatorTurnJustCompleted = false;
   // Pacing state for shouldRunAutonomousTurn: 0 = never run (floor fires first).
@@ -376,10 +417,7 @@ export async function handleStrategicResident(
 
   // ── Session + streaming wiring ──────────────────────────────────────────────
   const streamer = new SessionStreamer(ws, sessionId, taskId);
-  const session: ResidentSession = startResidentClaudeSession({
-    model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
-  });
-  session.onEvent((ev) => {
+  const onSessionEvent = (ev: ResidentSessionEvent): void => {
     if (ev.kind === 'text' && ev.text) {
       // Assistant reply text — the only content that reaches the durable
       // transcript (once the agent `./messages send`s it). Streams as `message`.
@@ -395,7 +433,11 @@ export async function handleStrategicResident(
     } else if (ev.kind === 'error' && ev.text) {
       streamer.status(`error: ${ev.text}`);
     }
+  };
+  let session: ResidentSession = startResidentClaudeSession({
+    model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
   });
+  session.onEvent(onSessionEvent);
 
   let firstTurnSent = false;
   let stopReason = 'stop_requested';
@@ -483,7 +525,60 @@ export async function handleStrategicResident(
     return false;
   };
 
-  // Persist an operator-facing reply as a durable strategic ProjectMessage
+  // ── Compaction: context-window pressure detection + subprocess restart ──
+  // After each turn, check whether the latest input token count exceeds the
+  // compaction threshold. If it does (and the cooldown has elapsed), build a
+  // condensed checkpoint, close the old Claude subprocess, spawn a fresh one,
+  // wire up the same event listeners, and prime it with the checkpoint as an
+  // internal turn. The session continues coherently — the exam ledger, message
+  // cursor, and operator conversation context survive the restart.
+  const maybeCompact = async (r: ResidentTurnResult): Promise<boolean> => {
+    const threshold = compactionThreshold(model, cfg.compactionThresholdTokens);
+    if (r.inputTokens <= 0 || r.inputTokens < threshold) return false;
+    const now = Date.now();
+    if (lastCompactionAt > 0 && now - lastCompactionAt < cfg.compactionCooldownMs) {
+      sendLog(ws, `[resident] compaction skipped — within cooldown (${Math.round((now - lastCompactionAt) / 1000)}s since last)\n`);
+      return false;
+    }
+    sendLog(ws, `[resident] context-window pressure detected (${r.inputTokens} input tokens >= ${threshold} threshold) — compacting session\n`);
+    streamer.status('session compacting — context reset to preserve signal');
+
+    // Build the checkpoint prompt from current handler state.
+    const checkpoint = buildCompactionCheckpoint(buildCheckpointContext());
+
+    // Close the old subprocess and spawn a fresh one with the same params.
+    session.close();
+    lastCompactionAt = now;
+    compactionCount += 1;
+
+    const newSession = startResidentClaudeSession({
+      model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
+    });
+    // Wire the same event listeners so the streamer keeps receiving deltas.
+    newSession.onEvent(onSessionEvent);
+    session = newSession;
+
+    // Prime the new session with the checkpoint as a standalone internal turn.
+    // This delivers the condensed context so the session remembers its role,
+    // exam ledger, recent interactions, and autonomous state. It is NOT an
+    // operator or autonomous turn — it carries no lifecycle frames.
+    streamer.status('priming compacted session with checkpoint');
+    try {
+      const primeResult = await newSession.sendTurn(checkpoint);
+      if (primeResult.processGone) {
+        sendLog(ws, '[resident] FATAL: new session died during checkpoint priming\n');
+        stopReason = 'compaction_prime_failed';
+        return true; // caller must stop the loop
+      }
+      streamer.status(`session compacted (compaction #${compactionCount}) — context reset to preserve signal`);
+      sendLog(ws, `[resident] compaction #${compactionCount} complete — new session primed with checkpoint (${checkpoint.length} chars)\n`);
+    } catch (e) {
+      sendLog(ws, `[resident] FATAL: checkpoint priming failed: ${String(e)}\n`);
+      stopReason = 'compaction_prime_failed';
+      return true; // caller must stop the loop
+    }
+    return false; // session continues
+  };
   // (from_type=strategic) so it lands in the chat transcript, in ADDITION to the
   // live stream. The turn prompt REQUIRES the agent to `./messages send` its
   // answer; this is the backstop for when it did not. Autonomous turns carry no
@@ -552,6 +647,10 @@ export async function handleStrategicResident(
       // restore it from task.context.message_cursor instead of falling back to
       // the 2-minute window that re-delivers already-answered messages.
       message_cursor: cursor,
+      // Report compaction metadata so the backend persists it in the session
+      // blob — surfaced in the snapshot for operator visibility.
+      compaction_count: compactionCount,
+      last_compaction_at: lastCompactionAt > 0 ? new Date(lastCompactionAt).toISOString() : null,
     };
     if (handledIds && handledIds.length > 0) {
       body.handled_message_ids = handledIds;
@@ -663,6 +762,8 @@ export async function handleStrategicResident(
         const r = await runTurn(combineOperatorMessages(msgs), true);
         if (turnWedgedSession(r)) break;
         await persistReply(r);
+        // Check context-window pressure after the turn: compact if needed.
+        if (await maybeCompact(r)) break;
         // Collect the ids of the messages we just consumed so the backend can
         // mark them handled — they stop counting as open backlog and won't be
         // re-delivered to a restarted session.
@@ -756,6 +857,8 @@ export async function handleStrategicResident(
       // dead-man's switch stays progress-gated).
       const r = await turnPromise;
       if (turnWedgedSession(r)) break;
+      // Check context-window pressure after the turn: compact if needed.
+      if (await maybeCompact(r)) break;
       const hb = await heartbeat(r.appliedStrategicOp && authorityHeld);
       // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
       // writes are already folded into the rev we compare against next iteration.
@@ -796,6 +899,8 @@ export async function handleStrategicResident(
         const or = await runTurn(combineOperatorMessages(watch.messages), true);
         if (turnWedgedSession(or)) break;
         await persistReply(or);
+        // Check context-window pressure after the turn: compact if needed.
+        if (await maybeCompact(or)) break;
         // Extract the ids of the messages we just consumed so the backend can mark
         // them handled — same as the fast-path operator-message pre-emption above.
         const consumedIds = watch.messages.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);

@@ -1196,6 +1196,7 @@ async def reset_project_admin(
             await session.execute(
                 select(Task)
                 .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+                .order_by(Task.id)
                 .limit(1000)
             )
         )
@@ -1209,18 +1210,7 @@ async def reset_project_admin(
         # the same safe cancellation/VM-teardown path as force-delete.
         from app.vm_lifecycle import _ensure_vm_deleted
 
-        all_cancelled_ids = (
-            (
-                await session.execute(
-                    select(Task.id).where(
-                        Task.project_id == project_id,
-                        Task.status.in_(ACTIVE_STATUSES),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        all_cancelled_ids = [t.id for t in active_tasks]
 
         result = await session.execute(
             update(Task)
@@ -1232,6 +1222,12 @@ async def reset_project_admin(
             .execution_options(synchronize_session=False)
         )
         cancelled_count = result.rowcount
+        if cancelled_count > len(all_cancelled_ids):
+            logger.warning(
+                "Project %s reset: %d active tasks but only %d fit in VM-cleanup cap (limit=1000); "
+                "excess tasks cancelled without individual VM teardown or JWT notification",
+                project_id, cancelled_count, len(all_cancelled_ids),
+            )
         for task in active_tasks:
             await _ensure_vm_deleted(task, reason="project_reset")
         from app.jwt_revocation import emit_bulk_task_terminated_notify
@@ -1329,17 +1325,27 @@ async def pause_all_autonomous(
     current_user: dict = Depends(get_current_user),
 ):
     """Disable autonomous mode on all projects at once."""
+    user_project_ids = _user_project_ids(current_user["user_id"])
     projects = (
         (
             await session.execute(
-                select(Project).where(
-                    Project.id.in_(_user_project_ids(current_user["user_id"]))
+                select(Project)
+                .where(
+                    Project.id.in_(user_project_ids)
                 )
+                .order_by(Project.id)
+                .limit(500)
             )
         )
         .scalars()
         .all()
     )
+    if len(user_project_ids) > 500:
+        logger.warning(
+            "pause-all: user has %d projects but cap limited fetch to 500; "
+            "%d projects were NOT paused",
+            len(user_project_ids), len(user_project_ids) - 500,
+        )
     for p in projects:
         p.autonomous_enabled = False
     await session.commit()

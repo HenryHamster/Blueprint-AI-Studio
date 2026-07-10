@@ -72,6 +72,11 @@ export interface ResidentTurnResult {
   turnMs: number;
   /** number of tool_use calls that fired during this turn. */
   toolCallCount: number;
+  /** inclusive input token count reported by this turn's top-level `result` event;
+   *  zero when no usage block was reported (interrupted / pre-result child exit).
+   *  The handler uses this to detect context-window pressure and trigger compaction
+   *  before the model's context limit is reached. */
+  inputTokens: number;
 }
 
 export interface ResidentSessionEvent {
@@ -156,6 +161,9 @@ interface ActiveTurn {
   firstTokenAtMs: number | null;
   /** count of tool_use calls observed so far this turn. */
   toolCallCount: number;
+  /** inclusive input token count reported by the turn's top-level `result` event;
+   *  zero when no usage block was reported (interrupted / pre-result child exit). */
+  inputTokens: number;
 }
 
 /**
@@ -273,6 +281,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       ttftMs,
       turnMs,
       toolCallCount: t.toolCallCount,
+      inputTokens: t.inputTokens,
     });
     resolveIdleWaiters();
   };
@@ -425,6 +434,9 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
             ev.usage.inputTokens, ev.usage.outputTokens,
             ev.usage.cacheCreationTokens, ev.usage.cacheReadTokens,
           );
+          // Capture the inclusive input token count on the active turn so the
+          // handler can detect context-window pressure and trigger compaction.
+          if (activeTurn) activeTurn.inputTokens = ev.usage.inputTokens;
         }
         if (ev.numTurns !== undefined) {
           recordNumTurns(ev.numTurns);
@@ -531,7 +543,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       return Promise.resolve({
         resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
         appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
-        processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0,
+        processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0, inputTokens: 0,
       });
     }
     if (activeTurn) {
@@ -554,7 +566,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         interrupted: false, timedOut: false, hardTimedOut: false, sawDeltaThisMessage: false,
         stallTimeoutMs,
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,
-        startedAtMs, firstTokenAtMs: null, toolCallCount: 0,
+        startedAtMs, firstTokenAtMs: null, toolCallCount: 0, inputTokens: 0,
       };
       activeTurn = turn;
       try {
@@ -571,6 +583,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
           appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
           processGone: !alive, ttftMs: null, turnMs: Date.now() - startedAtMs, toolCallCount: 0,
+          inputTokens: 0,
         });
         return;
       }

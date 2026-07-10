@@ -1230,3 +1230,132 @@ async def _resolve_runner_idle_gpu_alert(
             {"alert_id": str(alert.id), "title": alert.title},
         )
     return len(open_alerts)
+
+
+# ── Runner low memory ─────────────────────────────────────────────────────────
+
+_RUNNER_LOW_MEMORY_EVENT_TYPE = "runner.low_memory"
+
+
+def _runner_low_memory_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_LOW_MEMORY_EVENT_TYPE}:{runner_id}"
+
+
+async def _maybe_create_runner_low_memory_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    memory_free_bytes: int,
+    threshold_bytes: int,
+) -> bool:
+    """Create a deduplicated WARNING alert when a runner's free memory is low.
+
+    Fires when a live runner reports ``memory_free_bytes`` below
+    ``threshold_bytes`` during the orchestrator's degraded-runner sweep.
+    Surfaces the capacity risk before jobs start failing due to OOM.
+
+    Deduplicated on ``runner.low_memory:{runner_id}`` so repeated sweep passes
+    bump the occurrence count rather than creating duplicate rows. The alert
+    clears automatically when :func:`_resolve_runner_low_memory_alert` is called
+    once memory recovers above the threshold. Returns ``True`` when a NEW alert
+    was created, else ``False``.
+    """
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    free_mb = memory_free_bytes / (1024 ** 2)
+    threshold_mb = threshold_bytes / (1024 ** 2)
+    title = f"Fleet runner low memory: {runner_label}"
+    message = (
+        f"Self-hosted fleet runner {runner_label} ({str(runner_id)[:8]}) has "
+        f"only {free_mb:.0f} MB of free memory, below the "
+        f"{threshold_mb:.0f} MB threshold. Low memory may cause OOM job "
+        f"failures. Free up memory to restore healthy operation. The alert "
+        f"clears automatically when free memory recovers above the threshold."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_LOW_MEMORY_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_low_memory_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_LOW_MEMORY",
+                {
+                    "runner_id": str(runner_id),
+                    "runner_label": runner_label,
+                    "memory_free_bytes": memory_free_bytes,
+                    "threshold_bytes": threshold_bytes,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_LOW_MEMORY dispatch setup failed: %s", _ne)
+    return True
+
+
+async def _resolve_runner_low_memory_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss any open runner-low-memory alert for a runner whose memory has recovered.
+
+    The companion to :func:`_maybe_create_runner_low_memory_alert`. Called from
+    the degraded-runner sweep when a runner's ``memory_free_bytes`` rises back
+    above the threshold (or it stops reporting memory). Mirrors
+    :func:`_resolve_runner_low_disk_alert`. Returns the number of alerts
+    dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _runner_low_memory_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)

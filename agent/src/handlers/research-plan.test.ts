@@ -3612,6 +3612,7 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     expect(script).toContain('_call "set_evidence_progress"');
 	    // Usage string advertises the ops (set-memory set-session-summary added for memory; consume/dismiss-knowledge for knowledge lifecycle).
 	    expect(script).toContain("set-evidence-progress|set-acceptance-criteria|record-finding-resolution|set-memory|set-session-summary|consume-knowledge|dismiss-knowledge <json-or-file>");
+
   });
 });
 

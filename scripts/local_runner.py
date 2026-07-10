@@ -483,6 +483,38 @@ def _gpu_utilization_pct() -> int | None:
     return max(0, min(100, max(vals)))
 
 
+def _cpu_load_avg() -> float | None:
+    """One-minute CPU load average, or None on any error."""
+    try:
+        load1, _5min, _15min = os.getloadavg()
+        return round(load1, 2)
+    except (OSError, AttributeError):
+        return None
+
+
+def _memory_free_bytes() -> int | None:
+    """Free (available) memory in bytes, or None on any error.
+
+    Reads ``/proc/meminfo`` for ``MemAvailable`` (preferred) or falls
+    back to ``MemFree``.  Returns None when neither can be read.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            fallback: int | None = None
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+                if line.startswith("MemFree:"):
+                    fallback = int(line.split()[1]) * 1024
+                    # MemAvailable is preferred but may not exist on all kernels;
+                    # MemFree is the fallback when we didn't see MemAvailable first.
+                    # Guard: MemAvailable *follows* MemFree in /proc/meminfo, so we
+                    # cannot return early — keep scanning for MemAvailable.
+            return fallback
+    except (OSError, ValueError, FileNotFoundError, IndexError):
+        return None
+
+
 class _TelemetryState:
     """Thread-safe runner health counters emitted on each heartbeat.
 
@@ -1278,10 +1310,13 @@ def _heartbeat_loop(
                 "agent_backend": agent_backend,
                 "compute_backend": compute_backend,
                 # Health telemetry consumed by the orchestrator to spot a runner
-                # that is failing every job / running low on disk / idle-GPU.
+                # that is failing every job / running low on disk / low on memory /
+                # pegged CPU.
                 "last_successful_job_at": last_success_at,
                 "consecutive_job_failures": consecutive_failures,
                 "disk_free_bytes": _disk_free_bytes(workspace_root),
+                "cpu_load_avg": _cpu_load_avg(),
+                "memory_free_bytes": _memory_free_bytes(),
                 "gpu_utilization_pct": _gpu_utilization_pct() if has_gpu else None,
                 **gpu_capabilities,
             }
@@ -2859,6 +2894,7 @@ def _spawn_agent_task(
                     flush=True,
                 )
 
+
     # Build the FAIL-CLOSED sandbox plan. The env is assembled from an explicit
     # allowlist (never os.environ.copy) and NEVER carries BLUEPRINT_RUNNER_TOKEN /
     # BLUEPRINT_ORCHESTRATOR_URL into the task.  The backend-assigned pooled LLM
@@ -3460,12 +3496,13 @@ def main() -> None:
     _wait_for_compute_jobs(active_compute_jobs, compute_lock, orchestrator_url, token)
 
     # Graceful shutdown (monotonic clock so a wall-clock jump can't skew the wait).
+    deadline = time.monotonic() + 120
+
     with lock:
         remaining = dict(active_tasks)
 
     if remaining:
         print(f"[runner] Shutdown requested — waiting for {len(remaining)} active agents...", flush=True)
-        deadline = time.monotonic() + 120
         for tid, proc in remaining.items():
             timeout = max(0.0, deadline - time.monotonic())
             try:
@@ -3478,6 +3515,49 @@ def main() -> None:
                 iso.terminate_process_tree(
                     proc, backend=backend, container_name=container_name
                 )
+
+    # Drain compute job threads. These are daemon threads: when the process exits
+    # they are killed mid-flight, before _run_compute_job can send a terminal
+    # status report to the server. Wait for them to finish (they check
+    # _shutdown_event and self-terminate with a "failed" report); if any are still
+    # alive after the deadline, report failure on their behalf.
+    with compute_lock:
+        remaining_compute = set(active_compute_jobs)
+    if remaining_compute:
+        print(
+            f"[runner] Shutdown requested — waiting for {len(remaining_compute)} active compute jobs...",
+            flush=True,
+        )
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            with compute_lock:
+                if not active_compute_jobs:
+                    break
+        # After the deadline: any compute job still alive was stranded by a daemon
+        # thread that couldn't finish. Report it as failed so it doesn't remain
+        # stuck in RUNNING on the server.
+        with compute_lock:
+            stranded = set(active_compute_jobs)
+        if stranded:
+            for job_id in stranded:
+                print(
+                    f"[runner] compute job {job_id} did not finish within shutdown "
+                    "deadline — reporting as failed",
+                    flush=True,
+                )
+                try:
+                    _report_compute_job(
+                        orchestrator_url, token, job_id,
+                        exec_status="failed", exit_code=1,
+                        command_log={
+                            "text": "Runner shut down (SIGTERM) before job completed",
+                            "truncated": False,
+                        },
+                    )
+                except Exception:
+                    pass
+            with compute_lock:
+                active_compute_jobs.difference_update(stranded)
 
     print("[runner] Exiting.", flush=True)
 
