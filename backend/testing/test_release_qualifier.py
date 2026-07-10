@@ -34041,3 +34041,299 @@ async def test_record_v22_live_verification_evidence_records_evidence_row(db_ses
         db_session, project.id, version_v23
     )
     assert recorded3 == 0, "Expected 0 for non-v22 version — version guard must reject"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1a: QualificationDimensionResult dual-write tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_finalize_dual_writes_dimension_rows_for_all_gates(db_session, mocker):
+    """_finalize_qualification writes one QualificationDimensionResult row per
+    gate (audit, test_erosion, ci, smoketest, migration_identity, migration_apply,
+    merge_grade, acceptance_window, debt_pressure) on a clean pass.
+
+    Verifies: each finalize run persists the expected dimension rows for its
+    candidate_sha.
+    """
+    from app import shared_state
+    from app.models import QualificationDimensionResult
+    from sqlalchemy import select
+
+    shared_state.runtime_config["promotion_enabled"] = False  # dry-run, no promote
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=[],
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates("green", ci_green=True),
+    )
+    await db_session.commit()
+
+    assert result["status"] in ("dry_run", "not_promoted", "promoted"), (
+        f"unexpected status {result['status']!r}"
+    )
+
+    rows = (
+        await db_session.execute(
+            select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == candidate_sha,
+            )
+        )
+    ).scalars().all()
+
+    dims_found = {r.dimension for r in rows}
+    expected_dims = {
+        "audit",
+        "test_erosion",
+        "ci",
+        "smoketest",
+        "migration_identity",
+        "migration_apply",
+        "merge_grade",
+        "acceptance_window",
+        "debt_pressure",
+    }
+    assert expected_dims == dims_found, (
+        f"expected dims {expected_dims}, got {dims_found}"
+    )
+
+    by_dim = {r.dimension: r for r in rows}
+
+    # CI should be "passed" since ci_green=True
+    assert by_dim["ci"].status == "passed", (
+        f"expected ci=passed, got {by_dim['ci'].status!r}"
+    )
+    # audit should be "passed" with audit_score=1.0
+    assert by_dim["audit"].status == "passed", (
+        f"expected audit=passed, got {by_dim['audit'].status!r}"
+    )
+    # migration_identity and migration_apply pass with "ok" verdict
+    assert by_dim["migration_identity"].status == "passed"
+    assert by_dim["migration_apply"].status == "passed"
+    # All rows carry the correct candidate_sha
+    for r in rows:
+        assert r.candidate_sha == candidate_sha, (
+            f"dim {r.dimension!r}: expected sha {candidate_sha!r}, got {r.candidate_sha!r}"
+        )
+        assert r.project_id == project.id
+        assert r.release_version_id == version.id
+
+
+@pytest.mark.asyncio
+async def test_finalize_dimension_rows_unique_constraint_prevents_duplicates(
+    db_session, mocker
+):
+    """UNIQUE(release_version_id, candidate_sha, dimension) prevents duplicate rows.
+
+    A second _finalize_qualification call for the SAME candidate_sha must not
+    write duplicate rows — the ON CONFLICT DO NOTHING guard leaves existing rows
+    intact.
+    """
+    from app import shared_state
+    from app.models import QualificationDimensionResult
+    from sqlalchemy import func as count_func, select
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=[],
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    pre_gates = _clean_finalize_pre_gates("green", ci_green=True)
+
+    # First finalize
+    await rq._finalize_qualification(db_session, version, _pre_gates=pre_gates)
+    await db_session.commit()
+
+    count_after_first = (
+        await db_session.execute(
+            select(count_func.count()).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == candidate_sha,
+            )
+        )
+    ).scalar()
+
+    # Restore version state (simulating a re-finalize on the same SHA)
+    version.last_qualification = {
+        **version.last_qualification,
+        "status": "pending",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Second finalize for same candidate_sha
+    await rq._finalize_qualification(db_session, version, _pre_gates=pre_gates)
+    await db_session.commit()
+
+    count_after_second = (
+        await db_session.execute(
+            select(count_func.count()).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == candidate_sha,
+            )
+        )
+    ).scalar()
+
+    assert count_after_first > 0, "First finalize must write at least one row"
+    assert count_after_second == count_after_first, (
+        f"second finalize must not duplicate rows: "
+        f"first={count_after_first}, second={count_after_second}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_new_candidate_sha_writes_new_dimension_rows(
+    db_session, mocker
+):
+    """A second finalize for a NEW candidate_sha writes new rows rather than
+    mutating existing ones (immutable-once-terminal-per-SHA invariant).
+
+    Per the design's concurrency-safety argument in section 4: each row is
+    keyed by (release_version_id, candidate_sha, dimension) — a new candidate
+    maps to new rows, never in-place updates.
+    """
+    from app import shared_state
+    from app.models import QualificationDimensionResult
+    from sqlalchemy import select
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        challenge_verdicts=[],
+    )
+
+    sha_1 = version.last_qualification["candidate_sha"]
+    pre_gates = _clean_finalize_pre_gates("green", ci_green=True)
+
+    # Finalize with sha_1
+    await rq._finalize_qualification(db_session, version, _pre_gates=pre_gates)
+    await db_session.commit()
+
+    rows_sha1 = (
+        await db_session.execute(
+            select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == sha_1,
+            )
+        )
+    ).scalars().all()
+    assert len(rows_sha1) > 0, "sha_1 finalize must produce dimension rows"
+
+    # Switch to a new candidate_sha (simulates automain advancing).
+    # Clear challenge_task_id to avoid SHA-mismatch early-return in the challenge gate.
+    sha_2 = "b" * 40
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha_2,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-05-19T00:00:00",
+        "audit_task_id": version.last_qualification.get("audit_task_id"),
+        "smoketest_task_id": version.last_qualification.get("smoketest_task_id"),
+        "challenge_task_id": None,
+        "merge_grade_task_id": None,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version, _pre_gates=pre_gates)
+    await db_session.commit()
+
+    rows_sha2 = (
+        await db_session.execute(
+            select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == sha_2,
+            )
+        )
+    ).scalars().all()
+    assert len(rows_sha2) > 0, "sha_2 finalize must write new rows, not mutate sha_1 rows"
+
+    # sha_1 rows must still exist and be unchanged (immutable once written)
+    rows_sha1_after = (
+        await db_session.execute(
+            select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == sha_1,
+            )
+        )
+    ).scalars().all()
+    assert len(rows_sha1_after) == len(rows_sha1), (
+        "sha_1 rows must be immutable — count must not change after sha_2 finalize"
+    )
+
+    dims_sha2 = {r.dimension for r in rows_sha2}
+    dims_sha1 = {r.dimension for r in rows_sha1}
+    assert dims_sha2 == dims_sha1, (
+        f"both SHAs should produce the same set of dimension rows; "
+        f"sha_1={dims_sha1}, sha_2={dims_sha2}"
+    )

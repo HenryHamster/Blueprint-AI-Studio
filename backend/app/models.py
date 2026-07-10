@@ -49,6 +49,7 @@ from app.release_models import (  # noqa: F401
     AuditFindingResolution,
     CompletionDebtEntry,
     CriterionEvidence,
+    QualificationDimensionResult,
     QualificationVerdict,
     ReleaseDeployArtifact,
     ReleaseVersion,

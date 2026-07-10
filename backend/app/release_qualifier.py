@@ -94,6 +94,7 @@ from app.landed_signal import landed_signal_predicate
 from app.models import (
     ArtifactType,
     Project,
+    QualificationDimensionResult,
     Task,
     TaskStatus,
 )
@@ -3082,6 +3083,57 @@ async def _count_project_actionable_open_completion_debt(
     return int((await session.execute(stmt)).scalar_one() or 0)
 
 
+async def _dual_write_dimension_results(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str,
+    dimension_rows: list[dict[str, Any]],
+) -> None:
+    """Dual-write per-dimension rows to QualificationDimensionResult (Phase 1a).
+
+    Each entry in ``dimension_rows`` is a dict with keys matching the
+    QualificationDimensionResult columns.  Rows are upserted on the
+    (release_version_id, candidate_sha, dimension) unique key — an existing
+    terminal row for the same (version, sha, dim) is left unchanged (the
+    UNIQUE constraint causes the INSERT to be skipped via ON CONFLICT DO
+    NOTHING so rows are effectively immutable once written).
+
+    Best-effort: a failure to write never breaks or rolls back finalization.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+
+    for row in dimension_rows:
+        try:
+            stmt = (
+                pg_insert(QualificationDimensionResult)
+                .values(
+                    id=uuid.uuid4(),
+                    project_id=version.project_id,
+                    release_version_id=version.id,
+                    candidate_sha=candidate_sha,
+                    dimension=row["dimension"],
+                    status=row["status"],
+                    sub_score=row.get("sub_score"),
+                    blocker=row.get("blocker"),
+                    audited_surface_hash=row.get("audited_surface_hash"),
+                    detail=row.get("detail"),
+                    producing_task_id=row.get("producing_task_id"),
+                    computed_at=_utcnow(),
+                )
+                .on_conflict_do_nothing(
+                    constraint="uq_qualificationdimensionresult_version_sha_dim"
+                )
+            )
+            await session.execute(stmt)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never break finalize
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d dual-write dimension %r failed: %s",
+                version.version_number,
+                row.get("dimension"),
+                exc,
+            )
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -4262,6 +4314,176 @@ async def _finalize_qualification(
     acceptance_window = await _compute_acceptance_window_aggregate(session, version)
     extended_sub_scores = dict(composite["sub_scores"])
     extended_sub_scores.update(acceptance_window)
+
+    # --- Phase 1a: dual-write per-dimension rows (no behavior change) -------
+    # Write one QualificationDimensionResult row per gate as the existing code
+    # path computed it.  The decision logic below is unchanged — these rows are
+    # observability-only until the Phase 1b read-side cutover.
+    if candidate_sha:
+        _composite_blocker = composite.get("blocker")
+        _sub = composite["sub_scores"]
+
+        _dim_ci_status: str
+        if _composite_blocker in ("ci_not_green", "ci_unresolved"):
+            _dim_ci_status = "blocked"
+        elif ci_green:
+            _dim_ci_status = "passed"
+        else:
+            _dim_ci_status = "failed"
+
+        _dim_audit_status: str
+        if _composite_blocker == "audit_missing":
+            _dim_audit_status = "blocked"
+        elif audit_score is not None and audit_score > 0.0:
+            _dim_audit_status = "passed"
+        else:
+            _dim_audit_status = "failed"
+
+        _dim_erosion_status: str
+        if _composite_blocker == "test_file_deleted":
+            _dim_erosion_status = "blocked"
+        elif test_erosion_score is None or test_erosion_score >= 1.0:
+            _dim_erosion_status = "passed"
+        else:
+            _dim_erosion_status = "failed"
+
+        _dim_smoke_status: str
+        if not smoketest_enabled:
+            _dim_smoke_status = "passed"
+        elif _composite_blocker == "smoketest_startup_failed":
+            _dim_smoke_status = "blocked"
+        elif smoketest_score is None:
+            _dim_smoke_status = "unavailable"
+        elif smoketest_score > 0.0:
+            _dim_smoke_status = "passed"
+        else:
+            _dim_smoke_status = "failed"
+
+        _dim_migration_id_status = (
+            "blocked" if migration_verdict == "block" else "passed"
+        )
+        _dim_migration_apply_status = (
+            "blocked" if apply_verdict == "block" else "passed"
+        )
+
+        _dim_merge_grade_status: str
+        if not merge_grade_task_id:
+            _dim_merge_grade_status = "passed"
+        elif _composite_blocker == "merge_grade_misses":
+            _dim_merge_grade_status = "blocked"
+        elif merge_grade_cert.get("status") in (
+            "pass", "not_applicable", "superseded_exempt", "already_on_main_exempt"
+        ):
+            _dim_merge_grade_status = "passed"
+        else:
+            _dim_merge_grade_status = "failed"
+
+        _dim_acceptance_status = (
+            "blocked" if _composite_blocker == "criterion_coverage_incomplete"
+            else "passed"
+        )
+        _dim_debt_status = "passed"  # additive/observe only in Phase 1a
+
+        _audit_task_uuid: uuid.UUID | None = None
+        try:
+            if audit_task_id:
+                _audit_task_uuid = uuid.UUID(str(audit_task_id))
+        except (ValueError, TypeError):
+            pass
+        _smoke_task_uuid: uuid.UUID | None = None
+        try:
+            if smoketest_task_id:
+                _smoke_task_uuid = uuid.UUID(str(smoketest_task_id))
+        except (ValueError, TypeError):
+            pass
+        _merge_grade_task_uuid: uuid.UUID | None = None
+        try:
+            if merge_grade_task_id:
+                _merge_grade_task_uuid = uuid.UUID(str(merge_grade_task_id))
+        except (ValueError, TypeError):
+            pass
+
+        _dimension_rows: list[dict[str, Any]] = [
+            {
+                "dimension": "ci",
+                "status": _dim_ci_status,
+                "sub_score": _sub.get("ci"),
+                "blocker": _composite_blocker if _dim_ci_status == "blocked" else None,
+                "detail": {"ci_green": ci_green, "ci_resolution": ci_resolution},
+            },
+            {
+                "dimension": "audit",
+                "status": _dim_audit_status,
+                "sub_score": _sub.get("audit"),
+                "blocker": _composite_blocker if _dim_audit_status == "blocked" else None,
+                "audited_surface_hash": qual.get("candidate_diff_hash"),
+                "producing_task_id": _audit_task_uuid,
+                "detail": {
+                    "audit_score": audit_score,
+                    "audit_missing_reason": audit_missing_reason,
+                },
+            },
+            {
+                "dimension": "test_erosion",
+                "status": _dim_erosion_status,
+                "sub_score": _sub.get("test_erosion"),
+                "blocker": _composite_blocker if _dim_erosion_status == "blocked" else None,
+                "producing_task_id": _audit_task_uuid,
+                "detail": {"test_erosion_score": test_erosion_score},
+            },
+            {
+                "dimension": "smoketest",
+                "status": _dim_smoke_status,
+                "sub_score": _sub.get("smoketest"),
+                "blocker": _composite_blocker if _dim_smoke_status == "blocked" else None,
+                "producing_task_id": _smoke_task_uuid,
+                "detail": {"smoketest_score": smoketest_score, "enabled": smoketest_enabled},
+            },
+            {
+                "dimension": "migration_identity",
+                "status": _dim_migration_id_status,
+                "blocker": _composite_blocker if _dim_migration_id_status == "blocked" else None,
+                "detail": {
+                    "verdict": migration_verdict,
+                    "detail": migration_detail,
+                },
+            },
+            {
+                "dimension": "migration_apply",
+                "status": _dim_migration_apply_status,
+                "blocker": _composite_blocker if _dim_migration_apply_status == "blocked" else None,
+                "detail": {
+                    "verdict": apply_verdict,
+                    "detail": apply_detail,
+                },
+            },
+            {
+                "dimension": "merge_grade",
+                "status": _dim_merge_grade_status,
+                "sub_score": merge_grade_cert.get("coverage"),
+                "blocker": _composite_blocker if _dim_merge_grade_status == "blocked" else None,
+                "producing_task_id": _merge_grade_task_uuid,
+                "detail": merge_grade_cert,
+            },
+            {
+                "dimension": "acceptance_window",
+                "status": _dim_acceptance_status,
+                "blocker": _composite_blocker if _dim_acceptance_status == "blocked" else None,
+                "detail": {k: v for k, v in acceptance_window.items()},
+            },
+            {
+                "dimension": "debt_pressure",
+                "status": _dim_debt_status,
+                "sub_score": _sub.get("debt_pressure"),
+                "detail": {
+                    "score": _debt_pressure_score,
+                    "mode": _resolve_completion_debt_weight_mode(),
+                },
+            },
+        ]
+        await _dual_write_dimension_results(
+            session, version, candidate_sha, _dimension_rows
+        )
 
     finalized_at = _utcnow().isoformat()
     base_record: dict[str, Any] = {

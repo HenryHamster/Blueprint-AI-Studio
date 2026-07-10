@@ -964,3 +964,104 @@ class AuditFindingResolution(SQLModel, table=True):
         ),
     )
 
+
+class QualificationDimensionResult(SQLModel, table=True):
+    """Per-(candidate_sha, dimension) verdict ledger for qualification gates.
+
+    Phase 1a of the per-dimension fact ledger redesign (knowledge doc
+    28f9d31a).  The existing ``_finalize_qualification`` dual-writes one row per
+    gate here alongside the existing ``last_qualification`` / ``QualificationVerdict``
+    path (which is left entirely unchanged).  The read-side cutover is Phase 1b
+    (a separate follow-up task).
+
+    UNIQUE(release_version_id, candidate_sha, dimension) makes each row
+    immutable-once-terminal-per-SHA: a new candidate writes new rows rather than
+    mutating old ones.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # The automain HEAD SHA this result is FOR (the same SHA snapped into
+    # last_qualification["candidate_sha"]).
+    candidate_sha: str = Field(
+        sa_column=Column(String(40), nullable=False),
+    )
+
+    # Gate name: audit | migration_identity | migration_apply | ci | smoketest
+    #            | merge_grade | test_erosion | acceptance_window | debt_pressure
+    dimension: str = Field(
+        sa_column=Column(String(32), nullable=False),
+    )
+
+    # Gate outcome: passed | failed | blocked | unavailable | pending
+    status: str = Field(
+        sa_column=Column(String(16), nullable=False),
+    )
+
+    # Feed into compute_composite (mirrors the per-dimension sub_score slot).
+    sub_score: float | None = Field(
+        default=None,
+        sa_column=Column(Float, nullable=True),
+    )
+
+    # Hard-blocker code when this dimension forces confidence 0.0.
+    blocker: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Content-hash of the audited surface (for cross-SHA reuse, audit/migration dims).
+    audited_surface_hash: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Dimension-specific evidence (findings, migration detail, CI resolution, …).
+    detail: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # The child agent task that produced this result, when applicable.
+    producing_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True),
+    )
+
+    computed_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "release_version_id",
+            "candidate_sha",
+            "dimension",
+            name="uq_qualificationdimensionresult_version_sha_dim",
+        ),
+        Index(
+            "ix_qualificationdimensionresult_project_computed",
+            "project_id",
+            "computed_at",
+        ),
+    )
+
