@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act, createRef } from 'react';
 import { MessagesComposer } from './MessagesComposer';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
-import type { MessageAttachment } from '../types/messages';
+import type { PendingAttachment } from './MessagesComposer';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 import { MESSAGE_CONTENT_MAX } from '../api';
 
@@ -16,9 +16,9 @@ async function renderComposer(
   strategicContext: StrategicContextDescriptorModel | null = null,
   onOpenCommandPalette?: () => void,
   newContent = '',
-  pendingAttachments: MessageAttachment[] = [],
-  onAttachFiles?: (files: File[]) => void,
-  onRemoveAttachment?: (index: number) => void,
+  pendingAttachments: PendingAttachment[] = [],
+  onAddAttachment?: (file: File) => void,
+  onRemoveAttachment?: (id: string) => void,
 ) {
   const ref = createRef<HTMLTextAreaElement>();
   await act(async () => {
@@ -40,7 +40,7 @@ async function renderComposer(
         onOpenStrategicContext={() => {}}
         onOpenCommandPalette={onOpenCommandPalette}
         pendingAttachments={pendingAttachments}
-        onAttachFiles={onAttachFiles}
+        onAddAttachment={onAddAttachment}
         onRemoveAttachment={onRemoveAttachment}
       />,
     );
@@ -324,8 +324,8 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
-        { type: 'file', mime_type: 'image/png', name: 'screenshot.png', size_bytes: 123456, data: '' },
-        { type: 'file', mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 789012 },
+        { id: '1', file: new File([], 'screenshot.png', { type: 'image/png' }), previewUrl: null, mime_type: 'image/png', name: 'screenshot.png', size_bytes: 123456 },
+        { id: '2', file: new File([], 'report.pdf', { type: 'application/pdf' }), previewUrl: null, mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 789012 },
       ]);
     });
     await expectMinTouchTargetAt(1280, async () => {});
@@ -339,9 +339,9 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
-        { type: 'file', mime_type: 'image/png', name: 'screenshot.png', size_bytes: 123456, data: '' },
-        { type: 'file', mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 789012 },
-        { type: 'file', mime_type: 'text/plain', name: 'notes.txt', size_bytes: 1024 },
+        { id: 'a', file: new File([], 'screenshot.png', { type: 'image/png' }), previewUrl: null, mime_type: 'image/png', name: 'screenshot.png', size_bytes: 123456 },
+        { id: 'b', file: new File([], 'report.pdf', { type: 'application/pdf' }), previewUrl: null, mime_type: 'application/pdf', name: 'report.pdf', size_bytes: 789012 },
+        { id: 'c', file: new File([], 'notes.txt', { type: 'text/plain' }), previewUrl: null, mime_type: 'text/plain', name: 'notes.txt', size_bytes: 1024 },
       ]);
     });
     await expectMinTouchTargetAt(375, async () => {});
@@ -364,7 +364,7 @@ describe('MessagesComposer — attachment interaction', () => {
     }
   });
 
-  test('remove attachment button calls onRemoveAttachment with the correct index', async () => {
+  test('remove attachment button calls onRemoveAttachment with the correct attachment id', async () => {
     const onRemoveAttachment = vi.fn();
     host = document.createElement('div');
     host.style.width = '375px';
@@ -372,8 +372,8 @@ describe('MessagesComposer — attachment interaction', () => {
     const r = createRoot(host);
     root = r;
     await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
-      { type: 'file', mime_type: 'image/png', name: 'first.png', size_bytes: 1000 },
-      { type: 'file', mime_type: 'application/pdf', name: 'second.pdf', size_bytes: 2000 },
+      { id: 'first-id', file: new File([], 'first.png', { type: 'image/png' }), previewUrl: null, mime_type: 'image/png', name: 'first.png', size_bytes: 1000 },
+      { id: 'second-id', file: new File([], 'second.pdf', { type: 'application/pdf' }), previewUrl: null, mime_type: 'application/pdf', name: 'second.pdf', size_bytes: 2000 },
     ], undefined, onRemoveAttachment);
 
     // Find and click the remove button on the second attachment
@@ -385,8 +385,7 @@ describe('MessagesComposer — attachment interaction', () => {
     });
 
     expect(onRemoveAttachment).toHaveBeenCalledOnce();
-    // Index 1 = second attachment (0-indexed)
-    expect(onRemoveAttachment).toHaveBeenCalledWith(1);
+    expect(onRemoveAttachment).toHaveBeenCalledWith('second-id');
   });
 
   test('remove button aria-label reflects the file name', async () => {
@@ -396,21 +395,21 @@ describe('MessagesComposer — attachment interaction', () => {
     const r = createRoot(host);
     root = r;
     await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [
-      { type: 'file', mime_type: 'text/plain', name: 'my-notes.txt', size_bytes: 500 },
+      { id: '3', file: new File([], 'my-notes.txt', { type: 'text/plain' }), previewUrl: null, mime_type: 'text/plain', name: 'my-notes.txt', size_bytes: 500 },
     ]);
 
     const removeBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Remove my-notes.txt"]');
     expect(removeBtn).toBeTruthy();
   });
 
-  test('handlePaste calls onAttachFiles when files are pasted and prevents default', async () => {
-    const onAttachFiles = vi.fn();
+  test('handlePaste calls onAddAttachment when files are pasted and prevents default', async () => {
+    const onAddAttachment = vi.fn();
     host = document.createElement('div');
     host.style.width = '375px';
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAttachFiles);
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
 
     const textarea = host?.querySelector('textarea');
     expect(textarea).toBeTruthy();
@@ -424,19 +423,19 @@ describe('MessagesComposer — attachment interaction', () => {
       textarea!.dispatchEvent(pasteEvent);
     });
 
-    expect(onAttachFiles).toHaveBeenCalledOnce();
-    expect(onAttachFiles).toHaveBeenCalledWith([file]);
+    expect(onAddAttachment).toHaveBeenCalledOnce();
+    expect(onAddAttachment).toHaveBeenCalledWith(file);
     expect(pasteEvent.defaultPrevented).toBe(true);
   });
 
-  test('handlePaste does not prevent default or call onAttachFiles when no files are pasted', async () => {
-    const onAttachFiles = vi.fn();
+  test('handlePaste does not prevent default or call onAddAttachment when no files are pasted', async () => {
+    const onAddAttachment = vi.fn();
     host = document.createElement('div');
     host.style.width = '375px';
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAttachFiles);
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
 
     const textarea = host?.querySelector('textarea');
     expect(textarea).toBeTruthy();
@@ -448,18 +447,18 @@ describe('MessagesComposer — attachment interaction', () => {
       textarea!.dispatchEvent(pasteEvent);
     });
 
-    expect(onAttachFiles).not.toHaveBeenCalled();
+    expect(onAddAttachment).not.toHaveBeenCalled();
     expect(pasteEvent.defaultPrevented).toBe(false);
   });
 
-  test('handleDrop calls onAttachFiles with dropped files', async () => {
-    const onAttachFiles = vi.fn();
+  test('handleDrop calls onAddAttachment with dropped files', async () => {
+    const onAddAttachment = vi.fn();
     host = document.createElement('div');
     host.style.width = '375px';
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAttachFiles);
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
 
     const composerBox = host?.querySelector('[data-testid="strategic-composer-box"]');
     expect(composerBox).toBeTruthy();
@@ -473,8 +472,8 @@ describe('MessagesComposer — attachment interaction', () => {
       composerBox!.dispatchEvent(dropEvent);
     });
 
-    expect(onAttachFiles).toHaveBeenCalledOnce();
-    expect(onAttachFiles).toHaveBeenCalledWith([file]);
+    expect(onAddAttachment).toHaveBeenCalledOnce();
+    expect(onAddAttachment).toHaveBeenCalledWith(file);
   });
 
   test('dragOver and dragLeave toggle the drag-over border class', async () => {
@@ -505,13 +504,13 @@ describe('MessagesComposer — attachment interaction', () => {
   });
 
   test('handleDrop clears drag-over state', async () => {
-    const onAttachFiles = vi.fn();
+    const onAddAttachment = vi.fn();
     host = document.createElement('div');
     host.style.width = '375px';
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAttachFiles);
+    await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, undefined, '', [], onAddAttachment);
 
     const composerBox = host!.querySelector('[data-testid="strategic-composer-box"]')!;
 

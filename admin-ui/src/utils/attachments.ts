@@ -8,14 +8,16 @@ import type { MessageAttachment } from '../types/messages';
 export function fileToMessageAttachment(file: File): Promise<MessageAttachment> {
   return new Promise<MessageAttachment>((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () =>
+    reader.onload = () => {
+      const mime_type = file.type || 'application/octet-stream';
       resolve({
-        type: 'file' as const,
-        mime_type: file.type || 'application/octet-stream',
+        type: mime_type.startsWith('image/') ? 'image' : 'file',
+        mime_type,
         data: (reader.result as string).split(',')[1],
         name: file.name,
         size_bytes: file.size,
       });
+    };
     reader.onerror = () => reject(reader.error ?? new Error('FileReader error'));
     reader.readAsDataURL(file);
   });

@@ -311,6 +311,50 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     expect(r[1]).toHaveProperty('source.data', '/9j/4AAQ=');
   });
 
+  it('extractMessageTurn delivers an operator image produced by the real frontend attachment shape as an image block', () => {
+    // The frontend's fileToMessageAttachment sets type:'image' for image/* mime types.
+    // This test verifies that extractMessageTurn accepts that shape and emits an image block.
+    const r = extractMessageTurn({
+      content: 'see screenshot',
+      context: {
+        attachments: [
+          { type: 'image', mime_type: 'image/png', data: 'iVBORw0KGgo=', name: 'screenshot.png', size_bytes: 9 },
+        ],
+      },
+    });
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ type: 'text', text: 'see screenshot' });
+    expect(r[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } });
+  });
+
+  it('extractMessageTurn emits decoded text for a text/markdown attachment and a reference block for a PDF', () => {
+    const markdownContent = '# Hello\n\nThis is a markdown file.';
+    const markdownBase64 = Buffer.from(markdownContent).toString('base64');
+    const r = extractMessageTurn({
+      content: 'check these files',
+      context: {
+        attachments: [
+          { type: 'file', mime_type: 'text/markdown', data: markdownBase64, name: 'README.md', size_bytes: markdownContent.length },
+          { type: 'file', mime_type: 'application/pdf', data: 'JVBERi0=', name: 'document.pdf', size_bytes: 6 },
+        ],
+      },
+    });
+    // text block + decoded markdown + PDF reference
+    expect(r).toHaveLength(3);
+    expect(r[0]).toEqual({ type: 'text', text: 'check these files' });
+    // Decoded text/markdown attachment
+    expect(r[1].type).toBe('text');
+    const markdownBlock = r[1] as { type: 'text'; text: string };
+    expect(markdownBlock.text).toContain('README.md');
+    expect(markdownBlock.text).toContain(markdownContent);
+    // PDF reference block (no decoding — opaque binary)
+    expect(r[2].type).toBe('text');
+    const pdfBlock = r[2] as { type: 'text'; text: string };
+    expect(pdfBlock.text).toContain('document.pdf');
+    expect(pdfBlock.text).toContain('application/pdf');
+    expect(pdfBlock.text).toContain('6 bytes');
+  });
+
   it('caps the number of image attachments per turn', () => {
     const attachments: Array<Record<string, string>> = Array.from({ length: MAX_IMAGES_PER_TURN + 3 }, (_, i) => ({
       type: 'image',
@@ -408,9 +452,9 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     const out = await materializeContentBlocks([
       { type: 'text', text: 'look' },
       { type: 'image', source: { type: 'url', url: signedUrl, media_type: 'image/png', name: 'photo.png' } },
-    ], async (url) => {
+    ], (url) => {
       fetchCalls.push(url);
-      return {
+      return Promise.resolve({
         ok: true,
         status: 200,
         headers: {
@@ -420,8 +464,8 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
             return null;
           },
         },
-        arrayBuffer: async () => bytes.buffer,
-      };
+        arrayBuffer: () => Promise.resolve(bytes.buffer),
+      });
     });
 
     expect(fetchCalls).toEqual([signedUrl]);
@@ -449,11 +493,11 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
           name: 'missing.png',
         },
       },
-    ], async () => ({
+    ], () => Promise.resolve({
       ok: false,
       status: 403,
       headers: { get: () => null },
-      arrayBuffer: async () => new ArrayBuffer(0),
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
     }));
 
     expect(out).toEqual([
@@ -473,7 +517,7 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
           name: 'huge.png',
         },
       },
-    ], async () => ({
+    ], () => Promise.resolve({
       ok: true,
       status: 200,
       headers: {
@@ -483,9 +527,9 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
             : null;
         },
       },
-      arrayBuffer: async () => {
+      arrayBuffer: () => {
         readBody = true;
-        return new ArrayBuffer(0);
+        return Promise.resolve(new ArrayBuffer(0));
       },
     }));
 

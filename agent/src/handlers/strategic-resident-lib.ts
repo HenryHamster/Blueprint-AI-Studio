@@ -519,6 +519,24 @@ export type ImageBlockSource = ImageBlockBase64Source | ImageBlockUrlSource;
 export interface ImageBlock { type: 'image'; source: ImageBlockSource; }
 export type ContentBlock = TextBlock | ImageBlock;
 
+/**
+ * Whether a MIME type represents human-readable text that can be decoded and presented inline.
+ */
+function isTextLikeMime(mimeType: string): boolean {
+  return typeof mimeType === 'string' && mimeType.startsWith('text/');
+}
+
+/**
+ * Build a one-line reference block for an opaque (non-text, non-image) file attachment.
+ */
+function buildFileReference(att: Record<string, unknown>): string {
+  const name = str(att.name, 'file');
+  const mimeType = str(att.mime_type, 'application/octet-stream');
+  const sizeBytes = typeof att.size_bytes === 'number' ? att.size_bytes : null;
+  const sizeStr = sizeBytes !== null ? `, ${sizeBytes} bytes` : '';
+  return `[File attachment: ${name} (${mimeType}${sizeStr})]`;
+}
+
 export interface AttachmentFetchResponse {
   ok: boolean;
   status: number;
@@ -558,8 +576,10 @@ function attachmentUnavailableBlock(source: ImageBlockUrlSource, reason: string)
 /**
  * Extract message content as content blocks (text + image attachments from
  * context.attachments). Images can arrive as inline base64 data or as GCS
- * signed URLs (the scalable path for operator-uploaded files). Text-only
- * messages produce a single text block.
+ * signed URLs (the scalable path for operator-uploaded files). Non-image
+ * attachments with text/* MIME types are decoded and emitted as text blocks;
+ * opaque files (PDF, binary, URL-only) are emitted as a one-line reference
+ * block. Text-only messages produce a single text block.
  */
 export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] {
   const blocks: ContentBlock[] = [];
@@ -573,38 +593,54 @@ export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] 
       let imageCount = 0;
       for (const att of raw as Array<Record<string, unknown>>) {
         if (imageCount >= MAX_IMAGES_PER_TURN) break;
-        if (str(att.type) !== 'image') continue;
-        const mediaType = normalizeImageMediaType(att.mime_type);
-        if (!mediaType) continue;
-        // Inline base64 data — preferred when available.
-        if (typeof att.data === 'string' && att.data && att.data.length <= MAX_IMAGE_BASE64_LENGTH) {
-          blocks.push({
-            type: 'image',
-            source: { type: 'base64', media_type: mediaType, data: att.data },
-          });
-          imageCount++;
-        } else if (typeof att.url === 'string' && att.url) {
-          const url = att.url.trim();
-          // GCS signed URL — fallback when data is absent or oversized. The URL
-          // is an internal transport detail; materializeContentBlocks fetches it
-          // and converts it to base64 before the model sees the turn.
-          if (isAllowedAttachmentDownloadUrl(url)) {
+        if (str(att.type) === 'image') {
+          const mediaType = normalizeImageMediaType(att.mime_type);
+          if (!mediaType) continue;
+          // Inline base64 data — preferred when available.
+          if (typeof att.data === 'string' && att.data && att.data.length <= MAX_IMAGE_BASE64_LENGTH) {
             blocks.push({
               type: 'image',
-              source: {
-                type: 'url',
-                url,
-                media_type: mediaType,
-                name: attachmentName(att.name) || undefined,
-              },
+              source: { type: 'base64', media_type: mediaType, data: att.data },
             });
-          } else {
-            blocks.push(attachmentUnavailableBlock(
-              { type: 'url', url: '', media_type: mediaType, name: attachmentName(att.name) || undefined },
-              'unsupported download URL',
-            ));
+            imageCount++;
+          } else if (typeof att.url === 'string' && att.url) {
+            const url = att.url.trim();
+            // GCS signed URL — fallback when data is absent or oversized. The URL
+            // is an internal transport detail; materializeContentBlocks fetches it
+            // and converts it to base64 before the model sees the turn.
+            if (isAllowedAttachmentDownloadUrl(url)) {
+              blocks.push({
+                type: 'image',
+                source: {
+                  type: 'url',
+                  url,
+                  media_type: mediaType,
+                  name: attachmentName(att.name) || undefined,
+                },
+              });
+            } else {
+              blocks.push(attachmentUnavailableBlock(
+                { type: 'url', url: '', media_type: mediaType, name: attachmentName(att.name) || undefined },
+                'unsupported download URL',
+              ));
+            }
+            imageCount++;
           }
-          imageCount++;
+        } else {
+          // Non-image attachment: decode text-like content or emit a reference block.
+          const attData = typeof att.data === 'string' ? att.data : '';
+          const mimeType = str(att.mime_type);
+          if (attData && isTextLikeMime(mimeType)) {
+            try {
+              const decoded = Buffer.from(attData, 'base64').toString('utf-8');
+              const name = str(att.name, 'file');
+              blocks.push({ type: 'text', text: `[Attachment: ${name}]\n${decoded}` });
+            } catch {
+              blocks.push({ type: 'text', text: buildFileReference(att) });
+            }
+          } else {
+            blocks.push({ type: 'text', text: buildFileReference(att) });
+          }
         }
       }
     }

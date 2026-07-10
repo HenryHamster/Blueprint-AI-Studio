@@ -37,7 +37,7 @@ describe('fileToMessageAttachment', () => {
     const att = await fileToMessageAttachment(file);
 
     expect(att).toMatchObject({
-      type: 'file',
+      type: 'image',
       mime_type: 'image/png',
       name: 'icon.png',
       size_bytes: pngBytes.length,
