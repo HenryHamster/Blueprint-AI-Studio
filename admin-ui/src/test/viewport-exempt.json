@@ -48,6 +48,7 @@
     "StrategicContextDescriptor": "Composer/receipt context chip rendered exclusively inside MessagesComposer and MessageBubble; viewport coverage is provided by MessagesComposer.viewport.test.tsx and MessagesPanel.viewport.test.tsx.",
     "StrategicContextMap": "Context-map visualization rendered inside StrategicContextWorkspace and StrategicContextArtifactSlot; viewport coverage is provided by StrategicContextWorkspace.viewport.test.tsx and StrategicContextRail.viewport.test.tsx.",
     "StrategicSessionEvents": "Session-event list rendered inside StrategicContextWorkspace and StrategicContextRail; viewport coverage is provided by StrategicContextWorkspace.viewport.test.tsx and StrategicContextRail.viewport.test.tsx.",
-    "MarkdownContentInner": "Lazy-loaded inner implementation of MarkdownContent; never rendered standalone — always composed via MarkdownContent which wraps it in a Suspense boundary. Viewport coverage is provided by MarkdownContent.viewport.test.tsx which exercises the rendered output at 375px."
+    "MarkdownContentInner": "Lazy-loaded inner implementation of MarkdownContent; never rendered standalone — always composed via MarkdownContent which wraps it in a Suspense boundary. Viewport coverage is provided by MarkdownContent.viewport.test.tsx which exercises the rendered output at 375px.",
+    "RailMiniCanvas": "Compact SVG canvas visualization rendered exclusively inside StrategicContextRail's context section; never rendered standalone — viewport coverage is provided by StrategicContextRail.viewport.test.tsx which exercises the rail composition inline."
   }
 }
