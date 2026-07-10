@@ -14,7 +14,7 @@ import {
   AUTONOMOUS_FLOOR_TICK_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
-  MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN,
+  MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN, MAX_TEXT_ATTACHMENT_BYTES,
   modelContextLimit, compactionThreshold, buildCompactionCheckpoint,
   DEFAULT_CONTEXT_LIMIT, COMPACTION_THRESHOLD_RATIO,
   type ExamSurface, type ExamRecord, type ContentBlock,
@@ -537,6 +537,90 @@ describe('extractMessageTurn / combineOperatorMessages', () => {
     expect(out).toEqual([
       { type: 'text', text: '[Attached image "huge.png" could not be loaded: image is too large.]' },
     ]);
+  });
+
+  it('text attachment content reaches the model via GCS URL fetch', async () => {
+    // Operator uploads a Python file; backend stores only {type, url, mime_type, name} — no inline data.
+    const signedUrl = 'https://storage.googleapis.com/bucket/script.py?X-Goog-Signature=abc123';
+    const fileContent = 'def hello():\n    print("Hello, world!")\n';
+    const fetchCalls: string[] = [];
+
+    // Step 1: extractMessageTurn emits a text_url block for the URL-only text file.
+    const blocks = extractMessageTurn({
+      content: 'review this file',
+      context: {
+        attachments: [
+          { type: 'file', mime_type: 'text/x-python', url: signedUrl, name: 'script.py', size_bytes: fileContent.length },
+        ],
+      },
+    });
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toEqual({ type: 'text', text: 'review this file' });
+    expect(blocks[1]).toEqual({ type: 'text_url', url: signedUrl, name: 'script.py', mime_type: 'text/x-python' });
+
+    // Step 2: materializeContentBlocks fetches the URL and inlines the content as a text block.
+    const out = await materializeContentBlocks(blocks, (url) => {
+      fetchCalls.push(url);
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(fileContent);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        arrayBuffer: () => Promise.resolve(bytes.buffer),
+      });
+    });
+
+    expect(fetchCalls).toEqual([signedUrl]);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toEqual({ type: 'text', text: 'review this file' });
+    expect(out[1]).toEqual({ type: 'text', text: `[Attachment: script.py]\n${fileContent}` });
+    // Verify the file body is present — this is the seam: content reaches the model input.
+    expect(out[1].type === 'text' && out[1].text).toContain('def hello()');
+  });
+
+  it('text attachment URL fetch failure degrades to a notice without throwing', async () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/notes.txt?X-Goog-Signature=abc123';
+    const blocks = extractMessageTurn({
+      content: 'here',
+      context: {
+        attachments: [{ type: 'file', mime_type: 'text/plain', url: signedUrl, name: 'notes.txt', size_bytes: 100 }],
+      },
+    });
+    const out = await materializeContentBlocks(blocks, () => Promise.resolve({
+      ok: false,
+      status: 403,
+      headers: { get: () => null },
+      arrayBuffer: () => Promise.resolve(new ArrayBuffer(0)),
+    }));
+    expect(out).toEqual([
+      { type: 'text', text: 'here' },
+      { type: 'text', text: '[Attachment "notes.txt" could not be loaded: download failed (403).]' },
+    ]);
+  });
+
+  it('text attachment content is truncated when it exceeds MAX_TEXT_ATTACHMENT_BYTES', async () => {
+    const signedUrl = 'https://storage.googleapis.com/bucket/big.txt?X-Goog-Signature=abc123';
+    const blocks = extractMessageTurn({
+      content: 'check this',
+      context: {
+        attachments: [{ type: 'file', mime_type: 'text/plain', url: signedUrl, name: 'big.txt', size_bytes: MAX_TEXT_ATTACHMENT_BYTES + 10 }],
+      },
+    });
+    const bigContent = 'A'.repeat(MAX_TEXT_ATTACHMENT_BYTES + 10);
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(bigContent);
+    const out = await materializeContentBlocks(blocks, () => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      arrayBuffer: () => Promise.resolve(bytes.buffer),
+    }));
+    expect(out).toHaveLength(2);
+    const textOut = out[1].type === 'text' ? out[1].text : '';
+    expect(textOut).toContain('[... truncated]');
+    // Output should not contain the full original content (only the sliced prefix).
+    expect(textOut).not.toContain(bigContent);
   });
 });
 
