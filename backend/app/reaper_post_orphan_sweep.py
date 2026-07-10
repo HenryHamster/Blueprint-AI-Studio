@@ -143,7 +143,21 @@ async def run_post_orphan_sweep(
                 # round-trips cannot silently exhaust
                 # REAPER_HANG_SECONDS on this loop either (mirrors
                 # the stale-EVALUATING sweep at reaper.py:2789).
-                await _check_and_trigger_rollup(task, session, progress_cb=progress_cb)
+                # C4: _check_and_trigger_rollup may perform a silent internal
+                # rollback (e.g. `_sess_poisoned` recovery) WITHOUT re-raising.
+                # When that happens, all ORM objects in the shared session are
+                # expired — the next iteration's `task.status` would trigger a
+                # sync lazy-refresh inside the AsyncSession and raise
+                # MissingGreenlet on asyncpg. Re-batch immediately if the
+                # return value signals a silent rollback.
+                _rolled_back = await _check_and_trigger_rollup(
+                    task, session, progress_cb=progress_cb
+                )
+                if _rolled_back:
+                    _rows = await session.execute(
+                        select(Task).where(Task.id.in_(post_reap_task_ids))
+                    )
+                    _rollup_task_batch = {t.id: t for t in _rows.scalars().all()}
                 # Completion-side warm-reuse: if that landing
                 # completed the parent rollup, stamp the
                 # _deps_satisfied marker on the dependents it just

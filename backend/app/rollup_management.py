@@ -1198,8 +1198,14 @@ async def _record_completed_children_merge_evidence(
 
 async def _check_and_trigger_rollup(
     child_task: Task, session: AsyncSession, progress_cb=None
-) -> None:
+) -> bool:
     """Check if all siblings are done and trigger rollup PR for the parent.
+
+    Returns:
+        True if a silent internal session.rollback() was performed (e.g. the
+        ``_sess_poisoned`` recovery path). The caller should re-fetch ORM objects
+        before the next attribute access to avoid MissingGreenlet on expired
+        instances in async contexts. False (or None) otherwise — no re-batch needed.
 
     Called after a child task completes, fails, or is cancelled.
     Also called from admin PATCH when status/context changes.
@@ -1229,6 +1235,12 @@ async def _check_and_trigger_rollup(
         pr_is_not_behind_for,
         update_branch_with_sha_retry,
     )
+
+    # Track whether a silent internal rollback was performed (via the
+    # _sess_poisoned recovery path). The caller inspects this return value
+    # to decide whether to re-fetch ORM objects before the next attribute
+    # access, avoiding MissingGreenlet on expired instances in asyncpg.
+    _did_silent_rollback = False
 
     if not child_task.parent_task_id:
         return
@@ -4817,6 +4829,7 @@ async def _check_and_trigger_rollup(
                 with contextlib.suppress(Exception):
                     _sess_poisoned = not session.is_active
                 if _sess_poisoned:
+                    _did_silent_rollback = True
                     with contextlib.suppress(Exception):
                         await session.rollback()
                     if parent_id_local is not None:
@@ -4884,7 +4897,7 @@ async def _check_and_trigger_rollup(
                 # PR marker; the next sweep cycle re-enters with fresh parent
                 # state and resumes from the existing-PR branch.
                 if isinstance(e, _ParentMutatedDuringPRCreation):
-                    return
+                    return _did_silent_rollback
                 err_str = str(e).lower()
                 # Auth failures: invalidate the cached token so the next retry uses a fresh one
                 if (
@@ -5030,4 +5043,9 @@ async def _check_and_trigger_rollup(
         await broadcast_to_project(str(parent.project_id), "task_updated",
                                    {"task_id": str(parent.id), "status": TaskStatus.FAILED})
         logger.error(f"[ROLLUP] Parent {parent.id} failed — {failed_count} children failed")
+
+    # Every path above either returns explicitly or falls through to here.
+    # If a silent internal rollback occurred, signal it to the caller so it
+    # can re-fetch ORM objects before the next attribute access.
+    return _did_silent_rollback
 # fmt: on
