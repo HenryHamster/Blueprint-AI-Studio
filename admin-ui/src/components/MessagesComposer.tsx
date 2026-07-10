@@ -1,11 +1,19 @@
-import { type RefObject, useRef, useState } from 'react';
-import { Command, X, Send, Reply, Paperclip, FileText } from 'lucide-react';
+import { useRef, useState, type RefObject } from 'react';
+import { Command, X, Send, Reply, Paperclip, FileText, Image } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
 import { MESSAGE_CONTENT_MAX } from '../api';
-import type { MessageAttachment } from '../types/messages';
+
+export interface PendingAttachment {
+  id: string;
+  file: File;
+  previewUrl: string | null;
+  mime_type: string;
+  name: string;
+  size_bytes: number;
+}
 
 export interface MessagesComposerProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
@@ -21,6 +29,8 @@ export interface MessagesComposerProps {
   starterPrompts?: string[];
   capabilityHint?: string | null;
   disabledReason?: string | null;
+  pendingAttachments?: PendingAttachment[];
+  uploading?: boolean;
   onPickStarterPrompt?: (value: string) => void;
   onOpenStrategicContext?: () => void;
   onOpenCommandPalette?: () => void;
@@ -28,12 +38,8 @@ export interface MessagesComposerProps {
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
   onSubmit: () => void;
-  /** Pending file attachments to show as preview chips before sending. */
-  pendingAttachments?: MessageAttachment[];
-  /** Called when the user picks, drops, or pastes files. */
-  onAttachFiles?: (files: File[]) => void;
-  /** Called when the user removes a pending attachment by index. */
-  onRemoveAttachment?: (index: number) => void;
+  onAddAttachment?: (file: File) => void;
+  onRemoveAttachment?: (id: string) => void;
   chrome?: 'full' | 'minimal';
 }
 
@@ -57,6 +63,8 @@ export function MessagesComposer({
   starterPrompts,
   capabilityHint,
   disabledReason,
+  pendingAttachments,
+  uploading,
   onOpenStrategicContext,
   onOpenCommandPalette,
   onChangeType,
@@ -64,49 +72,12 @@ export function MessagesComposer({
   onCancelReply,
   onSubmit,
   onPickStarterPrompt,
-  chrome = 'full',
-  pendingAttachments = [],
-  onAttachFiles,
+  onAddAttachment,
   onRemoveAttachment,
+  chrome = 'full',
 }: MessagesComposerProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
-
-  function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
-    if (e.target.files?.length && onAttachFiles) onAttachFiles(Array.from(e.target.files));
-    e.target.value = '';
-  }
-
-  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
-    if (!onAttachFiles) return;
-    const files = Array.from(e.clipboardData?.items || [])
-      .filter(i => i.kind === 'file')
-      .map(i => i.getAsFile())
-      .filter(Boolean) as File[];
-    if (files.length) { e.preventDefault(); onAttachFiles(files); }
-  }
-
-  function handleDragOver(e: React.DragEvent) {
-    e.preventDefault();
-    setDragOver(true);
-  }
-
-  function handleDragLeave(e: React.DragEvent) {
-    // Only clear the drag-over highlight when the cursor actually leaves the
-    // drop-zone container — not when it moves from the container to a child
-    // element (textarea, button, etc.) inside it.
-    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
-    setDragOver(false);
-  }
-
-  function handleDrop(e: React.DragEvent) {
-    e.preventDefault();
-    setDragOver(false);
-    if (e.dataTransfer.files.length && onAttachFiles) {
-      onAttachFiles(Array.from(e.dataTransfer.files));
-    }
-  }
-
   // Auto-resize textarea — max 3 rows (~96px).
   function handleTextareaInput() {
     const el = textareaRef.current;
@@ -129,6 +100,53 @@ export function MessagesComposer({
   const hintArming = minimal && strategistBusy && lastArming !== 'not_armed' ? null : lastArming;
   const hintText = composerHintCopy(newType, hintArming, strategistBusy);
   const showHint = Boolean(disabledReason) || !minimal || Boolean(strategistBusy) || lastArming === 'not_armed';
+  const hasAttachments = pendingAttachments != null && pendingAttachments.length > 0;
+
+  // ── File handlers ──────────────────────────────────────────────────────────
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = e.target.files;
+    if (!files || !onAddAttachment) return;
+    for (let i = 0; i < files.length; i++) onAddAttachment(files[i]);
+    e.target.value = '';
+  }
+
+  function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    if (!onAddAttachment) return;
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) onAddAttachment(file);
+      }
+    }
+  }
+
+  function handleDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(true);
+  }
+  function handleDragLeave(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setDragOver(false);
+  }
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    if (!onAddAttachment) return;
+    const files = e.dataTransfer?.files;
+    if (!files) return;
+    for (let i = 0; i < files.length; i++) onAddAttachment(files[i]);
+  }
+
+  const attHasPreview = (att: PendingAttachment): string | null =>
+    att.previewUrl;
+
 
   return (
     <div className={minimal
@@ -169,41 +187,101 @@ export function MessagesComposer({
           </button>
         </div>
       )}
+      {/* Hidden file input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        onChange={handleFileChange}
+        className="hidden"
+        tabIndex={-1}
+        accept="image/*,.pdf,.txt,.csv,.json,.xml,.md,.log,.yaml,.yml,.env,.cfg,.ini,.toml,.js,.ts,.py,.go,.rs,.java,.kt,.swift,.sql,.sh,.bat,.ps1"
+      />
+
+      {/* Attachment preview strip */}
+      {hasAttachments && pendingAttachments && (
+        <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex flex-wrap gap-2 px-1`}>
+          {pendingAttachments.map(att => {
+            const preview = attHasPreview(att);
+            return (
+              <div key={att.id} className="group relative flex items-center gap-1.5 rounded-md border border-neutral-700/60 bg-neutral-800/40 px-2 py-1.5 pr-7 text-xs text-neutral-300">
+                {preview ? (
+                  <img src={preview} alt={att.name} className="h-8 w-8 rounded object-cover" />
+                ) : att.mime_type?.startsWith('image/') ? (
+                  <Image className="h-4 w-4 shrink-0 text-neutral-500" />
+                ) : (
+                  <FileText className="h-4 w-4 shrink-0 text-neutral-500" />
+                )}
+                <span className="max-w-[120px] truncate">{att.name}</span>
+                {att.size_bytes != null && (
+                  <span className="text-neutral-500 shrink-0">
+                    ({att.size_bytes < 1024 ? '<1' : (att.size_bytes / 1024).toFixed(0)} KB)
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => onRemoveAttachment?.(att.id)}
+                  className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center justify-center rounded p-0.5 text-neutral-500 opacity-0 transition-opacity hover:text-neutral-200 group-hover:opacity-100 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto"
+                  aria-label={`Remove ${att.name}`}
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       <div
         data-testid={minimal ? 'strategic-composer-box' : undefined}
-        className={minimal
-        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border ${dragOver ? 'border-emerald-500/60' : 'border-workbench-border-strong/80'} bg-workbench-card p-1 shadow-[0_10px_28px_rgba(0,0,0,0.20),inset_0_1px_0_rgba(255,255,255,0.035)]`
-        : 'flex gap-2 items-end'
-      }
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
-      >
-        <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileSelect} />
+        className={`${minimal
+          ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-workbench-border-strong/80 bg-workbench-card p-1 shadow-[0_10px_28px_rgba(0,0,0,0.20),inset_0_1px_0_rgba(255,255,255,0.035)]`
+          : 'flex gap-2 items-end'
+        } ${dragOver ? 'ring-2 ring-emerald-500/50 border-emerald-500/30' : ''}`}>
         {!minimal && (
           <MessageTypeDropdown value={newType} onChange={onChangeType} compact={minimal} />
         )}
-        {minimal && onOpenCommandPalette && (
+        {minimal && (
+          <>
+            {onOpenCommandPalette && (
+              <button
+                type="button"
+                onClick={onOpenCommandPalette}
+                title="Open command palette (Ctrl+K)"
+                aria-label="Open command palette (Ctrl+K)"
+                className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-100 md:hidden"
+              >
+                <Command className="h-3.5 w-3.5" />
+                <span className="hidden font-mono text-ui-sm text-neutral-500 sm:inline">Ctrl+K</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={composerDisabled}
+              title="Attach file"
+              aria-label="Attach file"
+              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2 text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-300 disabled:opacity-40 md:min-h-8 md:min-w-8"
+            >
+              <Paperclip className="h-3.5 w-3.5" />
+            </button>
+          </>
+        )}
+        {!minimal && (
           <button
             type="button"
-            onClick={onOpenCommandPalette}
-            title="Open command palette (Ctrl+K)"
-            aria-label="Open command palette (Ctrl+K)"
-            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-100 md:hidden"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={composerDisabled}
+            title="Attach file"
+            aria-label="Attach file"
+            className="flex shrink-0 items-center justify-center rounded-xl bg-neutral-900/50 border border-neutral-800/50 p-2.5 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300 disabled:opacity-40 min-h-[44px] min-w-[44px]"
           >
-            <Command className="h-3.5 w-3.5" />
-            <span className="hidden font-mono text-ui-sm text-neutral-500 sm:inline">Ctrl+K</span>
+            <Paperclip className="w-4 h-4" />
           </button>
         )}
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          title="Attach file"
-          aria-label="Attach file"
-          className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:text-neutral-300 md:min-h-8 md:min-w-8"
-        >
-          <Paperclip className="w-4 h-4" />
-        </button>
         <div className="relative flex-1">
           <textarea
             ref={textareaRef}
@@ -225,7 +303,7 @@ export function MessagesComposer({
         <button
           type="button"
           onClick={onSubmit}
-          disabled={composerDisabled || submitting || !newContent.trim() || overLimit}
+          disabled={composerDisabled || submitting || uploading || (!newContent.trim() && !hasAttachments) || overLimit}
           aria-label="Send message"
           title="Send message"
           className={minimal
@@ -236,27 +314,6 @@ export function MessagesComposer({
           <Send className="w-4 h-4" />
         </button>
       </div>
-      {/* Attachment preview strip */}
-      {pendingAttachments.length > 0 && (
-        <div className={`${minimal ? minimalColumnClass : ''} mt-2 flex flex-wrap gap-2`}>
-          {pendingAttachments.map((att, i) => (
-            <div key={att._attachmentKey ?? `${i}-${att.name || ''}-${att.size_bytes || 0}`} className="flex items-center gap-1.5 rounded border border-neutral-700/60 bg-neutral-800/40 px-2.5 py-1.5">
-              {att.mime_type?.startsWith('image/') && att.data ? (
-                <img src={`data:${att.mime_type};base64,${att.data}`} alt={att.name || ''} className="h-8 w-8 rounded object-cover" />
-              ) : (
-                <FileText className="h-4 w-4 shrink-0 text-neutral-500" />
-              )}
-              <span className="max-w-[120px] truncate text-xs text-neutral-300">{att.name || 'File'}</span>
-              {att.size_bytes != null && (
-                <span className="shrink-0 text-xs text-neutral-500">({(att.size_bytes / 1024).toFixed(0)} KB)</span>
-              )}
-              <button type="button" onClick={() => onRemoveAttachment?.(i)} className="text-neutral-500 hover:text-neutral-300 p-0.5 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto" aria-label={`Remove ${att.name || 'file'}`}>
-                <X className="h-3 w-3" />
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
       {/* Steering hint: grounded in the last send's real outcome when available,
           otherwise predicted from the selected type. */}
       {(showHint || nearLimit) && (

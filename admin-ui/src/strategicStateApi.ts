@@ -1241,3 +1241,30 @@ export async function stopStrategicSession(
   }
   return res.json() as Promise<StrategicSessionStopResponse>;
 }
+
+export interface MessageAttachmentUploadUrlResponse {
+  upload_url: string;
+  download_url: string;
+  storage_uri: string;
+  attachment_id: string;
+}
+
+export async function getMessageAttachmentUploadUrl(
+  projectId: string,
+  filename: string,
+  contentType?: string,
+): Promise<MessageAttachmentUploadUrlResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/messages/attachment-upload-url`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, content_type: contentType }),
+    },
+  );
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error((detail as { detail?: string }).detail || `Failed to get upload URL: ${res.status}`);
+  }
+  return res.json() as Promise<MessageAttachmentUploadUrlResponse>;
+}

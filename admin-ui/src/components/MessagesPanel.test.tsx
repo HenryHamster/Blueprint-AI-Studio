@@ -38,17 +38,6 @@ vi.mock('../api', async (importOriginal) => {
 
 import { apiFetch } from '../api';
 
-// Mock fileToMessageAttachment so the FileReader error path can be tested
-// at the integration level (the error-handling composition inside
-// MessagesPanel.handleAttachFiles). Default implementation delegates to
-// the real FileReader so existing attachment-integration tests still work.
-const { mockFileToMessageAttachment } = vi.hoisted(() => ({
-  mockFileToMessageAttachment: vi.fn(),
-}));
-vi.mock('../utils/attachments', () => ({
-  fileToMessageAttachment: mockFileToMessageAttachment,
-}));
-
 // jsdom does not implement scrollIntoView; several panel actions invoke it
 // (summary card → routine section scroll, showOnlyNew → scroll to first new
 // bubble). Stub it module-wide so click handlers do not throw and surface as
@@ -5018,6 +5007,43 @@ describe('MessagesPanel send arming receipt', () => {
     expect(onStrategicInteraction).toHaveBeenCalledTimes(1);
   });
 
+  test('answering a question with attachments is blocked without dropping the attachment', async () => {
+    const question = makeMsg({
+      id: 'q-attachment',
+      message_type: 'QUESTION',
+      from_type: 'agent',
+      content: 'Can you inspect the screenshot?',
+      status: 'open',
+    });
+    const patchBodies: unknown[] = [];
+    _setupQuestionAnswerMock(question, patchBodies);
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+
+    const replyBtn = [...el.querySelectorAll('button')].find(button => button.title === 'Reply');
+    expect(replyBtn).toBeTruthy();
+    await act(async () => { (replyBtn as HTMLButtonElement).click(); });
+
+    const fileInput = el.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(fileInput).toBeTruthy();
+    await act(async () => {
+      Object.defineProperty(fileInput, 'files', {
+        value: [new File(['fake-png'], 'question-screenshot.png', { type: 'image/png' })],
+        configurable: true,
+      });
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    await typeAndSend(el, 'see attached');
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith('Remove attachments before answering a question', 'error');
+    });
+    expect(patchBodies).toHaveLength(0);
+    expect(el.textContent).toContain('question-screenshot.png');
+  });
+
   test('passive_note send shows a success "won’t wake" toast', async () => {
     _setupSendMock({ arming: 'passive_note' });
     const addToast = vi.fn();
@@ -5234,6 +5260,229 @@ describe('MessagesPanel send arming receipt', () => {
     expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
   });
 
+  test('attachment upload flow: type=image + signed download URL in context', async () => {
+    const uploadUrlCalls: Array<{ body: unknown }> = [];
+    const messagePostCalls: Array<{ body: unknown }> = [];
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      const body = (init as RequestInit | undefined)?.body;
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        uploadUrlCalls.push({ body: body ? JSON.parse(String(body)) : null });
+        return new Response(JSON.stringify({
+          upload_url: 'https://storage.googleapis.com/signed-upload',
+          download_url: 'https://storage.googleapis.com/signed-download',
+          storage_uri: 'gs://bucket/message-attachments/proj-1/att-123/test.png',
+          attachment_id: 'att-123',
+        }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages$/.test(urlStr) && method === 'POST') {
+        messagePostCalls.push({ body: body ? JSON.parse(String(body)) : null });
+        return new Response(JSON.stringify({ id: 'm1', status: 'created', arming: 'steering' }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url) === 'https://storage.googleapis.com/signed-upload') {
+        return new Response(null, { status: 200 });
+      }
+      return origFetch(url);
+    });
+
+    const addToast = vi.fn();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    // Select an image file via the file input.
+    const fileInput = el.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(fileInput).toBeTruthy();
+    const testFile = new File(['fake-png'], 'test-screenshot.png', { type: 'image/png' });
+    await act(async () => {
+      Object.defineProperty(fileInput, 'files', {
+        value: [testFile],
+        configurable: true,
+      });
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    // Attachment preview renders with file name.
+    expect(el.textContent).toContain('test-screenshot.png');
+
+    // Remove the attachment and verify it disappears.
+    const removeBtn = el.querySelector('button[aria-label="Remove test-screenshot.png"]') as HTMLButtonElement;
+    expect(removeBtn).toBeTruthy();
+    await act(async () => { removeBtn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+    expect(el.textContent).not.toContain('test-screenshot.png');
+
+    // Re-add by redefining files (configurable: true allows re-definition).
+    await act(async () => {
+      Object.defineProperty(fileInput, 'files', {
+        value: [new File(['fake-png'], 'test-screenshot.png', { type: 'image/png' })],
+        configurable: true,
+      });
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    // Verify re-add rendered the attachment.
+    expect(el.textContent).toContain('test-screenshot.png');
+
+    // Add text and send.
+    const textarea = el.querySelector('textarea[placeholder="Type a message..."]') as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype, 'value',
+    )!.set!;
+    await act(async () => {
+      nativeSetter.call(textarea, 'check this screenshot');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const sendBtn = el.querySelector('button[class*="bg-blue-600"]') as HTMLButtonElement;
+    expect(sendBtn.disabled).toBe(false);
+    await act(async () => { sendBtn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+    // Assert upload-URL endpoint was called.
+    await waitFor(() => expect(uploadUrlCalls.length).toBe(1), { timeout: 3000 });
+    expect(uploadUrlCalls[0].body).toMatchObject({ filename: 'test-screenshot.png', content_type: 'image/png' });
+
+    // Assert GCS PUT upload was performed.
+    await waitFor(() => {
+      expect(globalThis.fetch).toHaveBeenCalledWith('https://storage.googleapis.com/signed-upload', expect.anything());
+    }, { timeout: 3000 });
+
+    // Assert message POST carries the attachment with corrected type and signed download URL.
+    await waitFor(() => expect(messagePostCalls.length).toBe(1), { timeout: 3000 });
+    const sentPayload = messagePostCalls[0].body as Record<string, unknown>;
+    const ctx = sentPayload.context;
+    expect(ctx).toBeTruthy();
+    const attachments = (ctx as Record<string, unknown>).attachments as Array<Record<string, unknown>>;
+    expect(attachments).toBeTruthy();
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0].type).toBe('image');
+    expect(attachments[0].url).toBe('https://storage.googleapis.com/signed-download');
+    expect(attachments[0].mime_type).toBe('image/png');
+    expect(attachments[0].name).toBe('test-screenshot.png');
+
+    globalThis.fetch = origFetch;
+  });
+
+  test('attachment upload flow: upload failure does not send message without attachment', async () => {
+    const messagePostCalls: Array<{ body: unknown }> = [];
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      const body = (init as RequestInit | undefined)?.body;
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        return new Response(JSON.stringify({
+          upload_url: 'https://storage.googleapis.com/signed-upload-fails',
+          download_url: 'https://storage.googleapis.com/signed-download',
+          storage_uri: 'gs://bucket/message-attachments/proj-1/att-123/test.png',
+          attachment_id: 'att-123',
+        }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages$/.test(urlStr) && method === 'POST') {
+        messagePostCalls.push({ body: body ? JSON.parse(String(body)) : null });
+        return new Response(JSON.stringify({ id: 'm1', status: 'created', arming: 'steering' }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url) === 'https://storage.googleapis.com/signed-upload-fails') {
+        return new Response(null, { status: 500 });
+      }
+      return origFetch(url);
+    });
+
+    try {
+      const addToast = vi.fn();
+      _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <MessagesPanel
+            selectedProjectId="proj-1"
+            onClose={() => {}}
+            addToast={addToast as never}
+            onMessageCountChange={() => {}}
+          />,
+        );
+      });
+      await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+      const el = host as HTMLDivElement;
+
+      const fileInput = el.querySelector('input[type="file"]') as HTMLInputElement;
+      expect(fileInput).toBeTruthy();
+      await act(async () => {
+        Object.defineProperty(fileInput, 'files', {
+          value: [new File(['fake-png'], 'test-screenshot.png', { type: 'image/png' })],
+          configurable: true,
+        });
+        fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+      const textarea = el.querySelector('textarea[placeholder="Type a message..."]') as HTMLTextAreaElement;
+      expect(textarea).toBeTruthy();
+      const nativeSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype, 'value',
+      )!.set!;
+      await act(async () => {
+        nativeSetter.call(textarea, 'check this screenshot');
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      const sendBtn = el.querySelector('button[class*="bg-blue-600"]') as HTMLButtonElement;
+      expect(sendBtn.disabled).toBe(false);
+      await act(async () => { sendBtn.click(); });
+
+      await waitFor(() => {
+        expect(addToast).toHaveBeenCalledWith('Failed to upload test-screenshot.png', 'error');
+      }, { timeout: 3000 });
+      expect(addToast).not.toHaveBeenCalledWith('Failed to send message', 'error');
+      expect(messagePostCalls).toHaveLength(0);
+      expect(el.textContent).toContain('test-screenshot.png');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   test('refreshes strategic state once after duplicate steering replay', async () => {
     _setupSendMock({ arming: 'duplicate' });
     const addToast = vi.fn();
@@ -5273,14 +5522,19 @@ describe('MessagesPanel send arming receipt', () => {
 describe('MessagesPanel attachment integration', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
+  let originalFetch: typeof globalThis.fetch | undefined;
 
   beforeEach(async () => {
     localStorage.clear();
-    // Restore the real fileToMessageAttachment implementation so existing
-    // attachment tests continue to work through the mock (cleared by
-    // vi.clearAllMocks in afterEach).
-    const realModule = await vi.importActual<typeof import('../utils/attachments')>('../utils/attachments');
-    mockFileToMessageAttachment.mockImplementation(realModule.fileToMessageAttachment);
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: RequestInfo | URL) => {
+      if (String(url) === 'https://storage.googleapis.com/signed-upload') {
+        return new Response(null, { status: 200 });
+      }
+      return originalFetch
+        ? originalFetch(url)
+        : new Response('', { status: 404 });
+    });
   });
 
   afterEach(() => {
@@ -5289,6 +5543,7 @@ describe('MessagesPanel attachment integration', () => {
     root = null;
     host?.remove();
     host = null;
+    if (originalFetch) globalThis.fetch = originalFetch;
     vi.clearAllMocks();
   });
 
@@ -5298,6 +5553,14 @@ describe('MessagesPanel attachment integration', () => {
       const method = (init as RequestInit | undefined)?.method ?? 'GET';
       if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
         return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        return new Response(JSON.stringify({
+          upload_url: 'https://storage.googleapis.com/signed-upload',
+          download_url: 'https://storage.googleapis.com/signed-download',
+          storage_uri: 'gs://bucket/message-attachments/proj-1/att-123/report.txt',
+          attachment_id: 'att-123',
+        }), { status: 200 });
       }
       if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'POST') {
         capturedBodies.push(JSON.parse(String((init as RequestInit).body)));
@@ -5400,7 +5663,7 @@ describe('MessagesPanel attachment integration', () => {
     expect(el.textContent).toContain('second.txt');
   });
 
-  test('sending with pendingAttachments includes context.attachments in POST body', async () => {
+  test('sending with pendingAttachments uploads and includes signed download URL in POST body', async () => {
     const addToast = vi.fn();
     const capturedBodies: Record<string, unknown>[] = [];
     _setupAttachmentMock(capturedBodies);
@@ -5428,9 +5691,8 @@ describe('MessagesPanel attachment integration', () => {
     await act(async () => { sendBtn.click(); });
     await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
 
-    // The POST body must include context.attachments set from pendingAttachments
-    // with the full shape (type, name, mime_type, data, size_bytes) so a
-    // regression that drops file content is caught.
+    // The POST body must include the uploaded attachment metadata and signed
+    // download URL, not inline base64 data.
     expect(capturedBodies.length).toBeGreaterThanOrEqual(1);
     const postBody = capturedBodies[capturedBodies.length - 1];
     expect(postBody).toMatchObject({
@@ -5438,15 +5700,17 @@ describe('MessagesPanel attachment integration', () => {
       context: expect.objectContaining({
         attachments: expect.arrayContaining([
           expect.objectContaining({
-            type: 'file',
+            type: 'attachment',
             name: 'report.txt',
             mime_type: 'text/plain',
-            data: expect.any(String),
             size_bytes: 14,
+            url: 'https://storage.googleapis.com/signed-download',
           }),
         ]),
       }),
     });
+    const attachments = ((postBody.context as { attachments?: unknown[] }).attachments ?? []) as Array<Record<string, unknown>>;
+    expect(attachments[0]).not.toHaveProperty('data');
   });
 
   test('oversized files (>50MB) are rejected with a toast and no chips', async () => {
@@ -5505,45 +5769,42 @@ describe('MessagesPanel attachment integration', () => {
     });
     await act(async () => { await new Promise<void>(res => setTimeout(res, 10)); });
 
-    // One toast for both files
+    // One toast per rejected file; no file is retained for upload.
     expect(addToast).toHaveBeenCalledWith(
       expect.stringContaining('50 MB size limit'),
       'error',
     );
-    expect(addToast).toHaveBeenCalledTimes(1);
+    expect(addToast).toHaveBeenCalledTimes(2);
     // No chips — early return before any file reading
     expect(el.querySelector('[aria-label^="Remove"]')).toBeNull();
   });
 
-  test('FileReader error shows failure toast without rendering chips', async () => {
-    mockFileToMessageAttachment.mockRejectedValue(new Error('mock FileReader error'));
+  test('object URL preview failure still renders attachment chip', async () => {
     const addToast = vi.fn();
     _setupAttachmentMock([]);
     const el = await renderPanel(addToast);
 
-    // Attach a valid-size file — the mock will reject during reading
-    const fileInput = el.querySelector<HTMLInputElement>('input[type="file"]')!;
-    expect(fileInput).toBeTruthy();
-    const file = new File(['content'], 'broken.txt', { type: 'text/plain' });
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    Object.defineProperty(fileInput, 'files', {
-      value: dt.files,
-      writable: true,
+    const originalCreateObjectURL = URL.createObjectURL;
+    Object.defineProperty(URL, 'createObjectURL', {
       configurable: true,
+      value: vi.fn(() => { throw new Error('mock preview error'); }),
     });
-    await act(async () => {
-      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-    // Wait for the async Promise.allSettled to settle
-    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    try {
+      await attachFile(el, 'broken.png', 'content', 'image/png');
 
-    expect(addToast).toHaveBeenCalledWith(
-      expect.stringContaining('failed to read'),
-      'error',
-    );
-    // No chips should appear since all reads failed
-    expect(el.querySelector('[aria-label^="Remove"]')).toBeNull();
+      await waitFor(() => {
+        expect(el.textContent).toContain('broken.png');
+      });
+      expect(addToast).not.toHaveBeenCalledWith(
+        expect.stringContaining('failed to read'),
+        'error',
+      );
+    } finally {
+      Object.defineProperty(URL, 'createObjectURL', {
+        configurable: true,
+        value: originalCreateObjectURL,
+      });
+    }
   });
 });
 

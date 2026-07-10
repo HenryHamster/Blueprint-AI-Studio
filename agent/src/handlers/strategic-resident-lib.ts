@@ -22,6 +22,15 @@ export const MAX_IMAGE_BASE64_LENGTH = 13_000_000;
  */
 export const MAX_IMAGES_PER_TURN = 8;
 
+/**
+ * Maximum downloaded image bytes for URL-sourced attachments. This is aligned
+ * with MAX_IMAGE_BASE64_LENGTH so a downloaded image cannot expand past the
+ * model input cap after base64 encoding.
+ */
+export const MAX_IMAGE_DOWNLOAD_BYTES = Math.floor(MAX_IMAGE_BASE64_LENGTH * 3 / 4);
+
+const MODEL_IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
 export interface ResidentInboundMessage {
   id?: string;
   created_at?: string;
@@ -504,12 +513,53 @@ export function dedupNewMessages(
 
 /** Content block types for multimodal message delivery. */
 export interface TextBlock { type: 'text'; text: string; }
-export interface ImageBlock { type: 'image'; source: { type: 'base64'; media_type: string; data: string; }; }
+export interface ImageBlockBase64Source { type: 'base64'; media_type: string; data: string; }
+export interface ImageBlockUrlSource { type: 'url'; url: string; media_type: string; name?: string; }
+export type ImageBlockSource = ImageBlockBase64Source | ImageBlockUrlSource;
+export interface ImageBlock { type: 'image'; source: ImageBlockSource; }
 export type ContentBlock = TextBlock | ImageBlock;
 
+export interface AttachmentFetchResponse {
+  ok: boolean;
+  status: number;
+  headers: { get(name: string): string | null };
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export type AttachmentFetch = (url: string) => Promise<AttachmentFetchResponse>;
+
+function normalizeImageMediaType(value: unknown): string {
+  const mediaType = str(value).split(';', 1)[0].trim().toLowerCase();
+  return MODEL_IMAGE_MEDIA_TYPES.has(mediaType) ? mediaType : '';
+}
+
+function attachmentName(value: unknown): string {
+  return str(value).trim().slice(0, 200);
+}
+
+export function isAllowedAttachmentDownloadUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:') return false;
+    const host = url.hostname.toLowerCase();
+    const gcsHost = host === 'storage.googleapis.com' || host.endsWith('.storage.googleapis.com');
+    if (!gcsHost) return false;
+    return url.searchParams.has('X-Goog-Signature');
+  } catch {
+    return false;
+  }
+}
+
+function attachmentUnavailableBlock(source: ImageBlockUrlSource, reason: string): TextBlock {
+  const label = source.name ? ` "${source.name}"` : '';
+  return { type: 'text', text: `[Attached image${label} could not be loaded: ${reason}.]` };
+}
+
 /**
- * Extract message content as content blocks (text + inline base64 image attachments
- * from context.attachments). Text-only messages produce a single text block.
+ * Extract message content as content blocks (text + image attachments from
+ * context.attachments). Images can arrive as inline base64 data or as GCS
+ * signed URLs (the scalable path for operator-uploaded files). Text-only
+ * messages produce a single text block.
  */
 export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] {
   const blocks: ContentBlock[] = [];
@@ -523,26 +573,105 @@ export function extractMessageTurn(msg: ResidentInboundMessage): ContentBlock[] 
       let imageCount = 0;
       for (const att of raw as Array<Record<string, unknown>>) {
         if (imageCount >= MAX_IMAGES_PER_TURN) break;
-        if (
-          str(att.type) === 'image'
-          && typeof att.data === 'string' && att.data
-          && typeof att.mime_type === 'string' && att.mime_type.startsWith('image/')
-          && att.data.length <= MAX_IMAGE_BASE64_LENGTH
-        ) {
+        if (str(att.type) !== 'image') continue;
+        const mediaType = normalizeImageMediaType(att.mime_type);
+        if (!mediaType) continue;
+        // Inline base64 data — preferred when available.
+        if (typeof att.data === 'string' && att.data && att.data.length <= MAX_IMAGE_BASE64_LENGTH) {
           blocks.push({
             type: 'image',
-            source: {
-              type: 'base64',
-              media_type: str(att.mime_type, 'image/png'),
-              data: att.data,
-            },
+            source: { type: 'base64', media_type: mediaType, data: att.data },
           });
+          imageCount++;
+        } else if (typeof att.url === 'string' && att.url) {
+          const url = att.url.trim();
+          // GCS signed URL — fallback when data is absent or oversized. The URL
+          // is an internal transport detail; materializeContentBlocks fetches it
+          // and converts it to base64 before the model sees the turn.
+          if (isAllowedAttachmentDownloadUrl(url)) {
+            blocks.push({
+              type: 'image',
+              source: {
+                type: 'url',
+                url,
+                media_type: mediaType,
+                name: attachmentName(att.name) || undefined,
+              },
+            });
+          } else {
+            blocks.push(attachmentUnavailableBlock(
+              { type: 'url', url: '', media_type: mediaType, name: attachmentName(att.name) || undefined },
+              'unsupported download URL',
+            ));
+          }
           imageCount++;
         }
       }
     }
   }
   return blocks;
+}
+
+/**
+ * Convert internal URL-sourced image blocks into model-ready base64 image
+ * blocks. Signed URLs are never forwarded into the resident model input.
+ * Download failures degrade to a text notice so the operator turn still runs.
+ */
+export async function materializeContentBlocks(
+  blocks: ContentBlock[],
+  fetchImpl: AttachmentFetch = async (url: string) => {
+    if (typeof globalThis.fetch !== 'function') throw new Error('fetch unavailable');
+    return globalThis.fetch(url);
+  },
+): Promise<ContentBlock[]> {
+  const result: ContentBlock[] = [];
+  for (const block of blocks) {
+    if (block.type !== 'image' || block.source.type !== 'url') {
+      result.push(block);
+      continue;
+    }
+
+    const source = block.source;
+    if (!isAllowedAttachmentDownloadUrl(source.url)) {
+      result.push(attachmentUnavailableBlock(source, 'unsupported download URL'));
+      continue;
+    }
+    try {
+      const resp = await fetchImpl(source.url);
+      if (!resp.ok) {
+        result.push(attachmentUnavailableBlock(source, `download failed (${resp.status})`));
+        continue;
+      }
+      const lengthHeader = resp.headers.get('content-length');
+      const contentLength = lengthHeader ? Number.parseInt(lengthHeader, 10) : 0;
+      if (Number.isFinite(contentLength) && contentLength > MAX_IMAGE_DOWNLOAD_BYTES) {
+        result.push(attachmentUnavailableBlock(source, 'image is too large'));
+        continue;
+      }
+      const bytes = Buffer.from(await resp.arrayBuffer());
+      if (bytes.length > MAX_IMAGE_DOWNLOAD_BYTES) {
+        result.push(attachmentUnavailableBlock(source, 'image is too large'));
+        continue;
+      }
+      const data = bytes.toString('base64');
+      if (data.length > MAX_IMAGE_BASE64_LENGTH) {
+        result.push(attachmentUnavailableBlock(source, 'image is too large'));
+        continue;
+      }
+      const headerMediaType = normalizeImageMediaType(resp.headers.get('content-type'));
+      result.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: headerMediaType || source.media_type,
+          data,
+        },
+      });
+    } catch {
+      result.push(attachmentUnavailableBlock(source, 'download failed'));
+    }
+  }
+  return result;
 }
 
 /**

@@ -11,7 +11,7 @@ import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './t
 import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
-import type { ProjectMessage, MessageAttachment } from '../types/messages';
+import type { MessageAttachment, ProjectMessage } from '../types/messages';
 import {
   computeStrategicStreamingTurn,
   computeStrategicSessionActivity,
@@ -23,18 +23,18 @@ import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
-import { MessagesComposer } from './MessagesComposer';
+import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
 import { armingToastCopy, parseArmingOutcome, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
-import { fileToMessageAttachment } from '../utils/attachments';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import {
   createStrategicSessionMessage,
   fetchStrategicConversation,
+  getMessageAttachmentUploadUrl,
   type StrategicContextPackageDescriptor,
   type StrategicMessageTarget,
   type StrategicStateResponse,
@@ -407,6 +407,14 @@ function messageListsEqual(a: ProjectMessage[], b: ProjectMessage[]): boolean {
   return a.length === b.length && a.every((message, i) => messagesEqual(message, b[i]));
 }
 
+function revokePendingAttachmentPreviews(attachments: PendingAttachment[]): void {
+  for (const attachment of attachments) {
+    if (attachment.previewUrl && typeof URL.revokeObjectURL === 'function') {
+      URL.revokeObjectURL(attachment.previewUrl);
+    }
+  }
+}
+
 
 export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
@@ -443,16 +451,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
   const [newType, setNewType] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.type ?? 'FEEDBACK');
   const [newContent, setNewContent] = useState(() => loadComposerDraft(auth.currentUser?.email, selectedProjectId)?.content ?? '');
-  /** Files the operator has picked / dropped / pasted but not yet sent. */
-  /** Files the operator has picked / dropped / pasted but not yet sent. */
-  const [pendingAttachments, setPendingAttachments] = useState<MessageAttachment[]>([]);
-  /** True while FileReader is decoding attached files — blocks send to prevent
-   *  submitting before pendingAttachments are populated. */
-  const [attachmentsLoading, setAttachmentsLoading] = useState(false);
-  const attachmentsLoadingRef = useRef(false);
-  /** Monotonic counter for stable attachment chip keys. */
-  const nextAttachmentKeyRef = useRef(0);
   const [submitting, setSubmitting] = useState(false);
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  useEffect(() => {
+    pendingAttachmentsRef.current = pendingAttachments;
+  }, [pendingAttachments]);
+  useEffect(() => () => {
+    revokePendingAttachmentPreviews(pendingAttachmentsRef.current);
+    pendingAttachmentsRef.current = [];
+  }, []);
   // Synchronous in-flight guard. `submitting` state updates asynchronously, so
   // two rapid keypresses (double-Enter) can both read the pre-update value and
   // each fire a request before React re-renders. This ref is set synchronously
@@ -789,6 +798,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const draft = loadComposerDraft(auth.currentUser?.email, selectedProjectId);
     setNewContent(draft?.content ?? '');
     setNewType(draft?.type ?? 'FEEDBACK');
+    setPendingAttachments(prev => {
+      revokePendingAttachmentPreviews(prev);
+      pendingAttachmentsRef.current = [];
+      return [];
+    });
+    setUploading(false);
     if (selectedProjectId) {
       // Prefer server saved views over localStorage — picks up views created on another device.
       fetchServerSavedViews(selectedProjectId).then(serverViews => {
@@ -1524,17 +1539,64 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }
 
+  function handleAddAttachment(file: File) {
+    if (submittingRef.current || uploading) return;
+    if (file.size > 50 * 1024 * 1024) {
+      addToast('File exceeds the 50 MB size limit and was skipped', 'error');
+      return;
+    }
+    const id = `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    let previewUrl: string | null = null;
+    if (file.type?.startsWith('image/') && file.size < 10_000_000 && typeof URL.createObjectURL === 'function') {
+      try {
+        previewUrl = URL.createObjectURL(file);
+      } catch {
+        previewUrl = null;
+      }
+    }
+    setPendingAttachments(prev => {
+      const next = [...prev, {
+        id,
+        file,
+        previewUrl,
+        mime_type: file.type || 'application/octet-stream',
+        name: file.name,
+        size_bytes: file.size,
+      }];
+      pendingAttachmentsRef.current = next;
+      return next;
+    });
+  }
+
+  function handleRemoveAttachment(id: string) {
+    if (submittingRef.current || uploading) return;
+    setPendingAttachments(prev => {
+      const att = prev.find(a => a.id === id);
+      if (att?.previewUrl && typeof URL.revokeObjectURL === 'function') {
+        URL.revokeObjectURL(att.previewUrl);
+      }
+      const next = prev.filter(a => a.id !== id);
+      pendingAttachmentsRef.current = next;
+      return next;
+    });
+  }
+
+  function clearPendingAttachments() {
+    setPendingAttachments(prev => {
+      revokePendingAttachmentPreviews(prev);
+      pendingAttachmentsRef.current = [];
+      return [];
+    });
+  }
+
   async function handleSubmit() {
-    if (!selectedProjectId || !newContent.trim()) return;
+    const submittedContent = newContent.trim();
+    const attachmentsForSubmit = pendingAttachmentsRef.current;
+    if (!selectedProjectId || (!submittedContent && attachmentsForSubmit.length === 0)) return;
     // Synchronous guard first — reject re-entrant calls before the async
     // `setSubmitting` has a chance to re-render, so rapid double-Enter cannot
     // launch two requests.
     if (submittingRef.current) return;
-    // Block send while attachments are still being decoded — the file-reading
-    // Promise.allSettled inside handleAttachFiles may not have resolved yet,
-    // so pendingAttachments would be empty and the message would send without
-    // the file content.
-    if (attachmentsLoadingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     try {
@@ -1542,27 +1604,22 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       // via PATCH — the backend posts a question_answer NOTE (linked back to the
       // question) and marks the question resolved so the strategist sees it answered.
       if (replyTo && replyTo.message_type === 'QUESTION' && replyTo.status === 'open') {
+        if (attachmentsForSubmit.length > 0) {
+          addToast('Remove attachments before answering a question', 'error');
+          return;
+        }
         const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
-        const patchBody: Record<string, unknown> = {
-          resolution: newContent.trim(),
-        };
-        // Include any pending attachments in the PATCH body so they are
-        // not silently discarded when an operator answers a question.
-        if (pendingAttachments.length > 0) {
-          patchBody.context = { attachments: pendingAttachments };
-        }
-        if (workbenchContext) {
-          patchBody.workbench_context = workbenchContext;
-        }
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${replyTo.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(patchBody),
+          body: JSON.stringify({
+            resolution: submittedContent,
+            ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
+          }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         idempotencyKeyRef.current = null;
         setNewContent('');
-        setPendingAttachments([]);
         clearComposerDraft(auth.currentUser?.email, selectedProjectId);
         setReplyTo(null);
         setLastArming(null);
@@ -1573,13 +1630,48 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         await fetchMessages();
         return;
       }
+      // Upload pending attachments to GCS before sending the message.
+      const uploadedAttachments: MessageAttachment[] = [];
+      if (attachmentsForSubmit.length > 0) {
+        setUploading(true);
+        try {
+          for (const att of attachmentsForSubmit) {
+            try {
+              const { upload_url, download_url } = await getMessageAttachmentUploadUrl(
+                selectedProjectId,
+                att.name,
+                att.mime_type,
+              );
+              const uploadRes = await fetch(upload_url, {
+                method: 'PUT',
+                headers: { 'Content-Type': att.mime_type },
+                body: att.file,
+              });
+              if (!uploadRes.ok) throw new Error(`Upload failed: ${uploadRes.status}`);
+              uploadedAttachments.push({
+                type: att.mime_type?.startsWith('image/') ? 'image' : 'attachment',
+                mime_type: att.mime_type,
+                name: att.name,
+                size_bytes: att.size_bytes,
+                url: download_url,
+              });
+            } catch {
+              addToast(`Failed to upload ${att.name}`, 'error');
+              return;
+            }
+          }
+        } finally {
+          setUploading(false);
+        }
+      }
+
       const context: Record<string, unknown> = {};
+      if (uploadedAttachments.length > 0) {
+        context.attachments = uploadedAttachments;
+      }
       if (replyTo) {
         context.reply_to = replyTo.id;
         context.reply_preview = replyTo.content.slice(0, 120);
-      }
-      if (pendingAttachments.length > 0) {
-        context.attachments = pendingAttachments;
       }
       const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
       // Reuse the draft's key across a double-submit / retry so the backend
@@ -1587,7 +1679,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       if (!idempotencyKeyRef.current) {
         idempotencyKeyRef.current = generateIdempotencyKey();
       }
-      const submittedContent = newContent.trim();
       if (conversationMode) {
         // INSTANT ACK: optimistically show the operator's message + working state
         // the moment they Send, before the POST round-trips (zero dead time). The
@@ -1603,7 +1694,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         setWorkingSince(Date.now());
         // Clear the composer immediately so the optimistic bubble reads as sent.
         setNewContent('');
-        setPendingAttachments([]);
         clearComposerDraft(auth.currentUser?.email, selectedProjectId);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         const data = await createStrategicSessionMessage(selectedProjectId, {
@@ -1617,6 +1707,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         idempotencyKeyRef.current = null;
         setReplyTo(null);
         setLastArming(arming);
+        clearPendingAttachments();
         addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
         let didRefreshStrategicState = false;
         if (arming === 'steering') {
@@ -1670,10 +1761,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       // Sent cleanly — the next distinct message gets a fresh key.
       idempotencyKeyRef.current = null;
       setNewContent('');
-      setPendingAttachments([]);
       clearComposerDraft(auth.currentUser?.email, selectedProjectId);
       setReplyTo(null);
       setLastArming(arming);
+      clearPendingAttachments();
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
       // A genuine steering message the server could not arm (`not_armed`) is a
       // partial outcome — the message saved, but the strategist was not woken.
@@ -1709,6 +1800,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
+      setUploading(false);
     }
   }
 
@@ -1762,50 +1854,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       setDeletingIds(prev => { const next = new Set(prev); next.delete(msgId); return next; });
     }
   }, [fetchMessages]);
-
-  function handleAttachFiles(rawFiles: File[]) {
-    // Client-side file size guard: refuse files larger than 50 MB before reading.
-    const MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024;
-    const validFiles = rawFiles.filter(f => f.size <= MAX_ATTACHMENT_SIZE);
-    const oversized = rawFiles.length - validFiles.length;
-    if (oversized > 0) {
-      addToast(`${oversized} file(s) exceed the 50 MB size limit and were skipped`, 'error');
-    }
-    if (validFiles.length === 0) return;
-    // Set the loading guard before the async FileReader work so that
-    // handleSubmit will reject concurrent sends while files are being read.
-    attachmentsLoadingRef.current = true;
-    setAttachmentsLoading(true);
-    Promise.allSettled(validFiles.map(fileToMessageAttachment)).then(results => {
-      const newAtts: MessageAttachment[] = [];
-      let failures = 0;
-      for (const result of results) {
-        if (result.status === 'fulfilled') {
-          newAtts.push({
-            ...result.value,
-            // Stable key for React reconciliation — avoids unmount/re-mount
-            // when a preceding chip is removed (array-index shift).
-            _attachmentKey: `att_${nextAttachmentKeyRef.current++}`,
-          });
-        } else {
-          failures++;
-        }
-      }
-      if (newAtts.length > 0) {
-        setPendingAttachments(prev => [...prev, ...newAtts]);
-      }
-      if (failures > 0) {
-        addToast(`${failures} file(s) failed to read`, 'error');
-      }
-    }).finally(() => {
-      attachmentsLoadingRef.current = false;
-      setAttachmentsLoading(false);
-    });
-  }
-
-  const handleRemoveAttachment = useCallback((index: number) => {
-    setPendingAttachments(prev => prev.filter((_, i) => i !== index));
-  }, []);
 
   async function handleCreateDirection(msg: ProjectMessage, silent = false): Promise<boolean> {
     if (!selectedProjectId) return false;
@@ -2381,11 +2429,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         textareaRef={textareaRef}
         newType={effectiveNewType}
         newContent={newContent}
-        submitting={submitting || attachmentsLoading}
+        submitting={submitting}
         replyTo={replyTo}
         lastArming={lastArming}
         strategistBusy={strategistActive}
         disabledReason={selectedProjectId ? null : 'Select a project to message Strategic'}
+        pendingAttachments={pendingAttachments}
+        uploading={uploading}
+        onAddAttachment={handleAddAttachment}
+        onRemoveAttachment={handleRemoveAttachment}
         onChangeType={(value) => { setNewType(value); setLastArming(null); if (newContent) saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: value, content: newContent }); }}
         onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
         onCancelReply={() => setReplyTo(null)}
@@ -2393,9 +2445,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         starterPrompts={starterPrompts ?? undefined}
         capabilityHint={starterPrompts ? WORKDAY_CAPABILITY_HINT : undefined}
         onPickStarterPrompt={(value) => { setNewContent(value); saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); focusComposerTextarea(); }}
-        pendingAttachments={pendingAttachments}
-        onAttachFiles={handleAttachFiles}
-        onRemoveAttachment={handleRemoveAttachment}
         chrome={conversationMode ? 'minimal' : 'full'}
         strategicContext={strategicComposerContext}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
