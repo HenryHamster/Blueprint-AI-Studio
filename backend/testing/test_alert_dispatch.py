@@ -1603,6 +1603,22 @@ async def test_idle_gpu_runner_check_integration(db_session, mocker):
     assert alerts[0].dismissed_at is not None, "idle-GPU alert must auto-resolve on recovery"
 
 
+# ── Runner token-stale alert ──────────────────────────────────────────────────
+
+from app.alert_dispatch import (  # noqa: E402
+    _RUNNER_TOKEN_STALE_EVENT_TYPE,
+    _maybe_create_runner_token_stale_alert,
+)
+
+
+async def _stale_token_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _RUNNER_TOKEN_STALE_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
 # ── Low-memory runner alert ────────────────────────────────────────────────────
 
 from app.alert_dispatch import (  # noqa: E402
@@ -1619,6 +1635,96 @@ async def _low_memory_alerts(db_session, project_id):
     )
     return (await db_session.execute(stmt)).scalars().all()
 
+
+@pytest.mark.asyncio
+async def test_runner_stale_token_alert_creates_and_resolves_via_sweep(db_session, mocker):
+    """_check_degraded_runners raises a token-stale WARNING alert and auto-resolves on rotation."""
+    from app.models import LocalRunner
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+    from app.time_utils import _utcnow
+
+    mocker.patch("app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Active runner with a stale token (>90 days).
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="hash-stale-token",
+        status="active",
+        last_seen_at=_utcnow(),
+        consecutive_job_failures=0,
+        token_created_at=_utcnow() - _timedelta(days=100),
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep → token-stale alert must fire.
+    await _check_degraded_runners(db_session)
+    alerts = await _stale_token_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].dismissed_at is None
+
+    # Second sweep → deduplication (no second alert).
+    await _check_degraded_runners(db_session)
+    alerts = await _stale_token_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+    # Runner rotates token (token_created_at updated to now).
+    await db_session.refresh(runner)
+    runner.token_created_at = _utcnow() - _timedelta(days=1)  # 1 day old — well within threshold
+    db_session.add(runner)
+    await db_session.commit()
+
+    # Sweep again → alert must be dismissed.
+    await _check_degraded_runners(db_session)
+    await db_session.refresh(alerts[0])
+    assert alerts[0].dismissed_at is not None, "stale-token alert must auto-resolve on token rotation"
+
+
+@pytest.mark.asyncio
+async def test_runner_stale_token_alert_creates_and_broadcasts(db_session, mocker):
+    """A runner with an old token raises one WARNING alert and broadcasts it."""
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    token_age_days = 100
+    threshold_days = 90
+
+    created = await _maybe_create_runner_token_stale_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="old-token-runner",
+        token_age_days=token_age_days,
+        threshold_days=threshold_days,
+    )
+
+    assert created is True
+    alerts = await _stale_token_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "stale" in alert.title.lower()
+    assert "100" in alert.message
+    bcast.assert_awaited_once()
+
+
+# ── Low-memory runner alert tests ──────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_runner_low_memory_alert_creates_and_broadcasts(db_session, mocker):

@@ -1810,6 +1810,11 @@ from app.runner_health_alerts import (  # noqa: F401
     _maybe_create_runner_idle_gpu_alert,
     _resolve_runner_idle_gpu_alert,
     _runner_idle_gpu_dedupe_key,
+    # Token-stale alert: runner credential not rotated within recommended window
+    _RUNNER_TOKEN_STALE_EVENT_TYPE,
+    _maybe_create_runner_token_stale_alert,
+    _resolve_runner_token_stale_alert,
+    _runner_token_stale_dedupe_key,
 )
 
 # Stable title prefix for the per-project cost-telemetry-reconciliation-failure alert.

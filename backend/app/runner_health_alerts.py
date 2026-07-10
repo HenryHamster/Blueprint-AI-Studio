@@ -1232,6 +1232,135 @@ async def _resolve_runner_idle_gpu_alert(
     return len(open_alerts)
 
 
+# ── Runner token-stale alert ──────────────────────────────────────────────────
+# Fires when a runner's token is older than the recommended rotation window
+# (90 days). Tokens issued months or years ago carry increased risk if
+# compromised. The alert auto-resolves when the token is rotated.
+# Mirrors the low-disk/idle-GPU pattern: deduplicated per runner, WARNING severity.
+
+_RUNNER_TOKEN_STALE_EVENT_TYPE = "runner.token_stale"
+_RUNNER_TOKEN_STALE_DEDUPE_KEY_PREFIX = "runner.token_stale:"
+
+
+def _runner_token_stale_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_TOKEN_STALE_DEDUPE_KEY_PREFIX}{runner_id}"
+
+
+async def _maybe_create_runner_token_stale_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    token_age_days: int,
+    threshold_days: int = 90,
+) -> bool:
+    """Create a deduplicated WARNING alert when a runner's token is stale.
+
+    Fires when a runner's ``token_created_at`` is older than ``threshold_days``,
+    indicating the token has not been rotated within the recommended window.
+    The alert auto-resolves when the token is rotated (``token_created_at``
+    is updated by the rotate-token endpoint).
+
+    Deduplicated on ``runner.token_stale:{runner_id}`` so repeated sweep passes
+    bump the occurrence count rather than creating duplicate rows. Returns
+    ``True`` when a NEW alert was created, else ``False``.
+    """
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    title = f"Fleet runner token stale: {runner_label}"
+    message = (
+        f"Self-hosted fleet runner {runner_label} ({str(runner_id)[:8]}) "
+        f"token is {token_age_days} days old, exceeding the {threshold_days}-day "
+        f"rotation threshold. Rotate the runner token via the admin API to "
+        f"reduce the risk of a compromised credential persisting. The alert "
+        f"clears automatically when the token is rotated."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_TOKEN_STALE_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_token_stale_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_TOKEN_STALE",
+                {
+                    "runner_id": str(runner_id),
+                    "runner_label": runner_label,
+                    "token_age_days": token_age_days,
+                    "threshold_days": threshold_days,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_TOKEN_STALE dispatch setup failed: %s", _ne)
+    return True
+
+
+async def _resolve_runner_token_stale_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss any open runner-token-stale alert for a runner whose token was rotated.
+
+    The companion to :func:`_maybe_create_runner_token_stale_alert`. Called from
+    the stale-token sweep when a runner's ``token_created_at`` is updated (token
+    was rotated). Returns the number of alerts dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _runner_token_stale_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 # ── Runner low memory ─────────────────────────────────────────────────────────
 
 _RUNNER_LOW_MEMORY_EVENT_TYPE = "runner.low_memory"

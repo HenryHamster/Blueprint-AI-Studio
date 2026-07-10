@@ -1461,8 +1461,26 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
     # would abort the whole stranded-lane sweep uncaught. populate_existing
     # forces the reload inside the async greenlet and reflects committed state.
     active_lane_ids = [lane.id for lane in active_lanes]
+    # Batch-fetch all lanes in one query instead of N individual session.get() calls.
+    # ``populate_existing`` via execution_options provides the same MissingGreenlet
+    # safety as the prior per-lane session.get(…, populate_existing=True) by forcing
+    # the reload inside the async greenlet and reflecting committed state.
+    lanes_by_id: dict[int, ImprovementLane] = {}
+    if active_lane_ids:
+        lanes_batch = (
+            (
+                await session.execute(
+                    select(ImprovementLane)
+                    .where(ImprovementLane.id.in_(active_lane_ids))
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        lanes_by_id = {lane.id: lane for lane in lanes_batch}
     for lane_id in active_lane_ids:
-        lane = await session.get(ImprovementLane, lane_id, populate_existing=True)
+        lane = lanes_by_id.get(lane_id)
         if lane is None or lane.status != ImprovementLaneStatus.ACTIVE.value:
             continue
         task = None

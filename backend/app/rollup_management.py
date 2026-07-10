@@ -1765,17 +1765,19 @@ async def _check_and_trigger_rollup(
             # (respawn-count bump) are persisted on this session and committed by
             # the Phase D relock commit.
             cap_exhausted_prs: list[int] = []
-            # Batch-fetch all respawn-candidate child tasks into the identity map
-            # (N+1 guard: _spawn_pipeline_task commits internally, expiring the
-            # session; a warm-up batch SELECT resolves the first iteration's
-            # session.get below without a DB query).
-            _cand_child_ids = [cand["child_id"] for cand in respawn_candidates]
-            if _cand_child_ids:
-                await session.execute(
-                    select(Task).where(Task.id.in_(_cand_child_ids))
-                )
+            # Batch-fetch all respawn-candidate child tasks into both the identity
+            # map and a local lookup dict (N+1 guard: _spawn_pipeline_task commits
+            # internally, expiring the session, and the dict gives us O(1) access
+            # without re-fetching).
+            child_ids = [cand["child_id"] for cand in respawn_candidates]
+            children_rows = (
+                (await session.execute(select(Task).where(Task.id.in_(child_ids))))
+                .scalars()
+                .all()
+            )
+            children_by_id = {child.id: child for child in children_rows}
             for cand in respawn_candidates:
-                child = await session.get(Task, cand["child_id"])
+                child = children_by_id.get(cand["child_id"])
                 if child is None:
                     continue
                 review_task, was_spawned = await _spawn_pipeline_task(

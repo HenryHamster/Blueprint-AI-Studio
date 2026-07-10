@@ -690,8 +690,112 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
     except Exception:
         logger.exception("[RUNNERS] Failed to sweep idle-GPU runner alerts")
 
-    # 7. Proactive low-memory alert: runners reporting free memory below the floor.
+    # 7. Proactive stale-token alert: runners whose token hasn't been rotated in 90+ days.
+    try:
+        await _check_stale_token_runners(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep stale-token runner alerts")
+
+    # 8. Proactive low-memory alert: runners reporting free memory below the floor.
     try:
         await _check_low_memory_runners(session)
     except Exception:
         logger.exception("[RUNNERS] Failed to sweep low-memory runner alerts")
+
+
+async def _check_stale_token_runners(session: AsyncSession) -> None:
+    """Detect runners whose token hasn't been rotated in 90+ days and alert/resolve.
+
+    Queries active runners with a ``token_created_at`` older than 90 days. For each
+    stale-token runner, calls :func:`~app.runner_health_alerts._maybe_create_runner_token_stale_alert`
+    to raise (or dedup) a WARNING alert. Then resolves alerts for runners whose token
+    was rotated (``token_created_at`` is now recent, or the runner was deactivated).
+
+    Called from :func:`_check_degraded_runners` so it shares the same 300s cadence
+    as the other health sweeps.
+    """
+    from app.runner_health_alerts import (
+        _RUNNER_TOKEN_STALE_EVENT_TYPE,
+        _maybe_create_runner_token_stale_alert,
+        _resolve_runner_token_stale_alert,
+    )
+    from app.models import Alert
+
+    stale_days = int(
+        _runtime_config.get("runner_token_stale_days", 90)
+    )
+
+    cutoff = _utcnow() - timedelta(days=stale_days)
+    active_rows = (
+        await session.execute(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.hostname,
+                LocalRunner.token_created_at,
+            ).where(
+                LocalRunner.status == "active",
+                LocalRunner.token_created_at.is_not(None),
+                LocalRunner.token_created_at < cutoff,
+            )
+        )
+    ).all()
+
+    stale_runner_ids: set[uuid.UUID] = set()
+    for runner_id, project_id, hostname, token_created_at in active_rows:
+        stale_runner_ids.add(runner_id)
+        token_age_days = max(0, int((_utcnow() - token_created_at).total_seconds() / 86400))
+        try:
+            await _maybe_create_runner_token_stale_alert(
+                session,
+                project_id=project_id,
+                runner_id=runner_id,
+                hostname=hostname,
+                token_age_days=token_age_days,
+                threshold_days=stale_days,
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create stale-token alert for runner %s", runner_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after stale-token alert create failed for %s",
+                    runner_id,
+                )
+
+    # Resolve alerts for runners whose token was rotated (or that stopped being active).
+    open_stale_token = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _RUNNER_TOKEN_STALE_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+    for project_id_row, dedupe_key in open_stale_token:
+        if not dedupe_key:
+            continue
+        try:
+            runner_id = uuid.UUID(dedupe_key.split(":", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if runner_id in stale_runner_ids:
+            continue
+        try:
+            await _resolve_runner_token_stale_alert(
+                session, project_id_row, runner_id
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve stale-token alert for runner %s", runner_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after stale-token alert resolve failed for %s",
+                    runner_id,
+                )

@@ -3718,6 +3718,12 @@ class KnowledgeDocument(SQLModel, table=True):
         Index("ix_knowledge_document_sweep_id", "sweep_id"),
         Index("ix_knowledge_document_project_direction", "project_id", "direction_id"),
         Index("ix_knowledge_document_lifecycle_status", "lifecycle_status"),
+        Index(
+            "ix_knowledge_document_project_source_lifecycle",
+            "project_id",
+            "source_kind",
+            "lifecycle_status",
+        ),
     )
 
 
@@ -4696,6 +4702,11 @@ class LocalRunner(SQLModel, table=True):
     consecutive_job_failures: int = Field(
         default=0,
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+    # When the runner's current token was created/rotated (for age/staleness tracking).
+    token_created_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     created_at: datetime = Field(
         default_factory=_utcnow,

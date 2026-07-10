@@ -7304,6 +7304,33 @@ class TestMessagesWorkbenchState:
         # (lowest i) should appear first
         assert listed[0]["hostname"] == "runner-000"
         assert listed[-1]["hostname"] == "runner-049"
+        # token_age_days is None when token_created_at is not set
+        assert listed[0]["token_age_days"] is None
+
+    @pytest.mark.asyncio
+    async def test_list_runners_includes_token_age_days(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash="abcd" + "f" * 60,
+            hostname="old-token-runner",
+            status="active",
+            token_created_at=_utcnow() - timedelta(days=100),
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners"
+        )
+        assert resp.status_code == 200
+        listed = resp.json()
+        assert len(listed) == 1
+        assert listed[0]["hostname"] == "old-token-runner"
+        # token_age_days must reflect the 100-day-old token
+        assert listed[0]["token_age_days"] == 100
 
     @pytest.mark.asyncio
     async def test_leaving_continuous_mode_clears_local_continuation_marker(
