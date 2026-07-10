@@ -1,11 +1,11 @@
-"""Encrypt existing plaintext claude_config_json values in MaxPlanAccount.
+"""Encrypt persisted MaxPlanAccount claude_config_json values.
 
-Prior to this migration, ``claude_config_json`` values were stored as plaintext
-JSON strings. This migration encrypts every existing value using the
-application-layer Fernet encryption (``app.field_encryption``).
+Migration 0466 already encrypts every MaxPlanAccount credential column. This
+follow-up remains independently safe for databases produced by the original
+candidate chain and idempotently skips ciphertext written by 0466.
 
-A subsequent deploy enables encrypt-on-write and decrypt-on-read in the
-application code; the key is provided via ``GITHUB_PAT_ENCRYPTION_KEY``.
+The migration is self-contained because the pre-promotion migration-apply gate
+runs candidate migrations inside the currently deployed backend process.
 
 Revision ID: 0467
 Revises: 0466
@@ -14,10 +14,14 @@ Create Date: 2026-07-10 00:00:00.000000
 """
 
 import logging
+import os
 
 from alembic import op
+import sqlalchemy as sa
 
 logger = logging.getLogger(__name__)
+
+ENCRYPTION_KEY_ENV = "GITHUB_PAT_ENCRYPTION_KEY"
 
 revision = "0467"
 down_revision = "0466"
@@ -25,80 +29,83 @@ branch_labels = None
 depends_on = None
 
 
+def _get_fernet():
+    key = os.getenv(ENCRYPTION_KEY_ENV)
+    if not key:
+        logger.warning(
+            "%s not set - migration 0467 leaves claude_config_json unchanged",
+            ENCRYPTION_KEY_ENV,
+        )
+        return None
+    try:
+        from cryptography.fernet import Fernet
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "cryptography is unavailable - migration 0467 leaves "
+            "claude_config_json unchanged: %s",
+            exc,
+        )
+        return None
+    try:
+        return Fernet(key.encode())
+    except Exception:
+        logger.exception("Invalid %s", ENCRYPTION_KEY_ENV)
+        return None
+
+
+def _rows(bind):
+    return bind.execute(
+        sa.text(
+            "SELECT id, claude_config_json FROM maxplanaccount "
+            "WHERE claude_config_json IS NOT NULL"
+        )
+    ).fetchall()
+
+
+def _update(bind, row_id, value: str) -> None:
+    bind.execute(
+        sa.text(
+            "UPDATE maxplanaccount SET claude_config_json = :value WHERE id = :id"
+        ),
+        {"value": value, "id": row_id},
+    )
+
+
+def _decrypt_if_encrypted(fernet, value: str) -> str | None:
+    try:
+        return fernet.decrypt(value.encode()).decode()
+    except Exception:  # noqa: BLE001 - plaintext is the expected miss
+        return None
+
+
 def upgrade() -> None:
     bind = op.get_bind()
-
-    from app.field_encryption import encrypt_field
-
-    if bind.dialect.name == "postgresql":
-        rows = bind.execute(
-            "SELECT id, claude_config_json FROM maxplanaccount WHERE claude_config_json IS NOT NULL"
-        ).fetchall()
-    else:
-        rows = bind.execute(
-            "SELECT id, claude_config_json FROM maxplanaccount WHERE claude_config_json IS NOT NULL"
-        ).fetchall()
+    fernet = _get_fernet()
+    if fernet is None:
+        return
 
     updated = 0
-    for row_id, plaintext in rows:
-        encrypted = encrypt_field(plaintext)
-        if encrypted == plaintext:
+    for row_id, value in _rows(bind):
+        if _decrypt_if_encrypted(fernet, value) is not None:
             continue
-        if bind.dialect.name == "postgresql":
-            bind.execute(
-                "UPDATE maxplanaccount SET claude_config_json = %s WHERE id = %s",
-                (encrypted, row_id),
-            )
-        else:
-            bind.execute(
-                "UPDATE maxplanaccount SET claude_config_json = ? WHERE id = ?",
-                (encrypted, row_id),
-            )
+        _update(bind, row_id, fernet.encrypt(value.encode()).decode())
         updated += 1
-
-    if updated:
-        logger.info(
-            "Migration 0467: encrypted %d claude_config_json value(s)", updated
-        )
-    else:
-        logger.info(
-            "Migration 0467: no claude_config_json values to encrypt "
-            "(either all null or no encryption key configured)"
-        )
+    logger.info("Migration 0467 encrypted %d claude_config_json value(s)", updated)
 
 
 def downgrade() -> None:
     bind = op.get_bind()
-
-    from app.field_encryption import decrypt_field
-
-    if bind.dialect.name == "postgresql":
-        rows = bind.execute(
-            "SELECT id, claude_config_json FROM maxplanaccount WHERE claude_config_json IS NOT NULL"
-        ).fetchall()
-    else:
-        rows = bind.execute(
-            "SELECT id, claude_config_json FROM maxplanaccount WHERE claude_config_json IS NOT NULL"
-        ).fetchall()
+    fernet = _get_fernet()
+    if fernet is None:
+        return
 
     updated = 0
-    for row_id, encrypted in rows:
-        plaintext = decrypt_field(encrypted)
-        if plaintext == encrypted:
+    for row_id, value in _rows(bind):
+        plaintext = _decrypt_if_encrypted(fernet, value)
+        if plaintext is None:
             continue
-        if bind.dialect.name == "postgresql":
-            bind.execute(
-                "UPDATE maxplanaccount SET claude_config_json = %s WHERE id = %s",
-                (plaintext, row_id),
-            )
-        else:
-            bind.execute(
-                "UPDATE maxplanaccount SET claude_config_json = ? WHERE id = ?",
-                (plaintext, row_id),
-            )
+        _update(bind, row_id, plaintext)
         updated += 1
-
-    if updated:
-        logger.info(
-            "Migration 0467 (downgrade): decrypted %d claude_config_json value(s)", updated
-        )
+    logger.info(
+        "Migration 0467 downgrade decrypted %d claude_config_json value(s)", updated
+    )
