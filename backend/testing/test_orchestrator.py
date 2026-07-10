@@ -13,7 +13,7 @@ import pytest
 import json
 import uuid
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from app.time_utils import _utcnow
 import app.main as _main_module
@@ -824,6 +824,11 @@ class TestReaperService:
 
         db_session.get = _intercepted_get
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
+        # The reaper batch-fetches orphan tasks and only falls back to session.get()
+        # when the cached instance is expired.  Force expired=True so _intercepted_get
+        # is reached and can return the already-COMPLETED stub that simulates a
+        # concurrent reaper instance having already processed the task.
+        mocker.patch("app.reaper.inspect", return_value=MagicMock(expired=True))
 
         try:
             await reaper_service()
@@ -3162,6 +3167,18 @@ class TestProjectConcurrencyCap:
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
             _orch_module._last_deadlock_check = now
+            _orch_module._last_anomaly_state_persist = now
+            _orch_module._last_anomaly_sweep = now
+            _orch_module._last_post_commit_sweep = now
+            _orch_module._last_sidecar_sweep = now
+            _orch_module._last_bootstrap_recovery_sweep = now
+            _orch_module._last_lane_baseline_backfill = now
+            _orch_module._last_merge_credit_backfill = now
+            _orch_module._last_v22_finding_backfill = now
+            _orch_module._last_runner_deactivation_sweep = now
+            _orch_module._last_runner_degraded_sweep = now
+            _orch_module._last_runner_escalation_sweep = now
+            _orch_module._last_local_runner_hold_sweep = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
@@ -4818,6 +4835,18 @@ class TestWarmVMSkipProvision:
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
             _orch_module._last_deadlock_check = now
+            _orch_module._last_anomaly_state_persist = now
+            _orch_module._last_anomaly_sweep = now
+            _orch_module._last_post_commit_sweep = now
+            _orch_module._last_sidecar_sweep = now
+            _orch_module._last_bootstrap_recovery_sweep = now
+            _orch_module._last_lane_baseline_backfill = now
+            _orch_module._last_merge_credit_backfill = now
+            _orch_module._last_v22_finding_backfill = now
+            _orch_module._last_runner_deactivation_sweep = now
+            _orch_module._last_runner_degraded_sweep = now
+            _orch_module._last_runner_escalation_sweep = now
+            _orch_module._last_local_runner_hold_sweep = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 
@@ -8853,6 +8882,18 @@ class TestDispatchCrashContainment:
             _orch_module._last_orphan_check = now
             _orch_module._last_evaluating_timeout_check = now
             _orch_module._last_deadlock_check = now
+            _orch_module._last_anomaly_state_persist = now
+            _orch_module._last_anomaly_sweep = now
+            _orch_module._last_post_commit_sweep = now
+            _orch_module._last_sidecar_sweep = now
+            _orch_module._last_bootstrap_recovery_sweep = now
+            _orch_module._last_lane_baseline_backfill = now
+            _orch_module._last_merge_credit_backfill = now
+            _orch_module._last_v22_finding_backfill = now
+            _orch_module._last_runner_deactivation_sweep = now
+            _orch_module._last_runner_degraded_sweep = now
+            _orch_module._last_runner_escalation_sweep = now
+            _orch_module._last_local_runner_hold_sweep = now
             _shared_state.deploy_monitoring["task_results"].clear()
             return _Session, _engine
 

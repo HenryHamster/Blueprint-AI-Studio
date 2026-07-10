@@ -1464,7 +1464,7 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
 
     created: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None, session_summary=None):
         # Mimic the canonical spawn: create + commit a strategic_review task.
         t = Task(
             project_id=proj.id,
@@ -1529,7 +1529,7 @@ async def test_start_compensation_receives_plain_snapshotted_project_id(
     # Snapshot the expected id while ``project`` is still loaded (before the run).
     expected_id = project.id
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None, session_summary=None):
         t = Task(
             project_id=proj.id,
             title="spawned resident",
