@@ -975,6 +975,75 @@ async def _resolve_fleet_no_healthy_runner_alert(
     return len(open_alerts)
 
 
+_RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE = "runner.cross_project_mismatch"
+
+
+def _runner_cross_project_mismatch_dedupe_key(
+    runner_id: "uuid.UUID | str", job_id: "uuid.UUID | str"
+) -> str:
+    return f"{_RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE}:{runner_id}:{job_id}"
+
+
+async def _maybe_create_runner_cross_project_mismatch_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    job_id: "uuid.UUID | str",
+    job_project_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+) -> bool:
+    """Create a deduplicated WARNING alert when a runner attempts to access a job
+    from a different project.
+
+    A self-hosted runner registered to one project should never touch compute
+    jobs belonging to another project. When this happens it almost always means
+    a misconfigured or leaked runner token. Surfaces in the operator Alerts banner
+    so the operator can investigate without grepping logs.
+
+    Deduplicated on ``runner.cross_project_mismatch:{runner_id}:{job_id}`` so
+    repeated report attempts for the SAME (runner, job) pair produce a single
+    alert row. Returns ``True`` when a NEW alert was created, else ``False``.
+    """
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    title = f"Runner cross-project access blocked: {runner_label}"
+    message = (
+        f"Self-hosted runner {runner_label} (id={str(runner_id)[:8]}) attempted "
+        f"to report on compute job {str(job_id)[:8]}, which belongs to a "
+        f"different project (project_id={str(job_project_id)[:8]}). Access was "
+        f"denied. This usually means a misconfigured or leaked runner token. "
+        f"Check runner registration and rotate the runner token if necessary."
+    )[:1000]
+
+    dedupe_key = _runner_cross_project_mismatch_dedupe_key(runner_id, job_id)
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="runner",
+        dedupe_key=dedupe_key,
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": title,
+        },
+    )
+    return True
+
+
 _RUNNER_LOW_DISK_EVENT_TYPE = "runner.low_disk"
 
 

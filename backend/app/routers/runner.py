@@ -874,6 +874,15 @@ async def report_compute_job(
                 job_id,
                 mismatch_job.project_id,
             )
+            from app.runner_health_alerts import _maybe_create_runner_cross_project_mismatch_alert
+            await _maybe_create_runner_cross_project_mismatch_alert(
+                session,
+                project_id=runner.project_id,
+                runner_id=runner.id,
+                job_id=job_id,
+                job_project_id=mismatch_job.project_id,
+                hostname=getattr(runner, "hostname", None),
+            )
         raise HTTPException(status_code=404, detail="compute job not found")
 
     _TERMINAL_STATUSES = {

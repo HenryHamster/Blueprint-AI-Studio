@@ -1878,3 +1878,94 @@ async def test_low_memory_runner_check_integration(db_session, mocker):
     await _check_degraded_runners(db_session)
     await db_session.refresh(alerts[0])
     assert alerts[0].dismissed_at is not None, "low-memory alert must auto-resolve on recovery"
+
+
+# ---------------------------------------------------------------------------
+# Cross-project runner mismatch alert
+# ---------------------------------------------------------------------------
+
+from app.alert_dispatch import (  # noqa: E402
+    _RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
+    _maybe_create_runner_cross_project_mismatch_alert,
+)
+
+
+async def _cross_project_mismatch_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == _RUNNER_CROSS_PROJECT_MISMATCH_EVENT_TYPE,
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_runner_cross_project_mismatch_raises_dedup_alert(db_session, mocker):
+    """A runner attempting to report on a foreign project's job raises a WARNING alert.
+
+    - First call creates one alert and broadcasts it.
+    - Repeated calls with the same (runner_id, job_id) dedup to the same row.
+    - A distinct job_id from the same runner creates a second alert (separate dedupe key).
+    """
+    bcast = mocker.patch(
+        "app.runner_health_alerts.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    other_project = make_project()
+    db_session.add(project)
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other_project)
+
+    runner_id = _uuid_module.uuid4()
+    job_id = _uuid_module.uuid4()
+
+    # First call → alert created, broadcast fired.
+    created = await _maybe_create_runner_cross_project_mismatch_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        job_id=job_id,
+        job_project_id=other_project.id,
+        hostname="runner-alpha",
+    )
+    assert created is True
+    alerts = await _cross_project_mismatch_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "cross-project" in alert.title.lower()
+    assert "runner-alpha" in alert.title
+    assert str(runner_id)[:8] in alert.message
+    assert str(job_id)[:8] in alert.message
+    assert str(other_project.id)[:8] in alert.message
+    bcast.assert_awaited_once()
+
+    # Second call with same (runner_id, job_id) → dedup, no new alert.
+    bcast.reset_mock()
+    created2 = await _maybe_create_runner_cross_project_mismatch_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        job_id=job_id,
+        job_project_id=other_project.id,
+        hostname="runner-alpha",
+    )
+    assert created2 is False
+    alerts = await _cross_project_mismatch_alerts(db_session, project.id)
+    assert len(alerts) == 1, "repeated call must dedup to one alert row"
+    bcast.assert_not_awaited()
+
+    # Different job_id → distinct dedupe key → second alert.
+    job_id_2 = _uuid_module.uuid4()
+    created3 = await _maybe_create_runner_cross_project_mismatch_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        job_id=job_id_2,
+        job_project_id=other_project.id,
+        hostname="runner-alpha",
+    )
+    assert created3 is True
+    alerts = await _cross_project_mismatch_alerts(db_session, project.id)
+    assert len(alerts) == 2

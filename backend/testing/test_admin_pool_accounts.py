@@ -2233,6 +2233,87 @@ async def test_reset_rate_limits_clears_disabled_at_column(client, db_session):
     assert acct.disabled_at is None
     assert acct.enabled is True
     assert acct.disabled_reason is None
+
+
+@pytest.mark.anyio
+async def test_claude_config_json_encrypted_at_rest_on_create(
+    client, db_session, mocker
+):
+    """claude_config_json is encrypted in DB and omitted from the API response."""
+    from cryptography.fernet import Fernet
+    from app.field_encryption import decrypt_field
+
+    key = Fernet.generate_key().decode()
+    mocker.patch.dict("os.environ", {"GITHUB_PAT_ENCRYPTION_KEY": key})
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/acct/versions/1"),
+    )
+
+    plaintext_config = '{"onboardingAccepted":true}'
+    res = await client.post(
+        "/api/admin/max-plan-accounts",
+        json={
+            "name": "Anthropic OAuth Encrypted",
+            "provider": "anthropic",
+            "auth_mode": "oauth",
+            "secret": "sk-ant-oat01-valid",
+            "claude_config_json": plaintext_config,
+        },
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # Credential material must not be echoed back by the create endpoint.
+    assert "claude_config_json" not in body
+    assert plaintext_config not in res.text
+
+    # DB row stores the encrypted value (not the original plaintext)
+    from app.models import MaxPlanAccount
+    from sqlmodel import select
+
+    acct = await db_session.scalar(select(MaxPlanAccount))
+    assert acct is not None
+    assert acct.claude_config_json != plaintext_config
+    assert decrypt_field(acct.claude_config_json) == plaintext_config
+
+
+@pytest.mark.anyio
+async def test_claude_config_json_encrypted_at_rest_on_update(
+    client, db_session, mocker
+):
+    """Updating claude_config_json via PATCH stores the value encrypted in DB."""
+    from cryptography.fernet import Fernet
+    from app.field_encryption import decrypt_field
+
+    key = Fernet.generate_key().decode()
+    mocker.patch.dict("os.environ", {"GITHUB_PAT_ENCRYPTION_KEY": key})
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/acct/versions/1"),
+    )
+
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="Anthropic OAuth Update Test",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/acct/versions/1",
+        secret_blob_ref="projects/test/secrets/acct/versions/1",
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    new_config = '{"sessionToken":"secret-session-abc"}'
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}",
+        json={"claude_config_json": new_config},
+    )
+    assert res.status_code == 200, res.text
+
+    await db_session.refresh(acct)
+    # DB value is encrypted
+    assert acct.claude_config_json != new_config
+    assert decrypt_field(acct.claude_config_json) == new_config
     assert acct.rate_limit_state is None
 
 

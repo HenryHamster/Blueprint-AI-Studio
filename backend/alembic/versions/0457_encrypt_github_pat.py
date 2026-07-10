@@ -125,21 +125,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-
-    # Decrypt back to plaintext.  If no key/dependency is configured, values
-    # stay as-is, so the downgrade is safe in scratch and local environments.
-    rows = _github_pat_rows(bind)
-
-    updated = 0
-    for row_id, encrypted in rows:
-        plaintext = _decrypt_field(encrypted)
-        if plaintext == encrypted:
-            continue
-        _update_github_pat(bind, row_id, plaintext)
-        updated += 1
-
-    if updated:
-        logger.info(
-            "Migration 0457 (downgrade): decrypted %d github_pat value(s)", updated
-        )
+    raise NotImplementedError(
+        "rollback not supported — data encryption is one-way; "
+        "deploy decryption keys to read plaintext values"
+    )

@@ -1317,6 +1317,13 @@ async def lifespan(app):
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
+    # Per-instance credential sweep — clears resolved Secret Manager secrets
+    # from idle accounts every 5 minutes, bounding in-process credential dwell
+    # time.  Re-fetches on next select_max_plan_account call.
+    from app.max_plan_pool import credential_sweep_service
+
+    credential_sweep_task = asyncio.create_task(credential_sweep_service())
+
     # Per-instance runtime_config sync — propagates admin mutations across
     # Cloud Run instances (each has its own in-memory dict; DB is shared).
     config_sync_task = asyncio.create_task(runtime_config_sync_service())
@@ -1372,6 +1379,7 @@ async def lifespan(app):
     from app.shared_state import background_tasks as _bg_tasks
 
     _bg_tasks["orchestrator"] = orchestrator_task
+    _bg_tasks["credential_sweep"] = credential_sweep_task
     _bg_tasks["reaper"] = reaper_task
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
     _bg_tasks["gcp_image_cleanup"] = gcp_image_cleanup_task

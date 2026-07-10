@@ -134,7 +134,8 @@
     "routers/admin_health.py": 1750,
     "metrics_integrity_sweep.py": 3350,
     "release_readiness.py": 2100,
-    "acceptance_criteria.py": 1750
+    "acceptance_criteria.py": 1750,
+    "runner_health_alerts.py": 1800
   },
   "agent": {
     "index.ts": 4600,

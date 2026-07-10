@@ -134,3 +134,65 @@ class TestInvalidTokenFallback:
 
         result = decrypt_field("")
         assert result == ""
+
+
+class TestMaxPlanAccountFieldEncryption:
+    """Verify encrypt/decrypt behaviour for MaxPlanAccount oauth_token and
+    claude_config_json fields, which must be encrypted at rest when a key is set."""
+
+    def test_oauth_token_is_encrypted_at_rest(self, monkeypatch):
+        """oauth_token written to DB is ciphertext, not the Secret Manager path."""
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        secret_manager_ref = "projects/p/secrets/llm-account-uuid/versions/1"
+        stored = encrypt_field(secret_manager_ref)
+        assert stored is not None
+        assert stored != secret_manager_ref
+        assert not stored.startswith("projects/")
+
+    def test_oauth_token_decrypts_to_original(self, monkeypatch):
+        """Decrypting a stored oauth_token recovers the Secret Manager path."""
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        ref = "projects/p/secrets/llm-account-uuid/versions/1"
+        recovered = decrypt_field(encrypt_field(ref))
+        assert recovered == ref
+
+    def test_claude_config_json_is_encrypted_at_rest(self, monkeypatch):
+        """claude_config_json written to DB is ciphertext, not raw JSON."""
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        config = '{"onboardingAccepted":true,"email":"user@example.com"}'
+        stored = encrypt_field(config)
+        assert stored is not None
+        assert stored != config
+        assert "onboardingAccepted" not in stored
+
+    def test_claude_config_json_decrypts_to_original(self, monkeypatch):
+        """Decrypting a stored claude_config_json recovers the original JSON string."""
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        config = '{"onboardingAccepted":true}'
+        recovered = decrypt_field(encrypt_field(config))
+        assert recovered == config
+
+    def test_oauth_token_none_passes_through(self, monkeypatch):
+        """None oauth_token (non-Anthropic/OAuth accounts) stays None."""
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        assert encrypt_field(None) is None
+        assert decrypt_field(None) is None
+
+    def test_legacy_plaintext_oauth_token_decrypts_unchanged(self, monkeypatch):
+        """Pre-encryption rows (plaintext oauth_token) are returned as-is on read."""
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        legacy_ref = "projects/p/secrets/old-account/versions/1"
+        result = decrypt_field(legacy_ref)
+        assert result == legacy_ref
