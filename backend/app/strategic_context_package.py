@@ -697,10 +697,13 @@ async def load_strategic_context_evidence(
                     raiseload=True,
                 )
             )
-            .where(KnowledgeDocument.project_id == project_id)
+            .where(
+                KnowledgeDocument.project_id == project_id,
+                KnowledgeDocument.lifecycle_status == "pending",
+            )
             .order_by(
-                KnowledgeDocument.updated_at.desc(),
-                KnowledgeDocument.created_at.desc(),
+                KnowledgeDocument.updated_at.asc(),
+                KnowledgeDocument.created_at.asc(),
             )
             .limit(4)
         )

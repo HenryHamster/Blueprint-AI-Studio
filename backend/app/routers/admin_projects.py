@@ -1210,7 +1210,20 @@ async def reset_project_admin(
         # the same safe cancellation/VM-teardown path as force-delete.
         from app.vm_lifecycle import _ensure_vm_deleted
 
-        all_cancelled_ids = [t.id for t in active_tasks]
+        all_cancelled_ids = (
+            (
+                await session.execute(
+                    select(Task.id)
+                    .where(
+                        Task.project_id == project_id,
+                        Task.status.in_(ACTIVE_STATUSES),
+                    )
+                    .limit(1000)
+                )
+            )
+            .scalars()
+            .all()
+        )
 
         result = await session.execute(
             update(Task)

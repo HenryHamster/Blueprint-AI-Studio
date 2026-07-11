@@ -5079,8 +5079,8 @@ async def test_build_pending_followups_cross_project_isolation(db_session):
 
 
 @pytest.mark.asyncio
-async def test_build_pending_followups_newest_first_ordering(db_session):
-    """Pending followups are returned newest-first by created_at."""
+async def test_build_pending_followups_oldest_first_ordering(db_session):
+    """Pending followups are returned oldest-first by created_at so stale items surface first."""
     from datetime import datetime, timedelta
 
     from app.knowledge_query import build_pending_followups
@@ -5140,7 +5140,7 @@ async def test_build_pending_followups_newest_first_ordering(db_session):
 
     entries = await build_pending_followups(db_session, project.id)
     titles = [e["title"] for e in entries]
-    assert titles == ["Newest doc", "Middle doc", "Oldest doc"]
+    assert titles == ["Oldest doc", "Middle doc", "Newest doc"]
 
 
 @pytest.mark.asyncio
@@ -5844,3 +5844,64 @@ async def test_consume_knowledge_null_lifecycle_succeeds(
     await db_session.refresh(doc)
     assert doc.lifecycle_status == "consumed"
     assert doc.consumed_at is not None
+
+# ── strategic context evidence ordering (oldest pending first) ─────────
+
+
+@pytest.mark.asyncio
+async def test_strategic_context_evidence_orders_by_oldest_pending_first(db_session):
+    """load_strategic_context_evidence returns pending knowledge docs oldest-first
+    so stale items are never displaced by newer ones within the 4-item limit."""
+    from datetime import datetime, timedelta
+
+    from app.strategic_context_package import load_strategic_context_evidence
+
+    project = make_project(name="SCEvidenceOrder")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    base = datetime(2026, 1, 15, 12, 0, 0)
+    # Create 5 pending docs with staggered ages (oldest first in iteration).
+    titles = []
+    for i in range(5):
+        title = f"Pending doc {i}"
+        titles.append(title)
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            title=title,
+            summary=f"Summary {i}.",
+            body=f"# Body {i}\n\nContent.",
+            topic="t",
+            source_kind="web_research",
+            lifecycle_status="pending",
+            created_at=base + timedelta(hours=i),
+            updated_at=base + timedelta(hours=i),
+        )
+        db_session.add(doc)
+    await db_session.commit()
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    knowledge = evidence["knowledge"]
+    assert knowledge["total"] == 5
+    assert len(knowledge["items"]) == 4  # .limit(4) in effect
+    assert knowledge["pending_count"] == 5  # aggregate count(*) of ALL pending docs in the project
+
+    # Items must be ordered oldest-first (by created_at).
+    timestamps = [item["created_at"] for item in knowledge["items"]]
+    assert timestamps == sorted(timestamps), (
+        "pending knowledge items must be ordered oldest-first"
+    )
+
+    # The oldest 4 titles should be the returned items.
+    returned_titles = [item["label"] for item in knowledge["items"]]
+    assert returned_titles == titles[:4], (
+        f"expected oldest 4 docs {titles[:4]}, got {returned_titles}"
+    )
+

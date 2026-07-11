@@ -1629,6 +1629,17 @@ class Task(SQLModel, table=True):
             postgresql_where=text("vm_stopped_at IS NOT NULL"),
             sqlite_where=text("vm_stopped_at IS NOT NULL"),
         ),
+        # Partial index on vm_dispatched_at for warm_pool_maintainer queries
+        # that filter vm_dispatched_at >= cutoff every ~30s leader tick to
+        # detect demand. Without this, the query scans all non-QUEUED tasks
+        # across all projects. Matches the ix_task_vm_stopped_at precedent.
+        # Postgres-only via alembic 0450 CONCURRENTLY DDL.
+        Index(
+            "ix_task_vm_dispatched_at",
+            "vm_dispatched_at",
+            postgresql_where=text("vm_dispatched_at IS NOT NULL"),
+            sqlite_where=text("vm_dispatched_at IS NOT NULL"),
+        ),
         # Partial index on (status, completed_at) for the global acceptance-gate
         # backfill query (acceptance_gate.py:1170-1175) that scans for the 200
         # oldest COMPLETED tasks WITHOUT a project_id filter.  The existing
@@ -1644,6 +1655,7 @@ class Task(SQLModel, table=True):
             "completed_at",
             postgresql_where=text("status = 'COMPLETED'"),
             sqlite_where=text("status = 'COMPLETED'"),
+        ),
         ),
     )
 

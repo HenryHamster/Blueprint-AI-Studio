@@ -2150,6 +2150,7 @@ async def test_strategic_state_resolves_selected_refs_absent_from_context_packag
         tags=[],
         source_citations=[],
         forward_quality_verdict={"passed": True},
+        lifecycle_status="consumed",
         created_at=now - timedelta(days=10),
         updated_at=now - timedelta(days=10),
     )

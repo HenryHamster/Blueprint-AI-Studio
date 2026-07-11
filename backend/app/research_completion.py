@@ -566,6 +566,62 @@ def _parse_research_findings(text: str) -> List[Dict[str, Any]] | None:
     return None
 
 
+def _cap_findings_by_priority(
+    findings: List[Dict[str, Any]], effective_cap: int
+) -> tuple[List[Dict[str, Any]], int, List[Dict[str, Any]]]:
+    """Cap findings to effective_cap, preserving high-priority items first.
+
+    Returns (capped_findings, batch_cap_applied_count, batch_cap_deferred).
+    Synchronous helper for asyncio.to_thread() offloading.
+    """
+    _BATCH_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+    batch_cap_applied_count = max(0, len(findings) - effective_cap)
+    _batch_cap_deferred: list[dict] = []
+    if len(findings) > effective_cap:
+        _ranked = sorted(
+            enumerate(findings),
+            key=lambda pair: _BATCH_PRIORITY_ORDER.get(
+                pair[1].get("priority", "medium"), 1
+            ),
+        )
+        _kept_set = {i for i, _ in _ranked[:effective_cap]}
+        # Co-defer any kept finding whose depends_on_indices points at a finding
+        # the cap dropped. Without this, the index remap below silently DROPS
+        # that edge (the target index is not in _old_to_new), and the dependent
+        # spawns as an ordinary child with no edge and no blocking need --
+        # dispatching against a foundation that does not exist yet. Mirror the
+        # same-cycle prerequisite co-deferral: shelve the dependent alongside its
+        # deferred foundation so the pair re-surfaces together next cycle.
+        # Iterate to a fixpoint so an entire dependent chain co-defers, never
+        # just the leaf.
+        while True:
+            _co_defer = {
+                i
+                for i in _kept_set
+                if any(
+                    0 <= d < len(findings) and d not in _kept_set
+                    for d in (findings[i].get("depends_on_indices") or [])
+                )
+            }
+            if not _co_defer:
+                break
+            _kept_set -= _co_defer
+        _kept_orig_indices = sorted(_kept_set)
+        _batch_cap_deferred = [
+            f for i, f in enumerate(findings) if i not in _kept_set
+        ]
+        _old_to_new = {old: new for new, old in enumerate(_kept_orig_indices)}
+        findings_capped = [findings[i] for i in _kept_orig_indices]
+        for _f in findings_capped:
+            _deps = _f.get("depends_on_indices")
+            if _deps:
+                _f["depends_on_indices"] = [
+                    _old_to_new[d] for d in _deps if d in _old_to_new
+                ]
+        return findings_capped, batch_cap_applied_count, _batch_cap_deferred
+    return findings, batch_cap_applied_count, _batch_cap_deferred
+
+
 def _annotate_capability_declarations(
     findings: List[Dict[str, Any]], registry_names: List[str]
 ) -> None:
@@ -1596,7 +1652,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         )
         return
 
-    findings = _parse_research_findings(logs)
+    findings = await asyncio.to_thread(_parse_research_findings, logs)
     insights = await _parse_research_insights(str(task.id))
     # Agent JSON sometimes contains non-dict entries (bare strings, nulls).
     # The downstream .get() loop would AttributeError and the handler-failed
@@ -1928,7 +1984,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         and _runtime_config.get("research_quality_grader_enabled", False)
         and _research_findings_would_spawn(findings)
     ):
-        grader = await spawn_forward_quality_grader(task, json.dumps(findings), session)
+        findings_json = await asyncio.to_thread(json.dumps, findings)
+        grader = await spawn_forward_quality_grader(task, findings_json, session)
         if grader is not None:
             logger.info(
                 "[RESEARCH] Task %s parked awaiting forward-quality grade "
@@ -2839,51 +2896,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # each surviving finding's depends_on_indices to the compacted positions
     # so _validate_plan_dependencies doesn't see spurious self-cycles and
     # UUID resolution wires deps to the correct child tasks.
-    _BATCH_PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 
     # Cap findings to prevent runaway task creation and backlog build-up.
     # Excess findings are deferred to the next cycle (via task.context['deferred_findings'])
     # rather than discarded, so capacity-constrained cycles don't permanently lose work.
-    batch_cap_applied_count = max(0, len(findings) - _effective_cap)
-    _batch_cap_deferred: list[dict] = []
-    if len(findings) > _effective_cap:
-        _ranked = sorted(
-            enumerate(findings),
-            key=lambda pair: _BATCH_PRIORITY_ORDER.get(
-                pair[1].get("priority", "medium"), 1
-            ),
-        )
-        _kept_set = {i for i, _ in _ranked[:_effective_cap]}
-        # Co-defer any kept finding whose depends_on_indices points at a finding the
-        # cap dropped. Without this, the index remap below silently DROPS that edge
-        # (the target index is not in _old_to_new), and the dependent spawns as an
-        # ordinary child with no edge and no blocking need — dispatching against a
-        # foundation that does not exist yet. Mirror the same-cycle prerequisite
-        # co-deferral: shelve the dependent alongside its deferred foundation so the
-        # pair re-surfaces together next cycle. Iterate to a fixpoint so an entire
-        # dependent chain co-defers, never just the leaf.
-        while True:
-            _co_defer = {
-                i
-                for i in _kept_set
-                if any(
-                    0 <= d < len(findings) and d not in _kept_set
-                    for d in (findings[i].get("depends_on_indices") or [])
-                )
-            }
-            if not _co_defer:
-                break
-            _kept_set -= _co_defer
-        _kept_orig_indices = sorted(_kept_set)
-        _batch_cap_deferred = [f for i, f in enumerate(findings) if i not in _kept_set]
-        _old_to_new = {old: new for new, old in enumerate(_kept_orig_indices)}
-        findings = [findings[i] for i in _kept_orig_indices]
-        for _f in findings:
-            _deps = _f.get("depends_on_indices")
-            if _deps:
-                _f["depends_on_indices"] = [
-                    _old_to_new[d] for d in _deps if d in _old_to_new
-                ]
+    # Offloaded to thread via asyncio.to_thread since the sort + fixpoint loop is CPU-bound.
+    (
+        findings,
+        batch_cap_applied_count,
+        _batch_cap_deferred,
+    ) = await asyncio.to_thread(_cap_findings_by_priority, findings, _effective_cap)
+    if _batch_cap_deferred:
         logger.info(
             "[RESEARCH] Batch cap (%d) exceeded — deferring %d lower-priority finding(s) to next cycle",
             _effective_cap,
