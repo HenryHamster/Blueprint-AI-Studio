@@ -82,7 +82,7 @@ describe('ProjectToolHost — viewport regression', () => {
   beforeEach(() => {
     // Default mocks: empty manifest + resolved asset token so existing tests
     // that don't exercise the manifest path still behave predictably.
-    vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], error: null });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchAssetToken).mockResolvedValue({ token: 'mock-token', expires_at: '2026-07-11T12:00:00Z' });
   });
 
@@ -217,6 +217,7 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
         kind: 'project',
         source: 'project',
       }],
+      skills: [],
       error: null,
     });
     host = document.createElement('div');
@@ -238,6 +239,7 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
     vi.mocked(fetchProjectTools).mockResolvedValue(SAMPLE_TOOLS);
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({
       tools: [],
+      skills: [],
       error: 'Manifest validation errors: tools[0]: title must be a non-empty string',
     });
     host = document.createElement('div');
@@ -265,6 +267,7 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
         kind: 'project',
         source: 'project',
       }],
+      skills: [],
       error: null,
     });
     host = document.createElement('div');
@@ -291,6 +294,7 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
         kind: 'project',
         source: 'project',
       }],
+      skills: [],
       error: null,
     });
     host = document.createElement('div');
@@ -323,6 +327,7 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
         kind: 'project',
         source: 'project',
       }],
+      skills: [],
       error: null,
     });
     await expectNoOverflowAt(1440, async () => {
@@ -373,5 +378,59 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
     // The notes tool renders inside its WorkbenchPanel with an editable textarea.
     expect(host.textContent).toContain('Notes');
     expect(host.querySelector('textarea')).toBeTruthy();
+  });
+
+  test('renders skills section when manifest returns skills array', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({ tools: [], total_count: 0, next_offset: null });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [],
+      skills: [
+        {
+          slug: 'run-tests',
+          title: 'Run Tests',
+          command: 'npm test',
+          description: 'Execute the project test suite',
+        },
+        {
+          slug: 'lint',
+          title: 'Lint',
+          command: 'npm run lint',
+        },
+      ],
+      error: null,
+    });
+    host = document.createElement('div');
+    host.style.width = '1280px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-skills" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    expect(host.textContent).toContain('Skills');
+    expect(host.textContent).toContain('Run Tests');
+    expect(host.textContent).toContain('npm test');
+    expect(host.textContent).toContain('Execute the project test suite');
+    expect(host.textContent).toContain('Lint');
+    expect(host.textContent).toContain('npm run lint');
+    expect(host.textContent).not.toContain('No tools registered');
+  });
+
+  test('renders no skills section when skills array is empty', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [{ ...TOOLS_RESULT.tools[0] }],
+      total_count: 1,
+      next_offset: null,
+    });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-no-skills" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    expect(host.textContent).toContain('Mock Widget');
+    expect(host.textContent).not.toContain('Skills');
   });
 });

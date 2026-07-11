@@ -577,6 +577,12 @@ async def sweep_metrics_integrity(session, now=None) -> dict | None:
 # git ls-files, so a slow project or deep file tree should not run every tick.
 _BACKING_PROOF_INTERVAL_SECONDS = 3600
 _last_backing_proof_sweep: datetime | None = None
+# Independent cadence timer for the proof-earn loop (Step 22b). It shares the
+# hourly interval above but MUST NOT share the timestamp global: Step 22 stamps
+# _last_backing_proof_sweep at the top of the same reaper cycle, so a shared
+# timer would report Step 22b as "not due" every cycle and permanently gate it
+# out. Splitting the timers lets both run at the same cadence on separate clocks.
+_last_proof_earn_loop_sweep: datetime | None = None
 
 
 async def sweep_capability_backing_proofs(session, now=None) -> int:
@@ -712,11 +718,13 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
     have no backing_paths, the gap is surfaced in the return summary so the
     strategist layer can act.
 
-    Cadence-gated to the same hourly interval as the backing-path sweep.
+    Cadence-gated to the same hourly interval as the backing-path sweep, but on
+    an INDEPENDENT timer (``_last_proof_earn_loop_sweep``) so Step 22 stamping
+    its own timer earlier in the same cycle cannot suppress this sweep.
     Returns a summary dict (see ``commission_proof_earn_loop`` return doc),
     or ``{}`` when gated.
     """
-    global _last_backing_proof_sweep
+    global _last_proof_earn_loop_sweep
     from app.capability_demand import collect_missing_capability_demand
     from app.capability_proof import commission_proof_earn_loop
     from app.models import Project
@@ -724,9 +732,10 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
 
     _now = now or _utcnow()
     if not _is_cadence_due(
-        _last_backing_proof_sweep, _BACKING_PROOF_INTERVAL_SECONDS, _now
+        _last_proof_earn_loop_sweep, _BACKING_PROOF_INTERVAL_SECONDS, _now
     ):
         return {}
+    _last_proof_earn_loop_sweep = _now
 
     max_projects = 25
     rows = (

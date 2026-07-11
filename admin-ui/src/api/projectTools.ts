@@ -179,15 +179,22 @@ export interface ProjectToolManifestEntry {
   source: 'project';
 }
 
+export interface ProjectSkillManifestEntry {
+  slug: string;
+  title: string;
+  command: string;
+  description?: string;
+}
+
 /**
- * Fetch tools declared in the project's `.blueprint/tools.json` manifest.
- * Returns a list of manifest tool entries plus an optional error string
+ * Fetch tools and skills declared in the project's `.blueprint/tools.json` manifest.
+ * Returns manifest tool entries, skill entries, and an optional error string
  * (set for partial validation failures; null means no issues).
  */
 export async function fetchProjectToolManifest(
   projectId: string,
   signal?: AbortSignal,
-): Promise<{ tools: ProjectToolManifestEntry[]; error: string | null }> {
+): Promise<{ tools: ProjectToolManifestEntry[]; skills: ProjectSkillManifestEntry[]; error: string | null }> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/tools/manifest`,
     undefined, 2, 30000, signal,

@@ -16091,3 +16091,117 @@ async def test_orphan_project_batch_expired_before_open_pr_review_spawn(
     assert not (task_b.context or {}).get("_pr_state_check_pending"), (
         "_pr_state_check_pending must be cleared after successful review spawn"
     )
+
+
+# ── Step 22 / 22b independent cadence timers ─────────────────────────────────
+# Regression coverage for the shared-cadence-global bug: sweep_proof_earn_loop
+# (Step 22b) MUST NOT share its cadence timestamp with sweep_capability_backing_proofs
+# (Step 22). The reaper runs Step 22 then Step 22b in the same cycle with the same
+# `now`; a shared timestamp global means Step 22 stamps it first, so Step 22b's
+# cadence check sees "just ran" and gates the proof-earn loop out on every cycle.
+
+
+@pytest.mark.asyncio
+async def test_proof_earn_loop_runs_after_backing_proof_same_cycle(reaper_db, mocker):
+    """Step 22b runs even after Step 22 stamps its own cadence timer this cycle.
+
+    With the shared-global bug, sweep_capability_backing_proofs stamps the cadence
+    timestamp at the top of the cycle, and sweep_proof_earn_loop — reading the SAME
+    global — then sees "not due" and returns {} without ever collecting demand. This
+    asserts the proof-earn loop actually executes its body (collect_missing_capability_demand
+    is awaited) after the backing-proof sweep ran with the same `now`.
+    """
+    # Reset both cadence timers to first-run-immediate.
+    _prev_backing = _rs._last_backing_proof_sweep
+    _prev_earn = _rs._last_proof_earn_loop_sweep
+    _rs._last_backing_proof_sweep = None
+    _rs._last_proof_earn_loop_sweep = None
+    try:
+        project = await _make_project(reaper_db)
+        project.problem_model = {
+            "capabilities": [
+                {
+                    "name": "demanded-cap",
+                    "status": "working",
+                    "backing_paths": [],
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        now = _utcnow()
+
+        # Spy on the loop-body entry point (imported inside the sweep from
+        # app.capability_demand). If Step 22b is gated out, this is never awaited.
+        demand_spy = mocker.patch(
+            "app.capability_demand.collect_missing_capability_demand",
+            new=AsyncMock(return_value={"demands": ["demanded-cap"]}),
+        )
+        commission_stub = mocker.patch(
+            "app.capability_proof.commission_proof_earn_loop",
+            new=AsyncMock(
+                return_value={
+                    "total_demanded_unproven": 1,
+                    "earned": 0,
+                    "no_backing_paths": ["demanded-cap"],
+                    "still_unproven": ["demanded-cap"],
+                }
+            ),
+        )
+
+        # Step 22 first — this stamps _last_backing_proof_sweep = now.
+        await _rs.sweep_capability_backing_proofs(reaper_db, now)
+        assert _rs._last_backing_proof_sweep == now
+
+        # Step 22b in the SAME cycle with the SAME now. Under the bug this returns
+        # {} (gated by the just-stamped shared global); with independent timers it
+        # runs its body.
+        result = await _rs.sweep_proof_earn_loop(reaper_db, now)
+
+        demand_spy.assert_awaited()  # the proof-earn loop body executed
+        commission_stub.assert_awaited_once()
+        assert result != {}, "proof-earn loop must not be gated out by Step 22"
+        assert result["total_demanded_unproven"] == 1
+        assert result["still_unproven"] == ["demanded-cap"]
+        # The loop stamped its OWN timer, not the backing-proof timer.
+        assert _rs._last_proof_earn_loop_sweep == now
+    finally:
+        _rs._last_backing_proof_sweep = _prev_backing
+        _rs._last_proof_earn_loop_sweep = _prev_earn
+
+
+@pytest.mark.asyncio
+async def test_proof_earn_loop_honors_its_own_cadence_gate(reaper_db, mocker):
+    """Step 22b's cadence gate is independent of the backing-proof timer.
+
+    The proof-earn loop must respect its OWN recent-run timestamp regardless of the
+    backing-proof timer's state. Pre-stamping _last_proof_earn_loop_sweep to `now`
+    while leaving _last_backing_proof_sweep=None must gate the loop out (return {})
+    without collecting demand.
+    """
+    _prev_backing = _rs._last_backing_proof_sweep
+    _prev_earn = _rs._last_proof_earn_loop_sweep
+    try:
+        await _make_project(reaper_db)
+        now = _utcnow()
+
+        # Backing-proof timer is "never ran"; proof-earn timer "just ran".
+        _rs._last_backing_proof_sweep = None
+        _rs._last_proof_earn_loop_sweep = now
+
+        demand_spy = mocker.patch(
+            "app.capability_demand.collect_missing_capability_demand",
+            new=AsyncMock(return_value={"demands": ["x"]}),
+        )
+
+        result = await _rs.sweep_proof_earn_loop(reaper_db, now)
+
+        assert result == {}, "proof-earn loop must honor its own recent-run gate"
+        demand_spy.assert_not_awaited()
+        # Its own timer is unchanged by a gated call; the backing timer stays None.
+        assert _rs._last_proof_earn_loop_sweep == now
+        assert _rs._last_backing_proof_sweep is None
+    finally:
+        _rs._last_backing_proof_sweep = _prev_backing
+        _rs._last_proof_earn_loop_sweep = _prev_earn

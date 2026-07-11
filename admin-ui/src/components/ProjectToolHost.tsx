@@ -9,6 +9,7 @@ import {
   seedProjectTools as seedProjectToolsApi,
   type ProjectTool,
   type ProjectToolManifestEntry,
+  type ProjectSkillManifestEntry,
   type ToolKindConfig,
 } from '../api/projectTools';
 import { getToolComponent } from '../toolRegistry';
@@ -27,7 +28,7 @@ type FetchState =
 type ManifestState =
   | { status: 'loading' }
   | { status: 'error'; message: string }
-  | { status: 'ok'; tools: ProjectToolManifestEntry[]; warning?: string };
+  | { status: 'ok'; tools: ProjectToolManifestEntry[]; skills: ProjectSkillManifestEntry[]; warning?: string };
 
 const actionBtn =
   'inline-flex min-h-11 items-center gap-1.5 rounded-md border px-3 text-xs font-semibold transition-colors';
@@ -79,11 +80,12 @@ export function ProjectToolHost({ projectId }: Props) {
       try {
         const data = await fetchProjectToolManifest(projectId, controller.signal);
         if (controller.signal.aborted) return;
+        const skills = data.skills ?? [];
         if (data.error) {
           // Partial success: some tools loaded, but there's a validation warning.
-          setManifestState({ status: 'ok', tools: data.tools, warning: data.error });
+          setManifestState({ status: 'ok', tools: data.tools, skills, warning: data.error });
         } else {
-          setManifestState({ status: 'ok', tools: data.tools });
+          setManifestState({ status: 'ok', tools: data.tools, skills });
         }
       } catch (err) {
         if (controller.signal.aborted) return;
@@ -293,7 +295,8 @@ export function ProjectToolHost({ projectId }: Props) {
     const registeredTools = enabledTools.filter(t => getToolComponent(t.kind) !== undefined);
     const allManifestTools = manifestState.status === 'ok' ? manifestState.tools : [];
     const manifestTools = allManifestTools.filter(t => !hiddenManifestSlugs.has(t.slug));
-    const hasAnyTool = registeredTools.length > 0 || manifestTools.length > 0;
+    const manifestSkills = manifestState.status === 'ok' ? manifestState.skills : [];
+    const hasAnyTool = registeredTools.length > 0 || manifestTools.length > 0 || manifestSkills.length > 0;
 
     if (!hasAnyTool) {
       return (
@@ -304,70 +307,98 @@ export function ProjectToolHost({ projectId }: Props) {
     }
 
     return (
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        {/* Registered (DB-backed) tools with management controls */}
-        {registeredTools.map(tool => {
-          const ToolComponent = getToolComponent(tool.kind);
-          if (!ToolComponent) return null;
-          return (
-            <div key={tool.id} className="min-w-0 space-y-1.5">
-              <WorkbenchPanel title={tool.title}>
-                <ToolComponent projectId={projectId} tool={tool} />
+      <div className="space-y-4">
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {/* Registered (DB-backed) tools with management controls */}
+          {registeredTools.map(tool => {
+            const ToolComponent = getToolComponent(tool.kind);
+            if (!ToolComponent) return null;
+            return (
+              <div key={tool.id} className="min-w-0 space-y-1.5">
+                <WorkbenchPanel title={tool.title}>
+                  <ToolComponent projectId={projectId} tool={tool} />
+                </WorkbenchPanel>
+                {/* Per-tool management actions */}
+                <div className="flex items-center gap-2 px-1">
+                  <button
+                    type="button"
+                    data-viewport-allow-small-target
+                    onClick={() => handleToggleEnabled(tool)}
+                    className="text-xs text-neutral-500 hover:text-neutral-300"
+                  >
+                    {tool.enabled ? 'Disable' : 'Enable'}
+                  </button>
+                  <button
+                    type="button"
+                    data-viewport-allow-small-target
+                    onClick={() => handleDelete(tool.id)}
+                    disabled={deletingId === tool.id}
+                    className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
+                  >
+                    {deletingId === tool.id ? 'Removing…' : 'Remove'}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+
+          {/* Manifest-declared (project-repo) tools — read-only, rendered via iframe */}
+          {manifestTools.map(tool => (
+            <div key={`manifest:${tool.slug}`} className="min-w-0 space-y-1.5">
+              <WorkbenchPanel
+                title={tool.title}
+                meta={
+                  <span className="inline-flex items-center gap-1 rounded border border-neutral-600 px-1.5 py-0.5 text-ui-sm font-medium uppercase tracking-wider text-neutral-400">
+                    Project-declared
+                  </span>
+                }
+              >
+                <ProjectToolIframe projectId={projectId} tool={tool} />
               </WorkbenchPanel>
-              {/* Per-tool management actions */}
               <div className="flex items-center gap-2 px-1">
                 <button
                   type="button"
                   data-viewport-allow-small-target
-                  onClick={() => handleToggleEnabled(tool)}
+                  onClick={() => setHiddenManifestSlugs(prev => new Set([...prev, tool.slug]))}
                   className="text-xs text-neutral-500 hover:text-neutral-300"
                 >
-                  {tool.enabled ? 'Disable' : 'Enable'}
-                </button>
-                <button
-                  type="button"
-                  data-viewport-allow-small-target
-                  onClick={() => handleDelete(tool.id)}
-                  disabled={deletingId === tool.id}
-                  className="text-xs text-red-400 hover:text-red-300 disabled:opacity-50"
-                >
-                  {deletingId === tool.id ? 'Removing…' : 'Remove'}
+                  Hide
                 </button>
               </div>
             </div>
-          );
-        })}
+          ))}
 
-        {/* Manifest-declared (project-repo) tools — read-only, rendered via iframe */}
-        {manifestTools.map(tool => (
-          <div key={`manifest:${tool.slug}`} className="min-w-0 space-y-1.5">
-            <WorkbenchPanel
-              title={tool.title}
-              meta={
-                <span className="inline-flex items-center gap-1 rounded border border-neutral-600 px-1.5 py-0.5 text-ui-sm font-medium uppercase tracking-wider text-neutral-400">
-                  Project-declared
-                </span>
-              }
-            >
-              <ProjectToolIframe projectId={projectId} tool={tool} />
-            </WorkbenchPanel>
-            <div className="flex items-center gap-2 px-1">
-              <button
-                type="button"
-                data-viewport-allow-small-target
-                onClick={() => setHiddenManifestSlugs(prev => new Set([...prev, tool.slug]))}
-                className="text-xs text-neutral-500 hover:text-neutral-300"
-              >
-                Hide
-              </button>
+          {/* Manifest warning (non-fatal validation error) */}
+          {manifestState.status === 'ok' && manifestState.warning && (
+            <div className="col-span-full rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-400">
+              Manifest warning: {manifestState.warning}
             </div>
-          </div>
-        ))}
+          )}
+        </div>
 
-        {/* Manifest warning (non-fatal validation error) */}
-        {manifestState.status === 'ok' && manifestState.warning && (
-          <div className="col-span-full rounded border border-amber-500/30 bg-amber-500/10 p-2 text-xs text-amber-400">
-            Manifest warning: {manifestState.warning}
+        {/* Project-declared skills — read-only list from .blueprint/tools.json */}
+        {manifestSkills.length > 0 && (
+          <div className="space-y-2">
+            <h3 className="text-sm font-semibold text-neutral-100">Skills</h3>
+            <div className="space-y-1">
+              {manifestSkills.map(skill => (
+                <div
+                  key={`skill:${skill.slug}`}
+                  className="flex flex-col gap-0.5 rounded-md border border-workbench-border bg-workbench-layer px-3 py-2"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-neutral-200">{skill.title}</span>
+                    <span className="inline-flex items-center gap-1 rounded border border-neutral-600 px-1.5 py-0.5 text-ui-sm font-medium uppercase tracking-wider text-neutral-400">
+                      Skill
+                    </span>
+                  </div>
+                  <code className="text-xs text-neutral-400">{skill.command}</code>
+                  {skill.description && (
+                    <p className="text-xs text-neutral-500">{skill.description}</p>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </div>
