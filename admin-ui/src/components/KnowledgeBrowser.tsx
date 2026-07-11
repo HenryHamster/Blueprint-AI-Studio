@@ -355,12 +355,12 @@ function ProbeDetail({ verdict }: { verdict: KnowledgeForwardQualityVerdict | nu
  * Execution provenance panel for compute_experiment knowledge documents.
  * Reads terminal_diagnostics from the forward_quality_verdict (stored by the
  * backend when the compute job has a terminal_reason) and surfaces where the
- * run executed and the evidence tier (always machine-verified for compute).
+ * run executed and the evidence tier (earned from criterion_met, not hardcoded).
  */
 function ComputeRunProvenanceDetail({
   doc,
 }: {
-  doc: Pick<KnowledgeDocument, 'source_kind' | 'forward_quality_verdict'>;
+  doc: Pick<KnowledgeDocument, 'source_kind' | 'forward_quality_verdict' | 'criterion_met'>;
 }) {
   if (doc.source_kind !== 'compute_experiment') return null;
   const v = doc.forward_quality_verdict;
@@ -369,15 +369,36 @@ function ComputeRunProvenanceDetail({
     : null;
   const backend = typeof tdRaw?.executing_backend === 'string' ? tdRaw.executing_backend : null;
   const runnerId = typeof tdRaw?.runner_target_id === 'string' ? tdRaw.runner_target_id : null;
-  if (!backend && !runnerId) return null;
+  const runnerHostname = typeof tdRaw?.runner_hostname === 'string' ? tdRaw.runner_hostname : null;
+  if (!backend && !runnerId && !runnerHostname) return null;
   const location = backend ? computeJobExecutionLocation(backend) : null;
+
+  let evidenceBadge: React.ReactNode;
+  if (doc.criterion_met === true) {
+    evidenceBadge = (
+      <span className="bg-emerald-500/10 border-emerald-500/20 border text-ui-xs uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5 text-emerald-300">
+        <CheckCircle className="w-2.5 h-2.5 shrink-0" /> Machine-verified
+      </span>
+    );
+  } else if (doc.criterion_met === false) {
+    evidenceBadge = (
+      <span className="bg-red-500/10 border-red-500/20 border text-ui-xs uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5 text-red-300">
+        <XCircle className="w-2.5 h-2.5 shrink-0" /> Criterion not met
+      </span>
+    );
+  } else {
+    evidenceBadge = (
+      <span className="bg-neutral-500/10 border-neutral-500/20 border text-ui-xs uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5 text-neutral-400">
+        Measured only
+      </span>
+    );
+  }
+
   return (
     <div className="rounded border border-neutral-800 bg-neutral-900/40 px-2 py-1.5 text-ui-md space-y-1">
       <div className="flex items-center gap-1.5 flex-wrap">
         <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Run provenance</div>
-        <span className="bg-emerald-500/10 border-emerald-500/20 border text-ui-xs uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5 text-emerald-300">
-          <CheckCircle className="w-2.5 h-2.5 shrink-0" /> Machine-verified
-        </span>
+        {evidenceBadge}
       </div>
       {location && (
         <div className="flex items-center gap-1.5">
@@ -385,9 +406,10 @@ function ComputeRunProvenanceDetail({
           <span className={location.isOperatorHardware ? 'text-amber-300' : 'text-sky-300'}>{location.label}</span>
         </div>
       )}
-      {runnerId && (
+      {(runnerHostname ?? runnerId) && (
         <div className="text-neutral-400 text-ui-sm font-mono">
-          <span className="text-neutral-500">runner: </span>{runnerId.slice(0, 8)}…
+          <span className="text-neutral-500">runner: </span>
+          {runnerHostname ?? (runnerId ? runnerId.slice(0, 8) + '…' : null)}
         </div>
       )}
     </div>
