@@ -58,6 +58,7 @@ from app.problem_model import (
     reconcile_gap_staffing_raw_result,
     reconcile_gaps_for_retired_directions,
     evidence_met_summary,
+    compute_evidence_health,
 )
 
 
@@ -5808,3 +5809,103 @@ def test_evidence_met_summary_empty_model():
     assert summary["gaps"] == {
         "proven": 0, "path_proven": 0, "partial": 0, "unproven": 0, "contradicted": 0, "unverified": 0
     }
+
+
+# compute_evidence_health
+
+# evidence_refs shape for each EvidenceStatus:
+#   proven       → [{"proven": True}]
+#   partial      → [{"proven": False}]   (refs present, none proven)
+#   unproven     → []                    (empty list)
+#   contradicted → not emitted by classify_evidence; stored externally as a
+#                  Gap/Capability override — simulate via a Gap with a tag
+# For simplicity we drive the tests through Gap objects whose evidence_refs
+# round-trip cleanly, and verify the overall classification.
+
+def _proven_cap(n: int, idx: int) -> Capability:
+    return Capability(name=f"cap_proven_{idx}", status="working", evidence_refs=[{"proven": True}])
+
+def _partial_cap(n: int, idx: int) -> Capability:
+    return Capability(name=f"cap_partial_{idx}", status="working", evidence_refs=[{"proven": False}])
+
+def _unproven_cap(n: int, idx: int) -> Capability:
+    return Capability(name=f"cap_unproven_{idx}", status="working", evidence_refs=[])
+
+def _make_model_caps(proven=0, partial=0, unproven=0):
+    caps = (
+        [_proven_cap(1, i) for i in range(proven)]
+        + [_partial_cap(1, i) for i in range(partial)]
+        + [_unproven_cap(1, i) for i in range(unproven)]
+    )
+    return ProblemModel(capabilities=caps)
+
+
+def test_compute_evidence_health_healthy_majority_proven():
+    model = _make_model_caps(proven=3, unproven=1)
+    result = compute_evidence_health(model)
+    assert result["overall"] == "healthy"
+    assert result["reconciliation_flags"] == []
+    assert result["capabilities"]["proven"] == 3
+    assert result["capabilities"]["unproven"] == 1
+
+
+def test_compute_evidence_health_degraded_below_50_percent():
+    model = _make_model_caps(proven=1, unproven=3)
+    result = compute_evidence_health(model)
+    assert result["overall"] == "degraded"
+
+
+def test_compute_evidence_health_poor_when_no_proven_but_checkable():
+    # unproven (empty refs) → active but no proven
+    model = _make_model_caps(partial=2, unproven=1)
+    result = compute_evidence_health(model)
+    assert result["overall"] == "poor"
+
+
+def test_compute_evidence_health_poor_from_contradicted_gap():
+    # Gap with no evidence_refs and status=active counts as unproven in tally.
+    # We simulate contradicted by injecting it via a raw Gap whose stored
+    # evidence_refs classify as partial but the model also has zero proven.
+    # Contradicted is only reachable when the reconciliation sweep overrides it
+    # externally — use the overall logic directly via a model with zero proven
+    # and active gaps to cover the "poor" path.
+    model = _make_model_caps(partial=1)
+    result = compute_evidence_health(model)
+    assert result["overall"] == "poor"
+
+
+def test_compute_evidence_health_empty_model_is_degraded():
+    # No active (checkable) evidence — active_total == 0.
+    # Falls through to the else branch → "degraded".
+    result = compute_evidence_health(ProblemModel())
+    assert result["overall"] == "degraded"
+    assert result["reconciliation_flags"] == []
+
+
+def test_compute_evidence_health_includes_summary_keys():
+    model = _make_model_caps(proven=1)
+    result = compute_evidence_health(model)
+    assert "capabilities" in result
+    assert "gaps" in result
+    assert "overall" in result
+    assert "reconciliation_flags" in result
+
+
+def test_compute_evidence_health_with_coverage_summary():
+    model = _make_model_caps(proven=2)
+    coverage = {
+        "criteria": [
+            {"criterion_key": "c1", "coverage": "covered", "status": "active"},
+            {"criterion_key": "c2", "coverage": "covered", "status": "active"},
+        ]
+    }
+    result = compute_evidence_health(model, coverage_summary=coverage)
+    assert result["acceptance"]["proven"] == 2
+    assert result["overall"] == "healthy"
+
+
+def test_compute_evidence_health_exactly_50_percent_is_healthy():
+    model = _make_model_caps(proven=1, unproven=1)
+    result = compute_evidence_health(model)
+    # 1/2 == 0.5 — boundary is >=0.5, so this is healthy
+    assert result["overall"] == "healthy"

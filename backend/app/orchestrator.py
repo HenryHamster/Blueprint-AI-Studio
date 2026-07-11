@@ -648,8 +648,12 @@ async def _project_resource_dispatch_defer_message(
         # touches it; healthy cache hits remain query-free.
         if project is not None:
             state = sa_inspect(project)
-            if "build_config" in state.expired_attributes:
-                await session.refresh(project, attribute_names=["build_config"])
+            if state.expired_attributes:
+                # A per-task rollback expires ALL scalar columns on every cached
+                # ORM instance.  Refresh the entire row so any column accessed by
+                # resolve_project_* helpers (build_config, paused, etc.) is live.
+                # Healthy cache hits remain query-free (no expired attributes).
+                await session.refresh(project)
     else:
         project = await session.get(Project, task.project_id)
         if project_cache is not None:

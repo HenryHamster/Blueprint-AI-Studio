@@ -684,6 +684,64 @@ def evidence_met_summary(
     return result
 
 
+def compute_evidence_health(
+    model: ProblemModel,
+    coverage_summary: dict | None = None,
+) -> dict:
+    """Unified evidence health signal across capability, gap, and acceptance surfaces.
+
+    Phase 1 of the evidence-primitive design: surfaces evidence status counts
+    and an overall classification so the strategist can see the evidence
+    posture without any behavioral change to writes or gates.
+
+    Shape::
+
+        {
+            "capabilities": {"proven": N, "partial": N, "unproven": N,
+                             "contradicted": N, "unverified": N},
+            "gaps": {same axes},
+            "acceptance": {same axes, "total": T},  # only when coverage_summary given
+            "reconciliation_flags": [],              # populated in Phase 2
+            "overall": "healthy" | "degraded" | "poor",
+        }
+
+    ``overall`` classification (per design-doc trade-off 1):
+      - ``poor``: any contradicted refs OR zero proven across all active items
+      - ``healthy``: proven rate >= 50% across active items, no contradicted refs
+      - ``degraded``: everything else
+    """
+    summary = evidence_met_summary(model, coverage_summary)
+    caps = summary.get("capabilities", {})
+    gaps_s = summary.get("gaps", {})
+    acc = summary.get("acceptance")
+
+    _CHECKABLE: tuple = ("proven", "partial", "unproven", "contradicted")
+    proven_total = (
+        caps.get("proven", 0)
+        + gaps_s.get("proven", 0)
+        + (acc.get("proven", 0) if acc else 0)
+    )
+    active_total = (
+        sum(caps.get(s, 0) for s in _CHECKABLE)
+        + sum(gaps_s.get(s, 0) for s in _CHECKABLE)
+        + (sum(acc.get(s, 0) for s in _CHECKABLE) if acc else 0)
+    )
+    contradicted_total = (
+        caps.get("contradicted", 0)
+        + gaps_s.get("contradicted", 0)
+        + (acc.get("contradicted", 0) if acc else 0)
+    )
+
+    if contradicted_total > 0 or (active_total > 0 and proven_total == 0):
+        overall: str = "poor"
+    elif active_total > 0 and proven_total / active_total >= 0.5:
+        overall = "healthy"
+    else:
+        overall = "degraded"
+
+    return {**summary, "reconciliation_flags": [], "overall": overall}
+
+
 def parse_problem_model(raw: dict | None) -> ProblemModel:
     """Safely parse a JSONB blob into a ProblemModel.
 

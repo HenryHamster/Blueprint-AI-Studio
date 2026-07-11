@@ -103,6 +103,7 @@ from app.strategic_problem_view import (  # noqa: F401 — re-exported for calle
     _agent_view_problem_model,
     _agent_view_problem_model_floor,
     _agent_view_problem_model_packed,
+    _compute_evidence_health,
     _compute_model_health,
     _gap_floor_keep_rank,
     _serialized_bytes,
@@ -2330,6 +2331,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # drops it whole under budget rather than trimming. Same tier as
     # knowledge_index.
     "compute_experiment_sweeps": {"priority": "medium", "exempt": True},
+    # Evidence health across capabilities, gaps, and acceptance criteria — Phase 1.
+    # Exempt: small bounded dict (counts + overall string + empty flags list).
+    "evidence_health": {"priority": "medium", "exempt": True},
     "capability_trial_verdicts": {
         "priority": "medium",
         "summarize": _summarize_capability_trial_verdicts,
@@ -2556,6 +2560,10 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "compute_experiment_sweeps": {"priority": "medium", "exempt": True},
     # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Exempt: small, bounded.
     "available_capabilities": {"priority": "medium", "exempt": True},
+    # Evidence health across capabilities, gaps, and acceptance criteria.
+    # Phase 1 of the evidence-primitive design: advisory only, no behavior change.
+    # Exempt: small bounded dict (counts + overall string + empty flags list).
+    "evidence_health": {"priority": "medium", "exempt": True},
 }
 
 
@@ -4192,6 +4200,25 @@ async def _spawn_design_doc_update(
     _dd_compute_sweep_groups = await build_compute_sweep_groups(session, project.id)
     _pending_followups = await build_pending_followups(session, project.id)
 
+    # Evidence health (Phase 1 of evidence-primitive design): surface counts
+    # and overall classification so the strategist can see the evidence
+    # posture of the self-model. Best-effort: omitted on any error.
+    _dd_coverage_summary: dict | None = None
+    try:
+        from app.acceptance_criteria import get_version_coverage_summary
+        from app.release_version import current_open_version as _cur_ver
+
+        _dd_open_ver = await _cur_ver(session, project.id)
+        if _dd_open_ver is not None:
+            _dd_coverage_summary = await get_version_coverage_summary(
+                session, _dd_open_ver.id
+            )
+    except Exception:  # noqa: BLE001 — advisory signal must never block spawn
+        logger.debug("[STRATEGIC] could not fetch coverage_summary for evidence_health")
+    _dd_evidence_health = _compute_evidence_health(
+        project.problem_model, _dd_coverage_summary
+    )
+
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
@@ -4225,6 +4252,9 @@ async def _spawn_design_doc_update(
                 if (_dd_model_health := _compute_model_health(project.problem_model))
                 else {}
             ),
+            # Evidence health: advisory per-surface evidence status counts +
+            # overall classification. Phase 1 of evidence-primitive design.
+            **({"evidence_health": _dd_evidence_health} if _dd_evidence_health else {}),
             "open_message_count": len(open_msgs),
             "open_messages": open_msgs,
             **(
@@ -7436,6 +7466,22 @@ async def _spawn_strategic_review(
         session, project.id, _active_direction_ids
     )
     _cadence_exam_leads = _resident_open_found_leads(project)
+
+    # Evidence health (Phase 1 of evidence-primitive design). Re-uses the open
+    # version already resolved above if available; coverage_summary is
+    # best-effort / fail-open so any error leaves it absent from the payload.
+    _sr_coverage_summary: dict | None = None
+    try:
+        from app.acceptance_criteria import get_version_coverage_summary as _gcvs
+
+        if _open_version is not None:
+            _sr_coverage_summary = await _gcvs(session, _open_version.id)
+    except Exception:  # noqa: BLE001 — advisory signal must never block spawn
+        logger.debug("[STRATEGIC] could not fetch coverage_summary for evidence_health")
+    _sr_evidence_health = _compute_evidence_health(
+        project.problem_model, _sr_coverage_summary
+    )
+
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -7460,6 +7506,9 @@ async def _spawn_strategic_review(
             # are honest (the agent view above is trimmed). Fail-open: omitted
             # when the durable model fails strict validation (computed above).
             **({"model_health": _sr_model_health} if _sr_model_health else {}),
+            # Evidence health: advisory per-surface evidence status counts +
+            # overall classification. Phase 1 of evidence-primitive design.
+            **({"evidence_health": _sr_evidence_health} if _sr_evidence_health else {}),
             # Concrete prune candidates — present only when the model is
             # large/oversized AND something is actually prunable. Advisory list.
             **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
