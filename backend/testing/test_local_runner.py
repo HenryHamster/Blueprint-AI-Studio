@@ -1277,6 +1277,36 @@ class TestRunnerEndpoints:
         assert resp.status_code == 401
 
     @pytest.mark.asyncio
+    async def test_next_task_rejects_foreign_project_pinned_task(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner registered to project A must NOT see tasks from project B
+        even if those tasks are pinned to this runner's ID (defense-in-depth)."""
+        project_a = await _make_project(db_session, name="Project A")
+        project_b = await _make_project(db_session, name="Project B")
+        runner_a, token_a = await _make_runner(db_session, project_a.id)
+
+        # Create a task in project B pinned to runner_a's vm identity
+        # (simulates a misconfiguration or race where project B's task
+        # somehow targets this runner).
+        foreign_task = Task(
+            project_id=project_b.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner_a.id}",
+            context={"runner_target_id": str(runner_a.id)},
+        )
+        db_session.add(foreign_task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        # Must not claim the cross-project task — 204 (no task) expected.
+        assert resp.status_code == 204
+
+    @pytest.mark.asyncio
     async def test_next_task_includes_pooled_credential_in_response(
         self, client: AsyncClient, db_session
     ):

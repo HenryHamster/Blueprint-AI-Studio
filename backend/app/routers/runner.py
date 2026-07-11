@@ -215,6 +215,7 @@ async def next_task(
         select(Task)
         .where(
             Task.status == TaskStatus.PROVISIONING,
+            Task.project_id == runner.project_id,
             Task.vm_instance_id == pinned_vm_id,
             Task.context["runner_target_id"].as_string() == str(runner.id),
             # Exclude tasks already dispatched: started_at is set on dispatch so
