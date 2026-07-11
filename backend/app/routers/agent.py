@@ -861,26 +861,45 @@ async def claim_task(
     # this widens the warm-VM continuity liveness window beyond just the
     # /vm-heartbeat and /next-role endpoints.
     _shared_state.record_vm_heartbeat(vm_id)
-    stmt = (
-        select(Task)
-        .where(
-            Task.vm_instance_id == vm_id,
-            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
-        )
-        .with_for_update(skip_locked=True)
-    )
+
+    # Parse the token's task sub defensively. When a local runner runs multiple
+    # agent tasks concurrently, all tasks on the same runner share the same
+    # vm_instance_id ("runner:<id>"). Without scoping the claim SELECT to the
+    # token's own task, an agent whose token authorizes Task A can accidentally
+    # claim Task B (same vm_instance_id, QUEUED/PROVISIONING), causing every
+    # subsequent task-scoped call to 403 with "Task ID mismatch" and the agent
+    # self-terminates. verify_agent_token already rejects bare VM-scoped tokens
+    # before reaching /claim so sub should be present and valid, but guard
+    # against malformed JWTs by falling back to vm_instance_id-only behavior.
+    try:
+        token_sub = uuid.UUID(token["sub"]) if token.get("sub") else None
+    except (ValueError, TypeError):
+        token_sub = None
+
+    # Build the primary claim WHERE clause: vm_instance_id + status, optionally
+    # scoped to the token's own task sub so concurrent runner agents cannot
+    # cross-claim sibling tasks on the same runner.
+    claim_where = [
+        Task.vm_instance_id == vm_id,
+        Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
+    ]
+    if token_sub is not None:
+        claim_where.append(Task.id == token_sub)
+    stmt = select(Task).where(*claim_where).with_for_update(skip_locked=True)
     result = await session.execute(stmt)
     task = result.scalars().first()
 
     idempotent_replay = False
     if not task:
-        # Distinguish "no task" from "task locked by another process"
-        check = await session.execute(
-            select(Task.id).where(
-                Task.vm_instance_id == vm_id,
-                Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
-            )
-        )
+        # Distinguish "no task" from "task locked by another process".
+        # Same sub-scoping so we only 429 when OUR task is locked, not a sibling.
+        check_where = [
+            Task.vm_instance_id == vm_id,
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.PROVISIONING]),
+        ]
+        if token_sub is not None:
+            check_where.append(Task.id == token_sub)
+        check = await session.execute(select(Task.id).where(*check_where))
         if check.scalars().first():
             # Use 429 (not 503) so Cloud Run doesn't classify this as ContainerError
             # and quarantine the instance — see commit 88a77903 for the same pattern
@@ -898,13 +917,17 @@ async def claim_task(
         # claimed successfully. Match this VM's just-claimed task (last heartbeat
         # within 5 min — covers slow GCP provisioning and the agent's worst-case
         # retry window of API_TIMEOUT * API_MAX_RETRIES with backoff) and replay
-        # the same response.
+        # the same response. Same sub-scoping so a retry replays only the token's
+        # own task, not a sibling's.
         replay_cutoff = _utcnow() - timedelta(minutes=5)
-        replay_stmt = select(Task).where(
+        replay_where = [
             Task.vm_instance_id == vm_id,
             Task.status == TaskStatus.IN_PROGRESS,
             Task.last_heartbeat >= replay_cutoff,
-        )
+        ]
+        if token_sub is not None:
+            replay_where.append(Task.id == token_sub)
+        replay_stmt = select(Task).where(*replay_where)
         task = (await session.execute(replay_stmt)).scalars().first()
         if not task:
             raise HTTPException(

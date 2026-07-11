@@ -443,6 +443,58 @@ async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_scoped_to_token_sub_prevents_cross_claim(
+    client: AsyncClient, db_session,
+):
+    """
+    When multiple QUEUED/PROVISIONING tasks share the same vm_instance_id
+    (e.g. local-runner concurrent tasks all pinned to "runner:<id>"), claim_task
+    must scope the primary SELECT by the token's ``sub`` (task id) so an agent
+    whose token authorizes Task A does not accidentally claim Task B. Without
+    this scoping, the vm_instance_id-only SELECT returns whichever row FOR UPDATE
+    SKIP LOCKED picks first, causing every subsequent task-scoped call to 403
+    with "Task ID mismatch" and the agent self-terminates.
+    """
+    project = Project(name="Cross-Claim Guard", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    shared_vm = "runner:test-123"
+
+    task_a = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "task_a"}],
+        vm_instance_id=shared_vm,
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    task_b = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "task_b"}],
+        vm_instance_id=shared_vm,
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task_b)
+    await db_session.commit()
+    await db_session.refresh(task_b)
+
+    # Token scoped to task_b — claim must return task_b, not task_a
+    token = create_agent_token(str(task_b.id), shared_vm)
+    headers = {"x-agent-token": token}
+    resp = await client.post("/api/agent/claim", headers=headers)
+
+    assert resp.status_code == 200
+    claimed_id = resp.json()["task_id"]
+    assert claimed_id == str(task_b.id), (
+        f"Claim returned task {claimed_id} instead of the token's task {task_b.id}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_ancestor_chain_fetched_in_single_query(
     client: AsyncClient, db_session
 ):
