@@ -4907,6 +4907,25 @@ async def _finalize_qualification(
             "status": "already_on_main_exempt",
             "blocked": False,
         }
+    # Eagerly persist merge_grade to the per-dimension ledger so a later-gate
+    # infra failure does not discard the result before _dual_write_dimension_results.
+    if merge_grade_task_id or "merge_grade" in resolved_dims:
+        _mg_cert_status = merge_grade_cert.get("status", "not_applicable")
+        if _mg_cert_status == "pass":
+            _mg_ledger_status = "passed"
+        elif _mg_cert_status in ("fail", "misses"):
+            _mg_ledger_status = "failed"
+        elif _mg_cert_status in ("superseded_exempt", "already_on_main_exempt"):
+            _mg_ledger_status = "passed"
+        else:
+            _mg_ledger_status = "unavailable"
+        _mg_coverage = merge_grade_cert.get("coverage")
+        await _upsert_dimension_result(
+            session, version, candidate_sha, "merge_grade",
+            status=_mg_ledger_status,
+            sub_score=_mg_coverage if isinstance(_mg_coverage, (int, float)) and not isinstance(_mg_coverage, bool) else None,
+            producing_task_id=merge_grade_task_id,
+        )
     # --- Capability-proof gate dimension (informational in OFF/OBSERVE, gating in ENFORCE) ---
     # Reflects whether the capability proof gate is active and — in ENFORCE
     # mode — whether all working capabilities carry machine-verified proof.

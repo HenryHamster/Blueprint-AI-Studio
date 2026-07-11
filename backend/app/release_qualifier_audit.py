@@ -162,6 +162,12 @@ def _infer_dimension_from_infra_error(infra_error: str) -> str:
         return "test_erosion"
     if code.startswith("audit"):
         return "audit"
+    # Ledger-integrity codes (qualification_dimension_ledger_incomplete /
+    # qualification_dimension_ledger_empty) are not a single-dimension failure —
+    # recording them as 'audit' would overwrite a legitimately-passed audit fact.
+    # Return None so the caller skips the per-dimension upsert entirely.
+    if code.startswith("qualification_dimension_ledger"):
+        return None
     return "audit"
 
 
@@ -935,14 +941,21 @@ async def _handle_infra_failure(
     # gate's flakiness cannot burn another gate's retry budget and the other
     # dimensions' already-resolved facts for this candidate tree are untouched.
     # Best-effort: a ledger write failure must never break the infra-failure hold.
+    # Skip when failing_dimension is None (e.g. ledger-integrity codes) — there
+    # is no single dimension to blame and writing 'audit' would overwrite a
+    # legitimately-resolved audit fact.
     _rq = _release_qualifier_module()
-    dimension_infra_streak = await _rq._record_infra_dimension_unavailable(
-        session,
-        version,
-        qual.get("candidate_sha"),
-        failing_dimension,
-        infra_error=infra_error,
-        signature=signature,
+    dimension_infra_streak = (
+        await _rq._record_infra_dimension_unavailable(
+            session,
+            version,
+            qual.get("candidate_sha"),
+            failing_dimension,
+            infra_error=infra_error,
+            signature=signature,
+        )
+        if failing_dimension is not None
+        else None
     )
 
     if (

@@ -9510,8 +9510,10 @@ class TestInferDimensionFromInfraError:
             ("merge_grade_report_unparseable", "merge_grade"),
             ("ci_not_green", "ci"),
             ("test_erosion_regressed", "test_erosion"),
+            # ledger-integrity codes → None (no dimension; caller skips upsert)
+            ("qualification_dimension_ledger_incomplete", None),
+            ("qualification_dimension_ledger_empty", None),
             # unrecognized / empty → 'audit' fallback
-            ("qualification_dimension_ledger_incomplete", "audit"),
             ("something_unrecognized", "audit"),
             ("", "audit"),
         ],
@@ -9609,6 +9611,75 @@ async def test_finalize_infra_failure_persists_partial_dimension_results(
     # Migration_identity was recorded as "unavailable" by _handle_infra_failure.
     assert "migration_identity" in by_dim
     assert by_dim["migration_identity"].status == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_merge_grade_eagerly_persisted_before_dual_write(db_session, mocker):
+    """merge_grade dimension is written to the ledger via the eager
+    _upsert_dimension_result call, BEFORE _dual_write_dimension_results.
+
+    When _dual_write_dimension_results is bypassed (simulated by a no-op patch),
+    the merge_grade ledger row must still be present because the eager write
+    in _finalize_qualification landed it during the merge_grade resolution block.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+        seed_merge_grade=True,
+        merge_grade_logs={
+            "covers_goal": True,
+            "coverage_score": 0.9,
+            "biggest_gap": None,
+            "misses": [],
+        },
+        version_goal="ship a working feature",
+    )
+
+    # Patch _dual_write_dimension_results to a no-op so that only the eager
+    # per-dimension writes (for ci, audit, test_erosion, smoketest, merge_grade)
+    # can populate the ledger.
+    mocker.patch(
+        "app.release_qualifier._dual_write_dimension_results",
+        new=AsyncMock(),
+    )
+    # Also patch promote so we don't execute GitHub calls on a passing finalize.
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+
+    # merge_grade must be present from the eager write even though
+    # _dual_write_dimension_results was suppressed.
+    assert "merge_grade" in by_dim, (
+        "merge_grade ledger row missing — eager _upsert_dimension_result was not called"
+    )
+    row = by_dim["merge_grade"]
+    assert row.status == "passed", (
+        f"expected merge_grade status 'passed', got {row.status!r}"
+    )
+    candidate_sha = version.last_qualification.get("candidate_sha")
+    assert row.candidate_sha == candidate_sha
 
 
 @pytest.mark.asyncio
@@ -9876,6 +9947,67 @@ async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mock
     promote_spy.assert_not_called()
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_ledger_integrity_infra_failure_does_not_overwrite_passed_audit(
+    db_session, mocker
+):
+    """_handle_infra_failure with a ledger-integrity error code must NOT overwrite
+    a legitimately-resolved audit dimension fact.
+
+    Regression guard: _infer_dimension_from_infra_error previously returned 'audit'
+    for 'qualification_dimension_ledger_incomplete', causing _record_infra_dimension_unavailable
+    to overwrite a passed audit row with 'unavailable'.
+    """
+    from app import release_qualifier_audit as rqa
+    from app.models import QualificationDimensionResult
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "abc123def456abc123def456abc123def456abc1"
+    version.qualification_attempts = 2
+    db_session.add(version)
+
+    # Seed a legitimately-passed audit dimension fact.
+    passed_audit_row = QualificationDimensionResult(
+        project_id=version.project_id,
+        release_version_id=version.id,
+        candidate_sha=candidate_sha,
+        dimension="audit",
+        status="passed",
+        sub_score=1.0,
+    )
+    db_session.add(passed_audit_row)
+    await db_session.flush()
+
+    qual = {
+        "candidate_sha": candidate_sha,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "prior_infra_streak": 0,
+    }
+
+    await rqa._handle_infra_failure(
+        db_session, version, qual, "qualification_dimension_ledger_incomplete"
+    )
+    await db_session.flush()
+
+    # The audit row must still be 'passed' — not overwritten with 'unavailable'.
+    from sqlalchemy import select as sa_select
+
+    row = (
+        await db_session.execute(
+            sa_select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == candidate_sha,
+                QualificationDimensionResult.dimension == "audit",
+            )
+        )
+    ).scalar_one_or_none()
+    assert row is not None, "audit dimension row disappeared"
+    assert row.status == "passed", (
+        f"audit dimension was overwritten: expected 'passed', got {row.status!r}"
+    )
 
 
 @pytest.mark.asyncio
