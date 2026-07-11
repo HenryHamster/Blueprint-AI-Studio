@@ -1758,7 +1758,7 @@ describe('buildCompactionCheckpoint', () => {
     // ./fetch directives let the model recover current state.
     expect(result).toContain('./fetch problem-model');
     expect(result).toContain('./fetch direction <id>');
-    expect(result).toContain('./fetch open-messages');
+    expect(result).toContain('./fetch message');
     // The top-level header must not claim the model 'retains ... all durable state'.
     expect(result).not.toMatch(/retain.*all durable state/);
 

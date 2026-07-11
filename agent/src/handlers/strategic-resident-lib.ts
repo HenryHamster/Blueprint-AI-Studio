@@ -448,7 +448,7 @@ ${ctx.autonomousState.trim()}`);
   if (grounding.length > 0) {
     const note = `> **Snapshot note:** The data below was captured when the session started
 > and may not reflect current project state. Use \`./fetch problem-model\`,
-> \`./fetch direction <id>\`, and \`./fetch open-messages\` to retrieve
+> \`./fetch direction <id>\`, and \`./fetch message\` to retrieve
 > the latest state.`;
     sections.push(`## Self-model grounding (session-start snapshot)\n${note}\n\n${grounding.join('\n\n')}`);
   }
