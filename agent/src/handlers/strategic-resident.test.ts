@@ -120,4 +120,21 @@ describe('SessionStreamer.flush — rate-limited boundary flush', () => {
     // Two SEPARATE message frames — A's tail never merges into B's first delta.
     expect(emittedTexts()).toEqual(['end of turn A', 'start of turn B']);
   });
+
+  it('interleaves tool frames between adjacent text deltas in order', async () => {
+    const streamer = new SessionStreamer(null, 'sess', 'task');
+    streamer.delta('checking ');
+    streamer.tool('Read', '/some/file');
+    streamer.delta(' result found');
+
+    streamer.flush();
+    await vi.advanceTimersByTimeAsync(STREAM_FLUSH_MS * 10);
+
+    // The tool frame seals any preceding open text and sits between deltas.
+    expect(emittedTexts()).toEqual([
+      'checking ',
+      '[tool: Read] /some/file',
+      ' result found',
+    ]);
+  });
 });

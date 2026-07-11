@@ -457,4 +457,43 @@ describe('ComputeJobsPanel — viewport regression', () => {
       { waitMs: 60 },
     );
   });
+
+  test('compact table view renders sortable columns at 1200px', async () => {
+    jobsToReturn = criterionJobs;
+    await expectFullViewportAt(
+      1200,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        // Switch to compact table view
+        const toggleBtn = host.querySelector('[data-testid="compute-view-mode-toggle"]') as HTMLButtonElement | null;
+        if (!toggleBtn) throw new Error('View mode toggle button not found');
+        await act(async () => { toggleBtn.click(); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 20)); });
+        // Table should be rendered
+        const table = host.querySelector('[data-testid="compact-jobs-table"]');
+        if (!table) throw new Error('compact-jobs-table not rendered after toggle');
+        // Sortable column headers should be present
+        const nameHeader = host.querySelector('[data-testid="jobs-table-sort-name"]');
+        if (!nameHeader) throw new Error('Name sort header not found');
+        const costHeader = host.querySelector('[data-testid="jobs-table-sort-cost"]');
+        if (!costHeader) throw new Error('Cost sort header not found');
+        // Criterion chips should render for both jobs
+        const chips = host.querySelectorAll('[data-testid="compact-table-criterion-chip"]');
+        if (chips.length < 2) throw new Error(`Expected at least 2 criterion chips, got ${chips.length}`);
+        // Verify met/unmet chips are present
+        const text = host.textContent ?? '';
+        if (!text.includes('met')) throw new Error('met criterion chip not rendered');
+        if (!text.includes('unmet')) throw new Error('unmet criterion chip not rendered');
+      },
+      { waitMs: 60 },
+    );
+  });
 });

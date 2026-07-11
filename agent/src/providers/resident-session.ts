@@ -245,6 +245,10 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   // pending stale result is swallowed exactly once before a live result settles
   // the current turn. Reset when the process dies (no more results can arrive).
   let staleResultsPending = 0;
+  // Track the last-seen cumulative numTurns from CLI result events so we only
+  // record the DELTA per turn, not the accumulating total (which would give
+  // N(N+1)/2 after N turns instead of N — see telemetry recordNumTurns).
+  let lastSeenNumTurns = 0;
   const pid = child.pid;
 
   const emit = (ev: ResidentSessionEvent): void => {
@@ -489,7 +493,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           if (activeTurn) activeTurn.inputTokens = ev.usage.inputTokens;
         }
         if (ev.numTurns !== undefined) {
-          recordNumTurns(ev.numTurns);
+          // numTurns is a cumulative count across the whole CLI process;
+          // only emit the delta since the last result to avoid double-counting.
+          const delta = ev.numTurns - lastSeenNumTurns;
+          lastSeenNumTurns = ev.numTurns;
+          if (Number.isFinite(delta) && delta > 0) recordNumTurns(delta);
         }
         // Swallow a result owed by an already-force-settled turn so it cannot
         // resolve a newer turn's promise (see staleResultsPending).

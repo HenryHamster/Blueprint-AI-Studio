@@ -1879,6 +1879,55 @@ describe('residentConfig compaction knobs', () => {
     const c = residentConfig({ strategic_session_compaction_cooldown_seconds: 10 });
     expect(c.compactionCooldownMs).toBe(60_000);
   });
+
+  describe('serializeDecisionsRegister / restoreDecisionsRegister', () => {
+    const makeEntry = (surfaceKey: string, atTick: number, note?: string): DecisionsRegisterEntry => ({
+      atTick,
+      at: '2026-07-10T12:00:00Z',
+      surfaceKey,
+      verdict: 'clear',
+      note: note ?? 'ok',
+    });
+
+    it('round-trips a register through serialize → restore', () => {
+      const reg = [makeEntry('direction:d-1', 1), makeEntry('qualification', 2)];
+      const serialized = serializeDecisionsReg(reg);
+      const restored = restoreDecisionsReg(serialized);
+      expect(restored).not.toBeNull();
+      const r = restored as DecisionsRegisterEntry[];
+      expect(r).toHaveLength(2);
+      expect(r[0].surfaceKey).toBe('direction:d-1');
+      expect(r[1].surfaceKey).toBe('qualification');
+      expect(r[0].atTick).toBe(1);
+      expect(r[1].verdict).toBe('clear');
+    });
+
+    it('restoreDecisionsReg returns null for undefined / empty / malformed input', () => {
+      expect(restoreDecisionsReg(undefined)).toBeNull();
+      expect(restoreDecisionsReg(null)).toBeNull();
+      expect(restoreDecisionsReg('')).toBeNull();
+      expect(restoreDecisionsReg('not json{')).toBeNull();
+      expect(restoreDecisionsReg('"just a string"')).toBeNull();
+      expect(restoreDecisionsReg('{}')).toEqual([]);
+    });
+
+    it('empty register returns a valid empty entries array from serializeDecisionsReg', () => {
+      const serialized = serializeDecisionsReg([]);
+      const parsed = JSON.parse(serialized) as { entries: DecisionsRegisterEntry[] };
+      expect(parsed.entries).toEqual([]);
+    });
+
+    it('caps at DECISIONS_REGISTER_CAP entries on restore', () => {
+      const many = Array.from({ length: 60 }, (_, i) => makeEntry(`surface-${i}`, i));
+      const serialized = serializeDecisionsReg(many);
+      const restored = restoreDecisionsReg(serialized);
+      expect(restored).not.toBeNull();
+      const r = restored as DecisionsRegisterEntry[];
+      expect(r.length).toBeLessThanOrEqual(50);
+      // Should keep the most recent entries (suffix of the original).
+      expect(r[r.length - 1].surfaceKey).toBe('surface-59');
+    });
+  });
 });
 
 describe('formatDirectionGroundingText', () => {

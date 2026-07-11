@@ -232,7 +232,7 @@
     "components/DirectionPortfolioSection.tsx": 1100,
     "components/HeaderBar.tsx": 1100,
     "components/ResearchBrowser.tsx": 1050,
-    "components/ComputeJobsPanel.tsx": 2450,
+    "components/ComputeJobsPanel.tsx": 2850,
     "hooks/useWorkbenchCommands.ts": 1800,
     "api/compute.ts": 2000,
     "api/projects.ts": 1750

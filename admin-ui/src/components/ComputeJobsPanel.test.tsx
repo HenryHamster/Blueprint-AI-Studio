@@ -508,11 +508,12 @@ describe('ComputeJobsPanel render + kill', () => {
         compute_rpc_diagnostic: makeDiagnostic({ operation: 'cost', job_status: 'FAILED' }),
       }),
     ]));
-    const { findByTestId, findByText, findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const { findByTestId, findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
     const warning = await findByTestId('compute-rpc-diagnostic');
     expect(warning.textContent).toContain('cost');
-    // Terminal label still rendered, separate from the amber warning block.
-    await findByText('Failed');
+    // Terminal label still rendered in the jobs list, separate from the amber warning block.
+    const jobsList = await findByTestId('compute-jobs-list');
+    expect(jobsList.textContent).toContain('Failed');
     expect(warning.textContent).not.toContain('Failed');
     // Result link still present alongside the warning.
     await findByRole('link', { name: /result\.json/i });

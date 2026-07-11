@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen, Search, List } from 'lucide-react';
 import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePersistedState } from '../hooks/usePersistedState';
@@ -666,6 +666,8 @@ function HeldExperimentsSection({
   onDismiss?: (taskId: string) => Promise<void>;
 }) {
   const [actionId, setActionId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchApproving, setBatchApproving] = useState(false);
 
   if (!experiments || experiments.length === 0) return null;
 
@@ -681,50 +683,123 @@ function HeldExperimentsSection({
     try { await onDismiss(id); } finally { setActionId(null); }
   };
 
+  const allSelected = experiments.length > 0 && selectedIds.size === experiments.length;
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    if (allSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(experiments.map(e => e.id)));
+    }
+  };
+
+  const handleBatchApprove = async () => {
+    if (!onApprove || selectedIds.size === 0) return;
+    setBatchApproving(true);
+    try {
+      await Promise.all([...selectedIds].map(id => onApprove(id)));
+      setSelectedIds(new Set());
+    } finally {
+      setBatchApproving(false);
+    }
+  };
+
+  const hasSelection = selectedIds.size > 0;
+  const busy = actionId !== null || batchApproving;
+
   return (
     <div className="mb-3" data-testid="held-experiments-section">
       <div className="text-ui-sm font-semibold text-amber-300 uppercase tracking-widest mb-1.5 flex items-center gap-1.5">
         <AlertTriangle className="w-3 h-3 shrink-0" />
         Held for approval
+        <span className="text-ui-xs text-amber-400/70 font-mono normal-case font-normal">({experiments.length})</span>
       </div>
       <div className="flex flex-col gap-1.5">
+        {/* Batch action toolbar — only when approve is wired and experiments are selectable */}
+        {onApprove && experiments.length >= 1 && (
+          <div className="flex items-center gap-2 mb-0.5">
+            <label className="flex items-center gap-1.5 text-ui-sm text-neutral-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={toggleSelectAll}
+                disabled={busy}
+                className="rounded border-neutral-600 bg-neutral-800 text-sky-500 focus:ring-sky-500 disabled:opacity-40"
+                data-testid="held-experiment-select-all"
+              />
+              {allSelected ? `${experiments.length} selected` : 'Select all'}
+            </label>
+            {hasSelection && (
+              <button
+                type="button"
+                onClick={() => void handleBatchApprove()}
+                disabled={batchApproving}
+                className="min-h-[28px] rounded bg-emerald-500/20 px-2.5 text-ui-sm font-semibold text-emerald-200 hover:bg-emerald-500/30 transition-colors disabled:opacity-50"
+                data-testid="held-experiment-batch-approve"
+              >
+                {batchApproving ? 'Approving…' : `Approve ${selectedIds.size}`}
+              </button>
+            )}
+          </div>
+        )}
         {experiments.map((exp) => {
           const spendCap = (exp.payloads?.[0] as Record<string, unknown> | undefined)?.spend_cap_usd;
           const capLabel = spendCap != null ? ` · $${Number(spendCap).toFixed(2)}` : '';
-          const busy = actionId === exp.id;
+          const isBusy = busy || actionId === exp.id;
+          const checked = selectedIds.has(exp.id);
           return (
             <div
               key={exp.id}
               className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 flex items-center justify-between gap-3"
               data-testid="held-experiment-row"
             >
-              <div className="min-w-0">
-                <div className="text-xs font-semibold text-amber-200 break-words">{exp.title}{capLabel}</div>
-                <div className="text-ui-sm text-amber-300/70 font-mono">spend cap requires operator approval</div>
+              <div className="flex items-center gap-3 min-w-0 flex-1">
+                {onApprove && (
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleSelect(exp.id)}
+                    disabled={busy}
+                    className="rounded border-neutral-600 bg-neutral-800 text-sky-500 focus:ring-sky-500 shrink-0 disabled:opacity-40"
+                    data-testid="held-experiment-checkbox"
+                  />
+                )}
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-amber-200 break-words">{exp.title}{capLabel}</div>
+                  <div className="text-ui-sm text-amber-300/70 font-mono">spend cap requires operator approval</div>
+                </div>
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 {onApprove && (
                   <button
                     type="button"
                     onClick={() => void handleApprove(exp.id)}
-                    disabled={busy}
+                    disabled={isBusy}
                     className="min-h-[44px] flex items-center gap-1.5 rounded bg-emerald-500/20 px-3 text-ui-md font-semibold text-emerald-200 hover:bg-emerald-500/30 transition-colors disabled:opacity-50"
                     data-testid="held-experiment-approve"
                   >
                     <CheckCircle className="w-3 h-3" />
-                    {busy ? 'Approving…' : 'Approve'}
+                    {actionId === exp.id ? 'Approving…' : 'Approve'}
                   </button>
                 )}
                 {onDismiss && (
                   <button
                     type="button"
                     onClick={() => void handleDismiss(exp.id)}
-                    disabled={busy}
+                    disabled={isBusy}
                     className="min-h-[44px] flex items-center gap-1.5 rounded bg-red-500/20 px-3 text-ui-md font-semibold text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50"
                     data-testid="held-experiment-dismiss"
                   >
                     <XCircle className="w-3 h-3" />
-                    {busy ? 'Dismissing…' : 'Dismiss'}
+                    {actionId === exp.id ? 'Dismissing…' : 'Dismiss'}
                   </button>
                 )}
               </div>
@@ -770,6 +845,109 @@ function buildCloneForm(job: ComputeJob): ComputeExperimentForm {
     successOperator: (sc?.operator as ComputeSuccessOperator) ?? '>=',
     successThreshold: sc?.threshold != null ? String(sc.threshold) : '',
   };
+}
+
+type TableSortKey = 'name' | 'status' | 'criterion' | 'cost' | 'runtime' | 'backend';
+
+const TABLE_COL_LABELS: Record<TableSortKey, string> = {
+  name: 'Name',
+  status: 'Status',
+  criterion: 'Criterion',
+  cost: 'Cost',
+  runtime: 'Runtime',
+  backend: 'Backend',
+};
+
+function CompactJobsTable({
+  jobs,
+  sortConfig,
+  onSort,
+  onNavigateToTask,
+}: {
+  jobs: ComputeJob[];
+  sortConfig: { key: TableSortKey; dir: 'asc' | 'desc' } | null;
+  onSort: (key: TableSortKey) => void;
+  onNavigateToTask?: (taskId: string) => void;
+}) {
+  return (
+    <div className="overflow-x-auto" data-testid="compact-jobs-table">
+      <table className="w-full text-ui-sm font-mono">
+        <thead>
+          <tr className="border-b border-neutral-800">
+            {(Object.keys(TABLE_COL_LABELS) as TableSortKey[]).map((col) => (
+              <th
+                key={col}
+                className="text-left py-1.5 pr-3 text-neutral-500 font-semibold cursor-pointer hover:text-neutral-300 select-none whitespace-nowrap"
+                onClick={() => onSort(col)}
+                data-testid={`jobs-table-sort-${col}`}
+              >
+                {TABLE_COL_LABELS[col]}
+                {sortConfig?.key === col ? (sortConfig.dir === 'asc' ? ' ↑' : ' ↓') : ''}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {jobs.map((job) => {
+            const active = isComputeJobActive(job);
+            const spent = computeJobSpent(job);
+            const runtimeSec = computeJobRuntimeSec(job);
+            const { label: backendLabel } = computeJobExecutionLocation(job.backend ?? '');
+            const cv = job.criterion_verdict;
+            const sc = job.success_criterion;
+            return (
+              <tr key={job.id} className="border-t border-neutral-800/50 hover:bg-neutral-800/30 transition-colors">
+                <td className="py-1.5 pr-3 max-w-xs">
+                  {job.task_id && onNavigateToTask ? (
+                    <button
+                      onClick={() => onNavigateToTask(job.task_id as string)}
+                      className="text-sky-300 hover:underline text-left truncate max-w-full block"
+                      data-testid="compact-table-job-name"
+                    >
+                      {(job.task_title ?? job.id).slice(0, 48)}
+                    </button>
+                  ) : (
+                    <span className="text-neutral-300 truncate block" data-testid="compact-table-job-name">
+                      {(job.task_title ?? job.id).slice(0, 48)}
+                    </span>
+                  )}
+                </td>
+                <td className="py-1.5 pr-3 whitespace-nowrap">
+                  <span className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${statusBadgeClass(job)}`}>
+                    {active ? job.status : computeJobTerminalLabel(job)}
+                  </span>
+                </td>
+                <td className="py-1.5 pr-3">
+                  {sc ? (
+                    <span className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-neutral-400 whitespace-nowrap">{sc.metric} {sc.operator} {sc.threshold}</span>
+                      {cv && (
+                        <span
+                          className={`rounded border px-1 py-0.5 text-ui-xs font-semibold ${cv.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : !cv.measurable ? 'border-amber-500/40 bg-amber-500/15 text-amber-300' : 'border-red-500/40 bg-red-500/15 text-red-300'}`}
+                          data-testid="compact-table-criterion-chip"
+                        >
+                          {cv.met ? 'met' : !cv.measurable ? 'inconclusive' : 'unmet'}
+                        </span>
+                      )}
+                    </span>
+                  ) : <span className="text-neutral-600">—</span>}
+                </td>
+                <td className="py-1.5 pr-3 text-neutral-400 whitespace-nowrap">
+                  {spent != null ? fmtUsd(spent) : '—'}
+                </td>
+                <td className="py-1.5 pr-3 text-neutral-400 whitespace-nowrap">
+                  {runtimeSec != null ? fmtDuration(runtimeSec) : active ? 'running' : '—'}
+                </td>
+                <td className="py-1.5 text-neutral-400 max-w-xs truncate">
+                  {backendLabel}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 interface ComputeJobsPanelProps {
@@ -819,6 +997,54 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     {},
     sanitizeAskState,
   );
+  const [searchText, setSearchText] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'completed' | 'failed'>('all');
+  const [viewMode, setViewMode] = useState<'card' | 'table'>('card');
+  const [sortConfig, setSortConfig] = useState<{ key: TableSortKey; dir: 'asc' | 'desc' } | null>(null);
+
+  const filteredJobs = useMemo(() => {
+    let result = jobs;
+    if (searchText.trim()) {
+      const q = searchText.toLowerCase();
+      result = result.filter((job) =>
+        (job.task_title ?? job.id ?? '').toLowerCase().includes(q) ||
+        (job.experiment ?? '').toLowerCase().includes(q) ||
+        (job.benchmark ?? '').toLowerCase().includes(q) ||
+        (job.hypothesis ?? '').toLowerCase().includes(q),
+      );
+    }
+    if (statusFilter === 'active') {
+      result = result.filter((job) => isComputeJobActive(job));
+    } else if (statusFilter === 'completed') {
+      result = result.filter((job) => !isComputeJobActive(job) && job.outcome === 'SUCCESS');
+    } else if (statusFilter === 'failed') {
+      result = result.filter((job) => !isComputeJobActive(job) && job.outcome !== null && job.outcome !== 'SUCCESS');
+    }
+    return result;
+  }, [jobs, searchText, statusFilter]);
+
+  const displayJobs = useMemo(() => {
+    if (!sortConfig) return filteredJobs;
+    return [...filteredJobs].sort((a, b) => {
+      let cmp = 0;
+      if (sortConfig.key === 'name') cmp = (a.task_title ?? a.id).localeCompare(b.task_title ?? b.id);
+      else if (sortConfig.key === 'status') cmp = (a.status ?? '').localeCompare(b.status ?? '');
+      else if (sortConfig.key === 'criterion') {
+        const am = a.criterion_verdict?.met ?? null;
+        const bm = b.criterion_verdict?.met ?? null;
+        cmp = am === bm ? 0 : am === true ? -1 : bm === true ? 1 : am === false ? -1 : 1;
+      } else if (sortConfig.key === 'cost') cmp = (computeJobSpent(a) ?? 0) - (computeJobSpent(b) ?? 0);
+      else if (sortConfig.key === 'runtime') cmp = (computeJobRuntimeSec(a) ?? 0) - (computeJobRuntimeSec(b) ?? 0);
+      else if (sortConfig.key === 'backend') cmp = (a.backend ?? '').localeCompare(b.backend ?? '');
+      return sortConfig.dir === 'asc' ? cmp : -cmp;
+    });
+  }, [filteredJobs, sortConfig]);
+
+  const handleTableSort = useCallback((key: TableSortKey) => {
+    setSortConfig((prev) =>
+      prev?.key === key ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' },
+    );
+  }, []);
 
   const toggleDocExpanded = useCallback((key: string) => {
     setExpandedDocIds((prev) => {
@@ -1135,6 +1361,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               All
             </button>
           </div>
+          <button
+            type="button"
+            onClick={() => setViewMode((m) => m === 'card' ? 'table' : 'card')}
+            className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded px-1.5 py-0.5 transition-colors ${viewMode === 'table' ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+            title={viewMode === 'table' ? 'Switch to card view' : 'Switch to compact table view'}
+            data-testid="compute-view-mode-toggle"
+          >
+            <List className="w-3.5 h-3.5" />
+          </button>
         </div>
       </div>
       {!allTerminal && (
@@ -1232,8 +1467,50 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
       <ExperimentSweepSummary jobs={jobs} />
 
+      {(jobs.length > 0 || searchText || statusFilter !== 'all') && (
+        <div className="mb-2 flex flex-wrap items-center gap-2" data-testid="compute-jobs-filters">
+          <div className="relative flex-1 min-w-0 max-w-xs">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-500 pointer-events-none" />
+            <input
+              type="text"
+              value={searchText}
+              onChange={(e) => setSearchText(e.target.value)}
+              placeholder="Search by name, experiment…"
+              className="w-full rounded border border-neutral-700 bg-neutral-900 pl-7 pr-2 py-1.5 text-ui-sm text-neutral-100 placeholder-neutral-600 focus:outline-none focus:border-sky-500/50"
+              data-testid="compute-jobs-search"
+            />
+          </div>
+          <div className="flex items-center gap-0.5" data-testid="compute-status-filter">
+            {(['all', 'active', 'completed', 'failed'] as const).map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => setStatusFilter(s)}
+                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${statusFilter === s ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+                data-testid={`compute-status-${s}`}
+              >
+                {s === 'all' ? 'All' : s === 'active' ? 'Active' : s === 'completed' ? 'Completed' : 'Failed'}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-col gap-2" data-testid="compute-jobs-list">
-        {jobs.map((job) => {
+        {filteredJobs.length === 0 && jobs.length > 0 && (
+          <div className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2">
+            <div className="text-ui-sm text-neutral-500">No jobs match the current filters.</div>
+          </div>
+        )}
+        {viewMode === 'table' && filteredJobs.length > 0 && (
+          <CompactJobsTable
+            jobs={displayJobs}
+            sortConfig={sortConfig}
+            onSort={handleTableSort}
+            onNavigateToTask={onNavigateToTask}
+          />
+        )}
+        {viewMode !== 'table' && displayJobs.map((job) => {
           const active = isComputeJobActive(job);
           const cap = job.spend_cap_usd ?? 0;
           const spent = computeJobSpent(job);

@@ -1470,7 +1470,7 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
 
     created: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None, session_summary=None):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None, session_summary=None, decisions_register=None):
         # Mimic the canonical spawn: create + commit a strategic_review task.
         t = Task(
             project_id=proj.id,
@@ -1566,7 +1566,7 @@ async def test_start_compensation_receives_plain_snapshotted_project_id(
 
     monkeypatch.setattr(db_session, "rollback", rollback_then_poison)
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None, session_summary=None):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None, session_summary=None, decisions_register=None):
         t = Task(
             project_id=proj.id,
             title="spawned resident",
@@ -2971,6 +2971,7 @@ async def test_start_revalidates_adopt_candidate_and_spawns_fresh(
         exam_ledger=None,
         message_cursor=None,
         session_summary=None,
+        decisions_register=None,
     ):
         # The real spawn wrapper BIRTHS the task with the resident context flags
         # (via extra_context); mirror that here so the fresh task carries them in
@@ -3638,6 +3639,61 @@ async def test_heartbeat_returns_active_direction_ids(db_session):
     # All excluded statuses must be absent.
     for key, _ in excluded_statuses:
         assert key not in ids, f"{key} should be excluded from active_direction_ids"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_state_endpoint_returns_current_data(
+    client: AsyncClient, db_session, enable_strategic_session_flag
+):
+    """The checkpoint-state endpoint returns the current problem model, memory
+    notes, and running update — not the bootstrap snapshot — so the compaction
+    checkpoint carries fresh state after mid-session mutations."""
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project, vm="agent-vm-cp")
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    await db_session.refresh(task)
+
+    # Set up initial project state.
+    project.problem_model = {"claim": "original"}
+    project.strategic_memory_notes = [{"note": "original note", "set_at": "2025-01-01T00:00:00"}]
+    project.running_update = "original update"
+    flag_modified(project, "problem_model")
+    flag_modified(project, "strategic_memory_notes")
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["problem_model"] == {"claim": "original"}
+    assert body["strategic_memory_notes"] == [{"note": "original note", "set_at": "2025-01-01T00:00:00"}]
+    assert body["running_update"] == "original update"
+    assert isinstance(body["vision"], dict)
+
+    # Simulate a mid-session mutation: update the project state.
+    project.problem_model = {"claim": "updated"}
+    project.strategic_memory_notes = [{"note": "updated note", "set_at": "2025-06-01T00:00:00"}]
+    project.running_update = "updated update"
+    flag_modified(project, "problem_model")
+    flag_modified(project, "strategic_memory_notes")
+    await db_session.commit()
+
+    res2 = await client.get(
+        f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state",
+        headers={"x-agent-token": token},
+    )
+    assert res2.status_code == 200, res2.text
+    body2 = res2.json()
+    # Must carry the updated state, not the original.
+    assert body2["problem_model"] == {"claim": "updated"}
+    assert body2["strategic_memory_notes"] == [{"note": "updated note", "set_at": "2025-06-01T00:00:00"}]
+    assert body2["running_update"] == "updated update"
 
 
 # ---------------------------------------------------------------------------
