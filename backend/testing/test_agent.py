@@ -12,6 +12,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 from app.database import get_session
 from app.main import app
+from testing.conftest import USE_POSTGRES
 from app.models import (
     Artifact,
     ArtifactType,
@@ -25994,6 +25995,12 @@ async def test_admin_viewport_shots_download_url_firebase_user_returns_json(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="the sibling-poisoning fault (rollback expires shared ORM rows, then "
+    "raiseload/MissingGreenlet on access) only reproduces on asyncpg; aiosqlite "
+    "no-ops InstanceState._expire so the isolation check is tautological.",
+)
 async def test_sr_analytics_sibling_isolation_after_rollback(
     client: AsyncClient, db_session, mocker
 ):

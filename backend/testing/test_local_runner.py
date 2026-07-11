@@ -2869,9 +2869,11 @@ class TestOrchestratorRunnerRouting:
         cache = await orch._load_active_runners_cache(db_session)
         assert {r.id for r in cache.get(project_id, [])} == {runner_id}
 
-        # Rollback does this in the live dispatch loop; expire_all reproduces the
+        # Rollback does this in the live dispatch loop; expunge_all reproduces the
         # same hazard without forcing an unrelated DB error in the test.
-        db_session.expire_all()
+        # (expire_all() is a no-op on SQLite because InstanceState._expire is
+        # globally patched in conftest.py; expunge_all() detaches without _expire.)
+        db_session.expunge_all()
 
         task = Task(
             project_id=project_id,

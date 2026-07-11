@@ -24,6 +24,8 @@ from sqlmodel import SQLModel
 
 from sqlmodel import select as _select
 
+from testing.conftest import USE_POSTGRES
+
 from app.capability_registry import derive_provider_marker
 from app.models import (
     Alert,
@@ -15850,6 +15852,11 @@ async def test_metrics_integrity_sweep_flags_counter_drift_without_mutating_sour
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="rollback-triggered ORM expiry (the MissingGreenlet fault) is no-oped "
+    "on aiosqlite; only asyncpg exercises the re-fetch guard faithfully.",
+)
 async def test_orphan_project_batch_expired_before_merged_pr_classification(
     reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
 ):
@@ -15966,6 +15973,11 @@ async def test_orphan_project_batch_expired_before_merged_pr_classification(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="rollback-triggered ORM expiry (the MissingGreenlet fault) is no-oped "
+    "on aiosqlite; only asyncpg exercises the re-fetch guard faithfully.",
+)
 async def test_orphan_project_batch_expired_before_open_pr_review_spawn(
     reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
 ):

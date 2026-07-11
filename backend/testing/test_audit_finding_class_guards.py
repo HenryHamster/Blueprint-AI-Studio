@@ -51,6 +51,16 @@ from pathlib import Path
 
 import pytest
 
+# Canonical registry for the MissingGreenlet fidelity growth ratchet lives in
+# production (backend/app/greenlet_fidelity.py) so the debt is greppable from
+# application code and the ceiling burn-down is a visible production diff. The
+# module is dependency-free, so this import is safe in the --standalone roster.
+from app.greenlet_fidelity import (
+    KNOWN_UNFAITHFUL_ALLOWLIST as _KNOWN_UNFAITHFUL_ALLOWLIST,
+    KNOWN_UNFAITHFUL_ALLOWLIST_CEILING as _KNOWN_UNFAITHFUL_ALLOWLIST_CEILING,
+    allowlist_within_ceiling as _allowlist_within_ceiling,
+)
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -586,40 +596,17 @@ _FIDELITY_FIXTURE_NAMES: frozenset[str] = frozenset(
     {"expire_fidelity", "missing_greenlet_proxy"}
 )
 
-# Tests that mention MissingGreenlet in their docstring but cannot faithfully
-# reproduce the asyncpg failure mode on SQLite (the conftest globally no-ops
-# InstanceState._expire, so session.rollback() does not expire ORM objects).
-# These tests are *context* references — they document the historical hazard
-# but verify correct behavior via integration rather than fault injection.
-# Each entry here represents known technical debt: ideally each test would
-# either get a @pytest.mark.skipif(not USE_POSTGRES, ...) decorator or use the
-# missing_greenlet_proxy/expire_fidelity fixtures to inject the fault.
-_KNOWN_UNFAITHFUL_ALLOWLIST: frozenset[str] = frozenset({
-    "test_agent.py::test_agent_status_complete_with_artifacts_creates_artifact_record",
-    "test_agent.py::test_sr_analytics_sibling_isolation_after_rollback",
-    "test_local_runner.py::test_heartbeat_survives_declined_continuation_renewal_race",
-    "test_local_runner_holds.py::test_repeated_hold_no_change_does_not_crash",
-    "test_orchestrator.py::test_pool_dispatch_commit_error_falls_back_to_cold",
-    "test_reaper.py::test_orphan_project_batch_expired_before_merged_pr_classification",
-    "test_reaper.py::test_orphan_project_batch_expired_before_open_pr_review_spawn",
-    "test_warm_pool_maintainer.py::test_idle_reaper_continues_after_retire_failure",
-    # alembic serialization test: docstring describes greenlet-bridged DDL
-    # concurrency but the test exercises no ORM session — uses a fake engine.
-    "test_migration_apply_gate.py::test_concurrent_applies_are_serialized",
-    # endpoint integration tests: load_only projection context in docstring;
-    # the endpoint succeeds because the fix applies the right projection,
-    # but the deferred-column MissingGreenlet fault is not directly injected.
-    "test_observability_payload_projection.py::test_digest_survives_trend_window_exceeding_digest_lookback",
-    "test_observability_payload_projection.py::test_evaluate_task_outcome_over_fixed_projection_fetch",
-    "test_observability_payload_projection.py::test_lane_diag_walks_hydrated_original_without_lazy_load",
-    "test_observability_payload_projection.py::test_outer_loop_convergence_trend_walks_non_code_outcomes",
-    "test_observability_payload_projection.py::test_outer_loop_convergence_walks_non_code_outcomes_without_lazy_load",
-})
-
-# Monotonic ceiling for the allowlist: the list can ONLY shrink. Bump this
-# constant when adding an entry (requires deliberate, visible action in the
-# diff alongside the new entry). Burn-down is tracked by lowering the ceiling.
-_KNOWN_UNFAITHFUL_ALLOWLIST_CEILING: int = 14
+# The known-unfaithful allowlist and its monotonic ceiling are the guard's
+# growth ratchet. Their canonical definition lives in the production module
+# ``app.greenlet_fidelity`` (imported above as ``_KNOWN_UNFAITHFUL_ALLOWLIST`` /
+# ``_KNOWN_UNFAITHFUL_ALLOWLIST_CEILING``) so the acknowledged debt is greppable
+# from application code and every burn-down is a visible production diff. Tests
+# in the allowlist are *context* references — they document the historical hazard
+# but cannot reproduce the asyncpg failure mode on the default SQLite backend
+# (the root conftest globally no-ops ``InstanceState._expire``). Each entry is
+# acknowledged technical debt: ideally each test either gets a
+# ``@pytest.mark.skipif(not USE_POSTGRES, ...)`` decorator or uses the
+# ``missing_greenlet_proxy``/``expire_fidelity`` fixtures to inject the fault.
 
 
 def _unfaithful_greenlet_tests(path: Path) -> list[str]:
@@ -630,16 +617,19 @@ def _unfaithful_greenlet_tests(path: Path) -> list[str]:
     - ``raise MissingGreenlet(...)`` anywhere in the function or nested scope
     - ``@pytest.mark.skipif`` conditioned on ``USE_POSTGRES`` or ``USE_TEST_POSTGRES``
     - A fixture arg named ``expire_fidelity`` or ``missing_greenlet_proxy``
-    - ``expunge_all()`` or ``expire_all()`` in the body
+    - ``expunge_all()`` in the body
     - ``raiseload=True`` keyword arg in the body
     - ``.expired`` attribute access in the body
     - ``.unloaded`` attribute access (``sa_inspect(obj).unloaded`` deferred-column check)
 
-    NOTE: ``session.expire(obj)`` alone is NOT a sufficient fidelity mechanism.
-    ``Session.expire()`` delegates to ``InstanceState._expire``, which the root
-    conftest globally no-ops.  The call silently does nothing on the aiosqlite
-    backend.  Tests that use ``session.expire()`` to reproduce the asyncpg fault
-    MUST also use the ``expire_fidelity`` fixture (which restores real expiry).
+    NOTE: ``session.expire(obj)`` and ``session.expire_all()`` alone are NOT
+    sufficient fidelity mechanisms.  Both delegate to ``InstanceState._expire``,
+    which the root conftest globally no-ops.  The calls silently do nothing on
+    the aiosqlite backend.  Tests that use ``session.expire()`` to reproduce the
+    asyncpg fault MUST also use the ``expire_fidelity`` fixture (which restores
+    real expiry).  Use ``expunge_all()`` — which removes objects from the session
+    identity map without calling ``_expire`` — when ``expire_all()`` was the
+    intent.
     """
     source = path.read_text(encoding="utf-8")
     try:
@@ -685,8 +675,8 @@ def _unfaithful_greenlet_tests(path: Path) -> list[str]:
             if isinstance(child, ast.Call):
                 func = child.func
                 if isinstance(func, ast.Attribute):
-                    # session.expunge_all() / session.expire_all()
-                    if func.attr in ("expunge_all", "expire_all"):
+                    # session.expunge_all() only — expire_all() is a no-op on SQLite
+                    if func.attr in ("expunge_all",):
                         faithful_body = True
                         break
                 # raiseload=True keyword arg
@@ -719,7 +709,7 @@ class TestMissingGreenletTestsFaithful:
     - ``raise MissingGreenlet(...)`` (fault injection)
     - ``@pytest.mark.skipif(not USE_POSTGRES / USE_TEST_POSTGRES, ...)``
     - ``expire_fidelity`` or ``missing_greenlet_proxy`` fixture arg
-    - ``expunge_all()`` / ``expire_all()``
+    - ``expunge_all()``
     - ``raiseload=True`` keyword
     - ``.expired`` attribute access
     - ``.unloaded`` (``sa_inspect(obj).unloaded`` deferred-column check)
@@ -824,6 +814,45 @@ class TestMissingGreenletTestsFaithful:
             "session.expire() genuinely works and the test is faithful."
         )
 
+    def test_session_expire_all_alone_is_not_faithful(self, tmp_path):
+        """A test that only uses ``session.expire_all()`` WITHOUT the
+        ``expire_fidelity`` fixture must be flagged by the fidelity scanner.
+
+        ``Session.expire_all()`` calls ``InstanceState._expire`` for each
+        managed instance — the same method globally no-oped by the root conftest.
+        It is therefore a no-op on the aiosqlite backend, making any test that
+        relies solely on it pass tautologically on SQLite.
+
+        Use ``expunge_all()`` instead — it removes objects from the session
+        identity map without invoking ``InstanceState._expire``.
+        """
+        not_faithful = tmp_path / "test_not_faithful_expire_all.py"
+        not_faithful.write_text(textwrap.dedent("""\
+            async def test_bare_expire_all():
+                \"\"\"Uses expire_all — MissingGreenlet hazard.\"\"\"
+                session.expire_all()
+        """))
+        violations = _unfaithful_greenlet_tests(not_faithful)
+        assert any("test_bare_expire_all" in v for v in violations), (
+            "session.expire_all() without expire_fidelity fixture was NOT flagged.  "
+            "expire_all() on SQLite is a no-op (InstanceState._expire is globally "
+            "patched in conftest.py) and cannot serve as a faithful fidelity "
+            "mechanism.  Use expunge_all() instead."
+        )
+
+        faithful = tmp_path / "test_faithful_expunge.py"
+        faithful.write_text(textwrap.dedent("""\
+            async def test_expunge_all_is_faithful():
+                \"\"\"Uses expunge_all — MissingGreenlet hazard.\"\"\"
+                session.expunge_all()
+        """))
+        violations2 = _unfaithful_greenlet_tests(faithful)
+        assert not any("test_expunge_all_is_faithful" in v for v in violations2), (
+            "session.expunge_all() was incorrectly flagged as unfaithful.  "
+            "expunge_all() removes objects from the identity map without calling "
+            "_InstanceState._expire, so it genuinely works on SQLite."
+        )
+
     def test_greenlet_lowercase_docstring_is_scanned(self, tmp_path):
         """A test whose docstring contains 'greenlet' in lowercase must be
         flagged by the fidelity scanner.
@@ -887,7 +916,7 @@ class TestMissingGreenletTestsFaithful:
             "full list). Either inject the fault (raise MissingGreenlet via a "
             "proxy — see test_strategic_resident_session.py::_ProjectIdPoisonAfterRollback), "
             "use the expire_fidelity or missing_greenlet_proxy fixtures, call "
-            "expunge_all()/expire_all(), use raiseload=True, or mark the "
+            "expunge_all() (not expire_all() — it is a no-op on SQLite), use raiseload=True, or mark the "
             "test Postgres-only with @pytest.mark.skipif(not USE_POSTGRES, ...):\n"
             + "\n".join(f"  - {v}" for v in sorted(violations))
             + "\n\nTo acknowledge existing debt, add to _KNOWN_UNFAITHFUL_ALLOWLIST "
@@ -902,13 +931,19 @@ class TestMissingGreenletTestsFaithful:
         ceiling constant, which is a deliberate, visible diff action.
         Burn-down is tracked by lowering the ceiling as entries are
         migrated to faithful patterns.
+
+        The ratchet is enforced by the production helper
+        ``app.greenlet_fidelity.allowlist_within_ceiling`` — importing and
+        calling it here is what ties this guard to the canonical production
+        registry rather than a test-local copy.
         """
-        assert len(_KNOWN_UNFAITHFUL_ALLOWLIST) <= _KNOWN_UNFAITHFUL_ALLOWLIST_CEILING, (
+        assert _allowlist_within_ceiling(), (
             f"_KNOWN_UNFAITHFUL_ALLOWLIST has {len(_KNOWN_UNFAITHFUL_ALLOWLIST)} entries "
             f"(ceiling: {_KNOWN_UNFAITHFUL_ALLOWLIST_CEILING}). Either migrate entries "
             "to a faithful pattern (see _unfaithful_greenlet_tests for recognised "
-            "mechanisms) and lower the ceiling, or—after exhausting faithful options—"
-            "deliberately bump _KNOWN_UNFAITHFUL_ALLOWLIST_CEILING."
+            "mechanisms) and lower the ceiling in app/greenlet_fidelity.py, or—after "
+            "exhausting faithful options—deliberately bump "
+            "KNOWN_UNFAITHFUL_ALLOWLIST_CEILING there."
         )
 
 

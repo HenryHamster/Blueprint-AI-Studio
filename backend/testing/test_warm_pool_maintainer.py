@@ -59,7 +59,7 @@ from app.warm_pool_maintainer import (
     sweep_idle_pool_vms,
     sweep_stranded_lanes,
 )
-from testing.conftest import TestingSessionLocal
+from testing.conftest import TestingSessionLocal, USE_POSTGRES
 
 
 class _NoCloseSession:
@@ -230,6 +230,11 @@ async def test_idle_reaper_retires_stale_image_member(db_session, warm_pool_on, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="the except-handler read after session.rollback() only expires (and so "
+    "raises MissingGreenlet) on asyncpg; aiosqlite no-ops InstanceState._expire.",
+)
 async def test_idle_reaper_continues_after_retire_failure(
     db_session, warm_pool_on, mocker
 ):

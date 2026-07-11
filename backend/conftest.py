@@ -61,10 +61,14 @@ def expire_fidelity():
     NOTE: A bare ``session.expire(obj)`` call (without this fixture) is NOT
     a valid MissingGreenlet fidelity mechanism.  ``Session.expire()`` delegates
     to ``InstanceState._expire``, which is globally no-oped above, so the call
-    silently does nothing on the aiosqlite backend.  The fidelity scanner in
-    ``test_audit_finding_class_guards.py`` therefore does NOT accept bare
-    ``session.expire()`` as faithful.  Always pair ``session.expire()`` with
-    this fixture when the goal is to reproduce the asyncpg failure mode.
+    silently does nothing on the aiosqlite backend.  The same applies to
+    ``session.expire_all()``, which calls ``InstanceState._expire`` for every
+    managed object — also a no-op on SQLite.  The fidelity scanner in
+    ``test_audit_finding_class_guards.py`` does NOT accept bare ``expire()``
+    or ``expire_all()`` as faithful.  Always pair ``session.expire()`` with
+    this fixture when the goal is to reproduce the asyncpg failure mode, or use
+    ``expunge_all()`` — which removes objects from the identity map without
+    calling ``_expire``.
     """
     _InstanceState._expire = _orig_instance_expire  # type: ignore[assignment]
     yield

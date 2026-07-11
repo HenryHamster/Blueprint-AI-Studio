@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 from app.time_utils import _utcnow
+from testing.conftest import USE_POSTGRES
 import app.main as _main_module
 import app.shared_state as _shared_state
 from app.reaper import reaper_service
@@ -6775,6 +6776,11 @@ class TestWarmVMSkipProvision:
             assert row.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not USE_POSTGRES,
+        reason="the lease-commit rollback expiry that raises MissingGreenlet only "
+        "reproduces on asyncpg; aiosqlite no-ops InstanceState._expire.",
+    )
     async def test_pool_dispatch_commit_error_falls_back_to_cold(
         self, orch_warm_db, mocker
     ):
